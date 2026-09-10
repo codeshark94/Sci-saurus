@@ -1,26 +1,35 @@
-# Sci-saurus — Concept SSOT (Single Source of Truth)
+# Sci-saurus — Concept SSOT
 
-> This document is the **single source of truth** for Sci-saurus. All other documents (`10-`, `20-`, `30-`) are **derived** from it; on conflict, this document prevails.
-> Rules: (1) changes to concept/principles/terminology happen here first; (2) when a decision changes, a new versioned decision (D-x) is added — previous decisions are never deleted (records accumulate).
+> **Version:** v0.8 · **Date:** 2026-09-10 · **Status:** working design; not an implemented system.
+> This is the normative source for purpose, authority, terminology, and design decisions. [System Concept](05-system-concept.md) explains the organizing model. Architecture and execution contracts implement these decisions.
+> Preserve prior decisions. Amend them with explicit superseding decisions rather than rewriting history. Historical decision entries below are retained; this checkout does not contain a separate historical document archive.
 
-Doc version: v0.4 · Status: under review (D9–D12 decisions applied; unified in English per D12)
+## 1. Definition and primary objective
 
----
+**Sci-saurus is a Principal-directed, compute-rich research organization that pursues evidence-backed progress through flexible, rationally supervised activity.** Investigation, alternative construction, synthesis, criticism, verification, and replanning are complementary reasoning activities. It exists to realize the human Principal's intent, not to maximize discussion, satisfy its own reviewers, or perpetuate its own activity.
 
-## 1. One-line Definition
+The flagship mission is **a user-supplied results package + rough storyline → broad external intelligence gathering → defensible argument → English manuscript → LaTeX source and rendered PDF**. Research & Intelligence, Strategy & Writing, Methods & Validation, and the Editorial Office retain distinct responsibilities while collaborating through a shared workspace, an organization-wide Web Intelligence Fabric, and recorded, event-driven exchanges.
 
-**Sci-saurus** is a general-purpose research-production multi-agent system organized as a **multi-department organization** — "Research & Intelligence · Strategy & Writing · Editorial Office". Its flagship task today is *research data + a rough storyline → prior-work survey → paper draft*, but every department is a **general-purpose functional unit** not bound to papers: with a Composer's custom "score", the organization can pursue any production goal. All artifacts, decisions, and inter-department exchanges are **rigorously version-controlled and archived per project**.
+The central design objective is **compute → verified progress toward the Principal's goal**. This is a hypothesis to test, not a guarantee that additional inference produces a better artifact. Spending more compute must buy useful search, stronger evidence, independently verified repairs, better candidates, or reduced decision-relevant uncertainty. Extra messages and additional versions are not, by themselves, progress.
 
-## 2. Vision Roadmap (Anything → Anything)
+External GPU capacity is assumed plentiful. The default policy spends generously on capable reasoning, depth, diverse approaches, and verification. It optimizes useful outcomes over elapsed time rather than minimizing tokens. Actual backend capacity and authorization are configured and measured; abundant inference does not create missing external evidence or an infallible evaluator.
 
-| Phase | Capability | Description |
+## 2. Vision roadmap
+
+| Horizon | Capability | Boundary |
 |---|---|---|
-| **Now (v1)** | Paper-writing pipeline | Brief (research data + rough storyline) → Research & Intelligence (prior work · genealogy · trends) → Strategy (storyline · feasibility · outline) → draft → Editorial (format · structure) → release |
-| **Next (v1.5)** | General-purpose goal switching | Composer swaps "score" presets to change deliverable type (research report, proposal, review article…). Department code is reused without modification |
-| **Later (v2+)** | Resource awareness & execution | The organization discovers its own resources (this computer, available tools), finds, installs, and runs open-source tools needed for the goal. Strategy extends to experiment design. Ultimately **anything → anything** |
-| **Endgame (v3)** | Autonomous organization operation | Cross-project org reuse, self-retrospective process improvement, collaboration with external agents (A2A/MCP) |
+| v1 | Project-scoped organization with adaptive activity, elastic inference, four scientific/editorial responsibilities, on-demand Operations Cell, active web/tools, scoped revisions, and human release approval | Authorized practical program execution; no new experiments or substantive analysis of raw research data |
+| v1.5 | A second deliverable through a different Score, reusing department contracts | Report/proposal support must be demonstrated, not assumed from generic role names |
+| v2 | Explicitly authorized scientific analysis/experimental execution beyond supplied results | New methods, result provenance, and domain validation; practical tool/environment operation already exists in v1 |
+| v3 | Reusable organizational experience and external-agent collaboration | Process improvements are versioned, evaluated, and approved; no self-amendment of the Principal's intent |
 
-## 3. Core Decisions (Design Decisions — agreed)
+An organic organization does not imply continuously running all agents. Persistent responsibilities, a durable backlog, delegated initiative, and reliable feedback matter more than simulating employee chatter.
+
+## 3. Decision register
+
+### 3.1 Historical decisions D1–D12 — preserved verbatim
+
+The following records describe the original design. Where they conflict with a later decision, the later decision's explicitly named scope prevails.
 
 - **D1 — Multi-department organization metaphor.** The system is an organization. Standing departments: Research & Intelligence / Strategy & Writing / Editorial Office. Standing cross-cutting organ: the Archivist (version control & storage). Standing conductor: the Composer.
 - **D2 — Departments are general-purpose functional units.** The Research department does not do "paper research"; it does *"survey of the world for a given goal"*. Papers are just one mission among many. Same for Strategy and Editorial.
@@ -35,80 +44,186 @@ Doc version: v0.4 · Status: under review (D9–D12 decisions applied; unified i
 - **D11 — Paper language policy.** The final paper (writing · rendering) is **English by default**. Briefs, internal collaboration notes, and release summaries may be Korean. Language is declared in the score; overrides (e.g., Korean paper with a kotex compile chain) are allowed.
 - **D12 — English-first development (supersedes the "internal docs may be Korean" clause of D11).** All development artifacts are unified in **English**: design documents, source code, comments, commit messages, CLI output, schema field names, identifiers, and inter-agent message bodies (default; score-configurable). Human-supplied inputs (briefs) may remain in any language.
 
-## 4. Organization Summary (details in `20-architecture-v0.md`)
+### 3.2 New decisions incorporated in this revision
 
-| Organ | Nature | One-line duty | Internal composition (summary) |
-|---|---|---|---|
-| **Composer** (conductor) | Orchestration | Turns briefs into missions, conducts departments, arbitrates, declares releases | Mission designer, arbiter, release steward |
-| **Research & Intelligence** (Dept) | Producing dept | Surveys the world for the goal: collects and systematizes references, genealogy, trends | Research Chief, Literature Scout, Genealogy & Trend Analyst, Cataloger, Fact Verifier |
-| **Strategy & Writing** (Dept) | Producing dept | Converts research data into goal-achieving storylines, stress-tests feasibility, writes the draft | Strategy Chief, Narrative Architect, Feasibility Red Team, Planner, Section Writers |
-| **Editorial Office** (Dept) | Review/quality | Rigorously reviews format, aesthetic structure, logical consistency; judges publication readiness | Editor-in-Chief, Format Editor, Structural Editor, Consistency QA |
-| **Archivist** (cross-cutting service) | Service | Stores, tags, and audits every artifact, message, and event in immutable versions | Storage engine, ledger, release/tag management |
+**Decision status:** D13–D15 and D22–D24 retain the established direction. D25 records the compute and supervision premise; D31–D36 specify surgical revision, structured management, active external intelligence, project instances, and practical operations. Engineering mechanisms are working design policies, not claims of measured efficacy or independently authorized runtime operations. Later decisions supersede only the explicitly named scope.
 
-## 5. Glossary — SSOT body
+**D13 — Adversarial progress by default.** Every department has a designated independent Adversarial Reviewer. Its mandate is to find substantive, justified reasons an output should not advance. Its output contains objections, investigation requests, or an explicit no-valid-objection-found result—not praise or ceremonial approval. It must not invent flaws to meet a negativity quota. Producers may rebut. An adjudicator other than the producer or reviewer decides disputed validity; repairs require verification. No substantive departmental deliverable advances without recorded adversarial coverage. This extends D4.
 
-| Term | Definition |
+**D14 — Principal-aligned command.** The organization exists to realize the Principal's intent. Preserve the original human instruction separately from the command's interpretation. Only the Principal can approve changes to objectives, prohibitions, priority ordering, or delegated authority. Command translates intent into missions, allocates resources, resolves trade-offs, and reports candidly. Alignment governs direction and choices, not factual conclusions. No role may conceal contradictory evidence or manufacture agreement with a desired conclusion.
+
+**D15 — Four departments and an Executive Command.** Add **Methods & Validation** as a department independent of Strategy & Writing. Replace the standalone Composer's combined responsibilities with **Executive Command**: Intent Keeper, Composer, Arbiter, and Progress Controller. The Composer remains the orchestration role within command. Archivist remains a cross-cutting deterministic service, not a creative agent. This supersedes the membership list in D1 and the Composer's concentration of authority; it preserves the organization metaphor.
+
+**D16 — Delegated initiative within a Score.** A Score specifies mission constraints, deliverables, stage readiness, capability limits, quality gates, and reactive policies. It is not a fixed conveyor belt. Departments may propose or execute in-scope tasks within delegated budgets, request another department's help, and challenge upstream assumptions. Events can reopen affected work without restarting unrelated work. Requests do not authorize themselves. This extends D3 and supersedes an exclusively sequential reading of D6–D7.
+
+**D17 — Evidence before narrative.** Keep user results and literature evidence distinct. Claims link to specific evidence spans/results, their interpretation, and limitations. Identifiers and bibliographic metadata establish source identity, not support for a claim. In v1, the Principal supplies interpreted results; the organization checks and writes from them but does not secretly perform omitted experiments or new statistical analyses. This clarifies D7 and the v1 non-goals.
+
+**D18 — Verified progress and incumbent preservation.** Progress is a documented improvement against a fixed, intent-aligned acceptance contract, or separately recorded decision-relevant information gain. Fewer open issues alone is not enough. Changes must preserve required coverage, pass non-regression checks, and survive independent verification. Keep the best currently admissible artifact as an incumbent; a new version is only a candidate until accepted. New evidence can invalidate an incumbent. There is no unconditional monotonic-quality guarantee.
+
+**D19 — Durable control plane; immutable artifacts.** Use a native Python orchestrator with a transactional local state/event/message store as the v1 default. SQLite is the proposed local implementation; JSONL is an audit export, not a multi-writer queue. Immutable content objects and version manifests are the artifact authority. Git is the inspectable snapshot/release history, not a second live transaction coordinator. This clarifies D5 and D9; it supersedes the original JSONL-queue implementation default.
+
+**D20 — Bounded authority and independent judgment.** Deterministic checks, evidence-based judgments, and human approvals are separate gate classes. Reviewers cannot unilaterally rewrite artifacts or block work indefinitely; chiefs cannot erase critiques or grant themselves final disputed approval. Scientific-integrity failures cannot be waived into a verified final release. The Principal may redirect, pause, or accept a visibly incomplete draft, but recorded facts and verdict histories remain unchanged.
+
+**D21 — Minimum organization before organizational scale.** Agents are role specifications executed by a bounded worker pool, not a required process per role. Establish one complete produce–challenge–respond–judge–verify–select loop and measure its value before expanding concurrency, frameworks, or the number of agents. No new framework or department is justified solely by the organization metaphor.
+
+**D22 — Organization-wide Web Intelligence Fabric.** Web retrieval is a shared organizational capability, not a Research-only tool. Any department may perform authorized, task-scoped discovery when external information can materially improve its work. Research & Intelligence owns broad search strategy, source acquisition quality, provenance, catalog normalization, and promotion of discoveries into the formal evidence base. A web discovery is not automatically evidence; publication into the project evidence registry requires source capture, provenance, and the appropriate verification.
+
+**D23 — Independent adversarial retrieval.** Each departmental Adversarial Reviewer receives a separately reserved retrieval allowance and may construct independent query families, terminology, source routes, and counterexample searches. An adversary must not be restricted to the producer's search history or selected corpus when the review criterion requires external verification. Independence is bounded by the same data, provider, cost, and capability policy as the rest of the mission.
+
+**D24 — Coverage-oriented search, not result-count search.** Search is an iterative evidence-acquisition process. For material questions, the organization may decompose concepts, expand historical/adjacent terminology, search multiple source classes and languages, chase backward/forward references where available, follow authors/labs/projects, and explicitly seek contradictory evidence. Search stops because the approved coverage target is met, additional search has low expected decision value, access is exhausted, or the resource envelope is reached—not because an arbitrary number of results was collected. Search coverage and known gaps are first-class records.
+
+**D25 — Compute-rich, time-accountable reasoning.** Plentiful external GPU capacity is the default operating premise. Reasoning should be generous, flexible, and rationally supervised. Prefer useful progress over elapsed time to token thrift or activity volume. No fixed number of model calls defines sufficient thought. This changes the allocation emphasis of D21 while retaining a minimal implementation and measured justification for organizational complexity.
+
+**D26 — Activity graph as the execution center.** Departments are responsibility and knowledge boundaries; work is a changing graph of questions, candidates, evidence, checks, and decisions. Cross-department groups may form and dissolve within delegation. A Score defines commitment conditions and permitted activity, not a fixed reasoning sequence. Provisional exploration may precede upstream acceptance, but substantive promotion requires the full current dependency closure. This extends D16 and clarifies D6–D7 and D13.
+
+**D27 — Renewable capacity, finite execution leases.** Separate authorized resources, measured capacity, and finite task/planning leases. Existing delegation may automatically renew an allocation window; no human reconfirmation is required solely because a window ends. Metered expenditure and explicit mission limits remain hard boundaries. Missing policy is not unlimited permission. This replaces universal lifetime call/round caps and fixed review/message-count defaults while preserving D19's durable accounting and D20's authority boundaries.
+
+**D28 — Rational supervision with independent recourse.** Every activity has a mission contribution, expected useful output, and evaluation or reassessment condition. Executive Command supervises the portfolio and its bottlenecks. Routine delegated work uses deterministic admission; consequential decisions and failed predictions receive independent scrutiny. The supervisor cannot change acceptance criteria to improve its own scores. Disputes have finite escalation paths, not an infinite hierarchy of reviewers. This extends D15 and D20.
+
+**D29 — Anytime results and durable learning.** At configured wall-clock checkpoints, expose the best admissible result, material alternatives, independently supported artifact/information changes, resources, gaps, and next action. Long investigations may span checkpoints with declared intermediate milestones. Deduplicate discoveries and retain stagnation history across renewals. New evidence can invalidate accepted work; never promise monotonic scientific improvement. This extends D18.
+
+**D30 — Adaptation before organizational scale.** The first vertical slice must already demonstrate parallel alternatives, supervised reallocation, renewable capacity, verification, and elapsed-time checkpoints. Add the complete department catalog after this loop works. Reserve review and integration capacity as production scales. Internal plan and outline revisions within approved scope need no new Principal checkpoint unless the mission explicitly requires one; final release and material scope/authority changes retain human control. This supersedes D21's narrow serial-slice reading and the previous mandatory outline-approval default.
+
+**D31 — Purpose-directed surgical revision.** Every edit names a defect, requirement, or justified improvement; the exact baseline; permitted units/fields/operations; preserved properties; and verification conditions. A worker may read broad context while holding narrow edit rights. Ownership, integration responsibility, or an instruction to improve quality does not grant whole-document rewrite authority. Scope expands only through a recorded, non-conflicted decision within delegation or the Principal's authority where needed. This strengthens D16, D18, and D20.
+
+**D32 — Structured, versioned deliverables and references.** Manage sections, paragraphs, and other meaningful blocks by stable identity and immutable versions, composed through a DocumentManifest. Keep order/containment, unit purpose, claim links, citation occurrences, captured reference versions, and rendering dependencies explicit. Moving content preserves identity; split/merge/retirement preserves lineage. Derived files are not an alternate mutable source of truth. This specializes D5 and D19.
+
+**D33 — Scoped proposals; verified atomic integration.** Workers submit ChangeSets under service-enforced EditGrants. The control plane checks the complete mutation set, including structure and shared assets, independently verifies semantic impact, and atomically adopts a current manifest. Concurrent textual separation is not proof of semantic independence. Coupled changes commit together; scoped inverse changes preserve unrelated later work. A reviewer or integrating agent cannot bypass these rules. This extends D13, D18, and D20 without requiring human permission for every routine correction.
+
+**D34 — Active external intelligence and tool integration.** All departments and adversaries actively seek external information when it can change a material decision. Search, original-source acquisition, citation/reference following, repository/documentation inspection, and independent counter-search are executable capabilities backed by usable API/tool adapters. Discover missing capabilities and implement/configure useful integrations early; record actual availability, credentials/rights, and measured failures. Already authorized tools may be selected autonomously. Plugin discovery or generated adapter code does not itself grant installation, credentials, or new data permissions. External findings enter evidence verification and scoped change control rather than rewriting accepted content. This operationalizes D22–D24.
+
+**D35 — One operating organization per research project.** Each project instantiates its own intent, missions, Command, departmental context, task graph, environment, capabilities, evidence, and artifact history. The Sci-saurus implementation repository and reusable organization templates are distinct from these research-project instances. Shared inference/services/public software caches do not imply shared private data, credentials, write authority, or accepted results. Artifact resolution and every execution/grant are bound to authenticated project identity. This operationalizes D5 and the project-local scope of D14–D20.
+
+**D36 — On-demand Operations Cell with actual execution responsibility.** Activate a practical support cell when a project needs program setup, API/MCP connection, adapter implementation, execution, repair, or packaging. It must carry useful open-source programs and services through a real project-runtime run and inspected outputs, not stop at recommendations, installation logs, or schema listing. Reuse existing workers/tasks; enabled tools remain directly usable by departments. The cell prepares and operates the environment under existing project delegation, while independent operational checks and qualified departmental review decide acceptance. This brings practical setup/execution into v1, superseding D8's deferral for that scope; substantive new analysis/experiments remain a separate mission capability.
+
+### 3.3 Effective interpretation of earlier rules
+
+| Earlier wording | Effective v0.8 interpretation |
 |---|---|
-| **Project** | Container for all artifacts, records, and versions of one goal. Owns a unique id and a repository (folder + git) |
-| **Brief** | The user's initial input (preserved verbatim). E.g., research data + rough storyline |
-| **Mission** | The executable goal statement the Composer derives from a brief (objective, constraints, success criteria, deliverable spec) |
-| **Score** | A Composer preset: declarative definition of the pipeline (stages, owning departments, gates) per deliverable type. Default: `paper` |
-| **Department** | A general-purpose functional unit; internally multi-agent; receives missions |
-| **Agent** | A role unit inside a department, defined by manifest (name, role, permissions, tools, model profile) |
-| **Blackboard** | The shared project workspace (files). Readable by all; writable only for one's own artifacts |
-| **Artifact** | A versioned output unit (research note, reference card, storyline, outline, section draft, review, report, …) |
-| **Message** | The inter-department envelope. Types: `request` / `review` / `data` / `critique` / `decision` |
-| **Ledger** | Append-only event log of every action (artifact creation, messages, gate verdicts) |
-| **Release** | A milestone snapshot tag, e.g., `v0.1-outline`, `v0.2-draft`, `v1.0-final` |
-| **Gate** | A quality condition permitting stage progress; failure routes to dispute → arbitration |
-| **Arbitration** | The Composer's evidence-based decision in inter-department deadlock/dispute (always recorded) |
+| Composer writes only releases | Command may author intent interpretations, missions, tasks, decisions, and release proposals in its own namespaces; it may not rewrite departmental knowledge |
+| Every edit is a new artifact version | Immutable content and metadata are preserved; status, approval, and adoption are append-only events, not in-place edits |
+| Every exchange is recorded | Structured requests, outputs, decisions, and concise evidence-based rationales are recorded; hidden model reasoning and secrets are not required |
+| Any department may read the blackboard | Access remains permissioned; each model call receives a bounded ContextPackage, not the whole project |
+| A gate failure routes to arbitration | Mechanical errors first follow bounded repair; factual uncertainty may remain blocked; authority conflicts and contested judgments escalate |
+| Final paper is English | Development artifacts and inter-agent communication default to English under D12; original human/source material stays in its original language |
+| Finite compute budget | Finite dispatch reservations and renewable capacity windows; hard lifetime limits only where explicitly configured |
+| Stage prerequisites | Required for accepted commitment; separately authorized provisional exploration may start earlier |
+| Every output needs review | Substantive accepted outputs require exact review coverage; exploratory proposals do not each trigger a full approval cycle |
+| A department owns an artifact namespace | Ownership permits responsibility and scoped proposals; it does not confer unrestricted whole-document editing |
+| Every draft is an immutable artifact | Accepted document versions compose exact structural-unit versions and pinned references; generated files are derived views |
+| Resource-aware tool execution is long-term | Practical project-local OSS/API/MCP setup and use are v1; new scientific experiments/estimation remain separately scoped |
 
-Korean↔English term map (for conversation continuity): 부서=Department · 조사부=Research & Intelligence · 전략부=Strategy & Writing · 편집실=Editorial Office · 기록부=Archivist · 지휘자=Composer · 브리프=Brief · 미션=Mission · 악보=Score · 블랙보드=Blackboard · 아티팩트=Artifact · 원장=Ledger · 릴리스=Release · 게이트=Gate · 중재=Arbitration.
+## 4. Organization and authority
 
-## 6. Data Model Summary (schemas in `20-architecture-v0.md` §5)
+| Organ | Mission | Core roles | Independent challenge |
+|---|---|---|---|
+| **Principal** | Defines desired outcomes, prohibitions, trade-offs, and delegation | Human owner | Can question, redirect, pause, or terminate any mission |
+| **Executive Command** | Preserves intent and makes the organization act toward it | Intent Keeper; Composer; Arbiter; Progress Controller | Any departmental adversary may challenge its decisions; conflicted arbitration goes to another qualified adjudicator or the Principal |
+| **Research & Intelligence** | Establishes what the outside world supports and disputes; owns formal evidence acquisition and registry quality | Chief; Search Strategist; Academic Scout; Open-Web Scout; Technical Ecosystem Scout; Standards & Patent Scout; Genealogy & Trend Analyst; Source Acquirer; Cataloger; Fact Verifier | Research Adversary |
+| **Strategy & Writing** | Develops the strongest useful argument and deliverable allowed by the evidence | Chief; Narrative Architect; Planner; Section Writers | Strategy Adversary; absorbs the original Feasibility Red Team's argumentative role |
+| **Methods & Validation** | Assesses whether the proposed conclusions follow from the supplied methods/results | Chief; Methodologist; Statistical Reviewer; Reproducibility Reviewer | Methods Adversary |
+| **Editorial Office** | Makes the deliverable accurate, coherent, and appropriately rendered without altering its meaning | Editor-in-Chief; Structural Editor; Format Editor; Consistency QA | Editorial Adversary reviews the editorial work, not only the manuscript |
+| **Operations Cell — on demand** | Makes the project's required programs, environments, APIs, and MCP services actually work | Coordinator; Tool/Environment Engineer; Execution Operator, activated as needed | Independent operational verifier and the qualified consuming department; no scientific acceptance authority |
+| **Archivist** | Preserves objects, provenance, decisions, events, and releases | Storage, audit, and recovery services | Deterministic integrity checks and sampled audit; no recursive LLM bureaucracy |
 
-Core entities (7): `Project`, `Mission`, `Task`, `Artifact` (immutable versions), `Message`, `Event` (ledger), `Release`.
-Immutability rule: artifact bodies are immutable once stored → edits are always a **new version + parent link**. The ledger is append-only.
+A chief owns coordination and synthesis. The department's adversary has an independently reserved review budget and direct access to the escalation channel; a chief cannot suppress an inconvenient review. Distinct roles may use the same model, but this provides procedural separation, not statistically independent reasoning.
 
-## 7. Artifact & Versioning Rules (summary)
+## 5. Principal Intent, mission, and delegation
 
-1. One project folder = one repository. Standard layout in architecture doc §6.
-2. Every artifact: frontmatter (id, type, version, parents, author_role, status, checksum, refs) + body.
-3. Release tags at milestones (brief accepted / survey done / outline approved / draft / editorial pass / final).
-4. The user can inspect, diff, and roll back project outputs at any time.
-5. Citations without evidence are blocked at gates (hallucination defense line).
+**Principal Intent** is a versioned policy: verbatim instruction references; approved interpretation; objectives; ordered priorities; hard constraints; non-goals; resource/data boundaries; and the scope of autonomous action. Do not fabricate numeric utility weights from conversational wording.
 
-## 8. Non-Goals (v1)
+**Mission** is a project-specific implementation of an approved intent revision. Every Task, gate result, and release pins the applicable intent, mission, and Score versions. An inferred preference is marked `assumed`, not `approved`.
 
-- Running experiment code or performing real data analysis (design slots only; opened in v2).
-- Publishing under human authorship in place of humans — transparent AI-generated-content attribution is maintained.
-- Single-vendor framework lock-in (department runners must remain replaceable).
-- UI polish (streaming UI etc.) — core and storage layer first.
+The Principal decides ends and material trade-offs. Departments decide specialist matters within their authority. Command can choose between scientifically permissible routes; it cannot vote a false proposition into truth. An unresolved scientific question produces uncertainty, a scoped claim, an investigation request, or a pause—not an invented answer.
 
-## 9. Open Questions (user decisions pending)
+A new principal instruction creates an intent revision with a recorded interpretation delta. An explicit instruction can itself authorize a faithful delta; ask only for unresolved material interpretation or additional authority. Impact analysis marks affected tasks/approvals stale. Prior approvals do not silently transfer to changed content.
 
-| # | Question | Default proposal |
-|---|---|---|
-| Q1 | ~~v1 execution harness~~ | ✅ **Decided (D9)**: hybrid — native Python core; department runners as adapters (LangGraph/AutoGen mixable) |
-| Q2 | ~~First target deliverable format~~ | ✅ **Decided (D10, D11)**: paper = English LaTeX source + compiled PDF |
-| Q3 | Search/tool access scope (which web-search API? citation metadata sources: arXiv/CrossRef/S2?) | arXiv + Semantic Scholar + web search combination |
-| Q4 | Model placement (per-department model tiers) and per-project cost cap | Research = economical models, writing = high-capability models; caps per project |
-| Q5 | Human-in-the-loop checkpoint locations (outline approval? post-draft?) | Two points: outline approval + before final release |
+## 6. Adversarial working contract
 
-## 10. Document Map
+A valid objection names the target version and location, the violated requirement or precise claim, evidence or a reproducible contradiction, material impact, and a resolution/verification condition. Logical defects may be grounded in an explicit counterexample rather than an external citation. Style criticism must cite an actual communication requirement and demonstrate the problem, not a personal preference.
 
-- `00-SSOT.md` — this document; origin of concept, principles, terminology.
-- `10-survey-precursors.md` — precedent systems & framework survey (with sources) and design implications.
-- `20-architecture-v0.md` — v1 architecture concretization (organization, comms, schemas, pipeline, execution mapping).
-- `30-roadmap.md` — implementation roadmap (P0–P4), risks, immediate next actions.
+Review results are `objections_found`, `no_valid_objection_found`, `insufficient_evidence`, or `review_failed`. The last three have different meanings. A lack of access or a failed tool call cannot count as successful review.
 
-All project documentation is maintained in **English** per D12.
+The common cycle is:
 
-## 11. Change Log
+```text
+produce candidate → blind challenge → respond/rebut/request evidence
+                  → adjudicate validity → revise if needed
+                  → verify resolution + test regressions → select/retain/pause
+```
+
+The first challenge sees the relevant mandate, evidence, rubric, and target artifact, not the producer's conversational history. It must still receive necessary technical context. Later rebuttal is visible to the adjudicator. High-severity disputed validity or closure requires another qualified role or the Principal when no credible independent check is available.
+
+The reviewer is not rewarded for raw issue count. The producer is not rewarded for mechanically accepting all edits. A successfully rebutted objection is a corrected review, not automatically an improved manuscript.
+
+## 7. Progress and compute policy
+
+Maintain two separate records:
+
+- **Artifact progress:** verified improvement to an accepted deliverable while preserving essential requirements and passing regression checks.
+- **Information progress:** new, supported information that materially changes a decision or exposes a risk, even when it makes the current artifact look worse.
+
+Neither activity volume, reviewer satisfaction, issue closure count, nor uncalibrated model confidence is the objective. Risk acceptance is not a repair. Deleting a difficult required claim does not count as progress unless the Principal authorizes a scope change or the replacement demonstrably still meets the approved mission.
+
+The Progress Controller allocates renewable compute tranches across a portfolio of justified actions: targeted retrieval, counterexample search, alternative construction, synthesis, repair, verification, or comparison. It tracks elapsed time, observed capacity, review/integration backlog, cost, verified outcomes, coverage, regressions, and uncertainty. Valuable alternatives can survive without immediately beating the incumbent. When evidence is missing, changing the wording repeatedly is not a substitute for obtaining evidence.
+
+Each wall-clock checkpoint records the current admissible artifact or its absence, verified artifact and information changes, unchanged state, blockers, and the next allocation. A long investigation may continue across checkpoints with a supported reassessment horizon. Stagnation triggers diagnosis and redirection; it cannot be erased by new task IDs or lease renewal. The system guarantees truthful accounting, not discovery on demand.
+
+Hard capability, capacity, expenditure, and explicit mission limits coexist with generous allocation. Window exhaustion triggers allocation review and may renew automatically under existing delegation. Missing evidence, unresolved authority, repeated unsupported continuation, or exhausted hard limits can pause affected work. Satisfying the mission's completion policy stops discretionary work; available GPUs are not a reason to perpetuate a completed mission.
+
+## 8. Core entities and versioning
+
+Core control entities: `Project`, `PrincipalIntent`, `Mission`, `Score`, `ResourcePolicy`, `AllocationWindow`, `Task`, `TaskAttempt`, `EditGrant`, `ContextPackage`, `Message`, `Event`, `GateResult`, `HumanApproval`, `Release`.
+
+Research/quality entities are immutable artifact types: `ResultsPackage`, `SearchCampaign`, `QueryRecord`, `DiscoveryRecord`, `ReferenceCard`, `SourceCapture`, `EvidenceRecord`, `CoverageReport`, `Claim`, `Critique`, `Response`, `Adjudication`, `Verification`, `ReviewCoverage`, `ProgressRecord`, `SupervisionDecision`, `ProgressCheckpoint`, and ordinary drafts/reports. Their status histories are event projections. A separate `Issue` identity tracks a defect across target revisions. The activity graph and candidate frontier are projections over these records, not additional independent stores.
+
+Every substantive artifact is immutable, version-pinned, owned, hashed, and linked to inputs. An `ArtifactRef` identifies both a logical artifact and its exact version. A release pins all included artifacts and the approval/evaluation conditions under which they were accepted. Dependency changes invalidate affected acceptance decisions without deleting earlier evidence.
+
+Structured deliverables additionally use `ContentUnit`, `DocumentManifest`, `ChangeRequest`, and `ChangeSet` as ArtifactVersion types. Their exact contracts are in `45-artifact-change-control.md`. Each unit's purpose, claim/evidence links, revision history, and review coverage remain inspectable. New whole-document candidates cannot evade edit grants by changing artifact IDs, replacing a parent, or modifying shared macros and references.
+
+## 9. v1 scope and non-goals
+
+**Included:** per-project organization/environment/capabilities; on-demand practical operations; delegated project-local program installation/build/connection and execution; supplied-results ingestion; organization-wide task-scoped web discovery; active API/tool-backed search campaigns; multilingual/source-class search where configured; source acquisition; reference normalization; evidence promotion and mapping; method/argument critique; writing; stable paragraph/structure management; purpose-scoped changes and independent integration; rendering; human approval; bounded event-driven rework; durable storage; recovery; and progress/cost measurement.
+
+**Excluded:** new experimental execution, new statistical estimation, installation/execution outside project delegation, external submission/publication, self-modification of governing intent, implicit cross-project private context, and polished UI. Authorized source extraction, conversion, validation, API/MCP operation, and document compilation are permitted. Actual program use does not expand the scientific mission into unapproved analysis.
+
+A raw dataset without interpretable, supplied results is insufficient for a final paper in v1. Return an intake-gap report rather than silently performing analysis or fabricating results.
+
+## 10. Open configuration and working defaults
+
+| Item | Current disposition |
+|---|---|
+| Q1 harness | D9 retained; D19 gives a proposed transactional implementation |
+| Q2 deliverable | English LaTeX source + PDF, with evidence/review archive |
+| Q3 retrieval providers | Web Intelligence Fabric contract fixed; exact search/index/full-text/patent/standards/code/dataset providers, credentials, source rights, robots/terms constraints, and outbound-data policy remain project configuration |
+| Q4 models/resources | Capable role profiles and plentiful external inference are the default direction. Endpoints, measured capacity, data policy, finite leases, and metered limits remain deployment configuration. Authorized capacity windows renew automatically; missing authorization blocks dispatch |
+| Q5 human checkpoints | Faithful explicit instructions can activate intent/mission. Internal plans and outlines advance within delegation; an optional mission policy may require outline approval. Final release, material goal/trade-off changes, and out-of-mandate actions require the Principal |
+| Review independence | Separate role/context mandatory; additional model/provider optional and subject to data permission. No cloud fallback without authorization |
+| First evaluation dataset | Must be defined and frozen before claiming improved quality or scaling benefit |
+
+These defaults make the blueprint internally concrete; they do not falsely mark the user's outstanding provider/budget choices as decided. Project configuration must resolve them before the corresponding live operation.
+
+## 11. Document map and change log
+
+| File | Responsibility |
+|---|---|
+| `00-SSOT.md` | Intent, authority, decisions, concepts, and scope |
+| `05-system-concept.md` | Organizing model, compute-rich supervision, anytime progress, and research rationale |
+| `15-project-organization.md` | Project instances, case-activated Operations Cell, tool environments, real execution evidence, and isolation |
+| `20-architecture-v0.md` | Organization, event-driven execution, evidence, storage, gates, and operational policies |
+| `30-roadmap.md` | Phases, acceptance tests, evaluation plan, and implementation priorities |
+| `40-execution-contract.md` | Exact identifiers, lifecycle rules, schema field contracts, and Score semantics |
+| `45-artifact-change-control.md` | Stable structural units, references, surgical revision, edit grants, and verified integration |
+| `50-web-intelligence-integration.md` | Active retrieval, API/plugin adapters, capability state, and evidence-to-change routing |
+| `web-search-campaign.yaml` | Illustrative search campaign; not a working runtime |
 
 | Version | Content |
 |---|---|
-| v0.1 | Initial draft: multi-department concept fixed, decisions D1–D8, glossary, open questions Q1–Q5 (written in Korean) |
-| v0.2 | Q1·Q2 decided: D9 hybrid harness, D10 LaTeX-rendered deliverable |
-| v0.3 | D11 language policy: paper written & rendered in English by default |
-| v0.4 | D12: unify all development artifacts in English — design docs translated to English |
+| v0.1 | Original D1–D8 and initial organization |
+| v0.2 | D9 hybrid harness and D10 rendered deliverable |
+| v0.3 | D11 paper language |
+| v0.4 | D12 English-first development |
+| v0.5 | D13–D21; Principal-aligned command; four departments; adversarial protocol; evidence-level traceability; verified progress; durable execution contracts; phased evaluation |
+| v0.6 | D22–D24; organization-wide Web Intelligence Fabric; specialized Research retrieval roles; independent adversarial search; coverage-oriented search campaigns and discovery→evidence promotion |
+| v0.7 | D25–D30; compute-rich activity graph; renewable capacity; rational supervision; provisional exploration; elapsed-time checkpoints; adaptation in the first implementation |
+| v0.8 | D31–D36; surgical revision; paragraph/structure/reference versioning; scoped grants and atomic integration; active API/plugin intelligence; per-project organization and on-demand practical operations |

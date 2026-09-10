@@ -1,0 +1,103 @@
+# Illustrative v0.8 campaign template. Runtime bindings are unresolved.
+schema_version: '0.8'
+status: illustrative_not_executed
+project_id: runtime_required
+campaign:
+  campaign_id: SC-NOVELTY-001
+  generation: 1
+  status: proposed
+  owner:
+    dept: research
+    role: search_strategist
+  objective: Test whether the proposed contribution has material prior-work collisions and map the strongest counterevidence.
+  governing_refs:
+    mission_ref: mission:M-001@1
+    claim_refs:
+    - artifact:strategy/claims/C-NOVELTY-01@1
+  concept_decomposition:
+  - claimed mechanism
+  - equivalent functional outcome
+  - historical terminology
+  - adjacent-field terminology
+  query_families:
+  - id: QF-exact
+    purpose: direct terminology and mechanism search
+    polarity: neutral
+  - id: QF-synonym
+    purpose: synonyms and historical terminology
+    polarity: neutral
+  - id: QF-adjacent
+    purpose: adjacent disciplines and equivalent mechanisms
+    polarity: neutral
+  - id: QF-counter
+    purpose: find prior art or counterexamples that falsify or narrow novelty
+    polarity: adversarial
+  source_classes:
+  - scholarly_primary
+  - scholarly_synthesis
+  - patent
+  - technical_repository
+  - official_institutional
+  languages:
+  - en
+  - ko
+  date_bounds:
+    policy_ref: runtime_required
+  chasing:
+    backward_citations: true
+    forward_citations: true
+    authors_labs_projects: true
+    depth_policy: reassess_at_frontier
+    per_call_limits_ref: runtime_required
+  coverage_targets:
+    require_counterevidence_route: true
+    require_known_gap_report: true
+    result_count_is_not_completion: true
+  resource_binding:
+    policy_ref: runtime_required
+    allocation_window_ref: runtime_required
+    per_attempt_reservation: finite_before_dispatch
+    renewal: automatic_within_delegation
+    continuation_requires: coverage_gap_and_expected_decision_value
+    hard_provider_limits: inherited_from_resource_policy
+    preserve_cumulative_usage: true
+  capability_bindings:
+    scholarly_search: runtime_required
+    general_web_search: runtime_required
+    source_capture: runtime_required
+    citation_neighbors: runtime_required
+  evidence_impact_policy:
+    pin_source_versions: true
+    identify_affected_claims_and_units: true
+    manuscript_mutation: scoped_change_request_only
+  allowed_stop_reasons:
+  - coverage_met
+  - diminishing_return
+  - budget_exhausted
+  - access_blocked
+  - needs_human_scope
+adversarial_branch:
+  required: true
+  independently_planned: true
+  reviewer_role: research.adversary
+  may_reuse_discoveries: true
+  producer_query_families_are_not_binding: true
+  independent_reservation_ref: runtime_required
+  reservation_owner: research.adversary
+promotion_policy:
+  discovery_is_evidence: false
+  require_reference_identity: true
+  require_source_capture: true
+  require_claim_relation_verification: true
+  scientific_evidence_owner: research
+expected_records:
+- SearchCampaign
+- QueryRecord
+- DiscoveryRecord
+- ReferenceCard
+- SourceCapture
+- EvidenceRecord
+- CoverageReport
+- SupervisionDecision
+- ProgressCheckpoint
+- ChangeRequest
