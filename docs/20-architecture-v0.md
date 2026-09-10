@@ -1,90 +1,95 @@
-# Sci-saurus — v1 아키텍처 구체화 (Architecture v0)
+# Sci-saurus — v1 Architecture (Architecture v0)
 
-> 이 문서는 `00-SSOT.md`의 결정(D1~D8)을 **구현 가능한 수준으로 구체화**한다. 근거 배경은 `10-survey-precursors.md` 참조.
+> This document concretizes the decisions (D1–D12) of `00-SSOT.md` to an implementable level. Design background is in `10-survey-precursors.md`.
 
 ---
 
-## 1. 전체 구성도
+## 1. Overall Composition
 
 ```
-                         ┌───────────────────────────────────────────────┐
-                         │                Composer (지휘자)               │
-                         │  브리프→미션 변환 · 부서 지휘 · 중재 · 릴리스 선언 │
-                         └──────┬────────────────┬───────────────┬───────┘
-                     악보(score)│                │중재/게이트      │태그/릴리스
-        ┌──────────────────────▼───┐   ┌────────▼──────┐   ┌────▼──────────────┐
-        │          조사부           │   │     전략부     │   │       편집실       │
-        │  조사부장 (chief)          │   │  전략부장      │   │  편집장            │
-        │  ├─ 문헌 스카우트          │   │  ├─ 스토리라인 │   │  ├─ 포맷 편집자     │
-        │  ├─ 계보/동향 분석가        │◀─▶│  │   건축가    │◀─▶│  ├─ 구조 편집자     │
-        │  ├─ 사서 (카탈로거)        │◀─▶│  ├─ 타당성     │◀─▶│  └─ 정확성 QA      │
-        │  └─ 검증관                │   │  │   심사관     │   │                   │
-        │                          │   │  ├─ 플래너     │   │                   │
-        │                          │   │  └─ 집필가     │   │                   │
-        └────────────┬─────────────┘   └───────┬───────┘   └─────────┬─────────┘
-                     │        모두 아래를 공유·기록함 (블랙보드 읽기 공통)        │
-                     └────────────────┬────────┴─────────────────────┘
-                                      ▼
-              ┌────────────────────────────────────┐     ┌───────────────────────────┐
-              │   블랙보드 = 프로젝트 워크스페이스      │     │   기록부 (Archivist)       │
-              │   kb/ · strategy/ · draft/ · ...    │◀───▶│   불변 저장 · 원장 · 릴리스  │
-              └────────────────────────────────────┘     └───────────────────────────┘
+                    ┌───────────────────────────────────────────────┐
+                    │                Composer (conductor)           │
+                    │  brief→mission · conducting · arbitration ·   │
+                    │  release declaration                          │
+                    └──────┬────────────────┬───────────────┬───────┘
+                 score     │                │ gates/arbitration
+        ┌──────────────────▼───┐   ┌────────▼──────┐   ┌────▼──────────────┐
+        │  Research &          │   │   Strategy &  │   │  Editorial Office │
+        │  Intelligence (Dept) │   │   Writing     │   │                   │
+        │  Research Chief      │   │  Strategy     │   │  Editor-in-Chief  │
+        │  ├─ Literature Scout │   │  Chief        │   │  ├─ Format Editor │
+        │  ├─ Genealogy &      │◀─▶│  ├─ Narrative │◀─▶│  ├─ Structural    │
+        │  │  Trend Analyst    │◀─▶│  │  Architect │◀─▶│  │  Editor        │
+        │  ├─ Cataloger        │   │  ├─ Feas. Red │   │  └─ Consistency   │
+        │  └─ Fact Verifier    │   │  │  Team      │   │     QA            │
+        │                      │   │  ├─ Planner   │   │                   │
+        │                      │   │  └─ Section   │   │                   │
+        │                      │   │     Writers   │   │                   │
+        └──────────┬───────────┘   └───────┬───────┘   └─────────┬─────────┘
+                   │   all share and record through the layers below      │
+                   └────────────────┬────────┴─────────────────────┘
+                                    ▼
+            ┌────────────────────────────────────┐     ┌───────────────────────────┐
+            │  Blackboard = project workspace    │     │  Archivist (cross-cutting)│
+            │  kb/ · strategy/ · draft/ · ...    │◀───▶│  immutable store · ledger │
+            │                                    │     │  · releases               │
+            └────────────────────────────────────┘     └───────────────────────────┘
 ```
 
-## 2. 구성요소 명세
+## 2. Component Specifications
 
-### 2.1 Composer (지휘자)
-| 항목 | 내용 |
+### 2.1 Composer (conductor)
+| Item | Content |
 |---|---|
-| 책임 | 브리프 파싱 → 미션 발행, 악보 로딩, 부서 태스크 배분, 게이트 판정 집행, 부서 간 분쟁 중재, 릴리스 선언, 사용자 질의 응답 |
-| 입/출력 | 입력: 브리프·부서 보고·게이트 결과 / 출력: 미션, 태스크, 결정, 릴리스 |
-| 권한 | 블랙보드 전체 **읽기**, `releases/*` **쓰기**, 다른 디렉터리는 아티팩트 생성 권한 없음(태그·포인터만) |
-| 원칙 | Composer는 **지식을 생산하지 않고** 지식의 흐름을 지휘한다. 판단은 항상 근거 아티팩트를 참조 |
+| Duties | Parse brief → publish mission, load score, assign department tasks, enforce gates, arbitrate disputes, declare releases, answer user queries |
+| In/Out | In: brief, department reports, gate results / Out: missions, tasks, decisions, releases |
+| Permissions | Blackboard **read-all**; **write** only `releases/*`; no artifact creation elsewhere (tags/pointers only) |
+| Principle | The Composer **does not produce knowledge**; it conducts the flow of knowledge. Every verdict cites evidence artifacts |
 
-### 2.2 조사부 (Research & Intelligence) — 범용 조직 기능: "세계를 조사해 체계화한다"
-| 에이전트 | 책임 | 산출물 |
+### 2.2 Research & Intelligence — general function: "survey the world and systematize it"
+| Agent | Duty | Outputs |
 |---|---|---|
-| 조사부장 (chief) | 조사 요구 분해, 우선순위, 통합·품질 판정, 타 부서 요청 접수 | 조사 계획, 조사 보고서 |
-| 문헌 스카우트 (scout) | 웹/학술 검색 실행, 후보 선별 | 후보 레퍼런스 묶음(원시) |
-| 계보/동향 분석가 (genealogist) | 인용 네트워크·학파 계보·연표·연구 갭 매핑 | 계보 맵, 갭 노트 |
-| 사서 (cataloger) | 레퍼런스 메타데이터 정규화·중복 제거·KB 인덱싱·스냅샷 생성 | 레퍼런스 카드, KB 스냅샷 |
-| 검증관 (verifier) | 출처 대조, 주장-근거 대응 확인, 모순 탐지 | 검증 리포트 |
+| Research Chief (chief) | Decompose survey needs, prioritize, integrate & judge quality, receive cross-dept requests | Survey plan, survey report |
+| Literature Scout (scout) | Run web/academic searches, shortlist candidates | Raw reference bundles |
+| Genealogy & Trend Analyst (genealogist) | Citation networks, school genealogy, timeline, research-gap mapping | Genealogy map, gap notes |
+| Cataloger (librarian) | Normalize reference metadata, dedupe, index the KB, produce snapshots | Reference cards, KB snapshots |
+| Fact Verifier (verifier) | Cross-check sources, claim–evidence correspondence, contradiction detection | Verification report |
 
-- 범용성 원칙: 도구 목록(웹검색, arXiv, S2, 로컬 파일 등)은 미션별로 주입. "논문 조사"가 아니라 "미션에 필요한 조사"를 수행.
-- 산출물의 핵심은 **KB 스냅샷**(`kb/snapshots/`): 조사 시점의 지식베이스 고정본 → 이후 전략부·편집실이 이 스냅샷을 근거로 참조(재현성).
+- Generality principle: tool lists (web search, arXiv, S2, local files, …) are injected per mission. The dept performs "the survey the mission needs" — not "paper research".
+- The key output is the **KB snapshot** (`kb/snapshots/`): a frozen view of the knowledge base at survey time → Strategy and Editorial cite this snapshot as evidence (reproducibility).
 
-### 2.3 전략부 (Strategy & Writing) — 범용 조직 기능: "목적 달성을 위한 논리·스토리·집필"
-| 에이전트 | 책임 | 산출물 |
+### 2.3 Strategy & Writing — general function: "turn research data into goal-achieving logic, story, and text"
+| Agent | Duty | Outputs |
 |---|---|---|
-| 전략부장 (chief) | 전략 수립 총괄, 집필 배분, 품질 판정 | 전략 브리핑 |
-| 스토리라인 건축가 (narrative architect) | KB 기반 기여 포지셔닝, 논지 골격(claim→evidence 체인) | 스토리라인 문서 |
-| 타당성 심사관 (red team) | 주장-근거 연결 공격, 반례 탐색, 약점 리포트 | 타당성 보고서 |
-| 플래너 (planner) | 아웃라인·섹션 명세·작업 분해 | 아웃라인 |
-| 집필가 (writer ×N) | 섹션별 초고 집필(병렬), 인용 삽입 | 섹션 드래프트 |
+| Strategy Chief (chief) | Owns strategy, allocates writing, judges quality | Strategy briefing |
+| Narrative Architect | Contribution positioning against the KB, argument skeleton (claim→evidence chains) | Storyline document |
+| Feasibility Red Team | Attacks claim–evidence links, hunts counterexamples, weakness report | Feasibility report |
+| Planner | Outline, section specs, work decomposition | Outline |
+| Section Writers (×N) | Write section drafts in parallel, insert citations from the KB only | Section drafts |
 
-### 2.4 편집실 (Editorial Office) — 범용 조직 기능: "산출물을 출판 가능 수준으로 검증·다듬는다"
-| 에이전트 | 책임 | 산출물 |
+### 2.4 Editorial Office — general function: "review and polish outputs to publishable quality"
+| Agent | Duty | Outputs |
 |---|---|---|
-| 편집장 (chief) | 최종 판정, 편집 정책, 루프 종료 선언 | 판정서 |
-| 포맷 편집자 (format) | venue LaTeX 템플릿(.cls/.sty)·인용 스타일(bib) 관리, 메타데이터 규격 | 포맷 보고서 |
-| 구조 편집자 (structure) | 섹션 논리·흐름·중복·심미 구조 | 구조 리뷰 |
-| 정확성 QA (consistency) | 용어·수치·인용·참조 일관성 교차 검증 | QA 리포트 |
+| Editor-in-Chief (chief) | Final verdict, editorial policy, loop termination | Verdict note |
+| Format Editor | Venue LaTeX templates (.cls/.sty), citation styles (bib), metadata conformance | Format report |
+| Structural Editor | Section logic, flow, duplication, aesthetic structure | Structural review |
+| Consistency QA | Cross-checks terminology, numbers, citations, references | QA report |
 
-### 2.5 기록부 (Archivist) — 횡단 서비스 (부서 아님)
-- 저장 엔진: 아티팩트 불변 저장(콘텐츠 어드레싱), git 커밋/태그.
-- 원장: 모든 이벤트 append-only 기록(JSONL).
-- 릴리스: 마일스톤 스냅샷 + 변경 요약 + 근거 인덱스.
-- 감사: "누가·언제·무엇을·무엇을 근거로" 재구성 가능.
+### 2.5 Archivist — cross-cutting service (not a department)
+- Storage engine: immutable artifact store (content-addressed), git commits/tags.
+- Ledger: append-only recording of all events (JSONL).
+- Releases: milestone snapshots + change summaries + evidence index.
+- Audit: "who · when · what · based on what" is reconstructable at any time.
 
-## 3. 통신 3계층 (D3의 구현)
+## 3. Communication — 3 Layers (implements D3)
 
-| 계층 | 역할 | 규칙 |
+| Layer | Role | Rules |
 |---|---|---|
-| **1. 블랙보드** (공유 파일) | 데이터·산출물의 공유 | 모두 읽기 가능. 쓰기는 소유 부서만(§7 권한 매트릭스). 직접 파일 주고받기 금지(아티팩트 참조로 전달) |
-| **2. 메시지 버스** (봉투 JSONL 큐) | 의견·요청·검토·이의제기의 비동기 교환 | 모든 부서 ↔ 모든 부서 가능(부장 경유 우선, 긴급 시 직접). 전부 원장에 기록 |
-| **3. 중재** (Composer) | 교착·분쟁·예산·게이트 이의 | 부장 간 미해결 시 이의제기 → Composer가 근거 기반 결정(`decision` 메시지) |
+| **1. Blackboard** (shared files) | Sharing of data & outputs | Readable by all. Write only for the owning department (§7 permission matrix). Direct file handoff is forbidden — pass artifact references |
+| **2. Message bus** (envelope JSONL queues) | Async exchange of opinions, requests, reviews, objections | Any dept ↔ any dept (chief-routed preferred; direct when urgent). All recorded in the ledger |
+| **3. Arbitration** (Composer) | Deadlock, disputes, budget, gate appeals | Unresolved chief-to-chief → escalation → Composer issues an evidence-based `decision` message |
 
-### 메시지 봉투 스키마 (v0)
+### Message envelope schema (v0)
 ```json
 {
   "msg_id": "m-0007",
@@ -92,8 +97,8 @@
   "from": { "dept": "editorial", "agent": "structure" },
   "to":   { "dept": "strategy",  "agent": "chief" },
   "project": "p-001",
-  "subject": "S2에서 S4 결과를 먼저 인용 — 논리 순환",
-  "body": "…구체 근거…",
+  "subject": "S2 cites S4's result before it exists — circular logic",
+  "body": "…concrete evidence…",
   "refs": ["artifact:draft/section-2@3", "artifact:editorial/reviews/r-002@1"],
   "action": { "kind": "revise", "payload": { "sections": ["section-2"] } },
   "created_at": "2025-09-10T00:00:00Z",
@@ -101,34 +106,34 @@
   "expires_at": null
 }
 ```
-설계 노트: `type/from/to/refs/action` 필드 구성은 A2A의 Task/Message 개념과 호환되게 잡음 → v2에서 A2A 어댑터로 전환 용이.
+Design note: `type/from/to/refs/action` field composition mirrors A2A's Task/Message concepts → cheap A2A adapter migration in v2. Message bodies are **English by default** (D12), score-configurable.
 
-## 4. 저장 계층 (D5의 구현)
+## 4. Storage Layer (implements D5)
 
-### 4.1 프로젝트 저장소 레이아웃
+### 4.1 Project repository layout
 ```
 projects/<project_id>/
-  brief.md                       # 사용자 원 입력 (불변)
-  mission.json                   # Composer 미션 (불변 버전 관리 대상)
-  org/manifest.json              # 이 프로젝트의 부서/에이전트/모델 배치
+  brief.md                       # user's verbatim input (immutable)
+  mission.json                   # Composer mission (versioned)
+  org/manifest.json              # departments/agents/model placement for this project
   kb/
-    references/                  # 레퍼런스 카드 (개별 md + json 메타)
-    notes/                       # 조사 노트, 계보 맵, 갭 노트
-    snapshots/                   # KB 스냅샷 (조사 시점 고정)
+    references/                  # reference cards (per-item md + json metadata)
+    notes/                       # survey notes, genealogy maps, gap notes
+    snapshots/                   # KB snapshots (frozen at survey time)
   strategy/
     storyline.md
-    feasibility/                 # 타당성 보고서
+    feasibility/                 # feasibility reports
     outline.md
-    sections/                    # 섹션 드래프트
+    sections/                    # section drafts
   editorial/
-    reviews/                     # 리뷰 문서
-    reports/                     # 포맷/QA 보고서
-  releases/                      # 릴리스 노트
-  ledger/events.jsonl            # 원장 (append-only)
+    reviews/                     # review documents
+    reports/                     # format/QA reports
+  releases/                      # release notes
+  ledger/events.jsonl            # ledger (append-only)
 ```
-- 전체 폴더 = git 저장소. **아티팩트 버전 확정 = 커밋**, **릴리스 = 태그(annotated)**. 큰 파일은 v2에서 DVC 슬롯.
+- The whole folder = a git repository. **Commit = artifact version finalized**, **tag = release (annotated)**. Large files: DVC slot in v2.
 
-### 4.2 아티팩트 frontmatter (YAML)
+### 4.2 Artifact frontmatter (YAML)
 ```yaml
 id: strategy/sections/section-2
 type: section_draft        # note|reference_card|kb_snapshot|storyline|feasibility_report|outline|section_draft|review|qa_report|decision_note|release_note
@@ -136,13 +141,13 @@ version: 3
 parents: ["strategy/sections/section-2@2"]
 author: { dept: strategy, agent: writer-1 }
 status: draft              # draft | proposed | approved | superseded | rejected
-inputs: ["kb/snapshots/kb-001@1", "strategy/outline@2"]   # 근거(데이터 계보)
+inputs: ["kb/snapshots/kb-001@1", "strategy/outline@2"]   # evidence (data genealogy)
 refs: ["arxiv:2411.00816", "doi:10.48550/arXiv.2411.00816"]
 created_at: "2025-09-10T03:21:00Z"
 checksum: "sha256:…"
 ```
 
-### 4.3 원장 이벤트 (JSONL, append-only)
+### 4.3 Ledger events (JSONL, append-only)
 ```json
 {"seq": 42, "ts": "…", "project": "p-001",
  "actor": {"dept": "editorial", "agent": "structure"},
@@ -150,91 +155,90 @@ checksum: "sha256:…"
  "payload": {"artifact": "editorial/reviews/r-002", "version": 1, "checksum": "sha256:…"},
  "refs": ["msg:m-0007"]}
 ```
-이벤트 종류(초기 세트): `project.created`, `mission.published`, `task.assigned`, `message.sent`, `artifact.created`, `gate.checked`, `gate.failed`, `arbitration.decided`, `release.tagged`.
+Initial event set: `project.created`, `mission.published`, `task.assigned`, `message.sent`, `artifact.created`, `gate.checked`, `gate.failed`, `arbitration.decided`, `release.tagged`.
 
-### 4.4 버전 규칙
-1. 동일 `id` 재저장 시 항상 `version+1`, 본문은 불변(부모 링크로 계보 추적).
-2. 동시 편집 → 각자 분기 버전 생성 → 병합/채택은 소유 부서 부장(또는 Composer)이 `superseded` 표시로 결정.
-3. 릴리스 태그: `v0.1-brief`, `v0.2-survey`, `v0.3-outline`, `v0.4-draft`, `v0.5-edited`, `v1.0-final`.
+### 4.4 Versioning rules
+1. Storing the same `id` again always yields `version+1`; bodies are immutable (genealogy via parent links).
+2. Concurrent edits → each branch version is created; merge/adoption is decided by the owning department's chief (or Composer) via `superseded` marking.
+3. Release tags: `v0.1-brief`, `v0.2-survey`, `v0.3-outline`, `v0.4-draft`, `v0.5-edited`, `v1.0-final`.
 
-## 5. 논문 악보 v0 (`scores/paper.yaml`) — 파이프라인
+## 5. The `paper` Score v0 — Pipeline
 
-| 단계 | 주관 | 내용 | 산출물 | 게이트 |
+| Stage | Owner | Content | Outputs | Gate |
 |---|---|---|---|---|
-| **S0 브리프 수접** | Composer | 브리프 파싱 → 미션·성공기준·산출물 명세 | `mission.json` | G0 미션 검토 |
-| **S1 조사** | 조사부 | 스카우트→계보/동향→사서 정규화→검증관 QA | KB 스냅샷 + 조사 보고서 | **G1** 출처 무결성 |
-| **S2 스토리라인** | 전략부 | KB 기반 포지셔닝·논지 체인 → 레드팀 공격 → (부족 근거 시 조사부 재요청 루프) | 스토리라인 + 타당성 보고서 | **G3** 증거 정합 |
-| **S3 아웃라인** | 전략부(플래너) + 편집실(사전 구조 검토) | 섹션 명세·작업 분해 | 아웃라인 | **G5a** 사용자 승인 |
-| **S4 집필** | 전략부(집필가 ×N) | 섹션 병렬 집필, 인용은 KB 참조만 | 섹션 드래프트 | **G2** 인용-주장 정합 |
-| **S5 편집 루프** | 편집실 ↔ 전략부 | 리뷰→수정 반복(기본 상한 3회), 편집장 종료 판정 | 리뷰 + 수정본 | **G4** 포맷·구조 |
-| **S5.5 조립·렌더링** | 편집실(포맷) + 전략부 | 섹션 조립 → LaTeX 소스 생성 → 컴파일(pdflatex/xelatex) | `final.tex` + `final.pdf` | **G4b** 컴파일 성공·참조 오류 0 |
-| **S6 릴리스** | Composer + 기록부 | 최종 판정·릴리스 노트·태그 | `v1.0-final` (LaTeX 소스 + PDF) | **G5b** 사용자 최종 승인 |
+| **S0 Brief intake** | Composer | Parse brief → mission, success criteria, deliverable spec | `mission.json` | G0 mission review |
+| **S1 Survey** | Research & Intelligence | Scout → genealogy/trends → cataloger normalization → verifier QA | KB snapshot + survey report | **G1** source integrity |
+| **S2 Storyline** | Strategy & Writing | KB-based positioning & argument chains → red-team attack → (insufficient evidence → research re-request loop) | Storyline + feasibility report | **G3** evidence alignment |
+| **S3 Outline** | Strategy (Planner) + Editorial (early structural review) | Section specs, work decomposition | Outline | **G5a** user approval |
+| **S4 Writing** | Strategy (Section Writers ×N) | Parallel section writing; citations from KB only | Section drafts | **G2** citation–claim alignment |
+| **S5 Editorial loop** | Editorial ↔ Strategy | Review → revise, repeat (default cap 3); Editor-in-Chief terminates | Reviews + revised drafts | **G4** format & structure |
+| **S5.5 Assembly & rendering** | Editorial (Format) + Strategy | Assemble sections → generate LaTeX source → compile (pdflatex/xelatex) | `final.tex` + `final.pdf` | **G4b** compile success, zero reference errors |
+| **S6 Release** | Composer + Archivist | Final verdict, release note, tag | `v1.0-final` (LaTeX source + PDF) | **G5b** user final approval |
 
-### 품질 게이트 정의
-- **G1 (출처 무결성):** 모든 레퍼런스 카드에 식별자(DOI/arXiv id/URL)와 접근 메타 존재. 중복·미확인 항목 0.
-- **G2 (인용-주장 정합):** 드래프트 내 모든 인용이 KB 스냅샷에 존재하고, 주장과의 대응이 검증관/편집 QA를 통과.
-- **G3 (스토리라인-증거 정합):** 레드팀 리포트의 차단급 이슈 0 (있으면 재조사 루프).
-- **G4 (포맷·구조):** 템플릿 규격·인용 스타일·구조 리뷰 통과.
-- **G4b (렌더링):** LaTeX 컴파일 성공, 참조/인용 오류 0, PDF 산출 확인.
-- **G5 (휴먼 게이트):** G5a 아웃라인 승인, G5b 최종 승인 (Q5 결정에 따라 조정).
+### Quality gate definitions
+- **G1 (source integrity):** every reference card carries an identifier (DOI/arXiv id/URL) and access metadata; zero duplicates, zero unverified items.
+- **G2 (citation–claim alignment):** every in-draft citation exists in the KB snapshot and passes verifier/consistency QA correspondence checks.
+- **G3 (storyline–evidence alignment):** zero blocking issues in the red-team report (otherwise research re-request loop).
+- **G4 (format & structure):** template conformance, citation style, structural review pass.
+- **G4b (rendering):** LaTeX compilation succeeds, zero reference/citation errors, PDF produced.
+- **G5 (human gates):** G5a outline approval, G5b final approval (per Q5).
 
-### 언어 정책 (D11)
-- 악보가 집필 언어를 지정한다. `paper` 악보 기본: **영어 집필·영어 렌더링**(브리프가 한국어여도 무관 — 조사부·전략부는 한국어로 내부 정리 가능하나, 인용 근거는 원문 언어 유지).
-- 편집실은 영어 학술 문체(academic register)를 검토 기준으로 한다.
-- 진행 문서·릴리스 요약은 한국어 병행. 한국어 논문 악보가 필요하면 악보 오버라이드(ko + kotex 컴파일 체인).
+### Language policy (D11/D12)
+- The score declares the writing language. `paper` score default: **English writing & rendering** (briefs may be Korean; internal notes may be Korean, citations keep source-language).
+- Editorial reviews against the **academic register** of the target language.
+- Release/progress summaries may be bilingual (Korean summary alongside). Korean-paper scores override with a kotex compile chain.
 
-### 자유 교환 실례 (D3의 체감용 시나리오)
-1. 전략부(레드팀) → 조사부: `request` "주장 A-3의 근거 부족 — 2023년 이후 반례 문헌 재조사 요청"
-2. 조사부(계보 분석가) → 전략부: `data` "신규 발견: X 계열 2024년 논문 2건, 기존 스토리라인과 충돌 가능" (선제 푸시)
-3. 편집실(구조) → 전략부: `critique` "S2→S4 논리 순환" (루프)
-4. 편집실(포맷) → 조사부(사서): `request` "인용 메타데이터 누락 3건 보강 요청"
-5. 미해결 시 → 각 부장 간 협의 → 실패 시 Composer `decision` (원장 기록)
+### Free-exchange scenarios (to make D3 tangible)
+1. Strategy (red team) → Research: `request` "claim A-3 lacks evidence — re-survey post-2023 counterexample literature"
+2. Research (genealogist) → Strategy: `data` "new finding: 2 papers in the X lineage, 2024 — may collide with the current storyline" (proactive push)
+3. Editorial (structural) → Strategy: `critique` "S2→S4 circular logic" (loop)
+4. Editorial (format) → Research (Cataloger): `request` "3 citations missing metadata — please complete"
+5. If unresolved → chief-to-chief negotiation → Composer `decision` (ledger-recorded)
 
-## 6. 에이전트 실행 추상 (프레임워크 무관 인터페이스)
+## 6. Agent Execution Abstraction (framework-agnostic interface)
 ```
 Agent:
   id, dept, role, tools[], model_profile
   run(task, inbox: [Message], blackboard: Store) -> { artifacts: [Artifact], messages: [Message] }
-Chief(Agent):    # 부장은 동일 인터페이스 + 분해/판정 권한
+Chief(Agent):    # same interface + decompose/verdict powers
 Arbiter(Composer):
   decide(dispute, evidence_refs) -> Message(type=decision)
 ```
-- 부서 실행기 어댑터: `LocalAgentRunner`(기본) / 이후 `LangGraphRunner`, `AutoGenRunner` 등 교체 가능.
+- Department runner adapters: `LocalAgentRunner` (default), later `LangGraphRunner`, `AutoGenRunner`, etc., all behind the same interface.
 
-## 7. 권한 매트릭스 (블랙보드 쓰기 권한)
+## 7. Permission Matrix (blackboard write permissions)
 
-| 경로 | 조사부 | 전략부 | 편집실 | Composer |
+| Path | Research | Strategy | Editorial | Composer |
 |---|---|---|---|---|
-| `kb/*` | **쓰기** | 읽기 | 읽기 | — |
-| `strategy/*` | 읽기(+요청) | **쓰기** | 리뷰(제안) | 태그 |
-| `draft/*`(sections) | 읽기 | **쓰기** | 리뷰 | 태그 |
-| `editorial/*` | 읽기 | 읽기 | **쓰기** | 태그 |
-| `releases/*` | 읽기 | 읽기 | 읽기 | **쓰기** |
-| `ledger/*` | — | — | — | append(기록부 대행) |
+| `kb/*` | **write** | read | read | — |
+| `strategy/*` | read (+requests) | **write** | review (proposals) | tag |
+| `draft/*` (sections) | read | **write** | review | tag |
+| `editorial/*` | read | read | **write** | tag |
+| `releases/*` | read | read | read | **write** |
+| `ledger/*` | — | — | — | append (via Archivist) |
 
-## 8. 실행 매핑 옵션 (Q1 근거자료)
+## 8. Execution Mapping Options (evidence for Q1/D9)
 
-| 옵션 | 설명 | 장점 | 단점 | 판단 |
+| Option | Description | Pros | Cons | Verdict |
 |---|---|---|---|---|
-| **A. 독립 Python 오케스트레이터** (권장) | 파일+JSONL 큐 기반 자체 코어, LLM API 직결 | 요구사항(버전·자유교환·악보)에 정확히 맞춤, 종속 최소, 디버깅 용이 | LLM 런타임 편의 기능은 자체 구현 | **v1 채택 권장** |
-| B. LangGraph 어댑터 | 각 부서를 서브그래프로, 체크포인트로 중단-재개 | 검증된 영속성, 휴먼게이트 내장 | 버스/블랙보드/버전관리는 별도 구현 필요 | v1.5 교체 옵션 |
-| C. AutoGen 0.4 어댑터 | actor 이벤트 모델로 부서 간 자유 교환 | 통신 계층 무료 상속 | 조직 은유·저장·게이트는 자체 레이어 | v1.5 교체 옵션 |
+| **A. Standalone Python orchestrator** (core) | File + JSONL queue-based native core, direct LLM API | Precisely fits our requirements (versioning, free exchange, scores); minimal deps; easy debugging | LLM runtime conveniences implemented ourselves | **v1 core** |
+| B. LangGraph runner adapter | Departments as subgraphs; checkpoints for interrupt–resume | Proven persistence, built-in human gates | Bus/blackboard/versioning still ours | v1.5 optional adapter |
+| C. AutoGen 0.4 runner adapter | Actor event model for free exchange | Free comms layer for free | Org metaphor, storage, gates still ours | v1.5 optional adapter |
 
-- 권장 경로: **A로 원칙(D1~D8) 검증 → 부서 실행기만 B/C 어댑터로 교체 가능하게 설계**(§6 인터페이스 유지).
-- 부록: 지금 사용 중인 DSH 하네스의 subagent/워크플로 기능으로 조직을 **데모 시뮬레이션**할 수 있으나, 제품 코어는 독립 런타임 권장(휴먼 세션과 제품 런타임의 분리).
+- Recommended path: **A validates principles (D1–D12) → swap department runners to B/C adapters where useful** (interface per §6).
 
-## 9. 보안·비용·운영 정책
+## 9. Security · Cost · Operations Policy
 
-1. **모델 라우팅:** 조사·정규화=경제 모델 / 스토리라인·집필·편집장=고성능 모델. 부서 매니페스트에서 프로젝트별 오버라이드.
-2. **비용 상한:** 프로젝트별 토큰/요금 예산. 초과 시 게이트 중단 → 사용자 알림.
-3. **루프 상한:** 편집 루프 3회, 재조사 루프 2회, 초과 시 중재.
-4. **비밀키:** 환경변수/로컬 시크릿 파일만. 원장에 키·개인정보 기록 금지.
-5. **웹 조사 로깅:** 모든 외부 조회의 URL·쿼리·시각을 KB 레퍼런스 카드에 남김(재현성).
-6. **투명성:** 최종 산출물에 AI 생성물 고지 + 기여 부서/에이전트 요약 포함.
+1. **Model routing:** survey & normalization = economical models / storyline, writing, Editor-in-Chief = high-capability models; per-project overrides in the manifest.
+2. **Cost caps:** per-project token/budget ceilings; overflow halts at the gate with a user notification.
+3. **Loop caps:** editorial loop 3, research re-request loop 2; beyond → arbitration.
+4. **Secrets:** environment variables / local secret files only; never recorded in the ledger.
+5. **Web-survey logging:** every external query's URL, query, and timestamp is recorded in reference cards (reproducibility).
+6. **Transparency:** final deliverables include an AI-generated-content notice + per-department/agent contribution summary.
 
-## 10. v2 확장 슬롯 (설계에 자리만 확보)
+## 10. v2 Expansion Slots (reserved in design)
 
-- **실험 실행:** `tasks/execute` 도구 + 트리 탐색(AI Scientist v2 참고), 샌드박스 실행 권한 게이트.
-- **리소스 자각:** 부팅 시 환경 인벤토리(CPU/GPU/도구/패키지) → `capabilities.json` 아티팩트. 조사부가 "가진 것"으로 조사 범위를 조정.
-- **도구 발굴:** 조사부가 오픈소스 도구 후보를 조사 → 전략부 타당성 → 설치/실행 게이트(사용자 승인) → 기록부에 도구 원장.
-- **외부 협업:** 부서를 A2A 에이전트로 노출, 도구는 MCP 연결.
+- **Experiment execution:** `tasks/execute` tool + tree search (per AI Scientist v2), sandboxed execution behind gates.
+- **Resource awareness:** boot-time environment inventory (CPU/GPU/tools/packages) → a `capabilities.json` artifact; Research adjusts survey scope to "what we have".
+- **Tool discovery:** Research surveys open-source tool candidates → Strategy feasibility → install/run gate (user approval) → tool ledger in the Archivist.
+- **External collaboration:** expose departments as A2A agents; connect tools via MCP.

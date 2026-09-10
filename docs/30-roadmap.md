@@ -1,86 +1,87 @@
-# Sci-saurus — 구현 로드맵 (Roadmap)
+# Sci-saurus — Implementation Roadmap
 
-> `00-SSOT.md` 파생 문서. 페이즈 완료조건은 SSOT의 결정(D1~D8)과 아키텍처(`20-architecture-v0.md`)를 준수함을 의미한다.
+> A derived document of `00-SSOT.md`. Phase completion means conformance to SSOT decisions (D1–D12) and the architecture (`20-architecture-v0.md`).
 
 ---
 
-## 1. 페이즈 개관
+## 1. Phase Overview
 
-| 페이즈 | 이름 | 산출물 | 완료조건 | 상태 |
+| Phase | Name | Outputs | Completion criteria | Status |
 |---|---|---|---|---|
-| **P0** | 설계 확정 | SSOT · survey · architecture · roadmap 4종 | 문서 승인(열린 질문 Q1~Q5 결정) | **본 세션 초안 완료** |
-| **P1** | 저장 코어 | `scisaurus` 파이썬 패키지: 프로젝트 스토어 + 원장 + CLI | 아티팩트 불변성·원장 append-only·릴리스 태그 테스트 통과 | 대기 |
-| **P2** | MVP 파이프라인 | 논문 악보 v0 실행(브리프→조사→스토리라인→아웃라인→드래프트) | 실제 브리프 1건으로 초고 + KB 스냅샷 + 컴파일 PDF(LaTeX) + 릴리스 산출 | 대기 |
-| **P3** | 자유 교환 완성 | 메시지 버스·이의제기/중재·편집 루프 캡·전체 감사 리포트 | 부서 간 크로스 리뷰 시나리오 3종 통과 | 대기 |
-| **P4** | 범용 확장 | 커스텀 악보 SDK · 리소스 자각 · 실험 실행 슬롯 · A2A/MCP 어댑터 | 논문 외 산출물 1종(예: 리포트) 악보 교체만으로 생성 | 대기 |
+| **P0** | Design freeze | SSOT · survey · architecture · roadmap (4 docs) | Docs approved (Q1–Q5 decided) | **Draft complete this session** |
+| **P1** | Storage core | `scisaurus` Python package: project store + ledger + CLI | Immutable artifacts, append-only ledger, release tags all pass tests | Pending |
+| **P2** | MVP pipeline | `paper` score v0 execution (brief → survey → storyline → outline → draft) | One real brief produces draft + KB snapshot + compiled PDF + release | Pending |
+| **P3** | Free exchange complete | Message bus, dispute/arbitration, editorial loop cap, full audit report | 3 cross-department review scenarios pass | Pending |
+| **P4** | General-purpose expansion | Custom score SDK · resource awareness · experiment-execution slot · A2A/MCP adapters | A non-paper deliverable (e.g., report) produced by swapping scores only | Pending |
 
-## 2. P1 — 저장 코어 상세 (다음 착수 대상)
+## 2. P1 — Storage Core Details (next target)
 
-### 2.1 디렉터리/모듈 계획
+### 2.1 Directory/module plan
 ```
 scisaurus/
   core/
-    schema.py        # dataclass + JSON 검증: Project, Mission, Task, Artifact, Message, Event
-    store.py         # 프로젝트 생성 / 아티팩트 쓰기(불변, version+1, parents) / 읽기 / HEAD / diff
-    ledger.py        # events.jsonl append-only / replay / project별 필터
-    release.py       # 마일스톤 스냅샷 + git 태그 + 릴리스 노트 생성
+    schema.py        # dataclasses + JSON validation: Project, Mission, Task, Artifact, Message, Event
+    store.py         # project create / artifact write (immutable, version+1, parents) / read / HEAD / diff
+    ledger.py        # events.jsonl append-only / replay / per-project filter
+    release.py       # milestone snapshot + git tag + release note generation
   org/
-    manifest.py      # 부서·에이전트 매니페스트 로더/검증
-    bus.py           # 메시지 큐(JSONL) 송수신 + 원장 기록
+    manifest.py      # department/agent manifest loader + validation
+    bus.py           # message queues (JSONL) send/receive + ledger recording
   agents/
-    base.py          # Agent 추상(run 인터페이스), LocalAgentRunner, 모델 라우팅
+    base.py          # Agent abstraction (run interface), LocalAgentRunner, model routing
   scores/
-    paper.yaml       # 논문 악보 v0 (P2에서 채움)
+    paper.yaml       # paper score v0 (filled in P2)
   cli.py             # scisaurus new|status|show|diff|release
   tests/
-    test_store.py    # 불변성·부모링크·동시분기
-    test_ledger.py   # append-only·replay 재현
-    test_bus.py      # 봉투 검증·기록
+    test_store.py    # immutability, parent links, concurrent branching
+    test_ledger.py   # append-only, replay reproduction
+    test_bus.py      # envelope validation, recording
 ```
 
-### 2.2 CLI (v0 스펙)
+### 2.2 CLI (v0 spec)
 ```bash
-scisaurus new <project_id> --brief brief.md       # 프로젝트 + 저장소 생성, 브리프 불변 저장
-scisaurus status <project_id>                     # 아티팩트 트리·게이트 상태·최근 원장
-scisaurus show <project_id> <artifact_id>[@ver]   # 아티팩트 열람(+provenance)
-scisaurus diff <project_id> <artifact_id> v1 v3   # 버전 비교
-scisaurus release <project_id> v0.2-survey        # 스냅샷 + 태그 + 릴리스 노트
-scisaurus run <project_id> --score paper          # (P2) 파이프라인 실행
+scisaurus new <project_id> --brief brief.md       # create project + repo, store brief immutably
+scisaurus status <project_id>                     # artifact tree, gate states, recent ledger
+scisaurus show <project_id> <artifact_id>[@ver]   # inspect artifact (+provenance)
+scisaurus diff <project_id> <artifact_id> v1 v3   # compare versions
+scisaurus release <project_id> v0.2-survey        # snapshot + tag + release note
+scisaurus run <project_id> --score paper          # (P2) run the pipeline
 ```
 
-### 2.3 P1 테스트 기준(완료조건)
-1. 같은 id 3회 저장 → 버전 3개, 본문 3개 모두 보존, parents 체인 정확.
-2. 원장 파일을 임의 편집 시도 → replay 검증으로 탐지(체크섬 체인).
-3. 릴리스 태그 → 스냅샷 재현 가능(동일 체크섬).
-4. 권한 매트릭스 위반 쓰기 → 거부(원장에 `gate.failed` 기록).
+### 2.3 P1 test criteria (completion conditions)
+1. 3 writes to the same id → 3 versions, all 3 bodies preserved, parent chain exact.
+2. Tampering with the ledger file → detected by replay verification (checksum chain).
+3. Release tag → snapshot reproducible (same checksums).
+4. Permission-matrix-violating writes → rejected (a `gate.failed` event recorded in the ledger).
 
-## 3. P2 — MVP 파이프라인 세부
+## 3. P2 — MVP Pipeline Details
 
-1. `scores/paper.yaml` 선언(§2 아키텍처의 S0~S6, 게이트 G0~G5b).
-2. 도구 어댑터: 웹검색 / arXiv / Semantic Scholar(선택) / 로컬 파일. 각 조회는 레퍼런스 카드 강제 생성.
-3. 조사부 실행: 스카우트(병렬 검색) → 계보 분석 → 사서 정규화 → 검증관 QA → **KB 스냅샷**.
-4. 전략부 실행: 스토리라인 → 레드팀 → (재조사 요청 루프) → 아웃라인 → 섹션 병렬 집필.
-5. 편집실 루프: 리뷰 → 수정 → 최대 3회 → 편집장 판정.
-6. 조립·렌더링: 섹션 → LaTeX 조립(포맷 편집자) → 컴파일(**G4b**) → PDF.
-7. 릴리스: `v1.0-final`(LaTeX 소스 + PDF) + 조사 아카이브 + 결정 요약.
+1. `scores/paper.yaml` declaration (stages S0–S6, gates G0–G5b per architecture §2/§5).
+2. Tool adapters: web search / arXiv / Semantic Scholar (optional) / local files. Every query must produce a reference card.
+3. Research execution: scout (parallel search) → genealogy analysis → cataloger normalization → verifier QA → **KB snapshot**.
+4. Strategy execution: storyline → red team → (research re-request loop) → outline → parallel section writing.
+5. Editorial loop: review → revise → max 3 rounds → Editor-in-Chief verdict.
+6. Assembly & rendering: sections → LaTeX assembly (Format Editor) → compile (**G4b**) → PDF.
+7. Release: `v1.0-final` (LaTeX source + PDF) + research archive + decision summary.
 
-## 4. 리스크 & 대응
+## 4. Risks & Mitigations
 
-| 리스크 | 영향 | 대응 | 근거 |
+| Risk | Impact | Mitigation | Precedent |
 |---|---|---|---|
-| 인용 환각 | 논문 신뢰성 붕괴 | 검증관 에이전트 + G1/G2 게이트(식별자 강제) | Deep Research 선례 |
-| 무한 리뷰 루프 | 비용·지연 | 루프 캡 3회 + 편집장 종료권 + 중재 | CycleResearcher 교훈 |
-| 비용 폭주 | 운영 | 부서별 모델 라우팅 + 프로젝트 예산 게이트 | — |
-| 부서 간 무질서 교류 | 품질·추적성 저하 | 봉투 스키마 강제 + 전면 원장 기록 + 권한 매트릭스 | 블랙보드 계열 교훈 |
-| 실행 상태 유실(중단) | 재시작 비용 | 원장 replay + git 체크포인트(계층 분리) | LangGraph 선례 |
-| 프레임워크 종속 | 확장 제약 | 부서 실행기 어댑터 인터페이스 고정 | SSOT D2/D6 |
-| 데이터 재현 불가 | 검증 불능 | KB 스냅샷 아티팩트화 + 조회 로그 | §5-E 선례 |
+| Citation hallucination | Paper credibility collapse | Fact Verifier + G1/G2 gates (mandatory identifiers) | Deep Research precedents |
+| Endless review loop | Cost & delay | Loop cap 3 + Editor-in-Chief termination + arbitration | CycleResearcher lesson |
+| Cost blowup | Operations | Per-department model routing + per-project budget gates | — |
+| Chaotic inter-department exchange | Quality & traceability loss | Enforced envelope schema + full ledger recording + permission matrix | Blackboard-family lessons |
+| Execution-state loss (interruption) | Restart cost | Ledger replay + git checkpoints (layer separation) | LangGraph precedent |
+| Framework lock-in | Expansion limits | Fixed runner-adapter interface | SSOT D2/D6/D9 |
+| Irreproducible data | Verification impossible | KB snapshots as artifacts + query logging | §5-E precedents |
 
-## 5. 즉시 착수 가능 작업 (결정 후 바로 실행)
+## 5. Immediate Next Actions (start right after decisions)
 
-- [x] Q1(하이브리드 하네스)·Q2(LaTeX 렌더링) 결정 반영 완료 — Q3~Q5 잔여
-- [ ] 사용자 문서 검토 의견 반영
-- [ ] `git init` + P1 스켈레톤 생성
-- [ ] `core/schema.py`, `core/store.py`, `core/ledger.py` 구현 + 테스트
-- [ ] `scores/paper.yaml` 초안 작성
-- [ ] 도구 어댑터 1종(웹검색) 검증 — 레퍼런스 카드 자동 생성 확인
+- [x] Q1 (hybrid harness) · Q2 (LaTeX rendering) decisions reflected
+- [x] D11/D12 language policy reflected — all development artifacts in English
+- [ ] User's document review feedback applied
+- [ ] P1 skeleton creation (git repo + package scaffolding)
+- [ ] Implement `core/schema.py`, `core/store.py`, `core/ledger.py` + tests
+- [ ] Draft `scores/paper.yaml`
+- [ ] Verify one tool adapter (web search) — automatic reference-card generation confirmed

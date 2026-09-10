@@ -1,108 +1,114 @@
-# Sci-saurus — 컨셉 SSOT (Single Source of Truth)
+# Sci-saurus — Concept SSOT (Single Source of Truth)
 
-> 이 문서가 Sci-saurus의 **유일한 진실 공급원**이다. 다른 문서(`10-`, `20-`, `30-`)는 모두 여기서 **파생**되며, 충돌 시 이 문서가 우선한다.
-> 규칙: (1) 컨셉·원칙·용어의 변경은 반드시 이 문서에서 먼저 이뤄진다. (2) 결정이 바뀌면 "결정 기록(D-x)"에 새 버전으로 추가하고 이전 결정을 삭제하지 않는다(기록은 누적).
+> This document is the **single source of truth** for Sci-saurus. All other documents (`10-`, `20-`, `30-`) are **derived** from it; on conflict, this document prevails.
+> Rules: (1) changes to concept/principles/terminology happen here first; (2) when a decision changes, a new versioned decision (D-x) is added — previous decisions are never deleted (records accumulate).
 
-문서 버전: v0.3 · 상태: 검토 대기 (Q1·Q2 결정 + D11 언어 정책 반영)
+Doc version: v0.4 · Status: under review (D9–D12 decisions applied; unified in English per D12)
 
 ---
 
-## 1. 한 줄 정의
+## 1. One-line Definition
 
-**Sci-saurus**는 "조사부 · 전략부 · 편집실"의 멀티부서 조직으로 구성된, **범용 연구생산 멀티에이전트 시스템**이다. 현재의 대표 업무는 *연구 데이터 + 간략한 스토리라인 → 선행연구 조사 → 논문 드래프트*이며, 모든 부서는 논문에 종속되지 않는 **범용 기능 단위**로 설계되어, Composer(지휘자)의 커스텀 설정만으로 어떤 생산 목적이든 수행한다. 모든 산출물·의사결정·부서 간 교류는 **프로젝트 단위로 철저하게 버전 관리·저장**된다.
+**Sci-saurus** is a general-purpose research-production multi-agent system organized as a **multi-department organization** — "Research & Intelligence · Strategy & Writing · Editorial Office". Its flagship task today is *research data + a rough storyline → prior-work survey → paper draft*, but every department is a **general-purpose functional unit** not bound to papers: with a Composer's custom "score", the organization can pursue any production goal. All artifacts, decisions, and inter-department exchanges are **rigorously version-controlled and archived per project**.
 
-## 2. 비전 로드맵 (Anything → Anything)
+## 2. Vision Roadmap (Anything → Anything)
 
-| 단계 | 능력 | 설명 |
+| Phase | Capability | Description |
 |---|---|---|
-| **Now (v1)** | 논문 저작 파이프라인 | 브리프(연구 데이터+스토리라인) → 조사부(선행연구·계보·동향) → 전략부(스토리라인·타당성·아웃라인) → 드래프트 → 편집실(포맷·구조) → 릴리스 |
-| **Next (v1.5)** | 범용 목적 전환 | Composer의 "악보(score)" 프리셋 교체로 리서치 리포트·제안서·리뷰 아티클 등 산출물 유형 변경. 부서 코드는 무수정 재사용 |
-| **Later (v2+)** | 자원 자각 & 실행 | 조사부가 내 컴퓨터·보유 리소스를 파악하고, 목적 달성에 필요한 오픈소스 도구를 스스로 탐색·설치·실행. 전략부가 실험 설계까지 확장. 궁극적으로 **anything → anything** |
-| **궁극 (v3)** | 자율 조직 운영 | 프로젝트 간 조직 재활용, 자기 성찰(retro)로 부서 내부 프로세스 개선, 외부 에이전트(A2A/MCP)와의 협업 |
+| **Now (v1)** | Paper-writing pipeline | Brief (research data + rough storyline) → Research & Intelligence (prior work · genealogy · trends) → Strategy (storyline · feasibility · outline) → draft → Editorial (format · structure) → release |
+| **Next (v1.5)** | General-purpose goal switching | Composer swaps "score" presets to change deliverable type (research report, proposal, review article…). Department code is reused without modification |
+| **Later (v2+)** | Resource awareness & execution | The organization discovers its own resources (this computer, available tools), finds, installs, and runs open-source tools needed for the goal. Strategy extends to experiment design. Ultimately **anything → anything** |
+| **Endgame (v3)** | Autonomous organization operation | Cross-project org reuse, self-retrospective process improvement, collaboration with external agents (A2A/MCP) |
 
-## 3. 핵심 결정 (Design Decisions — 합의된 사항)
+## 3. Core Decisions (Design Decisions — agreed)
 
-- **D1 — 멀티부서 조직 은유.** 시스템은 조직이다. 상설 부서: 조사부 / 전략부 / 편집실. 상설 횡단 조직: 기록부(버전관리·저장 전담). 상설 지휘: Composer.
-- **D2 — 부서는 범용 기능 단위다.** 조사부는 "논문 조사"가 아니라 *"주어진 목적에 대한 세계 조사"*를 한다. 논문은 조사부가 수행하는 수많은 미션 중 하나일 뿐이다. 전략부·편집실도 동일.
-- **D3 — 부서 간 자유 교환 + 전면 기록.** 어떤 부서든 언제든 다른 부서에 의견·데이터·요청·이의를 보낼 수 있다(비동기). 단, **모든 교류는 메시지 봉투로 기록**되며, 공유 데이터는 블랙보드(프로젝트 작업공간)를 통해서만 전달된다. 자유롭되, 추적 불가능한 교류는 없다.
-- **D4 — 부서 내부는 멀티에이전트.** 각 부서는 부장(chief) 1인 + 전문가 에이전트 다수로 구성되며, 부장이 업무 분해·품질 판정을, 전문가들이 실행을 맡는다.
-- **D5 — 프로젝트 단위 철저한 버전관리.** 프로젝트 = 하나의 저장소. 모든 산출물(아티팩트)은 **불변(immutable) 버전 + 근거(provenance: 누가, 언제, 무엇을 근거로)** 로 저장되고, 마일스톤마다 릴리스 태그가 붙는다. 덮어쓰기는 존재하지 않는다(새 버전만 존재).
-- **D6 — Composer는 교체 가능한 "악보(score)"로 목적을 정의한다.** 악보 = 산출물 유형별 파이프라인·품질 게이트·담당 부서 호출 순서의 선언적 정의. 기본 악보는 `paper`(학술 논문)이며, 사용자 정의 악보로 목적을 자유롭게 바꿀 수 있다.
-- **D7 — 최초 파이프라인(사용자 요구).** 입력: 어떤 연구의 데이터 + 간략한 스토리라인. 처리: 선행연구 조사 → 스토리라인 구체화·타당성 검토 → 아웃라인 → 드래프트 → 편집. 산출: 초고 + 조사 아카이브 + 결정 기록.
-- **D8 — 장기: 자원 자각형 조직.** 조사부/전략부는 실행 환경(로컬 컴퓨터, 사용 가능 도구, 오픈소스 생태계)을 자각하고, 목적 달성을 위해 도구를 발굴·조합·실행할 수 있어야 한다(선택적 권한, 게이트 아래).
-- **D9 — 하이브리드 실행 하네스.** 코어(저장·원장·메시지 버스·악보·게이트)는 독립 Python으로 자체 구현하되, 부서/에이전트 실행기는 어댑터 인터페이스 뒤로 분리해 LangGraph·AutoGen 등을 **부서별로 혼용**할 수 있게 한다(프레임워크는 전부 아니면 전도가 아니라 필요한 곳에만 도입).
-- **D10 — 최종 산출물은 렌더링 결과까지.** 논문 악보의 최종 산출물은 LaTeX 소스 + 컴파일 PDF. 편집실 포맷 편집자가 venue 템플릿(.cls/.sty)·인용 스타일을 관리하며, **컴파일 성공과 참조 오류 0**을 릴리스 게이트 조건에 포함한다.
-- **D11 — 언어 정책.** 최종 논문(집필·렌더링)은 **영어가 기본**이다. 브리프·내부 협업 문서·릴리스 요약은 한국어 가능(혼용 무방). 언어는 악보(score)에서 선언하며, 악보 오버라이드로 한국어 논문 등 다른 언어 출력도 가능하다(그 경우 컴파일 체인에 kotex 등 포함).
+- **D1 — Multi-department organization metaphor.** The system is an organization. Standing departments: Research & Intelligence / Strategy & Writing / Editorial Office. Standing cross-cutting organ: the Archivist (version control & storage). Standing conductor: the Composer.
+- **D2 — Departments are general-purpose functional units.** The Research department does not do "paper research"; it does *"survey of the world for a given goal"*. Papers are just one mission among many. Same for Strategy and Editorial.
+- **D3 — Free exchange between departments + full recording.** Any department may at any time send opinions, data, requests, or objections to any other (asynchronous). However, **every exchange is recorded as a message envelope**, and shared data moves only through the blackboard (project workspace). Free, yet nothing untraceable.
+- **D4 — Departments are internally multi-agent.** Each department = one chief + multiple specialist agents. Chiefs decompose work and judge quality; specialists execute.
+- **D5 — Rigorous per-project version control.** Project = one repository. Every artifact is stored as an **immutable version + provenance (who, when, based on what)** and tagged at milestones. Overwriting does not exist — only new versions.
+- **D6 — The Composer defines purpose via swappable "scores".** A score = a declarative definition of pipeline, quality gates, and department invocation order per deliverable type. The default score is `paper` (academic paper); user-defined scores can change the purpose freely.
+- **D7 — Initial pipeline (user request).** Input: research data + rough storyline. Processing: prior-work survey → storyline concretization & feasibility review → outline → draft → editing. Output: draft + research archive + decision record.
+- **D8 — Long-term: resource-aware organization.** Research/Strategy departments become aware of the execution environment (local computer, available tools, open-source ecosystem) and can discover, combine, and run tools to achieve goals (opt-in capabilities, behind gates).
+- **D9 — Hybrid execution harness.** The core (store, ledger, message bus, score, gates) is implemented natively as a standalone Python orchestrator; department/agent **runners sit behind an adapter interface**, so LangGraph, AutoGen, etc. can be mixed **per department** where useful (frameworks are adopted piecemeal, not all-or-nothing).
+- **D10 — Deliverables down to rendered output.** The paper score's final deliverable is LaTeX source + compiled PDF. The Editorial Format Editor maintains venue templates (.cls/.sty) and citation styles; **successful compilation and zero reference errors** are release-gate conditions.
+- **D11 — Paper language policy.** The final paper (writing · rendering) is **English by default**. Briefs, internal collaboration notes, and release summaries may be Korean. Language is declared in the score; overrides (e.g., Korean paper with a kotex compile chain) are allowed.
+- **D12 — English-first development (supersedes the "internal docs may be Korean" clause of D11).** All development artifacts are unified in **English**: design documents, source code, comments, commit messages, CLI output, schema field names, identifiers, and inter-agent message bodies (default; score-configurable). Human-supplied inputs (briefs) may remain in any language.
 
-## 4. 조직 요약 (상세는 `20-architecture-v0.md`)
+## 4. Organization Summary (details in `20-architecture-v0.md`)
 
-| 조직 | 성격 | 한 줄 임무 | 내부 구성(요약) |
+| Organ | Nature | One-line duty | Internal composition (summary) |
 |---|---|---|---|
-| **Composer** (지휘자) | 지휘/오케스트레이션 | 브리프를 미션으로 변환하고, 부서를 지휘·중재하며, 완성을 선언 | 미션 설계자, 중재자, 릴리스 관리인 |
-| **조사부** (Research & Intelligence) | 생산 부서 | 목적에 맞는 세계 조사: 레퍼런스·계보·동향을 수집해 체계화·관리 | 조사부장, 문헌 스카우트, 계보/동향 분석가, 사서(카탈로거), 검증관 |
-| **전략부** (Strategy & Writing) | 생산 부서 | 조사 데이터를 목적 달성 스토리라인으로 전환하고, 타당성을 검증하고, 집필한다 | 전략부장, 스토리라인 건축가, 타당성 심사관(레드팀), 플래너, 집필가(섹션 라이터) |
-| **편집실** (Editorial Office) | 검수/품질 | 포맷·심미 구조·논리 일관성을 빡세게 검토하고 출판 기준을 판정 | 편집장, 포맷 편집자, 구조 편집자, 정확성 QA |
-| **기록부** (Archivist) | 횡단 서비스 | 모든 부서의 산출물·메시지·이벤트를 불변 버전으로 저장·태깅·감사 | 저장 엔진, 원장(ledger), 릴리스/태그 관리 |
+| **Composer** (conductor) | Orchestration | Turns briefs into missions, conducts departments, arbitrates, declares releases | Mission designer, arbiter, release steward |
+| **Research & Intelligence** (Dept) | Producing dept | Surveys the world for the goal: collects and systematizes references, genealogy, trends | Research Chief, Literature Scout, Genealogy & Trend Analyst, Cataloger, Fact Verifier |
+| **Strategy & Writing** (Dept) | Producing dept | Converts research data into goal-achieving storylines, stress-tests feasibility, writes the draft | Strategy Chief, Narrative Architect, Feasibility Red Team, Planner, Section Writers |
+| **Editorial Office** (Dept) | Review/quality | Rigorously reviews format, aesthetic structure, logical consistency; judges publication readiness | Editor-in-Chief, Format Editor, Structural Editor, Consistency QA |
+| **Archivist** (cross-cutting service) | Service | Stores, tags, and audits every artifact, message, and event in immutable versions | Storage engine, ledger, release/tag management |
 
-## 5. 용어집 (Glossary) — SSOT 본문
+## 5. Glossary — SSOT body
 
-| 용어 | 정의 |
+| Term | Definition |
 |---|---|
-| **프로젝트 (Project)** | 하나의 목적을 향한 모든 산출물·기록·버전의 컨테이너. 고유 id와 저장소(폴더+git)를 가짐 |
-| **브리프 (Brief)** | 사용자의 최초 입력(원문 보존됨). 예: 연구 데이터 + 간략한 스토리라인 |
-| **미션 (Mission)** | Composer가 브리프에서 파생한 실행 가능한 목표 선언(목표·제약·성공기준·산출물 명세) |
-| **악보 (Score)** | Composer 프리셋. 산출물 유형별 파이프라인(단계·담당 부서·게이트)을 선언하는 설정. 기본값 `paper` |
-| **부서 (Department)** | 범용 기능 단위 조직. 내부에 여러 에이전트를 둠. 미션을 받아 업무 수행 |
-| **에이전트 (Agent)** | 부서 내 역할 수행 단위. 이름·역할·권한·도구·모델 프리셋을 매니페스트로 정의 |
-| **블랙보드 (Blackboard)** | 프로젝트 공유 작업공간(파일). 모든 부서가 읽기 가능. 쓰기는 자기 소유 아티팩트만 |
-| **아티팩트 (Artifact)** | 버전화 산출물 단위(조사 노트, 레퍼런스 카드, 스토리라인, 아웃라인, 섹션 초고, 리뷰, 보고서 등) |
-| **메시지 (Message)** | 부서 간 교환 봉투. 유형: `request`(요청) / `review`(검토) / `data`(데이터) / `critique`(이의제기) / `decision`(결정) |
-| **원장 (Ledger)** | 모든 행위(아티팩트 생성·메시지·게이트 판정)의 부가 전용(append-only) 이벤트 로그 |
-| **릴리스 (Release)** | 마일스톤 스냅샷 태그. 예: `v0.1-outline`, `v0.2-draft`, `v1.0-final` |
-| **게이트 (Gate)** | 단계 진행을 허가하는 품질 조건. 통과 전에는 다음 단계로 못 감(실패 시 이의제기→중재 경로 존재) |
-| **중재 (Arbitration)** | 부서 간 의견 대립·교착 시 Composer가 근거 기반으로 내리는 결정(전부 기록됨) |
+| **Project** | Container for all artifacts, records, and versions of one goal. Owns a unique id and a repository (folder + git) |
+| **Brief** | The user's initial input (preserved verbatim). E.g., research data + rough storyline |
+| **Mission** | The executable goal statement the Composer derives from a brief (objective, constraints, success criteria, deliverable spec) |
+| **Score** | A Composer preset: declarative definition of the pipeline (stages, owning departments, gates) per deliverable type. Default: `paper` |
+| **Department** | A general-purpose functional unit; internally multi-agent; receives missions |
+| **Agent** | A role unit inside a department, defined by manifest (name, role, permissions, tools, model profile) |
+| **Blackboard** | The shared project workspace (files). Readable by all; writable only for one's own artifacts |
+| **Artifact** | A versioned output unit (research note, reference card, storyline, outline, section draft, review, report, …) |
+| **Message** | The inter-department envelope. Types: `request` / `review` / `data` / `critique` / `decision` |
+| **Ledger** | Append-only event log of every action (artifact creation, messages, gate verdicts) |
+| **Release** | A milestone snapshot tag, e.g., `v0.1-outline`, `v0.2-draft`, `v1.0-final` |
+| **Gate** | A quality condition permitting stage progress; failure routes to dispute → arbitration |
+| **Arbitration** | The Composer's evidence-based decision in inter-department deadlock/dispute (always recorded) |
 
-## 6. 데이터 모델 요약 (스키마 상세는 `20-architecture-v0.md` §5)
+Korean↔English term map (for conversation continuity): 부서=Department · 조사부=Research & Intelligence · 전략부=Strategy & Writing · 편집실=Editorial Office · 기록부=Archivist · 지휘자=Composer · 브리프=Brief · 미션=Mission · 악보=Score · 블랙보드=Blackboard · 아티팩트=Artifact · 원장=Ledger · 릴리스=Release · 게이트=Gate · 중재=Arbitration.
 
-핵심 개체 7개: `Project`, `Mission`, `Task`, `Artifact`(불변 버전), `Message`, `Event(원장)`, `Release`.
-불변성 규칙: 아티팩트 본문은 저장 후 변경 불가 → 수정은 항상 **새 버전 + 부모 링크(parents)**. 원장은 append-only.
+## 6. Data Model Summary (schemas in `20-architecture-v0.md` §5)
 
-## 7. 산출물·버전 규칙 요약
+Core entities (7): `Project`, `Mission`, `Task`, `Artifact` (immutable versions), `Message`, `Event` (ledger), `Release`.
+Immutability rule: artifact bodies are immutable once stored → edits are always a **new version + parent link**. The ledger is append-only.
 
-1. 프로젝트 폴더 하나 = 저장소 하나. 표준 레이아웃은 아키텍처 문서 §6.
-2. 모든 아티팩트: frontmatter(id, type, version, parents, author_role, status, checksum, refs) + 본문.
-3. 마일스톤(브리프 확정 / 조사 완료 / 아웃라인 승인 / 드래프트 / 편집 통과 / 최종)마다 릴리스 태그.
-4. 프로젝트 산출물은 사용자가 언제든 열람·diff·롤백 가능해야 한다.
-5. 근거 없는 인용은 게이트에서 차단된다(할루시네이션 방어선).
+## 7. Artifact & Versioning Rules (summary)
 
-## 8. 비목표 (Non-Goals, v1 기준)
+1. One project folder = one repository. Standard layout in architecture doc §6.
+2. Every artifact: frontmatter (id, type, version, parents, author_role, status, checksum, refs) + body.
+3. Release tags at milestones (brief accepted / survey done / outline approved / draft / editorial pass / final).
+4. The user can inspect, diff, and roll back project outputs at any time.
+5. Citations without evidence are blocked at gates (hallucination defense line).
 
-- v1에서 실험 코드 실행·실제 데이터 분석 수행은 목표가 아님(설계 슬롯만 확보, v2에서 개방).
-- 조직이 "인간 저자를 대신해" 이름을 올리는 것 — 투명한 AI 생성물 표기 원칙 유지.
-- 단일 벤더 프레임워크 종속 설계(부서 실행기는 교체 가능해야 함).
-- 실시간 스트리밍 UI 등 사용자 인터페이스 고도화(먼저 코어와 저장 계층).
+## 8. Non-Goals (v1)
 
-## 9. 열린 질문 (사용자 결정 필요)
+- Running experiment code or performing real data analysis (design slots only; opened in v2).
+- Publishing under human authorship in place of humans — transparent AI-generated-content attribution is maintained.
+- Single-vendor framework lock-in (department runners must remain replaceable).
+- UI polish (streaming UI etc.) — core and storage layer first.
 
-| # | 질문 | 기본안 |
+## 9. Open Questions (user decisions pending)
+
+| # | Question | Default proposal |
 |---|---|---|
-| Q1 | ~~v1 실행 하네스~~ | ✅ **결정(D9)**: 하이브리드 — 코어는 독립 Python, 부서 실행기는 어댑터로 LangGraph/AutoGen 혼용 |
-| Q2 | ~~최초 타깃 산출물의 언어·포맷~~ | ✅ **결정(D10)**: 논문은 LaTeX 소스 + 컴파일 PDF 렌더링까지 |
-| Q3 | 검색/도구 접근 범위 (웹검색 API 무엇? 인용 메타데이터 소스: arXiv/CrossRef/S2?) | arXiv + Semantic Scholar + 웹검색 조합 |
-| Q4 | 모델 배치(부서별 모델 등급)와 프로젝트당 비용 상한 | 조사=경제 모델, 집필=고성능 모델, 상한은 프로젝트 설정 |
-| Q5 | 휴먼 인 더 루프 검문소 위치 (아웃라인 승인 시? 드래프트 후?) | 아웃라인 승인 + 최종 릴리스 전 2소 |
+| Q1 | ~~v1 execution harness~~ | ✅ **Decided (D9)**: hybrid — native Python core; department runners as adapters (LangGraph/AutoGen mixable) |
+| Q2 | ~~First target deliverable format~~ | ✅ **Decided (D10, D11)**: paper = English LaTeX source + compiled PDF |
+| Q3 | Search/tool access scope (which web-search API? citation metadata sources: arXiv/CrossRef/S2?) | arXiv + Semantic Scholar + web search combination |
+| Q4 | Model placement (per-department model tiers) and per-project cost cap | Research = economical models, writing = high-capability models; caps per project |
+| Q5 | Human-in-the-loop checkpoint locations (outline approval? post-draft?) | Two points: outline approval + before final release |
 
-## 10. 문서 맵
+## 10. Document Map
 
-- `00-SSOT.md` — 이 문서. 컨셉·원칙·용어의 원본.
-- `10-survey-precursors.md` — 선행 시스템·프레임워크 조사(근거 링크 포함) 및 설계 시사점.
-- `20-architecture-v0.md` — v1 아키텍처 구체화(조직·통신·스키마·파이프라인·실행 매핑).
-- `30-roadmap.md` — 구현 로드맵(P0~P4), 리스크, 즉시 착수 작업.
+- `00-SSOT.md` — this document; origin of concept, principles, terminology.
+- `10-survey-precursors.md` — precedent systems & framework survey (with sources) and design implications.
+- `20-architecture-v0.md` — v1 architecture concretization (organization, comms, schemas, pipeline, execution mapping).
+- `30-roadmap.md` — implementation roadmap (P0–P4), risks, immediate next actions.
 
-## 11. 변경 이력
+All project documentation is maintained in **English** per D12.
 
-| 버전 | 내용 |
+## 11. Change Log
+
+| Version | Content |
 |---|---|
-| v0.1 | 초안 작성: 멀티부서 컨셉 확정, 결정 D1~D8, 용어집, 열린 질문 Q1~Q5 |
-| v0.2 | Q1·Q2 결정 반영: D9 하이브리드 하네스, D10 LaTeX 렌더링 산출물 확정 |
-| v0.3 | D11 언어 정책 확정: 논문 집필·렌더링은 영어 기본, 악보 오버라이드 허용 |
+| v0.1 | Initial draft: multi-department concept fixed, decisions D1–D8, glossary, open questions Q1–Q5 (written in Korean) |
+| v0.2 | Q1·Q2 decided: D9 hybrid harness, D10 LaTeX-rendered deliverable |
+| v0.3 | D11 language policy: paper written & rendered in English by default |
+| v0.4 | D12: unify all development artifacts in English — design docs translated to English |
