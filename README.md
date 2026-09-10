@@ -7,7 +7,7 @@
 [![tests](https://github.com/codeshark94/Sci-saurus/actions/workflows/tests.yml/badge.svg)](https://github.com/codeshark94/Sci-saurus/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.14-3776AB?logo=python&logoColor=white)
 ![phase](https://img.shields.io/badge/phase-P1%20durable%20core-F7A41D)
-![tests](https://img.shields.io/badge/acceptance%20tests-28%2F28-2EA043)
+![tests](https://img.shields.io/badge/acceptance%20tests-33%2F33-2EA043)
 ![license](https://img.shields.io/badge/license-proprietary-lightgrey)
 
 </div>
@@ -44,11 +44,11 @@ Every department carries a designated **Adversarial Reviewer** with an independe
 | **Durable core** | Transactional control store (SQLite) + event hash chain · immutable content-addressed artifacts + adoption CAS · message bus (outbox, leases, fencing, idempotent effects) · task/attempt lifecycle | ✅ `T01–T05, T13` |
 | **Structured change** | Stable content units · document manifests · scoped EditGrants · ChangeSets with complete-mutation validation (scope, preimages, protected spans, citation anchors) | ✅ `T56–T58` |
 | **Review & issues** | Admissible critiques · stable issue identity · rebuttal · independent adjudication · verification closure · review gate that never converts failure into a pass | ✅ `T06–T10` |
-| Scheduler / capacity windows / progress checkpoints | Renewable allocation windows, stagnation diagnosis, wall-clock checkpoints | 🔜 next |
+| **Capacity & checkpoints** | Renewable allocation windows, finite reservations, causal stagnation tracking, wall-clock progress checkpoints | ✅ `T41–T45, T52` |
 | Retrieval adapters & Operations Cell | Capability registry, provider adapters, execution evidence | 🔜 |
 | Paper workflow MVP | Four-department run over the fixture → LaTeX + PDF | 🔜 |
 
-**28/28 acceptance tests passing** (`python3 -m unittest discover -s scisaurus/tests`).
+**33/33 acceptance tests passing** (`python3 -m unittest discover -s scisaurus/tests`).
 
 ## Quickstart
 
