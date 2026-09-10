@@ -147,6 +147,16 @@ CREATE TABLE IF NOT EXISTS allocation_windows(
   opened_at TEXT NOT NULL,
   closed_at TEXT
 );
+CREATE TABLE IF NOT EXISTS resource_pools(
+  policy_id TEXT PRIMARY KEY,
+  capacity_json TEXT NOT NULL,
+  cumulative_usage_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS outbox_quarantine(
+  outbox_seq INTEGER PRIMARY KEY,
+  reason TEXT NOT NULL,
+  quarantined_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS reservations(
   reservation_id TEXT PRIMARY KEY,
   window_id TEXT NOT NULL,

@@ -125,6 +125,145 @@ class TestT52Completion(BudgetFixture):
                 next_action={"decision": "continue"},
             )
 
+class TestPoolAccounting(BudgetFixture):
+    def test_outstanding_reservations_and_late_settlements_survive_renewals(self):
+        self.budget.reserve(window_id="w-1", reservation_id="r-1", task_id="t-1",
+                            amount={"tokens": 10000})
+        self.budget.renew(prior_window_id="w-1", new_window_id="w-2", rationale="continue")
+        self.budget.renew(prior_window_id="w-2", new_window_id="w-3", rationale="continue")
+        with self.assertRaises(ConflictError):
+            self.budget.reserve(window_id="w-3", reservation_id="r-2", task_id="t-2",
+                                amount={"tokens": 1})
+        self.assertEqual(self.budget.get_window("w-3")["reserved"], {"tokens": 10000})
+        self.budget.settle(window_id="w-1", reservation_id="r-1", actual={"tokens": 12500})
+        self.control.close()
+        self.control = ControlStore(self.dir)
+        self.budget = BudgetManager(self.control)
+        current = self.budget.get_window("w-3")
+        self.assertEqual(current["cumulative_usage"], {"tokens": 12500})
+        self.assertEqual(current["reserved"], {})
+        self.budget.reserve(window_id="w-3", reservation_id="r-2", task_id="t-2",
+                            amount={"tokens": 10000})
+        from scisaurus.core.errors import StateError
+        with self.assertRaises(StateError):
+            self.budget.settle(window_id="w-1", reservation_id="r-1", actual={"tokens": 12500})
+        self.assertEqual(self.budget.get_window("w-3")["cumulative_usage"], {"tokens": 12500})
+
+    def test_independent_windows_share_policy_capacity(self):
+        self.budget.open_window(window_id="parallel", policy_id="pol-1", delegation_ref="another",
+                                capacity={"tokens": 10000, "usd": 5})
+        self.budget.reserve(window_id="w-1", reservation_id="r-1", task_id="t-1", amount={"tokens": 6000})
+        with self.assertRaises(ConflictError):
+            self.budget.reserve(window_id="parallel", reservation_id="r-2", task_id="t-2", amount={"tokens": 6000})
+        self.budget.open_window(window_id="separate", policy_id="pol-2", delegation_ref="another",
+                                capacity={"tokens": 10000})
+        self.budget.reserve(window_id="separate", reservation_id="r-2", task_id="t-2", amount={"tokens": 10000})
+        with self.assertRaises(ValidationError):
+            self.budget.open_window(window_id="escalated", policy_id="pol-1", delegation_ref="another",
+                                    capacity={"tokens": 20000})
+
+    def test_invalid_quantities_never_mutate_accounting(self):
+        invalid = [-1, float("nan"), float("inf"), float("-inf"), True, "1", None]
+        for value in invalid:
+            with self.subTest(value=value):
+                before = list(self.control.replay())
+                with self.assertRaises(ValidationError):
+                    self.budget.reserve(window_id="w-1", reservation_id="bad", task_id="t",
+                                        amount={"tokens": value})
+                with self.assertRaises(ValidationError):
+                    self.budget.open_window(window_id="bad", policy_id="p-bad", delegation_ref="d",
+                                            capacity={"tokens": value})
+                self.assertEqual(list(self.control.replay()), before)
+                self.assertEqual(self.budget.get_window("w-1")["reserved"], {})
+        self.budget.reserve(window_id="w-1", reservation_id="valid", task_id="t", amount={"tokens": 10})
+        for value in invalid:
+            with self.assertRaises(ValidationError):
+                self.budget.settle(window_id="w-1", reservation_id="valid", actual={"tokens": value})
+        self.assertEqual(self.budget.get_reservation("valid")["state"], "reserved")
+
+    def test_failed_renewal_keeps_predecessor_open_and_events_unchanged(self):
+        import sqlite3
+        for capacity in ({"tokens": -1}, {"tokens": float("nan")}, {"new-resource": 0}):
+            before = list(self.control.replay())
+            with self.assertRaises(ValidationError):
+                self.budget.renew(prior_window_id="w-1", new_window_id="bad", rationale="continue",
+                                  capacity_delta=capacity)
+            self.assertEqual(self.budget.get_window("w-1")["state"], "open")
+            self.assertEqual(list(self.control.replay()), before)
+        self.budget.open_window(window_id="occupied", policy_id="pol-1", delegation_ref="d",
+                                capacity={"tokens": 10})
+        before = list(self.control.replay())
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.budget.renew(prior_window_id="w-1", new_window_id="occupied", rationale="continue")
+        self.assertEqual(self.budget.get_window("w-1")["state"], "open")
+        self.assertEqual(list(self.control.replay()), before)
+        self.budget.renew(prior_window_id="w-1", new_window_id="w-2", rationale="continue")
+        self.assertEqual(self.budget.get_window("w-1")["state"], "closed")
+        with self.assertRaises(ValidationError):
+            self.budget.open_window(window_id="bypass", policy_id="pol-1", delegation_ref="d",
+                                    capacity={"tokens": 1}, prior_window="w-2")
+
+    def test_legacy_snapshots_recover_late_actuals_once(self):
+        from scisaurus.core.schema import canonical_bytes
+        self.budget.reserve(window_id="w-1", reservation_id="r-1", task_id="t", amount={"tokens": 100})
+        self.budget.renew(prior_window_id="w-1", new_window_id="w-2", rationale="continue")
+        self.budget.settle(window_id="w-1", reservation_id="r-1", actual={"tokens": 80})
+        self.budget.reserve(window_id="w-2", reservation_id="r-2", task_id="t", amount={"tokens": 100})
+        self.budget.settle(window_id="w-2", reservation_id="r-2", actual={"tokens": 90})
+        with self.control.tx() as conn:
+            conn.execute("DELETE FROM resource_pools")
+            conn.execute("UPDATE allocation_windows SET cumulative_usage_json=? WHERE window_id='w-1'",
+                         (canonical_bytes({"tokens": 80}).decode(),))
+            conn.execute("UPDATE allocation_windows SET cumulative_usage_json=? WHERE window_id='w-2'",
+                         (canonical_bytes({"tokens": 90}).decode(),))
+        self.budget = BudgetManager(self.control)
+        self.assertEqual(self.budget.get_window("w-2")["cumulative_usage"], {"tokens": 170})
+        self.budget = BudgetManager(self.control)
+        self.assertEqual(self.budget.get_window("w-2")["cumulative_usage"], {"tokens": 170})
+
+    def test_concurrent_connections_cannot_overbook_shared_pool(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+
+        self.budget.open_window(window_id="parallel", policy_id="pol-1", delegation_ref="d",
+                                capacity={"tokens": 10000})
+        ready = Barrier(2)
+        def reserve(window_id):
+            control = ControlStore(self.dir)
+            try:
+                budget = BudgetManager(control)
+                ready.wait(timeout=5)
+                try:
+                    budget.reserve(window_id=window_id, reservation_id="r-" + window_id,
+                                   task_id="t", amount={"tokens": 6000})
+                    return "reserved"
+                except ConflictError:
+                    return "capacity_exhausted"
+            finally:
+                control.close()
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            outcomes = list(workers.map(reserve, ["w-1", "parallel"]))
+        self.assertCountEqual(outcomes, ["reserved", "capacity_exhausted"])
+        self.assertEqual(self.budget.get_window("w-1")["reserved"], {"tokens": 6000})
+
+    def test_late_renewal_event_failure_rolls_back_successor_and_closure(self):
+        from unittest.mock import patch
+
+        append_event = self.control.append_event
+        def fail_closure(conn, **kwargs):
+            if kwargs["event_type"] == "allocation.closed":
+                raise RuntimeError("event write failed")
+            return append_event(conn, **kwargs)
+        before = list(self.control.replay())
+        with patch.object(self.control, "append_event", side_effect=fail_closure):
+            with self.assertRaises(RuntimeError):
+                self.budget.renew(prior_window_id="w-1", new_window_id="w-2", rationale="continue")
+        self.assertEqual(self.budget.get_window("w-1")["state"], "open")
+        self.assertIsNone(self.control._conn.execute(
+            "SELECT 1 FROM allocation_windows WHERE window_id='w-2'"
+        ).fetchone())
+        self.assertEqual(list(self.control.replay()), before)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,8 +29,6 @@ class MessageBus:
 
     # -- publishing ------------------------------------------------------
     def publish(self, envelope: dict) -> str:
-        from scisaurus.core.schema import validate_message
-
         validate_message(envelope)
         with self.control.tx() as conn:
             conn.execute(
@@ -60,28 +58,46 @@ class MessageBus:
         return envelope["message_id"]
 
     def recover_outbox(self) -> int:
-        """Dispatch undispatched outbox entries after a crash (T03)."""
+        """Dispatch committed envelopes; quarantine malformed legacy entries.
+
+        Quarantine retains the original outbox row and emits a failure event.
+        It does not count as dispatch; quarantined() exposes the disposition.
+        """
         rows = self.control._conn.execute(
             "SELECT outbox_seq, effect_key, message_id, envelope_json FROM outbox"
-            " WHERE dispatched = 0 ORDER BY outbox_seq"
+            " WHERE dispatched = 0 AND outbox_seq NOT IN"
+            " (SELECT outbox_seq FROM outbox_quarantine) ORDER BY outbox_seq"
         ).fetchall()
         count = 0
         for row in rows:
             with self.control.tx() as conn:
                 still = conn.execute(
-                    "SELECT dispatched FROM outbox WHERE outbox_seq = ?",
+                    "SELECT dispatched FROM outbox WHERE outbox_seq = ?"
+                    " AND outbox_seq NOT IN (SELECT outbox_seq FROM outbox_quarantine)",
                     (row["outbox_seq"],),
                 ).fetchone()
                 if still is None or still["dispatched"]:
+                    continue
+                try:
+                    envelope = json.loads(row["envelope_json"])
+                    validate_message(envelope)
+                    if envelope["message_id"] != row["message_id"]:
+                        raise ValidationError("outbox message_id differs from envelope")
+                except (ValueError, ValidationError) as exc:
+                    conn.execute(
+                        "INSERT INTO outbox_quarantine VALUES (?, ?, ?)",
+                        (row["outbox_seq"], str(exc), now_iso()),
+                    )
+                    self.control.append_event(
+                        conn, actor="system", event_type="outbox.quarantined",
+                        payload={"outbox_seq": row["outbox_seq"], "message_id": row["message_id"],
+                                 "reason": str(exc)},
+                    )
                     continue
                 exists = conn.execute(
                     "SELECT 1 FROM messages WHERE message_id = ?", (row["message_id"],)
                 ).fetchone()
                 if exists is None:
-                    envelope = json.loads(row["envelope_json"])
-                    from scisaurus.core.schema import validate_message
-
-                    validate_message(envelope)
                     conn.execute(
                         "INSERT OR IGNORE INTO messages(message_id, envelope_json, state)"
                         " VALUES (?, ?, 'pending')",
@@ -197,9 +213,17 @@ class MessageBus:
         return effect_key, created
 
     # -- reads -----------------------------------------------------------
+    def quarantined(self) -> list[dict]:
+        return [dict(row) for row in self.control._conn.execute(
+            "SELECT q.outbox_seq, o.message_id, q.reason, q.quarantined_at"
+            " FROM outbox_quarantine q JOIN outbox o ON o.outbox_seq=q.outbox_seq"
+            " ORDER BY q.outbox_seq"
+        )]
+
     def pending(self) -> list[str]:
         rows = self.control._conn.execute(
-            "SELECT message_id FROM messages WHERE state = 'pending' ORDER BY message_id"
+            "SELECT message_id FROM messages"
+            " WHERE state IN ('pending', 'retry_pending') ORDER BY message_id"
         ).fetchall()
         return [r["message_id"] for r in rows]
 

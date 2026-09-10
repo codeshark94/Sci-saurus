@@ -175,13 +175,31 @@ def validate_artifact_manifest(m: dict) -> None:
 
 def validate_message(envelope: dict) -> None:
     """Validate the message envelope against 40 §5.1."""
+    if not isinstance(envelope, dict):
+        raise ValidationError("message envelope must be an object")
     for key in ("message_id", "project_id", "type", "from", "to", "subject", "body", "refs", "created_at"):
         if key not in envelope or envelope[key] is None:
             raise ValidationError(f"message envelope missing field: {key}")
+    for key in ("message_id", "project_id", "type", "subject", "created_at"):
+        if not isinstance(envelope[key], str) or not envelope[key].strip():
+            raise ValidationError(f"message {key} must be a nonempty string")
+    if not isinstance(envelope["body"], str):
+        raise ValidationError("message body must be a string")
+    for key in ("from", "to"):
+        address = envelope[key]
+        if not isinstance(address, dict) or any(
+            not isinstance(address.get(part), str) or not address[part].strip()
+            for part in ("dept", "agent")
+        ):
+            raise ValidationError(f"message {key} requires a department and agent")
     if envelope["type"] not in MESSAGE_TYPES:
         raise ValidationError(f"unknown message type: {envelope['type']!r}")
     if not isinstance(envelope["refs"], list):
         raise ValidationError("message refs must be a list")
+    for ref in envelope["refs"]:
+        if not isinstance(ref, str):
+            raise ValidationError("message refs must be artifact reference strings")
+        parse_ref(ref)
     if envelope.get("idempotency_key") is not None and not isinstance(
         envelope["idempotency_key"], str
     ):

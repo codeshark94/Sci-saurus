@@ -175,8 +175,8 @@ class TaskManager:
         """Record uncertainty for an external call whose completion is unknown (T05).
 
         The attempt is marked ``result_unknown``; its reserved resources stay
-        conservatively accounted (never zero-cost) and the task is blocked with
-        a typed reason until reconciliation confirms the outcome.
+        conservatively accounted (never zero-cost). Active tasks enter blocked
+        when their lifecycle permits it; terminal and paused decisions remain.
         """
         with self.control.tx() as conn:
             row = conn.execute(
@@ -193,10 +193,19 @@ class TaskManager:
                 " WHERE attempt_id = ?",
                 (canonical_bytes(usage).decode("utf-8"), attempt_id),
             )
-            conn.execute(
-                "UPDATE tasks SET state='blocked', updated_at=? WHERE task_id = ?",
-                (now_iso(), row["task_id"]),
-            )
+            task = conn.execute(
+                "SELECT state FROM tasks WHERE task_id = ?", (row["task_id"],)
+            ).fetchone()
+            if "blocked" in TRANSITIONS.get(task["state"], set()):
+                conn.execute(
+                    "UPDATE tasks SET state='blocked', updated_at=? WHERE task_id = ?",
+                    (now_iso(), row["task_id"]),
+                )
+                self.control.append_event(
+                    conn, actor=actor, event_type="task.state_changed",
+                    payload={"task_id": row["task_id"], "from": task["state"],
+                             "to": "blocked", "reason": "unknown_external_outcome"},
+                )
             self.control.append_event(
                 conn,
                 actor=actor,

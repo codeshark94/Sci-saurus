@@ -30,6 +30,31 @@ class Documents:
         self.store = store
 
     # -- units -----------------------------------------------------------
+    @staticmethod
+    def validate_unit_content(content: dict) -> None:
+        if content.get("kind") not in UNIT_KINDS:
+            raise ValidationError(f"unknown unit kind: {content.get('kind')!r}")
+        text = content.get("text")
+        if not isinstance(text, str):
+            raise ValidationError("unit text must be a string")
+        occurrences: set[str] = set()
+        for citation in content.get("citations", []):
+            for key in ("occurrence_id", "span", "reference_card_ref"):
+                if key not in citation:
+                    raise ValidationError(f"citation occurrence missing {key}: {citation!r}")
+            occurrence = citation["occurrence_id"]
+            if not isinstance(occurrence, str) or not occurrence or occurrence in occurrences:
+                raise ValidationError(f"citation occurrence must be unique and nonempty: {occurrence!r}")
+            occurrences.add(occurrence)
+            span = citation["span"]
+            if not (
+                isinstance(span, list) and len(span) == 2
+                and all(type(value) is int for value in span)
+                and 0 <= span[0] < span[1] <= len(text)
+            ):
+                raise ValidationError(f"citation span outside unit text: {span!r}")
+            parse_ref(citation["reference_card_ref"])
+
     def publish_unit(
         self,
         *,
@@ -50,18 +75,12 @@ class Documents:
         reference_card_ref, claim_ref, relation}. ``lineage`` records
         split/merge/retire relationships, e.g. {"derived_from": [ref]}.
         """
-        if kind not in UNIT_KINDS:
-            raise ValidationError(f"unknown unit kind: {kind!r}")
         retired = self.control._conn.execute(
             "SELECT 1 FROM retired_units WHERE logical_id = ?", (logical_id,)
         ).fetchone()
         if retired is not None:
             # retired ids are never reused to hide a replacement (45 §2)
             raise ValidationError(f"unit id reuse forbidden: {logical_id} was retired")
-        for citation in citations or []:
-            for key in ("occurrence_id", "span", "reference_card_ref"):
-                if key not in citation:
-                    raise ValidationError(f"citation occurrence missing {key}: {citation!r}")
         content = {
             "kind": kind,
             "text": text,
@@ -70,6 +89,7 @@ class Documents:
             "citations": citations or [],
             "lineage": lineage or {},
         }
+        self.validate_unit_content(content)
         return self.store.publish_artifact(
             logical_id=logical_id,
             artifact_type="content_unit",
@@ -102,7 +122,10 @@ class Documents:
             if logical in seen:
                 raise ValidationError(f"live unit appears twice in tree: {logical}")
             seen.add(logical)
-            self.store.get(ref)  # must resolve to a published unit version
+            manifest = self.store.get(ref)
+            if manifest["artifact_type"] != "content_unit":
+                raise ValidationError(f"tree member is not a content unit: {ref}")
+            self.validate_unit_content(self.read_unit(ref))
 
     def publish_manifest(
         self,
@@ -112,16 +135,19 @@ class Documents:
         author: str,
         task_id: str | None = None,
         assembly_dependencies: list[str] | None = None,
+        parents: list[str] | None = None,
         conn=None,
     ) -> dict:
         """Publish one DocumentManifest version pinning the unit tree."""
-        ns, _, _ = (document_id.split("/", 1) + [""])[:3] if "/" in document_id else ("", None, None)
         if not document_id.startswith("strategy/documents/"):
             raise ValidationError("document_id must live under 'strategy/documents/'")
         pinned = {
             "document_id": document_id,
             "units": tree.get("units", []),
-            "assembly_dependencies": assembly_dependencies or [],
+            "assembly_dependencies": (
+                tree.get("assembly_dependencies", [])
+                if assembly_dependencies is None else assembly_dependencies
+            ),
         }
         self.validate_tree(pinned)
         kwargs = dict(
@@ -131,6 +157,7 @@ class Documents:
             body=canonical_bytes(pinned),
             media_type="application/json+scisaurus-document",
             task_id=task_id,
+            parents=parents,
         )
         if conn is not None:
             return self.store._publish_artifact_in(conn, **kwargs)

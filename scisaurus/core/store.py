@@ -24,6 +24,7 @@ from scisaurus.core.schema import (
     parse_ref,
     sha256_hex,
     validate_artifact_manifest,
+    validate_message,
 )
 from scisaurus.core.events import ControlStore
 
@@ -180,6 +181,8 @@ class ArtifactStore:
         messages: list[dict] | None = None,
     ) -> dict:
         ns, name = logical_id.split("/", 1) if "/" in logical_id else ("", logical_id)
+        for envelope in messages or []:
+            validate_message(envelope)
         if not ns:
             raise ValidationError("logical_id must be '<namespace>/<name>'")
         owner = owner or NAMESPACE_OWNERS.get(ns)

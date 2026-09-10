@@ -7,7 +7,6 @@
 [![tests](https://github.com/codeshark94/Sci-saurus/actions/workflows/tests.yml/badge.svg)](https://github.com/codeshark94/Sci-saurus/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.14-3776AB?logo=python&logoColor=white)
 ![phase](https://img.shields.io/badge/phase-P1%20durable%20core-F7A41D)
-![tests](https://img.shields.io/badge/acceptance%20tests-33%2F33-2EA043)
 ![license](https://img.shields.io/badge/license-proprietary-lightgrey)
 
 </div>
@@ -45,10 +44,12 @@ Every department carries a designated **Adversarial Reviewer** with an independe
 | **Structured change** | Stable content units · document manifests · scoped EditGrants · ChangeSets with complete-mutation validation (scope, preimages, protected spans, citation anchors) | ✅ `T56–T58` |
 | **Review & issues** | Admissible critiques · stable issue identity · rebuttal · independent adjudication · verification closure · review gate that never converts failure into a pass | ✅ `T06–T10` |
 | **Capacity & checkpoints** | Renewable allocation windows, finite reservations, causal stagnation tracking, wall-clock progress checkpoints | ✅ `T41–T45, T52` |
-| Retrieval adapters & Operations Cell | Capability registry, provider adapters, execution evidence | 🔜 |
+| **Paragraph runtime** | Bounded supervisor → writer → independent verifier → conditional adoption; exact staged candidates, reservations, native checkpoints, cancellation and retained failure evidence | Live synthetic-paragraph validation passed |
+| **Live retrieval** | Crossref bibliographic search + official MCP Fetch execution, pinned setup, source captures and hashes | Live search and source capture verified |
+| Operations Cell orchestration | Dynamic capability discovery, environment selection, operator activation | 🔜 |
 | Paper workflow MVP | Four-department run over the fixture → LaTeX + PDF | 🔜 |
 
-**33/33 acceptance tests passing** (`python3 -m unittest discover -s scisaurus/tests`).
+The CI workflow runs the acceptance and regression suite. Its cases include stale grants, subtree authorization, composed edits, exact verification evidence, concurrent reservations, renewal rollback, and restart recovery. See [implemented API contracts](docs/55-control-plane-api.md) for supported behavior and upgrade boundaries.
 
 ## Quickstart
 
@@ -69,6 +70,22 @@ Run the acceptance suite:
 python3 -m unittest discover -s scisaurus/tests -t . -v
 ```
 
+## Run a paragraph revision
+
+Install the official MCP server and its pinned source extractor:
+
+```bash
+sh scripts/setup-runtime.sh
+```
+
+Configure a copy of [the paragraph run template](config/paragraph-run.example.json) with the authorized GPU endpoint, model, and public inputs, then run from the repository root:
+
+```bash
+python3 -m scisaurus.cli run-paragraph /tmp/research-paragraph --config /path/to/run.json
+```
+
+The template blocks dispatch until configured. Results, retained candidates, source records, and checkpoints live in the project directory; `output/report.md` and `output/run.json` expose the outcome. See [runtime setup and limits](docs/60-paragraph-runtime.md).
+
 ## Design entry points
 
 1. [System concept](docs/05-system-concept.md) — organizing model, compute policy, anytime progress
@@ -84,4 +101,4 @@ python3 -m unittest discover -s scisaurus/tests -t . -v
 
 ## Current state
 
-Design documents, the P0 freeze record, the P1 fixture set, and a deployment-configuration template — plus the `scisaurus` control-plane slices listed above. **Not yet present:** a scheduler/runner, model adapter, retrieval adapters, a runnable paper workflow, or benchmark results. External GPU capacity is a design premise; endpoints, models, measured capacity, and data permissions remain deployment configuration.
+Design documents, the P0 freeze record, the P1 fixture set, and a deployment-configuration template — plus the `scisaurus` control-plane slices listed above. A bounded paragraph runner and external-model protocol adapters are present, with live Crossref/MCP retrieval. **Not yet present:** a general autonomous scheduler, dynamic Operations Cell orchestration, a runnable paper workflow, or research-quality benchmarks. A synthetic paragraph has completed external GPU production, independent verification, and conditional adoption; see the [live validation scope](docs/60-paragraph-runtime.md#live-validation). External GPU capacity is a design premise; endpoints, models, measured capacity, and data permissions remain deployment configuration.

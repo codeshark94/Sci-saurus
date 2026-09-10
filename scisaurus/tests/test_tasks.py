@@ -61,6 +61,24 @@ class TestTaskLifecycle(unittest.TestCase):
         with self.assertRaises(Exception):
             self.tm.transition("t-3", "queued", "composer")  # terminal
 
+    def test_unknown_outcome_preserves_terminal_and_paused_tasks(self):
+        for target in ("cancelled", "failed", "stale", "completed", "paused"):
+            with self.subTest(target=target):
+                task_id, attempt_id = "t-" + target, "a-" + target
+                self.tm.create(task_id, "production", {"objective": "draft"}, "composer")
+                self.tm.admit(task_id, "composer")
+                self.tm.start_attempt(task_id, attempt_id, owner="writer", lease_ttl_seconds=60,
+                                      reserved={"tokens": 100})
+                if target == "completed":
+                    self.tm.transition(task_id, "awaiting_review", "scheduler")
+                self.tm.transition(task_id, target, "principal")
+                result = self.tm.reconcile_unknown(attempt_id, "scheduler")
+                self.assertEqual(self.tm.get(task_id)["state"], target)
+                self.assertEqual(result["state"], "result_unknown")
+                self.assertEqual(result["usage"]["reserved"], {"tokens": 100})
+                self.tm.finish_attempt(attempt_id, "succeeded", usage={"tokens": 90})
+                self.assertEqual(self.tm.get(task_id)["state"], target)
+
 
 if __name__ == "__main__":
     unittest.main()

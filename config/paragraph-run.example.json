@@ -1,0 +1,51 @@
+{
+  "live_dispatch_allowed": false,
+  "data_classification": "public",
+  "allocation_mode": "capacity_pool",
+  "project_id": "synthetic-sleep-paragraph",
+  "objective": "Revise only the paragraph to report the supplied immediate-recall result accurately. Preserve all supplied result values. Do not claim measured long-term retention, consolidation magnitude, verified seven-day results, or an exam-scheduling recommendation. Distinguish external background literature from this synthetic study and state the pending follow-up gap.",
+  "paragraph": "In this randomized experiment of 40 healthy adults, the normal-sleep group recalled 14.1 word pairs (SD 2.9), compared with 12.4 (SD 3.2) after sleep restriction, Welch’s t(38) = 2.31, p = 0.026, d = 0.73. This proves that sleep protects long-term memory consolidation by up to 15%, and seven-day retention was significantly better, so students should schedule exams after a full night of sleep.",
+  "preserved_neighbor": "The supplied results describe a single-site experiment in healthy adults. No raw data or additional analysis is available in this fixture.",
+  "supplied_context": "# Supplied Results Package — SP-001 (P1 slice fixture)\n\n> **SYNTHETIC FIXTURE.** Authored for P1 acceptance testing; not a real study and not real user data.\n> `schema_version: '0.8'` · input role: `premise` (user-supplied, approved) · artifact ref: `artifact:inputs/results-package@1` (example resolution under CC-001).\n\n## 1. Study summary\n\n- Design: two-condition, between-subject experiment with randomized assignment.\n- Participants: n = 40 healthy adults (20 per condition), ages 18–35, single site.\n- Conditions: **A** = normal overnight sleep (≥ 7 h, verified by actigraphy); **B** = sleep-restricted night (≤ 4 h, verified).\n- Task: 16-item word-pair cued recall, administered 30 minutes after waking. **Immediate recall only.**\n\n## 2. Reported results (as supplied by the Principal)\n\n| Metric | A — normal sleep | B — sleep restricted |\n|---|---|---|\n| Mean items recalled (of 16) | 14.1 (SD 2.9) | 12.4 (SD 3.2) |\n| Median response time per pair | 2.9 s | 3.1 s |\n\nStatistics as supplied: Welch's *t*(38) = 2.31, *p* = 0.026, Cohen's *d* = 0.73 for the recall comparison; response-time comparison not significant (*p* = 0.41).\n\n## 3. Procedure (as reported)\n\nPaired-associate learning: encoding session in the evening, sleep manipulation overnight, cued recall test the next morning. Standard exclusion criteria (self-reported sleep, neurological, or psychiatric conditions) were applied.\n\n## 4. User-stated findings (verbatim)\n\n- **F1:** \"Participants with normal sleep recalled more word pairs than sleep-restricted participants (14.1 vs 12.4; *p* = 0.026).\"\n- **F2:** \"Sleep deprivation impairs long-term memory consolidation, reducing retention by up to 15%.\"\n- **F3:** \"Retention after seven days was significantly better in the normal-sleep group.\" (Follow-up data have been collected but are **not yet entered or verified**; no numbers are supplied.)\n\n## 5. Limitations (as stated by the Principal)\n\nSmall sample; single site; healthy volunteers; a single recall measure; follow-up data not yet verified.\n\n## 6. Supplied provenance\n\nCondition-assignment log: summarized only (randomized, balanced). Raw data files: **not supplied** by design — re-analysis is outside the v1 boundary (SSOT §9). Missing information stays missing; ingestion may not invent or estimate it (40 §3.2).\n# Claims & Acceptance Contract — CC-001 (P1 slice fixture)\n\n> Governing acceptance contract for the P1 slice run over SP-001/SB-001. Synthetic; frozen at P0 (25-p0-freeze §4).\n\n## Required claims\n\n| ID | Kind | Statement (required meaning) | Support requirement |\n|---|---|---|---|\n| **C1** | observation | Under the tested conditions, normal-sleep participants recalled more word pairs than sleep-restricted participants. | Exact transcription from SP-001 §2 (14.1 vs 12.4; SDs; *t*(38) = 2.31, *p* = 0.026, *d* = 0.73), with conditions and test type. Must survive all repairs (SC1). |\n| **C2** | interpretation | The immediate-recall difference is **consistent with** a role of sleep in memory processes shortly after encoding. | Interpretation language only (\"consistent with\"). Must not assert consolidation, long-term retention, or any magnitude for them. |\n| **C3** | boundary | SP-001 does **not** support claims about long-term retention or consolidation magnitude. | The phrase \"long-term memory consolidation\" and the \"up to 15%\" figure must not appear as observed results. F2 may appear only as a qualified immediate-recall effect or in a repaired form. |\n| **C4** | gap | The 7-day retention difference (F3) has no verified data. | Must appear only as a pending-data limitation or gap report. Never as a supported finding; never with invented numbers. |\n\n## Required sections\n\nAbstract · Introduction · Methods (transcription) · Results (transcription) · Discussion · Limitations.\n\n## Hard requirements (non-waivable)\n\n1. Every numeric value is transcribed exactly, with units and test types (G2 mechanical class).\n2. Causal language is permitted **only** for the immediate-recall effect (randomized assignment supports it); no causal claims about retention or consolidation.\n3. No invented citations, no fabricated values, no unverified follow-up data (v1 boundary; D17).\n4. Deleting or softening C1/C1's required values fails coverage checks (T09).\n5. External literature, when cited, must follow the discovery → capture → evidence path (`50-web-intelligence-integration.md`); snippets are not support.\n\n## Gates exercised in the slice\n\nG0 (intake/authority over the fixture) → G2 (transcription/citation–claim alignment) → G3 (conclusion defensibility under supplied results; C3/C4 boundary) — with editorial/rendering gates exercised later in P2 (roadmap §5).",
+  "required_literals": [
+    "40",
+    "14.1",
+    "2.9",
+    "12.4",
+    "3.2",
+    "38",
+    "2.31",
+    "0.026",
+    "0.73"
+  ],
+  "public_queries": [
+    "sleep memory immediate recall long term consolidation"
+  ],
+  "source_urls": [
+    "https://www.nhlbi.nih.gov/health/sleep/why-sleep-important"
+  ],
+  "mcp_fetch_command": [
+    ".venv/bin/python",
+    "-m",
+    "mcp_server_fetch"
+  ],
+  "model": {
+    "protocol": "openai_compatible",
+    "base_url": "runtime_required",
+    "model": "runtime_required",
+    "timeout_seconds": 180,
+    "max_output_tokens": 8192,
+    "auth_env": null
+  },
+  "limits": {
+    "max_rounds": 3,
+    "search_results": 3,
+    "max_capture_chars": 16000,
+    "max_source_bytes": 2000000,
+    "wall_clock_seconds": 1200,
+    "checkpoint_seconds": 15,
+    "retrieval_timeout_seconds": 60,
+    "max_result_bytes": 10000000,
+    "concurrent_calls": 2
+  }
+}

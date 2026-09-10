@@ -91,6 +91,62 @@ class TestMessageBus(unittest.TestCase):
         # recovery is idempotent
         self.assertEqual(self.bus.recover_outbox(), 0)
 
+    def test_expired_message_is_discoverable_after_restart(self):
+        self.bus.publish(envelope("m-retry", "retry-effect"))
+        old = self.bus.lease("m-retry", "first-worker", ttl_seconds=-1)
+        self.assertEqual(self.bus.expire_stale_leases(), 1)
+        self.control.close()
+        self.control = ControlStore(self.dir)
+        self.bus = MessageBus(self.control)
+        self.assertEqual(self.bus.pending(), ["m-retry"])
+        current = self.bus.lease(self.bus.pending()[0], "replacement")
+        with self.assertRaises(StaleFenceError):
+            self.bus.acknowledge("m-retry", old, "scheduled", "first-worker")
+        self.bus.acknowledge("m-retry", current, "scheduled", "replacement")
+        self.assertEqual(self.bus.pending(), [])
+
+    def test_legacy_malformed_outbox_is_quarantined_without_blocking_delivery(self):
+        from scisaurus.core.schema import canonical_bytes, now_iso
+        from scisaurus.core.store import ArtifactStore
+
+        malformed = envelope("m-bad", "bad-effect")
+        malformed["type"] = "invalid"
+        with self.control.tx() as conn:
+            conn.execute(
+                "INSERT INTO outbox(effect_key, message_id, envelope_json, created_at) VALUES (?, ?, ?, ?)",
+                ("bad-effect", "m-bad", canonical_bytes(malformed).decode(), now_iso()),
+            )
+        self.control.close()
+        self.control = ControlStore(self.dir)
+        self.bus = MessageBus(self.control)
+        ArtifactStore(self.control).publish_artifact(
+            logical_id="kb/notes/valid", artifact_type="note", author="research.chief",
+            body=b"body", messages=[envelope("m-valid", "valid-effect")],
+        )
+        self.assertEqual(self.bus.recover_outbox(), 1)
+        self.assertEqual(self.bus.pending(), ["m-valid"])
+        rejected = self.bus.quarantined()
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["message_id"], "m-bad")
+        self.assertIn("unknown message type", rejected[0]["reason"])
+        self.assertEqual(self.control._conn.execute(
+            "SELECT dispatched FROM outbox WHERE message_id='m-bad'"
+        ).fetchone()[0], 0)
+        self.assertEqual(self.bus.recover_outbox(), 0)
+        events = [e for e in self.control.replay() if e["event_type"] == "outbox.quarantined"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(self.control.verify_chain(), (True, "ok"))
+
+    def test_message_schema_rejects_malformed_field_types(self):
+        from scisaurus.core.errors import ValidationError
+        from scisaurus.core.schema import validate_message
+
+        for malformed in (None, [], {**envelope("m", "e"), "type": []},
+                          {**envelope("m", "e"), "from": "worker"},
+                          {**envelope("m", "e"), "refs": [None]}):
+            with self.subTest(envelope=malformed), self.assertRaises(ValidationError):
+                validate_message(malformed)
+
 
 if __name__ == "__main__":
     unittest.main()

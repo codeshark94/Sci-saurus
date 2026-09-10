@@ -37,7 +37,25 @@ def main(argv=None) -> int:
     p_verify = sub.add_parser("verify", help="verify the event hash chain")
     p_verify.add_argument("project_dir")
 
+    p_run = sub.add_parser("run-paragraph", help="run a public-data paragraph revision with live providers")
+    p_run.add_argument("project_dir")
+    p_run.add_argument("--config", required=True)
+
     args = parser.parse_args(argv)
+    if args.cmd == "run-paragraph":
+        from scisaurus.runtime.config import load_config
+        from scisaurus.runtime.runner import ParagraphRunner
+        from scisaurus.core.errors import ContractError
+        try:
+            result = ParagraphRunner(args.project_dir, load_config(args.config),
+                on_progress=lambda state: print(json.dumps(state), flush=True)).run()
+        except ContractError as exc:
+            print(f"configuration rejected: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({"status": result["status"], "incumbent_ref": result["incumbent_ref"],
+                          "report": str(__import__("pathlib").Path(args.project_dir).resolve() / "output" / "report.md")}, indent=2))
+        return 0 if result["status"] == "accepted" else 3
+
 
     if args.cmd == "init":
         control = ControlStore(args.project_dir)
@@ -72,6 +90,8 @@ def main(argv=None) -> int:
         print(f"events: {control._conn.execute('SELECT COUNT(*) c FROM events').fetchone()['c']}")
         print(f"trusted_head: {control.trusted_head()[:16]}…")
         print(f"pending_messages: {bus.pending()}")
+        for item in bus.quarantined():
+            print(f"quarantined_message {item['message_id']}: {item['reason']}")
         for row in control._conn.execute("SELECT task_id, state FROM tasks"):
             print(f"task {row['task_id']}: {row['state']}")
         return 0

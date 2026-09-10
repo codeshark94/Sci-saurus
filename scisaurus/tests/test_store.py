@@ -121,6 +121,31 @@ class TestArtifactStore(unittest.TestCase):
         last_events = [e["event_type"] for e in self.control.replay()]
         self.assertNotIn("artifact.published", last_events)
 
+    def test_malformed_outgoing_batch_rolls_back_publication(self):
+        from scisaurus.core.errors import ValidationError
+        from scisaurus.core.messages import MessageBus
+        from scisaurus.tests.test_messages import envelope
+
+        valid = envelope("m-good", "effect-good")
+        malformed = envelope("m-bad", "effect-bad")
+        malformed["type"] = "not_registered"
+        before = list(self.control.replay())
+        with self.assertRaises(ValidationError):
+            self.store.publish_artifact(
+                logical_id="kb/notes/outbox", artifact_type="note", author="research.chief",
+                body=b"candidate", messages=[valid, malformed],
+            )
+        self.assertEqual(self.store.versions("kb/notes/outbox"), [])
+        self.assertEqual(list(self.control.replay()), before)
+        self.assertEqual(self.control._conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+        self.store.publish_artifact(
+            logical_id="kb/notes/outbox", artifact_type="note", author="research.chief",
+            body=b"candidate", messages=[valid],
+        )
+        bus = MessageBus(self.control)
+        self.assertEqual(bus.recover_outbox(), 1)
+        self.assertEqual(bus.pending(), ["m-good"])
+
 
 if __name__ == "__main__":
     unittest.main()
