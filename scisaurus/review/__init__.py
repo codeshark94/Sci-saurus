@@ -1,0 +1,1 @@
+"""Review protocol package: coverage records, gate semantics, issue lifecycle."""

@@ -127,6 +127,14 @@ CREATE TABLE IF NOT EXISTS retired_units(
   logical_id TEXT PRIMARY KEY,
   retired_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS issues(
+  issue_id TEXT PRIMARY KEY,
+  causal_key TEXT NOT NULL,
+  state TEXT NOT NULL,
+  generation INTEGER NOT NULL DEFAULT 1,
+  critique_ref TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 

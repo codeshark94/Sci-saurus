@@ -37,6 +37,7 @@ NAMESPACE_OWNERS = {
     "editorial": "editorial",
     "fixtures": "test",
     "releases": "archivist",
+    "issues": "issues",
 }
 
 
