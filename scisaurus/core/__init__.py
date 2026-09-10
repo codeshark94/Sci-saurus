@@ -1,0 +1,1 @@
+"""Domain entities of the Sci-saurus control plane."""
