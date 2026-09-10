@@ -18,7 +18,7 @@ from scisaurus.core.events import ControlStore
 from scisaurus.core.store import ArtifactStore
 
 UNIT_KINDS = frozenset(
-    {"paragraph", "heading", "list_item", "equation", "table", "figure", "caption", "container"}
+    {"paragraph", "heading", "list_item", "equation", "table", "figure", "caption", "container", "code", "json"}
 )
 
 UNIT_MEDIA_TYPE = "application/json+scisaurus-unit"

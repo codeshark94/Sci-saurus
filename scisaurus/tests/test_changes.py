@@ -755,6 +755,47 @@ class TestStagedChangeAcceptance(ChangeIntegrityFixture):
                 self._accept(stage, verification)
         self.assertEqual(self._state(), before)
 
+    def test_current_governing_heads_are_pinned_in_atomic_acceptance(self):
+        claim = self.store.publish_artifact(logical_id="strategy/claims/governing", artifact_type="claim",
+            author="principal", body=b'{"statement":"Only immediate recall is established."}', media_type="application/json")
+        self._grant()
+        stage = self._stage()
+        verification = self._verify_stage(stage)
+        pins = [claim["artifact_ref"], "artifact:kb/references/r1@1"]
+        result = self._accept(stage, verification, expected_head_refs=pins)
+        self.assertEqual(result["manifest_ref"], stage["manifest_ref"])
+        self.assertEqual(self.store.accepted(self.document_id)["artifact_ref"], stage["manifest_ref"])
+        event = next(event for event in reversed(list(self.control.replay()))
+                     if event["event_type"] == "changeset.integrated")
+        self.assertCountEqual(event["payload"]["expected_head_refs"], pins)
+
+    def test_changed_governing_head_rejects_acceptance_without_any_partial_effect(self):
+        self._grant()
+        stage = self._stage()
+        verification = self._verify_stage(stage)
+        self.store.publish_artifact(logical_id="kb/references/r1", artifact_type="reference_card",
+            author="research.cataloger", body=b'{"title":"Revised source with changed interpretation"}', media_type="application/json")
+        before = self._state()
+        with self.assertRaises(ConflictError):
+            self._accept(stage, verification, expected_head_refs=["artifact:kb/references/r1@1"])
+        self.assertEqual(self._state(), before)
+        self.assertEqual(self.store.accepted(self.document_id)["artifact_ref"], self.doc["artifact_ref"])
+
+    def test_malformed_and_conflicting_governing_pins_are_rejected_without_effects(self):
+        self._grant()
+        stage = self._stage()
+        verification = self._verify_stage(stage)
+        self.store.publish_artifact(logical_id="kb/references/r1", artifact_type="reference_card",
+            author="research.cataloger", body=b'{"title":"Updated source"}', media_type="application/json")
+        current = "artifact:kb/references/r1@2"
+        before = self._state()
+        for pins in (current, {"ref": current}, ["not-an-artifact-ref"], [None], [12],
+                     ["artifact:kb/references/r1@0"], [current, "artifact:kb/references/r1@1"],
+                     ["artifact:kb/references/r1@1", current]):
+            with self.subTest(pins=pins), self.assertRaises(ValidationError):
+                self._accept(stage, verification, expected_head_refs=pins)
+            self.assertEqual(self._state(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,756 @@
+"""Bounded literature discovery, scoped mapping, and independent gap assessment."""
+from copy import deepcopy
+import json
+import re
+import signal
+import threading
+import time
+import unicodedata
+
+from scisaurus.core.errors import ValidationError
+from scisaurus.core.schema import canonical_bytes
+from scisaurus.core.surveys import RELATIONSHIP_SEMANTICS, SurveyGate, work_review_checks
+from scisaurus.runtime.execution import ExecutionRuntime, _invoke_worker
+from scisaurus.runtime.models import ModelResult
+from scisaurus.runtime.literature import SEARCH_SYNTAX
+from scisaurus.runtime.operations import OperationsCell
+from scisaurus.runtime.scores import exact, identifier
+from scisaurus.runtime.survey_config import validate_survey_config, search_query
+from scisaurus.runtime.survey_records import (MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, validate_map,
+                                             validate_survey_review, validate_assessment, validate_work_review)
+from scisaurus.runtime.time_policy import TimePolicy
+
+
+def normalized(text):
+    return " ".join(re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold()))
+
+
+class SurveyRunner(ExecutionRuntime):
+    def __init__(self, project_dir, config, *, on_progress=None):
+        super().__init__(project_dir, validate_survey_config(config), worker_target=_invoke_worker, on_progress=on_progress)
+        self.score = self.config["survey"]
+        self.bounds = self.score["search"]
+        self.operations = OperationsCell(self.control, self.store, project_id=self.config["project_id"])
+        self.gate = SurveyGate(self.control, self.store)
+        self.worker_slots = self.config["limits"]["concurrent_calls"] - 1
+        self.time_policy = TimePolicy(stage_seconds=self.score["stage_seconds"],
+            unit_count=self.bounds["max_works"], worker_slots=self.worker_slots,
+            wall_clock_seconds=self.config["limits"]["wall_clock_seconds"], policy=self.config.get("time_policy"))
+        self.time_policy.started_at = self.started
+        self.deadline = min(self.deadline, self.started + self.time_policy.hard_seconds)
+        self.work_records, self.works, self.source_docs, self.source_records = {}, {}, {}, {}
+        self.aliases, self.dois, self.analysis_records, self.analyzed_basis = {}, {}, {}, {}
+        self.relationships, self.bindings, self.capability_ids = {}, {}, []
+        self.work_reviews, self.reviewed_basis = {}, {}
+        self.query_refs, self.search_log, self.expansion_log, self.gaps, self.time_decisions = [], [], [], [], []
+        self.api_calls, self.serial, self.survey_revision = 0, 0, 0
+        self.expanded, self.full_text_attempted = set(), set()
+        self.survey_ref, self.assessment_ref, self.register_ref = None, None, None
+        self.nomination = None
+
+    def _record(self, logical, kind, body, author, *, subjects=()):
+        head = self.store.head(logical)
+        if head and self.store.read_body(head["body_hash"]) == canonical_bytes(body):
+            return head
+        return self._publish(logical, kind, body, author, subjects=subjects)
+
+    def _tick(self, stage, *, count=1, pending_review_count=0):
+        self._ensure_active()
+        decision = self.time_policy.admit(stage, task_count=count, pending_review_count=pending_review_count)
+        decision.update(task_count=count, worker_slots=self.worker_slots, pending_review_count=pending_review_count)
+        self.time_decisions.append(decision)
+        self._publish(f"command/time-decisions/{len(self.time_decisions)}", "note", decision,
+                      "command.controller", subjects=[self.score_ref])
+        if not decision["allowed"]:
+            raise ValidationError(f"time admission deferred {stage}: {decision['reason']}")
+
+    def _before_dispatch(self, spec):
+        super()._before_dispatch(spec)
+        if spec["kind"] == "model":
+            prompt = json.loads(spec["params"]["prompt"])
+            if "prerequisite_survey_ref" in prompt:
+                required = prompt["prerequisite_survey_ref"]
+                if required != prompt.get("survey_ref"):
+                    raise ValidationError("gap task has inconsistent survey prerequisites")
+                self.gate.require_current(required)
+            if prompt.get("phase") in {"counter_plan", "gap_assessment"}:
+                nomination = self.gate.require_current_nomination(prompt.get("nomination_ref"))
+                if canonical_bytes(prompt.get("gap")) != canonical_bytes({
+                        key: nomination[key] for key in ("id", "statement")}):
+                    raise ValidationError("gap task does not match its exact nomination")
+        for binding in self.bindings.values():
+            self.operations.authorize(binding)
+        self._ensure_active()
+
+    def _model_checked(self, name, actor, assignment, validator, *, stage="production", task_kind="production"):
+        return self._models_checked([{"name": name, "actor": actor, "assignment": assignment,
+            "validator": validator}], stage=stage, task_kind=task_kind)[name]
+
+    def _models_checked(self, jobs, *, stage="production", task_kind="production"):
+        """Validate bounded worker waves and retry only the rejected assignments."""
+        pending, results, feedback = list(jobs), {}, {}
+        for _ in range(self.config["limits"]["max_rounds"]):
+            rejected = []
+            for offset in range(0, len(pending), self.worker_slots):
+                wave = pending[offset:offset + self.worker_slots]
+                self._tick(stage, count=len(wave), pending_review_count=len(results) if stage in {"production", "revision"} else 0)
+                specs = []
+                for job in wave:
+                    self.serial += 1
+                    repair = feedback.get(job["name"])
+                    assignment = {**job["assignment"], **({"validation_feedback": repair} if repair else {})}
+                    specs.append({"task_id": f"survey-{job['name']}-{self.serial}", "kind": "model",
+                        "actor": job["actor"], "task_kind": task_kind,
+                        "params": {"client": self.config["model"], "prompt": json.dumps(assignment, ensure_ascii=False)}})
+                outcomes = self._call_batch(specs, max_parallel=self.worker_slots)
+                failures = []
+                for job, spec in zip(wave, specs):
+                    task_id, actor = spec["task_id"], spec["actor"]
+                    outcome = outcomes[task_id]
+                    if not outcome["ok"]:
+                        failures.append(f"{job['name']}: {outcome['error']}")
+                        continue
+                    result = ModelResult(**outcome["result"])
+                    execution = outcome["record_ref"]
+                    self.time_policy.observe(stage, result.elapsed_seconds)
+                    try:
+                        value = result.json_object()
+                    except ValidationError:
+                        value = {"raw_text": result.text}
+                    proposal = self._publish(f"kb/model-proposals/{task_id}", "note", value, actor, subjects=[execution])
+                    try:
+                        if result.finish_reason != "stop":
+                            raise ValidationError(f"model generation did not finish normally: {result.finish_reason}")
+                        value = result.json_object()
+                        job["validator"](value)
+                    except (ValidationError, TypeError, ValueError, KeyError) as exc:
+                        feedback[job["name"]] = {"error": str(exc), "previous_response": value,
+                            "scope": "Repair only this assignment's contract violations; preserve every valid field."}
+                        self.tasks.transition(task_id, "blocked", "command.controller", reason=str(exc))
+                        self._publish(f"command/validation/{task_id}", "note", {"error": str(exc)},
+                                      "command.controller", subjects=[proposal["artifact_ref"]])
+                        rejected.append(job)
+                        continue
+                    self._ensure_active()
+                    if job.get("on_valid"):
+                        job["on_valid"](value, execution)
+                    self._complete(task_id)
+                    results[job["name"]] = (value, execution)
+                if failures:
+                    raise ValidationError("model dispatch failed: " + "; ".join(failures))
+            if not rejected:
+                return results
+            pending = rejected
+        raise ValidationError("; ".join(
+            f"{job['name']} did not satisfy its evidence contract: {feedback[job['name']]['error']}" for job in pending))
+
+    def _plan_validator(self, value):
+        exact(value, {"queries", "rationale"}, "search plan")
+        queries = value["queries"]
+        if (not isinstance(queries, list) or not 1 <= len(queries) <= self.bounds["queries_per_role"]
+                or any(not isinstance(q, str) or not q.strip() or len(q) > 2048 for q in queries)
+                or len({normalized(q) for q in queries}) != len(queries)
+                or not isinstance(value["rationale"], str) or not value["rationale"].strip()):
+            raise ValidationError("search plan requires unique bounded queries and a rationale")
+        for query in queries:
+            search_query(query)
+
+    def _initialize(self):
+        score = self._publish(f"command/scores/{self.score['id']}", "note",
+            {"schema_version": "literature-survey-score-1", "survey": self.score,
+             "time_policy": self.config.get("time_policy")}, "principal")
+        self.score_ref = score["artifact_ref"]
+        self.protocol = self._publish("kb/search-protocol", "search_campaign", {
+            "question": self.score["question"], "seed_queries": self.score["seed_queries"],
+            "seed_work_ids": self.score["seed_work_ids"], "bounds": self.bounds,
+            "scope": "Configured providers and finite search/citation batches; not exhaustive scholarly coverage",
+            "publication_metadata": "Provider-reported, not independently confirmed publication history",
+            "independence": "Separately planned topic searches before the nominated gap is exposed; later targeted counter-search",
+        }, "command.search-coordinator", subjects=[self.score_ref])
+        self._checkpoint("survey_initialized", force=True)
+
+    def _setup(self):
+        self._tick("setup")
+        started = time.monotonic()
+        for key in ("bibliography", "full_text"):
+            definition = self.score[key]
+            if definition is None:
+                continue
+            client = deepcopy(definition["client"])
+            if definition["adapter"] == "mcp_fetch":
+                client.update(cwd=str(self.operations.workspace_dir(definition["id"])), own_process_group=False)
+            self.operations.register(definition["id"], adapter=definition["adapter"], client=client,
+                representative=definition["representative"], environment_files=definition["environment_files"],
+                engineer="operations.engineer")
+            self.capability_ids.append(definition["id"])
+        for key in ("bibliography", "full_text"):
+            definition = self.score[key]
+            if definition is None:
+                continue
+            state = self.operations.ensure_ready(definition["id"], self._call, operator="operations.operator",
+                verifier="operations.verifier", purpose=self.score["question"])
+            if state["state"] != "ready":
+                if key == "bibliography":
+                    raise ValidationError("bibliographic capability did not pass operational readiness")
+                self.gaps.append({"kind": "full_text_unavailable", "reason": state["reason"]})
+                continue
+            self.bindings[key] = state["binding"]
+            self.operations.idle(definition["id"])
+        self.time_policy.observe("setup", time.monotonic() - started)
+
+    def _initial_plans(self):
+        self._tick("supervision", count=2)
+        jobs = []
+        for role in ("research.search-planner", "methods.blind-search-planner"):
+            task_id = role.replace(".", "-")
+            assignment = {"assignment": "Plan a topic search without assuming a particular research gap.",
+                "phase": "blind_plan", "question": self.score["question"],
+                "seed_terms": self.score["seed_queries"], "max_queries": self.bounds["queries_per_role"],
+                "search_syntax": SEARCH_SYNTAX,
+                "instructions": "Return {queries:[search strings],rationale:string}. Use a distinct terminology or neighboring method family. Do not assert novelty."}
+            jobs.append({"task_id": task_id, "kind": "model", "actor": role, "task_kind": "service",
+                         "params": {"client": self.config["model"], "prompt": json.dumps(assignment)}})
+        outcomes = self._call_batch(jobs, max_parallel=self.config["limits"]["concurrent_calls"] - 1)
+        plans = []
+        for job in jobs:
+            outcome = outcomes[job["task_id"]]
+            if not outcome["ok"]:
+                raise ValidationError(f"independent search planning failed: {outcome['error']}")
+            result = ModelResult(**outcome["result"])
+            if result.finish_reason != "stop":
+                raise ValidationError("search planner did not finish normally")
+            value = result.json_object()
+            self._plan_validator(value)
+            self.time_policy.observe("supervision", result.elapsed_seconds)
+            record = self._publish(f"kb/search-plans/{job['task_id']}", "note", value, job["actor"], subjects=[outcome["record_ref"]])
+            self._complete(job["task_id"])
+            plans.append((job["actor"], value["queries"], record["artifact_ref"]))
+        return plans
+
+    def _ingest(self, works, execution):
+        added = 0
+        for observed in works:
+            wid = self.aliases.get(observed["id"]) or self.dois.get(observed["doi"]) or observed["id"]
+            if wid not in self.works and len(self.works) >= self.bounds["max_works"]:
+                self.gaps.append({"kind": "work_limit", "work_id": observed["id"]})
+                continue
+            self.aliases[observed["id"]] = wid
+            if observed["doi"]:
+                self.dois[observed["doi"]] = wid
+            old = self.works.get(wid)
+            item = deepcopy(observed)
+            item.update(work_id=wid, id=wid, provider_ids=sorted({observed["id"], *(old or {}).get("provider_ids", [])}),
+                        publication_metadata_status="provider_reported")
+            # Duplicate identities retain their first record and every observed provider ID.
+            if old and observed["id"] != wid:
+                item = {**old, "provider_ids": item["provider_ids"]}
+            if not old:
+                added += 1
+            if old != item:
+                self.works[wid] = item
+                record = self._record(f"kb/works/{wid}", "reference_card", item, "research.cataloger", subjects=[execution])
+                self.work_records[wid] = record
+            if item.get("abstract"):
+                current = self.source_records.get(f"abstract/{wid}")
+                previous = self.source_docs.get(current["artifact_ref"]) if current else None
+                if previous is None or previous["text"] != item["abstract"]:
+                    body = {"work_id": wid, "representation": "abstract", "text": item["abstract"],
+                            "url": "https://openalex.org/" + wid, "execution_ref": execution, "identity_verified": False}
+                    source = self._publish(f"kb/abstracts/{wid}", "source_capture", body,
+                                           "research.cataloger", subjects=[record["artifact_ref"] if old != item else self.work_records[wid]["artifact_ref"], execution])
+                    if current:
+                        self.source_docs.pop(current["artifact_ref"], None)
+                    self.source_records[f"abstract/{wid}"] = source
+                    self.source_docs[source["artifact_ref"]] = body
+        return added
+
+    def _bibliographic_call(self, operation, *, role, query=None, work_id=None, cursor=None, plan_ref=None):
+        self._ensure_active()
+        if self.api_calls >= self.bounds["max_api_calls"]:
+            self.gaps.append({"kind": "api_call_limit", "operation": operation, "query": query, "work_id": work_id})
+            return None
+        self.api_calls += 1
+        arguments = {"operation": operation, "query": query, "work_id": work_id,
+                     "limit": self.bounds["results_per_query"], "cursor": cursor}
+        try:
+            result, execution = self.operations.run(self.bindings["bibliography"], arguments, self._call, operator=role)
+        except Exception as exc:
+            self._ensure_active()
+            self.gaps.append({"kind": "bibliographic_failure", "request": arguments, "error": str(exc)})
+            raise
+        added = self._ingest(result["works"], execution)
+        metadata = result["metadata"]
+        body = {"request": arguments, "role": role, "execution_ref": execution, "plan_ref": plan_ref,
+                "returned_work_ids": [w["id"] for w in result["works"]], "new_unique_works": added,
+                "count": metadata["count"], "next_cursor": metadata["next_cursor"], "has_more": metadata["has_more"]}
+        record = self._publish(f"kb/queries/{self.api_calls}", "query_record", body, role,
+                               subjects=[execution, *([plan_ref] if plan_ref else [])])
+        self.query_refs.append(record["artifact_ref"])
+        self.search_log.append(body)
+        self._update_register()
+        self._checkpoint("literature_captured", force=True)
+        return body
+
+    def _search(self, queries, role, plan_ref=None):
+        seen = set()
+        for query in queries:
+            if normalized(query) in seen:
+                continue
+            seen.add(normalized(query))
+            self._bibliographic_call("search", role=role, query=query, plan_ref=plan_ref)
+
+    def _expand(self):
+        quiet = 0
+        for number in range(self.bounds["expansion_rounds"]):
+            before = len(self.works)
+            seeds = [wid for wid in self.works if wid not in self.expanded][:self.bounds["expansion_seed_count"]]
+            if not seeds:
+                break
+            completed = True
+            for wid in seeds:
+                self.expanded.add(wid)
+                for reference in self.works[wid]["referenced_works"][:self.bounds["references_per_work"]]:
+                    if reference not in self.aliases:
+                        completed &= self._bibliographic_call("work", role="research.citation-tracer", work_id=reference) is not None
+                completed &= self._bibliographic_call("citing", role="research.citation-tracer", work_id=wid) is not None
+            new = len(self.works) - before
+            quiet = quiet + 1 if completed and new < self.bounds["min_new_works"] else 0
+            self.expansion_log.append({"round": number + 1, "seed_work_ids": seeds, "new_unique_works": new,
+                                       "completed": completed, "quiet_rounds": quiet})
+            if quiet >= self.bounds["saturation_rounds"]:
+                break
+
+    def _full_texts(self):
+        if "full_text" not in self.bindings:
+            return
+        for route in self.score["full_text_sources"]:
+            wid = self.aliases.get(route["work_id"], route["work_id"])
+            if wid not in self.works or wid in self.full_text_attempted:
+                continue
+            if len(self.full_text_attempted) >= self.bounds["max_full_texts"]:
+                self.gaps.append({"kind": "full_text_limit", "work_id": wid})
+                break
+            self.full_text_attempted.add(wid)
+            try:
+                result, execution = self.operations.run(self.bindings["full_text"],
+                    {"url": route["url"], "max_length": self.bounds["max_text_chars"]}, self._call,
+                    operator="research.full-text-reader")
+            except Exception as exc:
+                self._ensure_active()
+                self.gaps.append({"kind": "full_text_failure", "work_id": wid, "reason": str(exc)})
+                self.bindings.pop("full_text", None)
+                break
+            text = result["text"]
+            title_match = normalized(self.works[wid]["title"]) == normalized(route["title"]) and normalized(route["title"]) in normalized(text)
+            sections_match = all(normalized(marker) in normalized(text) for marker in route["section_markers"])
+            verified = title_match and sections_match and not any(result["metadata"].get(key) for key in ("capture_truncated", "capture_incomplete"))
+            body = {"work_id": wid, "representation": "full_text" if verified else "unverified_text",
+                    "text": text, "url": route["url"], "execution_ref": execution, "identity_verified": verified,
+                    "identity_checks": {"title_match": title_match, "section_markers": route["section_markers"] if sections_match else []}}
+            record = self._publish(f"kb/full-text/{wid}", "source_capture", body, "methods.source-verifier",
+                                   subjects=[execution, self.work_records[wid]["artifact_ref"]])
+            self.source_records[f"full_text/{wid}"] = record
+            self.source_docs[record["artifact_ref"]] = body
+            if not verified:
+                self.gaps.append({"kind": "full_text_identity_or_scope", "work_id": wid})
+            self._update_register()
+
+    def _update_register(self):
+        body = {"work_refs": [r["artifact_ref"] for r in self.work_records.values()],
+                "source_refs": list(self.source_docs), "query_refs": list(self.query_refs), "aliases": self.aliases}
+        self.register_ref = self._record("kb/work-register", "note", body, "research.cataloger")["artifact_ref"]
+
+    def _source_context(self):
+        return [{"source_ref": ref, "work_id": value["work_id"], "representation": value["representation"],
+                 "text": value["text"][:self.bounds["context_chars"]], "available_chars": len(value["text"]),
+                 "window": {"start": 0, "end": min(len(value["text"]), self.bounds["context_chars"])}}
+                for ref, value in self.source_docs.items()]
+
+    def _coverage(self):
+        return {"unique_works": len(self.works), "abstracts": sum(w.get("abstract") is not None for w in self.works.values()),
+            "verified_full_texts": sum(s["representation"] == "full_text" for s in self.source_docs.values()),
+            "searches": self.search_log, "expansion": self.expansion_log, "access_and_limit_gaps": self.gaps,
+            "pagination_remaining": any(query["has_more"] for query in self.search_log),
+            "saturated": bool(self.expansion_log and self.expansion_log[-1]["quiet_rounds"] >= self.bounds["saturation_rounds"]),
+            "scope": "Recorded finite queries and citation expansion; no exhaustive-coverage claim",
+            "source_windows": [{"source_ref": item["source_ref"], "available_chars": item["available_chars"], "window": item["window"]}
+                               for item in self._source_context()]}
+
+    def _map(self):
+        requested = []
+        basis = {}
+        for wid, work in self.work_records.items():
+            basis[wid] = [work["artifact_ref"], *[ref for ref, source in self.source_docs.items() if source["work_id"] == wid]]
+            if self.analyzed_basis.get(wid) != basis[wid]:
+                requested.append(wid)
+        changed = set(requested)
+        for relationship in self.relationships.values():
+            if (relationship["source"] not in requested and (relationship["target"] in changed or any(
+                    proof["source_ref"] not in self.source_docs for proof in relationship["claim"]["evidence"]))):
+                requested.append(relationship["source"])
+        if requested:
+            self._models_checked([self._map_job(wid, basis[wid]) for wid in requested])
+        edges = []
+        for wid, work in self.works.items():
+            for other in work["referenced_works"]:
+                target = self.aliases.get(other, other)
+                if target in self.works:
+                    edges.append({"source": wid, "target": target, "kind": "cites"})
+        self.map_record = self._record("kb/literature-map", "note", {
+            "question": self.score["question"], "entry_refs": [r["artifact_ref"] for r in self.analysis_records.values()],
+            "relationship_refs": [r["artifact_ref"] for r in self.relationships.values()], "citation_edges": edges,
+            "publication_metadata_status": "provider_reported_not_verified",
+        }, "research.literature-mapper", subjects=[self.register_ref])
+
+    def _map_job(self, wid, basis, *, review_feedback=None):
+        sources = [source for source in self._source_context()
+                   if source["work_id"] == wid or source["representation"] == "abstract"]
+        visible_sources = {source["source_ref"]: source for source in sources}
+        previous = json.loads(self.store.read_body(self.analysis_records[wid]["body_hash"])) if wid in self.analysis_records else None
+        entry_editable = self.analyzed_basis.get(wid) != basis
+        old_relationships = [relation for relation in self.relationships.values() if relation["source"] == wid]
+        if review_feedback is not None:
+            entry_editable = bool(review_feedback["entry_fields"])
+        assignment = {
+            "assignment": "Assess the single assigned work and propose supported outgoing conceptual connections.", "phase": "map",
+            "question": self.score["question"], "requested_work_ids": [wid],
+            "works": [{key: work[key] for key in ("id", "title", "year", "doi", "publication_metadata_status")} for work in self.works.values()],
+            "previous_entries": [previous] if previous is not None else [], "entry_editable": entry_editable,
+            "previous_affected_relationships": old_relationships,
+            "semantic_feedback": review_feedback,
+            "relationship_semantics": RELATIONSHIP_SEMANTICS,
+            "sources": sources,
+            "instructions": "Return exactly {entries:[{work_id:string,inclusion:string,reason:string,problem:Statement,approach:Statement,finding:Statement,limitations:Statement}],"
+                "relationships:[{source:string,target:string,kind:string,claim:Statement}]}. entries must contain exactly the assigned work. "
+                "inclusion is included/excluded/uncertain. reason is a plain string, never an evidence object. "
+                "Only problem, approach, finding, limitations, and relationship claim use Statement={text:string|null,evidence:[{work_id:string,source_ref:string,quote:string}]}. "
+                "For unknown facts return {text:null,evidence:[]}. Every substantive statement needs a short contiguous exact quote, usually 3-12 words, from the displayed text. "
+                "Every clause must be supported. Report limitations only when the source states them explicitly; an abstract's silence cannot establish an untested domain or omitted comparison. "
+                "Copy quote characters exactly, including whitespace, Markdown, punctuation, and literal escaped newline characters; do not paraphrase, normalize, or repair quotations. "
+                "Use only displayed source_ref values. Each entry statement must cite the assigned work. "
+                "Each relationship source must be the assigned work; target must be a different known work. "
+                "kind is extends/contradicts/compares/related; claim needs evidence from BOTH works. Omit unsupported relationships. "
+                "Other works are supplied for comparison, not for editing. Preserve supported previous fields and outgoing relationships. "
+                "If entry_editable is false, copy the previous entry exactly without changing any field; only its outgoing relationships may change. "
+                "When semantic_feedback is present, change only its entry_fields and relationships with its relationship_targets. "
+                "Preserve every other field and relationship exactly. Correct unsupported claims by narrowing them to the evidence, recording unknown facts, or removing unsupported relationships. "
+                "Titles, years, and citation links are provider-reported catalog metadata, not textual evidence for substantive claims. "
+                "Do not infer confirmed chronology, conceptual inheritance, identity claims, or superiority from metadata or shared terminology alone."
+        }
+        def validate(value):
+            validate_map(value, [wid], set(self.works), visible_sources)
+            if not entry_editable and canonical_bytes(value["entries"][0]) != canonical_bytes(previous):
+                raise ValidationError(f"unchanged work {wid} must preserve its exact previous entry; only outgoing relationships may change")
+            if any(relation["source"] != wid for relation in value["relationships"]):
+                raise ValidationError(f"relationship source must be its assigned owner {wid}")
+            if review_feedback is not None:
+                for field in set(previous) - set(review_feedback["entry_fields"]):
+                    if canonical_bytes(value["entries"][0][field]) != canonical_bytes(previous[field]):
+                        raise ValidationError(f"semantic repair changed ungranted field {wid}.{field}")
+                targets = set(review_feedback["relationship_targets"])
+                def unchanged(items):
+                    return sorted(({key: item[key] for key in ("source", "target", "kind", "claim")}
+                                   for item in items if item["target"] not in targets),
+                                  key=lambda item: (item["source"], item["target"], item["kind"]))
+                if canonical_bytes(unchanged(value["relationships"])) != canonical_bytes(unchanged(old_relationships)):
+                    raise ValidationError(f"semantic repair changed ungranted relationships owned by {wid}")
+
+        def integrate(value, execution):
+            entry = value["entries"][0]
+            self.analysis_records[wid] = self._record(f"kb/work-analyses/{wid}", "note", entry,
+                "research.literature-mapper", subjects=[execution, *basis])
+            self.analyzed_basis[wid] = basis
+            self.relationships = {key: relation for key, relation in self.relationships.items() if relation["source"] != wid}
+            for relationship in value["relationships"]:
+                key = "-".join(relationship[field] for field in ("source", "target", "kind"))
+                record = self._record(f"kb/relationships/{key}", "note", relationship,
+                    "research.literature-mapper", subjects=[execution, *[proof["source_ref"] for proof in relationship["claim"]["evidence"]]])
+                self.relationships[key] = {**relationship, "artifact_ref": record["artifact_ref"]}
+
+        return {"name": f"map-{wid}", "actor": "research.literature-mapper", "assignment": assignment,
+                "validator": validate, "on_valid": integrate}
+
+    def _map_body(self):
+        return {"entries": [json.loads(self.store.read_body(r["body_hash"])) for r in self.analysis_records.values()],
+                "relationships": list(self.relationships.values()),
+                **json.loads(self.store.read_body(self.map_record["body_hash"]))}
+
+    def _review_work_claims(self):
+        for round_number in range(self.config["limits"]["max_rounds"]):
+            jobs, rejected = [], []
+            for wid, entry_record in self.analysis_records.items():
+                relations = [relation for relation in self.relationships.values() if relation["source"] == wid]
+                refs = [relation["artifact_ref"] for relation in relations]
+                source_ids = {wid, *[relation["target"] for relation in relations]}
+                sources = [source for source in self._source_context() if source["work_id"] in source_ids]
+                basis = [entry_record["artifact_ref"], *refs, *[source["source_ref"] for source in sources]]
+                if self.reviewed_basis.get(wid) == basis:
+                    continue
+                entry = json.loads(self.store.read_body(entry_record["body_hash"]))
+                assignment = {
+                    "phase": "work_review", "assignment": "Independently audit the entailment of each individual literature claim.",
+                    "question": self.score["question"], "entry_ref": entry_record["artifact_ref"],
+                    "entry": entry, "relationship_refs": refs, "relationships": relations,
+                    "relationship_semantics": RELATIONSHIP_SEMANTICS,
+                    "sources": sources, "required_checks": list(work_review_checks(refs)),
+                    "instructions": "Return exactly {checks:[{check_id,outcome,method,result}],rationale:string}. "
+                        "Run each required check separately; outcome is passed/failed/insufficient_evidence/check_failed. "
+                        "Judge whether the supplied text entails the ENTIRE claim, not whether its quotation merely exists or the topic sounds plausible. "
+                        "A passed check requires support for every clause. Fail unsupported minor clauses too; a correct main point does not excuse them. "
+                        "For limitations require an explicit source statement; reject a claim about missing evaluation or excluded scope inferred only from an abstract's silence. "
+                        "An abstract's silence cannot establish what a full paper did not evaluate, include, compare, or generalize. "
+                        "Attention-based does not entail attention-only or absence of recurrence/convolution. "
+                        "A newer date, citation, shared terminology, or similar application does not establish extension, conceptual inheritance, or superiority. "
+                        "For a claimed extends relationship require text establishing the specific dependency; otherwise fail it and identify the unsupported part. "
+                        "Do not fill missing text from model memory or titles. A proceedings preface is not architectural research evidence. "
+                        "Check inclusion and reason against actual scope and source content. Check null statements as explicit abstentions; those may pass. "
+                        "A claim may be scientifically plausible yet unsupported by these sources. Fail each unsupported assertion and state the narrowest evidence-grounded correction."
+                }
+                def integrate(value, execution, *, wid=wid, basis=basis, entry_ref=entry_record["artifact_ref"], refs=refs, relations=relations):
+                    record = self._publish(f"kb/work-reviews/{wid}", "note", {
+                        "entry_ref": entry_ref, "relationship_refs": refs, "execution_ref": execution, **value},
+                        "methods.work-reviewer", subjects=[entry_ref, *refs, execution])
+                    self.work_reviews[wid] = record
+                    failed = [check for check in value["checks"] if check["outcome"] != "passed"]
+                    if not failed:
+                        self.reviewed_basis[wid] = basis
+                        return
+                    self.reviewed_basis.pop(wid, None)
+                    by_ref = {relation["artifact_ref"]: relation for relation in relations}
+                    fields = [check["check_id"] for check in failed if not check["check_id"].startswith("relationship:")]
+                    targets = sorted({by_ref[check["check_id"][len("relationship:"):]]["target"]
+                                      for check in failed if check["check_id"].startswith("relationship:")})
+                    rejected.append((wid, {"review_ref": record["artifact_ref"], "entry_fields": fields,
+                                           "relationship_targets": targets, "checks": failed, "rationale": value["rationale"]}))
+                jobs.append({"name": f"work-review-{wid}", "actor": "methods.work-reviewer", "assignment": assignment,
+                             "validator": lambda value, refs=refs: validate_work_review(value, refs), "on_valid": integrate})
+            if jobs:
+                self._models_checked(jobs, stage="unit_review", task_kind="verification")
+            if not rejected:
+                return
+            if round_number + 1 == self.config["limits"]["max_rounds"]:
+                raise ValidationError("focused literature review remains unresolved: " + ", ".join(wid for wid, _ in rejected))
+            self._models_checked([self._map_job(wid, self.analyzed_basis[wid], review_feedback=feedback)
+                                  for wid, feedback in rejected], stage="revision")
+            self._map()
+
+    def _accept_survey(self):
+        if not self.works:
+            raise ValidationError("no works were captured; a survey cannot be fabricated")
+        self._map()
+        self._review_work_claims()
+        coverage = self._record("kb/coverage", "coverage_report", self._coverage(), "command.search-coordinator",
+                                subjects=[self.register_ref, *self.query_refs])
+        dependencies = [self.score_ref, self.protocol["artifact_ref"], self.map_record["artifact_ref"], coverage["artifact_ref"],
+            self.register_ref, *[r["artifact_ref"] for r in self.work_records.values()], *self.source_docs, *self.query_refs,
+            *[r["artifact_ref"] for r in self.analysis_records.values()], *[r["artifact_ref"] for r in self.relationships.values()],
+            *[r["artifact_ref"] for r in self.work_reviews.values()],
+            *[json.loads(self.store.read_body(r["body_hash"]))["execution_ref"] for r in self.work_reviews.values()],
+            *[source["execution_ref"] for source in self.source_docs.values()]]
+        body = {"schema_version": "literature-survey-2", "score_ref": self.score_ref, "protocol_ref": self.protocol["artifact_ref"],
+                "map_ref": self.map_record["artifact_ref"], "coverage_ref": coverage["artifact_ref"],
+                "source_refs": list(self.source_docs), "work_refs": [r["artifact_ref"] for r in self.work_records.values()],
+                "query_refs": list(self.query_refs), "dependency_refs": list(dict.fromkeys(dependencies))}
+        body["work_review_refs"] = [r["artifact_ref"] for r in self.work_reviews.values()]
+        bundle = self._publish("kb/surveys/current", "note", body, "research.literature-mapper", subjects=body["dependency_refs"])
+        self.survey_revision += 1
+        value, execution = self._model_checked("survey-review", "methods.survey-reviewer", {
+            "assignment": "Independently check this exact survey, including honest reporting of incomplete coverage.",
+            "phase": "survey_review", "survey_ref": bundle["artifact_ref"], "question": self.score["question"],
+            "map": self._map_body(), "coverage": self._coverage(), "sources": self._source_context(),
+            "relationship_semantics": RELATIONSHIP_SEMANTICS,
+            "required_checks": list(SURVEY_CHECKS),
+            "instructions": "Return {checks:[{check_id,outcome,method,result}],rationale}. Execute exactly the required checks. "
+                "Outcomes passed/failed/insufficient_evidence/check_failed. Passing approves a faithful bounded survey, not novelty or exhaustive coverage. "
+                "Check accurate coverage/accounting, faithful quotations and source scope, and support for every map claim. Unknown facts must stay unknown. "
+                "Unverified provider metadata is not itself a false assertion if explicitly labeled; fail unsupported chronology or superiority inferred from it."
+        }, validate_survey_review, stage="unit_review", task_kind="verification")
+        review = self._publish(f"kb/survey-reviews/{self.survey_revision}", "note", {
+            "survey_ref": bundle["artifact_ref"], "execution_ref": execution, **value}, "methods.survey-reviewer",
+            subjects=[bundle["artifact_ref"], execution])
+        accepted = self.store.accepted(bundle["artifact_id"])
+        adopted = self.gate.accept(bundle["artifact_ref"], review["artifact_ref"], author="strategy.survey-integrator",
+                                  expected_version=accepted["version"] if accepted else None, guard=self._admission_guard)
+        self.survey_ref = adopted["artifact_ref"]
+        self.incumbent = self.survey_ref
+        self.time_policy.mark_first_verified_result(self.survey_ref)
+        self.verified_changes.append({"kind": "accepted_literature_survey", "ref": self.survey_ref})
+        self._checkpoint("survey_accepted", force=True)
+
+    def _admission_guard(self):
+        for binding in self.bindings.values():
+            self.operations.authorize(binding)
+        self._ensure_active()
+
+    def _nominate(self):
+        self.gate.require_current(self.survey_ref)
+        if self.score["proposed_gap"] is not None:
+            self.nomination = deepcopy(self.score["proposed_gap"])
+        else:
+            def validate(value):
+                exact(value, {"id", "statement"}, "gap nomination")
+                identifier(value["id"])
+                if not isinstance(value["statement"], str) or not value["statement"].strip():
+                    raise ValidationError("nomination needs an explicit bounded statement")
+            self.nomination, _ = self._model_checked("nominate", "research.gap-proposer", {
+                "phase": "nomination", "assignment": "Nominate one bounded and testable research-gap hypothesis from the accepted map.",
+                "question": self.score["question"], "map": self._map_body(), "coverage": self._coverage(),
+                "survey_ref": self.survey_ref, "prerequisite_survey_ref": self.survey_ref,
+                "instructions": "Return {id:lowercase_identifier,statement:string}. This is a hypothesis to challenge, not an established novelty claim."
+            }, validate, task_kind="selection")
+        self.nomination_record = self._publish("kb/gap-nomination", "note", {
+            "survey_ref": self.survey_ref, **self.nomination}, "research.gap-proposer", subjects=[self.survey_ref])
+
+    def _countersearch(self):
+        plan, execution = self._model_checked("counter-plan", "methods.novelty-challenger", {
+            "assignment": "Find searches most likely to disprove the nominated gap by locating an existing solution or alternate terminology.",
+            "phase": "counter_plan", "question": self.score["question"], "gap": self.nomination,
+            "map": self._map_body(), "max_queries": self.bounds["queries_per_role"],
+            "search_syntax": SEARCH_SYNTAX,
+            "nomination_ref": self.nomination_record["artifact_ref"],
+            "survey_ref": self.survey_ref, "prerequisite_survey_ref": self.survey_ref,
+            "instructions": "Return {queries:[search strings],rationale:string}. Seek prior solutions, incompatible assumptions, and decisive counterevidence."
+        }, self._plan_validator, stage="supervision", task_kind="selection")
+        record = self._publish("kb/counter-search-plan", "note", {**plan, "survey_ref": self.survey_ref},
+                               "methods.novelty-challenger", subjects=[execution, self.survey_ref])
+        self._search(plan["queries"], "methods.novelty-challenger", record["artifact_ref"])
+        self._full_texts()
+        self._accept_survey()
+
+    def _assess(self):
+        value, execution = self._model_checked("gap-assessment", "methods.novelty-verifier", {
+            "assignment": "Independently determine the status of the nominated gap using the current accepted survey and targeted counter-search.",
+            "phase": "gap_assessment", "question": self.score["question"], "gap": self.nomination,
+            "nomination_ref": self.nomination_record["artifact_ref"],
+            "survey_ref": self.survey_ref, "prerequisite_survey_ref": self.survey_ref,
+            "map": self._map_body(), "coverage": self._coverage(), "sources": self._source_context(),
+            "required_checks": list(GAP_CHECKS),
+            "instructions": "Return {state,rationale,comparisons:[{work_id,relationship,statement,evidence}],checks:[{check_id,outcome,method,result}],evidence}. "
+                "Each evidence item is {work_id,source_ref,quote}, quoting exact available source text. relationship is solves/partial/different/uncertain. "
+                "state is refuted_by_prior_work, insufficient_evidence, or eligible_for_experiment. Run exactly all required checks. "
+                "A prior solution supported by decisive full-text quotes refutes the gap even if global search is incomplete. "
+                "For decisive states all checks must pass and evidence must include verified full_text sources. Abstracts alone cannot authorize a decisive state. "
+                "Use insufficient_evidence if access, source windows, missing closest work, or incomparable conditions prevent the judgment. "
+                "Eligibility requires meaningful, testable distinction, no prior solution or unresolved comparison, and adequate search coverage. "
+                "It authorizes an experiment under the stated scope, never publication-ready novelty. Do not force a positive finding to finish the task."
+        }, lambda value: validate_assessment(value, self.source_docs, self.works), stage="integrated_review", task_kind="verification")
+        if value["state"] == "eligible_for_experiment" and (self.gaps or any(
+                len(source["text"]) > self.bounds["context_chars"] for source in self.source_docs.values()
+                if source["representation"] == "full_text")):
+            raise ValidationError("gap eligibility lacks complete access or decisive source context")
+        record = self._publish("kb/gap-assessments/current", "note", {
+            "survey_ref": self.survey_ref, "nomination_ref": self.nomination_record["artifact_ref"],
+            "execution_ref": execution, **value}, "methods.novelty-verifier",
+            subjects=[self.survey_ref, execution, self.nomination_record["artifact_ref"]])
+        adopted = self.gate.commit_assessment(record["artifact_ref"], survey_ref=self.survey_ref,
+                                             author="strategy.survey-integrator", guard=self._admission_guard)
+        self.assessment_ref = adopted["artifact_ref"]
+        self.verified_changes.append({"kind": "accepted_gap_assessment", "ref": self.assessment_ref})
+        return value["state"]
+
+    def run(self):
+        if threading.current_thread() is not threading.main_thread():
+            raise ValidationError("survey run requires the main thread")
+        previous = signal.getsignal(signal.SIGTERM)
+        def terminate(signum, frame):
+            raise KeyboardInterrupt("termination requested")
+        signal.signal(signal.SIGTERM, terminate)
+        try:
+            return self._run()
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+    def _run(self):
+        status, error, decision = "blocked", None, "insufficient_evidence"
+        try:
+            self._initialize()
+            if not self.time_policy.snapshot()["initial_hard_limit_feasible"]:
+                raise ValidationError("configured survey stages do not fit the hard deadline; no external work dispatched")
+            self._setup()
+            plans = self._initial_plans()
+            for wid in self.score["seed_work_ids"]:
+                self._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+            self._search(self.score["seed_queries"], "research.seed-searcher", self.protocol["artifact_ref"])
+            for role, queries, ref in plans:
+                self._search(queries, role, ref)
+            self._expand()
+            self._full_texts()
+            self._accept_survey()
+            self._nominate()
+            self._countersearch()
+            decision = self._assess()
+            status = "completed"
+        except (Exception, KeyboardInterrupt) as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self.blockers.append({"reason": error})
+        finally:
+            for row in self.control._conn.execute("SELECT task_id FROM tasks WHERE state='awaiting_review'").fetchall():
+                self.tasks.transition(row[0], "blocked", "command.controller", reason="Run ended without an accepted scoped output")
+            current, assessment_current = False, False
+            if self.survey_ref:
+                try:
+                    self.gate.require_current(self.survey_ref)
+                    current = True
+                except Exception:
+                    pass
+            if self.assessment_ref:
+                try:
+                    self.gate.require_current_assessment(self.assessment_ref)
+                    assessment_current = True
+                except Exception:
+                    pass
+            self._checkpoint(status, force=True)
+        result = {"run_id": self.run_id, "project_id": self.config["project_id"], "status": status, "error": error,
+            "incumbent_ref": self.incumbent,
+            "score_ref": getattr(self, "score_ref", None), "survey_ref": self.survey_ref, "survey_current": current,
+            "assessment_ref": self.assessment_ref, "assessment_current": assessment_current,
+            "gap_state": decision, "nomination": self.nomination,
+            "nomination_ref": self.nomination_record["artifact_ref"] if hasattr(self, "nomination_record") else None,
+            "coverage": self._coverage(), "time_plan": self.time_policy.snapshot(), "time_decisions": self.time_decisions,
+            "usage": self.budget.get_window("run-window"), "unreported_usage": self.usage_gaps,
+            "capabilities": {key: self.operations.status(key) for key in self.capability_ids},
+            "blockers": self.blockers, "event_chain": self.control.verify_chain(), "release_status": "not_released"}
+        self._publish("command/results/final", "report", result, "command.controller")
+        self._export(result)
+        self.control.close()
+        return result
+
+    def _export(self, result):
+        output = self.dir / "output"
+        output.mkdir(exist_ok=True)
+        (output / "run.json").write_bytes(canonical_bytes(result))
+        (output / "works.json").write_bytes(canonical_bytes(list(self.works.values())))
+        (output / "coverage.json").write_bytes(canonical_bytes(self._coverage()))
+        if hasattr(self, "map_record"):
+            (output / "literature-map.json").write_bytes(canonical_bytes({
+                "survey_ref": self.survey_ref, "survey_current": result["survey_current"],
+                "map_ref": self.map_record["artifact_ref"], "map": self._map_body()}))
+        if self.assessment_ref:
+            body = self.store.read_body(self.store.get(self.assessment_ref)["body_hash"])
+            (output / "gap-assessment.json").write_bytes(body)
+        lines = ["# Literature assessment", "", self.score["question"], "",
+            f"Run status: **{result['status']}**. Gap state: **{result['gap_state']}**.", "",
+            f"Current accepted survey: {result['survey_ref'] or 'none'}. Current applicability: {result['survey_current']}.", "",
+            "This assessment covers the recorded search protocol. It does not establish exhaustive coverage or publication-ready novelty.", "",
+            "## Works and comparisons", "", "Publication years below are provider-reported and have not been independently reconciled.", ""]
+        for wid, work in self.works.items():
+            lines.extend([f"### {work['title']}", "", f"[Provider record](https://openalex.org/{wid}); reported year: {work['year'] or 'unknown'}.", ""])
+            record = self.analysis_records.get(wid)
+            if record:
+                entry = json.loads(self.store.read_body(record["body_hash"]))
+                lines.extend([f"Screening: {entry['inclusion']}. {entry['reason']}", ""])
+                for field in MAP_FIELDS:
+                    claim = entry[field]
+                    lines.extend([f"**{field.capitalize()}:** {claim['text'] or 'Not established by available text.'}", ""])
+        if self.assessment_ref:
+            assessment = json.loads(self.store.read_body(self.store.get(self.assessment_ref)["body_hash"]))
+            lines.extend(["## Gap assessment", "", f"Hypothesis: {self.nomination['statement']}", "",
+                          f"Nomination: {result['nomination_ref']}. Current assessment applicability: {result['assessment_current']}.", "",
+                          assessment["rationale"], ""])
+            for comparison in assessment["comparisons"]:
+                lines.extend([f"- **{self.works[comparison['work_id']]['title']}** ({comparison['relationship']}): {comparison['statement']}"])
+        lines.extend(["", "## Coverage and unresolved access", "", f"Unique works: {len(self.works)}. Bibliographic calls: {self.api_calls}.", ""])
+        for gap in self.gaps + self.blockers:
+            lines.append("- " + json.dumps(gap, ensure_ascii=False))
+        lines.extend(["", "Release status: not_released.", ""])
+        (output / "survey.md").write_text("\n".join(lines), encoding="utf-8", newline="")

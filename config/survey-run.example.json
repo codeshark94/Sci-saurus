@@ -1,0 +1,111 @@
+{
+  "live_dispatch_allowed": false,
+  "data_classification": "public",
+  "allocation_mode": "capacity_pool",
+  "project_id": "attention-only-survey",
+  "objective": "Trace the evolution of attention-only sequence transduction and assess the proposed research gap against retrieved public literature, including evidence that contradicts it. Preserve bibliographic metadata as returned by its provider and distinguish bounded search coverage from an exhaustive survey.",
+  "supplied_context": "Public literature assessment of sequence transduction architectures. The proposed gap is an unverified claim to assess independently. Use the configured primary text to inspect architecture details and stated limitations; retain conflicting metadata and uncertain source coverage explicitly.",
+  "model": {
+    "protocol": "openai_compatible",
+    "base_url": "runtime_required",
+    "model": "runtime_required",
+    "timeout_seconds": 180,
+    "max_output_tokens": 8192,
+    "auth_env": null
+  },
+  "limits": {
+    "max_rounds": 2,
+    "wall_clock_seconds": 900,
+    "checkpoint_seconds": 15,
+    "max_result_bytes": 20000000,
+    "concurrent_calls": 11
+  },
+  "time_policy": {
+    "first_result_seconds": 480,
+    "target_seconds": 720,
+    "hard_seconds": 900
+  },
+  "survey": {
+    "id": "attention-only-sequence-transduction",
+    "revision": 3,
+    "question": "How did sequence transduction architectures evolve from recurrence and convolution toward attention-based representations, and what assumptions and limitations distinguish the methods?",
+    "seed_queries": [
+      "Attention Is All You Need"
+    ],
+    "seed_work_ids": [
+      "W2626778328"
+    ],
+    "proposed_gap": {
+      "id": "attention-only-absence",
+      "statement": "No sequence transduction architecture has eliminated both recurrence and convolution by using attention alone."
+    },
+    "bibliography": {
+      "id": "survey-openalex",
+      "adapter": "openalex",
+      "client": {
+        "timeout": 20,
+        "max_bytes": 5000000
+      },
+      "representative": {
+        "operation": "work",
+        "query": null,
+        "work_id": "W2626778328",
+        "limit": 1,
+        "cursor": null
+      },
+      "environment_files": []
+    },
+    "full_text": {
+      "id": "survey-primary-text",
+      "adapter": "mcp_fetch",
+      "client": {
+        "command": [
+          ".venv/bin/python",
+          "-m",
+          "mcp_server_fetch"
+        ],
+        "timeout": 60,
+        "max_bytes": 5000000
+      },
+      "representative": {
+        "url": "https://arxiv.org/html/1706.03762",
+        "max_length": 300000
+      },
+      "environment_files": []
+    },
+    "full_text_sources": [
+      {
+        "work_id": "W2626778328",
+        "title": "Attention Is All You Need",
+        "url": "https://arxiv.org/html/1706.03762",
+        "section_markers": [
+          "Introduction",
+          "Model Architecture",
+          "Conclusion"
+        ]
+      }
+    ],
+    "search": {
+      "queries_per_role": 1,
+      "results_per_query": 3,
+      "max_works": 10,
+      "expansion_rounds": 1,
+      "expansion_seed_count": 1,
+      "references_per_work": 2,
+      "max_api_calls": 18,
+      "min_new_works": 1,
+      "saturation_rounds": 1,
+      "max_full_texts": 2,
+      "max_text_chars": 300000,
+      "context_chars": 22000
+    },
+    "stage_seconds": {
+      "setup": 120,
+      "supervision": 45,
+      "production": 60,
+      "unit_review": 60,
+      "integrated_review": 90,
+      "reassessment": 45
+    }
+  }
+}

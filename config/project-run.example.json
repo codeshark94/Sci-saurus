@@ -1,0 +1,113 @@
+{
+  "live_dispatch_allowed": false,
+  "data_classification": "public",
+  "allocation_mode": "capacity_pool",
+  "project_id": "synthetic-sleep-project",
+  "objective": "Repair the immediate-recall interpretation and pending follow-up status across assigned paragraphs. Preserve supplied statistics, unchanged limitations, section order, and claim bindings. Avoid unsupported long-term or practical recommendations.",
+  "supplied_context": "# Supplied Results Package — SP-001 (P1 slice fixture)\n\n> **SYNTHETIC FIXTURE.** Authored for P1 acceptance testing; not a real study and not real user data.\n> `schema_version: '0.8'` · input role: `premise` (user-supplied, approved) · artifact ref: `artifact:inputs/results-package@1` (example resolution under CC-001).\n\n## 1. Study summary\n\n- Design: two-condition, between-subject experiment with randomized assignment.\n- Participants: n = 40 healthy adults (20 per condition), ages 18–35, single site.\n- Conditions: **A** = normal overnight sleep (≥ 7 h, verified by actigraphy); **B** = sleep-restricted night (≤ 4 h, verified).\n- Task: 16-item word-pair cued recall, administered 30 minutes after waking. **Immediate recall only.**\n\n## 2. Reported results (as supplied by the Principal)\n\n| Metric | A — normal sleep | B — sleep restricted |\n|---|---|---|\n| Mean items recalled (of 16) | 14.1 (SD 2.9) | 12.4 (SD 3.2) |\n| Median response time per pair | 2.9 s | 3.1 s |\n\nStatistics as supplied: Welch's *t*(38) = 2.31, *p* = 0.026, Cohen's *d* = 0.73 for the recall comparison; response-time comparison not significant (*p* = 0.41).\n\n## 3. Procedure (as reported)\n\nPaired-associate learning: encoding session in the evening, sleep manipulation overnight, cued recall test the next morning. Standard exclusion criteria (self-reported sleep, neurological, or psychiatric conditions) were applied.\n\n## 4. User-stated findings (verbatim)\n\n- **F1:** \"Participants with normal sleep recalled more word pairs than sleep-restricted participants (14.1 vs 12.4; *p* = 0.026).\"\n- **F2:** \"Sleep deprivation impairs long-term memory consolidation, reducing retention by up to 15%.\"\n- **F3:** \"Retention after seven days was significantly better in the normal-sleep group.\" (Follow-up data have been collected but are **not yet entered or verified**; no numbers are supplied.)\n\n## 5. Limitations (as stated by the Principal)\n\nSmall sample; single site; healthy volunteers; a single recall measure; follow-up data not yet verified.\n\n## 6. Supplied provenance\n\nCondition-assignment log: summarized only (randomized, balanced). Raw data files: **not supplied** by design — re-analysis is outside the v1 boundary (SSOT §9). Missing information stays missing; ingestion may not invent or estimate it (40 §3.2).",
+  "public_queries": [
+    "sleep memory immediate recall long term consolidation"
+  ],
+  "source_urls": [
+    "https://www.nhlbi.nih.gov/health/sleep/why-sleep-important"
+  ],
+  "mcp_fetch_command": [
+    ".venv/bin/python",
+    "-m",
+    "mcp_server_fetch"
+  ],
+  "model": {
+    "protocol": "openai_compatible",
+    "base_url": "runtime_required",
+    "model": "runtime_required",
+    "timeout_seconds": 180,
+    "max_output_tokens": 8192,
+    "auth_env": null
+  },
+  "limits": {
+    "max_rounds": 3,
+    "search_results": 3,
+    "max_capture_chars": 16000,
+    "max_source_bytes": 2000000,
+    "wall_clock_seconds": 1200,
+    "checkpoint_seconds": 15,
+    "retrieval_timeout_seconds": 60,
+    "max_result_bytes": 10000000,
+    "concurrent_calls": 3
+  },
+  "document": {
+    "title": "Sleep and immediate recall: synthetic integration fixture",
+    "sections": [
+      {
+        "id": "results-section",
+        "title": "Results and interpretation",
+        "paragraphs": [
+          {
+            "id": "recall",
+            "editable": true,
+            "text": "In this randomized experiment of 40 healthy adults, the normal-sleep group recalled 14.1 word pairs (SD 2.9), compared with 12.4 (SD 3.2) after sleep restriction, Welch’s t(38) = 2.31, p = 0.026, d = 0.73. This proves that sleep protects long-term memory consolidation by up to 15%, and seven-day retention was significantly better, so students should schedule exams after a full night of sleep.",
+            "objective": "Preserve the immediate-recall statistics exactly, clarify the measured task and timing, and give a qualified immediate-recall interpretation. Remove unsupported long-term, retention magnitude, follow-up significance, and exam-scheduling claims. The followup paragraph owns the pending-data gap.",
+            "required_literals": [
+              "40",
+              "14.1",
+              "2.9",
+              "12.4",
+              "3.2",
+              "38",
+              "2.31",
+              "0.026",
+              "0.73"
+            ],
+            "claim_ids": [
+              "recall-result",
+              "immediate-interpretation"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "limitations-section",
+        "title": "Follow-up and limitations",
+        "paragraphs": [
+          {
+            "id": "followup",
+            "editable": true,
+            "text": "Seven-day retention was significantly better after normal sleep, confirming a lasting improvement of up to 15% and supporting exam scheduling after a full night of sleep.",
+            "objective": "Replace unsupported follow-up findings and recommendations with the exact pending-data status: follow-up data collected but not entered or verified; no retention figures are supplied. Do not describe unverified data as uncollected or unmeasured.",
+            "required_literals": [],
+            "claim_ids": [
+              "followup-gap"
+            ]
+          },
+          {
+            "id": "limitations",
+            "editable": false,
+            "text": "The supplied results concern 40 healthy adults at a single site, one acute sleep manipulation, and one immediate-recall task.",
+            "objective": null,
+            "required_literals": [
+              "40"
+            ],
+            "claim_ids": []
+          }
+        ]
+      }
+    ]
+  },
+  "claims": [
+    {
+      "id": "recall-result",
+      "statement": "Under the tested conditions, normal-sleep participants recalled more word pairs than sleep-restricted participants. Transcribe all supplied recall statistics exactly, including conditions and test type."
+    },
+    {
+      "id": "immediate-interpretation",
+      "statement": "The immediate-recall difference is consistent with a role of sleep in memory processes shortly after encoding. These verified results do not establish long-term retention or consolidation magnitude."
+    },
+    {
+      "id": "followup-gap",
+      "statement": "Seven-day follow-up data have been collected but are not yet entered or verified. No follow-up retention numbers or significance results may be asserted."
+    }
+  ],
+  "operations": {
+    "environment_files": []
+  }
+}

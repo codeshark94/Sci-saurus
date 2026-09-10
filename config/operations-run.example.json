@@ -1,0 +1,361 @@
+{
+  "live_dispatch_allowed": false,
+  "data_classification": "public",
+  "allocation_mode": "capacity_pool",
+  "project_id": "artifact-gateway-policy",
+  "objective": "Produce a schema-valid policy.json and an operations guide that states the same approved retry, backoff, and rate-limit values. Preserve service identity and binding and distinguish a validated configuration candidate from deployment or measured service behavior.",
+  "supplied_context": "Public example configuration for the artifact-gateway service. Existing identity and binding are version 1, service artifact-gateway, host 127.0.0.1, port 8080. The approved operating values are: at most 3 total attempts per request, including the initial attempt (no more than two retries); exponential retry backoff with base delay 200 ms and maximum delay 2000 ms; full jitter; rate limit 120 requests per minute with burst capacity 20. The supplied baseline disables retries and rate limiting and uses an unsupported backoff strategy. Repair the JSON policy and operating guide to the approved values. The configured schema checker establishes JSON syntax and declared field constraints only. No service has been started, no deployment has occurred, and behavior under load has not been measured. Do not infer service behavior or production readiness from a passing schema check.",
+  "model": {
+    "protocol": "openai_compatible",
+    "base_url": "runtime_required",
+    "model": "runtime_required",
+    "timeout_seconds": 90,
+    "max_output_tokens": 8192,
+    "auth_env": null
+  },
+  "limits": {
+    "max_rounds": 2,
+    "max_result_bytes": 10000000,
+    "concurrent_calls": 3,
+    "wall_clock_seconds": 600,
+    "checkpoint_seconds": 15
+  },
+  "claims": [
+    {
+      "id": "service-identity",
+      "statement": "Keep version 1, service artifact-gateway, host 127.0.0.1, and port 8080 unchanged."
+    },
+    {
+      "id": "operating-values",
+      "statement": "Use 3 total attempts, exponential backoff with 200 ms base and 2000 ms maximum delays and full jitter, a rate limit of 120 requests per minute, and burst capacity 20. The JSON and guide must agree."
+    },
+    {
+      "id": "execution-boundary",
+      "statement": "Schema validation checks syntax and field constraints. The configuration has not been deployed, the service has not been started, and behavior under load has not been measured."
+    }
+  ],
+  "deliverable": {
+    "id": "operations-guide",
+    "title": "Artifact gateway operating policy",
+    "output_file": "operations-guide.md",
+    "groups": [
+      {
+        "id": "policy-group",
+        "title": "Service configuration",
+        "units": [
+          {
+            "id": "policy",
+            "kind": "json",
+            "text": "{\n  \"version\": 1,\n  \"service\": \"artifact-gateway\",\n  \"bind\": {\n    \"host\": \"127.0.0.1\",\n    \"port\": 8080\n  },\n  \"retry\": {\n    \"max_attempts\": 0,\n    \"strategy\": \"none\",\n    \"base_delay_ms\": 0,\n    \"max_delay_ms\": 0,\n    \"jitter\": \"none\"\n  },\n  \"rate_limit\": {\n    \"requests_per_minute\": 0,\n    \"burst\": 0\n  }\n}",
+            "editable": true,
+            "objective": "Correct the retry and rate-limit fields to the exact approved values. Keep version, service, host, and port unchanged; do not introduce new properties.",
+            "required_literals": [
+              "artifact-gateway",
+              "127.0.0.1",
+              "8080"
+            ],
+            "claim_ids": [
+              "service-identity",
+              "operating-values"
+            ],
+            "output_file": "policy.json"
+          }
+        ]
+      },
+      {
+        "id": "guide-group",
+        "title": "Operating guide",
+        "units": [
+          {
+            "id": "operating-guide",
+            "kind": "paragraph",
+            "text": "Artifact-gateway accepts unlimited traffic and retries failed requests immediately until they succeed. This policy is already deployed and proven stable under load.",
+            "editable": true,
+            "objective": "Describe the exact approved attempts, exponential backoff, delays, full jitter, rate limit, and burst in the JSON policy. State the configuration validation boundary without claiming deployment, observed enforcement, stability, or measured behavior. Use the exact phrase \"at most 3 total attempts per request, including the initial attempt\"; do not describe the limit as three retries or three retry attempts.",
+            "required_literals": [],
+            "claim_ids": [
+              "operating-values",
+              "execution-boundary"
+            ],
+            "output_file": null
+          },
+          {
+            "id": "deployment-boundary",
+            "kind": "paragraph",
+            "text": "Service artifact-gateway remains bound to 127.0.0.1:8080. This configuration candidate has not been deployed, and live service behavior has not been measured.",
+            "editable": false,
+            "objective": null,
+            "required_literals": [
+              "artifact-gateway",
+              "127.0.0.1",
+              "8080"
+            ],
+            "claim_ids": [
+              "service-identity",
+              "execution-boundary"
+            ],
+            "output_file": null
+          }
+        ]
+      }
+    ]
+  },
+  "score": {
+    "id": "operating-policy",
+    "revision": 2,
+    "domain": "operational policy configuration",
+    "checks": [
+      {
+        "check_id": "policy-guide-consistency",
+        "requirement": "Compare all retry and rate-limit values in the exact JSON candidate and operating guide against the approved supplied values; fail on missing values, mismatches, or additional unsupported behavior. The guide must contain \"at most 3 total attempts per request, including the initial attempt\" so that retries cannot be confused with total attempts."
+      },
+      {
+        "check_id": "execution-evidence-boundary",
+        "requirement": "Require the exact staged policy to pass the configured schema checker. Distinguish checker output from deployment, enforcement, stability, or measured service behavior; fail any unsupported claim that the policy has been deployed or tested under load."
+      }
+    ],
+    "capabilities": [
+      {
+        "id": "json-schema-check",
+        "adapter": "local_program",
+        "client": {
+          "command": [
+            "runtime_required"
+          ],
+          "timeout": 30,
+          "max_bytes": 1000000
+        },
+        "representative": {
+          "input": {
+            "text": "{}",
+            "schema": {
+              "type": "object"
+            }
+          }
+        },
+        "environment_files": []
+      }
+    ],
+    "workloads": [
+      {
+        "id": "baseline-policy-check",
+        "capability_id": "json-schema-check",
+        "arguments": {
+          "input": {
+            "text": "{\n  \"version\": 1,\n  \"service\": \"artifact-gateway\",\n  \"bind\": {\n    \"host\": \"127.0.0.1\",\n    \"port\": 8080\n  },\n  \"retry\": {\n    \"max_attempts\": 0,\n    \"strategy\": \"none\",\n    \"base_delay_ms\": 0,\n    \"max_delay_ms\": 0,\n    \"jitter\": \"none\"\n  },\n  \"rate_limit\": {\n    \"requests_per_minute\": 0,\n    \"burst\": 0\n  }\n}",
+            "schema": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "version": {
+                  "const": 1
+                },
+                "service": {
+                  "const": "artifact-gateway"
+                },
+                "bind": {
+                  "type": "object",
+                  "properties": {
+                    "host": {
+                      "const": "127.0.0.1"
+                    },
+                    "port": {
+                      "const": 8080
+                    }
+                  },
+                  "required": [
+                    "host",
+                    "port"
+                  ],
+                  "additionalProperties": false
+                },
+                "retry": {
+                  "type": "object",
+                  "properties": {
+                    "max_attempts": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 3
+                    },
+                    "strategy": {
+                      "enum": [
+                        "exponential"
+                      ]
+                    },
+                    "base_delay_ms": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 500
+                    },
+                    "max_delay_ms": {
+                      "type": "integer",
+                      "minimum": 1000,
+                      "maximum": 5000
+                    },
+                    "jitter": {
+                      "enum": [
+                        "full"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "max_attempts",
+                    "strategy",
+                    "base_delay_ms",
+                    "max_delay_ms",
+                    "jitter"
+                  ],
+                  "additionalProperties": false
+                },
+                "rate_limit": {
+                  "type": "object",
+                  "properties": {
+                    "requests_per_minute": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 120
+                    },
+                    "burst": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 20
+                    }
+                  },
+                  "required": [
+                    "requests_per_minute",
+                    "burst"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "required": [
+                "version",
+                "service",
+                "bind",
+                "retry",
+                "rate_limit"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      }
+    ],
+    "candidate_checks": [
+      {
+        "id": "policy-schema-valid",
+        "capability_id": "json-schema-check",
+        "unit_id": "policy",
+        "input": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "version": {
+                "const": 1
+              },
+              "service": {
+                "const": "artifact-gateway"
+              },
+              "bind": {
+                "type": "object",
+                "properties": {
+                  "host": {
+                    "const": "127.0.0.1"
+                  },
+                  "port": {
+                    "const": 8080
+                  }
+                },
+                "required": [
+                  "host",
+                  "port"
+                ],
+                "additionalProperties": false
+              },
+              "retry": {
+                "type": "object",
+                "properties": {
+                  "max_attempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3
+                  },
+                  "strategy": {
+                    "enum": [
+                      "exponential"
+                    ]
+                  },
+                  "base_delay_ms": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 500
+                  },
+                  "max_delay_ms": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "maximum": 5000
+                  },
+                  "jitter": {
+                    "enum": [
+                      "full"
+                    ]
+                  }
+                },
+                "required": [
+                  "max_attempts",
+                  "strategy",
+                  "base_delay_ms",
+                  "max_delay_ms",
+                  "jitter"
+                ],
+                "additionalProperties": false
+              },
+              "rate_limit": {
+                "type": "object",
+                "properties": {
+                  "requests_per_minute": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 120
+                  },
+                  "burst": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20
+                  }
+                },
+                "required": [
+                  "requests_per_minute",
+                  "burst"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "version",
+              "service",
+              "bind",
+              "retry",
+              "rate_limit"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "text_field": "text",
+        "result_path": [
+          "valid"
+        ],
+        "expected": true
+      }
+    ],
+    "stage_seconds": {
+      "setup": 30,
+      "supervision": 30,
+      "production": 30,
+      "unit_review": 70,
+      "integrated_review": 80,
+      "reassessment": 30
+    }
+  }
+}

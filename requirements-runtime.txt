@@ -1,3 +1,4 @@
 mcp-server-fetch==2026.8.18
 mcp==1.30.0
 readabilipy==0.3.0
+jsonschema==4.26.0

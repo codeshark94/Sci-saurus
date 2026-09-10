@@ -1,12 +1,12 @@
 # Sci-saurus — Concept SSOT
 
-> **Version:** v0.8 · **Date:** 2026-09-10 · **Status:** working design; not an implemented system.
+> **Version:** v0.9 · **Date:** 2026-09-10 · **Status:** normative design; implemented slices and evidence are documented separately.
 > This is the normative source for purpose, authority, terminology, and design decisions. [System Concept](05-system-concept.md) explains the organizing model. Architecture and execution contracts implement these decisions.
 > Preserve prior decisions. Amend them with explicit superseding decisions rather than rewriting history. Historical decision entries below are retained; this checkout does not contain a separate historical document archive.
 
 ## 1. Definition and primary objective
 
-**Sci-saurus is a Principal-directed, compute-rich research organization that pursues evidence-backed progress through flexible, rationally supervised activity.** Investigation, alternative construction, synthesis, criticism, verification, and replanning are complementary reasoning activities. It exists to realize the human Principal's intent, not to maximize discussion, satisfy its own reviewers, or perpetuate its own activity.
+**Sci-saurus is a Principal-directed, compute-rich, general-purpose project organization that pursues evidence-backed progress through flexible, rationally supervised activity.** Investigation, alternative construction, synthesis, criticism, verification, and replanning are complementary reasoning activities. Its reusable core organizes goals, tasks, evidence, artifact versions, tools, independent checks, and time. The mission selects the deliverable and domain requirements.
 
 The flagship mission is **a user-supplied results package + rough storyline → broad external intelligence gathering → defensible argument → English manuscript → LaTeX source and rendered PDF**. Research & Intelligence, Strategy & Writing, Methods & Validation, and the Editorial Office retain distinct responsibilities while collaborating through a shared workspace, an organization-wide Web Intelligence Fabric, and recorded, event-driven exchanges.
 
@@ -18,8 +18,8 @@ External GPU capacity is assumed plentiful. The default policy spends generously
 
 | Horizon | Capability | Boundary |
 |---|---|---|
-| v1 | Project-scoped organization with adaptive activity, elastic inference, four scientific/editorial responsibilities, on-demand Operations Cell, active web/tools, scoped revisions, and human release approval | Authorized practical program execution; no new experiments or substantive analysis of raw research data |
-| v1.5 | A second deliverable through a different Score, reusing department contracts | Report/proposal support must be demonstrated, not assumed from generic role names |
+| v1 | General-purpose project organization with mission-specific Scores, elastic inference, functional departments, on-demand Operations Cell, selected web/tools, scoped revisions, time accounting, and human release approval | Paper is the flagship; non-paper artifacts must exercise the same runtime. No new experiments or substantive analysis of raw research data |
+| v1.5 | Broader deliverables and custom Score composition, reusing department contracts | Generality beyond the implemented bounded revision contract must be demonstrated on additional missions |
 | v2 | Explicitly authorized scientific analysis/experimental execution beyond supplied results | New methods, result provenance, and domain validation; practical tool/environment operation already exists in v1 |
 | v3 | Reusable organizational experience and external-agent collaboration | Process improvements are versioned, evaluated, and approved; no self-amendment of the Principal's intent |
 
@@ -46,7 +46,7 @@ The following records describe the original design. Where they conflict with a l
 
 ### 3.2 New decisions incorporated in this revision
 
-**Decision status:** D13–D15 and D22–D24 retain the established direction. D25 records the compute and supervision premise; D31–D36 specify surgical revision, structured management, active external intelligence, project instances, and practical operations. Engineering mechanisms are working design policies, not claims of measured efficacy or independently authorized runtime operations. Later decisions supersede only the explicitly named scope.
+**Decision status:** D13–D15 and D22–D24 retain the established direction. D25 records the compute and supervision premise; D31–D36 specify surgical revision, structured management, active external intelligence, project instances, and practical operations. D37–D38 establish mission-independent execution and explicit result/time contracts. Engineering mechanisms do not establish measured efficacy or independently authorize runtime operations. Later decisions supersede only the explicitly named scope.
 
 **D13 — Adversarial progress by default.** Every department has a designated independent Adversarial Reviewer. Its mandate is to find substantive, justified reasons an output should not advance. Its output contains objections, investigation requests, or an explicit no-valid-objection-found result—not praise or ceremonial approval. It must not invent flaws to meet a negativity quota. Producers may rebut. An adjudicator other than the producer or reviewer decides disputed validity; repairs require verification. No substantive departmental deliverable advances without recorded adversarial coverage. This extends D4.
 
@@ -96,9 +96,15 @@ The following records describe the original design. Where they conflict with a l
 
 **D36 — On-demand Operations Cell with actual execution responsibility.** Activate a practical support cell when a project needs program setup, API/MCP connection, adapter implementation, execution, repair, or packaging. It must carry useful open-source programs and services through a real project-runtime run and inspected outputs, not stop at recommendations, installation logs, or schema listing. Reuse existing workers/tasks; enabled tools remain directly usable by departments. The cell prepares and operates the environment under existing project delegation, while independent operational checks and qualified departmental review decide acceptance. This brings practical setup/execution into v1, superseding D8's deferral for that scope; substantive new analysis/experiments remain a separate mission capability.
 
+**D37 — General-purpose core; mission-specific Scores.** Project organization, immutable artifacts, scoped proposals, review, operational readiness, and resource accounting are shared across deliverables. Paper production is the flagship application. A versioned Score declares the domain, output units/files, additional acceptance checks, selected capabilities, and workloads; an operational guide or configuration must not inherit academic retrieval, scientific terminology, or manuscript output names implicitly. Real programs may validate exact candidate artifacts through the same task and evidence services. This strengthens D2 and D6, broadens D35's research-project terminology to all authorized project instances, and supersedes deferring the first non-paper execution proof to v1.5/P4. It does not authorize arbitrary tool execution or imply that every Score design feature is implemented.
+
+**D38 — Explicit result targets and protected verification time.** A mission can define a target for its first newly verified result, a completion target, and a hard elapsed-time cap. Initial stage durations are declared planning assumptions; completed work updates their estimates with observed durations and visible provenance. Admission reserves time and capacity for independent unit and integrated review. Reaching a completion target stops discretionary production/reassessment while already required verification remains subject to the hard cap. An infeasible initial hard cap blocks external work. Missing a target remains visible; neither an inherited baseline nor a successful program exit establishes a new verified result. This extends D25, D27, D29, and D30 without promising completion by a guessed duration or lowering acceptance requirements.
+
+**D39 — Literature assessment precedes paper contribution selection.** A paper mission first establishes a current, versioned prior-work survey with abstract screening, citation expansion, supported research lineages, comparable results, and unresolved questions. The bounded [Literature Survey Score](75-literature-survey-score.md) implements OpenAlex discovery, configured MCP full-text capture, immutable per-work mapping, mandatory focused claim and relationship reviews with scoped repair, independent survey review, and an independently challenged gap assessment through the shared execution services. Gap nomination, targeted challenge, and assessment require a current accepted survey at dispatch; survey and assessment commitment recheck exact evidence, governing versions, and time/capability authority. Targeted challenge and assessment also bind the exact nomination; a candidate revision invalidates its prior verdict independently of survey currentness. Decisive comparisons require verified full-text evidence from the compared work. Failure to find a solution is not proof of novelty; insufficient access or coverage requires abstention. The implemented search uses finite query and citation batches, provider-reported metadata, and explicitly configured full-text routes. Local workflow tests establish those boundaries; held-out expert-level accuracy, resumable surveys, and the complete paper pipeline remain separate requirements. Non-paper Scores remain unaffected.
+
 ### 3.3 Effective interpretation of earlier rules
 
-| Earlier wording | Effective v0.8 interpretation |
+| Earlier wording | Effective interpretation |
 |---|---|
 | Composer writes only releases | Command may author intent interpretations, missions, tasks, decisions, and release proposals in its own namespaces; it may not rewrite departmental knowledge |
 | Every edit is a new artifact version | Immutable content and metadata are preserved; status, approval, and adoption are append-only events, not in-place edits |
@@ -112,6 +118,8 @@ The following records describe the original design. Where they conflict with a l
 | A department owns an artifact namespace | Ownership permits responsibility and scoped proposals; it does not confer unrestricted whole-document editing |
 | Every draft is an immutable artifact | Accepted document versions compose exact structural-unit versions and pinned references; generated files are derived views |
 | Resource-aware tool execution is long-term | Practical project-local OSS/API/MCP setup and use are v1; new scientific experiments/estimation remain separately scoped |
+| Project means research project; other deliverables follow later | The core serves all authorized projects. Paper is the flagship, and the first non-paper Score proof belongs to the initial shared runtime |
+| More time or an existing baseline implies progress | First-result and completion targets are explicit; only a newly independently accepted artifact fulfills the first verified-result target |
 
 ## 4. Organization and authority
 
@@ -194,11 +202,12 @@ A raw dataset without interpretable, supplied results is insufficient for a fina
 | Item | Current disposition |
 |---|---|
 | Q1 harness | D9 retained; D19 gives a proposed transactional implementation |
-| Q2 deliverable | English LaTeX source + PDF, with evidence/review archive |
+| Q2 deliverable | Mission-selected artifact and evidence/review archive; the paper flagship requires English LaTeX source + rendered PDF |
 | Q3 retrieval providers | Web Intelligence Fabric contract fixed; exact search/index/full-text/patent/standards/code/dataset providers, credentials, source rights, robots/terms constraints, and outbound-data policy remain project configuration |
 | Q4 models/resources | Capable role profiles and plentiful external inference are the default direction. Endpoints, measured capacity, data policy, finite leases, and metered limits remain deployment configuration. Authorized capacity windows renew automatically; missing authorization blocks dispatch |
 | Q5 human checkpoints | Faithful explicit instructions can activate intent/mission. Internal plans and outlines advance within delegation; an optional mission policy may require outline approval. Final release, material goal/trade-off changes, and out-of-mandate actions require the Principal |
 | Review independence | Separate role/context mandatory; additional model/provider optional and subject to data permission. No cloud fallback without authorization |
+| Time policy | Finite elapsed cap required by the bounded runtime; optional first-result and completion targets derive from declared stage estimates when omitted. Estimates and measured timings remain distinct |
 | First evaluation dataset | Must be defined and frozen before claiming improved quality or scaling benefit |
 
 These defaults make the blueprint internally concrete; they do not falsely mark the user's outstanding provider/budget choices as decided. Project configuration must resolve them before the corresponding live operation.
@@ -215,6 +224,8 @@ These defaults make the blueprint internally concrete; they do not falsely mark 
 | `40-execution-contract.md` | Exact identifiers, lifecycle rules, schema field contracts, and Score semantics |
 | `45-artifact-change-control.md` | Stable structural units, references, surgical revision, edit grants, and verified integration |
 | `50-web-intelligence-integration.md` | Active retrieval, API/plugin adapters, capability state, and evidence-to-change routing |
+| `70-scored-project-runtime.md` | Implemented bounded Score, selected operational workloads, non-paper fixture, exact candidate checks, and result/time contracts |
+| `75-literature-survey-score.md` | Implemented bounded literature survey, focused reviews, independent gap challenge, evidence gates, and evaluation contract |
 | `web-search-campaign.yaml` | Illustrative search campaign; not a working runtime |
 | `25-p0-freeze.md` | P0 contract-freeze record: frozen principles, selected first fixture, deployment-configuration template, acceptance state |
 | `fixtures/`, `config/` | Non-normative test assets: the P1 slice fixture set and the deployment template pinned by the P0 freeze record |
@@ -229,3 +240,4 @@ These defaults make the blueprint internally concrete; they do not falsely mark 
 | v0.6 | D22–D24; organization-wide Web Intelligence Fabric; specialized Research retrieval roles; independent adversarial search; coverage-oriented search campaigns and discovery→evidence promotion |
 | v0.7 | D25–D30; compute-rich activity graph; renewable capacity; rational supervision; provisional exploration; elapsed-time checkpoints; adaptation in the first implementation |
 | v0.8 | D31–D36; surgical revision; paragraph/structure/reference versioning; scoped grants and atomic integration; active API/plugin intelligence; per-project organization and on-demand practical operations |
+| v0.9 | D37–D39; general-purpose project core, mission-selected artifacts/tools, explicit result/time contracts, and a literature-assessment prerequisite for paper contribution selection |

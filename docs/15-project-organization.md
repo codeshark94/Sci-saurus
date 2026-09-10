@@ -1,6 +1,6 @@
 # Sci-saurus — Project Organization and Operations
 
-> **Version:** v0.8 · **Date:** 2026-09-10 · **Status:** proposed organization and execution design.
+> **Version:** v0.8 · **Date:** 2026-09-10 · **Status:** organization design; bounded configured-adapter lifecycle implemented in [the project runtime](65-project-runtime.md).
 > Governed by [SSOT](00-SSOT.md) D35–D36. Integrates the [activity model](05-system-concept.md), [web/tool adapters](50-web-intelligence-integration.md), and [scoped artifact changes](45-artifact-change-control.md).
 
 ## 1. One operating organization per project

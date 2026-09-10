@@ -181,6 +181,9 @@ for line in sys.stdin:
         if mode == 'environment':
             text = json.dumps({'ambient': os.environ.get('SCISAURUS_TEST_API_SECRET'),
                                'explicit': os.environ.get('SCISAURUS_TEST_EXPLICIT')})
+        if mode == 'workspace':
+            import tempfile
+            text = json.dumps({'cwd': os.getcwd(), 'temp': tempfile.gettempdir()})
         result = {'content': [{'type': 'text', 'text': text}], 'isError': mode == 'tool_error'}
         if mode == 'rpc_error':
             emit({'jsonrpc': '2.0', 'id': incoming['id'], 'error': {'code': -32000, 'message': 'source denied'}})
@@ -277,6 +280,16 @@ class TestMCPRetrieval(unittest.TestCase):
         result = MCPFetchClient([str(Path(self.directory.name, "not-installed"))]).fetch("https://example.org/source")
         self.assertEqual(result["outcome"], "provider_error")
         self.assertIsNone(result["capture_sha256"])
+
+    def test_server_and_temporary_files_use_project_workspace(self):
+        workspace = Path(self.directory.name, "project-workspace")
+        workspace.mkdir()
+        result = self.client("workspace", cwd=str(workspace)).fetch("https://example.org/source")
+        self.assertEqual(result["outcome"], "ok")
+        actual = json.loads(result["text"])
+        self.assertEqual(Path(actual["cwd"]).resolve(), workspace.resolve())
+        self.assertEqual(Path(actual["temp"]).resolve(), workspace.resolve())
+        self.assertEqual(result["metadata"]["cwd"], str(workspace))
 
     def test_input_validation_precedes_execution(self):
         with self.assertRaises(ValueError):

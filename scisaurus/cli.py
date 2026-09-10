@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import sys
 
 from scisaurus.core.events import ControlStore
@@ -41,20 +42,52 @@ def main(argv=None) -> int:
     p_run.add_argument("project_dir")
     p_run.add_argument("--config", required=True)
 
+    p_project = sub.add_parser("run-project", help="run scoped artifact work from a project Score")
+    p_project.add_argument("project_dir")
+    p_project.add_argument("--config", required=True)
+    p_project.add_argument("--deadline-seconds", type=float, help="Hard elapsed deadline within the configured limit")
+    p_project.add_argument("--target-seconds", type=float, help="Target completion time; stop admitting discretionary work")
+    p_project.add_argument("--first-result-seconds", type=float, help="Target time for the first verified result")
+
+    p_survey = sub.add_parser("run-survey", help="map literature and independently test a research-gap hypothesis")
+    p_survey.add_argument("project_dir")
+    p_survey.add_argument("--config", required=True)
+    p_survey.add_argument("--deadline-seconds", type=float)
+    p_survey.add_argument("--target-seconds", type=float)
+    p_survey.add_argument("--first-result-seconds", type=float)
+
     args = parser.parse_args(argv)
-    if args.cmd == "run-paragraph":
-        from scisaurus.runtime.config import load_config
-        from scisaurus.runtime.runner import ParagraphRunner
-        from scisaurus.core.errors import ContractError
+    if args.cmd in {"run-paragraph", "run-project", "run-survey"}:
+        from scisaurus.core.errors import ContractError, ValidationError
+        if args.cmd == "run-survey":
+            from scisaurus.runtime.survey_config import load_survey_config as load_config
+            from scisaurus.runtime.survey import SurveyRunner as Runner
+        elif args.cmd == "run-project":
+            from scisaurus.runtime.project_config import load_project_config as load_config
+            from scisaurus.runtime.project import ProjectRunner as Runner
+        else:
+            from scisaurus.runtime.config import load_config
+            from scisaurus.runtime.runner import ParagraphRunner as Runner
         try:
-            result = ParagraphRunner(args.project_dir, load_config(args.config),
+            config = load_config(args.config)
+            if args.cmd in {"run-project", "run-survey"}:
+                overrides = {name: getattr(args, flag) for name, flag in (
+                    ("hard_seconds", "deadline_seconds"), ("target_seconds", "target_seconds"),
+                    ("first_result_seconds", "first_result_seconds")) if getattr(args, flag) is not None}
+                if overrides:
+                    if "score" not in config and "survey" not in config:
+                        raise ValidationError(
+                            "Time planning options require a versioned Score configuration")
+                    config["time_policy"] = {**(config.get("time_policy") or {}), **overrides}
+            result = Runner(args.project_dir, config,
                 on_progress=lambda state: print(json.dumps(state), flush=True)).run()
         except ContractError as exc:
             print(f"configuration rejected: {exc}", file=sys.stderr)
             return 2
         print(json.dumps({"status": result["status"], "incumbent_ref": result["incumbent_ref"],
-                          "report": str(__import__("pathlib").Path(args.project_dir).resolve() / "output" / "report.md")}, indent=2))
-        return 0 if result["status"] == "accepted" else 3
+                          "report": str(Path(args.project_dir).resolve() / "output" / (
+                              "survey.md" if args.cmd == "run-survey" else "report.md"))}, indent=2))
+        return 0 if result["status"] in {"accepted", "completed"} else 3
 
 
     if args.cmd == "init":

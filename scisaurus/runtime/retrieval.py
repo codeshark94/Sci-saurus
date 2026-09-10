@@ -24,7 +24,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
-ADAPTER_VERSION = "1"
+ADAPTER_VERSION = "2"
 MCP_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = {MCP_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"}
 SAFE_PROCESS_ENV = {
@@ -199,12 +199,15 @@ class _RetrievalFailure(Exception):
 class _StdioMCP:
     """One bounded MCP session; no shell and no ambient API credentials."""
 
-    def __init__(self, command, timeout, max_bytes, env, own_process_group):
+    def __init__(self, command, timeout, max_bytes, env, own_process_group, cwd=None):
         self.command, self.timeout, self.max_bytes = command, timeout, max_bytes
         self.own_process_group = own_process_group
+        self.cwd = cwd
         self.env = {k: v for k, v in os.environ.items() if k.upper() in SAFE_PROCESS_ENV}
         self.env.update(env or {})
         self.env["PYTHONIOENCODING"] = "utf-8"
+        if cwd is not None:
+            self.env["TMPDIR"] = cwd
         self.messages = queue.Queue(maxsize=8)
         self.stop = threading.Event()
         self.expired = threading.Event()
@@ -219,7 +222,7 @@ class _StdioMCP:
     def __enter__(self):
         self.process = subprocess.Popen(
             self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            bufsize=0, env=self.env, shell=False,
+            bufsize=0, env=self.env, shell=False, cwd=self.cwd,
             start_new_session=self.own_process_group and os.name == "posix",
         )
         self.deadline = time.monotonic() + self.timeout
@@ -359,7 +362,7 @@ class MCPFetchClient:
 
     def __init__(
         self, command: list[str], *, timeout: float = 30, max_bytes: int = 1_048_576,
-        env: dict | None = None, own_process_group: bool = True,
+        env: dict | None = None, own_process_group: bool = True, cwd: str | None = None,
     ):
         _limits(timeout, max_bytes)
         if not isinstance(command, list) or not command or any(not isinstance(v, str) or not v for v in command):
@@ -368,8 +371,11 @@ class MCPFetchClient:
             raise ValueError("MCP environment must map names to string values")
         if type(own_process_group) is not bool:
             raise ValueError("own_process_group must be a Boolean")
+        if cwd is not None and (not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd)):
+            raise ValueError("MCP cwd must be an existing absolute directory")
         self.command, self.timeout, self.max_bytes, self.env = list(command), timeout, max_bytes, env
         self.own_process_group = own_process_group
+        self.cwd = cwd
 
     def fetch(self, url: str, *, max_length: int = 20000, start_index: int = 0, raw: bool = False) -> dict:
         _url(url)
@@ -379,8 +385,9 @@ class MCPFetchClient:
         result["metadata"].update({
             "command": self.command, "representation": "unclassified",
             "own_process_group": self.own_process_group,
+            "cwd": self.cwd,
         })
-        session = _StdioMCP(self.command, self.timeout, self.max_bytes, self.env, self.own_process_group)
+        session = _StdioMCP(self.command, self.timeout, self.max_bytes, self.env, self.own_process_group, self.cwd)
         try:
             with session:
                 initialized = session.request("initialize", {

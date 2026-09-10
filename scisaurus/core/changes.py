@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Callable
 
 from scisaurus.core.errors import (
     ConflictError,
@@ -319,17 +320,37 @@ class ChangeService:
     def accept_changeset(
         self, *, changeset_ref: str, verification_ref: str, author: str,
         expected_accepted_manifest_version: int | None = None,
+        expected_head_refs: list[str] | None = None,
+        acceptance_guard: Callable[[], None] | None = None,
     ) -> dict:
         """Adopt the exact staged document after a committed passing review.
 
         The producer may submit the acceptance request but cannot supply a
         self-issued verification. Acceptance rechecks the baseline and live
-        grant in the same transaction as the accepted-head transition.
+        grant and any governing input heads in the same transaction as the
+        accepted-head transition. A runtime guard may abort admission after
+        evidence validation or roll back an adoption before its transaction commits.
         """
         from scisaurus.review.issues import IssueManager
 
         reviews = IssueManager(self.control, self.store, self.documents)
+        if acceptance_guard is not None and not callable(acceptance_guard):
+            raise ValidationError("acceptance_guard must be callable")
         with self.control.tx() as conn:
+            if expected_head_refs is not None and not isinstance(expected_head_refs, list):
+                raise ValidationError("expected_head_refs must be an explicit list of pinned artifact refs")
+            expected_heads = {}
+            for ref in expected_head_refs or []:
+                if not isinstance(ref, str):
+                    raise ValidationError("governing head preconditions must contain artifact ref strings")
+                logical = _logical(ref)
+                if logical in expected_heads:
+                    raise ValidationError("governing head preconditions must identify each artifact once")
+                expected_heads[logical] = ref
+            for logical, ref in expected_heads.items():
+                head = self.store.head(logical)
+                if head is None or head["artifact_ref"] != ref:
+                    raise ConflictError(f"governing artifact head changed: {logical}")
             record = self.store.get(changeset_ref)
             if record["artifact_type"] != "change_set":
                 raise ValidationError("acceptance requires a staged change_set artifact")
@@ -352,8 +373,12 @@ class ChangeService:
                 raise ValidationError("changeset author does not match the edit grant actor")
             if grant["state"] != "issued":
                 raise StateError(f"grant {grant['grant_id']} is {grant['state']}")
-            if grant["expires_at"] is not None and grant["expires_at"] <= time.time():
-                raise StateError(f"grant {grant['grant_id']} expired")
+            def check_admission():
+                if acceptance_guard is not None:
+                    acceptance_guard()
+                if grant["expires_at"] is not None and grant["expires_at"] <= time.time():
+                    raise StateError(f"grant {grant['grant_id']} expired")
+            check_admission()
             if (stage["baseline_ref"] != grant["baseline_manifest_ref"]
                 or stage["request_ref"] != grant["request_ref"]):
                 raise ValidationError("staged candidate no longer matches its grant")
@@ -374,6 +399,7 @@ class ChangeService:
                 reviews, verification_ref=verification_ref,
                 candidate_ref=candidate_ref, baseline_ref=baseline_ref,
             )
+            check_admission()
             self.store._adopt_in(
                 conn, baseline["artifact_id"], candidate["version"],
                 expected_accepted_manifest_version, author,
@@ -384,8 +410,10 @@ class ChangeService:
                     "grant_id": grant["grant_id"], "changeset_ref": changeset_ref,
                     "manifest_ref": candidate_ref, "verification_ref": verification_ref,
                     "changed_units": stage["changed_units"], "retired_units": [],
+                    "expected_head_refs": list(expected_heads.values()),
                 },
             )
+            check_admission()
             return {
                 "changeset_ref": changeset_ref, "manifest_ref": candidate_ref,
                 "manifest_version": candidate["version"], "verification_ref": verification_ref,
