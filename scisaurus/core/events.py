@@ -135,6 +135,33 @@ CREATE TABLE IF NOT EXISTS issues(
   critique_ref TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS allocation_windows(
+  window_id TEXT PRIMARY KEY,
+  policy_id TEXT NOT NULL,
+  delegation_ref TEXT NOT NULL,
+  prior_window TEXT,
+  state TEXT NOT NULL,
+  capacity_json TEXT NOT NULL,
+  reserved_json TEXT NOT NULL,
+  cumulative_usage_json TEXT NOT NULL,
+  opened_at TEXT NOT NULL,
+  closed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS reservations(
+  reservation_id TEXT PRIMARY KEY,
+  window_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  amount_json TEXT NOT NULL,
+  state TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS stagnation(
+  cause_key TEXT PRIMARY KEY,
+  observed_count INTEGER NOT NULL,
+  windows_spanned TEXT NOT NULL,
+  first_seen TEXT NOT NULL,
+  last_seen TEXT NOT NULL
+);
 """
 
 
