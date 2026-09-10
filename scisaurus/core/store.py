@@ -3,7 +3,9 @@
 Implements docs/40-execution-contract.md §3.1 and the publish transaction of
 docs/20-architecture-v0.md §9.3: blob published before the database commit
 (a crash leaves a harmless orphan, T03), version allocation and events in one
-transaction, and accepted-head changes via compare-and-swap (T02).
+transaction, and accepted-head changes via compare-and-swap (T02). Callers may
+join an external transaction through ``conn`` for atomic multi-artifact
+application.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from scisaurus.core.schema import (
 )
 from scisaurus.core.events import ControlStore
 
-# Initial namespace authority map (20 §10). "command" covers command/*.
+# Initial namespace authority map (20 §10).
 NAMESPACE_OWNERS = {
     "inputs": "principal",
     "command": "command",
@@ -39,7 +41,7 @@ NAMESPACE_OWNERS = {
 
 
 class ArtifactStore:
-    def __init__(self, control):
+    def __init__(self, control: ControlStore):
         self.control = control
         self.objects_dir = os.path.join(control.dir, "objects", "sha256")
 
@@ -67,8 +69,9 @@ class ArtifactStore:
             )
 
     # -- objects ---------------------------------------------------------
-    def publish_object(self, body: bytes, media_type: str) -> str:
-        """Write a content-addressed blob; reuse existing objects (dedupe)."""
+    def publish_object(self, body: bytes, media_type: str, conn=None) -> str:
+        """Write a content-addressed blob; reuse existing objects (dedupe).
+        With ``conn`` the objects row joins the caller's transaction."""
         h = sha256_hex(body)
         os.makedirs(self.objects_dir, exist_ok=True)
         path = os.path.join(self.objects_dir, h)
@@ -84,12 +87,19 @@ class ArtifactStore:
                 if os.path.exists(tmp):
                     os.unlink(tmp)
                 raise
-        with self.control.tx() as conn:
+        if conn is not None:
             conn.execute(
                 "INSERT OR IGNORE INTO objects(hash, size_bytes, media_type, created_at)"
                 " VALUES (?, ?, ?, ?)",
                 (h, len(body), media_type, now_iso()),
             )
+        else:
+            with self.control.tx() as c:
+                c.execute(
+                    "INSERT OR IGNORE INTO objects(hash, size_bytes, media_type, created_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (h, len(body), media_type, now_iso()),
+                )
         return h
 
     def read_body(self, body_hash: str) -> bytes:
@@ -118,6 +128,55 @@ class ArtifactStore:
         owner: str | None = None,
         created_at: str | None = None,
         messages: list[dict] | None = None,
+        conn=None,
+    ) -> dict:
+        """Publish one artifact version.
+
+        ``conn`` joins a caller-managed transaction (atomic multi-artifact
+        application). Blobs are published before the transaction either way —
+        a crash between blob and commit leaves a harmless orphan (T03).
+        """
+        kwargs = dict(
+            logical_id=logical_id,
+            artifact_type=artifact_type,
+            author=author,
+            body=body,
+            media_type=media_type,
+            parents=parents,
+            inputs=inputs,
+            intent_ref=intent_ref,
+            mission_ref=mission_ref,
+            score_ref=score_ref,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            owner=owner,
+            created_at=created_at,
+            messages=messages,
+        )
+        if conn is not None:
+            return self._publish_artifact_in(conn, **kwargs)
+        with self.control.tx() as tx_conn:
+            return self._publish_artifact_in(tx_conn, **kwargs)
+
+    def _publish_artifact_in(
+        self,
+        conn,
+        *,
+        logical_id: str,
+        artifact_type: str,
+        author: str,
+        body: bytes | None = None,
+        media_type: str = "application/octet-stream",
+        parents: list[str] | None = None,
+        inputs: list[dict] | None = None,
+        intent_ref: str | None = None,
+        mission_ref: str | None = None,
+        score_ref: str | None = None,
+        task_id: str | None = None,
+        attempt_id: str | None = None,
+        owner: str | None = None,
+        created_at: str | None = None,
+        messages: list[dict] | None = None,
     ) -> dict:
         ns, name = logical_id.split("/", 1) if "/" in logical_id else ("", logical_id)
         if not ns:
@@ -128,100 +187,99 @@ class ArtifactStore:
         if artifact_type not in ARTIFACT_TYPES:
             raise ValidationError(f"unregistered artifact type: {artifact_type!r}")
 
-        # 1. publish blob before the transaction (crash leaves an orphan, T03)
+        # 1. publish blob (crash leaves a harmless orphan, T03)
         body_hash = None
         if body is not None:
-            body_hash = self.publish_object(body, media_type)
+            body_hash = self.publish_object(body, media_type, conn=conn)
 
-        # 2. one transaction: version allocation + event + outbox
-        with self.control.tx() as conn:
-            row = conn.execute(
-                "SELECT version, artifact_ref FROM artifacts"
-                " WHERE logical_id = ? ORDER BY version DESC LIMIT 1",
-                (logical_id,),
-            ).fetchone()
-            version = (row["version"] if row else 0) + 1
-            if parents is None:
-                parents = [format_ref(logical_id, row["version"])] if row else []
-            inputs = list(inputs or [])
-            manifest = {
-                "schema_version": SCHEMA_VERSION,
-                "artifact_ref": format_ref(logical_id, version),
-                "artifact_id": logical_id,
-                "version": version,
-                "artifact_type": artifact_type,
-                "owner": owner,
-                "author": author,
+        # 2. version allocation + event + outbox in the caller's transaction
+        row = conn.execute(
+            "SELECT version FROM artifacts"
+            " WHERE logical_id = ? ORDER BY version DESC LIMIT 1",
+            (logical_id,),
+        ).fetchone()
+        version = (row["version"] if row else 0) + 1
+        if parents is None:
+            parents = [format_ref(logical_id, row["version"])] if row else []
+        inputs = list(inputs or [])
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "artifact_ref": format_ref(logical_id, version),
+            "artifact_id": logical_id,
+            "version": version,
+            "artifact_type": artifact_type,
+            "owner": owner,
+            "author": author,
+            "body_hash": body_hash,
+            "body_media_type": media_type if body is not None else None,
+            "body_size_bytes": len(body) if body is not None else 0,
+            "parents": parents,
+            "inputs": inputs,
+            "intent_ref": intent_ref,
+            "mission_ref": mission_ref,
+            "score_ref": score_ref,
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "context_ref": None,
+            "created_at": created_at or now_iso(),
+        }
+        validate_artifact_manifest(manifest)
+        manifest_hash = sha256_hex(canonical_bytes(manifest))
+        conn.execute(
+            "INSERT INTO artifacts(logical_id, version, artifact_ref,"
+            " artifact_type, owner, author, body_hash, body_media_type,"
+            " body_size_bytes, parents_json, inputs_json, governing_json,"
+            " task_id, attempt_id, created_at, manifest_hash, manifest_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                logical_id,
+                version,
+                manifest["artifact_ref"],
+                artifact_type,
+                owner,
+                author,
+                body_hash,
+                manifest["body_media_type"],
+                manifest["body_size_bytes"],
+                canonical_bytes(manifest["parents"]).decode("utf-8"),
+                canonical_bytes(manifest["inputs"]).decode("utf-8"),
+                canonical_bytes(
+                    {
+                        "intent_ref": intent_ref,
+                        "mission_ref": mission_ref,
+                        "score_ref": score_ref,
+                    }
+                ).decode("utf-8"),
+                task_id,
+                attempt_id,
+                manifest["created_at"],
+                manifest_hash,
+                canonical_bytes(manifest).decode("utf-8"),
+            ),
+        )
+        self.control.append_event(
+            conn,
+            actor=author,
+            event_type="artifact.published",
+            payload={
+                "artifact_ref": manifest["artifact_ref"],
+                "manifest_hash": manifest_hash,
                 "body_hash": body_hash,
-                "body_media_type": media_type if body is not None else None,
-                "body_size_bytes": len(body) if body is not None else 0,
-                "parents": parents,
-                "inputs": inputs,
-                "intent_ref": intent_ref,
-                "mission_ref": mission_ref,
-                "score_ref": score_ref,
-                "task_id": task_id,
-                "attempt_id": attempt_id,
-                "context_ref": None,
-                "created_at": created_at or now_iso(),
-            }
-            validate_artifact_manifest(manifest)
-            manifest_hash = sha256_hex(canonical_bytes(manifest))
+                "artifact_type": artifact_type,
+            },
+            causal=[task_id] if task_id else [],
+        )
+        for envelope in messages or []:
             conn.execute(
-                "INSERT INTO artifacts(logical_id, version, artifact_ref,"
-                " artifact_type, owner, author, body_hash, body_media_type,"
-                " body_size_bytes, parents_json, inputs_json, governing_json,"
-                " task_id, attempt_id, created_at, manifest_hash, manifest_json)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO outbox(effect_key, message_id, envelope_json, created_at)"
+                " VALUES (?, ?, ?, ?)",
                 (
-                    logical_id,
-                    version,
-                    manifest["artifact_ref"],
-                    artifact_type,
-                    owner,
-                    author,
-                    body_hash,
-                    manifest["body_media_type"],
-                    manifest["body_size_bytes"],
-                    canonical_bytes(manifest["parents"]).decode("utf-8"),
-                    canonical_bytes(manifest["inputs"]).decode("utf-8"),
-                    canonical_bytes(
-                        {
-                            "intent_ref": intent_ref,
-                            "mission_ref": mission_ref,
-                            "score_ref": score_ref,
-                        }
-                    ).decode("utf-8"),
-                    task_id,
-                    attempt_id,
-                    manifest["created_at"],
-                    manifest_hash,
-                    canonical_bytes(manifest).decode("utf-8"),
+                    envelope.get("idempotency_key"),
+                    envelope["message_id"],
+                    canonical_bytes(envelope).decode("utf-8"),
+                    now_iso(),
                 ),
             )
-            self.control.append_event(
-                conn,
-                actor=author,
-                event_type="artifact.published",
-                payload={
-                    "artifact_ref": manifest["artifact_ref"],
-                    "manifest_hash": manifest_hash,
-                    "body_hash": body_hash,
-                    "artifact_type": artifact_type,
-                },
-                causal=[task_id] if task_id else [],
-            )
-            for envelope in messages or []:
-                conn.execute(
-                    "INSERT INTO outbox(effect_key, message_id, envelope_json, created_at)"
-                    " VALUES (?, ?, ?, ?)",
-                    (
-                        envelope.get("idempotency_key"),
-                        envelope["message_id"],
-                        canonical_bytes(envelope).decode("utf-8"),
-                        now_iso(),
-                    ),
-                )
         return manifest
 
     # -- reads -----------------------------------------------------------
@@ -265,42 +323,53 @@ class ArtifactStore:
         target_version: int,
         expected_accepted_version: int | None,
         actor: str,
+        conn=None,
     ) -> dict:
-        """Accepted-head compare-and-swap (T02). expected=None means 'no head yet'."""
-        with self.control.tx() as conn:
-            row = conn.execute(
-                "SELECT accepted_version FROM accepted_heads WHERE logical_id = ?",
-                (logical_id,),
-            ).fetchone()
-            current = row["accepted_version"] if row else None
-            if current != expected_accepted_version:
-                raise ConflictError(
-                    f"head moved for {logical_id}: expected {expected_accepted_version!r},"
-                    f" current {current!r}"
-                )
-            artifact = conn.execute(
-                "SELECT artifact_ref FROM artifacts WHERE logical_id = ? AND version = ?",
-                (logical_id, target_version),
-            ).fetchone()
-            if artifact is None:
-                raise NotFoundError(f"no version {target_version} of {logical_id}")
-            conn.execute(
-                "INSERT INTO accepted_heads(logical_id, accepted_version, accepted_at)"
-                " VALUES (?, ?, ?)"
-                " ON CONFLICT(logical_id) DO UPDATE SET accepted_version = excluded.accepted_version,"
-                " accepted_at = excluded.accepted_at",
-                (logical_id, target_version, now_iso()),
-            )
-            self.control.append_event(
-                conn,
-                actor=actor,
-                event_type="artifact.accepted",
-                payload={
-                    "artifact_ref": format_ref(logical_id, target_version),
-                    "previous_accepted": current,
-                },
-            )
+        """Accepted-head compare-and-swap (T02). expected=None means 'no head yet'.
+
+        With ``conn`` the CAS joins the caller's transaction so a change
+        integration and its head advance commit atomically.
+        """
+        if conn is not None:
+            self._adopt_in(conn, logical_id, target_version, expected_accepted_version, actor)
+        else:
+            with self.control.tx() as tx_conn:
+                self._adopt_in(tx_conn, logical_id, target_version, expected_accepted_version, actor)
         return self.get(format_ref(logical_id, target_version))
+
+    def _adopt_in(self, conn, logical_id, target_version, expected_accepted_version, actor):
+        row = conn.execute(
+            "SELECT accepted_version FROM accepted_heads WHERE logical_id = ?",
+            (logical_id,),
+        ).fetchone()
+        current = row["accepted_version"] if row else None
+        if current != expected_accepted_version:
+            raise ConflictError(
+                f"head moved for {logical_id}: expected {expected_accepted_version!r},"
+                f" current {current!r}"
+            )
+        artifact = conn.execute(
+            "SELECT artifact_ref FROM artifacts WHERE logical_id = ? AND version = ?",
+            (logical_id, target_version),
+        ).fetchone()
+        if artifact is None:
+            raise NotFoundError(f"no version {target_version} of {logical_id}")
+        conn.execute(
+            "INSERT INTO accepted_heads(logical_id, accepted_version, accepted_at)"
+            " VALUES (?, ?, ?)"
+            " ON CONFLICT(logical_id) DO UPDATE SET accepted_version = excluded.accepted_version,"
+            " accepted_at = excluded.accepted_at",
+            (logical_id, target_version, now_iso()),
+        )
+        self.control.append_event(
+            conn,
+            actor=actor,
+            event_type="artifact.accepted",
+            payload={
+                "artifact_ref": format_ref(logical_id, target_version),
+                "previous_accepted": current,
+            },
+        )
 
     # -- internal --------------------------------------------------------
     def _conn_artifact(self, logical_id, version):

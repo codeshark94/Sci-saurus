@@ -111,6 +111,22 @@ CREATE TABLE IF NOT EXISTS attempts(
   created_at TEXT NOT NULL,
   finished_at TEXT
 );
+CREATE TABLE IF NOT EXISTS edit_grants(
+  grant_id TEXT PRIMARY KEY,
+  request_ref TEXT NOT NULL,
+  baseline_manifest_ref TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  units_json TEXT NOT NULL,
+  task_id TEXT,
+  attempt_id TEXT,
+  issued_at TEXT NOT NULL,
+  expires_at REAL,
+  state TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS retired_units(
+  logical_id TEXT PRIMARY KEY,
+  retired_at TEXT NOT NULL
+);
 """
 
 
