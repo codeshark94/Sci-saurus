@@ -20,9 +20,10 @@ The first application is a supplied results package and rough storyline becoming
 6. [Structured artifact changes](docs/45-artifact-change-control.md): unit versions, scoped edits, references, and atomic integration.
 7. [Web intelligence integration](docs/50-web-intelligence-integration.md): active search and API/plugin implementation contracts.
 8. [Project organization and operations](docs/15-project-organization.md): per-project scope, conditional team activation, and actual program execution.
+9. [P0 freeze record](docs/25-p0-freeze.md): frozen principles, the selected first fixture (`fixtures/p1-slice/`), and the deployment-configuration template (`config/deployment-template.yaml`).
 
 [Search campaign](docs/web-search-campaign.yaml) is an illustrative configuration, not executable software or provider authorization.
 
 ## Current state
 
-This repository contains design documents. It does not yet contain an orchestrator, model adapter, runnable paper workflow, or benchmark result. External GPU capacity is a design premise; endpoints, models, measured capacity, and data permissions remain deployment configuration.
+This repository contains design documents, the P0 freeze record, the selected P1 fixture set, and a deployment-configuration template. It does not yet contain an orchestrator, model adapter, runnable paper workflow, or benchmark result. External GPU capacity is a design premise; endpoints, models, measured capacity, and data permissions remain deployment configuration.

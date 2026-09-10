@@ -216,6 +216,8 @@ These defaults make the blueprint internally concrete; they do not falsely mark 
 | `45-artifact-change-control.md` | Stable structural units, references, surgical revision, edit grants, and verified integration |
 | `50-web-intelligence-integration.md` | Active retrieval, API/plugin adapters, capability state, and evidence-to-change routing |
 | `web-search-campaign.yaml` | Illustrative search campaign; not a working runtime |
+| `25-p0-freeze.md` | P0 contract-freeze record: frozen principles, selected first fixture, deployment-configuration template, acceptance state |
+| `fixtures/`, `config/` | Non-normative test assets: the P1 slice fixture set and the deployment template pinned by the P0 freeze record |
 
 | Version | Content |
 |---|---|

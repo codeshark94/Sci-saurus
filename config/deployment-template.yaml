@@ -1,0 +1,68 @@
+# Deployment configuration template — v0.8
+# Purpose: instantiate the open configuration of SSOT §10 and roadmap §3.
+# Every `runtime_required` field blocks live dispatch until a human sets it
+# (40-execution-contract §2.1, §9; 50-web-intelligence-integration §5).
+# This template is NOT approval to spend, install, or call any service.
+schema_version: '0.8'
+status: template_unresolved
+project_id: runtime_required
+
+authority:
+  intent_authorization: runtime_required        # Principal-approved PrincipalIntent revision ref
+  brief_ref: "artifact:fixtures/p1-slice/storyline-brief@1"  # example binding for the P1 slice
+  human_approval_policy:
+    final_release: required                      # G5b (fixed by contract)
+    outline_approval: optional_by_mission        # D30; default off unless mission policy sets it
+
+resource_policy:
+  allocation_mode: runtime_required              # capacity_pool | metered
+  lifetime_limit: absent_by_policy               # or bounded with explicit values
+  metered_ceilings:
+    per_window_expenditure: runtime_required     # required when allocation_mode = metered
+  attempt_limits:
+    lease_minutes: 30                            # proposal; measurable, finite
+    provider_retries: 3
+  checkpoint_cadence_minutes: 30                 # wall-clock progress checkpoints (D29)
+  renewal:
+    automatic_within_delegation: true            # D27
+    requires_recorded_rationale: true
+  hard_limits:
+    wall_clock_mission_minutes: runtime_required
+    max_parallel_workers: runtime_required
+    storage_budget_bytes: runtime_required
+
+model_pool:
+  default_profile: capable_model                 # D25: capable reasoning default, not token-thrift
+  endpoints: runtime_required                    # provider, endpoint, model id, context limit
+  capacity_probe_required: true                  # probe before dispatch (20 §8)
+
+retrieval_bindings:                              # 50 §5 initial matrix; state machine per 50 §3
+  crossref:      { state: discovered, credentials_ref: runtime_required }
+  openalex:      { state: discovered, credentials_ref: runtime_required }
+  semantic_scholar: { state: discovered, credentials_ref: runtime_required }
+  unpaywall:     { state: discovered, credentials_ref: runtime_required, contact_email: runtime_required }
+  arxiv:         { state: discovered, credentials_ref: none_required_public }
+  general_web:   { state: discovered, provider: runtime_required, credentials_ref: runtime_required }
+  github:        { state: discovered, credentials_ref: runtime_required }
+  mcp_fetch:     { state: discovered, server_ref: runtime_required }
+
+data_policy:
+  outbound_query_classification: runtime_required # protected text must not leave the project
+  private_text_as_queries: false                  # default false; may only be relaxed by authority
+  cloud_fallback_for_private_data: false          # fixed: no automatic fallback (20 §12)
+  cross_project_context: forbidden                # D35
+
+compile_sandbox:                                 # G4b environment (20 §12)
+  network: disabled
+  secrets: none
+  filesystem: restricted_project_paths
+  shell_escape: disabled
+  resource_limits: enforced
+
+release_policy:
+  human_approval_required: true                   # G5b; silence is not approval (D20)
+  external_submission: excluded_in_v1             # SSOT §9
+
+validation:
+  live_dispatch_allowed: false                   # flips to true only when every runtime_required above is resolved
+  validator_behavior: block_live_ops_on_unresolved   # roadmap §3
