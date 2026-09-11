@@ -152,6 +152,17 @@ class TimePolicyTests(unittest.TestCase):
         self.assertEqual(plan.snapshot()["first_result_status"], "available_on_time")
         self.assertEqual(plan.snapshot()["first_verified_result"]["elapsed_seconds"], 20)
 
+    def test_retained_result_does_not_count_as_new_progress_in_a_resume_window(self):
+        plan = self.plan(policy={"first_result_seconds": 30, "target_seconds": 90})
+        plan.mark_retained_result("artifact:document@1")
+        self.clock.advance(80)
+        snapshot = plan.snapshot()
+        self.assertIsNone(snapshot["first_verified_result"])
+        self.assertEqual(snapshot["retained_result"], {
+            "artifact_ref": "artifact:document@1", "origin": "prior_run"})
+        self.assertEqual(snapshot["first_result_status"], "retained_from_prior_run")
+        self.assertFalse(snapshot["first_result_target_missed"])
+
     def test_policy_validation_rejects_escalation_and_inconsistent_deadlines(self):
         for policy in ({"hard_seconds": 301}, {"first_result_seconds": 80, "target_seconds": 70},
                        {"target_seconds": 90, "hard_seconds": 80}, {"extra": 1}):

@@ -238,6 +238,34 @@ class TestExecutionRuntime(unittest.TestCase):
         self.assertEqual(runtime.tasks.get_attempt("malformed-attempt")["state"], "result_unknown")
         self.assertEqual(runtime.budget.get_window("run-window")["reserved"], {"concurrent_calls": 1})
 
+    def test_existing_runtime_requires_explicit_recovery_and_reconciles_unknown_attempt(self):
+        value = config()
+        value["limits"].update(concurrent_calls=2, wall_clock_seconds=15, checkpoint_seconds=1)
+        value["model"]["timeout_seconds"] = 5
+        source_root = self.root / "source"
+        (source_root / "scisaurus").mkdir(parents=True)
+        (source_root / "scisaurus" / "worker.py").write_text("VERSION = 1\n")
+        run_dir = self.root / "recoverable"
+        runtime = ExecutionRuntime(run_dir, validate_config(value), worker_target=execution_worker,
+                                   repository_root=source_root)
+        self.runtimes.append(runtime)
+        outcome = runtime._call_batch([self.spec("unknown", delay=0.01, failure="unknown")])["unknown"]
+        self.assertFalse(outcome["outcome_known"])
+        runtime.control.close()
+        self.runtimes.remove(runtime)
+        with self.assertRaisesRegex(ValidationError, "new project directory"):
+            ExecutionRuntime(run_dir, validate_config(value), worker_target=execution_worker,
+                             repository_root=source_root)
+        policy = {"additional_seconds": 10,
+                  "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
+                  "source_changes": {"mode": "reject", "reopen_scopes": []}}
+        resumed = ExecutionRuntime(run_dir, validate_config(value), worker_target=execution_worker,
+                                   repository_root=source_root, resume_policy=policy)
+        self.runtimes.append(resumed)
+        self.assertEqual(resumed.tasks.get_attempt("unknown-attempt")["state"], "failed")
+        self.assertEqual(resumed.budget.get_window("run-window")["reserved"], {})
+        self.assertEqual(resumed.resume_session["unknown_reconciliations"][0]["task_id"], "unknown")
+
     def test_completed_result_is_recorded_but_single_call_still_propagates_cancellation(self):
         count = 0
         def cancel_after_publication(update):

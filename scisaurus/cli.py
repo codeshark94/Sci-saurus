@@ -56,10 +56,75 @@ def main(argv=None) -> int:
     p_survey.add_argument("--target-seconds", type=float)
     p_survey.add_argument("--first-result-seconds", type=float)
 
+    p_resume_survey = sub.add_parser(
+        "resume-survey", help="resume an interrupted survey from durable evidence and explicit accounting policy")
+    p_resume_survey.add_argument("project_dir")
+    p_resume_survey.add_argument("--config", required=True)
+    p_resume_survey.add_argument("--additional-seconds", required=True, type=float)
+    p_resume_survey.add_argument("--reconcile-unknown", action="store_true",
+                                 help="charge one conservative model call for each uncertain prior attempt")
+    p_resume_survey.add_argument("--reopen-scope", action="append", default=[],
+                                 choices=["operations", "retrieval", "mapping", "focused_review",
+                                          "integrated_review", "gap_assessment", "production", "rendering"])
+
+    p_blind = sub.add_parser("prepare-evaluation", help="export label-free cases from a frozen judgment corpus")
+    p_blind.add_argument("--corpus", required=True)
+    p_blind.add_argument("--output", required=True)
+
+    p_score = sub.add_parser("score-evaluation", help="score predictions against a frozen judgment corpus")
+    p_score.add_argument("--corpus", required=True)
+    p_score.add_argument("--predictions", required=True)
+    p_score.add_argument("--output", required=True)
+    p_score.add_argument("--min-accuracy", type=float, default=0.8)
+    p_score.add_argument("--min-coverage", type=float, default=0.8)
+    p_score.add_argument("--max-decisive-false-positive-rate", type=float, default=0.05)
+
+    p_paper = sub.add_parser("build-paper", help="build a provenance-bound LaTeX/PDF release candidate")
+    p_paper.add_argument("release_dir")
+    p_paper.add_argument("--config", required=True)
+    p_paper.add_argument("--compile-script", default=(
+        "/Users/seungyeop/.codex/plugins/cache/openai-bundled/latex/0.2.6/scripts/compile_latex.py"))
+
     args = parser.parse_args(argv)
-    if args.cmd in {"run-paragraph", "run-project", "run-survey"}:
+    if args.cmd == "build-paper":
+        from scisaurus.core.errors import ValidationError
+        from scisaurus.runtime.paper import PaperReleaseBuilder
+        try:
+            config = json.loads(Path(args.config).read_text())
+            result = PaperReleaseBuilder(args.release_dir, config).build(
+                compile_script=Path(args.compile_script).resolve())
+        except (OSError, ValueError, ValidationError) as exc:
+            print(f"paper build rejected: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({"status": result["status"], "release_ref": result["release_ref"],
+                          "pdf": str(Path(args.release_dir).resolve() / "output" / "pdf" /
+                                     f"{config['paper_id']}.pdf")}, indent=2))
+        return 0
+    if args.cmd in {"prepare-evaluation", "score-evaluation"}:
+        from scisaurus.core.errors import ValidationError
+        from scisaurus.runtime.evaluation import JudgmentEvaluation, load_corpus
+        try:
+            evaluation = JudgmentEvaluation(load_corpus(args.corpus))
+            if args.cmd == "prepare-evaluation":
+                result = evaluation.blind_packet()
+            else:
+                submission = json.loads(Path(args.predictions).read_text())
+                result = evaluation.score(submission, thresholds={
+                    "min_accuracy": args.min_accuracy, "min_coverage": args.min_coverage,
+                    "max_decisive_false_positive_rate": args.max_decisive_false_positive_rate,
+                })
+            Path(args.output).write_bytes(
+                json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                           allow_nan=False).encode())
+        except (OSError, ValueError, ValidationError) as exc:
+            print(f"evaluation rejected: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({"status": result.get("status", "prepared"),
+                          "output": str(Path(args.output).resolve())}, indent=2))
+        return 0
+    if args.cmd in {"run-paragraph", "run-project", "run-survey", "resume-survey"}:
         from scisaurus.core.errors import ContractError, ValidationError
-        if args.cmd == "run-survey":
+        if args.cmd in {"run-survey", "resume-survey"}:
             from scisaurus.runtime.survey_config import load_survey_config as load_config
             from scisaurus.runtime.survey import SurveyRunner as Runner
         elif args.cmd == "run-project":
@@ -79,14 +144,27 @@ def main(argv=None) -> int:
                         raise ValidationError(
                             "Time planning options require a versioned Score configuration")
                     config["time_policy"] = {**(config.get("time_policy") or {}), **overrides}
-            result = Runner(args.project_dir, config,
-                on_progress=lambda state: print(json.dumps(state), flush=True)).run()
+            kwargs = {"on_progress": lambda state: print(json.dumps(state), flush=True)}
+            if args.cmd == "resume-survey":
+                scopes = list(dict.fromkeys(args.reopen_scope))
+                kwargs["resume_policy"] = {
+                    "additional_seconds": args.additional_seconds,
+                    "unknown_outcomes": {
+                        "mode": "charge_and_retry" if args.reconcile_unknown else "block",
+                        "usage_per_attempt": {"model_calls": 1} if args.reconcile_unknown else {},
+                    },
+                    "source_changes": {
+                        "mode": "reopen" if scopes else "reject",
+                        "reopen_scopes": scopes,
+                    },
+                }
+            result = Runner(args.project_dir, config, **kwargs).run()
         except ContractError as exc:
             print(f"configuration rejected: {exc}", file=sys.stderr)
             return 2
         print(json.dumps({"status": result["status"], "incumbent_ref": result["incumbent_ref"],
                           "report": str(Path(args.project_dir).resolve() / "output" / (
-                              "survey.md" if args.cmd == "run-survey" else "report.md"))}, indent=2))
+                              "survey.md" if args.cmd in {"run-survey", "resume-survey"} else "report.md"))}, indent=2))
         return 0 if result["status"] in {"accepted", "completed"} else 3
 
 

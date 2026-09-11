@@ -10,6 +10,9 @@ import unicodedata
 
 from scisaurus.core.errors import ConflictError, ValidationError
 from scisaurus.core.schema import canonical_bytes, parse_ref, sha256_hex
+from scisaurus.core.source_spans import bind as bind_source_spans, validate as validate_source_span
+from scisaurus.runtime.bibliographic_identity import normalize_doi, reconcile_result
+from scisaurus.runtime.operation_adapters import get_adapter
 
 
 SURVEY_CHECKS = frozenset({"coverage-accounting", "source-fidelity", "map-support"})
@@ -118,10 +121,13 @@ class SurveyGate:
 
     def _survey(self, survey_ref):
         manifest, body = self._note(survey_ref)
-        if body.get("schema_version") != "literature-survey-2":
+        if body.get("schema_version") not in {"literature-survey-2", "literature-survey-3"}:
             raise ValidationError("unsupported literature survey schema")
         scalar = [body.get(key) for key in ("score_ref", "protocol_ref", "map_ref", "coverage_ref")]
-        listed = [ref for key in ("source_refs", "work_refs", "query_refs", "work_review_refs")
+        list_fields = ["source_refs", "work_refs", "query_refs", "work_review_refs"]
+        if body["schema_version"] == "literature-survey-3":
+            list_fields.append("identity_refs")
+        listed = [ref for key in list_fields
                   for ref in self._refs(body.get(key), key)]
         required = self._refs([*scalar, *listed], "survey governing references")
         dependencies = self._refs(body.get("dependency_refs"), "dependency_refs")
@@ -131,7 +137,48 @@ class SurveyGate:
         for ref in dependencies:
             item, _ = self._artifact(ref)
             pins.append({"ref": ref, "body_hash": item["body_hash"]})
+        if body["schema_version"] == "literature-survey-3":
+            self._bibliographic_identities(body)
         return manifest, body, pins
+
+    def _bibliographic_identities(self, survey):
+        identities, works = {}, {}
+        dependencies = set(survey["dependency_refs"])
+        for ref in survey["work_refs"]:
+            _, raw = self._artifact(ref)
+            work = self._json(raw, "survey work")
+            work_id = self._text(work.get("work_id"), "survey work_id")
+            if work_id in works:
+                raise ValidationError("survey work identities must be unique")
+            works[work_id] = (ref, work)
+        for ref in survey["identity_refs"]:
+            manifest, raw = self._artifact(ref)
+            body = self._json(raw, "bibliographic identity")
+            if (manifest["artifact_type"] != "reference_card"
+                    or body.get("schema_version") != "bibliographic-identity-1"
+                    or body.get("status") not in {"verified", "verified_with_gaps", "conflicted", "insufficient_evidence"}):
+                raise ValidationError("survey bibliographic identity record is invalid")
+            work_id = self._text(body.get("work_id"), "bibliographic identity work_id")
+            if work_id in identities:
+                raise ValidationError("survey has duplicate bibliographic identity records")
+            observation_refs = self._refs(body.get("observation_refs"), "bibliographic observation_refs")
+            lookup = body.get("lookup_execution_ref")
+            if (not set(observation_refs).issubset(dependencies) or not isinstance(lookup, str)
+                    or lookup not in dependencies or work_id not in works):
+                raise ValidationError("bibliographic identity inputs must be pinned by survey dependencies")
+            execution, _ = self._artifact(lookup)
+            _, _, result, params = self._recorded_execution(
+                lookup, execution["author"], operation="crossref", task_kinds={"retrieval"})
+            operational_checks, _ = get_adapter("crossref").inspect_result(
+                {"adapter": "crossref"}, result, params, representative=False)
+            work_ref, work = works[work_id]
+            if (normalize_doi(params.get("query")) != normalize_doi(work.get("doi"))
+                    or result.get("metadata", {}).get("match_mode") != "exact_doi"
+                    or not all(check["outcome"] == "passed" for check in operational_checks)
+                    or canonical_bytes(body) != canonical_bytes(
+                        reconcile_result(work, work_ref, result, lookup))):
+                raise ValidationError("bibliographic identity does not match its exact provider executions")
+            identities[work_id] = ref
 
     def _passed_checks(self, checks, required, name):
         if not isinstance(checks, list) or len(checks) != len(required):
@@ -245,13 +292,15 @@ class SurveyGate:
                     or not 0 <= window["start"] <= window["end"] <= len(text)
                     or source.get("text") != text[window["start"]:window["end"]]):
                 raise ValidationError("focused review source window must contain the exact captured text slice")
-            visible[source["source_ref"]] = source
+            visible[source["source_ref"]] = {**source, "text": text}
         for field in WORK_CHECKS[2:]:
-            self._visible_evidence(entry.get(field), visible, work_id=entry["work_id"])
+            self._visible_evidence(entry.get(field), visible, work_id=entry["work_id"],
+                                   require_spans=survey["schema_version"] == "literature-survey-3")
         for relationship in relationships:
-            self._visible_evidence(relationship.get("claim"), visible)
+            self._visible_evidence(relationship.get("claim"), visible,
+                                   require_spans=survey["schema_version"] == "literature-survey-3")
 
-    def _visible_evidence(self, statement, sources, *, work_id=None):
+    def _visible_evidence(self, statement, sources, *, work_id=None, require_spans=False):
         if not isinstance(statement, dict) or set(statement) != {"text", "evidence"}:
             raise ValidationError("focused review statements must contain explicit text and evidence")
         evidence = statement["evidence"]
@@ -273,8 +322,7 @@ class SurveyGate:
             if (source is None or source["work_id"] != proof["work_id"]
                     or work_id is not None and proof["work_id"] != work_id):
                 raise ValidationError("focused review evidence must identify the correct visible source and work")
-            if proof["quote"] not in source["text"]:
-                raise ValidationError("focused review quotation must be visible in its recorded source window")
+            validate_source_span(proof, source, require_span=require_spans, window=source["window"])
 
     def _review(self, survey, review_ref):
         review, body = self._note(review_ref)
@@ -412,7 +460,8 @@ class SurveyGate:
             self._text(body.get(key), f"nomination {key}")
         origin, raw = self._artifact(body["survey_ref"], current=False)
         if (origin["artifact_type"] != "note"
-                or self._json(raw, "nomination survey").get("schema_version") != "literature-survey-2"):
+                or self._json(raw, "nomination survey").get("schema_version") not in
+                {"literature-survey-2", "literature-survey-3"}):
             raise ValidationError("nomination must originate from an accepted literature survey")
         acceptance = self._accepted_event("survey.accepted", "survey_ref", body["survey_ref"])
         pins = acceptance.get("evidence_pins", [])
@@ -450,6 +499,25 @@ class SurveyGate:
         if (prompt.get("nomination_ref") != body["nomination_ref"]
                 or prompt.get("gap") != {key: nomination[key] for key in ("id", "statement")}):
             raise ValidationError("assessment dispatch must bind the exact nomination and gap statement")
+        if survey["schema_version"] == "literature-survey-3":
+            source_values, windows = {}, {}
+            supplied = prompt.get("sources")
+            if not isinstance(supplied, list):
+                raise ValidationError("assessment dispatch must contain explicit source windows")
+            for context in supplied:
+                if not isinstance(context, dict) or context.get("source_ref") not in survey["source_refs"]:
+                    raise ValidationError("assessment dispatch source is not pinned by the survey")
+                _, raw = self._artifact(context["source_ref"])
+                source = self._json(raw, "assessment source capture")
+                window = context.get("window")
+                if (not isinstance(window, dict) or set(window) != {"start", "end"}
+                        or any(type(window.get(key)) is not int for key in ("start", "end"))
+                        or not 0 <= window["start"] <= window["end"] <= len(source.get("text", ""))
+                        or context.get("text") != source["text"][window["start"]:window["end"]]):
+                    raise ValidationError("assessment dispatch source window is not an exact captured slice")
+                source_values[context["source_ref"]] = source
+                windows[context["source_ref"]] = window
+            reply = bind_source_spans(reply, source_values, windows=windows)
         fields = ("state", "rationale", "comparisons", "checks", "evidence")
         if any(key not in body or reply.get(key) != body[key] for key in fields):
             raise ValidationError("assessment does not match its recorded model reply")
@@ -526,9 +594,10 @@ class SurveyGate:
                 raise ValidationError("comparison evidence must come from that comparison's own work")
             _, raw = self._artifact(item["source_ref"])
             source = self._json(raw, "assessment source")
-            if (source.get("work_id") != item["work_id"] or not isinstance(source.get("text"), str)
-                    or item["quote"] not in source["text"]):
+            if source.get("work_id") != item["work_id"] or not isinstance(source.get("text"), str):
                 raise ValidationError("assessment evidence identity or exact quotation is unsupported")
+            validate_source_span(item, source,
+                                 require_span=survey["schema_version"] == "literature-survey-3")
             if full_text and source.get("representation") == "full_text":
                 self._full_text(source, works[item["work_id"]], survey)
                 verified_full_text = True

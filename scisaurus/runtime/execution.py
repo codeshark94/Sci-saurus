@@ -23,6 +23,7 @@ from scisaurus.core.store import ArtifactStore
 from scisaurus.core.tasks import TaskManager
 from scisaurus.review.issues import IssueManager
 from scisaurus.runtime.models import ModelCallError, ModelClient, ModelResult
+from scisaurus.runtime.resume import ResumeController, source_manifest
 
 SYSTEM = (
     "You are a project worker operating on a bounded assignment. Return only the requested JSON object. "
@@ -113,12 +114,16 @@ class ExecutionRuntime:
     The owner passes validated configuration and a spawn-picklable worker.
     Unknown external outcomes retain their reservations until reconciliation.
     """
-    def __init__(self, project_dir, config, *, worker_target, on_progress=None):
+    def __init__(self, project_dir, config, *, worker_target, on_progress=None,
+                 resume_policy=None, repository_root=None):
         self.config = config
         self.worker_target = worker_target
         self.dir = Path(project_dir).resolve()
-        if (self.dir / "state" / "control.sqlite").exists():
+        existing = (self.dir / "state" / "control.sqlite").exists()
+        if existing and resume_policy is None:
             raise ValidationError("run requires a new project directory; inspect existing runs without overwriting them")
+        if not existing and resume_policy is not None:
+            raise ValidationError("resume requires an existing durable run")
         self.control = ControlStore(self.dir)
         self.store = ArtifactStore(self.control)
         self.store.init_project(principal_note=self.config["project_id"])
@@ -130,7 +135,15 @@ class ExecutionRuntime:
         self.progress = ProgressManager(self.control, self.store)
         self.run_id = uuid.uuid4().hex
         self.started = time.monotonic()
-        self.deadline = self.started + config["limits"]["wall_clock_seconds"]
+        self.resume_session = None
+        allowed_seconds = config["limits"]["wall_clock_seconds"]
+        if existing:
+            root = repository_root or Path(__file__).resolve().parents[2]
+            self.resume_session = ResumeController(
+                self.control, self.store, repository_root=root,
+            ).prepare(config, resume_policy)
+            allowed_seconds = self.resume_session["additional_seconds"]
+        self.deadline = self.started + allowed_seconds
         self.next_checkpoint = self.started
         self.checkpoint_number = 0
         self.on_progress = on_progress or (lambda state: None)
@@ -143,9 +156,15 @@ class ExecutionRuntime:
         self.sources = []
         self.usage_gaps = []
         self.candidates = []
-        self._publish("inputs/run-config", "note", config, "principal")
-        self.budget.open_window(window_id="run-window", policy_id="run-capacity", delegation_ref="inputs/run-config",
-                                capacity={"concurrent_calls": self.config["limits"]["concurrent_calls"]})
+        if not existing:
+            self._publish("inputs/run-config", "note", config, "principal")
+            self._publish("inputs/source-manifest", "note",
+                          source_manifest(repository_root or Path(__file__).resolve().parents[2]),
+                          "command.controller")
+            self.budget.open_window(window_id="run-window", policy_id="run-capacity", delegation_ref="inputs/run-config",
+                                    capacity={"concurrent_calls": self.config["limits"]["concurrent_calls"]})
+        elif self.budget.get_window("run-window")["state"] != "open":
+            raise ValidationError("resume requires the original active accounting window")
 
     def _publish(self, logical, kind, body, author, *, subjects=()):
         return self.store.publish_artifact(

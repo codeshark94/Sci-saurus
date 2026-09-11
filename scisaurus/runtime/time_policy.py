@@ -60,6 +60,7 @@ class TimePolicy:
         }
         self.clock, self.started_at = clock, clock()
         self.first_verified_result = None
+        self.retained_result = None
 
     @property
     def elapsed_seconds(self):
@@ -137,18 +138,27 @@ class TimePolicy:
         if self.first_verified_result is None:
             self.first_verified_result = {"elapsed_seconds": self.elapsed_seconds, "artifact_ref": artifact_ref}
 
+    def mark_retained_result(self, artifact_ref):
+        if not isinstance(artifact_ref, str) or not artifact_ref.strip():
+            raise ValidationError("retained artifact_ref must be a nonempty string")
+        if self.first_verified_result is None:
+            self.retained_result = {"artifact_ref": artifact_ref, "origin": "prior_run"}
+
     def snapshot(self):
         elapsed = self.elapsed_seconds
         result = self.first_verified_result
         missed = (result["elapsed_seconds"] > self.first_result_seconds if result is not None
-                  else elapsed >= self.first_result_seconds)
-        status = ("available_late" if missed else "available_on_time") if result else ("missed" if missed else "pending")
+                  else False if self.retained_result else elapsed >= self.first_result_seconds)
+        status = (("available_late" if missed else "available_on_time") if result
+                  else "retained_from_prior_run" if self.retained_result
+                  else "missed" if missed else "pending")
         return {
             "first_result_seconds": self.first_result_seconds, "target_seconds": self.target_seconds,
             "hard_seconds": self.hard_seconds, "elapsed_seconds": elapsed,
             "remaining_seconds": max(0.0, self.hard_seconds - elapsed),
             "target_reached": elapsed >= self.target_seconds, "hard_deadline_reached": elapsed >= self.hard_seconds,
             "first_verified_result": dict(result) if result else None,
+            "retained_result": dict(self.retained_result) if self.retained_result else None,
             "first_result_status": status, "first_result_target_missed": missed,
             "deadline_provenance": dict(self.provenance), "initial_schedule": deepcopy(self.initial_schedule),
             "initial_target_feasible": self.initial_schedule["total_seconds"] <= self.target_seconds,

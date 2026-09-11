@@ -28,7 +28,7 @@ class CrossrefFixture(BaseHTTPRequestHandler):
     def do_GET(self):
         query = parse_qs(urlsplit(self.path).query)
         self.queries.append(query)
-        term = query["query.bibliographic"][0]
+        term = query.get("query.bibliographic", query.get("filter", [""]))[0]
         status, content = 200, b""
         if term == "interrupted":
             self.send_response(200)
@@ -100,6 +100,11 @@ class TestCrossrefRetrieval(unittest.TestCase):
         self.assertEqual(CrossrefFixture.queries[-1]["mailto"], ["research@example.org"])
         CrossrefClient(endpoint=self.endpoint).search("A & B", cursor="page-two")
         self.assertEqual(CrossrefFixture.queries[-1]["cursor"], ["page-two"])
+
+    def test_doi_query_uses_exact_provider_filter(self):
+        result = CrossrefClient(endpoint=self.endpoint).search("https://doi.org/10.1234/EXAMPLE", limit=1)
+        self.assertEqual(result["metadata"]["match_mode"], "exact_doi")
+        self.assertEqual(CrossrefFixture.queries[-1]["filter"], ["doi:10.1234/example"])
 
     def test_empty_results_are_distinct_from_rate_limits_and_bad_responses(self):
         client = CrossrefClient(endpoint=self.endpoint)

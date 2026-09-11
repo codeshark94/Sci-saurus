@@ -13,6 +13,7 @@ import json
 import math
 import os
 import queue
+import re
 import signal
 import subprocess
 import threading
@@ -24,7 +25,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
-ADAPTER_VERSION = "2"
+ADAPTER_VERSION = "3"
 MCP_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = {MCP_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"}
 SAFE_PROCESS_ENV = {
@@ -90,7 +91,10 @@ class CrossrefClient:
             raise ValueError("search query must be nonempty and at most 2048 characters")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
             raise ValueError("Crossref rows must be between 1 and 1000")
-        params = {"query.bibliographic": query, "rows": limit, "sort": "score", "order": "desc", "cursor": "*"}
+        doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", query.strip(), flags=re.IGNORECASE).lower()
+        exact_doi = bool(re.fullmatch(r"10\.[0-9]{4,9}/\S+", doi))
+        params = ({"filter": "doi:" + doi, "rows": limit, "cursor": "*"} if exact_doi else
+                  {"query.bibliographic": query, "rows": limit, "sort": "score", "order": "desc", "cursor": "*"})
         if cursor is not None:
             if not isinstance(cursor, str) or not cursor or len(cursor) > 8192:
                 raise ValueError("Crossref cursor must be a bounded nonempty string")
@@ -99,7 +103,8 @@ class CrossrefClient:
             params["mailto"] = self.mailto
         url = self.endpoint + ("&" if "?" in self.endpoint else "?") + urlencode(params)
         result = _result("crossref", "http_api", url)
-        result["metadata"].update({"query": query, "rows": limit, "representation": "metadata"})
+        result["metadata"].update({"query": query, "rows": limit, "representation": "metadata",
+                                   "match_mode": "exact_doi" if exact_doi else "relevance"})
         deadline = time.monotonic() + self.timeout
         response = None
         body = bytearray()

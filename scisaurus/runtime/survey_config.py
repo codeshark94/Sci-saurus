@@ -40,8 +40,11 @@ def _strings(value, name, *, empty=False):
 def validate_survey_config(value):
     validate_common(value, {"survey", "time_policy"}, retrieval=False)
     survey = value.get("survey")
-    exact(survey, {"id", "revision", "question", "seed_queries", "seed_work_ids", "proposed_gap", "bibliography",
-                   "full_text", "full_text_sources", "search", "stage_seconds"}, "survey")
+    fields = {"id", "revision", "question", "seed_queries", "seed_work_ids", "proposed_gap", "bibliography",
+              "full_text", "full_text_sources", "search", "stage_seconds"}
+    if isinstance(survey, dict) and "identity" in survey:
+        fields.add("identity")
+    exact(survey, fields, "survey")
     identifier(survey["id"])
     if type(survey["revision"]) is not int or survey["revision"] < 1:
         raise ValidationError("survey revision must be positive")
@@ -57,9 +60,9 @@ def validate_survey_config(value):
         identifier(survey["proposed_gap"]["id"])
         _text(survey["proposed_gap"]["statement"], "gap statement")
     capability_ids = set()
-    for name, adapter in (("bibliography", "openalex"), ("full_text", "mcp_fetch")):
-        cap = survey[name]
-        if name == "full_text" and cap is None:
+    for name, adapter in (("bibliography", "openalex"), ("identity", "crossref"), ("full_text", "mcp_fetch")):
+        cap = survey.get(name)
+        if name != "bibliography" and cap is None:
             continue
         exact(cap, {"id", "adapter", "client", "representative", "environment_files"}, name)
         identifier(cap["id"])

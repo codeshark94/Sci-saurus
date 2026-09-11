@@ -27,7 +27,7 @@
   },
   "survey": {
     "id": "attention-only-sequence-transduction",
-    "revision": 3,
+    "revision": 4,
     "question": "How did sequence transduction architectures evolve from recurrence and convolution toward attention-based representations, and what assumptions and limitations distinguish the methods?",
     "seed_queries": [
       "Attention Is All You Need"
@@ -52,6 +52,20 @@
         "work_id": "W2626778328",
         "limit": 1,
         "cursor": null
+      },
+      "environment_files": []
+    },
+    "identity": {
+      "id": "survey-crossref-identity",
+      "adapter": "crossref",
+      "client": {
+        "timeout": 20,
+        "max_bytes": 2000000,
+        "endpoint": "https://api.crossref.org/v1/works"
+      },
+      "representative": {
+        "query": "10.1038/nphys1170",
+        "limit": 1
       },
       "environment_files": []
     },
@@ -92,7 +106,7 @@
       "expansion_rounds": 1,
       "expansion_seed_count": 1,
       "references_per_work": 2,
-      "max_api_calls": 18,
+      "max_api_calls": 30,
       "min_new_works": 1,
       "saturation_rounds": 1,
       "max_full_texts": 2,

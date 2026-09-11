@@ -15,8 +15,10 @@ from urllib.parse import parse_qs, urlsplit
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.store import ArtifactStore
+from scisaurus.core.surveys import SurveyGate
 from scisaurus.runtime.execution import _invoke_worker
-from scisaurus.runtime.survey import SurveyRunner
+from scisaurus.runtime.survey import (SurveyRunner, apply_scoped_map_repair,
+                                      overlay_post_checkpoint_relationships)
 from scisaurus.runtime.survey_config import validate_survey_config
 from scisaurus.runtime.survey_records import GAP_CHECKS, MAP_FIELDS, SURVEY_CHECKS, validate_map
 from scisaurus.runtime.time_policy import STAGES
@@ -52,6 +54,22 @@ class SurveyHTTPFixture(BaseHTTPRequestHandler):
         path = urlsplit(self.path)
         query = parse_qs(path.query)
         self.requests.append({"path": path.path, "query": query})
+        if ("query.bibliographic" in query
+                or query.get("filter", [""])[0].lower().startswith("doi:")):
+            doi = query.get("query.bibliographic", query.get("filter"))[0].lower()
+            doi = doi.removeprefix("doi:")
+            wid = doi.rsplit("/", 1)[-1].upper()
+            item = {"DOI": doi, "title": ["Recall study " + wid], "publisher": "Fixture Publisher",
+                    "published": {"date-parts": [[2020 + int(wid[-1])]]}, "author": []}
+            payload = {"status": "ok", "message-version": "1.0.0", "message": {
+                "items": [item], "total-results": 1, "next-cursor": None}}
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path.path != "/works":
             payload = survey_work(path.path.rsplit("/", 1)[1])
         else:
@@ -112,10 +130,14 @@ def simulated_survey_worker(kind, params, channel):
         value = {"entries": entries, "relationships": []}
         if mode.startswith("semantic-") and (assignment["requested_work_ids"] == ["W101"] or mode == "semantic-many"):
             repair = assignment.get("semantic_feedback") is not None
-            value["entries"][0]["reason"] = ("The study examines recall timing." if repair and mode != "semantic-exhaust"
-                                               else "The method generalizes to every task.")
-            if repair and mode == "semantic-unscoped":
-                value["entries"][0]["finding"] = deepcopy(value["entries"][0]["problem"])
+            if repair:
+                value = {"entry_updates": {
+                    "reason": "The study examines recall timing." if mode != "semantic-exhaust" else "The method generalizes to every task."
+                }, "relationships": []}
+                if mode == "semantic-unscoped":
+                    value["entry_updates"]["finding"] = deepcopy(entries[0]["problem"])
+            else:
+                value["entries"][0]["reason"] = "The method generalizes to every task."
         if mode.startswith("map-links") and assignment["requested_work_ids"] == ["W101"]:
             proofs = [source_quote(next(source for source in assignment["sources"] if source["work_id"] == wid))
                       for wid in ("W101", "W102")]
@@ -258,6 +280,7 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(repairs[0]["requested_work_ids"], ["W101"])
         self.assertEqual(repairs[0]["semantic_feedback"]["entry_fields"], ["reason"])
         self.assertEqual(repairs[0]["semantic_feedback"]["relationship_targets"], [])
+        self.assertEqual(repairs[0]["response_contract"], "scoped_patch")
         self.assertEqual(store.head("kb/work-analyses/W101")["version"], 2)
         first = json.loads(store.read_body(store.get("artifact:kb/work-analyses/W101@1")["body_hash"]))
         second = json.loads(store.read_body(store.head("kb/work-analyses/W101")["body_hash"]))
@@ -285,7 +308,7 @@ class TestSurveyRunner(unittest.TestCase):
         config["limits"]["max_rounds"] = 2
         result = self.runtime(config).run()
         self.assertEqual(result["status"], "blocked")
-        self.assertIn("ungranted field W101.finding", result["error"])
+        self.assertIn("exactly the granted entry fields", result["error"])
         self.assertIsNone(result["survey_ref"])
         _, store = self.open_store()
         self.assertEqual(store.head("kb/work-analyses/W101")["version"], 1)
@@ -593,7 +616,101 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertTrue(all(source["representation"] == "abstract" for source in assessment["sources"]))
 
 
+    def test_crossref_identity_and_stable_source_spans_are_pinned_in_v3_survey(self):
+        config = survey_config(self.endpoint)
+        config["survey"]["search"]["max_api_calls"] = 30
+        config["survey"]["identity"] = {
+            "id": "identity", "adapter": "crossref",
+            "client": {"endpoint": self.endpoint, "timeout": 4, "max_bytes": 1000000},
+            "representative": {"query": "10.1234/W101", "limit": 1},
+            "environment_files": []}
+        result = self.runtime(config).run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        control, store = self.open_store()
+        survey = json.loads(store.read_body(store.get(result["survey_ref"])["body_hash"]))
+        self.assertEqual(survey["schema_version"], "literature-survey-3")
+        self.assertTrue(survey["identity_refs"])
+        for ref in survey["identity_refs"]:
+            identity = json.loads(store.read_body(store.get(ref)["body_hash"]))
+            self.assertEqual(identity["status"], "verified")
+        identity = json.loads(store.read_body(store.get(survey["identity_refs"][0])["body_hash"]))
+        identity["checks"][1]["crossref"] = "Forged title"
+        forged = store.publish_artifact(logical_id="kb/forged-identities/W101", artifact_type="reference_card",
+            author="fixture.forgery", body=json.dumps(identity).encode(), media_type="application/json")
+        forged_survey = deepcopy(survey)
+        forged_survey["identity_refs"] = [forged["artifact_ref"], *survey["identity_refs"][1:]]
+        forged_survey["dependency_refs"] = [forged["artifact_ref"] if ref == survey["identity_refs"][0] else ref
+                                             for ref in survey["dependency_refs"]]
+        with self.assertRaisesRegex(ValidationError, "exact provider executions"):
+            SurveyGate(control, store)._bibliographic_identities(forged_survey)
+        mapped = json.loads(store.read_body(store.head("kb/work-analyses/W101")["body_hash"]))
+        proof = mapped["problem"]["evidence"][0]
+        self.assertEqual(set(proof), {"work_id", "source_ref", "quote", "start", "end", "quote_sha256"})
+        source = json.loads(store.read_body(store.get(proof["source_ref"])["body_hash"]))
+        self.assertEqual(source["text"][proof["start"]:proof["end"]], proof["quote"])
+
+    def test_resume_charges_api_reservations_even_without_provider_results(self):
+        config = survey_config(self.endpoint)
+        first = self.runtime(config)
+        first._initialize()
+        # Simulate a legacy run whose successful calls predate reservation
+        # artifacts. New reservations must carry the cumulative baseline.
+        first.api_calls = 10
+        first.identity_calls = 3
+        first._reserve_api_call("bibliography", {"operation": "search", "query": "failed"},
+                                "research.search-planner")
+        first._reserve_api_call("identity", {"query": "10.1234/unknown", "limit": 3},
+                                "research.identity-checker")
+        first.control.close()
+
+        policy = {
+            "additional_seconds": 20,
+            "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+            "source_changes": {"mode": "reject", "reopen_scopes": []},
+        }
+        resumed = SurveyRunner(self.root / "run", config, resume_policy=policy)
+        self.addCleanup(resumed.control.close)
+        self.assertEqual(resumed.api_calls, 12)
+        self.assertEqual(resumed.identity_calls, 4)
+        reservations = [resumed._body(record) for record in resumed._heads("command/api-calls/")]
+        self.assertEqual([row["number"] for row in reservations], [11, 12])
+        self.assertEqual([row["identity_number"] for row in reservations], [3, 4])
+        self.assertEqual([row["capability"] for row in reservations], ["bibliography", "identity"])
+
+
 class TestSurveyContracts(unittest.TestCase):
+    def test_resume_overlays_only_validated_relationship_versions_after_map_checkpoint(self):
+        old = {"source": "W101", "target": "W102", "kind": "related",
+               "claim": {"text": "old", "evidence": []}, "artifact_ref": "artifact:kb/r@1"}
+        new = {**old, "claim": {"text": "new", "evidence": []}}
+        baseline = {"W101-W102-related": old}
+        omitted = {"source": "W201", "target": "W102", "kind": "related",
+                   "claim": {"text": "omitted", "evidence": []}}
+        records = [
+            ({"created_at": "2026-09-11T00:00:00+00:00", "artifact_ref": "artifact:kb/r@1"}, old),
+            ({"created_at": "2026-09-11T00:00:00+00:00", "artifact_ref": "artifact:kb/r@2"}, new),
+            ({"created_at": "2026-09-11T00:00:00+00:00", "artifact_ref": "artifact:kb/omitted@1"}, omitted),
+        ]
+        restored = overlay_post_checkpoint_relationships(
+            baseline, "2026-09-11T00:00:01+00:00", records)
+        self.assertEqual(restored["W101-W102-related"]["artifact_ref"], "artifact:kb/r@2")
+        self.assertEqual(restored["W101-W102-related"]["claim"]["text"], "new")
+        self.assertNotIn("W201-W102-related", restored)
+
+    def test_scoped_map_patch_preserves_ungranted_relationship_without_artifact_metadata(self):
+        previous = {"work_id": "W101", "inclusion": "included", "reason": "Old reason",
+                    **{field: {"text": None, "evidence": []} for field in MAP_FIELDS}}
+        relationship = {"source": "W101", "target": "W102", "kind": "related",
+                        "claim": {"text": None, "evidence": []},
+                        "artifact_ref": "artifact:kb/relationships/W101-W102-related@1"}
+        repaired = apply_scoped_map_repair(
+            "W101", previous, [relationship],
+            {"entry_fields": ["reason"], "relationship_targets": []},
+            {"entry_updates": {"reason": "Narrow reason"}, "relationships": []})
+        self.assertEqual(repaired["entries"][0]["reason"], "Narrow reason")
+        self.assertEqual(repaired["relationships"], [{key: relationship[key]
+                         for key in ("source", "target", "kind", "claim")}])
+
     def test_unknown_statement_has_no_evidence_and_scope_is_exact(self):
         unknown = {"text": None, "evidence": []}
         entry = {"work_id": "W101", "inclusion": "uncertain", "reason": "No available text.",
@@ -629,7 +746,6 @@ class TestSurveyContracts(unittest.TestCase):
         config["time_policy"]["hard_seconds"] = 5
         with self.assertRaisesRegex(ValidationError, "first_result_seconds"):
             validate_survey_config(config)
-
 
 if __name__ == "__main__":
     unittest.main()

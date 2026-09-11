@@ -1,0 +1,50 @@
+{
+  "schema_version": "judgment-corpus-1",
+  "corpus_id": "literature-judgment-development",
+  "revision": 1,
+  "split": "development",
+  "label_status": "development",
+  "frozen_at": "2026-09-11T00:00:00Z",
+  "cases": [
+    {
+      "id": "explicit-method",
+      "task": "literature_entailment",
+      "evidence": {
+        "claim": "The study reports a controlled experiment.",
+        "source": "We conducted a controlled experiment."
+      },
+      "label": "supported",
+      "rationale": "The supplied text explicitly states the claimed method."
+    },
+    {
+      "id": "abstract-silence",
+      "task": "literature_entailment",
+      "evidence": {
+        "claim": "The work did not evaluate robustness.",
+        "source": "We report mean accuracy in the abstract."
+      },
+      "label": "unsupported",
+      "rationale": "An abstract's silence about robustness does not establish that the full work omitted it."
+    },
+    {
+      "id": "closest-work-unavailable",
+      "task": "gap_state",
+      "evidence": {
+        "coverage": "abstract only",
+        "closest_work": "full text unavailable"
+      },
+      "label": "insufficient_evidence",
+      "rationale": "A decisive gap judgment requires a resolved comparison with the closest work."
+    },
+    {
+      "id": "same-scope-prior-solution",
+      "task": "gap_state",
+      "evidence": {
+        "coverage": "identity-verified full text",
+        "closest_work": "implements the proposed method under the same conditions"
+      },
+      "label": "refuted_by_prior_work",
+      "rationale": "The supplied closest-work evidence contains the proposed solution under comparable conditions."
+    }
+  ]
+}

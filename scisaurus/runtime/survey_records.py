@@ -2,6 +2,7 @@
 from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.config import _text
 from scisaurus.runtime.scores import exact
+from scisaurus.core.source_spans import validate as validate_source_span
 
 
 MAP_FIELDS = ("problem", "approach", "finding", "limitations")
@@ -9,38 +10,40 @@ SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
 GAP_CHECKS = ("closest-prior-work", "scope-comparability", "counterevidence", "full-text-support")
 
 
-def evidence(items, sources, *, required=False):
+def evidence(items, sources, *, required=False, require_spans=False):
     if not isinstance(items, list) or (required and not items):
         raise ValidationError("asserted statements require explicit source evidence")
     errors = []
     for index, item in enumerate(items):
         try:
-            exact(item, {"work_id", "source_ref", "quote"}, "evidence")
+            if not isinstance(item, dict):
+                raise ValidationError("evidence must be an object")
             _text(item["work_id"], "evidence work ID")
             _text(item["source_ref"], "evidence source ref")
             _text(item["quote"], "evidence quote")
             source = sources.get(item["source_ref"])
-            if source is None or source["work_id"] != item["work_id"] or item["quote"] not in source["text"]:
+            if source is None or source["work_id"] != item["work_id"]:
                 raise ValidationError(f"must quote the exact captured text of its identified work ({item['source_ref']})")
+            validate_source_span(item, source, require_span=require_spans)
         except ValidationError as exc:
             errors.append(f"evidence[{index}]: {exc}")
     if errors:
         raise ValidationError("; ".join(errors))
 
 
-def statement(value, sources, *, work_id=None):
+def statement(value, sources, *, work_id=None, require_spans=False):
     exact(value, {"text", "evidence"}, "literature statement")
     if value["text"] is None:
         if value["evidence"] != []:
             raise ValidationError("an unknown statement cannot claim supporting evidence")
         return
     _text(value["text"], "statement text")
-    evidence(value["evidence"], sources, required=True)
+    evidence(value["evidence"], sources, required=True, require_spans=require_spans)
     if work_id and any(item["work_id"] != work_id for item in value["evidence"]):
         raise ValidationError("a work assessment must use evidence from that work")
 
 
-def validate_map(value, requested, all_work_ids, sources):
+def validate_map(value, requested, all_work_ids, sources, *, require_spans=False):
     exact(value, {"entries", "relationships"}, "map response")
     if not isinstance(value["entries"], list) or not isinstance(value["relationships"], list):
         raise ValidationError("map entries and relationships must be lists")
@@ -69,7 +72,7 @@ def validate_map(value, requested, all_work_ids, sources):
             errors.append(f"{path}.inclusion: unknown screening decision")
         check(f"{path}.reason", _text, entry["reason"], "screening rationale (string)")
         for field in MAP_FIELDS:
-            check(f"{path}.{field}", statement, entry[field], sources, work_id=wid)
+            check(f"{path}.{field}", statement, entry[field], sources, work_id=wid, require_spans=require_spans)
     if seen != set(requested):
         errors.append("entries: map update omitted an assigned work: " + ", ".join(sorted(set(requested) - seen)))
     relations = set()
@@ -90,7 +93,7 @@ def validate_map(value, requested, all_work_ids, sources):
         if key in relations:
             errors.append(f"{path}: duplicate conceptual relationship")
         relations.add(key)
-        if check(f"{path}.claim", statement, relation["claim"], sources):
+        if check(f"{path}.claim", statement, relation["claim"], sources, require_spans=require_spans):
             if relation["claim"]["text"] is None or not {relation["source"], relation["target"]}.issubset(
                     {item["work_id"] for item in relation["claim"]["evidence"]}):
                 errors.append(f"{path}.claim: conceptual relationship requires evidence from both works")
@@ -108,7 +111,9 @@ def checks(value, names):
             raise ValidationError("unknown or duplicate required check")
         seen.add(check["check_id"])
         if check["outcome"] not in ("passed", "failed", "insufficient_evidence", "check_failed"):
-            raise ValidationError("unknown check outcome")
+            raise ValidationError(
+                f"check {check['check_id']} outcome {check['outcome']!r} must be exactly passed, failed, "
+                "insufficient_evidence, or check_failed")
         _text(check["method"], "check method")
         _text(check["result"], "check result")
     if seen != set(names):
@@ -128,13 +133,14 @@ def validate_work_review(value, relationship_refs):
     _text(value["rationale"], "work review rationale")
 
 
-def validate_assessment(value, sources, works):
+def validate_assessment(value, sources, works, *, require_spans=False):
     exact(value, {"state", "rationale", "comparisons", "checks", "evidence"}, "gap assessment")
     if value["state"] not in ("refuted_by_prior_work", "insufficient_evidence", "eligible_for_experiment"):
         raise ValidationError("unsupported gap decision")
     _text(value["rationale"], "assessment rationale")
     checks(value["checks"], GAP_CHECKS)
-    evidence(value["evidence"], sources, required=value["state"] != "insufficient_evidence")
+    evidence(value["evidence"], sources, required=value["state"] != "insufficient_evidence",
+             require_spans=require_spans)
     if not isinstance(value["comparisons"], list):
         raise ValidationError("comparisons must be an explicit list")
     seen = set()
@@ -146,7 +152,8 @@ def validate_assessment(value, sources, works):
         if item["relationship"] not in ("solves", "partial", "different", "uncertain"):
             raise ValidationError("unknown comparison relationship")
         _text(item["statement"], "comparison statement")
-        evidence(item["evidence"], sources, required=item["relationship"] != "uncertain")
+        evidence(item["evidence"], sources, required=item["relationship"] != "uncertain",
+                 require_spans=require_spans)
         if any(proof["work_id"] != item["work_id"] for proof in item["evidence"]):
             raise ValidationError("comparison must cite its own work")
         decisive = value["state"] == "eligible_for_experiment" or (
