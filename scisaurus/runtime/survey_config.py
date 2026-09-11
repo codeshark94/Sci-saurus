@@ -10,7 +10,7 @@ from scisaurus.runtime.scores import exact, identifier
 from scisaurus.runtime.time_policy import validate_time_policy
 
 
-SEARCH_LIMITS = {"queries_per_role", "results_per_query", "max_works", "expansion_rounds", "expansion_seed_count",
+SEARCH_LIMITS = {"queries_per_role", "results_per_query", "max_works", "challenge_reserve", "expansion_rounds", "expansion_seed_count",
                  "references_per_work", "max_api_calls", "min_new_works", "saturation_rounds", "max_full_texts", "max_text_chars", "context_chars"}
 
 
@@ -74,7 +74,14 @@ def validate_survey_config(value):
         if not isinstance(cap["environment_files"], list):
             raise ValidationError("environment_files must be an explicit list")
         get_adapter(adapter).validate_arguments(cap["representative"])
-    exact(survey["search"], SEARCH_LIMITS, "search limits")
+    search_fields = set(survey["search"]) if isinstance(survey["search"], dict) else set()
+    legacy_limits = SEARCH_LIMITS - {"challenge_reserve"}
+    if (survey["revision"] >= 5 and search_fields != SEARCH_LIMITS) or (
+            survey["revision"] < 5 and frozenset(search_fields) not in {
+                frozenset(SEARCH_LIMITS), frozenset(legacy_limits)}):
+        raise ValidationError(f"search limits requires exactly {sorted(SEARCH_LIMITS)}"
+                              + ("" if survey["revision"] >= 5
+                                 else " or the legacy revision fields"))
     for name, amount in survey["search"].items():
         minimum = 0 if name in {"expansion_rounds", "min_new_works"} else 1
         if type(amount) is not int or amount < minimum:
@@ -83,8 +90,11 @@ def validate_survey_config(value):
         raise ValidationError("requested capture exceeds provider limits")
     if survey["search"]["context_chars"] > survey["search"]["max_text_chars"]:
         raise ValidationError("context window cannot exceed the capture limit")
-    if len(survey["seed_work_ids"]) > survey["search"]["max_works"]:
-        raise ValidationError("seed works exceed the work limit")
+    reserve = survey["search"].get("challenge_reserve", 0)
+    if reserve >= survey["search"]["max_works"]:
+        raise ValidationError("challenge reserve must leave at least one discovery work slot")
+    if len(survey["seed_work_ids"]) > survey["search"]["max_works"] - reserve:
+        raise ValidationError("seed works exceed the discovery work limit after challenge reserve")
     if not isinstance(survey["full_text_sources"], list):
         raise ValidationError("full_text_sources must be an explicit list")
     seen = set()

@@ -87,6 +87,11 @@ class SurveyRunner(ExecutionRuntime):
         self.expanded, self.full_text_attempted = set(), set()
         self.survey_ref, self.assessment_ref, self.register_ref = None, None, None
         self.nomination = None
+        self.nomination_record = None
+        self.counter_plan_record = None
+        self.counter_query_refs = []
+        self.counter_queries_complete = False
+        self.countersearch_complete = False
         if self.resume_session:
             self.time_policy.hard_seconds = min(
                 self.time_policy.hard_seconds, self.resume_session["additional_seconds"])
@@ -223,6 +228,7 @@ class SurveyRunner(ExecutionRuntime):
         if nomination:
             self.nomination_record, self.nomination = nomination, {
                 key: self._body(nomination)[key] for key in ("id", "statement")}
+        self._refresh_countersearch_state()
         if self.survey_ref and "gap_assessment" not in scopes:
             accepted = self.store.accepted("kb/gap-assessments/current")
             if accepted:
@@ -231,6 +237,47 @@ class SurveyRunner(ExecutionRuntime):
                     self.assessment_ref = accepted["artifact_ref"]
                 except Exception:
                     pass
+
+    def _refresh_countersearch_state(self):
+        """Reconstruct challenge completion from exact durable dependencies."""
+        self.counter_plan_record = None
+        self.counter_query_refs = []
+        self.counter_queries_complete = False
+        self.countersearch_complete = False
+        if self.nomination_record is None:
+            return
+        plan = self.store.head("kb/counter-search-plan")
+        if plan is None:
+            return
+        body = self._body(plan)
+        nomination_body = self._body(self.nomination_record)
+        if (body.get("nomination_ref") != self.nomination_record["artifact_ref"]
+                or body.get("survey_ref") != nomination_body.get("survey_ref")):
+            return
+        proposal = {key: body.get(key) for key in ("queries", "rationale")}
+        try:
+            self._plan_validator(proposal)
+        except ValidationError:
+            return
+        successful = {}
+        for ref, row in zip(self.query_refs, self.search_log):
+            request = row.get("request", {})
+            query = request.get("query")
+            if (row.get("role") == "methods.novelty-challenger"
+                    and row.get("plan_ref") == plan["artifact_ref"]
+                    and request.get("operation") == "search" and query):
+                successful[normalized(query)] = ref
+        required = [normalized(query) for query in proposal["queries"]]
+        if not all(query in successful for query in required):
+            self.counter_plan_record = plan
+            return
+        self.counter_plan_record = plan
+        self.counter_query_refs = [successful[query] for query in required]
+        self.counter_queries_complete = True
+        if self.survey_ref:
+            survey = self._body(self.store.get(self.survey_ref))
+            self.countersearch_complete = all(ref in survey.get("query_refs", [])
+                                              for ref in self.counter_query_refs)
 
     def _record(self, logical, kind, body, author, *, subjects=()):
         head = self.store.head(logical)
@@ -287,9 +334,37 @@ class SurveyRunner(ExecutionRuntime):
             "validator": validator, **({"normalizer": normalizer} if normalizer else {})}],
             stage=stage, task_kind=task_kind)[name]
 
+    def _retained_validation_feedback(self, name, assignment):
+        """Reuse a failed response only when its original assignment is still exact."""
+        if not self.resume_session:
+            return None
+        prefix = f"command/validation/survey-{name}-"
+        rows = self.control._conn.execute(
+            "SELECT artifact_ref FROM artifacts WHERE logical_id LIKE ? ORDER BY created_at DESC",
+            (prefix + "%",)).fetchall()
+        for row in rows:
+            validation = self.store.get(row["artifact_ref"])
+            try:
+                error = self._body(validation)["error"]
+                proposal = self.store.get(validation["inputs"][0]["ref"])
+                previous_response = self._body(proposal)
+                execution = self.store.get(proposal["inputs"][0]["ref"])
+                context = self._body(self.store.get(execution["inputs"][0]["ref"]))
+                prior_assignment = json.loads(context["prompt"])
+                prior_assignment.pop("validation_feedback", None)
+            except (IndexError, KeyError, TypeError, ValueError):
+                continue
+            if canonical_bytes(prior_assignment) == canonical_bytes(assignment):
+                return {"error": error, "previous_response": previous_response,
+                    "scope": "Repair only this assignment's recorded contract violations; preserve every valid field. "
+                             "Use every requested field name and enum value exactly as specified; do not substitute synonyms."}
+        return None
+
     def _models_checked(self, jobs, *, stage="production", task_kind="production"):
         """Validate bounded worker waves and retry only the rejected assignments."""
-        pending, results, feedback = list(jobs), {}, {}
+        pending, results = list(jobs), {}
+        feedback = {job["name"]: retained for job in pending
+                    if (retained := self._retained_validation_feedback(job["name"], job["assignment"])) is not None}
         for _ in range(self.config["limits"]["max_rounds"]):
             rejected = []
             for offset in range(0, len(pending), self.worker_slots):
@@ -403,19 +478,31 @@ class SurveyRunner(ExecutionRuntime):
         self.time_policy.observe("setup", time.monotonic() - started)
 
     def _initial_plans(self):
-        self._tick("supervision", count=2)
-        jobs = []
+        plans, jobs, plan_ids = [], [], {}
         for role in ("research.search-planner", "methods.blind-search-planner"):
-            task_id = role.replace(".", "-")
+            plan_id = role.replace(".", "-")
+            retained = self.store.head(f"kb/search-plans/{plan_id}") if self.resume_session else None
+            if retained is not None:
+                value = self._body(retained)
+                self._plan_validator(value)
+                plans.append((role, value["queries"], retained["artifact_ref"]))
+                continue
+            task_id = plan_id
+            if self.control._conn.execute(
+                    "SELECT 1 FROM tasks WHERE task_id = ?", (task_id,)).fetchone():
+                task_id = f"{plan_id}-{self.run_id}"
             assignment = {"assignment": "Plan a topic search without assuming a particular research gap.",
                 "phase": "blind_plan", "question": self.score["question"],
                 "seed_terms": self.score["seed_queries"], "max_queries": self.bounds["queries_per_role"],
                 "search_syntax": SEARCH_SYNTAX,
                 "instructions": "Return {queries:[search strings],rationale:string}. Use a distinct terminology or neighboring method family. Do not assert novelty."}
+            plan_ids[task_id] = plan_id
             jobs.append({"task_id": task_id, "kind": "model", "actor": role, "task_kind": "service",
                          "params": {"client": self.config["model"], "prompt": json.dumps(assignment)}})
+        if not jobs:
+            return plans
+        self._tick("supervision", count=len(jobs))
         outcomes = self._call_batch(jobs, max_parallel=self.config["limits"]["concurrent_calls"] - 1)
-        plans = []
         for job in jobs:
             outcome = outcomes[job["task_id"]]
             if not outcome["ok"]:
@@ -426,17 +513,24 @@ class SurveyRunner(ExecutionRuntime):
             value = result.json_object()
             self._plan_validator(value)
             self.time_policy.observe("supervision", result.elapsed_seconds)
-            record = self._publish(f"kb/search-plans/{job['task_id']}", "note", value, job["actor"], subjects=[outcome["record_ref"]])
+            record = self._publish(f"kb/search-plans/{plan_ids[job['task_id']]}", "note", value, job["actor"], subjects=[outcome["record_ref"]])
             self._complete(job["task_id"])
             plans.append((job["actor"], value["queries"], record["artifact_ref"]))
         return plans
 
-    def _ingest(self, works, execution):
+    def _ingest(self, works, execution, *, admission):
+        if admission not in {"discovery", "challenge"}:
+            raise ValidationError("literature admission phase is invalid")
+        admission_limit = self.bounds["max_works"]
+        if admission == "discovery":
+            admission_limit -= self.bounds.get("challenge_reserve", 0)
         added = 0
         for observed in works:
             wid = self.aliases.get(observed["id"]) or self.dois.get(observed["doi"]) or observed["id"]
-            if wid not in self.works and len(self.works) >= self.bounds["max_works"]:
-                self.gaps.append({"kind": "work_limit", "work_id": observed["id"]})
+            if wid not in self.works and len(self.works) >= admission_limit:
+                self.gaps.append({"kind": "work_limit", "work_id": observed["id"],
+                                  "admission": admission,
+                                  "reserved_challenge_slots": self.bounds.get("challenge_reserve", 0)})
                 continue
             self.aliases[observed["id"]] = wid
             if observed["doi"]:
@@ -468,7 +562,8 @@ class SurveyRunner(ExecutionRuntime):
                     self.source_docs[source["artifact_ref"]] = body
         return added
 
-    def _bibliographic_call(self, operation, *, role, query=None, work_id=None, cursor=None, plan_ref=None):
+    def _bibliographic_call(self, operation, *, role, query=None, work_id=None, cursor=None,
+                            plan_ref=None, admission="discovery"):
         self._ensure_active()
         if self.api_calls >= self.bounds["max_api_calls"]:
             self.gaps.append({"kind": "api_call_limit", "operation": operation, "query": query, "work_id": work_id})
@@ -482,7 +577,7 @@ class SurveyRunner(ExecutionRuntime):
             self._ensure_active()
             self.gaps.append({"kind": "bibliographic_failure", "request": arguments, "error": str(exc)})
             raise
-        added = self._ingest(result["works"], execution)
+        added = self._ingest(result["works"], execution, admission=admission)
         metadata = result["metadata"]
         body = {"request": arguments, "role": role, "execution_ref": execution, "plan_ref": plan_ref,
                 "returned_work_ids": [w["id"] for w in result["works"]], "new_unique_works": added,
@@ -495,15 +590,18 @@ class SurveyRunner(ExecutionRuntime):
         self._checkpoint("literature_captured", force=True)
         return body
 
-    def _search(self, queries, role, plan_ref=None):
+    def _search(self, queries, role, plan_ref=None, *, admission="discovery"):
         seen = ({normalized(row["request"]["query"]) for row in self.search_log
-                 if row.get("request", {}).get("operation") == "search" and row["request"].get("query")}
+                 if (row.get("request", {}).get("operation") == "search"
+                     and row["request"].get("query")
+                     and (admission != "challenge" or row.get("plan_ref") == plan_ref))}
                 if self.resume_session else set())
         for query in queries:
             if normalized(query) in seen:
                 continue
             seen.add(normalized(query))
-            self._bibliographic_call("search", role=role, query=query, plan_ref=plan_ref)
+            self._bibliographic_call("search", role=role, query=query, plan_ref=plan_ref,
+                                     admission=admission)
 
     def _expand(self):
         quiet = 0
@@ -882,7 +980,11 @@ class SurveyRunner(ExecutionRuntime):
         self.nomination_record = self._publish("kb/gap-nomination", "note", {
             "survey_ref": self.survey_ref, **self.nomination}, "research.gap-proposer", subjects=[self.survey_ref])
 
-    def _countersearch(self):
+    def _counter_plan(self):
+        self._refresh_countersearch_state()
+        if self.counter_plan_record is not None:
+            body = self._body(self.counter_plan_record)
+            return {key: body[key] for key in ("queries", "rationale")}, self.counter_plan_record
         plan, execution = self._model_checked("counter-plan", "methods.novelty-challenger", {
             "assignment": "Find searches most likely to disprove the nominated gap by locating an existing solution or alternate terminology.",
             "phase": "counter_plan", "question": self.score["question"], "gap": self.nomination,
@@ -892,11 +994,23 @@ class SurveyRunner(ExecutionRuntime):
             "survey_ref": self.survey_ref, "prerequisite_survey_ref": self.survey_ref,
             "instructions": "Return {queries:[search strings],rationale:string}. Seek prior solutions, incompatible assumptions, and decisive counterevidence."
         }, self._plan_validator, stage="supervision", task_kind="selection")
-        record = self._publish("kb/counter-search-plan", "note", {**plan, "survey_ref": self.survey_ref},
-                               "methods.novelty-challenger", subjects=[execution, self.survey_ref])
-        self._search(plan["queries"], "methods.novelty-challenger", record["artifact_ref"])
+        record = self._publish("kb/counter-search-plan", "note", {
+            **plan, "survey_ref": self.survey_ref,
+            "nomination_ref": self.nomination_record["artifact_ref"],
+        }, "methods.novelty-challenger", subjects=[execution, self.survey_ref,
+                                                   self.nomination_record["artifact_ref"]])
+        self.counter_plan_record = record
+        return plan, record
+
+    def _countersearch(self):
+        plan, record = self._counter_plan()
+        self._search(plan["queries"], "methods.novelty-challenger", record["artifact_ref"],
+                     admission="challenge")
         self._full_texts()
         self._accept_survey()
+        self._refresh_countersearch_state()
+        if not self.countersearch_complete:
+            raise ValidationError("counter-search completion could not be bound to the accepted survey")
 
     def _assess(self):
         value, execution = self._model_checked("gap-assessment", "methods.novelty-verifier", {
@@ -907,8 +1021,8 @@ class SurveyRunner(ExecutionRuntime):
             "map": self._map_body(), "coverage": self._coverage(), "sources": self._source_context(),
             "required_checks": list(GAP_CHECKS),
             "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
-            "instructions": "Return {state,rationale,comparisons:[{work_id,relationship,statement,evidence}],checks:[{check_id,outcome,method,result}],evidence}. "
-                "Each evidence item is {work_id,source_ref,quote}, quoting exact available source text. Each quote must be unique in its displayed source window. relationship is solves/partial/different/uncertain. "
+            "instructions": "Return exactly {state:string,rationale:string,comparisons:[{work_id:string,relationship:string,statement:string,evidence:[{work_id:string,source_ref:string,quote:string}]}],checks:[{check_id:string,outcome:string,method:string,result:string}],evidence:[{work_id:string,source_ref:string,quote:string}]}. "
+                "Both top-level evidence and every comparison evidence field must be arrays of evidence objects, never arrays of quote strings. Each evidence item quotes exact available source text. Each quote must be unique in its displayed source window. relationship is solves/partial/different/uncertain. "
                 "state is refuted_by_prior_work, insufficient_evidence, or eligible_for_experiment. Run exactly all required checks. "
                 "For every check, copy outcome from allowed_check_outcomes exactly; words such as pass, incomplete, inconclusive, or partial are invalid. "
                 "A prior solution supported by decisive full-text quotes refutes the gap even if global search is incomplete. "
@@ -952,25 +1066,31 @@ class SurveyRunner(ExecutionRuntime):
                 self._initialize()
             if not self.resume_session and not self.time_policy.snapshot()["initial_hard_limit_feasible"]:
                 raise ValidationError("configured survey stages do not fit the hard deadline; no external work dispatched")
-            needs_operations = not self.assessment_ref and (not self.works or self.nomination is None)
+            needs_operations = not self.assessment_ref and (
+                not self.survey_ref or self.nomination is None or not self.countersearch_complete)
             if needs_operations:
                 self._setup()
             if self.assessment_ref:
                 decision = self._body(self.store.get(self.assessment_ref))["state"]
             else:
-                if not self.works:
-                    plans = self._initial_plans()
-                    for wid in self.score["seed_work_ids"]:
-                        self._bibliographic_call("work", role="research.seed-reader", work_id=wid)
-                    self._search(self.score["seed_queries"], "research.seed-searcher", self.protocol["artifact_ref"])
-                    for role, queries, ref in plans:
-                        self._search(queries, role, ref)
-                    self._expand()
-                    self._full_texts()
                 if not self.survey_ref:
-                    self._accept_survey()
+                    if self.nomination is not None:
+                        self._accept_survey()
+                        self._refresh_countersearch_state()
+                    else:
+                        plans = self._initial_plans()
+                        for wid in self.score["seed_work_ids"]:
+                            if wid not in self.aliases:
+                                self._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+                        self._search(self.score["seed_queries"], "research.seed-searcher", self.protocol["artifact_ref"])
+                        for role, queries, ref in plans:
+                            self._search(queries, role, ref)
+                        self._expand()
+                        self._full_texts()
+                        self._accept_survey()
                 if self.nomination is None:
                     self._nominate()
+                if not self.countersearch_complete:
                     self._countersearch()
                 decision = self._assess()
             status = "completed"
@@ -999,7 +1119,7 @@ class SurveyRunner(ExecutionRuntime):
             "score_ref": getattr(self, "score_ref", None), "survey_ref": self.survey_ref, "survey_current": current,
             "assessment_ref": self.assessment_ref, "assessment_current": assessment_current,
             "gap_state": decision, "nomination": self.nomination,
-            "nomination_ref": self.nomination_record["artifact_ref"] if hasattr(self, "nomination_record") else None,
+            "nomination_ref": self.nomination_record["artifact_ref"] if self.nomination_record else None,
             "coverage": self._coverage(), "time_plan": self.time_policy.snapshot(), "time_decisions": self.time_decisions,
             "usage": self.budget.get_window("run-window"), "unreported_usage": self.usage_gaps,
             "capabilities": {key: self.operations.status(key) for key in self.capability_ids},

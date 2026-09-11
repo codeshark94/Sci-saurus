@@ -1,6 +1,10 @@
 """Wire-level model protocol checks against an explicit local test server."""
 import json
+import base64
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import tempfile
 import threading
 import unittest
 from unittest.mock import patch
@@ -82,6 +86,52 @@ class TestModelClient(unittest.TestCase):
         self.client('openai_compatible', reasoning_effort='none').complete(system='Return JSON.', prompt='Inspect.')
         self.assertEqual(self.request['reasoning_effort'], 'none')
         self.assertNotIn('response_format', self.request)
+
+    def test_compatible_multimodal_images_are_hash_pinned_and_embedded(self):
+        self.response = {'choices': [{'message': {'content': '{"ok":true}'}, 'finish_reason': 'stop'}]}
+        png = b'\x89PNG\r\n\x1a\n' + b'fixture-image'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'figure.png'
+            path.write_bytes(png)
+            digest = hashlib.sha256(png).hexdigest()
+            result = self.client('openai_compatible').complete(
+                system='Return JSON.', prompt='Inspect the figure.', images=[{
+                    'path': str(path.resolve()), 'media_type': 'image/png', 'sha256': digest,
+                }])
+        content = self.request['messages'][1]['content']
+        self.assertEqual(content[0], {'type': 'text', 'text': 'Inspect the figure.'})
+        self.assertEqual(content[1]['type'], 'image_url')
+        url = content[1]['image_url']['url']
+        self.assertTrue(url.startswith('data:image/png;base64,'))
+        self.assertEqual(base64.b64decode(url.split(',', 1)[1]), png)
+        self.assertEqual(result.json_object(), {'ok': True})
+
+    def test_multimodal_input_rejects_drift_mismatch_and_unsupported_protocol(self):
+        png = b'\x89PNG\r\n\x1a\n' + b'fixture-image'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'figure.png'
+            path.write_bytes(png)
+            valid = {'path': str(path.resolve()), 'media_type': 'image/png',
+                     'sha256': hashlib.sha256(png).hexdigest()}
+            with self.assertRaises(ValidationError):
+                self.client().complete(system='x', prompt='x', images=[valid])
+            with self.assertRaises(ValidationError):
+                self.client('openai_compatible').complete(
+                    system='x', prompt='x', images=[{**valid, 'sha256': '0' * 64}])
+            with self.assertRaises(ValidationError):
+                self.client('openai_compatible').complete(
+                    system='x', prompt='x', images=[{**valid, 'media_type': 'image/jpeg'}])
+
+    def test_multimodal_request_limits_are_enforced_before_network(self):
+        png = b'\x89PNG\r\n\x1a\n' + b'x' * 64
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'figure.png'
+            path.write_bytes(png)
+            image = {'path': str(path.resolve()), 'media_type': 'image/png',
+                     'sha256': hashlib.sha256(png).hexdigest()}
+            with self.assertRaises(ValidationError):
+                self.client('openai_compatible', max_image_bytes=32,
+                            max_request_bytes=128).complete(system='x', prompt='x', images=[image])
 
     def test_invalid_or_unsupported_generation_options_fail_before_network(self):
         for value in ('', 'ultra', True, ['high']):

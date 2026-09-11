@@ -76,6 +76,12 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(result["source_changed_paths"], ["scisaurus/worker.py"])
         self.assertEqual(result["reopened_scopes"], ["production"])
 
+    def test_explicit_retry_scope_is_retained_without_source_change(self):
+        policy = self.policy(source_changes={"mode": "reopen", "reopen_scopes": ["operations"]})
+        result = self.controller.prepare(self.config, policy)
+        self.assertEqual(result["source_changed_paths"], [])
+        self.assertEqual(result["reopened_scopes"], ["operations"])
+
     def test_new_runtime_source_file_is_also_detected(self):
         (self.root / "scisaurus" / "new_module.py").write_text("ENABLED = True\n")
         with self.assertRaisesRegex(ValidationError, "source changed"):

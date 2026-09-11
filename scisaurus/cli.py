@@ -67,6 +67,22 @@ def main(argv=None) -> int:
                                  choices=["operations", "retrieval", "mapping", "focused_review",
                                           "integrated_review", "gap_assessment", "production", "rendering"])
 
+    p_visual = sub.add_parser(
+        "run-visual-review", help="evaluate hash-pinned figures or visual concepts with multimodal review")
+    p_visual.add_argument("project_dir")
+    p_visual.add_argument("--config", required=True)
+    p_visual.add_argument("--deadline-seconds", type=float)
+    p_visual.add_argument("--target-seconds", type=float)
+    p_visual.add_argument("--first-result-seconds", type=float)
+
+    p_experiment = sub.add_parser(
+        "run-experiment", help="execute, replay, independently recalculate, and review a frozen study")
+    p_experiment.add_argument("project_dir")
+    p_experiment.add_argument("--config", required=True)
+    p_experiment.add_argument("--deadline-seconds", type=float)
+    p_experiment.add_argument("--target-seconds", type=float)
+    p_experiment.add_argument("--first-result-seconds", type=float)
+
     p_blind = sub.add_parser("prepare-evaluation", help="export label-free cases from a frozen judgment corpus")
     p_blind.add_argument("--corpus", required=True)
     p_blind.add_argument("--output", required=True)
@@ -122,9 +138,15 @@ def main(argv=None) -> int:
         print(json.dumps({"status": result.get("status", "prepared"),
                           "output": str(Path(args.output).resolve())}, indent=2))
         return 0
-    if args.cmd in {"run-paragraph", "run-project", "run-survey", "resume-survey"}:
+    if args.cmd in {"run-paragraph", "run-project", "run-survey", "resume-survey", "run-visual-review", "run-experiment"}:
         from scisaurus.core.errors import ContractError, ValidationError
-        if args.cmd in {"run-survey", "resume-survey"}:
+        if args.cmd == "run-experiment":
+            from scisaurus.runtime.experiment_config import load_experiment_config as load_config
+            from scisaurus.runtime.experiment import ExperimentRunner as Runner
+        elif args.cmd == "run-visual-review":
+            from scisaurus.runtime.visual_review_config import load_visual_review_config as load_config
+            from scisaurus.runtime.visual_review import VisualReviewRunner as Runner
+        elif args.cmd in {"run-survey", "resume-survey"}:
             from scisaurus.runtime.survey_config import load_survey_config as load_config
             from scisaurus.runtime.survey import SurveyRunner as Runner
         elif args.cmd == "run-project":
@@ -135,12 +157,12 @@ def main(argv=None) -> int:
             from scisaurus.runtime.runner import ParagraphRunner as Runner
         try:
             config = load_config(args.config)
-            if args.cmd in {"run-project", "run-survey"}:
+            if args.cmd in {"run-project", "run-survey", "run-visual-review", "run-experiment"}:
                 overrides = {name: getattr(args, flag) for name, flag in (
                     ("hard_seconds", "deadline_seconds"), ("target_seconds", "target_seconds"),
                     ("first_result_seconds", "first_result_seconds")) if getattr(args, flag) is not None}
                 if overrides:
-                    if "score" not in config and "survey" not in config:
+                    if not any(key in config for key in ("score", "survey", "visual_review", "experiment")):
                         raise ValidationError(
                             "Time planning options require a versioned Score configuration")
                     config["time_policy"] = {**(config.get("time_policy") or {}), **overrides}
@@ -164,7 +186,10 @@ def main(argv=None) -> int:
             return 2
         print(json.dumps({"status": result["status"], "incumbent_ref": result["incumbent_ref"],
                           "report": str(Path(args.project_dir).resolve() / "output" / (
-                              "survey.md" if args.cmd in {"run-survey", "resume-survey"} else "report.md"))}, indent=2))
+                              "survey.md" if args.cmd in {"run-survey", "resume-survey"}
+                              else "visual-assessment.md" if args.cmd == "run-visual-review"
+                              else "experiment.md" if args.cmd == "run-experiment"
+                              else "report.md"))}, indent=2))
         return 0 if result["status"] in {"accepted", "completed"} else 3
 
 

@@ -29,9 +29,14 @@ _REVIEW = (
     "passed, failed, insufficient_evidence, or check_failed. Execute every required_checks entry, copying its check_id "
     "and kind exactly. Include at least one resolution check and concrete comparisons. Do not use the reserved "
     "check_id mechanical-preservation. regressions and uncertainties are lists of substantive strings; material "
-    "unresolved acceptance questions belong in uncertainties. observations is a list of {observation,reason_nonblocking}; "
-    "both strings must explain why the note cannot affect acceptance. Do not downgrade failed checks or insufficient "
-    "evidence to observations. Use empty lists when there are no items. rationale is a substantive string. "
+    "unresolved acceptance questions belong in uncertainties. An uncertainty is blocking: use it only when a required "
+    "check cannot be passed or a concrete acceptance criterion remains unresolved. If every required check passes and "
+    "there are no regressions, uncertainties MUST be an empty list. Informational notes, intentionally bounded states "
+    "already required by the supplied objective (including an insufficient_evidence literature assessment when the "
+    "document makes no novelty claim), and wording alternatives within the resolution condition belong in observations. "
+    "observations is a list of {observation,reason_nonblocking}; both strings must explain why the note cannot affect "
+    "acceptance. Do not downgrade failed checks or insufficient evidence to observations. Use empty lists when there "
+    "are no items. rationale is a substantive string. "
     "Do not propose replacement deliverable content."
 )
 

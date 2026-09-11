@@ -77,7 +77,7 @@ def _invoke_worker(kind, params, channel):
     try:
         if kind == "model":
             client = ModelClient(**params["client"])
-            result = asdict(client.complete(system=SYSTEM, prompt=params["prompt"]))
+            result = asdict(client.complete(system=SYSTEM, prompt=params["prompt"], images=params.get("images")))
         elif kind == "crossref":
             from scisaurus.runtime.retrieval import CrossrefClient
             result = CrossrefClient(**params["client"]).search(params["query"], limit=params["limit"])
@@ -475,8 +475,10 @@ class ExecutionRuntime:
     def _complete(self, task_id):
         self.tasks.transition(task_id, "completed", "command.controller", reason="scoped output recorded and checked")
 
-    def _model(self, task_id, role, assignment, *, task_kind, reservation_id=None):
+    def _model(self, task_id, role, assignment, *, task_kind, reservation_id=None, images=None):
         params = {"client": self.config["model"], "prompt": json.dumps(assignment, ensure_ascii=False)}
+        if images:
+            params["images"] = images
         data, ref = self._call(task_id, "model", params, actor=role, task_kind=task_kind, reservation_id=reservation_id)
         result = ModelResult(**data)
         if result.finish_reason != "stop":

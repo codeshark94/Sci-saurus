@@ -1,0 +1,88 @@
+{
+  "live_dispatch_allowed": false,
+  "data_classification": "public",
+  "allocation_mode": "capacity_pool",
+  "project_id": "example-visual-review",
+  "objective": "Evaluate the supplied visual at its intended delivery size and produce evidence-grounded, purpose-scoped revision actions while preserving scientific meaning and unaffected content.",
+  "supplied_context": "The subject is a public example. The rendered asset is the exact delivery candidate. Reference and source assets, when present, are context rather than replacement content.",
+  "model": {
+    "protocol": "openai_compatible",
+    "base_url": "runtime_required",
+    "model": "runtime_required",
+    "timeout_seconds": 300,
+    "max_output_tokens": 8192,
+    "max_image_bytes": 7000000,
+    "max_request_bytes": 10000000,
+    "auth_env": null,
+    "reasoning_effort": "high",
+    "output_format": "json_object"
+  },
+  "limits": {
+    "max_rounds": 2,
+    "wall_clock_seconds": 900,
+    "checkpoint_seconds": 15,
+    "max_result_bytes": 10000000,
+    "concurrent_calls": 4
+  },
+  "time_policy": {
+    "first_result_seconds": 480,
+    "target_seconds": 720,
+    "hard_seconds": 900
+  },
+  "visual_review": {
+    "id": "figure-or-concept-review",
+    "revision": 1,
+    "mode": "general_visual",
+    "target_medium": "final rendered page or screen at its intended reading size",
+    "intended_audience": "the intended end reader",
+    "assets": [
+      {
+        "id": "subject",
+        "path": "/absolute/path/to/subject.png",
+        "media_type": "image/png",
+        "role": "subject",
+        "label": "Visual candidate under review"
+      }
+    ],
+    "criteria": [
+      {
+        "id": "purpose-fit",
+        "requirement": "The visual hierarchy and composition support the stated communication purpose and audience."
+      },
+      {
+        "id": "legibility",
+        "requirement": "Text, symbols, marks, labels, legends, and important detail remain legible at delivery size."
+      },
+      {
+        "id": "geometry",
+        "requirement": "Comparable elements align; spacing, gutters, dimensions, aspect ratios, and visual balance are consistent."
+      },
+      {
+        "id": "semantic-fidelity",
+        "requirement": "The presentation preserves the supplied meaning, data, labels, scale bars, and relationships without visually implying unsupported conclusions."
+      },
+      {
+        "id": "aesthetic-coherence",
+        "requirement": "Typography, color, contrast, density, and style form a coherent visual system appropriate to the medium."
+      }
+    ],
+    "perspectives": [
+      {
+        "id": "information",
+        "focus": "Information hierarchy, legibility, accessibility, and semantic fidelity."
+      },
+      {
+        "id": "composition",
+        "focus": "Grid, alignment, spacing, proportion, balance, typography, and aesthetic coherence."
+      }
+    ],
+    "stage_seconds": {
+      "setup": 30,
+      "supervision": 30,
+      "production": 120,
+      "unit_review": 120,
+      "integrated_review": 120,
+      "reassessment": 60
+    }
+  }
+}

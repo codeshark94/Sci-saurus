@@ -45,6 +45,7 @@ def survey_work(wid):
 class SurveyHTTPFixture(BaseHTTPRequestHandler):
     requests = []
     refresh_target = False
+    rate_limit_once = None
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *_):
@@ -54,6 +55,17 @@ class SurveyHTTPFixture(BaseHTTPRequestHandler):
         path = urlsplit(self.path)
         query = parse_qs(path.query)
         self.requests.append({"path": path.path, "query": query})
+        if (self.rate_limit_once is not None
+                and query.get("search", [None])[0] == self.rate_limit_once):
+            type(self).rate_limit_once = None
+            body = json.dumps({"error": "Rate limit exceeded", "retryAfter": 1}).encode()
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Retry-After", "1")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if ("query.bibliographic" in query
                 or query.get("filter", [""])[0].lower().startswith("doi:")):
             doi = query.get("query.bibliographic", query.get("filter"))[0].lower()
@@ -221,6 +233,7 @@ def survey_config(endpoint, mode="pass"):
                 "environment_files": []},
             "full_text": None, "full_text_sources": [],
             "search": {"queries_per_role": 1, "results_per_query": 2, "max_works": 10,
+                "challenge_reserve": 1,
                 "expansion_rounds": 1, "expansion_seed_count": 1, "references_per_work": 1,
                 "max_api_calls": 10, "min_new_works": 1, "saturation_rounds": 1,
                 "max_full_texts": 2, "max_text_chars": 10000, "context_chars": 10000},
@@ -247,9 +260,11 @@ class TestSurveyRunner(unittest.TestCase):
         self.root = Path(self.temp.name)
         SurveyHTTPFixture.requests.clear()
         SurveyHTTPFixture.refresh_target = False
+        SurveyHTTPFixture.rate_limit_once = None
 
-    def runtime(self, config=None, *, on_progress=None):
-        runner = SurveyRunner(self.root / "run", config or survey_config(self.endpoint), on_progress=on_progress)
+    def runtime(self, config=None, *, on_progress=None, resume_policy=None):
+        runner = SurveyRunner(self.root / "run", config or survey_config(self.endpoint),
+                              on_progress=on_progress, resume_policy=resume_policy)
         runner.worker_target = simulated_survey_worker
         return runner
 
@@ -266,6 +281,29 @@ class TestSurveyRunner(unittest.TestCase):
             if "prompt" in body:
                 contexts.append((manifest, json.loads(body["prompt"])))
         return contexts
+
+    def test_resume_reuses_latest_validation_feedback_only_for_the_same_assignment(self):
+        runner = self.runtime()
+        assignment = {"phase": "gap_assessment", "survey_ref": "artifact:kb/surveys/current@1"}
+        prior = {"state": "insufficient_evidence", "evidence": []}
+        context = runner._publish("command/contexts/survey-gap-assessment-1", "note", {
+            "client": {"model": "fixture"},
+            "prompt": json.dumps({**assignment, "validation_feedback": {"error": "older"}})},
+            "methods.novelty-verifier")
+        execution = runner._publish("command/executions/survey-gap-assessment-1", "report", {
+            "text": json.dumps(prior)}, "methods.novelty-verifier", subjects=[context["artifact_ref"]])
+        proposal = runner._publish("kb/model-proposals/survey-gap-assessment-1", "note", prior,
+            "methods.novelty-verifier", subjects=[execution["artifact_ref"]])
+        runner._publish("command/validation/survey-gap-assessment-1", "note", {
+            "error": "$.comparisons[0].evidence[0]: invalid quote"}, "command.controller",
+            subjects=[proposal["artifact_ref"]])
+        runner.resume_session = True
+        retained = runner._retained_validation_feedback("gap-assessment", assignment)
+        self.assertEqual(retained["previous_response"], prior)
+        self.assertIn("comparisons[0]", retained["error"])
+        self.assertIsNone(runner._retained_validation_feedback(
+            "gap-assessment", {**assignment, "survey_ref": "artifact:kb/surveys/current@2"}))
+        runner.control.close()
 
     def test_focused_semantic_repair_changes_only_failed_field_and_work(self):
         config = survey_config(self.endpoint)
@@ -359,6 +397,23 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertIn({"source": "W301", "target": "W101", "kind": "cites"}, mapping["citation_edges"])
         self.assertIsNotNone(result["time_plan"]["first_verified_result"])
         self.assertTrue(result["event_chain"][0])
+
+    def test_countersearch_reserve_prevents_discovery_from_filling_work_budget(self):
+        config = survey_config(self.endpoint)
+        config["survey"]["search"].update(max_works=4, challenge_reserve=1)
+        result = self.runtime(config).run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertEqual(result["coverage"]["unique_works"], 4)
+        _, store = self.open_store()
+        register = json.loads(store.read_body(store.head("kb/work-register")["body_hash"]))
+        work_ids = {store.get(ref)["artifact_id"].removeprefix("kb/works/")
+                    for ref in register["work_refs"]}
+        self.assertIn("W401", work_ids)
+        self.assertNotIn("W301", work_ids)
+        self.assertTrue(any(gap.get("work_id") == "W301"
+                            and gap.get("admission") == "discovery"
+                            and gap.get("reserved_challenge_slots") == 1
+                            for gap in result["coverage"]["access_and_limit_gaps"]))
 
     def test_automatic_nomination_uses_current_accepted_survey(self):
         config = survey_config(self.endpoint)
@@ -676,6 +731,113 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual([row["number"] for row in reservations], [11, 12])
         self.assertEqual([row["identity_number"] for row in reservations], [3, 4])
         self.assertEqual([row["capability"] for row in reservations], ["bibliography", "identity"])
+
+    def test_resume_reuses_completed_blind_search_plans_before_any_work_was_captured(self):
+        config = survey_config(self.endpoint)
+        del config["survey"]["search"]["challenge_reserve"]
+        first = self.runtime(config)
+        first._initialize()
+        original = first._initial_plans()
+        task_count = first.control._conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        first.control.close()
+
+        policy = {
+            "additional_seconds": 20,
+            "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+            "source_changes": {"mode": "reject", "reopen_scopes": []},
+        }
+        resumed = SurveyRunner(self.root / "run", config, resume_policy=policy)
+        self.addCleanup(resumed.control.close)
+        resumed.worker_target = lambda *_: (_ for _ in ()).throw(AssertionError("retained plans dispatched again"))
+        retained = resumed._initial_plans()
+        self.assertEqual(retained, original)
+        self.assertEqual(resumed.control._conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], task_count)
+        self.assertEqual(resumed.time_decisions, [])
+
+    def test_resume_finishes_pending_searches_after_partial_capture_and_rate_limit(self):
+        config = survey_config(self.endpoint)
+        config["survey"]["seed_queries"] = ["recall timing", "rate limited topic"]
+        config["survey"]["search"]["expansion_rounds"] = 0
+        SurveyHTTPFixture.rate_limit_once = "rate limited topic"
+        first = self.runtime(config).run()
+        self.assertEqual(first["status"], "blocked")
+        self.assertEqual(first["coverage"]["unique_works"], 1)
+        self.assertIn("Workload output or provider schema failed", first["error"])
+
+        policy = {
+            "additional_seconds": 40,
+            "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+            "source_changes": {"mode": "reject", "reopen_scopes": []},
+        }
+        completed = self.runtime(config, resume_policy=policy).run()
+        self.assertEqual(completed["status"], "completed", completed)
+        successful = [row["request"]["query"] for row in completed["coverage"]["searches"]
+                      if row["request"]["operation"] == "search"]
+        self.assertEqual(successful.count("recall timing"), 1)
+        self.assertEqual(successful.count("rate limited topic"), 1)
+        control, store = self.open_store()
+        blind_prompts = [prompt for _, prompt in self.model_contexts(control, store)
+                         if prompt["phase"] == "blind_plan"]
+        self.assertEqual(len(blind_prompts), 2)
+        reservations = [json.loads(store.read_body(record[0])) for record in control._conn.execute(
+            "SELECT body_hash FROM artifacts WHERE logical_id LIKE 'command/api-calls/%' ORDER BY version"
+        ).fetchall()]
+        failed = [row for row in reservations if row["request"].get("query") == "rate limited topic"]
+        self.assertEqual(len(failed), 2)
+
+    def test_resume_after_nomination_still_executes_countersearch(self):
+        config = survey_config(self.endpoint)
+        with patch.object(SurveyRunner, "_countersearch", side_effect=KeyboardInterrupt("fixture stop")):
+            first = self.runtime(config).run()
+        self.assertEqual(first["status"], "blocked")
+        self.assertIsNotNone(first["nomination_ref"])
+        self.assertFalse(any(request["query"].get("search") == ["prior solution"]
+                             for request in SurveyHTTPFixture.requests))
+
+        policy = {
+            "additional_seconds": 40,
+            "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+            "source_changes": {"mode": "reject", "reopen_scopes": []},
+        }
+        completed = self.runtime(config, resume_policy=policy).run()
+        self.assertEqual(completed["status"], "completed", completed)
+        self.assertEqual(sum(request["query"].get("search") == ["prior solution"]
+                             for request in SurveyHTTPFixture.requests), 1)
+
+    def test_resume_after_counter_query_reaccepts_before_assessment_without_repeating_query(self):
+        config = survey_config(self.endpoint)
+        original = SurveyRunner._accept_survey
+
+        def stop_before_post_challenge_acceptance(runner):
+            if (runner.nomination is not None and any(
+                    row.get("role") == "methods.novelty-challenger" for row in runner.search_log)):
+                raise KeyboardInterrupt("fixture stop after challenge capture")
+            return original(runner)
+
+        with patch.object(SurveyRunner, "_accept_survey", stop_before_post_challenge_acceptance):
+            first = self.runtime(config).run()
+        self.assertEqual(first["status"], "blocked")
+        self.assertFalse(first["survey_current"])
+        self.assertEqual(sum(request["query"].get("search") == ["prior solution"]
+                             for request in SurveyHTTPFixture.requests), 1)
+
+        policy = {
+            "additional_seconds": 40,
+            "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+            "source_changes": {"mode": "reject", "reopen_scopes": []},
+        }
+        completed = self.runtime(config, resume_policy=policy).run()
+        self.assertEqual(completed["status"], "completed", completed)
+        self.assertTrue(completed["survey_current"])
+        self.assertTrue(completed["assessment_current"])
+        self.assertEqual(sum(request["query"].get("search") == ["prior solution"]
+                             for request in SurveyHTTPFixture.requests), 1)
+        control, store = self.open_store()
+        counter_plans = [prompt for _, prompt in self.model_contexts(control, store)
+                         if prompt["phase"] == "counter_plan"]
+        self.assertEqual(len(counter_plans), 1)
+        plan = json.loads(store.read_body(store.head("kb/counter-search-plan")["body_hash"]))
+        self.assertEqual(plan["nomination_ref"], completed["nomination_ref"])
 
 
 class TestSurveyContracts(unittest.TestCase):

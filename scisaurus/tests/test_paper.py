@@ -167,6 +167,106 @@ class PaperReleaseTests(unittest.TestCase):
         finally:
             builder.close()
 
+    def test_generated_bibliography_uses_unstretched_reference_spacing(self):
+        builder = PaperReleaseBuilder(self.root / "reference-layout", self.config())
+        try:
+            tex = builder._tex(builder._manuscript())
+            self.assertIn("\\begin{thebibliography}{99}\n\\footnotesize\n\\raggedright\n"
+                          "\\setlength{\\itemsep}{0.25em}\n\\bibitem", tex)
+        finally:
+            builder.close()
+
+    def test_generated_result_figure_is_rendered_from_the_copied_asset_path(self):
+        builder = PaperReleaseBuilder(self.root / "figure-layout", self.config())
+        try:
+            manuscript = builder._manuscript()
+            results = {"assets": [{"id": "figure_one", "path": "figures/result.png", "role": "figure",
+                                    "media_type": "image/png", "caption": "Observed result."}]}
+            tex = builder._tex(manuscript, results)
+            self.assertIn(r"\includegraphics[width=0.78\linewidth]{\detokenize{../assets/figures/result.png}}", tex)
+            self.assertIn(r"\caption{Observed result.}", tex)
+        finally:
+            builder.close()
+
+    def test_storyline_score_binds_every_ordered_beat_to_claims_and_evidence(self):
+        value = self.config()
+        value["schema_version"] = "paper-release-score-2"
+        value["storyline"] = {"id": "fixture_story", "revision": 1,
+            "thesis": "The fixture demonstrates evidence-bound assembly.", "beats": [
+                {"id": "prior_beat", "role": "motivation",
+                 "proposition": "The treatment also works in condition B."},
+                {"id": "metric_beat", "role": "result", "proposition": "91.2% accuracy"},
+                {"id": "observation_beat", "role": "conclusion",
+                 "proposition": "Observed accuracy was 91.2 percent."}]}
+        for evidence in value["evidence"]:
+            evidence["relation"] = "support"
+        value["claims"][0]["storyline_id"] = "prior_beat"
+        value["claims"][1]["storyline_id"] = "metric_beat"
+        value["claims"].append({"id": "observation_claim", "statement": "Observed accuracy was 91.2 percent.",
+            "unit_ids": ["metric"], "evidence_ids": ["measured_accuracy"],
+            "storyline_id": "observation_beat"})
+        builder = PaperReleaseBuilder(self.root / "storyline-release", value)
+        try:
+            index = builder._bind(builder._manuscript(), builder._survey(), json.loads(self.results.read_text()))
+            self.assertEqual(index["schema_version"], "paper-claim-index-3")
+            self.assertEqual(index["storyline"], value["storyline"])
+        finally:
+            builder.close()
+        value["claims"][-1]["storyline_id"] = "metric_beat"
+        with self.assertRaisesRegex(ValidationError, "every storyline beat"):
+            PaperReleaseBuilder(self.root / "missing-storyline-beat", value)
+
+    def test_storyline_score_rejects_reordered_manuscript_beats(self):
+        value = self.config()
+        value["schema_version"] = "paper-release-score-2"
+        value["storyline"] = {"id": "reordered_story", "revision": 1, "thesis": "Order is frozen.", "beats": [
+            {"id": "metric_first", "role": "result", "proposition": "91.2% accuracy"},
+            {"id": "prior_second", "role": "motivation", "proposition": "The treatment also works in condition B."},
+            {"id": "observation_third", "role": "conclusion", "proposition": "Observed accuracy was 91.2 percent."}]}
+        for evidence in value["evidence"]:
+            evidence["relation"] = "support"
+        value["claims"][0]["storyline_id"] = "prior_second"
+        value["claims"][1]["storyline_id"] = "metric_first"
+        value["claims"].append({"id": "observation_claim", "statement": "Observed accuracy was 91.2 percent.",
+            "unit_ids": ["metric"], "evidence_ids": ["measured_accuracy"],
+            "storyline_id": "observation_third"})
+        builder = PaperReleaseBuilder(self.root / "reordered-storyline", value)
+        try:
+            with self.assertRaisesRegex(ValidationError, "ordered storyline"):
+                builder._bind(builder._manuscript(), builder._survey(), json.loads(self.results.read_text()))
+        finally:
+            builder.close()
+
+    def test_storyline_score_binds_method_finding_and_limitation_to_results_package(self):
+        value = self.config()
+        value["schema_version"] = "paper-release-score-2"
+        value["storyline"] = {"id": "result_story", "revision": 1, "thesis": "The fixture is bounded.", "beats": [
+            {"id": "method_beat", "role": "method", "proposition": "Evaluate the frozen fixture."},
+            {"id": "finding_beat", "role": "result", "proposition": "Observed accuracy was 91.2 percent."},
+            {"id": "limit_beat", "role": "limitation", "proposition": "The fixture does not establish external validity."}]}
+        value["evidence"] = [
+            {"id": "frozen_procedure", "kind": "procedure", "locator": "frozen_test",
+             "quote": "Evaluate the frozen fixture.", "relation": "support"},
+            {"id": "observed_finding", "kind": "finding", "locator": "observed_accuracy",
+             "quote": "Observed accuracy was 91.2 percent.", "relation": "support"},
+            {"id": "external_limit", "kind": "limitation", "locator": "limitation/0",
+             "quote": "The fixture does not establish external validity.", "relation": "qualify"}]
+        value["claims"] = [
+            {"id": "method_claim", "statement": "Evaluate the frozen fixture.", "unit_ids": ["method"],
+             "evidence_ids": ["frozen_procedure"], "storyline_id": "method_beat"},
+            {"id": "finding_claim", "statement": "Observed accuracy was 91.2 percent.", "unit_ids": ["metric"],
+             "evidence_ids": ["observed_finding"], "storyline_id": "finding_beat"},
+            {"id": "limit_claim", "statement": "The fixture does not establish external validity.", "unit_ids": ["limits"],
+             "evidence_ids": ["external_limit"], "storyline_id": "limit_beat"}]
+        builder = PaperReleaseBuilder(self.root / "result-evidence", value)
+        try:
+            builder._bind(builder._manuscript(), builder._survey(), json.loads(self.results.read_text()))
+            builder.config["evidence"][0]["quote"] = "Evaluate a different fixture."
+            with self.assertRaisesRegex(ValidationError, "exact procedure"):
+                builder._bind(builder._manuscript(), builder._survey(), json.loads(self.results.read_text()))
+        finally:
+            builder.close()
+
 
 if __name__ == "__main__":
     unittest.main()

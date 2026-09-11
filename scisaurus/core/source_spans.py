@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 from copy import deepcopy
+import re
 
 from scisaurus.core.errors import ValidationError
 
@@ -42,29 +43,80 @@ def locate(source: dict, quote: str, *, window: dict | None = None) -> dict:
     return {"start": position, "end": position + len(quote), "quote_sha256": quote_sha256(quote)}
 
 
+def _restore_unique_source_whitespace(source: dict, quote: str, *, window: dict | None = None) -> str:
+    """Return the exact source slice for one whitespace-equivalent quotation.
+
+    JSON-producing models commonly collapse a rendered line break into a space.  That
+    transport difference is safe to repair only when every non-whitespace character
+    is unchanged and the resulting pattern identifies one source span.
+    """
+    text = source.get("text")
+    if not isinstance(text, str) or not isinstance(quote, str) or not quote or not quote.strip():
+        raise ValidationError("source text and evidence quote must be nonempty strings")
+    start, end = (0, len(text)) if window is None else (window.get("start"), window.get("end"))
+    if (type(start) is not int or type(end) is not int or not 0 <= start <= end <= len(text)):
+        raise ValidationError("source window must be a valid character range")
+    parts = re.split(r"\s+", quote.strip())
+    pattern = re.compile(r"\s+".join(re.escape(part) for part in parts))
+    matches = list(pattern.finditer(text, start, end))
+    if len(matches) != 1:
+        raise ValidationError("evidence quote is absent from the supplied source window"
+                              if not matches else
+                              "evidence quote occurs more than once; provide a longer unique quotation")
+    return matches[0].group(0)
+
+
 def bind(value, sources: dict, *, windows: dict | None = None) -> dict:
-    """Bind legacy quotation objects to deterministic spans without altering other fields."""
+    """Bind quotation objects to deterministic spans without altering other fields.
+
+    Model replies sometimes copy a valid quotation together with character offsets
+    from a different representation of the same source. The quotation remains the
+    authoritative payload: when a span-shaped item does not reproduce it, discard
+    only the stale locator and re-locate that exact quotation inside the pinned
+    source window. A quotation that cannot be located uniquely still fails closed.
+    """
     value = deepcopy(value)
     windows = windows or {}
+    errors = []
 
-    def visit(item):
+    def visit(item, path="$"):
         if isinstance(item, dict):
-            if set(item) == LEGACY_EVIDENCE_FIELDS:
+            fields = set(item)
+            if fields == LEGACY_EVIDENCE_FIELDS or fields == SPAN_EVIDENCE_FIELDS:
                 source = sources.get(item.get("source_ref"))
                 if source is None or source.get("work_id") != item.get("work_id"):
-                    raise ValidationError("evidence identifies an unavailable source or different work")
+                    errors.append(f"{path}: evidence identifies an unavailable source or different work")
+                    return
                 try:
-                    item.update(locate(source, item.get("quote"), window=windows.get(item["source_ref"])))
+                    window = windows.get(item["source_ref"])
+                    if fields == SPAN_EVIDENCE_FIELDS:
+                        start, end = item.get("start"), item.get("end")
+                        text = source.get("text")
+                        if (isinstance(text, str) and type(start) is int and type(end) is int
+                                and 0 <= start < end <= len(text)
+                                and text[start:end] == item.get("quote")
+                                and item.get("quote_sha256") == quote_sha256(item.get("quote"))):
+                            return
+                    item.update(locate(source, item.get("quote"), window=window))
                 except ValidationError as exc:
-                    raise ValidationError(
-                        f"evidence for {item.get('work_id')} must quote exact captured text unambiguously: {exc}") from exc
-            for child in item.values():
-                visit(child)
+                    try:
+                        item["quote"] = _restore_unique_source_whitespace(
+                            source, item.get("quote"), window=window)
+                        item.update(locate(source, item["quote"], window=window))
+                    except ValidationError:
+                        errors.append(
+                            f"{path}: evidence for {item.get('work_id')} must quote exact captured text "
+                            f"unambiguously: {exc}")
+                        return
+            for key, child in item.items():
+                visit(child, f"{path}.{key}")
         elif isinstance(item, list):
-            for child in item:
-                visit(child)
+            for index, child in enumerate(item):
+                visit(child, f"{path}[{index}]")
 
     visit(value)
+    if errors:
+        raise ValidationError("; ".join(errors))
     return value
 
 

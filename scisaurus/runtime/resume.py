@@ -181,9 +181,16 @@ class ResumeController:
         serial = self.control._conn.execute(
             "SELECT COUNT(*) FROM artifacts WHERE logical_id LIKE 'command/resume-sessions/%'"
         ).fetchone()[0] + 1
+        # An explicit reopen request is meaningful even when no source file
+        # changed.  This is the recovery path for a known, retryable provider
+        # failure (for example a 429) whose failed request was never promoted
+        # into the retained search log.  Source drift still requires the same
+        # explicit scope; this simply avoids conflating retry authority with
+        # file-change detection.
+        reopened_scopes = source_policy["reopen_scopes"] if source_policy["mode"] == "reopen" else []
         body = {"schema_version": "resume-session-1", "session": serial,
                 "config_ref": config_ref["artifact_ref"], "source_changed_paths": changed,
-                "reopened_scopes": source_policy["reopen_scopes"] if changed else [],
+                "reopened_scopes": reopened_scopes,
                 "unknown_reconciliations": reconciled,
                 "additional_seconds": float(policy["additional_seconds"]),
                 "event_chain_before_resume": self.control.verify_chain()}

@@ -1,0 +1,152 @@
+{
+  "live_dispatch_allowed": false,
+  "data_classification": "public",
+  "allocation_mode": "capacity_pool",
+  "project_id": "robust-mean-validation",
+  "objective": "Run a reproducible finite simulation comparing the empirical mean and a median-of-means estimator under clean and symmetric replacement-contamination conditions. Preserve raw replicate outputs, mixed results, exact replay evidence, independent metric recalculation, figure review, and limits on inference.",
+  "supplied_context": "This is a computational methods-validation pilot. It tests a frozen parameter setting and does not claim a new estimator, exhaustive tuning, adversarial-contamination coverage, or external empirical validity.",
+  "model": {
+    "protocol": "openai_compatible",
+    "base_url": "runtime_required",
+    "model": "runtime_required",
+    "timeout_seconds": 600,
+    "max_output_tokens": 8192,
+    "auth_env": null,
+    "reasoning_effort": "high",
+    "output_format": "json_object",
+    "max_image_bytes": 7000000,
+    "max_request_bytes": 10000000
+  },
+  "limits": {
+    "max_rounds": 2,
+    "wall_clock_seconds": 1200,
+    "checkpoint_seconds": 10,
+    "max_result_bytes": 60000000,
+    "concurrent_calls": 3
+  },
+  "time_policy": {
+    "first_result_seconds": 720,
+    "target_seconds": 960,
+    "hard_seconds": 1200
+  },
+  "experiment": {
+    "id": "robust_mean_pilot",
+    "revision": 1,
+    "study_type": "methods_validation",
+    "domain": "robust statistics and reproducible computational experiments",
+    "research_question": "How does a 20-block median-of-means estimator trade clean-data efficiency for robustness relative to the empirical mean in a frozen symmetric replacement-contamination simulation?",
+    "hypothesis": "With n=200 and 5% replacement by N(0,20^2) observations, median-of-means will reduce the 95th percentile of absolute estimation error by at least 40% relative to the empirical mean; the clean-data condition will quantify rather than conceal any efficiency penalty.",
+    "method": "Generate 10,000 independent samples of size 200 for each of two seeded scenarios: N(0,1) without contamination and N(0,1) with each observation independently replaced with probability 0.05 by N(0,20^2). For every sample, compute the empirical mean and the median of 20 contiguous block means of size 10. Record both estimates, their absolute errors relative to the known symmetry center zero, and the number of replacements. Compare paired errors without optional stopping, and report the median and 95th percentile using linear interpolation.",
+    "parameters": {
+      "sample_size": 200,
+      "blocks": 20,
+      "contamination_rate": 0.05,
+      "contamination_scale": 20.0
+    },
+    "seed": 20260911,
+    "run_count": 10000,
+    "stopping_rule": "Execute exactly 10,000 replicates per scenario; do not inspect interim results or extend the run based on the observed effect.",
+    "primary_outcomes": [
+      {
+        "id": "contamination_p95_reduction_percent",
+        "definition": "Percentage reduction in the 95th percentile of absolute error for median-of-means relative to the empirical mean under contamination.",
+        "unit": "percent",
+        "direction": "higher",
+        "threshold": 40.0
+      },
+      {
+        "id": "contamination_mom_win_rate_percent",
+        "definition": "Percentage of paired contaminated replicates in which median-of-means has smaller absolute error.",
+        "unit": "percent",
+        "direction": "higher",
+        "threshold": 50.0
+      },
+      {
+        "id": "clean_mom_penalty_percent",
+        "definition": "Percentage increase in median absolute error for median-of-means relative to the empirical mean under clean sampling.",
+        "unit": "percent",
+        "direction": "descriptive",
+        "threshold": null
+      }
+    ],
+    "limitations": [
+      "The result applies only to the frozen univariate sample size, block count, replacement rate, and symmetric Gaussian replacement distribution.",
+      "The simulation does not represent adversarial placement, asymmetric outliers, dependence, multivariate estimation, or real-world data.",
+      "A single seeded Monte Carlo run estimates finite-simulation behavior and is not a proof of a general performance guarantee."
+    ],
+    "literature_gate": null,
+    "execution": {
+      "id": "robust_mean_executor",
+      "adapter": "local_program",
+      "client": {
+        "command": [
+          "runtime_required",
+          "runtime_required"
+        ],
+        "timeout": 180,
+        "max_bytes": 30000000,
+        "cwd": "runtime_required",
+        "env": {},
+        "own_process_group": false
+      },
+      "representative": {
+        "input": {
+          "probe": true
+        }
+      },
+      "environment_files": [],
+      "input": {}
+    },
+    "validation": {
+      "id": "robust_mean_validator",
+      "adapter": "local_program",
+      "client": {
+        "command": [
+          "runtime_required",
+          "runtime_required"
+        ],
+        "timeout": 180,
+        "max_bytes": 5000000,
+        "cwd": "runtime_required",
+        "env": {},
+        "own_process_group": false
+      },
+      "representative": {
+        "input": {
+          "probe": true
+        }
+      },
+      "environment_files": [],
+      "input": {}
+    },
+    "required_assets": [
+      {
+        "role": "figure",
+        "media_types": [
+          "image/png"
+        ],
+        "min_count": 1
+      }
+    ],
+    "reviewers": [
+      {
+        "id": "statistical_method",
+        "focus": "Frozen design, estimator definitions, paired comparison, Monte Carlo scope, and numerical traceability."
+      },
+      {
+        "id": "adversarial_claims",
+        "focus": "Search for overstatement, hidden negative results, unsupported generalization, misleading visualization, and missing limitations."
+      }
+    ],
+    "stage_seconds": {
+      "setup": 60,
+      "supervision": 30,
+      "production": 90,
+      "unit_review": 60,
+      "integrated_review": 180,
+      "reassessment": 90
+    },
+    "max_observations": 25000,
+    "max_asset_bytes": 10000000
+  }
+}

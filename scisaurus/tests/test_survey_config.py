@@ -38,6 +38,16 @@ class TestSurveyConfig(unittest.TestCase):
         validated["survey"]["seed_queries"].append("Independent modification")
         self.assertEqual(value["survey"]["seed_queries"], ["Attention Is All You Need"])
 
+    def test_legacy_revision_remains_valid_without_mutating_in_a_challenge_reserve(self):
+        value = survey_config()
+        value["survey"]["revision"] = 4
+        del value["survey"]["search"]["challenge_reserve"]
+        self.assertEqual(validate_survey_config(value), value)
+        current = survey_config()
+        del current["survey"]["search"]["challenge_reserve"]
+        with self.assertRaisesRegex(ValidationError, "challenge_reserve"):
+            validate_survey_config(current)
+
     def test_public_input_and_capacity_authorization_are_explicit(self):
         for field, invalid in (("live_dispatch_allowed", 1), ("data_classification", "private"),
                                ("allocation_mode", "unbounded")):
@@ -62,7 +72,8 @@ class TestSurveyConfig(unittest.TestCase):
             validate_survey_config(value)
 
     def test_search_limits_reject_invalid_counts_and_provider_overflow(self):
-        for field, amount in (("max_works", 0), ("queries_per_role", True), ("max_api_calls", 1.5),
+        for field, amount in (("max_works", 0), ("challenge_reserve", -1),
+                              ("queries_per_role", True), ("max_api_calls", 1.5),
                               ("expansion_rounds", -1), ("min_new_works", -1),
                               ("results_per_query", 101), ("max_text_chars", 1000000),
                               ("context_chars", 300001)):
@@ -73,8 +84,12 @@ class TestSurveyConfig(unittest.TestCase):
                     validate_survey_config(value)
         value = survey_config()
         value["survey"]["seed_work_ids"].append("W123")
-        value["survey"]["search"]["max_works"] = 1
-        with self.assertRaisesRegex(ValidationError, "seed works exceed"):
+        value["survey"]["search"].update(max_works=2, challenge_reserve=1)
+        with self.assertRaisesRegex(ValidationError, "seed works exceed the discovery"):
+            validate_survey_config(value)
+        value = survey_config()
+        value["survey"]["search"].update(max_works=2, challenge_reserve=2)
+        with self.assertRaisesRegex(ValidationError, "leave at least one"):
             validate_survey_config(value)
 
     def test_search_seed_identity_and_unique_queries_are_required(self):

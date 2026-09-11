@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
+import hashlib
 import json
 import math
 import os
+from pathlib import Path
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -47,7 +51,8 @@ class ModelClient:
     def __init__(self, *, base_url: str, model: str, protocol: str,
                  timeout_seconds: float, max_output_tokens: int,
                  auth_env: str | None = None, max_response_bytes: int = 2_000_000,
-                 reasoning_effort: str | None = None, output_format: str | None = None):
+                 reasoning_effort: str | None = None, output_format: str | None = None,
+                 max_image_bytes: int = 7_000_000, max_request_bytes: int = 10_000_000):
         if not isinstance(base_url, str):
             raise ValidationError("model base_url must be a URL string")
         parsed = urllib.parse.urlsplit(base_url)
@@ -65,6 +70,12 @@ class ModelClient:
             raise ValidationError("model timeout must be finite and positive")
         if type(max_response_bytes) is not int or max_response_bytes <= 0:
             raise ValidationError("response byte limit must be a positive integer")
+        if type(max_image_bytes) is not int or max_image_bytes <= 0:
+            raise ValidationError("image byte limit must be a positive integer")
+        if type(max_request_bytes) is not int or max_request_bytes <= 0:
+            raise ValidationError("request byte limit must be a positive integer")
+        if max_image_bytes >= max_request_bytes:
+            raise ValidationError("image byte limit must leave room inside the request byte limit")
         if reasoning_effort is not None and (
             not isinstance(reasoning_effort, str) or reasoning_effort not in {"none", "low", "medium", "high"}
         ):
@@ -79,9 +90,52 @@ class ModelClient:
         self.timeout_seconds, self.max_output_tokens = timeout_seconds, max_output_tokens
         self.max_response_bytes, self.auth_env = max_response_bytes, auth_env
         self.reasoning_effort, self.output_format = reasoning_effort, output_format
+        self.max_image_bytes, self.max_request_bytes = max_image_bytes, max_request_bytes
 
-    def complete(self, *, system: str, prompt: str) -> ModelResult:
-        messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+    @staticmethod
+    def _read_image(image):
+        if not isinstance(image, dict) or set(image) != {"path", "media_type", "sha256"}:
+            raise ValidationError("each model image requires exactly path, media_type, and sha256")
+        path, media_type, expected = image["path"], image["media_type"], image["sha256"]
+        if (not isinstance(path, str) or not Path(path).is_absolute()
+                or media_type not in {"image/png", "image/jpeg"}
+                or not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected)):
+            raise ValidationError("model image descriptor is invalid")
+        try:
+            resolved = Path(path).resolve(strict=True)
+            if not resolved.is_file():
+                raise OSError("not a regular file")
+            body = resolved.read_bytes()
+        except OSError as exc:
+            raise ValidationError("model image is unavailable") from exc
+        actual = hashlib.sha256(body).hexdigest()
+        if actual != expected:
+            raise ValidationError("model image content does not match its pinned SHA-256")
+        if media_type == "image/png" and not body.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValidationError("model image media type does not match PNG bytes")
+        if media_type == "image/jpeg" and not body.startswith(b"\xff\xd8\xff"):
+            raise ValidationError("model image media type does not match JPEG bytes")
+        return body, media_type
+
+    def complete(self, *, system: str, prompt: str, images=None) -> ModelResult:
+        if not isinstance(system, str) or not isinstance(prompt, str):
+            raise ValidationError("model system and prompt content must be strings")
+        images = [] if images is None else images
+        if not isinstance(images, list) or len(images) > 16:
+            raise ValidationError("model images must be a list containing at most 16 items")
+        if images and self.protocol != "openai_compatible":
+            raise ValidationError("multimodal image input requires the openai_compatible protocol")
+        parts, total = [{"type": "text", "text": prompt}], 0
+        for descriptor in images:
+            raw, media_type = self._read_image(descriptor)
+            total += len(raw)
+            if total > self.max_image_bytes:
+                raise ValidationError("combined model images exceed the configured byte limit")
+            encoded = base64.b64encode(raw).decode("ascii")
+            parts.append({"type": "image_url", "image_url": {
+                "url": f"data:{media_type};base64,{encoded}"}})
+        user_content = parts if images else prompt
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user_content}]
         body = {"model": self.model, "messages": messages, "stream": False}
         if self.protocol == "ollama":
             path = "/api/chat"
@@ -99,7 +153,10 @@ class ModelClient:
             if not key:
                 raise ModelCallError("model authentication environment variable is absent", outcome_known=True)
             headers["Authorization"] = "Bearer " + key
-        request = urllib.request.Request(self.base_url + path, json.dumps(body).encode(), headers)
+        wire = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
+        if len(wire) > self.max_request_bytes:
+            raise ValidationError("model request exceeds the configured byte limit")
+        request = urllib.request.Request(self.base_url + path, wire, headers)
         started = time.monotonic()
         try:
             with urllib.request.build_opener(_NoRedirect()).open(request, timeout=self.timeout_seconds) as response:
