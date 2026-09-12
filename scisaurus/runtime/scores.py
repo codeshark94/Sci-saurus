@@ -140,11 +140,25 @@ def validate_scored_config(config):
     editable = {u["id"] for u in all_units(deliverable) if u["editable"]}
     if not editable:
         raise ValidationError("revision requires at least one editable unit")
-    exact(score, {"id", "revision", "domain", "checks", "capabilities", "workloads", "candidate_checks", "stage_seconds"}, "score")
+    score_fields = {"id", "revision", "domain", "checks", "capabilities", "workloads", "candidate_checks", "stage_seconds"}
+    if "quality_axes" in score:
+        score_fields.add("quality_axes")
+    exact(score, score_fields, "score")
     identifier(score["id"])
     if type(score["revision"]) is not int or score["revision"] < 1:
         raise ValidationError("score revision must be a positive integer")
     _text(score["domain"], "score.domain")
+    if "quality_axes" in score:
+        axes = score["quality_axes"]
+        expected_axes = {"truthfulness", "verification", "explanatory_value", "information_compression",
+                         "narrative_coherence"}
+        exact(axes, expected_axes, "score quality_axes")
+        if any(type(weight) not in {int, float} or isinstance(weight, bool) or weight < 0 for weight in axes.values()):
+            raise ValidationError("score quality axes must be nonnegative numeric weights")
+        if not any(weight > 0 for weight in axes.values()):
+            raise ValidationError("score quality axes require at least one positive weight")
+        if axes["truthfulness"] <= 0 or axes["verification"] <= 0:
+            raise ValidationError("truthfulness and verification quality axes must remain active")
     for name in ("checks", "capabilities", "workloads", "candidate_checks"):
         if not isinstance(score[name], list):
             raise ValidationError(f"score.{name} must be an explicit list")

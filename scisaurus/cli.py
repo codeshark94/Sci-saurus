@@ -83,6 +83,22 @@ def main(argv=None) -> int:
     p_experiment.add_argument("--target-seconds", type=float)
     p_experiment.add_argument("--first-result-seconds", type=float)
 
+    p_interpretation = sub.add_parser(
+        "run-interpretation", help="derive an evidence-bound scientific interpretation before manuscript writing")
+    p_interpretation.add_argument("--input", required=True, help="JSON evidence packet")
+    p_interpretation.add_argument("--config", required=True, help="JSON model configuration")
+    p_interpretation.add_argument("--output", required=True, help="JSON interpretation output")
+
+    p_argument = sub.add_parser(
+        "run-argument", help="discover and independently adjudicate the scientific argument before writing")
+    p_argument.add_argument("--input", required=True, help="JSON evidence packet")
+    p_argument.add_argument("--config", required=True, help="JSON model configuration")
+    p_argument.add_argument("--output", required=True, help="JSON research-argument package output")
+    p_argument.add_argument("--deadline-seconds", type=float, default=900.0)
+    p_argument.add_argument("--min-figures", type=int, default=2)
+    p_argument.add_argument("--min-tables", type=int, default=1)
+    p_argument.add_argument("--min-experiments", type=int, default=2)
+
     p_blind = sub.add_parser("prepare-evaluation", help="export label-free cases from a frozen judgment corpus")
     p_blind.add_argument("--corpus", required=True)
     p_blind.add_argument("--output", required=True)
@@ -101,7 +117,106 @@ def main(argv=None) -> int:
     p_paper.add_argument("--compile-script", default=(
         "/Users/seungyeop/.codex/plugins/cache/openai-bundled/latex/0.2.6/scripts/compile_latex.py"))
 
+    p_run_paper = sub.add_parser("run-paper", help="autonomously write, surgically repair, review, and release a paper")
+    p_run_paper.add_argument("--packet", required=True, help="JSON writer packet")
+    p_run_paper.add_argument("--model-config", required=True, help="JSON model configuration")
+    p_run_paper.add_argument("--paper-config", required=True, help="paper release configuration")
+    p_run_paper.add_argument("--output-dir", required=True, help="new pipeline output directory")
+    p_run_paper.add_argument("--draft", help="resume from an existing validated structured manuscript draft")
+    p_run_paper.add_argument("--initial-review-package", help="reuse a completed review package when resuming a run")
+    p_run_paper.add_argument("--argument-package", help="reuse an independently accepted research-argument package")
+    p_run_paper.add_argument("--image", action="append", default=[], help="PNG/JPEG passed to every reviewer")
+    p_run_paper.add_argument("--review-deadline-seconds", type=float, default=1200.0,
+                             help="hard wall-clock limit for one independent-review batch")
+    p_run_paper.add_argument("--release-on-review-limit", action="store_true",
+                             help="publish the incumbent as candidate_needs_review when the final review remains unresolved")
+    p_run_paper.add_argument("--pipeline-deadline-seconds", type=float, default=3600.0,
+                             help="hard wall-clock limit for the whole paper run")
+    p_run_paper.add_argument("--argument-deadline-seconds", type=float, default=900.0,
+                             help="hard wall-clock limit for argument discovery and adjudication")
+    p_run_paper.add_argument("--min-argument-figures", type=int, default=2,
+                             help="minimum argument-linked figures")
+    p_run_paper.add_argument("--min-argument-tables", type=int, default=1,
+                             help="minimum argument-linked tables")
+    p_run_paper.add_argument("--min-argument-experiments", type=int, default=2,
+                             help="minimum discriminating experiments in the argument map")
+    p_run_paper.add_argument("--compile-script", default=(
+        "/Users/seungyeop/.codex/plugins/cache/openai-bundled/latex/0.2.6/scripts/compile_latex.py"))
+    p_run_paper.add_argument("--max-review-rounds", type=int, default=3)
+
     args = parser.parse_args(argv)
+    if args.cmd == "run-paper":
+        from scisaurus.core.errors import ValidationError
+        from scisaurus.runtime.paper_pipeline import PaperPipelineRunner
+        try:
+            packet = json.loads(Path(args.packet).read_text())
+            model_config = json.loads(Path(args.model_config).read_text())
+            paper_config = json.loads(Path(args.paper_config).read_text())
+            draft = json.loads(Path(args.draft).read_text()) if args.draft else None
+            initial_review_package = (json.loads(Path(args.initial_review_package).read_text())
+                                      if args.initial_review_package else None)
+            argument_package = (json.loads(Path(args.argument_package).read_text())
+                                if args.argument_package else None)
+            result = PaperPipelineRunner(packet=packet, model_config=model_config, paper_config=paper_config,
+                                         output_dir=args.output_dir, image_paths=args.image,
+                                         compile_script=args.compile_script,
+                                         max_review_rounds=args.max_review_rounds, draft=draft,
+                                         initial_review_package=initial_review_package,
+                                         initial_argument_package=argument_package,
+                                         review_deadline_seconds=args.review_deadline_seconds,
+                                         release_on_review_limit=args.release_on_review_limit,
+                                         pipeline_deadline_seconds=args.pipeline_deadline_seconds,
+                                         argument_deadline_seconds=args.argument_deadline_seconds,
+                                         min_argument_figures=args.min_argument_figures,
+                                         min_argument_tables=args.min_argument_tables,
+                                         min_argument_experiments=args.min_argument_experiments).run()
+        except (OSError, ValueError, ValidationError) as exc:
+            print(f"paper pipeline rejected: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({"status": result["status"], "word_count": result["word_count"],
+                          "review_rounds": result["review_rounds"], "review_status": result["review_status"],
+                          "elapsed_seconds": result.get("elapsed_seconds"), "pdf": result["pdf"]}, indent=2))
+        return 0
+    if args.cmd == "run-interpretation":
+        from scisaurus.core.errors import ValidationError
+        from scisaurus.runtime.scientific_interpretation import ScientificInterpretationRunner
+        try:
+            model_config = json.loads(Path(args.config).read_text())
+            packet = json.loads(Path(args.input).read_text())
+            evidence_ids = packet.get("evidence_ids") if isinstance(packet, dict) else None
+            result = ScientificInterpretationRunner(model_config).run(packet, evidence_ids=evidence_ids)
+            # The durable interpretation file is the reader-facing scientific
+            # object consumed by manuscript assembly.  Transport usage and
+            # model-call accounting stay in the command output/ledger rather
+            # than becoming manuscript input.
+            Path(args.output).write_bytes(json.dumps(result["interpretation"], sort_keys=True,
+                                                   separators=(",", ":"), ensure_ascii=False).encode())
+        except (OSError, ValueError, ValidationError) as exc:
+            print(f"scientific interpretation rejected: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({"status": result["status"], "output": str(Path(args.output).resolve())}, indent=2))
+        return 0
+    if args.cmd == "run-argument":
+        from scisaurus.core.errors import ValidationError
+        from scisaurus.runtime.research_argument import ResearchArgumentRunner, argument_evidence_packet
+        try:
+            model_config = json.loads(Path(args.config).read_text())
+            packet = json.loads(Path(args.input).read_text())
+            evidence_packet = argument_evidence_packet(packet)
+            result = ResearchArgumentRunner(model_config, deadline_seconds=args.deadline_seconds).run(
+                evidence_packet,
+                evidence_ids=evidence_packet.get("evidence_ids", []),
+                min_figures=args.min_figures,
+                min_tables=args.min_tables,
+                min_experiments=args.min_experiments)
+            Path(args.output).write_bytes(json.dumps(result, sort_keys=True, separators=(",", ":"),
+                                                    ensure_ascii=False).encode())
+        except (OSError, ValueError, ValidationError) as exc:
+            print(f"research argument rejected: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({"status": result["status"], "output": str(Path(args.output).resolve()),
+                          "argument_sha256": result["argument_sha256"]}, indent=2))
+        return 0
     if args.cmd == "build-paper":
         from scisaurus.core.errors import ValidationError
         from scisaurus.runtime.paper import PaperReleaseBuilder
@@ -165,7 +280,18 @@ def main(argv=None) -> int:
                     if not any(key in config for key in ("score", "survey", "visual_review", "experiment")):
                         raise ValidationError(
                             "Time planning options require a versioned Score configuration")
-                    config["time_policy"] = {**(config.get("time_policy") or {}), **overrides}
+                    existing_policy = config.get("time_policy") or {}
+                    # Preserve the stored numeric representation when a CLI
+                    # override is semantically identical (21600 and 21600.0).
+                    # Resume compares the exact configuration bytes; changing
+                    # only JSON number spelling must not make a run look like
+                    # a different mission.
+                    normalized_overrides = {
+                        key: (int(value) if type(existing_policy.get(key)) is int
+                              and isinstance(value, float) and value.is_integer() else value)
+                        for key, value in overrides.items()
+                    }
+                    config["time_policy"] = {**existing_policy, **normalized_overrides}
             kwargs = {"on_progress": lambda state: print(json.dumps(state), flush=True)}
             if args.cmd == "resume-survey":
                 scopes = list(dict.fromkeys(args.reopen_scope))

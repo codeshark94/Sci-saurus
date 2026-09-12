@@ -47,7 +47,7 @@ Development corpora always return `development_only`. Only an expert-adjudicated
 
 ## Paper release candidate
 
-`PaperReleaseBuilder` accepts the compatible `paper-release-score-1` configuration and the storyline-first `paper-release-score-2`. It checks the current accepted survey and gap assessment through `SurveyGate`, the accepted document manifest and its integrated verification, a supplied `results-package-1` or generated `results-package-2`, paragraph-level claim/evidence bindings, exact result phrases, and citation keys backed by accepted survey sources. Score 2 freezes an ordered thesis and storyline beats before prose assembly; every beat must appear exactly in its bound units and map to a claim with supporting or qualifying evidence. Evidence relations are retained as support, qualification, or context. Literature evidence binds an accepted source quotation, while generated-result evidence can bind an exact procedure description, metric presentation, finding statement, or indexed limitation. For a v3 survey, literature evidence must reproduce its pinned character span and quote SHA-256. A DOI-bearing reference must name a `verified` OpenAlex/Crossref identity record whose DOI, title, year, and source work match; conflict or missing metadata blocks the release candidate. A research-paper build is blocked unless the accepted gap state is `eligible_for_experiment`.
+`PaperReleaseBuilder` accepts the compatible `paper-release-score-1` configuration and the storyline-first `paper-release-score-2`. It checks the current accepted survey and gap assessment through `SurveyGate`, the accepted document manifest and its integrated verification, a supplied `results-package-1` or generated `results-package-2`, paragraph-level claim/evidence bindings, exact result phrases, and citation keys backed by accepted survey sources. Score 2 freezes an ordered thesis and storyline beats before prose assembly; every beat must appear exactly in its bound units and map to a claim with supporting or qualifying evidence. The paper pipeline additionally requires the versioned Research Argument artifact and an independent argument adjudication before composition. That artifact binds the unresolved question, competing mechanisms, discriminating tests, and figure/table jobs; its references and hashes are recorded in the manuscript project and release manifest. Evidence relations are retained as support, qualification, or context. Literature evidence binds an accepted source quotation, while generated-result evidence can bind an exact procedure description, metric presentation, finding statement, or indexed limitation. For a v3 survey, literature evidence must reproduce its pinned character span and quote SHA-256. A DOI-bearing reference must name a `verified` OpenAlex/Crossref identity record whose DOI, title, year, and source work match; conflict or missing metadata blocks the release candidate. A research-paper build is blocked unless the accepted gap state is `eligible_for_experiment`.
 
 The build emits:
 
@@ -58,6 +58,11 @@ The build emits:
 - `output/rendered/page-*.png`
 - `output/visual-review.json`
 - `output/release-manifest.json`
+
+When invoked by the argument-aware paper pipeline, the release manifest uses
+candidate version 4 and claim-index version 5; both include the argument and
+adjudication references. Direct legacy builds retain their prior candidate
+version so historical artifacts remain stable.
 
 ```bash
 python3 -m scisaurus.cli build-paper /path/to/new-release \

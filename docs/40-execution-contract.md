@@ -76,6 +76,14 @@ A Claim does not certify its own support. A verifier assesses the relation again
 
 A ResultsPackage is a manifest of supplied figures, tables, metric definitions, procedures, findings, provenance, and missing fields. Intake acceptance means the input is usable within the stated scope—not that all experimental conclusions are independently proven.
 
+A ResearchArgument is the versioned bridge from accepted evidence to prose. It
+binds an unresolved research question to observed patterns, competing
+hypotheses, discriminating experiments, and figure/table jobs. The argument
+and its independent adjudication are separate immutable artifacts; a paper
+writer cannot start without both. Candidate or unresolved mechanisms remain
+explicitly provisional, and each planned figure must identify the rendered
+asset it explains.
+
 ### 3.3 Web intelligence records
 
 A `SearchCampaign` includes `campaign_id`, generation, owner department/role, objective, governing task/issue/claim refs, concept decomposition, query families, authorized source classes, languages, date bounds, positive/counterexample routes, citation/author/project chasing policy, coverage targets, stopping conditions, resource binding, and status. `resource_binding` resolves to the active policy/window; actual calls require finite reservations before dispatch. An illustrative template may use `runtime_required` for unresolved bindings, which blocks live dispatch. It is versioned; reopening creates a new generation linked to the prior campaign.

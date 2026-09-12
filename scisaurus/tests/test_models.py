@@ -20,14 +20,21 @@ class TestModelClient(unittest.TestCase):
             def do_POST(self):
                 outer.path = self.path
                 outer.request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-                if outer.status != 200:
-                    self.send_response(outer.status)
+                outer.calls += 1
+                status = outer.status[min(outer.calls - 1, len(outer.status) - 1)] if isinstance(outer.status, list) else outer.status
+                if status != 200:
+                    self.send_response(status)
+                    if status == 429:
+                        self.send_header('Retry-After', '0')
                     self.end_headers()
                     self.wfile.write(b'private provider failure content')
                     return
                 self.send_response(200)
                 self.end_headers()
-                self.wfile.write(json.dumps(outer.response).encode())
+                response = (outer.response_sequence[min(outer.calls - 1, len(outer.response_sequence) - 1)]
+                            if outer.response_sequence else outer.response)
+                self.wfile.write(response if isinstance(response, (bytes, bytearray))
+                                 else json.dumps(response).encode())
             def log_message(self, *args):
                 pass
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
@@ -35,6 +42,8 @@ class TestModelClient(unittest.TestCase):
         self.thread.start()
         self.url = f'http://127.0.0.1:{self.server.server_port}'
         self.status = 200
+        self.calls = 0
+        self.response_sequence = None
         self.response = {'model':'served-model','message':{'content':'{"value": 4}'}, 'done':True,
                          'done_reason':'stop', 'prompt_eval_count':10, 'eval_count':5}
 
@@ -161,6 +170,33 @@ class TestModelClient(unittest.TestCase):
         with self.assertRaises(ModelCallError) as error:
             self.client().complete(system='x',prompt='x')
         self.assertFalse(error.exception.outcome_known)
+
+    def test_retryable_rate_limit_is_retried_within_one_request_budget(self):
+        self.status = [429, 200]
+        self.response = {'choices': [{'message': {'content': '{"value": 4}'}, 'finish_reason': 'stop'}]}
+        result = self.client('openai_compatible', max_retries=2, retry_backoff_seconds=0).complete(
+            system='x', prompt='x')
+        self.assertEqual(self.calls, 2)
+        self.assertEqual(result.json_object(), {'value': 4})
+
+    def test_rate_limit_exhaustion_reports_status_without_provider_body(self):
+        self.status = 429
+        with self.assertRaises(ModelCallError) as error:
+            self.client('openai_compatible', max_retries=2, retry_backoff_seconds=0).complete(
+                system='x', prompt='x')
+        self.assertEqual(self.calls, 3)
+        self.assertTrue(error.exception.outcome_known)
+        self.assertNotIn('private', str(error.exception))
+
+    def test_malformed_response_is_retried_within_one_request_budget(self):
+        self.response_sequence = [
+            b'{"done":true}',
+            {'model': 'served-model', 'message': {'content': '{"value": 4}'},
+             'done': True, 'done_reason': 'stop'},
+        ]
+        result = self.client(max_retries=1, retry_backoff_seconds=0).complete(system='x', prompt='x')
+        self.assertEqual(self.calls, 2)
+        self.assertEqual(result.json_object(), {'value': 4})
 
     def test_incomplete_or_oversized_response_is_not_success(self):
         self.response['done']=False

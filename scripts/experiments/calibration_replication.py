@@ -48,7 +48,7 @@ def load_wdbc(path, expected_sha256):
 
 
 def stratified_split(y, seed):
-    rng = np.random.default_rng(seed)
+    rng = np.random.Generator(np.random.PCG64(seed))
     train, calibration, test = [], [], []
     for cls in (0.0, 1.0):
         indexes = np.flatnonzero(y == cls)
@@ -110,12 +110,33 @@ def ece(probabilities, y, bins=10):
     return float(total)
 
 
+def ece_with_reference_bins(probabilities, y, reference, bins=10):
+    """Compute ECE with bin membership defined by a paired reference score.
+
+    The primary ECE uses each score's own probability vector to determine bin
+    membership.  This companion calculation keeps the raw-score partition for
+    both raw and temperature-scaled probabilities so that a shared-bin
+    sensitivity check is available without changing the prespecified primary
+    outcome.
+    """
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    total = 0.0
+    for index in range(bins):
+        mask = ((reference >= edges[index]) &
+                (reference < edges[index + 1] if index < bins - 1 else reference <= edges[index + 1]))
+        if np.any(mask):
+            total += float(mask.mean()) * abs(float(probabilities[mask].mean()) - float(y[mask].mean()))
+    return float(total)
+
+
 def fit_temperature(calibration_logits, calibration_y):
     def objective(log_temperature):
         temperature = math.exp(float(log_temperature))
         return log_loss(sigmoid(calibration_logits / temperature), calibration_y)
 
-    grid = np.linspace(-3.0, 3.0, 121)
+    # Search the declared temperature interval in log space so the runtime
+    # and the manuscript describe the same bounded optimization problem.
+    grid = np.linspace(math.log(0.1), math.log(5.0), 121)
     values = np.asarray([objective(value) for value in grid])
     best = int(np.argmin(values))
     left = float(grid[max(0, best - 1)])
@@ -138,10 +159,11 @@ def summarize(observations):
     def median(key):
         return float(np.median([item[key] for item in observations]))
 
-    return {
+    summary = {
         "test_log_loss_delta": mean("test_log_loss_delta"),
         "test_brier_delta": mean("test_brier_delta"),
         "test_ece_delta": mean("test_ece_delta"),
+        "test_ece_raw_reference_delta": mean("test_ece_raw_reference_delta"),
         "rank_invariance_delta": mean("rank_invariance_delta"),
         "temperature_median": median("temperature"),
         "test_log_loss_delta_p025": float(np.percentile([item["test_log_loss_delta"] for item in observations], 2.5)),
@@ -150,7 +172,26 @@ def summarize(observations):
         "test_brier_delta_p975": float(np.percentile([item["test_brier_delta"] for item in observations], 97.5)),
         "test_ece_delta_p025": float(np.percentile([item["test_ece_delta"] for item in observations], 2.5)),
         "test_ece_delta_p975": float(np.percentile([item["test_ece_delta"] for item in observations], 97.5)),
+        "test_ece_raw_reference_delta_p025": float(np.percentile([item["test_ece_raw_reference_delta"] for item in observations], 2.5)),
+        "test_ece_raw_reference_delta_p975": float(np.percentile([item["test_ece_raw_reference_delta"] for item in observations], 97.5)),
     }
+    # The split-level percentile ranges describe heterogeneity among the
+    # repeated partitions.  A separate deterministic percentile bootstrap
+    # quantifies uncertainty in each reported mean across those split deltas.
+    bootstrap_seed = 20260912
+    bootstrap_draws = 100000
+    rng = np.random.Generator(np.random.PCG64(bootstrap_seed))
+    for key in ("test_log_loss_delta", "test_brier_delta", "test_ece_delta", "test_ece_raw_reference_delta"):
+        values = np.asarray([item[key] for item in observations], dtype=np.float64)
+        means = np.empty(bootstrap_draws, dtype=np.float64)
+        chunk = 2000
+        for start in range(0, bootstrap_draws, chunk):
+            stop = min(start + chunk, bootstrap_draws)
+            indexes = rng.integers(0, len(values), size=(stop - start, len(values)))
+            means[start:stop] = values[indexes].mean(axis=1)
+        summary[f"{key}_mean_ci_low"] = float(np.percentile(means, 2.5))
+        summary[f"{key}_mean_ci_high"] = float(np.percentile(means, 97.5))
+    return summary
 
 
 def statement_for_delta(name, value, unit):
@@ -166,7 +207,7 @@ def statement_for_range(name, low, high, unit):
 
 def make_figure(observations, summary, path):
     fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.5), dpi=180)
-    names = ["Log loss", "Brier", "ECE"]
+    names = ["Log loss", "Brier", "ECE (per-score-bin)"]
     keys = ["test_log_loss_delta", "test_brier_delta", "test_ece_delta"]
     values = [np.asarray([item[key] for item in observations]) for key in keys]
     # Matplotlib 3.9 renamed ``labels`` to ``tick_labels``; keep the frozen
@@ -177,7 +218,7 @@ def make_figure(observations, summary, path):
         axes[0].boxplot(values, labels=names, showmeans=True, meanline=True)
     axes[0].axhline(0.0, color="#333333", linewidth=0.9)
     axes[0].set_ylabel("Calibrated minus raw score (lower is better)")
-    axes[0].set_title("Held-out score changes")
+    axes[0].set_title("Held-out score changes\nECE box: per-score-bin sensitivity", fontsize=9)
     axes[0].grid(axis="y", alpha=0.25)
 
     raw_bins, calibrated_bins, empirical = [], [], []
@@ -195,7 +236,7 @@ def make_figure(observations, summary, path):
     axes[1].plot([0, 1], [0, 1], "--", color="#666666", label="Perfect calibration")
     axes[1].set_xlabel("Observed event frequency")
     axes[1].set_ylabel("Mean predicted probability")
-    axes[1].set_title("Reliability across held-out folds")
+    axes[1].set_title("Pooled reliability, shared raw partition\n30 folds (N = 3,450)", fontsize=9)
     axes[1].legend(frameon=False, fontsize=8)
     axes[1].grid(alpha=0.25)
     fig.suptitle("Post-hoc temperature scaling on WDBC", fontsize=13)
@@ -229,6 +270,9 @@ def main():
         calibrated_brier = brier(calibrated_probabilities, y[test])
         raw_ece = ece(raw_probabilities, y[test])
         calibrated_ece = ece(calibrated_probabilities, y[test])
+        raw_reference_ece = ece_with_reference_bins(raw_probabilities, y[test], raw_probabilities)
+        calibrated_raw_reference_ece = ece_with_reference_bins(
+            calibrated_probabilities, y[test], raw_probabilities)
         # Calibration changes scores but not their ranking. Compare logits rather
         # than clipped probabilities so saturation ties cannot create a false
         # order change in this numerical sanity check.
@@ -255,6 +299,7 @@ def main():
             "test_brier_delta": calibrated_brier - raw_brier,
             "test_ece_raw": raw_ece, "test_ece_calibrated": calibrated_ece,
             "test_ece_delta": calibrated_ece - raw_ece,
+            "test_ece_raw_reference_delta": calibrated_raw_reference_ece - raw_reference_ece,
             "rank_invariance_delta": rank_invariance_delta,
             "reliability": reliability,
         })
@@ -274,6 +319,34 @@ def main():
          "statement": statement_for_range("Brier score", summary["test_brier_delta_p025"], summary["test_brier_delta_p975"], "Brier points")},
         {"id": "ece_split_range", "metric_ids": ["test_ece_delta", "test_ece_delta_p025", "test_ece_delta_p975"],
          "statement": statement_for_range("ECE", summary["test_ece_delta_p025"], summary["test_ece_delta_p975"], "ECE points")},
+        {"id": "ece_raw_reference_change", "metric_ids": ["test_ece_raw_reference_delta"],
+         "statement": (f"With raw-probability bin membership reused for both scores, temperature scaling produced "
+                        f"{abs(summary['test_ece_raw_reference_delta']):.4f} ECE points "
+                        f"{'lower' if summary['test_ece_raw_reference_delta'] < 0 else 'higher'} mean held-out ECE "
+                        "across the 30 prespecified repeated splits.")},
+        {"id": "ece_raw_reference_split_range",
+         "metric_ids": ["test_ece_raw_reference_delta", "test_ece_raw_reference_delta_p025", "test_ece_raw_reference_delta_p975"],
+         "statement": (f"With raw-probability bin membership reused for both scores, the ECE delta had an empirical "
+                        f"2.5th-97.5th percentile range of {summary['test_ece_raw_reference_delta_p025']:.4f} to "
+                        f"{summary['test_ece_raw_reference_delta_p975']:.4f} ECE points across the 30 prespecified splits.")},
+        {"id": "mean_delta_bootstrap_ci",
+         "metric_ids": [
+             "test_log_loss_delta_mean_ci_low", "test_log_loss_delta_mean_ci_high",
+             "test_brier_delta_mean_ci_low", "test_brier_delta_mean_ci_high",
+             "test_ece_delta_mean_ci_low", "test_ece_delta_mean_ci_high",
+             "test_ece_raw_reference_delta_mean_ci_low", "test_ece_raw_reference_delta_mean_ci_high",
+         ],
+         "statement": (
+             "A percentile bootstrap over the 30 split-level deltas (100,000 resamples; seed 20260912) gave percentile "
+             "intervals of "
+             f"{summary['test_log_loss_delta_mean_ci_low']:.4f} to "
+             f"{summary['test_log_loss_delta_mean_ci_high']:.4f} nats for mean log loss, "
+             f"{summary['test_brier_delta_mean_ci_low']:.4f} to {summary['test_brier_delta_mean_ci_high']:.4f} "
+             f"Brier points for mean Brier score, {summary['test_ece_delta_mean_ci_low']:.4f} to "
+             f"{summary['test_ece_delta_mean_ci_high']:.4f} ECE points for the per-score-bin mean ECE, and "
+             f"{summary['test_ece_raw_reference_delta_mean_ci_low']:.4f} to "
+             f"{summary['test_ece_raw_reference_delta_mean_ci_high']:.4f} ECE points for the shared raw-bin mean ECE."
+         )},
     ]
     metrics = [
         {"id": "test_log_loss_delta", "value": summary["test_log_loss_delta"], "unit": "nats",
@@ -285,6 +358,9 @@ def main():
         {"id": "test_ece_delta", "value": summary["test_ece_delta"], "unit": "ECE points",
          "conditions": "Mean calibrated minus raw 10-bin ECE across 30 held-out test splits; negative favors calibration.",
          "source": "aggregate of observations.test_ece_delta", "presentation": f"{summary['test_ece_delta']:.4f}"},
+        {"id": "test_ece_raw_reference_delta", "value": summary["test_ece_raw_reference_delta"], "unit": "ECE points",
+         "conditions": "Mean calibrated minus raw 10-bin ECE using raw-probability bin membership for both scores across 30 held-out test splits; negative favors calibration.",
+         "source": "aggregate of observations.test_ece_raw_reference_delta", "presentation": f"{summary['test_ece_raw_reference_delta']:.4f}"},
         {"id": "rank_invariance_delta", "value": summary["rank_invariance_delta"], "unit": "rank agreement delta",
          "conditions": "Mean rank-preservation sanity delta; temperature scaling should preserve ordering.",
          "source": "aggregate of observations.rank_invariance_delta", "presentation": f"{summary['rank_invariance_delta']:.4f}"},
@@ -309,7 +385,27 @@ def main():
         {"id": "test_ece_delta_p975", "value": summary["test_ece_delta_p975"], "unit": "ECE points",
          "conditions": "Empirical 97.5th percentile of split-level calibrated minus raw ECE deltas across 30 held-out splits; descriptive range endpoint, not an inferential confidence interval.",
          "source": "percentile(97.5) of observations.test_ece_delta", "presentation": f"{summary['test_ece_delta_p975']:.4f}"},
+        {"id": "test_ece_raw_reference_delta_p025", "value": summary["test_ece_raw_reference_delta_p025"], "unit": "ECE points",
+         "conditions": "Empirical 2.5th percentile of split-level calibrated minus raw ECE deltas using raw-probability bin membership for both scores across 30 held-out splits; descriptive range endpoint, not an inferential confidence interval.",
+         "source": "percentile(2.5) of observations.test_ece_raw_reference_delta", "presentation": f"{summary['test_ece_raw_reference_delta_p025']:.4f}"},
+        {"id": "test_ece_raw_reference_delta_p975", "value": summary["test_ece_raw_reference_delta_p975"], "unit": "ECE points",
+         "conditions": "Empirical 97.5th percentile of split-level calibrated minus raw ECE deltas using raw-probability bin membership for both scores across 30 held-out splits; descriptive range endpoint, not an inferential confidence interval.",
+         "source": "percentile(97.5) of observations.test_ece_raw_reference_delta", "presentation": f"{summary['test_ece_raw_reference_delta_p975']:.4f}"},
     ]
+    for key, unit in (
+        ("test_log_loss_delta", "nats"),
+        ("test_brier_delta", "Brier points"),
+        ("test_ece_delta", "ECE points"),
+        ("test_ece_raw_reference_delta", "ECE points"),
+    ):
+        metrics.extend([
+            {"id": f"{key}_mean_ci_low", "value": summary[f"{key}_mean_ci_low"], "unit": unit,
+             "conditions": f"2.5th percentile of a 100,000-resample percentile bootstrap for the mean {key} across 30 held-out splits; distinct from the split-level percentile range.",
+             "source": f"bootstrap_percentile(2.5) of observations.{key}", "presentation": f"{summary[f'{key}_mean_ci_low']:.4f}"},
+            {"id": f"{key}_mean_ci_high", "value": summary[f"{key}_mean_ci_high"], "unit": unit,
+             "conditions": f"97.5th percentile of a 100,000-resample percentile bootstrap for the mean {key} across 30 held-out splits; distinct from the split-level percentile range.",
+             "source": f"bootstrap_percentile(97.5) of observations.{key}", "presentation": f"{summary[f'{key}_mean_ci_high']:.4f}"},
+        ])
     limitations = list(experiment["limitations"])
     additional_limit = ("The public WDBC features are diagnostic measurements, not a prospective clinical "
                         "deployment cohort; no clinical decision should be inferred.")
@@ -318,13 +414,13 @@ def main():
     output = {
         "schema_version": "experiment-program-output-1", "study_id": experiment["id"], "revision": experiment["revision"],
         "procedures": [
-            {"id": "dataset_ingest", "description": f"Read the 569-row, 30-feature WDBC diagnostic dataset from the official UCI distribution; SHA-256 {dataset_sha}.", "source": DATA_URL},
+            {"id": "dataset_ingest", "description": "Read the 569-row, 30-feature WDBC diagnostic dataset from the official UCI distribution.", "source": DATA_URL},
             {"id": "repeated_holdout", "description": "For each of 30 fixed seeds, split each class into 60% training, 20% calibration, and 20% held-out test data; standardize using training statistics only.", "source": "calibration-replication.py::stratified_split"},
             {"id": "temperature_scaling", "description": "Fit L2-regularized logistic regression on training data, fit one positive temperature by calibration-set log loss, and score raw and scaled probabilities only on the untouched test split.", "source": "calibration-replication.py::fit_logistic,fit_temperature"},
         ],
         "observations": observations, "metrics": metrics, "findings": findings, "limitations": limitations,
         "assets": [{"id": "calibration_figure", "path": str(figure_path), "sha256": hashlib.sha256(figure_path.read_bytes()).hexdigest(),
-                     "role": "figure", "media_type": "image/png", "caption": "Held-out score changes and reliability curves for raw versus temperature-scaled logistic predictions across repeated WDBC splits."}],
+                     "role": "figure", "media_type": "image/png", "caption": "Held-out score changes and a pooled shared-partition reliability comparison for raw versus temperature-scaled logistic predictions across 30 WDBC splits (N = 3,450); the left-panel ECE box uses per-score-bin ECE, and the right curve uses shared raw-probability bins rather than a per-score reliability diagram."}],
     }
     json.dump(output, sys.stdout, ensure_ascii=False, separators=(",", ":"))
 

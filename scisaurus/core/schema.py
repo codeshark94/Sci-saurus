@@ -50,6 +50,7 @@ PREMISE_REQUIRED_STATES = frozenset({"accepted", "provisional_allowed"})
 ARTIFACT_TYPES: set[str] = {
     "note",
     "results_package",
+    "argument",
     "search_campaign",
     "query_record",
     "discovery_record",

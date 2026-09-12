@@ -7,6 +7,8 @@ import json
 import math
 import sys
 
+import numpy as np
+
 
 def canonical(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -25,6 +27,38 @@ def percentile(rows, key, fraction):
     upper = min(lower + 1, len(values) - 1)
     weight = position - lower
     return values[lower] + weight * (values[upper] - values[lower])
+
+
+def shared_raw_bin_ece_delta(row):
+    """Recalculate the shared raw-probability-bin ECE delta independently."""
+    total = int(row["test_n"])
+    if total <= 0:
+        raise ValueError("test_n must be positive")
+    raw_ece = calibrated_ece = 0.0
+    for group in row["reliability"]:
+        labels = group["labels"]
+        raw = group["raw_probabilities"]
+        calibrated = group["calibrated_probabilities"]
+        if not (len(labels) == len(raw) == len(calibrated)):
+            raise ValueError("reliability group lengths do not match")
+        if labels:
+            weight = len(labels) / total
+            observed = sum(labels) / len(labels)
+            raw_ece += weight * abs(sum(raw) / len(raw) - observed)
+            calibrated_ece += weight * abs(sum(calibrated) / len(calibrated) - observed)
+    return calibrated_ece - raw_ece
+
+
+def bootstrap_mean_interval(values, rng, draws=100000):
+    """Recalculate the percentile bootstrap interval without experiment helpers."""
+    values = np.asarray(values, dtype=np.float64)
+    means = np.empty(draws, dtype=np.float64)
+    chunk = 2000
+    for start in range(0, draws, chunk):
+        stop = min(start + chunk, draws)
+        indexes = rng.integers(0, len(values), size=(stop - start, len(values)))
+        means[start:stop] = values[indexes].mean(axis=1)
+    return float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
 
 
 def main():
@@ -46,12 +80,24 @@ def main():
         "test_log_loss_delta": mean(observations, "test_log_loss_delta"),
         "test_brier_delta": mean(observations, "test_brier_delta"),
         "test_ece_delta": mean(observations, "test_ece_delta"),
+        "test_ece_raw_reference_delta": sum(shared_raw_bin_ece_delta(row) for row in observations) / len(observations),
         "rank_invariance_delta": mean(observations, "rank_invariance_delta"),
         "temperature_median": temperature_median,
     }
     for key in ("test_log_loss_delta", "test_brier_delta", "test_ece_delta"):
         metric_values[f"{key}_p025"] = percentile(observations, key, 0.025)
         metric_values[f"{key}_p975"] = percentile(observations, key, 0.975)
+    fixed_deltas = [shared_raw_bin_ece_delta(row) for row in observations]
+    metric_values["test_ece_raw_reference_delta_p025"] = percentile(
+        [{"value": value} for value in fixed_deltas], "value", 0.025)
+    metric_values["test_ece_raw_reference_delta_p975"] = percentile(
+        [{"value": value} for value in fixed_deltas], "value", 0.975)
+    bootstrap_rng = np.random.Generator(np.random.PCG64(20260912))
+    for key in ("test_log_loss_delta", "test_brier_delta", "test_ece_delta", "test_ece_raw_reference_delta"):
+        values = fixed_deltas if key == "test_ece_raw_reference_delta" else [row[key] for row in observations]
+        low, high = bootstrap_mean_interval(values, bootstrap_rng)
+        metric_values[f"{key}_mean_ci_low"] = low
+        metric_values[f"{key}_mean_ci_high"] = high
     reported = {item["id"]: float(item["value"]) for item in candidate["metrics"]}
     checks = []
     def check(identifier, outcome, evidence):

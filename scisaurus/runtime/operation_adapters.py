@@ -50,7 +50,7 @@ def _crossref_client(client, project_path, environment_files):
 
 def _openalex_client(client, project_path, environment_files):
     _limits(client)
-    if set(client) - {"timeout", "max_bytes", "endpoint", "auth_env"}:
+    if set(client) - {"timeout", "max_bytes", "endpoint", "auth_env", "max_retries", "retry_backoff_seconds"}:
         raise ValidationError("Unsupported OpenAlex client options")
     client.setdefault("endpoint", literature.DEFAULT_ENDPOINT)
     try:
@@ -320,7 +320,7 @@ def _inspect_openalex(profile, result, params, *, representative=True):
         request_valid = False
     check("openalex-request", request_valid, "The exact operation arguments and HTTP URL match the execution context")
 
-    expected_works, expected_sources, expected_text = [], [], ""
+    expected_works, expected_sources, expected_text, expected_abstract_gaps = [], [], "", []
     try:
         require(request_valid and integrity)
         payload = json.loads(raw, object_pairs_hook=object_pairs, parse_constant=reject_constant, parse_float=finite_float)
@@ -358,15 +358,18 @@ def _inspect_openalex(profile, result, params, *, representative=True):
             require(expected["operation"] != "citing" or expected["work_id"] in relationships["referenced_works"])
             index, abstract = item.get("abstract_inverted_index"), None
             if index is not None:
-                require(isinstance(index, dict) and bool(index))
-                tokens = []
-                for word, offsets in index.items():
-                    require(isinstance(word, str) and bool(word.strip()) and isinstance(offsets, list) and bool(offsets))
-                    require(all(type(offset) is int and offset >= 0 for offset in offsets))
-                    tokens.extend((offset, word) for offset in offsets)
-                tokens.sort()
-                require([offset for offset, _ in tokens] == list(range(len(tokens))))
-                abstract = " ".join(word for _, word in tokens)
+                try:
+                    require(isinstance(index, dict) and bool(index))
+                    tokens = []
+                    for word, offsets in index.items():
+                        require(isinstance(word, str) and bool(word.strip()) and isinstance(offsets, list) and bool(offsets))
+                        require(all(type(offset) is int and offset >= 0 for offset in offsets))
+                        tokens.extend((offset, word) for offset in offsets)
+                    tokens.sort()
+                    require([offset for offset, _ in tokens] == list(range(len(tokens))))
+                    abstract = " ".join(word for _, word in tokens)
+                except ValueError:
+                    expected_abstract_gaps.append({"work_id": identity, "reason": "provider_abstract_index_invalid"})
             locations = []
             require(isinstance(item["locations"], list))
             for location in item["locations"]:
@@ -387,7 +390,8 @@ def _inspect_openalex(profile, result, params, *, representative=True):
         require(len({work["id"] for work in expected_works}) == len(expected_works))
         require(type(metadata.get("count")) is int and metadata["count"] == count
                 and metadata.get("next_cursor") == cursor and type(metadata.get("has_more")) is bool
-                and metadata["has_more"] == (cursor is not None))
+                and metadata["has_more"] == (cursor is not None)
+                and metadata.get("abstract_gaps", []) == expected_abstract_gaps)
         require(canonical_bytes(result.get("works")) == canonical_bytes(expected_works))
         require(canonical_bytes(result.get("sources")) == canonical_bytes(expected_sources))
         expected_text = "\n\n".join(work["title"] + " — https://openalex.org/" + work["id"]

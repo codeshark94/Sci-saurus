@@ -44,7 +44,9 @@
       "adapter": "openalex",
       "client": {
         "timeout": 20,
-        "max_bytes": 5000000
+        "max_bytes": 5000000,
+        "max_retries": 3,
+        "retry_backoff_seconds": 1.0
       },
       "representative": {
         "operation": "work",
@@ -99,6 +101,11 @@
         ]
       }
     ],
+    "provider_intervals": {
+      "bibliography": 0.5,
+      "identity": 0.5,
+      "full_text": 0.25
+    },
     "search": {
       "queries_per_role": 1,
       "results_per_query": 3,

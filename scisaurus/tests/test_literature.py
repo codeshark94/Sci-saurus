@@ -61,6 +61,7 @@ class RecordedOpenAlexExecutor:
 class OpenAlexFixture(BaseHTTPRequestHandler):
     requests = []
     bodies = []
+    rate_limit_count = 0
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *_):
@@ -77,6 +78,13 @@ class OpenAlexFixture(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         self.requests.append({"path": parsed.path, "query": query, "authorization": self.headers.get("Authorization")})
         mode = query.get("search", ["ok"])[0]
+        if mode == "rate-limit-once" and self.rate_limit_count == 0:
+            type(self).rate_limit_count += 1
+            self.send_response(429)
+            self.send_header("Retry-After", "0")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if mode == "interrupted":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -231,6 +239,16 @@ class TestOpenAlex(unittest.TestCase):
                            "is_oa": True, "version": "acceptedVersion"}]})
         self.assertTrue(all(check["outcome"] == "passed" for check in self.inspect(result)))
 
+    def test_transient_rate_limit_is_retried_inside_total_timeout(self):
+        result = self.client(max_retries=1, retry_backoff_seconds=0).run(
+            **self.arguments("rate-limit-once"))
+        self.assertEqual(result["outcome"], "ok")
+        self.assertEqual(result["metadata"]["attempts"], 2)
+        self.assertEqual(result["metadata"]["retry_wait_seconds"], 0.0)
+        self.assertEqual(OpenAlexFixture.rate_limit_count, 1)
+        self.assertTrue(all(check["outcome"] == "passed" for check in self.inspect(result,
+                                                                                       self.arguments("rate-limit-once"))))
+
     def test_operations_readiness_and_routine_workloads_use_full_execution_context(self):
         with tempfile.TemporaryDirectory(prefix="scisaurus-openalex-operations-") as directory:
             control = ControlStore(directory)
@@ -312,8 +330,7 @@ class TestOpenAlex(unittest.TestCase):
         self.assertTrue(all(check["outcome"] == "passed" for check in self.inspect(result, self.arguments("no-abstract"))))
 
     def test_bad_shapes_never_become_empty_success_or_partial_normalization(self):
-        for mode in ("bad-abstract-gap", "bad-abstract-collision", "bad-abstract-bool", "bad-abstract-empty",
-                     "bad-work-id", "bad-year", "bad-location", "bad-reference", "missing-references",
+        for mode in ("bad-work-id", "bad-year", "bad-location", "bad-reference", "missing-references",
                      "duplicate-works", "bad-count", "bad-cursor", "repeated-cursor", "bad-limit", "missing-results",
                      "null-results", "conflicting-empty", "malformed", "duplicate-keys", "nonfinite", "overflow", "surrogate"):
             with self.subTest(mode=mode):
@@ -324,10 +341,21 @@ class TestOpenAlex(unittest.TestCase):
                 self.assertEqual(result["text"], "")
                 self.assertIsNotNone(result["capture_sha256"])
 
-    def test_rate_limits_and_redirects_are_not_retried(self):
+    def test_malformed_provider_abstract_is_omitted_without_discarding_the_work(self):
+        for mode in ("bad-abstract-gap", "bad-abstract-collision", "bad-abstract-bool", "bad-abstract-empty"):
+            with self.subTest(mode=mode):
+                result = self.client().run(**self.arguments(mode))
+                self.assertEqual(result["outcome"], "ok")
+                self.assertEqual(len(result["works"]), 1)
+                self.assertIsNone(result["works"][0]["abstract"])
+                self.assertEqual(result["metadata"]["abstract_gaps"],
+                                 [{"work_id": "W123", "reason": "provider_abstract_index_invalid"}])
+                self.assertTrue(all(check["outcome"] == "passed" for check in self.inspect(result, self.arguments(mode))))
+
+    def test_retry_policy_can_disable_retries_and_redirects_remain_terminal(self):
         for mode, outcome in (("rate-limited", "rate_limited"), ("redirect", "provider_error")):
             before = len(OpenAlexFixture.requests)
-            result = self.client().run(operation="search", query=mode)
+            result = self.client(max_retries=0).run(operation="search", query=mode)
             self.assertEqual(result["outcome"], outcome)
             self.assertEqual(len(OpenAlexFixture.requests), before + 1)
             self.assertEqual(result["works"], [])

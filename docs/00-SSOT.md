@@ -1,6 +1,6 @@
 # Sci-saurus — Concept SSOT
 
-> **Version:** v1.2 · **Date:** 2026-09-11 · **Status:** normative design; implemented slices and evidence are documented separately.
+> **Version:** v1.3 · **Date:** 2026-09-11 · **Status:** normative design; implemented slices and evidence are documented separately.
 > This is the normative source for purpose, authority, terminology, and design decisions. [System Concept](05-system-concept.md) explains the organizing model. Architecture and execution contracts implement these decisions.
 > Preserve prior decisions. Amend them with explicit superseding decisions rather than rewriting history. Historical decision entries below are retained; this checkout does not contain a separate historical document archive.
 
@@ -37,7 +37,7 @@ The following records describe the original design. Where they conflict with a l
 - **D4 — Departments are internally multi-agent.** Each department = one chief + multiple specialist agents. Chiefs decompose work and judge quality; specialists execute.
 - **D5 — Rigorous per-project version control.** Project = one repository. Every artifact is stored as an **immutable version + provenance (who, when, based on what)** and tagged at milestones. Overwriting does not exist — only new versions.
 - **D6 — The Composer defines purpose via swappable "scores".** A score = a declarative definition of pipeline, quality gates, and department invocation order per deliverable type. The default score is `paper` (academic paper); user-defined scores can change the purpose freely.
-- **D7 — Initial pipeline (user request).** Input: research data + rough storyline. Processing: prior-work survey → storyline concretization & feasibility review → outline → draft → editing. Output: draft + research archive + decision record.
+- **D7 — Initial pipeline (user request).** Input: research data + rough storyline. Processing: prior-work survey → verified result interpretation → research-question and competing-hypothesis map → discriminating-test and figure plan → outline → draft → editing. Output: draft + research archive + argument map + decision record.
 - **D8 — Long-term: resource-aware organization.** Research/Strategy departments become aware of the execution environment (local computer, available tools, open-source ecosystem) and can discover, combine, and run tools to achieve goals (opt-in capabilities, behind gates).
 - **D9 — Hybrid execution harness.** The core (store, ledger, message bus, score, gates) is implemented natively as a standalone Python orchestrator; department/agent **runners sit behind an adapter interface**, so LangGraph, AutoGen, etc. can be mixed **per department** where useful (frameworks are adopted piecemeal, not all-or-nothing).
 - **D10 — Deliverables down to rendered output.** The paper score's final deliverable is LaTeX source + compiled PDF. The Editorial Format Editor maintains venue templates (.cls/.sty) and citation styles; **successful compilation and zero reference errors** are release-gate conditions.
@@ -120,6 +120,16 @@ The following records describe the original design. Where they conflict with a l
 
 **D48 — Exploration may branch, commitment may not.** An open-ended research mission can retain a bounded hypothesis tree with explicit parentage, stage, seed, metrics, and evidence. Promotion requires independent verification and preserves materially different alternatives for later inspection. A tree-search proposal never changes an accepted artifact, bypasses the literature gate, or grants model-generated code unrestricted execution. The reusable implementation and benchmark comparison are documented in `95-ai-scientist-benchmark.md`.
 
+**D49 — Interpretation is a scientific stage, not a writing side effect.** After evidence and deterministic results are assembled, a separate interpretation artifact records the important result patterns, their practical meaning, competing mechanisms, evidence for and against each mechanism, and experiments that would distinguish them. Possible explanations remain explicitly possible until evidence supports or refutes them. A bounded conclusion is projected from this artifact into the manuscript; a writer cannot jump directly from a number to a conclusion by omitting the explanatory step.
+
+**D50 — Control-plane state is projected into public scientific language.** Hashes, reservations, acceptance states, repair scopes, model-call accounting, and internal gap enums remain complete in the ledger and appendices. The manuscript surface is screened for operational vocabulary and must express the corresponding scientific meaning in terms a human researcher would publish. This projection is explicit and reviewable; it is not a silent text scrub.
+
+**D51 — Editorial compression is a release gate.** The assembly pass separates observation from interpretation, prevents repeated numerical facts and duplicated caveats, and prioritizes limitations by their effect on the conclusion. A limitation that does not change how the conclusion should be read is omitted from the main text or moved to a reproducibility record. Compression reduces reader burden without weakening evidence, provenance, or uncertainty reporting.
+
+**D52 — Human-scientist review is independent of factual QA.** In addition to method and accuracy checks, every manuscript release receives an adversarial scientific-communication review of the question, narrative importance, mechanism discussion, explanatory value, exposed pipeline language, repetition, figure argument, and section function. The reviewer may request a scoped repair or state that no justified objection was found; it may not invent objections to satisfy a negativity quota.
+
+**D53 — Provider pacing is part of the execution contract.** A provider has an explicit inter-request interval, request-level transient retry policy, and total request deadline. Pacing is scheduled independently for bibliography, identity, and full-text capabilities; `Retry-After` and exponential backoff are honored inside the same deadline. Waits, retries, and exhausted budgets remain visible in the run report, and a delay that cannot fit the hard wall blocks before dispatch rather than creating an unbounded timeout.
+
 ### 3.3 Effective interpretation of earlier rules
 
 | Earlier wording | Effective interpretation |
@@ -201,7 +211,7 @@ Hard capability, capacity, expenditure, and explicit mission limits coexist with
 
 Core control entities: `Project`, `PrincipalIntent`, `Mission`, `Score`, `ResourcePolicy`, `AllocationWindow`, `Task`, `TaskAttempt`, `EditGrant`, `ContextPackage`, `Message`, `Event`, `GateResult`, `HumanApproval`, `Release`.
 
-Research/quality entities are immutable artifact types: `ResultsPackage`, `SearchCampaign`, `QueryRecord`, `DiscoveryRecord`, `ReferenceCard`, `SourceCapture`, `EvidenceRecord`, `CoverageReport`, `Claim`, `Critique`, `Response`, `Adjudication`, `Verification`, `ReviewCoverage`, `ProgressRecord`, `SupervisionDecision`, `ProgressCheckpoint`, and ordinary drafts/reports. Their status histories are event projections. A separate `Issue` identity tracks a defect across target revisions. The activity graph and candidate frontier are projections over these records, not additional independent stores.
+Research/quality entities are immutable artifact types: `ResultsPackage`, `ResearchArgument`, `SearchCampaign`, `QueryRecord`, `DiscoveryRecord`, `ReferenceCard`, `SourceCapture`, `EvidenceRecord`, `CoverageReport`, `Claim`, `Critique`, `Response`, `Adjudication`, `Verification`, `ReviewCoverage`, `ProgressRecord`, `SupervisionDecision`, `ProgressCheckpoint`, and ordinary drafts/reports. Their status histories are event projections. A separate `Issue` identity tracks a defect across target revisions. The activity graph and candidate frontier are projections over these records, not additional independent stores.
 
 Every substantive artifact is immutable, version-pinned, owned, hashed, and linked to inputs. An `ArtifactRef` identifies both a logical artifact and its exact version. A release pins all included artifacts and the approval/evaluation conditions under which they were accepted. Dependency changes invalidate affected acceptance decisions without deleting earlier evidence.
 
@@ -246,6 +256,7 @@ These defaults make the blueprint internally concrete; they do not falsely mark 
 | `75-literature-survey-score.md` | Implemented bounded literature survey, focused reviews, independent gap challenge, evidence gates, and evaluation contract |
 | `80-completion-runtime.md` | Implemented recovery, executable plans, capability acquisition, blinded evaluation, and paper release-candidate contracts |
 | `90-experiment-runtime.md` | Implemented bounded scientific execution, exact replay, independent recalculation, result review, and generated-result provenance |
+| `100-research-argument-runtime.md` | Pre-composition question, hypothesis, discriminating-test, and figure/table argument contract |
 | `85-multimodal-visual-review.md` | Hash-pinned image inputs, independent visual judgment, exact synthesis, and scoped repair actions |
 | `web-search-campaign.yaml` | Illustrative search campaign; not a working runtime |
 | `25-p0-freeze.md` | P0 contract-freeze record: frozen principles, selected first fixture, deployment-configuration template, acceptance state |
@@ -265,3 +276,4 @@ These defaults make the blueprint internally concrete; they do not falsely mark 
 | v1.0 | D40–D44; source-aware recovery, dependency plans, approved capability acquisition, frozen-label evaluation, and an evidence-bound rendered paper candidate |
 | v1.1 | D45; reusable hash-pinned multimodal review, exact perspective reconciliation, and purpose-scoped visual repair |
 | v1.2 | D46–D47; frozen experiment execution with replay and distinct validation, plus storyline-first paper assembly with explicit evidence relations |
+| v1.3 | D48; research-argument discovery and adjudication become a mandatory pre-composition gate with evidence-bound hypotheses, discriminating tests, and figure/table jobs |

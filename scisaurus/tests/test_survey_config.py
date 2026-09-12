@@ -92,6 +92,21 @@ class TestSurveyConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "leave at least one"):
             validate_survey_config(value)
 
+    def test_provider_intervals_are_explicit_and_finite(self):
+        value = survey_config()
+        value["survey"]["provider_intervals"] = {
+            "bibliography": 1.5, "identity": 0.25, "full_text": 0,
+        }
+        self.assertEqual(validate_survey_config(value), value)
+        for invalid in ({"bibliography": -1, "identity": 0, "full_text": 0},
+                        {"bibliography": float("inf"), "identity": 0, "full_text": 0},
+                        {"bibliography": 1, "identity": 0, "extra": 0}):
+            with self.subTest(invalid=invalid):
+                candidate = survey_config()
+                candidate["survey"]["provider_intervals"] = invalid
+                with self.assertRaises(ValidationError):
+                    validate_survey_config(candidate)
+
     def test_search_seed_identity_and_unique_queries_are_required(self):
         for field, invalid in (("seed_queries", []), ("seed_queries", ["same", "same"]),
                                ("seed_queries", ["x" * 2049]), ("seed_queries", ["a\nb"]),

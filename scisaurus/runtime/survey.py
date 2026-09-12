@@ -77,6 +77,17 @@ class SurveyRunner(ExecutionRuntime):
             wall_clock_seconds=self.config["limits"]["wall_clock_seconds"], policy=self.config.get("time_policy"))
         self.time_policy.started_at = self.started
         self.deadline = min(self.deadline, self.started + self.time_policy.hard_seconds)
+        # Provider pacing is independent from request retries.  The former
+        # spaces successful calls across a provider's rate window, while the
+        # latter handles transient failures for one request.  Keeping a
+        # monotonic schedule means a slow response naturally consumes the
+        # interval instead of adding another unnecessary sleep.
+        self.provider_intervals = {
+            name: float(value)
+            for name, value in self.score.get("provider_intervals", {}).items()
+        }
+        self.next_provider_at = {name: self.started for name in self.provider_intervals}
+        self.provider_waits = []
         self.work_records, self.works, self.source_docs, self.source_records = {}, {}, {}, {}
         self.identity_records = {}
         self.aliases, self.dois, self.analysis_records, self.analyzed_basis = {}, {}, {}, {}
@@ -102,6 +113,27 @@ class SurveyRunner(ExecutionRuntime):
 
     def _body(self, record):
         return json.loads(self.store.read_body(record["body_hash"]))
+
+    def _wait_provider(self, capability):
+        """Wait until the next paced provider slot, bounded by the run deadline."""
+        interval = self.provider_intervals.get(capability, 0.0)
+        if interval <= 0:
+            return
+        due = self.next_provider_at.get(capability, self.started)
+        waited = 0.0
+        while True:
+            self._ensure_active()
+            remaining = due - time.monotonic()
+            if remaining <= 0:
+                break
+            if time.monotonic() + remaining >= self.deadline:
+                raise ValidationError(f"provider interval for {capability} exceeds run deadline")
+            time.sleep(min(remaining, 0.25))
+            waited += min(remaining, 0.25)
+        self._ensure_active()
+        self.next_provider_at[capability] = time.monotonic() + interval
+        self.provider_waits.append({"capability": capability, "waited_seconds": round(waited, 3),
+                                    "interval_seconds": interval})
 
     def _heads(self, prefix):
         rows = self.control._conn.execute(
@@ -466,6 +498,7 @@ class SurveyRunner(ExecutionRuntime):
             definition = self.score.get(key)
             if definition is None:
                 continue
+            self._wait_provider(key)
             state = self.operations.ensure_ready(definition["id"], self._call, operator="operations.operator",
                 verifier="operations.verifier", purpose=self.score["question"])
             if state["state"] != "ready":
@@ -565,11 +598,22 @@ class SurveyRunner(ExecutionRuntime):
     def _bibliographic_call(self, operation, *, role, query=None, work_id=None, cursor=None,
                             plan_ref=None, admission="discovery"):
         self._ensure_active()
-        if self.api_calls >= self.bounds["max_api_calls"]:
+        # The discovery/expansion budget must not consume the calls reserved
+        # for the independent challenge.  ``challenge_reserve`` already
+        # protects work admission; the same revision-5 policy reserves one
+        # full challenge query tranche so that a saturated discovery campaign
+        # can still execute the counter-search.  Challenge calls are therefore
+        # allowed through the base cap plus the configured planner width,
+        # while every call remains charged in the immutable reservation ledger.
+        api_limit = self.bounds["max_api_calls"]
+        if admission == "challenge":
+            api_limit += max(1, self.bounds.get("queries_per_role", 1))
+        if self.api_calls >= api_limit:
             self.gaps.append({"kind": "api_call_limit", "operation": operation, "query": query, "work_id": work_id})
             return None
         arguments = {"operation": operation, "query": query, "work_id": work_id,
                      "limit": self.bounds["results_per_query"], "cursor": cursor}
+        self._wait_provider("bibliography")
         self._reserve_api_call("bibliography", arguments, role)
         try:
             result, execution = self.operations.run(self.bindings["bibliography"], arguments, self._call, operator=role)
@@ -636,6 +680,7 @@ class SurveyRunner(ExecutionRuntime):
                 break
             self.full_text_attempted.add(wid)
             try:
+                self._wait_provider("full_text")
                 result, execution = self.operations.run(self.bindings["full_text"],
                     {"url": route["url"], "max_length": self.bounds["max_text_chars"]}, self._call,
                     operator="research.full-text-reader")
@@ -669,6 +714,7 @@ class SurveyRunner(ExecutionRuntime):
                 self.gaps.append({"kind": "identity_call_limit", "work_id": wid})
                 break
             arguments = {"query": work["doi"], "limit": 3}
+            self._wait_provider("identity")
             self._reserve_api_call("identity", arguments, "research.identity-checker")
             try:
                 result, execution = self.operations.run(
@@ -701,6 +747,99 @@ class SurveyRunner(ExecutionRuntime):
                  "text": value["text"][:self.bounds["context_chars"]], "available_chars": len(value["text"]),
                  "window": {"start": 0, "end": min(len(value["text"]), self.bounds["context_chars"])}}
                 for ref, value in self.source_docs.items()]
+
+    def _assessment_source_context(self):
+        """Bound source windows for the final gap decision.
+
+        The assessment receives the compact map plus enough source text to
+        check decisive quotations.  Sending every captured 60k-character
+        window again can exceed the compatible model's context limit and is
+        redundant with the exact evidence already present in the map.
+        """
+        result = []
+        for ref, value in self.source_docs.items():
+            representation = value["representation"]
+            limit = self.bounds["context_chars"]
+            if representation == "unverified_text":
+                # Keep enough of captured pages to retain the exact spans
+                # surfaced by the map, while still avoiding the full HTML
+                # payload that caused the assessment request to overflow.
+                limit = min(limit, 40000)
+            elif representation == "abstract":
+                limit = min(limit, 2500)
+            text = value["text"][:limit]
+            result.append({"source_ref": ref, "work_id": value["work_id"],
+                           "representation": representation,
+                           "identity_verified": value.get("identity_verified", False),
+                           "text": text,
+                           "available_chars": len(value["text"]),
+                           "window": {"start": 0, "end": len(text)}})
+        return result
+
+    @staticmethod
+    def _assessment_statement(statement):
+        if not isinstance(statement, dict):
+            return {"text": None, "evidence": []}
+        return {"text": statement.get("text"), "evidence": [
+            {key: proof.get(key) for key in ("work_id", "source_ref", "quote")
+             if proof.get(key) is not None}
+            for proof in statement.get("evidence", []) if isinstance(proof, dict)
+        ]}
+
+    def _assessment_map_context(self):
+        """Project map claims to evidence needed for gap reasoning."""
+        entries = []
+        for record in self.analysis_records.values():
+            entry = self._body(record)
+            entries.append({"work_id": entry.get("work_id"),
+                            "inclusion": entry.get("inclusion"),
+                            "reason": entry.get("reason"),
+                            **{field: self._assessment_statement(entry.get(field))
+                               for field in MAP_FIELDS}})
+        relationships = []
+        for relation in self.relationships.values():
+            relationships.append({"source": relation.get("source"),
+                                  "target": relation.get("target"),
+                                  "kind": relation.get("kind"),
+                                  "claim": self._assessment_statement(relation.get("claim"))})
+        return {"entries": entries, "relationships": relationships}
+
+    def _bind_assessment_spans(self, value, sources):
+        """Bind quotes and repair an unambiguous abstract/full-text mismatch.
+
+        A map quote can be copied from an abstract while a reviewer selects
+        the same work's full-text source reference.  Rebinding is allowed only
+        when the exact quote occurs once in another displayed source for that
+        work; unsupported or ambiguous quotes still fail the normal evidence
+        validator and are sent back for a scoped retry.
+        """
+        source_by_ref = {source["source_ref"]: source for source in sources}
+        by_work = {}
+        for source in sources:
+            by_work.setdefault(source["work_id"], []).append(source)
+        repaired = deepcopy(value)
+
+        def repair(items):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                quote, ref, work_id = item.get("quote"), item.get("source_ref"), item.get("work_id")
+                if not all(isinstance(part, str) for part in (quote, ref, work_id)):
+                    continue
+                source = source_by_ref.get(ref)
+                visible = source["text"] if source is not None else ""
+                if visible.count(quote) == 1:
+                    continue
+                candidates = [candidate for candidate in by_work.get(work_id, [])
+                              if candidate["text"].count(quote) == 1]
+                if len(candidates) == 1:
+                    item["source_ref"] = candidates[0]["source_ref"]
+
+        repair(repaired.get("evidence", []))
+        for comparison in repaired.get("comparisons", []):
+            if isinstance(comparison, dict):
+                repair(comparison.get("evidence", []))
+        return self._bind_visible_spans(repaired, sources)
 
     def _bind_visible_spans(self, value, sources):
         windows = {source["source_ref"]: source["window"] for source in sources}
@@ -790,7 +929,8 @@ class SurveyRunner(ExecutionRuntime):
                 "When semantic_feedback is present, change only its entry_fields and relationships with its relationship_targets. "
                 "Preserve every other field and relationship exactly. Correct unsupported claims by narrowing them to the evidence, recording unknown facts, or removing unsupported relationships. "
                 "Titles, years, and citation links are provider-reported catalog metadata, not textual evidence for substantive claims. "
-                "Do not infer confirmed chronology, conceptual inheritance, identity claims, or superiority from metadata or shared terminology alone."
+                "Do not infer confirmed chronology, conceptual inheritance, identity claims, or superiority from metadata or shared terminology alone. "
+                "When no captured source belongs to the assigned work, set inclusion to uncertain and make reason a narrow availability note: state that the catalog record is relevant by metadata but no abstract or verified full text was available, so substantive content could not be assessed. Do not put other work IDs, quotations, chronology, evolution, extension, comparison, or superiority in that reason."
         }
         if review_feedback is not None:
             editable_fields = list(review_feedback["entry_fields"])
@@ -809,6 +949,7 @@ class SurveyRunner(ExecutionRuntime):
                     "Every substantive statement needs a short contiguous exact quote from the displayed source, with every clause supported. "
                     "Relationship source must be the assigned work, target must be editable, kind is extends/contradicts/compares/related, "
                     "and its claim needs evidence from both works. Use only displayed source_ref values. "
+                    "If no captured source belongs to the assigned work, the only valid repair for inclusion/reason is inclusion=uncertain with a narrow note that catalog metadata is relevant but no abstract or verified full text was available, so substantive content could not be assessed; remove other work IDs, quotations, chronology, evolution, extension, comparison, and superiority from that reason. "
                     "Correct the failed checks narrowly by grounding, narrowing, setting unknown, or deleting an unsupported relationship."
             })
 
@@ -817,6 +958,18 @@ class SurveyRunner(ExecutionRuntime):
             if review_feedback is not None:
                 value = apply_scoped_map_repair(wid, previous, old_relationships, review_feedback, value)
             validate_map(value, [wid], set(self.works), self.source_docs, require_spans=True)
+            own_sources = [source for source in sources if source["work_id"] == wid]
+            if not own_sources:
+                entry = value["entries"][0]
+                reason = entry["reason"].lower()
+                forbidden = set(self.works) - {wid}
+                if entry["inclusion"] != "uncertain":
+                    raise ValidationError("a work without captured source text must be marked uncertain")
+                if ("abstract" not in reason or "full text" not in reason
+                        or not any(token in reason for token in ("could not", "cannot", "not available", "unavailable"))
+                        or any(other.lower() in reason for other in forbidden)
+                        or any(token in reason for token in ("evolved", "extends", "superior", "foundational", "chronolog"))):
+                    raise ValidationError("a source-less work reason must report only metadata relevance and unavailable abstract/full text")
             if not entry_editable and canonical_bytes(value["entries"][0]) != canonical_bytes(previous):
                 raise ValidationError(f"unchanged work {wid} must preserve its exact previous entry; only outgoing relationships may change")
             if any(relation["source"] != wid for relation in value["relationships"]):
@@ -844,6 +997,96 @@ class SurveyRunner(ExecutionRuntime):
         return {"entries": [json.loads(self.store.read_body(r["body_hash"])) for r in self.analysis_records.values()],
                 "relationships": list(self.relationships.values()),
                 **json.loads(self.store.read_body(self.map_record["body_hash"]))}
+
+    def _survey_review_packet(self):
+        """Build a bounded, text-only context for the aggregate survey review.
+
+        Focused reviews already inspect the exact captured spans for every map
+        entry and relationship.  Sending the complete search log and source
+        bodies again makes the aggregate request needlessly large and can
+        trigger gateway failures.  The aggregate reviewer therefore receives
+        the map statements, evidence references, source inventory, coverage
+        counters, and the independent focused-review outcomes; the immutable
+        source captures remain pinned in the survey dependencies.
+        """
+        def compact_statement(statement):
+            if not isinstance(statement, dict):
+                return {"text": None, "evidence": []}
+            proofs = []
+            for proof in statement.get("evidence", []):
+                if not isinstance(proof, dict):
+                    continue
+                proofs.append({key: proof.get(key) for key in ("work_id", "source_ref", "quote_sha256")
+                               if proof.get(key) is not None})
+            return {"text": statement.get("text"), "evidence": proofs}
+
+        entries = []
+        for record in self.analysis_records.values():
+            entry = json.loads(self.store.read_body(record["body_hash"]))
+            entries.append({
+                "work_id": entry.get("work_id"),
+                "inclusion": entry.get("inclusion"),
+                "reason": entry.get("reason"),
+                **{field: compact_statement(entry.get(field)) for field in MAP_FIELDS},
+            })
+
+        relationships = []
+        for relation in self.relationships.values():
+            claim = relation.get("claim") or {}
+            relationships.append({
+                "source": relation.get("source"),
+                "target": relation.get("target"),
+                "kind": relation.get("kind"),
+                "claim": compact_statement(claim),
+            })
+
+        coverage = self._coverage()
+        search_counts = {}
+        for row in coverage.get("searches", []):
+            if not isinstance(row, dict):
+                continue
+            outcome = row.get("outcome", "unknown")
+            search_counts[outcome] = search_counts.get(outcome, 0) + 1
+        gap_counts = {}
+        for row in coverage.get("access_and_limit_gaps", []):
+            if not isinstance(row, dict):
+                continue
+            kind = row.get("kind", "unknown")
+            gap_counts[kind] = gap_counts.get(kind, 0) + 1
+        coverage_summary = {
+            key: coverage.get(key) for key in (
+                "unique_works", "abstracts", "verified_full_texts", "bibliographic_identities",
+                "source_windows", "pagination_remaining", "saturated",
+            )
+        }
+        coverage_summary.update({
+            "search_count": len(coverage.get("searches", [])),
+            "search_outcomes": search_counts,
+            "gap_count": len(coverage.get("access_and_limit_gaps", [])),
+            "gap_kinds": gap_counts,
+        })
+
+        sources = []
+        for source in self._source_context():
+            sources.append({key: source.get(key) for key in (
+                "source_ref", "work_id", "representation", "identity_verified", "available_chars",
+            )})
+
+        focused_reviews = []
+        for wid, record in self.work_reviews.items():
+            review = self._body(record)
+            focused_reviews.append({
+                "work_id": wid,
+                "checks": [{"check_id": check.get("check_id"), "outcome": check.get("outcome")}
+                           for check in review.get("checks", [])],
+                "rationale": str(review.get("rationale", ""))[:800],
+            })
+        return {
+            "map": {"entries": entries, "relationships": relationships},
+            "coverage": coverage_summary,
+            "sources": sources,
+            "focused_review_summary": focused_reviews,
+        }
 
     def _review_work_claims(self):
         for round_number in range(self.config["limits"]["max_rounds"]):
@@ -932,17 +1175,23 @@ class SurveyRunner(ExecutionRuntime):
         body["work_review_refs"] = [r["artifact_ref"] for r in self.work_reviews.values()]
         bundle = self._publish("kb/surveys/current", "note", body, "research.literature-mapper", subjects=body["dependency_refs"])
         self.survey_revision += 1
+        review_packet = self._survey_review_packet()
         value, execution = self._model_checked("survey-review", "methods.survey-reviewer", {
             "assignment": "Independently check this exact survey, including honest reporting of incomplete coverage.",
             "phase": "survey_review", "survey_ref": bundle["artifact_ref"], "question": self.score["question"],
-            "map": self._map_body(), "coverage": self._coverage(), "sources": self._source_context(),
+            "map": review_packet["map"], "coverage": review_packet["coverage"],
+            "sources": review_packet["sources"],
+            "focused_review_summary": review_packet["focused_review_summary"],
             "relationship_semantics": RELATIONSHIP_SEMANTICS,
             "required_checks": list(SURVEY_CHECKS),
             "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
             "instructions": "Return {checks:[{check_id,outcome,method,result}],rationale}. Execute exactly the required checks. "
                 "Outcomes passed/failed/insufficient_evidence/check_failed. Passing approves a faithful bounded survey, not novelty or exhaustive coverage. "
-                "Check accurate coverage/accounting, faithful quotations and source scope, and support for every map claim. Unknown facts must stay unknown. "
-                "Unverified provider metadata is not itself a false assertion if explicitly labeled; fail unsupported chronology or superiority inferred from it."
+                "Check accurate coverage/accounting, faithful quotations and source scope, and support for every map claim. "
+                "The focused-review summary records independent exact-span checks; use it as the primary support for map claims. "
+                "The sources list is an inventory only and intentionally contains no source body or image bytes; do not infer text that is not represented. "
+                "Unknown facts must stay unknown. Unverified provider metadata is not itself a false assertion if explicitly labeled; "
+                "fail unsupported chronology or superiority inferred from it."
         }, validate_survey_review, stage="unit_review", task_kind="verification")
         review = self._publish(f"kb/survey-reviews/{self.survey_revision}", "note", {
             "survey_ref": bundle["artifact_ref"], "execution_ref": execution, **value}, "methods.survey-reviewer",
@@ -1013,12 +1262,18 @@ class SurveyRunner(ExecutionRuntime):
             raise ValidationError("counter-search completion could not be bound to the accepted survey")
 
     def _assess(self):
+        assessment_sources = self._assessment_source_context()
+        assessment_source_lookup = {source["source_ref"]: source for source in assessment_sources}
+        verified_full_text_refs = [source["source_ref"] for source in assessment_sources
+                                   if source["representation"] == "full_text"
+                                   and source.get("identity_verified") is True]
         value, execution = self._model_checked("gap-assessment", "methods.novelty-verifier", {
             "assignment": "Independently determine the status of the nominated gap using the current accepted survey and targeted counter-search.",
             "phase": "gap_assessment", "question": self.score["question"], "gap": self.nomination,
             "nomination_ref": self.nomination_record["artifact_ref"],
             "survey_ref": self.survey_ref, "prerequisite_survey_ref": self.survey_ref,
-            "map": self._map_body(), "coverage": self._coverage(), "sources": self._source_context(),
+            "map": self._assessment_map_context(), "coverage": self._coverage(), "sources": assessment_sources,
+            "verified_full_text_refs": verified_full_text_refs,
             "required_checks": list(GAP_CHECKS),
             "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
             "instructions": "Return exactly {state:string,rationale:string,comparisons:[{work_id:string,relationship:string,statement:string,evidence:[{work_id:string,source_ref:string,quote:string}]}],checks:[{check_id:string,outcome:string,method:string,result:string}],evidence:[{work_id:string,source_ref:string,quote:string}]}. "
@@ -1028,10 +1283,12 @@ class SurveyRunner(ExecutionRuntime):
                 "A prior solution supported by decisive full-text quotes refutes the gap even if global search is incomplete. "
                 "For decisive states all checks must pass and evidence must include verified full_text sources. Abstracts alone cannot authorize a decisive state. "
                 "Use insufficient_evidence if access, source windows, missing closest work, or incomparable conditions prevent the judgment. "
+                "For refuted_by_prior_work or eligible_for_experiment, cite only the listed verified_full_text_refs for any decisive comparison; "
+                "if no listed full-text quote directly supports the comparison, set the state to insufficient_evidence and use relationship=uncertain. "
                 "Eligibility requires meaningful, testable distinction, no prior solution or unresolved comparison, and adequate search coverage. "
                 "It authorizes an experiment under the stated scope, never publication-ready novelty. Do not force a positive finding to finish the task."
-        }, lambda value: validate_assessment(value, self.source_docs, self.works, require_spans=True),
-            normalizer=lambda value: self._bind_visible_spans(value, self._source_context()),
+        }, lambda value: validate_assessment(value, assessment_source_lookup, self.works, require_spans=True),
+            normalizer=lambda value: self._bind_assessment_spans(value, assessment_sources),
             stage="integrated_review", task_kind="verification")
         if value["state"] == "eligible_for_experiment" and (self.gaps or any(
                 len(source["text"]) > self.bounds["context_chars"] for source in self.source_docs.values()
@@ -1121,6 +1378,7 @@ class SurveyRunner(ExecutionRuntime):
             "gap_state": decision, "nomination": self.nomination,
             "nomination_ref": self.nomination_record["artifact_ref"] if self.nomination_record else None,
             "coverage": self._coverage(), "time_plan": self.time_policy.snapshot(), "time_decisions": self.time_decisions,
+            "provider_intervals": self.provider_intervals, "provider_waits": self.provider_waits,
             "usage": self.budget.get_window("run-window"), "unreported_usage": self.usage_gaps,
             "capabilities": {key: self.operations.status(key) for key in self.capability_ids},
             "blockers": self.blockers, "event_chain": self.control.verify_chain(), "release_status": "not_released"}

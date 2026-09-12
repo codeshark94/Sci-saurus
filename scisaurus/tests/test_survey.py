@@ -415,6 +415,17 @@ class TestSurveyRunner(unittest.TestCase):
                             and gap.get("reserved_challenge_slots") == 1
                             for gap in result["coverage"]["access_and_limit_gaps"]))
 
+    def test_countersearch_api_tranche_survives_base_call_cap(self):
+        """A saturated discovery budget cannot starve the falsification query."""
+        config = survey_config(self.endpoint)
+        config["survey"]["search"].update(max_api_calls=2, expansion_rounds=0)
+        result = self.runtime(config).run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertTrue(result["survey_current"])
+        self.assertTrue(any(request["query"].get("search") == ["prior solution"]
+                            for request in SurveyHTTPFixture.requests))
+        self.assertGreaterEqual(result["usage"]["cumulative_usage"]["retrieval_calls"], 3)
+
     def test_automatic_nomination_uses_current_accepted_survey(self):
         config = survey_config(self.endpoint)
         config["survey"]["proposed_gap"] = None
@@ -758,6 +769,9 @@ class TestSurveyRunner(unittest.TestCase):
         config = survey_config(self.endpoint)
         config["survey"]["seed_queries"] = ["recall timing", "rate limited topic"]
         config["survey"]["search"]["expansion_rounds"] = 0
+        # Exercise recovery from a provider failure explicitly; the live
+        # default now retries transient responses within one request budget.
+        config["survey"]["bibliography"]["client"]["max_retries"] = 0
         SurveyHTTPFixture.rate_limit_once = "rate limited topic"
         first = self.runtime(config).run()
         self.assertEqual(first["status"], "blocked")

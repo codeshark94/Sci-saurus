@@ -103,6 +103,21 @@ External retrieval runs throughout the activity graph. Departments directly sear
 
 The organization maintains a live capability registry for direct APIs, connected tools, and optional MCP/plugin adapters. It can select already authorized capabilities, request missing integrations, and check their actual behavior. New information is captured and verified before it changes a claim; accepted claims and paragraphs change only through scoped proposals. [Web integration design](50-web-intelligence-integration.md) specifies the first adapters and implementation sequence.
 
+### 4.3 Scientific interpretation and argument construction
+
+Evidence and a result table are not yet an explanation. Scientific
+Interpretation identifies the result patterns that matter, states what each
+pattern means, keeps competing mechanisms at the level justified by the
+evidence, and proposes discriminating follow-up experiments. The
+Research-Argument stage then turns that interpretation into a versioned
+question, competing-hypothesis map, bounded thesis, and figure/table plan.
+Independent adjudication must accept this map before a writer is admitted. The
+writer receives the accepted argument together with the evidence ledger; it
+cannot invent a thesis, turn a possible mechanism into a fact, or use a figure
+as decoration without a reader-facing job.
+
+The final assembly then projects the control plane into a reader-facing scientific surface. Operational labels, hashes, reservations, repair scopes, and reviewer bookkeeping remain queryable in the project archive and reproducibility note; the article describes the dataset, method, result, uncertainty, and implication in public academic language. An editorial compression gate checks that numeric facts and caveats are not repeated mechanically, that Results reports observations while Discussion explains them, that each figure makes an argument in the text, and that limitations are retained because they change the conclusion's scope.
+
 ## 5. Generous compute with executable boundaries
 
 Separate three resource concepts:

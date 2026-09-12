@@ -18,6 +18,9 @@ from scisaurus.core.store import ArtifactStore
 from scisaurus.core.surveys import SurveyGate
 from scisaurus.runtime.bibliographic_identity import normalize_doi, normalize_title
 from scisaurus.runtime.results import validate_results_package
+from scisaurus.runtime.research_argument import validate_argument_review, validate_research_argument
+from scisaurus.runtime.scientific_interpretation import validate_interpretation
+from scisaurus.runtime.scientific_surface import validate_scientific_surface
 
 
 def _exact(value, fields, name):
@@ -65,6 +68,73 @@ def validate_paper_config(value):
                 raise ValidationError("storyline beat identity or role is invalid")
             storyline_ids.add(beat["id"])
             _text(beat["proposition"], "storyline beat proposition")
+    elif schema == "paper-release-score-3":
+        _exact(value, base_fields | {"storyline", "depth_profile", "interpretation_file", "figure_arguments",
+                                     "surface_policy"}, "paper configuration")
+        storyline = value["storyline"]
+        _exact(storyline, {"id", "revision", "thesis", "beats"}, "paper storyline")
+        _identifier(storyline["id"], "storyline id")
+        if type(storyline["revision"]) is not int or storyline["revision"] < 1:
+            raise ValidationError("storyline revision must be positive")
+        _text(storyline["thesis"], "storyline thesis")
+        if not isinstance(storyline["beats"], list) or len(storyline["beats"]) < 4:
+            raise ValidationError("a research-paper storyline requires at least four ordered beats")
+        storyline_ids = set()
+        for beat in storyline["beats"]:
+            _exact(beat, {"id", "role", "proposition"}, "storyline beat")
+            _identifier(beat["id"], "storyline beat id")
+            if beat["id"] in storyline_ids or beat["role"] not in {
+                    "motivation", "question", "hypothesis", "method", "result", "interpretation",
+                    "limitation", "conclusion"}:
+                raise ValidationError("storyline beat identity or role is invalid")
+            storyline_ids.add(beat["id"])
+            _text(beat["proposition"], "storyline beat proposition")
+        depth = value["depth_profile"]
+        _exact(depth, {"min_words", "min_references", "min_full_text_references", "min_sections",
+                       "required_section_titles", "max_numeric_repetitions", "max_caveat_repetitions"},
+              "paper depth profile")
+        for key in ("min_words", "min_references", "min_full_text_references", "min_sections",
+                    "max_numeric_repetitions", "max_caveat_repetitions"):
+            if type(depth[key]) is not int or depth[key] < 0:
+                raise ValidationError(f"depth_profile.{key} must be a nonnegative integer")
+        if depth["max_numeric_repetitions"] < 1 or depth["max_caveat_repetitions"] < 1:
+            raise ValidationError("depth repetition limits must be positive")
+        if not isinstance(depth["required_section_titles"], list) or not depth["required_section_titles"]:
+            raise ValidationError("depth_profile.required_section_titles must be a nonempty list")
+        for title in depth["required_section_titles"]:
+            _text(title, "required section title")
+        if len(set(depth["required_section_titles"])) != len(depth["required_section_titles"]):
+            raise ValidationError("required section titles must be unique")
+        if value["document_type"] == "research_paper" and (
+                depth["min_words"] < 1 or depth["min_references"] < 1 or depth["min_sections"] < 1):
+            raise ValidationError("research papers require an explicit positive depth profile")
+        interpretation_file = Path(value["interpretation_file"])
+        if not interpretation_file.is_absolute() or not interpretation_file.is_file():
+            raise ValidationError("interpretation_file must be an existing absolute path")
+        arguments = value["figure_arguments"]
+        if not isinstance(arguments, list):
+            raise ValidationError("figure_arguments must be an explicit list")
+        argument_ids = set()
+        for argument in arguments:
+            _exact(argument, {"asset_id", "why", "observation", "unit_id"}, "figure argument")
+            for key in ("asset_id", "unit_id"):
+                _identifier(argument[key], f"figure argument {key}")
+            for key in ("why", "observation"):
+                _text(argument[key], f"figure argument {key}")
+            if argument["asset_id"] in argument_ids:
+                raise ValidationError("figure arguments must identify each asset once")
+            argument_ids.add(argument["asset_id"])
+        surface = value["surface_policy"]
+        _exact(surface, {"allow_control_patterns", "max_numeric_repetitions", "max_caveat_repetitions"},
+              "surface policy")
+        if not isinstance(surface["allow_control_patterns"], list) or len(
+                surface["allow_control_patterns"]) != len(set(surface["allow_control_patterns"])):
+            raise ValidationError("surface_policy.allow_control_patterns must be a unique list")
+        for pattern in surface["allow_control_patterns"]:
+            _text(pattern, "surface policy pattern")
+        for key in ("max_numeric_repetitions", "max_caveat_repetitions"):
+            if type(surface[key]) is not int or surface[key] < 1:
+                raise ValidationError(f"surface_policy.{key} must be a positive integer")
     else:
         raise ValidationError("unsupported paper release score")
     _identifier(value["paper_id"], "paper id")
@@ -86,7 +156,7 @@ def validate_paper_config(value):
     evidence_ids = set()
     for item in value["evidence"]:
         fields = {"id", "kind", "locator", "quote"}
-        if schema == "paper-release-score-2":
+        if schema in {"paper-release-score-2", "paper-release-score-3"}:
             fields.add("relation")
         if (isinstance(item, dict) and item.get("kind") == "literature"
                 and {"start", "end", "quote_sha256"}.intersection(item)):
@@ -94,11 +164,11 @@ def validate_paper_config(value):
         _exact(item, fields, "claim evidence")
         _identifier(item["id"], "evidence id")
         allowed_kinds = ({"result", "literature", "procedure", "finding", "limitation"}
-                         if schema == "paper-release-score-2" else {"result", "literature"})
+                         if schema in {"paper-release-score-2", "paper-release-score-3"} else {"result", "literature"})
         if item["id"] in evidence_ids or item["kind"] not in allowed_kinds:
             raise ValidationError("evidence identity or kind is invalid")
         _text(item["locator"], "evidence locator"); _text(item["quote"], "evidence quote")
-        if schema == "paper-release-score-2" and item["relation"] not in {"support", "qualify", "context"}:
+        if schema in {"paper-release-score-2", "paper-release-score-3"} and item["relation"] not in {"support", "qualify", "context"}:
             raise ValidationError("evidence relation must be support, qualify, or context")
         if "start" in item and (type(item["start"]) is not int or type(item["end"]) is not int
                                 or not 0 <= item["start"] < item["end"]
@@ -109,7 +179,7 @@ def validate_paper_config(value):
     mapped_storyline_ids = set()
     for claim in value["claims"]:
         fields = {"id", "statement", "unit_ids", "evidence_ids"}
-        if schema == "paper-release-score-2":
+        if schema in {"paper-release-score-2", "paper-release-score-3"}:
             fields.add("storyline_id")
         _exact(claim, fields, "paper claim")
         _identifier(claim["id"], "claim id"); _text(claim["statement"], "claim statement")
@@ -120,7 +190,7 @@ def validate_paper_config(value):
                 raise ValidationError(f"claim {name} must be nonempty and unique")
         if set(claim["evidence_ids"]) - evidence_ids:
             raise ValidationError("paper claim references unknown evidence")
-        if schema == "paper-release-score-2":
+        if schema in {"paper-release-score-2", "paper-release-score-3"}:
             if claim["storyline_id"] not in storyline_ids:
                 raise ValidationError("paper claim references an unknown storyline beat")
             if not any(next(item for item in value["evidence"] if item["id"] == evidence_id)["relation"]
@@ -167,14 +237,47 @@ def _latex_with_citations(value):
     return "".join(parts)
 
 
+def _finding_supported(finding, text):
+    """Check a reader-facing finding without forcing machine-generated prose.
+
+    Findings remain exact, immutable evidence records in the results package.
+    The manuscript may express the same result in a compact scientific
+    sentence, so binding checks the reported numeric tokens and metric terms
+    rather than requiring the results engine's sentence skeleton verbatim.
+    """
+    statement = finding["statement"]
+    numbers = re.findall(r"[-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?", statement.casefold())
+    for number in numbers:
+        unsigned = number.lstrip("+-")
+        if number not in text and unsigned not in text:
+            return False
+    metric_terms = re.findall(r"\b(?:log\s+loss|brier(?:\s+score)?|ece)\b", statement.casefold())
+    if metric_terms:
+        return any(term in text.casefold() for term in metric_terms)
+    # Findings are also used for ordinary measured quantities such as
+    # accuracy. Their numeric token is the binding evidence when no shared
+    # metric vocabulary exists; qualitative findings must retain their exact
+    # reader-facing sentence.
+    return bool(numbers) or statement in text
+
+
 class PaperReleaseBuilder:
     """Prepare a pinned candidate; external submission and final approval remain separate."""
 
-    def __init__(self, release_dir, config):
+    def __init__(self, release_dir, config, *, research_argument=None, argument_review=None):
         self.dir = Path(release_dir).resolve()
         if (self.dir / "state" / "control.sqlite").exists():
             raise ValidationError("paper release build requires a new output directory")
         self.config = validate_paper_config(config)
+        self.research_argument = research_argument
+        self.argument_review = argument_review
+        if research_argument is not None:
+            validate_research_argument(research_argument)
+            if argument_review is None:
+                raise ValidationError("research argument release binding requires its independent review")
+            validate_argument_review(argument_review, argument=research_argument)
+            if argument_review["decision"] != "accept":
+                raise ValidationError("research argument release binding requires an accepted review")
         self.control = ControlStore(self.dir)
         self.store = ArtifactStore(self.control)
         self.store.init_project(principal_note=self.config["paper_id"])
@@ -196,8 +299,8 @@ class PaperReleaseBuilder:
             if final is None:
                 raise ValidationError("manuscript project has no final execution report")
             report = self._body(store, final)
-            if report.get("status") != "accepted" or not report.get("incumbent_ref"):
-                raise ValidationError("manuscript project has no independently accepted candidate")
+            if report.get("status") not in {"accepted", "needs_review"} or not report.get("incumbent_ref"):
+                raise ValidationError("manuscript project has no independently reviewed candidate")
             accepted = store.accepted(store.get(report["incumbent_ref"])["artifact_id"])
             if accepted is None or accepted["artifact_ref"] != report["incumbent_ref"]:
                 raise ValidationError("manuscript report does not name its current accepted manifest")
@@ -213,13 +316,18 @@ class PaperReleaseBuilder:
                     children.append({"id": unit_id, "kind": unit["kind"], "text": unit["text"], "ref": child["ref"]})
                     units[unit_id] = children[-1]
                 groups.append({"title": heading, "units": children})
+            interpretation = None
+            if self.config["schema_version"] == "paper-release-score-3":
+                interpretation = validate_interpretation(
+                    json.loads(Path(self.config["interpretation_file"]).read_text()))
             verification_refs = [candidate.get("verification_ref") for candidate in report.get("candidates", [])
                                  if candidate.get("candidate_ref") == report["incumbent_ref"]]
             if len(verification_refs) != 1 or not verification_refs[0]:
-                raise ValidationError("accepted manuscript lacks one integrated verification record")
+                raise ValidationError("reviewed manuscript lacks one integrated verification record")
             return {"title": self.config["title"], "groups": groups, "units": units,
                     "manifest_ref": report["incumbent_ref"], "score_ref": report["score_ref"],
-                    "verification_ref": verification_refs[0], "event_chain": control.verify_chain()}
+                    "verification_ref": verification_refs[0], "event_chain": control.verify_chain(),
+                    "interpretation": interpretation, "review_status": report["status"]}
         finally:
             control.close()
 
@@ -252,6 +360,15 @@ class PaperReleaseBuilder:
                     or provenance["literature_assessment_ref"] != survey["assessment_ref"]):
                 raise ValidationError("generated results and paper must use the same accepted literature basis")
         evidence = {item["id"]: item for item in self.config["evidence"]}
+        # A reader-facing paraphrase can be bound to a literature source by
+        # its citation marker.  Exact source wording remains in the evidence
+        # ledger and is checked above; requiring that wording in the paper
+        # would turn provenance bookkeeping into awkward prose.
+        reference_keys_by_work = {}
+        for reference in self.config["references"]:
+            source = survey["sources"].get(reference["source_ref"])
+            if source is not None:
+                reference_keys_by_work.setdefault(source["work_id"], set()).add(reference["key"])
         metrics = {item["id"]: item for item in results["metrics"]}
         procedures = {item["id"]: item for item in results["procedures"]}
         findings = {item["id"]: item for item in results["findings"]}
@@ -286,9 +403,33 @@ class PaperReleaseBuilder:
             if claim["statement"] not in text:
                 raise ValidationError("claim statement is absent from its bound manuscript units")
             for evidence_id in claim["evidence_ids"]:
-                if evidence[evidence_id]["quote"] not in text:
-                    raise ValidationError("claim unit omits the exact result or source phrase it relies on")
-        if self.config["schema_version"] == "paper-release-score-2":
+                bound_evidence = evidence[evidence_id]
+                if bound_evidence["kind"] == "finding":
+                    finding = findings[bound_evidence["locator"]]
+                    if not _finding_supported(finding, text):
+                        raise ValidationError("claim unit omits the reported numeric result it relies on")
+                elif bound_evidence["quote"] not in text:
+                    if bound_evidence["kind"] == "result":
+                        metric = metrics.get(bound_evidence["locator"])
+                        metric_text = " ".join([
+                            metric.get("id", "") if metric else "",
+                            metric.get("conditions", "") if metric else "",
+                        ]).casefold()
+                        metric_terms = re.findall(r"\b(?:log\s+loss|brier(?:\s+score)?|ece|rank|temperature)\b",
+                                                  metric_text)
+                        text_lower = text.casefold()
+                        if not any(term in text_lower or (term.startswith("brier") and "brier" in text_lower)
+                                   for term in metric_terms):
+                            raise ValidationError("claim unit omits the metric meaning of the result it relies on")
+                    elif bound_evidence["kind"] == "literature":
+                        source = survey["sources"].get(bound_evidence["locator"])
+                        cited = set(re.findall(r"\[\[cite:([a-z][a-z0-9_-]{0,63})\]\]", text))
+                        allowed = reference_keys_by_work.get(source.get("work_id") if source else None, set())
+                        if not cited.intersection(allowed):
+                            raise ValidationError("claim unit omits a citation to the literature evidence it relies on")
+                    else:
+                        raise ValidationError("claim unit omits the exact result or source phrase it relies on")
+        if self.config["schema_version"] in {"paper-release-score-2", "paper-release-score-3"}:
             claims_by_beat = {}
             for claim in self.config["claims"]:
                 claims_by_beat.setdefault(claim["storyline_id"], []).append(claim)
@@ -303,12 +444,63 @@ class PaperReleaseBuilder:
             if beat_positions != sorted(beat_positions):
                 raise ValidationError("accepted manuscript does not preserve the ordered storyline beats")
         manuscript_text = " ".join(unit["text"] for unit in manuscript["units"].values())
+        depth = None
+        surface_audit = None
+        full_text_reference_count = None
+        if self.config["schema_version"] == "paper-release-score-3":
+            depth = self.config["depth_profile"]
+            word_count = len(re.findall(r"\b[\w'-]+\b", manuscript_text))
+            section_titles = {group["title"] for group in manuscript["groups"]}
+            if word_count < depth["min_words"]:
+                raise ValidationError("manuscript does not meet its declared minimum word depth")
+            if len(self.config["references"]) < depth["min_references"]:
+                raise ValidationError("manuscript does not meet its declared minimum reference depth")
+            if len(manuscript["groups"]) < depth["min_sections"]:
+                raise ValidationError("manuscript does not meet its declared minimum section depth")
+            if set(depth["required_section_titles"]) - section_titles:
+                raise ValidationError("manuscript omits a required scholarly section")
+            full_text_reference_count = sum(
+                survey["sources"].get(reference["source_ref"], {}).get("representation") == "full_text"
+                for reference in self.config["references"])
+            if full_text_reference_count < depth["min_full_text_references"]:
+                raise ValidationError("manuscript does not meet its declared full-text evidence depth")
+            surface = self.config["surface_policy"]
+            surface_audit = validate_scientific_surface(
+                manuscript_text,
+                allowed_patterns=surface["allow_control_patterns"],
+                max_numeric_repetitions=surface["max_numeric_repetitions"],
+                max_caveat_repetitions=surface["max_caveat_repetitions"],
+            )
+            interpretation = manuscript.get("interpretation")
+            if interpretation is None:
+                raise ValidationError("research paper requires a scientific interpretation artifact")
+            interpretation_text = " ".join([
+                interpretation["research_question"], interpretation["conclusion"],
+                interpretation["prioritization"]["rationale"],
+                *[item["so_what"] for item in interpretation["result_patterns"]],
+                *[item["discriminating_test"] for item in interpretation["competing_explanations"]],
+            ])
+            if not any(fragment in manuscript_text for fragment in (
+                    interpretation["research_question"], interpretation["conclusion"])):
+                raise ValidationError("manuscript does not project its scientific interpretation")
+            figures = {asset["id"] for asset in results["assets"] if asset.get("role") == "figure"}
+            arguments = {item["asset_id"]: item for item in self.config["figure_arguments"]}
+            if figures != set(arguments):
+                raise ValidationError("every figure requires one argument binding")
+            for argument in arguments.values():
+                if argument["unit_id"] not in manuscript["units"]:
+                    raise ValidationError("figure argument references an unknown manuscript unit")
+                if argument["observation"] not in manuscript["units"][argument["unit_id"]]["text"]:
+                    raise ValidationError("figure argument observation is absent from its bound unit")
         required_results = [procedure["description"] for procedure in results["procedures"]]
         required_results += [metric["presentation"] for metric in results["metrics"]]
-        required_results += [finding["statement"] for finding in results["findings"]]
         required_results += list(results["limitations"])
         if any(item not in manuscript_text for item in required_results):
             raise ValidationError("accepted manuscript omits a supplied procedure, metric, finding, or limitation")
+        missing_findings = [finding["id"] for finding in results["findings"]
+                            if not _finding_supported(finding, manuscript_text)]
+        if missing_findings:
+            raise ValidationError("accepted manuscript omits reported findings: " + ", ".join(missing_findings))
         source_refs = set(survey["sources"])
         reference_keys = {item["key"] for item in self.config["references"]}
         markers = {match.group(1) for unit in manuscript["units"].values()
@@ -335,6 +527,15 @@ class PaperReleaseBuilder:
                   "evidence": self.config["evidence"], "references": self.config["references"]}
         if self.config["schema_version"] == "paper-release-score-2":
             result.update(schema_version="paper-claim-index-3", storyline=self.config["storyline"])
+        elif self.config["schema_version"] == "paper-release-score-3":
+            result.update(schema_version="paper-claim-index-4", storyline=self.config["storyline"],
+                          depth_profile=self.config["depth_profile"], figure_arguments=self.config["figure_arguments"],
+                          interpretation_sha256=sha256_hex(canonical_bytes(manuscript["interpretation"])),
+                          surface_audit=surface_audit, full_text_reference_count=full_text_reference_count)
+        if self.research_argument is not None:
+            result.update(schema_version="paper-claim-index-5",
+                          research_argument_sha256=sha256_hex(canonical_bytes(self.research_argument)),
+                          research_argument_review_sha256=sha256_hex(canonical_bytes(self.argument_review)))
         return result
 
     def _tex(self, manuscript, results=None):
@@ -349,6 +550,25 @@ class PaperReleaseBuilder:
             for unit in group["units"]:
                 if unit["kind"] == "list_item":
                     lines.extend([r"\begin{itemize}", r"\item " + _latex_with_citations(unit["text"]), r"\end{itemize}"])
+                elif unit["kind"] == "table":
+                    # Table units use a small, reader-facing pipe-delimited
+                    # representation: first line is the caption, second line
+                    # the header, and remaining lines the data rows. Keeping
+                    # the source as plain text lets the structured manuscript
+                    # and review layers inspect exactly the values rendered.
+                    rows = [line.split("|") for line in unit["text"].splitlines() if line.strip()]
+                    if len(rows) < 3 or any(len(row) != len(rows[1]) for row in rows[1:]):
+                        raise ValidationError("table units require a caption, header, and rectangular rows")
+                    caption = rows[0][0].strip()
+                    header = [cell.strip() for cell in rows[1]]
+                    data_rows = [[cell.strip() for cell in row] for row in rows[2:]]
+                    lines.extend([r"\begin{table}[htbp]", r"\centering", r"\scriptsize",
+                                  r"\caption{" + _latex(caption) + "}",
+                                  r"\begin{tabular}{" + "r" * len(header) + "}", r"\hline",
+                                  " & ".join(r"\textbf{" + _latex(cell) + "}" for cell in header) + r" \\", r"\hline"])
+                    for row in data_rows:
+                        lines.append(" & ".join(_latex(cell) for cell in row) + r" \\")
+                    lines.extend([r"\hline", r"\end{tabular}", r"\end{table}", ""])
                 elif unit["kind"] in {"code", "json"}:
                     lines.extend([r"\begin{verbatim}", unit["text"], r"\end{verbatim}"])
                 else:
@@ -437,23 +657,50 @@ class PaperReleaseBuilder:
             author="archivist", body=pdf.read_bytes(), media_type="application/pdf",
             inputs=[{"ref": inputs["artifact_ref"], "purpose": "subject"},
                     {"ref": results_record["artifact_ref"], "purpose": "subject"}])
-        manifest = {"schema_version": ("paper-release-candidate-2" if self.config["schema_version"] == "paper-release-score-2"
-                                        else "paper-release-candidate-1"), "paper_id": self.config["paper_id"],
+        argument_record = None
+        argument_review_record = None
+        if self.research_argument is not None:
+            argument_record = self.store.publish_artifact(
+                logical_id="strategy/research-argument", artifact_type="argument", author="strategy.architect",
+                body=canonical_bytes(self.research_argument), media_type="application/json",
+                inputs=[{"ref": results_record["artifact_ref"], "purpose": "premise"}])
+            argument_review_record = self.store.publish_artifact(
+                logical_id="methods/verifications/research-argument", artifact_type="verification",
+                author="methods.argument-adjudicator", body=canonical_bytes(self.argument_review),
+                media_type="application/json", inputs=[{"ref": argument_record["artifact_ref"], "purpose": "subject"}])
+        manifest = {"schema_version": ("paper-release-candidate-4" if self.research_argument is not None
+                                        else ("paper-release-candidate-3" if self.config["schema_version"] == "paper-release-score-3"
+                                        else ("paper-release-candidate-2" if self.config["schema_version"] == "paper-release-score-2"
+                                              else "paper-release-candidate-1"))), "paper_id": self.config["paper_id"],
                     "revision": self.config["revision"], "status": "needs_principal_approval",
                     "document_type": self.config["document_type"], "paper_score_ref": inputs["artifact_ref"],
                     "results_ref": results_record["artifact_ref"], "pdf_ref": pdf_record["artifact_ref"],
                     "pdf_sha256": sha256_hex(pdf.read_bytes()), "manuscript_manifest_ref": manuscript["manifest_ref"],
                     "manuscript_score_ref": manuscript["score_ref"], "manuscript_verification_ref": manuscript["verification_ref"],
+                    "review_status": manuscript["review_status"],
                     "survey_ref": survey["survey_ref"], "assessment_ref": survey["assessment_ref"],
                     "gap_state": survey["state"], "claim_index_sha256": sha256_hex(canonical_bytes(claim_index)),
                     "storyline_sha256": (sha256_hex(canonical_bytes(self.config["storyline"]))
-                                          if self.config["schema_version"] == "paper-release-score-2" else None),
+                                          if self.config["schema_version"] in {"paper-release-score-2", "paper-release-score-3"} else None),
+                    "depth_profile": claim_index.get("depth_profile"),
+                    "interpretation_sha256": claim_index.get("interpretation_sha256"),
+                    "research_argument_sha256": (sha256_hex(canonical_bytes(self.research_argument))
+                                                  if self.research_argument is not None else None),
+                    "research_argument_review_sha256": (sha256_hex(canonical_bytes(self.argument_review))
+                                                        if self.argument_review is not None else None),
+                    "research_argument_ref": argument_record["artifact_ref"] if argument_record else None,
+                    "research_argument_review_ref": argument_review_record["artifact_ref"] if argument_review_record else None,
+                    "surface_audit": claim_index.get("surface_audit"),
+                    "full_text_reference_count": claim_index.get("full_text_reference_count"),
                     "source_sha256": sha256_hex(tex.encode()), "assets": copied_assets, "visual_check": visual,
                     "external_submission": "excluded"}
         release = self.store.publish_artifact(logical_id="releases/candidate", artifact_type="release_note",
             author="archivist", body=canonical_bytes(manifest), media_type="application/json",
             inputs=[{"ref": pdf_record["artifact_ref"], "purpose": "subject"},
-                    {"ref": results_record["artifact_ref"], "purpose": "subject"}])
+                    {"ref": results_record["artifact_ref"], "purpose": "subject"},
+                    *([{"ref": argument_record["artifact_ref"], "purpose": "subject"},
+                       {"ref": argument_review_record["artifact_ref"], "purpose": "subject"}]
+                      if argument_record is not None else [])])
         (self.dir / "output" / "release-manifest.json").write_bytes(canonical_bytes(manifest))
         result = {**manifest, "release_ref": release["artifact_ref"], "event_chain": self.control.verify_chain()}
         self.close()

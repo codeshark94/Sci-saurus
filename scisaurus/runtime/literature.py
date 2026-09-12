@@ -151,7 +151,7 @@ def _doi(value):
     return value.lower()
 
 
-def normalize_work(item):
+def normalize_work(item, *, tolerate_invalid_abstract=False, abstract_gaps=None):
     if not isinstance(item, dict):
         raise ValueError("OpenAlex work must be an object")
     required = {"id", "title", "publication_year", "referenced_works", "related_works", "locations"}
@@ -180,19 +180,30 @@ def normalize_work(item):
             value = location.get(key)
             normalized[key] = _url(value) if value is not None else None
         locations.append(normalized)
-    return {"id": work_id(item["id"]), "doi": _doi(item.get("doi")), "title": item["title"],
-            "year": year, "abstract": _abstract(item.get("abstract_inverted_index")),
+    identity = work_id(item["id"])
+    try:
+        abstract = _abstract(item.get("abstract_inverted_index"))
+    except ValueError:
+        if not tolerate_invalid_abstract:
+            raise
+        abstract = None
+        if abstract_gaps is not None:
+            abstract_gaps.append({"work_id": identity, "reason": "provider_abstract_index_invalid"})
+    return {"id": identity, "doi": _doi(item.get("doi")), "title": item["title"],
+            "year": year, "abstract": abstract,
             **relationships, "locations": locations}
 
 
 def _page(payload, arguments):
     if not isinstance(payload, dict):
         raise ValueError("OpenAlex response must be an object")
+    abstract_gaps = []
     if arguments["operation"] == "work":
-        works = [normalize_work(payload)]
+        works = [normalize_work(payload, tolerate_invalid_abstract=True, abstract_gaps=abstract_gaps)]
         if works[0]["id"] != arguments["work_id"]:
             raise ValueError("OpenAlex returned a different work identifier")
-        return works, {"count": 1, "next_cursor": None, "has_more": False}
+        return works, {"count": 1, "next_cursor": None, "has_more": False,
+                       "abstract_gaps": abstract_gaps}
     meta, items = payload.get("meta"), payload.get("results")
     if not isinstance(meta, dict) or not isinstance(items, list):
         raise ValueError("OpenAlex list response requires meta and results")
@@ -208,13 +219,14 @@ def _page(payload, arguments):
         raise ValueError("OpenAlex cursor did not advance")
     if not items and arguments["cursor"] in (None, "*") and meta["count"] != 0:
         raise ValueError("OpenAlex initial empty page conflicts with result count")
-    works = [normalize_work(item) for item in items]
+    works = [normalize_work(item, tolerate_invalid_abstract=True, abstract_gaps=abstract_gaps) for item in items]
     if len({item["id"] for item in works}) != len(works):
         raise ValueError("OpenAlex page contains duplicate work identifiers")
     if arguments["operation"] == "citing" and any(
             arguments["work_id"] not in item["referenced_works"] for item in works):
         raise ValueError("OpenAlex citing result does not reference the requested work")
-    return works, {"count": meta["count"], "next_cursor": cursor, "has_more": cursor is not None}
+    return works, {"count": meta["count"], "next_cursor": cursor, "has_more": cursor is not None,
+                   "abstract_gaps": abstract_gaps}
 
 
 def _sources(works):
@@ -229,10 +241,15 @@ def _text(works):
 
 
 class OpenAlexClient:
-    """One HTTP transaction, with explicit byte and wall-clock limits, without retries."""
+    """Bounded OpenAlex transactions with provider-aware retry handling."""
 
-    def __init__(self, *, timeout=30, max_bytes=1_048_576, endpoint=DEFAULT_ENDPOINT, auth_env=None):
+    def __init__(self, *, timeout=30, max_bytes=1_048_576, endpoint=DEFAULT_ENDPOINT, auth_env=None,
+                 max_retries=3, retry_backoff_seconds=1.0):
         _limits(timeout, max_bytes)
+        if type(max_retries) is not int or max_retries < 0 or max_retries > 8:
+            raise ValueError("max_retries must be an integer between 0 and 8")
+        if type(retry_backoff_seconds) not in (int, float) or not math.isfinite(retry_backoff_seconds) or retry_backoff_seconds < 0:
+            raise ValueError("retry_backoff_seconds must be finite and non-negative")
         endpoint = _url(endpoint)
         parsed = urlsplit(endpoint)
         if parsed.port == 0:
@@ -243,8 +260,49 @@ class OpenAlexClient:
                                      or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", auth_env)):
             raise ValueError("OpenAlex auth_env must name an environment variable")
         self.timeout, self.max_bytes, self.endpoint, self.auth_env = timeout, max_bytes, endpoint, auth_env
+        self.max_retries, self.retry_backoff_seconds = max_retries, float(retry_backoff_seconds)
 
     def run(self, *, operation, query=None, work_id=None, limit=5, cursor=None):
+        """Retry transient provider responses inside one operation budget.
+
+        The timeout is a total budget for the call, so backoff cannot silently
+        turn a nominally bounded request into an unbounded sequence of calls.
+        """
+        started = time.monotonic()
+        last = None
+        retry_wait_seconds = 0.0
+        for attempt in range(self.max_retries + 1):
+            remaining = self.timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                break
+            last = self._run_once(operation=operation, query=query, work_id=work_id,
+                                  limit=limit, cursor=cursor, timeout=remaining)
+            last.setdefault("metadata", {})["attempts"] = attempt + 1
+            status = (last.get("metadata") or {}).get("http_status")
+            if status not in {408, 425, 429, 500, 502, 503, 504} or attempt >= self.max_retries:
+                last.setdefault("metadata", {})["retry_wait_seconds"] = retry_wait_seconds
+                return last
+            headers = (last.get("metadata") or {}).get("headers") or {}
+            delay = self.retry_backoff_seconds * (2 ** attempt)
+            try:
+                if headers.get("retry-after") is not None:
+                    delay = max(delay, min(60.0, float(headers["retry-after"])))
+            except (TypeError, ValueError):
+                pass
+            if time.monotonic() + delay >= started + self.timeout:
+                last.setdefault("metadata", {})["retry_wait_seconds"] = retry_wait_seconds
+                return last
+            retry_wait_seconds += delay
+            time.sleep(delay)
+        if last is None:
+            last = self._run_once(operation=operation, query=query, work_id=work_id,
+                                  limit=limit, cursor=cursor, timeout=0.001)
+            last.setdefault("metadata", {})["attempts"] = 1
+        last.setdefault("metadata", {})["retry_wait_seconds"] = retry_wait_seconds
+        return last
+
+    def _run_once(self, *, operation, query=None, work_id=None, limit=5, cursor=None, timeout=None):
+        request_timeout = self.timeout if timeout is None else timeout
         arguments = validate_arguments({"operation": operation, "query": query, "work_id": work_id,
                                         "limit": limit, "cursor": cursor})
         url = request_url(self.endpoint, arguments)
@@ -265,8 +323,8 @@ class OpenAlexClient:
             headers["Authorization"] = "Bearer " + credential
         parsed = urlsplit(url)
         connection_type = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
-        connection = connection_type(parsed.hostname, parsed.port, timeout=self.timeout)
-        deadline = time.monotonic() + self.timeout
+        connection = connection_type(parsed.hostname, parsed.port, timeout=request_timeout)
+        deadline = time.monotonic() + request_timeout
         expired = threading.Event()
 
         active_socket = None
@@ -307,7 +365,7 @@ class OpenAlexClient:
                 except OSError:
                     pass
 
-        timer = threading.Timer(self.timeout, expire)
+        timer = threading.Timer(request_timeout, expire)
         timer.daemon = True
         response, body = None, bytearray()
         timer.start()
@@ -352,6 +410,8 @@ class OpenAlexClient:
             result.update(works=works, sources=_sources(works), text=_text(works), outcome="ok" if works else "empty")
             metadata.update(page)
             result["gaps"].append("Scholarly metadata, abstracts and location URLs do not establish acquired full text or claim support.")
+            if page.get("abstract_gaps"):
+                result["gaps"].append("One or more provider abstract indexes were malformed; affected abstracts were omitted.")
         except (TimeoutError, OSError, HTTPException) as exc:
             result["outcome"] = "timeout" if expired.is_set() or isinstance(exc, TimeoutError) else "provider_error"
             result["error"] = f"OpenAlex HTTP transaction failed: {type(exc).__name__}"

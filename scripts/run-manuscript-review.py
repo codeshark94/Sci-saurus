@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the three-role manuscript review gate against a frozen JSON document."""
+"""Run the scientific and editorial manuscript review gate against a JSON document."""
 from __future__ import annotations
 
 import argparse
@@ -26,15 +26,21 @@ def main():
     parser.add_argument("--manuscript", required=True, type=Path)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--interpretation", type=Path,
+                        help="Attach the independently validated scientific-interpretation package")
     parser.add_argument("--image", action="append", default=[], type=Path,
                         help="Attach a PNG/JPEG image to every independent review")
+    parser.add_argument("--deadline-seconds", type=float, default=1200.0,
+                        help="hard wall-clock limit for the complete review batch")
     args = parser.parse_args()
     manuscript = json.loads(args.manuscript.read_text())
     config = json.loads(args.config.read_text())
     runner = ManuscriptReviewRunner(config["model"], reviewers=config.get("reviewers"),
-                                    max_workers=config.get("max_workers", 3))
+                                    max_workers=config.get("max_workers", 3),
+                                    deadline_seconds=args.deadline_seconds)
     images = [image_descriptor(path) for path in args.image]
-    result = runner.run(manuscript, images=images)
+    interpretation = json.loads(args.interpretation.read_text()) if args.interpretation else None
+    result = runner.run(manuscript, images=images, interpretation=interpretation)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(canonical_bytes(result))
     print(json.dumps({"status": result["status"], "output": str(args.output.resolve()),

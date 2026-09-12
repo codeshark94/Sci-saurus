@@ -1,6 +1,7 @@
 """Explicit mission and resource boundaries for literature assessment."""
 from copy import deepcopy
 import json
+import math
 from pathlib import Path
 
 from scisaurus.core.errors import ValidationError
@@ -44,6 +45,8 @@ def validate_survey_config(value):
               "full_text", "full_text_sources", "search", "stage_seconds"}
     if isinstance(survey, dict) and "identity" in survey:
         fields.add("identity")
+    if isinstance(survey, dict) and "provider_intervals" in survey:
+        fields.add("provider_intervals")
     exact(survey, fields, "survey")
     identifier(survey["id"])
     if type(survey["revision"]) is not int or survey["revision"] < 1:
@@ -86,6 +89,13 @@ def validate_survey_config(value):
         minimum = 0 if name in {"expansion_rounds", "min_new_works"} else 1
         if type(amount) is not int or amount < minimum:
             raise ValidationError(f"search.{name} must be an integer at least {minimum}")
+    intervals = survey.get("provider_intervals")
+    if intervals is not None:
+        if not isinstance(intervals, dict) or set(intervals) != {"bibliography", "identity", "full_text"}:
+            raise ValidationError("provider_intervals requires bibliography, identity, and full_text")
+        for name, amount in intervals.items():
+            if type(amount) not in (int, float) or not math.isfinite(amount) or amount < 0:
+                raise ValidationError(f"provider_intervals.{name} must be finite and nonnegative")
     if survey["search"]["results_per_query"] > 100 or survey["search"]["max_text_chars"] > 999999:
         raise ValidationError("requested capture exceeds provider limits")
     if survey["search"]["context_chars"] > survey["search"]["max_text_chars"]:

@@ -289,6 +289,7 @@ class ProjectRunner(ExecutionRuntime):
                     "or permitted interpretation. Do not add external background merely to fill the support list. "
                     "The other output units are read-only context and must not be returned or changed.",
                     "output_kind": unit["kind"], "domain": self.score["domain"], "score_ref": self.score_ref,
+                    "quality_axes": self.score.get("quality_axes", {}),
                     "program_requirements": [c for c in self.score["candidate_checks"] if c["unit_id"] == unit_id],
                     "unit_id": unit_id, "baseline_unit_ref": record["artifact_ref"], "baseline": unit["text"],
                     "objective": unit["objective"], "project_objective": self.config["objective"],
@@ -471,6 +472,7 @@ class ProjectRunner(ExecutionRuntime):
             "baseline_document": self._document(self.baseline["artifact_ref"]), "claims": self.config["claims"],
             "producer_captures": producer_sources, "independently_fetched_sources": verifier_sources,
             "program_checks": program_checks, "domain": self.score["domain"], "score_ref": self.score_ref}
+        common["quality_axes"] = self.score.get("quality_axes", {})
         jobs = [{"task_id": f"verify-{number}-{key}", "actor": f"methods.verifier-{key}", "task_kind": "verification",
                  "time_stage": "unit_review",
                  "assignment": {**common, "scope": "assigned unit in exact composed candidate", "unit_id": key,

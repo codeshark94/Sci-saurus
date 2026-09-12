@@ -52,7 +52,8 @@ class ModelClient:
                  timeout_seconds: float, max_output_tokens: int,
                  auth_env: str | None = None, max_response_bytes: int = 2_000_000,
                  reasoning_effort: str | None = None, output_format: str | None = None,
-                 max_image_bytes: int = 7_000_000, max_request_bytes: int = 10_000_000):
+                 max_image_bytes: int = 7_000_000, max_request_bytes: int = 10_000_000,
+                 max_retries: int = 2, retry_backoff_seconds: float = 1.0):
         if not isinstance(base_url, str):
             raise ValidationError("model base_url must be a URL string")
         parsed = urllib.parse.urlsplit(base_url)
@@ -76,6 +77,10 @@ class ModelClient:
             raise ValidationError("request byte limit must be a positive integer")
         if max_image_bytes >= max_request_bytes:
             raise ValidationError("image byte limit must leave room inside the request byte limit")
+        if type(max_retries) is not int or max_retries < 0 or max_retries > 8:
+            raise ValidationError("max_retries must be an integer between 0 and 8")
+        if type(retry_backoff_seconds) not in (int, float) or not math.isfinite(retry_backoff_seconds) or retry_backoff_seconds < 0:
+            raise ValidationError("retry_backoff_seconds must be finite and non-negative")
         if reasoning_effort is not None and (
             not isinstance(reasoning_effort, str) or reasoning_effort not in {"none", "low", "medium", "high"}
         ):
@@ -91,6 +96,7 @@ class ModelClient:
         self.max_response_bytes, self.auth_env = max_response_bytes, auth_env
         self.reasoning_effort, self.output_format = reasoning_effort, output_format
         self.max_image_bytes, self.max_request_bytes = max_image_bytes, max_request_bytes
+        self.max_retries, self.retry_backoff_seconds = max_retries, float(retry_backoff_seconds)
 
     @staticmethod
     def _read_image(image):
@@ -158,40 +164,74 @@ class ModelClient:
             raise ValidationError("model request exceeds the configured byte limit")
         request = urllib.request.Request(self.base_url + path, wire, headers)
         started = time.monotonic()
-        try:
-            with urllib.request.build_opener(_NoRedirect()).open(request, timeout=self.timeout_seconds) as response:
-                raw = response.read(self.max_response_bytes + 1)
-        except urllib.error.HTTPError as exc:
-            code = exc.code
-            exc.close()
-            raise ModelCallError(f"model HTTP request failed with status {code}", outcome_known=400 <= code < 500) from None
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise ModelCallError(f"model transport failed: {type(exc).__name__}") from None
+        deadline = started + self.timeout_seconds
+        retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
+        attempt = 0
+        parsed = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ModelCallError("model request deadline exceeded") from None
+            try:
+                with urllib.request.build_opener(_NoRedirect()).open(
+                        request, timeout=max(0.1, remaining)) as response:
+                    raw = response.read(self.max_response_bytes + 1)
+            except urllib.error.HTTPError as exc:
+                code = exc.code
+                retry_after = exc.headers.get("Retry-After")
+                exc.close()
+                if code in retryable_statuses and attempt < self.max_retries:
+                    delay = self.retry_backoff_seconds * (2 ** attempt)
+                    try:
+                        if retry_after is not None:
+                            delay = max(delay, min(60.0, float(retry_after)))
+                    except (TypeError, ValueError):
+                        pass
+                    if time.monotonic() + delay >= deadline:
+                        raise ModelCallError(f"model HTTP request failed with status {code}",
+                                              outcome_known=400 <= code < 500) from None
+                    time.sleep(delay)
+                    attempt += 1
+                    continue
+                raise ModelCallError(f"model HTTP request failed with status {code}",
+                                     outcome_known=400 <= code < 500) from None
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                raise ModelCallError(f"model transport failed: {type(exc).__name__}") from None
+            if len(raw) > self.max_response_bytes:
+                raise ModelCallError("model response exceeded the configured byte limit")
+            try:
+                data = json.loads(raw)
+                if self.protocol == "ollama":
+                    if data.get("done") is not True:
+                        raise ValueError("incomplete response")
+                    text = data["message"]["content"]
+                    reason = data.get("done_reason", "unknown")
+                    usage = {k: data[source] for k, source in
+                             (("input_tokens", "prompt_eval_count"), ("output_tokens", "eval_count")) if source in data}
+                else:
+                    choice = data["choices"][0]
+                    text, reason = choice["message"]["content"], choice["finish_reason"]
+                    usage = {k: data["usage"][source] for k, source in
+                             (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens"))
+                             if source in data.get("usage", {})}
+                if not isinstance(text, str) or not text.strip():
+                    raise ValueError("empty text")
+                if any(type(value) is not int or value < 0 for value in usage.values()):
+                    raise ValueError("invalid usage")
+                if reason not in {"stop", "length", "load", "unload", "unknown"}:
+                    raise ValueError("unsupported completion state")
+                parsed = (text, reason, usage, data.get("model", self.model))
+            except (ValueError, TypeError, KeyError, IndexError):
+                if attempt >= self.max_retries:
+                    raise ModelCallError("model returned an invalid or incomplete response") from None
+                delay = self.retry_backoff_seconds * (2 ** attempt)
+                if time.monotonic() + delay >= deadline:
+                    raise ModelCallError("model returned an invalid or incomplete response") from None
+                time.sleep(delay)
+                attempt += 1
+                continue
+            break
         elapsed = time.monotonic() - started
-        if len(raw) > self.max_response_bytes:
-            raise ModelCallError("model response exceeded the configured byte limit")
-        try:
-            data = json.loads(raw)
-            if self.protocol == "ollama":
-                if data.get("done") is not True:
-                    raise ValueError("incomplete response")
-                text = data["message"]["content"]
-                reason = data.get("done_reason", "unknown")
-                usage = {k: data[source] for k, source in
-                         (("input_tokens", "prompt_eval_count"), ("output_tokens", "eval_count")) if source in data}
-            else:
-                choice = data["choices"][0]
-                text, reason = choice["message"]["content"], choice["finish_reason"]
-                usage = {k: data["usage"][source] for k, source in
-                         (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens"))
-                         if source in data.get("usage", {})}
-            if not isinstance(text, str) or not text.strip():
-                raise ValueError("empty text")
-            if any(type(value) is not int or value < 0 for value in usage.values()):
-                raise ValueError("invalid usage")
-            if reason not in {"stop", "length", "load", "unload", "unknown"}:
-                raise ValueError("unsupported completion state")
-        except (ValueError, TypeError, KeyError, IndexError) as exc:
-            raise ModelCallError("model returned an invalid or incomplete response") from None
-        return ModelResult(text, data.get("model", self.model),
+        text, reason, usage, served_model = parsed
+        return ModelResult(text, served_model,
                            {"model_calls": 1, **usage}, elapsed, reason)
