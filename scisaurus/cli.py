@@ -144,7 +144,26 @@ def main(argv=None) -> int:
         "/Users/seungyeop/.codex/plugins/cache/openai-bundled/latex/0.2.6/scripts/compile_latex.py"))
     p_run_paper.add_argument("--max-review-rounds", type=int, default=3)
 
+    p_composer = sub.add_parser(
+        "run-composer", help="run a project-scoped end-to-end research workflow under Executive Command")
+    p_composer.add_argument("--workflow", required=True, help="immutable composer workflow JSON")
+    p_composer.add_argument("--resume", action="store_true", help="resume the matching composer project")
+
     args = parser.parse_args(argv)
+    if args.cmd == "run-composer":
+        from scisaurus.core.errors import ValidationError
+        from scisaurus.runtime.composer import ComposerRunner
+        try:
+            workflow = json.loads(Path(args.workflow).read_text())
+            result = ComposerRunner(workflow, resume=args.resume,
+                                    on_progress=lambda state: print(json.dumps(state), flush=True)).run()
+        except (OSError, ValueError, ValidationError) as exc:
+            print(f"composer workflow rejected: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({"status": result["status"], "elapsed_seconds": result["elapsed_seconds"],
+                          "stages": result["stages"], "release_status": result["release_status"],
+                          "report": str(Path(workflow["project_id"]).resolve() / "output" / "run.json")}, indent=2))
+        return 0 if result["status"] == "completed" else 3
     if args.cmd == "run-paper":
         from scisaurus.core.errors import ValidationError
         from scisaurus.runtime.paper_pipeline import PaperPipelineRunner

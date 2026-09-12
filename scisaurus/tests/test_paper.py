@@ -14,7 +14,7 @@ from scisaurus.core.events import ControlStore
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.source_spans import locate
 from scisaurus.core.store import ArtifactStore
-from scisaurus.runtime.paper import PaperReleaseBuilder
+from scisaurus.runtime.paper import PaperReleaseBuilder, _finding_supported, _latex
 
 
 COMPILE_SCRIPT = Path("/Users/seungyeop/.codex/plugins/cache/openai-bundled/latex/0.2.6/scripts/compile_latex.py")
@@ -93,6 +93,20 @@ class PaperReleaseTests(unittest.TestCase):
                                 "year": "2026", "doi": None, "url": "https://example.org/known",
                                 "source_ref": self.survey_fixture.source}],
                 "authors": ["Sci-saurus Validation Team"], "keywords": ["provenance", "controlled revision"]}
+
+    def test_finding_binding_accepts_equivalent_scientific_notation(self):
+        finding = {"statement": "The maximum absolute error was 1.110e-16."}
+        self.assertTrue(_finding_supported(finding, "The maximum absolute error was 1.110 × 10⁻¹⁶."))
+        threshold = {"statement": "The rule first crossed 1e-06 at n=14."}
+        self.assertTrue(_finding_supported(threshold, "The rule first crossed 10⁻⁶ at n = 14."))
+
+    def test_latex_projection_preserves_common_scientific_glyphs(self):
+        rendered = _latex("f(x)=exp(−100(x−c)^2), 1.110 × 10⁻¹⁶, a≤b, 1/√a—b")
+        for glyph in ("−", "×", "⁻", "≤", "√", "—"):
+            self.assertNotIn(glyph, rendered)
+        self.assertIn(r"$\times$", rendered)
+        self.assertIn(r"\textsuperscript{-16}", rendered)
+        self.assertIn(r"$\sqrt{a}$", rendered)
 
     @unittest.skipUnless(os.environ.get("SCISAURUS_RUN_LATEX_INTEGRATION") == "1" and COMPILE_SCRIPT.is_file()
                          and shutil.which("pdfinfo") and shutil.which("pdftoppm"),
@@ -185,6 +199,20 @@ class PaperReleaseTests(unittest.TestCase):
             tex = builder._tex(manuscript, results)
             self.assertIn(r"\includegraphics[width=0.78\linewidth]{\detokenize{../assets/figures/result.png}}", tex)
             self.assertIn(r"\caption{Observed result.}", tex)
+        finally:
+            builder.close()
+
+    def test_table_renderer_preserves_pipe_table_footnotes(self):
+        builder = PaperReleaseBuilder(self.root / "table-layout", self.config())
+        try:
+            manuscript = {"title": "Table", "groups": [{"title": "Results", "units": [{
+                "kind": "table",
+                "text": "A compact table.\nRule | Error\nMidpoint | 1e-6\n(a) Value is the first threshold crossing: |error| <= tolerance.",
+            }]}]}
+            tex = builder._tex(manuscript)
+            self.assertIn(r"\parbox{0.95\linewidth}", tex)
+            self.assertIn("Value is the first threshold crossing: |error| <= tolerance.", tex)
+            self.assertIn(r"\resizebox{\linewidth}{!}{%", tex)
         finally:
             builder.close()
 

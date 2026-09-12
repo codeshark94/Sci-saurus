@@ -55,6 +55,13 @@ Compile the approved mission and Score into readiness conditions, task templates
 
 Composer may write `command/missions/*`, `command/plans/*`, and operational proposals. It does not rewrite `kb/*`, `strategy/*`, or `methods/*` to force agreement. It may propose a task or a change; the proper owner produces the resulting artifact.
 
+The project-level `run-composer` entry point makes this control loop executable:
+it admits the allowlisted survey, experiment, interpretation, argument, and
+paper stages; binds their exact outputs; records feedback and checkpoints; and
+stops or resumes from the durable stage frontier. The specialist runners retain
+their independent acceptance checks, so Composer controls procedure without
+becoming the sole source of scientific truth.
+
 ### 2.3 Arbiter
 
 Resolve contested objections, cross-department conflicts, and authority disputes using the applicable intent, evidence, and acceptance contract. Outcomes include upholding/rejecting an objection, requesting a specified investigation, selecting a permissible alternative, escalating, or acknowledging uncertainty.

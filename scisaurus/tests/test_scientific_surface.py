@@ -27,6 +27,10 @@ class ScientificSurfaceTests(unittest.TestCase):
         audit = editorial_audit(text, max_numeric_repetitions=2)
         self.assertEqual(len(audit["numeric_repetitions"]), 1)
 
+    def test_editorial_audit_ignores_table_labels_as_numeric_facts(self):
+        text = "Table 1 reports the threshold. The control uses f(x) = 1."
+        self.assertEqual(editorial_audit(text, max_numeric_repetitions=1)["numeric_repetitions"], [])
+
     def test_validation_rejects_surface_leak_and_allows_scientific_language(self):
         with self.assertRaisesRegex(ValidationError, "control-plane"):
             validate_scientific_surface("The frozen protocol was accepted by the validator.")

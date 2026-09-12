@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import math
+import time
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
@@ -188,17 +190,29 @@ def interpretation_prompt(evidence_packet, *, validation_feedback=None):
 class ScientificInterpretationRunner:
     """Run one independently validated interpretation proposal."""
 
-    def __init__(self, model):
+    def __init__(self, model, *, deadline_seconds=None):
         self.model_config = deepcopy(model)
+        if (deadline_seconds is not None and
+                (type(deadline_seconds) not in (int, float) or not math.isfinite(deadline_seconds)
+                 or deadline_seconds <= 0)):
+            raise ValidationError("scientific interpretation deadline must be finite and positive")
+        self.deadline_seconds = float(deadline_seconds) if deadline_seconds is not None else None
 
     def run(self, evidence_packet, *, evidence_ids=None, max_attempts=3):
         if type(max_attempts) is not int or max_attempts < 1 or max_attempts > 8:
             raise ValidationError("scientific interpretation max_attempts must be between 1 and 8")
-        client = ModelClient(**self.model_config)
         feedback = None
         total_usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
         last_error = None
+        deadline = time.monotonic() + self.deadline_seconds if self.deadline_seconds is not None else None
         for attempt in range(max_attempts):
+            config = deepcopy(self.model_config)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.2:
+                    raise ValidationError("scientific interpretation deadline exceeded")
+                config["timeout_seconds"] = min(float(config["timeout_seconds"]), remaining)
+            client = ModelClient(**config)
             result = client.complete(system=SYSTEM,
                                       prompt=interpretation_prompt(evidence_packet,
                                                                    validation_feedback=feedback))

@@ -9,6 +9,13 @@ from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.manuscript_review import (
     ManuscriptReviewRunner,
     _review_prompt,
+    _namespace_review_findings,
+    _normalise_review_candidate,
+    _normalise_adjudication_candidate,
+    _normalise_synthesis_candidate,
+    apply_numeric_evidence_guard,
+    audit_numeric_repair_support,
+    validate_adjudication,
     validate_review,
     validate_synthesis,
 )
@@ -24,8 +31,8 @@ def review_for(reviewer, *, finding=False):
                          "protected": ["reported metric values"],
                          "verification": "Re-read the paragraph against the limitation list."})
     return {"schema_version": "manuscript-review-1", "reviewer_id": reviewer, "stage": {
-                "science": 1, "methods": 2, "ai_smell": 3, "human_scientist": 4,
-                "editorial_compression": 5}[reviewer],
+            "science": 1, "methods": 2, "ai_smell": 3, "human_scientist": 4,
+                "editorial_compression": 5, "journal_editor": 6}[reviewer],
             "decision": "revise" if finding else "accept",
             "checks": [{"id": "scope", "outcome": "passed", "evidence": "The supplied document was inspected."}],
             "findings": findings, "protected_units": ["Results paragraph 1"],
@@ -46,9 +53,15 @@ class FakeClient:
             reviewer = packet["reviewer"]
             return ModelResult(text=json.dumps(review_for(reviewer["id"])), model="fake", usage={"model_calls": 1},
                                elapsed_seconds=0.01, finish_reason="stop")
+        if packet["assignment"] == "independent_review_arbitration":
+            return ModelResult(text=json.dumps({"schema_version": "manuscript-review-arbitration-1",
+                                                "decision": "resolved", "resolutions": [],
+                                                "rationale": "No material findings were raised."}),
+                               model="fake", usage={"model_calls": 1}, elapsed_seconds=0.01,
+                               finish_reason="stop")
         return ModelResult(text=json.dumps({"schema_version": "manuscript-review-synthesis-1", "decision": "accept",
                                             "required_repairs": [], "accepted_reviewers": ["science", "methods", "ai_smell",
-                                                                                              "human_scientist", "editorial_compression"],
+                                            "human_scientist", "editorial_compression", "journal_editor"],
                                            "rationale": "All independent reviews passed.",
                                            "verification_contract": ["Re-render the final manuscript."]}),
                            model="fake", usage={"model_calls": 1}, elapsed_seconds=0.01, finish_reason="stop")
@@ -60,10 +73,215 @@ class SlowClient(FakeClient):
         return super().complete(system=system, prompt=prompt, images=images)
 
 
+class MissingStageClient(FakeClient):
+    def complete(self, *, system, prompt, images=None):
+        result = super().complete(system=system, prompt=prompt, images=images)
+        payload = json.loads(result.text)
+        if payload.get("schema_version") == "manuscript-review-1":
+            payload.pop("stage", None)
+        return ModelResult(text=json.dumps(payload), model=result.model, usage=result.usage,
+                           elapsed_seconds=result.elapsed_seconds, finish_reason=result.finish_reason)
+
+
 class ManuscriptReviewTests(unittest.TestCase):
+    def test_namespaces_local_finding_ids_before_synthesis(self):
+        first = review_for("science", finding=True)
+        second = review_for("methods", finding=True)
+        first["findings"][0]["id"] = "f1"
+        second["findings"][0]["id"] = "f1"
+        self.assertEqual(_namespace_review_findings(first)["findings"][0]["id"], "science_f1")
+        self.assertEqual(_namespace_review_findings(second)["findings"][0]["id"], "methods_f1")
+
     def test_validator_rejects_accepted_review_with_major_finding(self):
         with self.assertRaisesRegex(ValidationError, "accepted manuscript review"):
             validate_review(review_for("science", finding=True) | {"decision": "accept"}, "science", 1)
+
+    def test_normalizer_binds_assignment_metadata_and_empty_protection_to_unit(self):
+        candidate = review_for("science", finding=True)
+        candidate.pop("schema_version")
+        candidate.pop("reviewer_id")
+        candidate.pop("stage")
+        candidate["findings"][0]["protected"] = []
+        candidate["findings"][0]["location"] = "results_p1"
+        manuscript = {"sections": [{"id": "results", "units": [{"id": "results_p1"}]}]}
+        normalized, changes = _normalise_review_candidate(
+            candidate, {"id": "science", "stage": 1}, manuscript)
+        validate_review(normalized, "science", 1)
+        self.assertEqual(normalized["findings"][0]["protected"], ["results_p1"])
+        self.assertGreaterEqual(len(changes), 4)
+
+    def test_normalizer_removes_provider_echoed_review_metadata_without_touching_finding(self):
+        candidate = review_for("science", finding=True)
+        candidate.pop("schema_version")
+        candidate.pop("reviewer_id")
+        candidate.pop("stage")
+        candidate["size_limit"] = "at most four highest-impact findings"
+        finding = candidate["findings"][0]
+        finding["protected_units"] = list(finding["protected"])
+        manuscript = {"sections": [{"id": "results", "units": [{"id": "results_p1"}]}]}
+        normalized, changes = _normalise_review_candidate(
+            candidate, {"id": "science", "stage": 1}, manuscript)
+        validate_review(normalized, "science", 1)
+        self.assertNotIn("size_limit", normalized)
+        self.assertNotIn("protected_units", normalized["findings"][0])
+        self.assertIn("findings.protected_units", {change["field"] for change in changes})
+
+    def test_normalizer_maps_provider_review_aliases_without_inventing_severity(self):
+        candidate = review_for("science", finding=True)
+        finding = candidate["findings"][0]
+        finding["repair"] = finding.pop("surgical_fix")
+        finding["protected_content"] = finding.pop("protected")
+        finding["verification_check"] = finding.pop("verification")
+        finding["unit_id"] = "results_p1"
+        finding.pop("severity")
+        for check in candidate["checks"]:
+            check["name"] = check["id"]
+            check.pop("id")
+        normalized, changes = _normalise_review_candidate(
+            candidate, {"id": "science", "stage": 1},
+            {"sections": [{"id": "results", "units": [{"id": "results_p1"}]}]})
+        self.assertNotIn("repair", normalized["findings"][0])
+        self.assertEqual(normalized["findings"][0]["protected"], ["reported metric values"])
+        self.assertTrue(any(change["field"] == "checks.id" for change in changes))
+        with self.assertRaisesRegex(ValidationError, "invalid shape"):
+            validate_review(normalized, "science", 1)
+
+    def test_normalizer_maps_suggested_fix_to_surgical_fix(self):
+        candidate = review_for("editorial_compression", finding=True)
+        finding = candidate["findings"][0]
+        finding["suggested_fix"] = finding.pop("surgical_fix")
+        normalized, changes = _normalise_review_candidate(
+            candidate, {"id": "editorial_compression", "stage": 5},
+            {"sections": [{"id": "results", "units": [{"id": "results_p1"}]}]})
+        validate_review(normalized, "editorial_compression", 5)
+        self.assertNotIn("suggested_fix", normalized["findings"][0])
+        self.assertIn("surgical_fix", normalized["findings"][0])
+        self.assertTrue(any(change["field"] == "findings.surgical_fix" for change in changes))
+
+    def test_normalizer_maps_science_provider_aliases_without_dropping_rationale(self):
+        candidate = review_for("science", finding=True)
+        finding = candidate["findings"][0]
+        finding["fix"] = finding.pop("surgical_fix")
+        finding["rationale"] = finding.pop("verification")
+        candidate["checks"][0]["status"] = candidate["checks"][0].pop("outcome")
+        normalized, changes = _normalise_review_candidate(
+            candidate, {"id": "science", "stage": 1},
+            {"sections": [{"id": "results", "units": [{"id": "results_p1"}]}]})
+        validate_review(normalized, "science", 1)
+        self.assertEqual(normalized["findings"][0]["surgical_fix"], "Qualify that sentence in the same paragraph.")
+        self.assertEqual(normalized["findings"][0]["verification"], "Re-read the paragraph against the limitation list.")
+        self.assertEqual(normalized["checks"][0]["outcome"], "passed")
+        self.assertTrue(any(change["field"] == "findings.verification" for change in changes))
+
+    def test_normalizer_removes_check_level_rationale_after_preserving_evidence(self):
+        candidate = review_for("ai_smell", finding=False)
+        check = candidate["checks"][0]
+        check["name"] = check.pop("id")
+        check["status"] = check.pop("outcome")
+        check["rationale"] = "The supplied document was inspected independently."
+        normalized, changes = _normalise_review_candidate(
+            candidate, {"id": "ai_smell", "stage": 3},
+            {"sections": [{"id": "results", "units": [{"id": "results_p1"}]}]})
+        validate_review(normalized, "ai_smell", 3)
+        self.assertNotIn("rationale", normalized["checks"][0])
+        self.assertEqual(normalized["checks"][0]["evidence"], "The supplied document was inspected.")
+        self.assertTrue(any(change["field"] == "checks.rationale" for change in changes))
+
+    def test_normalizer_removes_check_description_alias(self):
+        candidate = review_for("methods", finding=False)
+        check = candidate["checks"][0]
+        check["check"] = "Independent methods check."
+        normalized, changes = _normalise_review_candidate(
+            candidate, {"id": "methods", "stage": 2},
+            {"sections": [{"id": "results", "units": [{"id": "results_p1"}]}]})
+        validate_review(normalized, "methods", 2)
+        self.assertNotIn("check", normalized["checks"][0])
+        self.assertTrue(any(change["field"] == "checks.check" for change in changes))
+
+    def test_normalizer_maps_methods_protection_check_and_boolean_passed_aliases(self):
+        candidate = review_for("methods", finding=True)
+        finding = candidate["findings"][0]
+        finding["protection"] = finding.pop("protected")
+        finding["repair"] = finding.pop("surgical_fix")
+        finding["check"] = finding.pop("verification")
+        check = candidate["checks"][0]
+        check["passed"] = True
+        check.pop("outcome")
+        normalized, changes = _normalise_review_candidate(
+            candidate, {"id": "methods", "stage": 2},
+            {"sections": [{"id": "results", "units": [{"id": "results_p1"}]}]})
+        validate_review(normalized, "methods", 2)
+        self.assertEqual(normalized["findings"][0]["protected"], ["reported metric values"])
+        self.assertEqual(normalized["checks"][0]["outcome"], "passed")
+        self.assertTrue(any(change["field"] == "checks.outcome" for change in changes))
+
+    def test_normalizer_binds_synthesis_scope_unit_list(self):
+        candidate = {
+            "schema_version": "manuscript-review-synthesis-1",
+            "decision": "revise",
+            "required_repairs": [{"finding_id": "science_f1", "owner": "science",
+                                   "scope": ["results_p1", "results_table"],
+                                   "verification": "Re-read the affected units."}],
+            "accepted_reviewers": [], "rationale": "A scoped repair is required.",
+            "verification_contract": ["Re-run independent review."],
+        }
+        normalized, changes = _normalise_synthesis_candidate(candidate)
+        self.assertEqual(normalized["required_repairs"][0]["scope"], "results_p1; results_table")
+        self.assertTrue(any(change["field"] == "required_repairs.scope" for change in changes))
+
+    def test_normalizer_removes_provider_resolution_protection_metadata(self):
+        candidate = {
+            "schema_version": "manuscript-review-arbitration-1",
+            "decision": "resolved",
+            "resolutions": [{"id": "res_1", "finding_ids": ["science_f1"],
+                              "decision": "retain", "rationale": "Keep the supported finding.",
+                              "directive": "Retain the finding.", "protected": ["results_p1"]}],
+            "rationale": "The finding was adjudicated.",
+        }
+        normalized, changes = _normalise_adjudication_candidate(candidate)
+        self.assertNotIn("protected", normalized["resolutions"][0])
+        self.assertTrue(any(change["field"] == "resolutions.protected" for change in changes))
+
+    def test_adjudication_can_resolve_by_rejecting_a_competing_material_finding(self):
+        review = review_for("science", finding=True)
+        adjudication = {
+            "schema_version": "manuscript-review-arbitration-1",
+            "decision": "resolved",
+            "resolutions": [{
+                "id": "arbiter_science_finding",
+                "finding_ids": [review["findings"][0]["id"]],
+                "decision": "reject",
+                "rationale": "The supplied evidence does not support this competing repair.",
+                "directive": "Preserve the current text and retain the rationale in provenance.",
+            }],
+            "rationale": "The material critique received an explicit rejection with a recorded reason.",
+        }
+        self.assertEqual(validate_adjudication(adjudication, [review])["decision"], "resolved")
+
+    def test_numeric_evidence_guard_rejects_an_ungrounded_correction(self):
+        review = review_for("science", finding=True)
+        finding = review["findings"][0]
+        finding["protected"] = ["results_p1"]
+        finding["location"] = "results_p1"
+        finding["surgical_fix"] = "Replace 0.166 with 0.038 after recalculating the peak width."
+        manuscript = {"sections": [{"id": "results", "units": [
+            {"id": "results_p1", "text": "The reported width is 0.166."},
+        ]}]}
+        evidence = {"results_package": {"procedures": [
+            {"id": "p", "description": "Use exp(-100(x-c)^2) over [0,1]."},
+        ], "metrics": [], "findings": [], "limitations": []}}
+        audit = audit_numeric_repair_support([review], manuscript, evidence)
+        self.assertEqual(audit[finding["id"]]["unsupported_decimal_tokens"], ["0.038"])
+        adjudication = {
+            "schema_version": "manuscript-review-arbitration-1", "decision": "resolved",
+            "resolutions": [{"id": "res_width", "finding_ids": [finding["id"]],
+                             "decision": "retain", "rationale": "Keep the correction.",
+                             "directive": "Replace the value."}],
+            "rationale": "The finding was considered.",
+        }
+        guarded = apply_numeric_evidence_guard(adjudication, audit)
+        self.assertEqual(guarded["resolutions"][0]["decision"], "reject")
+        validate_adjudication(guarded, [review])
 
     def test_synthesis_requires_repairs_for_major_findings(self):
         review = review_for("science", finding=True)
@@ -76,15 +294,42 @@ class ManuscriptReviewTests(unittest.TestCase):
     def test_runner_executes_scientific_and_editorial_roles_then_final_gate(self):
         FakeClient.calls = []
         manuscript = {"title": "Calibration", "units": [{"id": "results-1", "text": "Held-out log loss changed."}]}
+        feedback = []
         with patch("scisaurus.runtime.manuscript_review.ModelClient", FakeClient):
+            result = ManuscriptReviewRunner({"base_url": "http://example.invalid", "model": "fake",
+                                             "protocol": "openai_compatible", "timeout_seconds": 1,
+                                             "max_output_tokens": 10}).run(
+                                                 manuscript, feedback_callback=feedback.append)
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(result["model_calls"], 7)
+        self.assertEqual([item["reviewer_id"] for item in result["reviews"]], ["science", "methods", "ai_smell",
+                                                                                       "human_scientist", "editorial_compression", "journal_editor"])
+        self.assertEqual(FakeClient.calls.count("independent_manuscript_review"), 6)
+        self.assertEqual([event["kind"] for event in feedback], ["review"] * 6 + ["synthesis"])
+        self.assertEqual(feedback[-1]["status"], "accepted")
+
+    def test_runner_binds_provider_review_that_omits_assignment_stage(self):
+        manuscript = {"title": "Calibration", "units": [{"id": "results-1", "text": "Held-out log loss changed."}]}
+        with patch("scisaurus.runtime.manuscript_review.ModelClient", MissingStageClient):
             result = ManuscriptReviewRunner({"base_url": "http://example.invalid", "model": "fake",
                                              "protocol": "openai_compatible", "timeout_seconds": 1,
                                              "max_output_tokens": 10}).run(manuscript)
         self.assertEqual(result["status"], "accepted")
-        self.assertEqual(result["model_calls"], 6)
-        self.assertEqual([item["reviewer_id"] for item in result["reviews"]], ["science", "methods", "ai_smell",
-                                                                                       "human_scientist", "editorial_compression"])
-        self.assertEqual(FakeClient.calls.count("independent_manuscript_review"), 5)
+        self.assertTrue(all("stage" in review for review in result["reviews"]))
+
+    def test_composer_mode_adjudicates_material_review_feedback_before_synthesis(self):
+        manuscript = {"title": "Calibration", "units": [{"id": "results-1", "text": "Held-out log loss changed."}]}
+        feedback = []
+        with patch("scisaurus.runtime.manuscript_review.ModelClient", FakeClient):
+            result = ManuscriptReviewRunner({"base_url": "http://example.invalid", "model": "fake",
+                                             "protocol": "openai_compatible", "timeout_seconds": 1,
+                                             "max_output_tokens": 10}, arbiter_enabled=True).run(
+                                                 manuscript, feedback_callback=feedback.append)
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(result["adjudication"]["decision"], "resolved")
+        self.assertEqual(result["model_calls"], 8)
+        self.assertEqual(feedback[-2]["kind"], "arbitration")
+        self.assertEqual(feedback[-1]["kind"], "synthesis")
 
     def test_runner_stops_a_slow_review_batch_at_the_deadline(self):
         manuscript = {"title": "Calibration", "units": [{"id": "results-1", "text": "Held-out log loss changed."}]}

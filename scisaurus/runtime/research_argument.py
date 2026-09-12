@@ -364,11 +364,16 @@ def argument_prompt(evidence_packet, *, min_figures=2, min_tables=1, min_experim
             "Plan figures and tables as parts of the argument: each must answer a reader question and cover every observed pattern.",
             "State a primary bounded thesis and the scope boundary that prevents overclaiming.",
         ],
+        "final_consistency_check": (
+            "After drafting, enumerate the exact observed_patterns IDs and set the union of every hypothesis's "
+            "explains_pattern_ids to exactly that same set. Do not omit a pattern merely because it is a control "
+            "or a null result; assign it to the hypothesis that explains why it is informative."
+        ),
         "minimums": {"figures": min_figures, "tables": min_tables, "experiments": min_experiments},
         "output_contract": {
             "schema_version": SCHEMA_VERSION,
             "observed_patterns": "list of {id,observation,implication,evidence_ids}; at least two",
-            "hypotheses": "list of {id,statement,mechanism,status,predictions,counterevidence,discriminating_test,evidence_ids,explains_pattern_ids}; at least two",
+            "hypotheses": "list of {id,statement,mechanism,status,predictions,counterevidence,discriminating_test,evidence_ids,explains_pattern_ids}; at least two; status must be exactly candidate, supported, disfavored, or unresolved",
             "primary_argument": "{thesis,primary_hypothesis_id,rationale,scope_boundary}",
             "discriminating_experiments": "list of {id,question,design,controls,predictions,measurements,tests_hypothesis_ids}",
             "figure_plan": "list of {id,kind,asset_id,purpose,supports,source_refs,readout,placement}; every observed pattern covered; every figure asset_id must be copied from evidence_packet.asset_ids and table asset_id may be null",

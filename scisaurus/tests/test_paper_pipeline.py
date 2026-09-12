@@ -3,7 +3,13 @@
 import unittest
 
 from scisaurus.core.errors import ValidationError
-from scisaurus.runtime.paper_pipeline import validate_argument_projection, validate_manuscript_draft
+from scisaurus.runtime.paper_pipeline import (
+    bind_claim_citations,
+    compress_reader_surface,
+    _review_input,
+    validate_argument_projection,
+    validate_manuscript_draft,
+)
 from scisaurus.tests.test_research_argument import argument
 
 
@@ -50,6 +56,57 @@ class ManuscriptDraftContractTests(unittest.TestCase):
                                    "units": [{"id": "discussion_p1", "kind": "paragraph", "text": "The findings are reported."}]})
         with self.assertRaisesRegex(ValidationError, "primary argument"):
             validate_argument_projection(validate_manuscript_draft(value), argument())
+
+    def test_surface_compression_removes_internal_ledger_duplicates(self):
+        procedure = "Evaluate midpoint rules over the fixed grid and compare each estimate with the analytic integral."
+        metric = "midpoint first crossed 1e-06 absolute error at n=14"
+        draft = {"schema_version": "manuscript-draft-2", "title": "A paper", "citation": "markers",
+                 "sections": [
+                     {"id": "methods", "title": "Methods", "units": [{
+                         "id": "methods_p1", "kind": "paragraph",
+                         "text": "We evaluated the rule on the fixed grid. " + procedure}]},
+                     {"id": "results", "title": "Results", "units": [{
+                         "id": "results_p1", "kind": "paragraph",
+                         "text": "The midpoint reached the threshold at n=14. " + metric + ". " + metric + "."}]},
+                 ]}
+        packet = {"results_package": {
+            "procedures": [{"description": procedure}],
+            "metrics": [{"presentation": metric}],
+            "findings": [], "limitations": [],
+        }}
+        config = {"storyline": {"beats": []}, "claims": [], "figure_arguments": []}
+        compressed, replacements, audit = compress_reader_surface(draft, packet, config)
+        methods = compressed["sections"][0]["units"][0]["text"]
+        results = compressed["sections"][1]["units"][0]["text"]
+        self.assertNotIn(procedure, methods)
+        self.assertEqual(results.casefold().count(metric.casefold()), 0)
+        self.assertIn("reached the threshold at n=14", results)
+        self.assertEqual(sorted(replacements), ["methods_p1", "results_p1"])
+        self.assertGreaterEqual(len(audit["removed"]), 2)
+
+    def test_review_projection_hides_internal_citation_tokens(self):
+        draft = {"schema_version": "manuscript-draft-2", "title": "A paper", "citation": "markers",
+                 "sections": [{"id": "introduction", "title": "Introduction", "units": [
+                     {"id": "intro_p1", "kind": "paragraph", "text": "Prior work [[cite:alpha]]."}]}]}
+        projected = _review_input(draft, references=[{"key": "alpha"}])
+        self.assertEqual(projected["sections"][0]["units"][0]["text"], "Prior work [1].")
+
+    def test_claim_citation_binding_projects_literature_to_claim_unit(self):
+        draft = {"schema_version": "manuscript-draft-2", "title": "A paper", "citation": "markers",
+                 "sections": [{"id": "introduction", "title": "Introduction", "units": [
+                     {"id": "intro_p1", "kind": "paragraph", "text": "Prior work frames the question. [1]"},
+                     {"id": "intro_p2", "kind": "paragraph", "text": "The study asks a bounded question."},
+                 ]}]}
+        config = {
+            "references": [{"key": "talvila2012", "source_ref": "artifact:kb/abstracts/W123@1"}],
+            "evidence": [{"id": "lit-1", "kind": "literature", "locator": "artifact:kb/abstracts/W123@1"}],
+            "claims": [{"id": "claim-question", "unit_ids": ["intro_p2"], "evidence_ids": ["lit-1"]}],
+        }
+        bound, replacements, audit = bind_claim_citations(draft, config)
+        self.assertNotIn("[1]", bound["sections"][0]["units"][0]["text"])
+        self.assertTrue(bound["sections"][0]["units"][1]["text"].endswith("[[cite:talvila2012]]"))
+        self.assertEqual(sorted(replacements), ["intro_p1", "intro_p2"])
+        self.assertEqual(audit["added"][0]["reference_key"], "talvila2012")
 
 
 if __name__ == "__main__":

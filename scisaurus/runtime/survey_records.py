@@ -139,6 +139,9 @@ def validate_assessment(value, sources, works, *, require_spans=False):
         raise ValidationError("unsupported gap decision")
     _text(value["rationale"], "assessment rationale")
     checks(value["checks"], GAP_CHECKS)
+    if value["state"] != "insufficient_evidence" and any(
+            check["outcome"] != "passed" for check in value["checks"]):
+        raise ValidationError("decisive gap assessment requires every check to pass")
     evidence(value["evidence"], sources, required=value["state"] != "insufficient_evidence",
              require_spans=require_spans)
     if not isinstance(value["comparisons"], list):

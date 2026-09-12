@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -33,8 +34,15 @@ class TestModelClient(unittest.TestCase):
                 self.end_headers()
                 response = (outer.response_sequence[min(outer.calls - 1, len(outer.response_sequence) - 1)]
                             if outer.response_sequence else outer.response)
-                self.wfile.write(response if isinstance(response, (bytes, bytearray))
-                                 else json.dumps(response).encode())
+                body = response if isinstance(response, (bytes, bytearray)) else json.dumps(response).encode()
+                if outer.slow_body:
+                    self.wfile.write(body[:1])
+                    self.wfile.flush()
+                    time.sleep(0.25)
+                    self.wfile.write(body[1:])
+                    self.wfile.flush()
+                else:
+                    self.wfile.write(body)
             def log_message(self, *args):
                 pass
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
@@ -44,6 +52,7 @@ class TestModelClient(unittest.TestCase):
         self.status = 200
         self.calls = 0
         self.response_sequence = None
+        self.slow_body = False
         self.response = {'model':'served-model','message':{'content':'{"value": 4}'}, 'done':True,
                          'done_reason':'stop', 'prompt_eval_count':10, 'eval_count':5}
 
@@ -205,6 +214,17 @@ class TestModelClient(unittest.TestCase):
         self.response['done']=True
         with self.assertRaises(ModelCallError):
             self.client(max_response_bytes=10).complete(system='x',prompt='x')
+
+    def test_body_transfer_is_bounded_by_absolute_timeout(self):
+        self.slow_body = True
+        client = ModelClient(base_url=self.url + '/v1', protocol='openai_compatible',
+                             model='configured-model', timeout_seconds=0.08, max_output_tokens=5,
+                             max_retries=0)
+        started = time.monotonic()
+        with self.assertRaises(ModelCallError) as error:
+            client.complete(system='x', prompt='x')
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertIn('deadline', str(error.exception))
 
     def test_secrets_cannot_be_embedded_in_url_and_absent_key_is_rejected(self):
         with self.assertRaises(ValidationError):

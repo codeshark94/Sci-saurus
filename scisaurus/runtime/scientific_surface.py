@@ -105,12 +105,21 @@ def _normal(text: str) -> str:
 
 
 def _numeric_signature(sentence: str):
-    numbers = tuple(re.findall(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?%?", sentence.casefold()))
+    normalized = unicodedata.normalize("NFKC", sentence).casefold()
+    # Table, figure, section, and appendix labels are layout references, not
+    # reported measurements.  Removing them before tokenization prevents a
+    # document with several ``Table 1`` mentions from looking like it repeats
+    # the numeric result 1.
+    normalized = re.sub(r"\b(?:table|fig(?:ure)?|section|appendix)\s+\d+\b", "", normalized)
+    numbers = tuple(re.findall(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?%?", normalized))
     if not numbers:
         return None
     terms = tuple(sorted(set(re.findall(
-        r"\b(?:log\s+loss|brier|ece|accuracy|auc|precision|recall|temperature|p\s*value|confidence\s+interval)\b",
-        sentence.casefold()))))
+        r"\b(?:log\s+loss|brier|ece|accuracy|auc|precision|recall|temperature|p\s*value|confidence\s+interval|"
+        r"error|rate|threshold|cross(?:ed|ing)?|subintervals?|tolerance|convergence|order|peak|control)\b",
+        normalized))))
+    if not terms:
+        return None
     return numbers, terms
 
 
@@ -170,4 +179,3 @@ def validate_scientific_surface(text: str, *, allowed_patterns=(), max_numeric_r
     if audit["caveat_repetitions"]:
         raise ValidationError("manuscript repeats a caveat beyond the editorial limit")
     return audit
-

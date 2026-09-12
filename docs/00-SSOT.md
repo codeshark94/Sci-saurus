@@ -108,7 +108,9 @@ The following records describe the original design. Where they conflict with a l
 
 **D42 — Tool discovery is separate from tool trust.** Operations may query the official MCP Registry and use other approved catalogs to locate candidates. A project can activate only one explicitly allowlisted recipe compatible with the task adapter, tags, and data classification. Registry presence or installation success does not create a capability binding. Local programs, APIs, and MCP services must still pass a representative execution and independent output, protocol, identity, and accounting verification. Python package provisioning accepts local wheels with pinned hashes and no dependency resolution during installation.
 
-**D43 — Scientific judgment claims require frozen external labels.** The evaluation runner removes labels and adjudication rationales from inference packets, pins submissions to the exact frozen corpus hash, and reports task-level accuracy, coverage, and decisive false positives on insufficient-evidence cases. Development labels can diagnose behavior but cannot clear a release gate. A held-out release verdict requires expert-adjudicated labels; the repository does not claim expert-level accuracy until such a corpus and results exist.
+**D43 — Journal-readiness is a separate desk decision.** Factual, methodological, and prose reviewers do not establish conventional scholarly depth. A deterministic Journal Editor applies the project's named publication profile to the candidate's observed reference count, full-text support, in-text citation distribution, figures, and tables. A score-3 research-paper descriptor with no explicit profile resolves to the empirical-journal floor and cannot select the shorter validation floor; a validation report resolves to that shorter floor. A missed floor requests scoped literature or experiment work and leaves the candidate visibly incomplete; padding references, duplicating displays, or lowering the profile after review is not a repair. A Composer run propagates this candidate state instead of reporting an accepted completion.
+
+**D43a — Scientific judgment claims require frozen external labels.** The evaluation runner removes labels and adjudication rationales from inference packets, pins submissions to the exact frozen corpus hash, and reports task-level accuracy, coverage, and decisive false positives on insufficient-evidence cases. Development labels can diagnose behavior but cannot clear a release gate. A held-out release verdict requires expert-adjudicated labels; the repository does not claim expert-level accuracy until such a corpus and results exist.
 
 **D44 — The paper release candidate is a dependency closure.** A paper build requires a current accepted survey and assessment, an independently accepted structured manuscript, a validated supplied-results package, exact paragraph-level claim/evidence bindings, and citations pinned to accepted survey sources. Literature claims from v3 surveys retain exact source spans and quote hashes in the claim index. DOI references require a verified reconciled identity whose source work, DOI, title, and year match the bibliography entry. The builder emits English LaTeX, a bibliography, claim index, rendered PDF, visual-render report, and exact release manifest. A research-paper candidate requires an experiment-eligible accepted gap assessment; a replication or methods-validation outcome may instead use a `validation_report` that preserves the actual gap state and avoids a novelty claim. Compilation and deterministic checks produce a candidate only. Final Principal approval and external submission remain separate.
 
@@ -129,6 +131,40 @@ The following records describe the original design. Where they conflict with a l
 **D52 — Human-scientist review is independent of factual QA.** In addition to method and accuracy checks, every manuscript release receives an adversarial scientific-communication review of the question, narrative importance, mechanism discussion, explanatory value, exposed pipeline language, repetition, figure argument, and section function. The reviewer may request a scoped repair or state that no justified objection was found; it may not invent objections to satisfy a negativity quota.
 
 **D53 — Provider pacing is part of the execution contract.** A provider has an explicit inter-request interval, request-level transient retry policy, and total request deadline. Pacing is scheduled independently for bibliography, identity, and full-text capabilities; `Retry-After` and exponential backoff are honored inside the same deadline. Waits, retries, and exhausted budgets remain visible in the run report, and a delay that cannot fit the hard wall blocks before dispatch rather than creating an unbounded timeout.
+
+**D54 — Composer feedback is a first-class organizational exchange.** Every
+stage handoff produces a linked command decision note and message-bus envelope
+addressed to the responsible department chief. A successful handoff advances
+the dependency graph; an unresolved or failed handoff routes a scoped critique
+to the Arbiter and Progress Controller. The message body records the stage,
+role, scientific state, dependency set, elapsed/deadline budget, output
+reference, and next condition. Blocker reconciliation may reopen only the
+affected scope and must preserve the incumbent; a department cannot silently
+acknowledge its own output as an independent review. This is the Composer's
+control loop for human-like organizational collaboration, while scientific
+acceptance remains with the stage's independent checks and the Principal's
+release boundary.
+
+Internal paper reviews, synthesis decisions, surgical repairs, and release
+events use that same exchange rather than a private sub-pipeline. Stable event
+IDs make a resumed checkpoint idempotent; review bodies and replacement text
+stay in the manuscript project's immutable unit history, while the Composer
+routes only bounded control summaries.
+
+**D55 — Evidence-aware adjudication.** Every review role receives a bounded
+projection of the frozen evidence needed to test the target claim. Before an
+Arbiter can authorize a surgical repair, deterministic guards compare proposed
+numeric corrections with the target text and evidence registry. A novel
+numeric value without an evidence or calculation artifact is preserved as an
+explicit unresolved alternative and rejected as a repair directive; it cannot
+replace a supported value by model assertion. The project may reopen the
+finding after a qualified fact-verification artifact is promoted. This
+preserves rational oversight while keeping the full review and dispute history
+immutable.
+When material review findings conflict, a dedicated Arbiter reconciliation is
+recorded before synthesis; only retained finding IDs may become repair
+instructions, while rejected alternatives remain visible and cannot be silently
+converted into acceptance.
 
 ### 3.3 Effective interpretation of earlier rules
 

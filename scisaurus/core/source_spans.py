@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 from copy import deepcopy
 import re
+import unicodedata
 
 from scisaurus.core.errors import ValidationError
 
@@ -57,13 +58,70 @@ def _restore_unique_source_whitespace(source: dict, quote: str, *, window: dict 
     if (type(start) is not int or type(end) is not int or not 0 <= start <= end <= len(text)):
         raise ValidationError("source window must be a valid character range")
     parts = re.split(r"\s+", quote.strip())
-    pattern = re.compile(r"\s+".join(re.escape(part) for part in parts))
+
+    # Renderers commonly replace ASCII punctuation with typographic
+    # equivalents while preserving the scientific wording.  Treat only the
+    # small, unambiguous punctuation family below as equivalent; return the
+    # original source slice so the stored span remains byte-faithful.
+    equivalents = {
+        "'": "'’‘ʻʼ",
+        '"': '"“”„‟',
+        "-": "-‐‑‒–—−",
+    }
+
+    def pattern_part(part):
+        rendered = []
+        for char in part:
+            if char in equivalents:
+                rendered.append("[" + re.escape(equivalents[char]) + "]")
+            else:
+                rendered.append(re.escape(char))
+        return "".join(rendered)
+
+    pattern = re.compile(r"\s+".join(pattern_part(part) for part in parts))
     matches = list(pattern.finditer(text, start, end))
-    if len(matches) != 1:
-        raise ValidationError("evidence quote is absent from the supplied source window"
-                              if not matches else
-                              "evidence quote occurs more than once; provide a longer unique quotation")
-    return matches[0].group(0)
+    if len(matches) == 1:
+        return matches[0].group(0)
+    if matches:
+        raise ValidationError("evidence quote occurs more than once; provide a longer unique quotation")
+
+    # Formula renderers may additionally duplicate a TeX expression in a
+    # plain-text form, change Unicode symbols, or escape an underscore.  A
+    # token-level fallback handles those transport differences while still
+    # requiring one unique contiguous source span.  It deliberately ignores
+    # punctuation only after the whitespace-aware match has failed; ordinary
+    # prose therefore keeps the stricter character contract above.
+    def token_spans(value):
+        chars, starts, ends = [], [], []
+        for index, char in enumerate(value):
+            normalized = unicodedata.normalize("NFKC", char).casefold()
+            normalized = normalized.translate(str.maketrans({
+                "’": "'", "‘": "'", "ʻ": "'", "ʼ": "'",
+                "“": '"', "”": '"', "„": '"', "‟": '"',
+                "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "−": "-",
+            }))
+            for rendered in normalized:
+                chars.append(rendered)
+                starts.append(index)
+                ends.append(index + 1)
+        normalized_text = "".join(chars)
+        return [(match.group(0), starts[match.start()], ends[match.end() - 1])
+                for match in re.finditer(r"\w+", normalized_text, flags=re.UNICODE)]
+
+    expected = [token[0] for token in token_spans(quote)]
+    observed = token_spans(text)
+    if len(expected) >= 2:
+        candidates = []
+        for offset in range(len(observed) - len(expected) + 1):
+            window_tokens = observed[offset:offset + len(expected)]
+            if [token[0] for token in window_tokens] != expected:
+                continue
+            if window_tokens[0][1] < start or window_tokens[-1][2] > end:
+                continue
+            candidates.append(window_tokens)
+        if len(candidates) == 1:
+            return text[candidates[0][0][1]:candidates[0][-1][2]]
+    raise ValidationError("evidence quote is absent from the supplied source window")
 
 
 def bind(value, sources: dict, *, windows: dict | None = None) -> dict:

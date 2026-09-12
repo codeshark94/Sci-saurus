@@ -752,15 +752,26 @@ class SurveyRunner(ExecutionRuntime):
         """Bound source windows for the final gap decision.
 
         The assessment receives the compact map plus enough source text to
-        check decisive quotations.  Sending every captured 60k-character
-        window again can exceed the compatible model's context limit and is
-        redundant with the exact evidence already present in the map.
+        check decisive quotations.  A short prefix is not a safe evidence
+        boundary: a verifier can identify the right passage in the captured
+        paper and then fail closed simply because that passage occurs later
+        in the paper.  Send a complete verified paper when it fits the
+        configured capture budget; retain a bounded prefix only for unusually
+        large captures where a full request would exceed the model context.
         """
         result = []
         for ref, value in self.source_docs.items():
             representation = value["representation"]
             limit = self.bounds["context_chars"]
-            if representation == "unverified_text":
+            if representation == "full_text":
+                # Full-text evidence is the decisive input to eligibility and
+                # refutation.  The current configured capture is at most
+                # 999,999 characters; use the whole document up to a
+                # conservative 100k request budget so equations and methods
+                # near the end remain bindable.  Larger documents stay
+                # bounded and must be treated as insufficient evidence.
+                limit = min(self.bounds["max_text_chars"], 100000)
+            elif representation == "unverified_text":
                 # Keep enough of captured pages to retain the exact spans
                 # surfaced by the map, while still avoiding the full HTML
                 # payload that caused the assessment request to overflow.
@@ -830,6 +841,18 @@ class SurveyRunner(ExecutionRuntime):
                 visible = source["text"] if source is not None else ""
                 if visible.count(quote) == 1:
                     continue
+                # First try the displayed representation itself.  The source
+                # binder can restore line breaks and typographic punctuation
+                # while retaining the full-text source reference, which is
+                # required for a decisive assessment.
+                if source is not None:
+                    try:
+                        bound = self._bind_visible_spans({"evidence": [item]}, [source])
+                        item.clear()
+                        item.update(bound["evidence"][0])
+                        continue
+                    except ValidationError:
+                        pass
                 candidates = [candidate for candidate in by_work.get(work_id, [])
                               if candidate["text"].count(quote) == 1]
                 if len(candidates) == 1:
@@ -1267,6 +1290,22 @@ class SurveyRunner(ExecutionRuntime):
         verified_full_text_refs = [source["source_ref"] for source in assessment_sources
                                    if source["representation"] == "full_text"
                                    and source.get("identity_verified") is True]
+        displayed_lengths = {source["source_ref"]: len(source["text"])
+                             for source in assessment_sources}
+
+        def validate_gap_assessment(value):
+            validate_assessment(value, assessment_source_lookup, self.works, require_spans=True)
+            # A decisive literature state cannot be adopted while the
+            # accepted survey still records access, identity, or bounded
+            # coverage gaps.  Treat this as a model-contract rejection so the
+            # normal scoped retry asks for an evidence-bounded abstention,
+            # rather than discovering the contradiction after publication.
+            if value["state"] != "insufficient_evidence" and (self.gaps or any(
+                    len(source["text"]) > displayed_lengths.get(ref, 0)
+                    for ref, source in self.source_docs.items()
+                    if source["representation"] == "full_text")):
+                raise ValidationError("decisive gap state requires complete access and source context")
+
         value, execution = self._model_checked("gap-assessment", "methods.novelty-verifier", {
             "assignment": "Independently determine the status of the nominated gap using the current accepted survey and targeted counter-search.",
             "phase": "gap_assessment", "question": self.score["question"], "gap": self.nomination,
@@ -1283,15 +1322,20 @@ class SurveyRunner(ExecutionRuntime):
                 "A prior solution supported by decisive full-text quotes refutes the gap even if global search is incomplete. "
                 "For decisive states all checks must pass and evidence must include verified full_text sources. Abstracts alone cannot authorize a decisive state. "
                 "Use insufficient_evidence if access, source windows, missing closest work, or incomparable conditions prevent the judgment. "
+                "A decisive state is valid only when every required check has outcome=passed. If any check is insufficient_evidence, failed, or check_failed, state must be insufficient_evidence. "
+                "For insufficient_evidence, keep comparisons different or uncertain as warranted by the captured text; do not relabel an abstract sentence as full_text. "
+                "If coverage.access_and_limit_gaps is nonempty or any verified full text is longer than the displayed assessment context, state must be insufficient_evidence because the runner cannot adopt a decisive result. "
+                "When state is decisive, every comparison evidence item for that comparison must remain attached to an exact verified full_text quotation; prefer short contiguous prose spans over rendered equations. "
                 "For refuted_by_prior_work or eligible_for_experiment, cite only the listed verified_full_text_refs for any decisive comparison; "
                 "if no listed full-text quote directly supports the comparison, set the state to insufficient_evidence and use relationship=uncertain. "
                 "Eligibility requires meaningful, testable distinction, no prior solution or unresolved comparison, and adequate search coverage. "
                 "It authorizes an experiment under the stated scope, never publication-ready novelty. Do not force a positive finding to finish the task."
-        }, lambda value: validate_assessment(value, assessment_source_lookup, self.works, require_spans=True),
+        }, validate_gap_assessment,
             normalizer=lambda value: self._bind_assessment_spans(value, assessment_sources),
             stage="integrated_review", task_kind="verification")
         if value["state"] == "eligible_for_experiment" and (self.gaps or any(
-                len(source["text"]) > self.bounds["context_chars"] for source in self.source_docs.values()
+                len(source["text"]) > displayed_lengths.get(ref, 0)
+                for ref, source in self.source_docs.items()
                 if source["representation"] == "full_text")):
             raise ValidationError("gap eligibility lacks complete access or decisive source context")
         record = self._publish("kb/gap-assessments/current", "note", {

@@ -27,6 +27,7 @@ from scisaurus.core.store import ArtifactStore
 from scisaurus.runtime.manuscript_review import ManuscriptReviewRunner
 from scisaurus.runtime.models import ModelClient, ModelResult
 from scisaurus.runtime.paper import PaperReleaseBuilder, validate_paper_config
+from scisaurus.runtime.scholarly_depth import profile_for_paper
 from scisaurus.runtime.research_argument import (
     PACKAGE_SCHEMA_VERSION,
     ResearchArgumentRunner,
@@ -105,13 +106,27 @@ def validate_manuscript_draft(value):
     return value
 
 
-def _review_input(draft):
+def _review_input(draft, *, references=None):
+    citation_labels = {}
+    for index, reference in enumerate(references or [], start=1):
+        if isinstance(reference, dict) and isinstance(reference.get("key"), str):
+            citation_labels[reference["key"]] = f"[{index}]"
+
+    def reader_surface(text):
+        if not citation_labels:
+            return text
+        return re.sub(
+            r"\[\[cite:([a-z][a-z0-9_-]{0,63})\]\]",
+            lambda match: citation_labels.get(match.group(1), "[citation]"),
+            text,
+        )
+
     return {
         "schema_version": "manuscript-review-input-1",
         "title": draft["title"],
         "sections": [{
             "id": section["id"], "title": section["title"],
-            "units": [{"id": unit["id"], "text": unit["text"], "editable": True,
+            "units": [{"id": unit["id"], "text": reader_surface(unit["text"]), "editable": True,
                        "claim_ids": []} for unit in section["units"]],
         } for section in draft["sections"]],
     }
@@ -125,8 +140,342 @@ def _citation_markers(text):
     return re.findall(r"\[\[cite:([a-z][a-z0-9_-]{0,63})\]\]", text)
 
 
+def bind_claim_citations(draft, paper_config):
+    """Project pinned literature evidence onto the units that make each claim.
+
+    Citation markers are the manuscript's internal binding surface.  A writer
+    or repair model can preserve the global marker set while moving a marker
+    away from the claim that relies on its source.  This deterministic pass
+    restores the local claim-to-source edge and removes orphan numeric
+    placeholders before release; it never invents a reference or a claim.
+    """
+    candidate = deepcopy(validate_manuscript_draft(deepcopy(draft)))
+    units = _all_units(candidate)
+    evidence = {
+        item.get("id"): item for item in paper_config.get("evidence", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    references = [item for item in paper_config.get("references", []) if isinstance(item, dict)]
+    reference_keys = {item.get("key") for item in references if isinstance(item.get("key"), str)}
+    replacements = {}
+    added = []
+    placeholder_removals = []
+
+    # Numeric citation placeholders are not part of the structured citation
+    # contract.  Remove only standalone bracketed integers, leaving scientific
+    # interval notation such as [0, 1] untouched.
+    for unit in units.values():
+        cleaned = re.sub(r"\s*\[(\d+)\](?!\s*[,\)])", "", unit["text"])
+        if cleaned != unit["text"]:
+            placeholder_removals.append({"unit_id": unit["id"], "count": len(re.findall(r"\[(\d+)\]", unit["text"]))})
+            unit["text"] = cleaned.strip()
+            replacements[unit["id"]] = unit["text"]
+
+    for claim in paper_config.get("claims", []):
+        if not isinstance(claim, dict):
+            continue
+        targets = [unit_id for unit_id in claim.get("unit_ids", []) if unit_id in units]
+        if not targets:
+            continue
+        keys = []
+        for evidence_id in claim.get("evidence_ids", []):
+            item = evidence.get(evidence_id)
+            if not item or item.get("kind") != "literature":
+                continue
+            locator = item.get("locator")
+            match = next((reference for reference in references
+                          if reference.get("source_ref") == locator), None)
+            if match is None and isinstance(locator, str):
+                # Survey locators are content-addressed; permit a matching
+                # work ID when a source revision is represented differently.
+                work_match = re.search(r"W(\d+)", locator)
+                if work_match:
+                    work_id = work_match.group(1)
+                    match = next((reference for reference in references
+                                  if re.search(rf"W{work_id}(?:@|$)", str(reference.get("source_ref", "")))), None)
+            key = match.get("key") if match else None
+            if key in reference_keys and key not in keys:
+                keys.append(key)
+        if not keys:
+            continue
+        target_id = targets[0]
+        text = units[target_id]["text"].rstrip()
+        for key in keys:
+            marker = f"[[cite:{key}]]"
+            if marker in text:
+                continue
+            text = f"{text} {marker}"
+            added.append({"claim_id": claim.get("id"), "unit_id": target_id, "reference_key": key})
+        if text != units[target_id]["text"]:
+            units[target_id]["text"] = text
+            replacements[target_id] = text
+
+    validate_manuscript_draft(candidate)
+    return candidate, replacements, {
+        "schema_version": "claim-citation-binding-1",
+        "policy": "bind literature evidence to claim units and remove orphan numeric placeholders",
+        "changed_unit_ids": sorted(replacements),
+        "added": added,
+        "placeholder_removals": placeholder_removals,
+    }
+
+
 def _word_count(draft):
     return len(re.findall(r"\b[\w'-]+\b", " ".join(unit["text"] for unit in _all_units(draft).values())))
+
+
+def _normalise_surface(text):
+    """Return a comparison form without changing the manuscript text."""
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+def _surface_key(text):
+    """Canonicalise punctuation for duplicate-sentence comparison only."""
+    value = str(text).casefold().translate(str.maketrans({
+        "−": "-", "–": "-", "—": "-", "⁻": "-", "²": "^2", "×": "x",
+        "∈": "in", "₀": "0", "₁": "1", "₆": "6",
+    }))
+    return re.sub(r"[^a-z0-9]+", "", value)
+
+
+def _sentence_spans(text):
+    """Yield sentence-like spans while retaining their source offsets.
+
+    Scientific prose in the draft is plain text rather than a markup tree.
+    Keeping offsets lets the editor remove only a confirmed duplicate fragment
+    and leave every other character, citation marker, and paragraph address
+    untouched.
+    """
+    # Do not treat decimal points in n=1.992 or scientific notation as
+    # sentence boundaries.  Building spans from a cursor (rather than using a
+    # free ``finditer`` over non-punctuation text) also prevents a decimal
+    # point from making the regex start a new match at the following digit.
+    boundary = re.compile(r"(?<![\d.])[.!?](?=\s|$)")
+    spans = []
+    start = 0
+    for match in boundary.finditer(text):
+        spans.append((start, match.end(), text[start:match.end()]))
+        start = match.end()
+    if start < len(text):
+        spans.append((start, len(text), text[start:]))
+    return spans
+
+
+def compress_reader_surface(draft, packet, paper_config):
+    """Perform a deterministic, surgical editorial projection.
+
+    Result packages contain exact machine-facing descriptions so they can be
+    replayed and verified.  Those strings are useful context for a writer but
+    are not a manuscript contract.  This pass removes duplicated ledger-like
+    fragments, keeps the first reader-facing statement of each fact, and
+    preserves the frozen storyline/claim/figure spine.  It returns a new draft,
+    the unit-level replacements, and an audit suitable for the control ledger.
+    """
+    candidate = deepcopy(validate_manuscript_draft(deepcopy(draft)))
+    results = packet.get("results_package", {}) if isinstance(packet, dict) else {}
+
+    procedure_fragments = []
+    for item in results.get("procedures", []):
+        if isinstance(item, dict) and isinstance(item.get("description"), str):
+            procedure_fragments.append(item["description"])
+    metric_fragments = []
+    for item in results.get("metrics", []):
+        if isinstance(item, dict) and isinstance(item.get("presentation"), str):
+            metric_fragments.append(item["presentation"])
+    finding_fragments = []
+    for item in results.get("findings", []):
+        if isinstance(item, dict) and isinstance(item.get("statement"), str):
+            finding_fragments.append(item["statement"])
+    limitation_fragments = [item for item in results.get("limitations", []) if isinstance(item, str)]
+
+    # A procedure is an internal execution instruction.  The manuscript keeps
+    # its declarative methods description; imperative exact strings are always
+    # removed when they occur as an appended block.
+    removable_exact = procedure_fragments + metric_fragments + finding_fragments + limitation_fragments
+    removable_exact = [item.strip() for item in removable_exact if len(item.strip()) >= 24]
+    removable_exact.sort(key=len, reverse=True)
+
+    # Reader-facing spine is protected semantically, but not as a literal copy
+    # of the result ledger.  The repair contract uses the same distinction.
+    protected_literals = []
+    protected_literals.extend(
+        beat.get("proposition") for beat in paper_config.get("storyline", {}).get("beats", [])
+        if isinstance(beat, dict))
+    protected_literals.extend(
+        claim.get("statement") for claim in paper_config.get("claims", [])
+        if isinstance(claim, dict))
+    protected_literals.extend(
+        item.get("observation") for item in paper_config.get("figure_arguments", [])
+        if isinstance(item, dict))
+    protected_norm = {_normalise_surface(item) for item in protected_literals if isinstance(item, str)}
+
+    contract_fragments = []
+    for item in packet.get("writer_contract", {}).get("required_exact_content", []):
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            contract_fragments.append((item.get("unit_id"), item["text"].strip()))
+
+    def remove_fragment(text, fragment, unit_id, kind):
+        """Remove only exact copies that are clearly assembly surface."""
+        positions = []
+        folded = text.casefold()
+        needle = fragment.casefold()
+        cursor = 0
+        while True:
+            index = folded.find(needle, cursor)
+            if index < 0:
+                break
+            positions.append(index)
+            cursor = index + len(fragment)
+        if not positions:
+            return text, []
+        # If a result paragraph contains a run of two or more exact ledger
+        # labels, the run is an appended machine summary.  Truncate it at the
+        # first label and retain the preceding reader-facing observation.
+        if kind == "duplicate_result_fragment" and len(positions) == 1:
+            before = text[:positions[0]]
+            if before.rstrip().endswith((".", ";", ":")) and unit_id.startswith("results_"):
+                # A single lowercase metric label after a complete sentence is
+                # still a duplicate when the paragraph has already stated the
+                # number in ordinary prose.
+                if fragment[:1].islower() and before.strip():
+                    positions = positions
+        audit = []
+        for index in reversed(positions):
+            before = text[:index]
+            after = text[index + len(fragment):]
+            before = before.rstrip()
+            after = after.lstrip()
+            # Avoid leaving ``. ;`` or ``word .`` after deleting a ledger
+            # fragment.  The punctuation already present in the surrounding
+            # prose is retained where it is meaningful.
+            if after[:1] in ".,;:":
+                join = ""
+            else:
+                join = " " if before and after else ""
+            text = before + join + after
+            audit.append({"unit_id": unit_id, "kind": kind, "fragment": fragment,
+                          "reason": "retain reader-facing prose"})
+        text = re.sub(r"\s+([,.;:])", r"\1", text)
+        text = re.sub(r"([.;:])\s*([.;:])", r"\1", text)
+        return text.strip(), audit
+
+    replacements = {}
+    removed = []
+    preserved = []
+    for section in candidate["sections"]:
+        for unit in section["units"]:
+            if unit["kind"] != "paragraph":
+                continue
+            original = unit["text"]
+            text = original
+            # Remove imperative protocol blocks only when there is prose on
+            # both sides or the block follows an existing methods sentence.
+            for fragment in procedure_fragments:
+                start = text.find(fragment)
+                if start < 0:
+                    continue
+                prefix = text[:start].rstrip()
+                if prefix and unit["id"].startswith("methods_"):
+                    text = prefix
+                    removed.append({"unit_id": unit["id"], "kind": "execution_instruction",
+                                    "fragment": fragment, "reason": "project declarative method"})
+                    break
+            # Remove result labels only when they are a duplicate assembly
+            # surface.  A natural lead-in such as ``The ...`` at the beginning
+            # of a paragraph may be the only reader-facing statement and is
+            # retained; an appended lowercase label after a completed sentence
+            # is removed.  A run of labels is always treated as the ledger tail.
+            fragments = [*metric_fragments, *finding_fragments, *limitation_fragments]
+            hit_count = sum(text.casefold().count(fragment.casefold()) for fragment in fragments)
+            if hit_count >= 2 and unit["id"].startswith("results_"):
+                first_hits = [(text.casefold().find(fragment.casefold()), fragment)
+                              for fragment in fragments if text.casefold().find(fragment.casefold()) >= 0]
+                first_hits.sort(key=lambda item: item[0])
+                if first_hits and first_hits[0][0] > 0:
+                    cut_at = first_hits[0][0]
+                    raw_tail = text[cut_at:].strip()
+                    prefix = text[:cut_at].rstrip()
+                    if prefix.endswith((".", ";", ":")):
+                        text = prefix
+                        removed.append({"unit_id": unit["id"], "kind": "ledger_tail",
+                                        "fragment": raw_tail,
+                                        "reason": "retain preceding observation"})
+                        hit_count = 0
+            for fragment in fragments:
+                norm = _normalise_surface(fragment)
+                if not norm or norm in protected_norm:
+                    continue
+                before = text[:text.casefold().find(fragment.casefold())]
+                index = text.casefold().find(fragment.casefold())
+                if index < 0:
+                    continue
+                # Keep an exact fragment only when it is integrated into a
+                # short lead-in at the start of a paragraph (for example,
+                # ``The constant-function control ...``).  Otherwise it is a
+                # machine label or a duplicate of an earlier prose sentence.
+                sentence_start = max(before.rfind("."), before.rfind("!"), before.rfind("?")) + 1
+                lead = before[sentence_start:].strip()
+                natural_lead = bool(re.fullmatch(r"(?:the|a|an|for|at|on)\s+", lead.casefold()))
+                if natural_lead and index < 48:
+                    preserved.append({"unit_id": unit["id"], "fragment": fragment,
+                                      "reason": "first integrated reader-facing occurrence"})
+                    continue
+                text, entries = remove_fragment(text, fragment, unit["id"], "duplicate_result_fragment")
+                removed.extend(entries)
+            for contract_unit, fragment in contract_fragments:
+                if contract_unit != unit["id"]:
+                    continue
+                index = text.casefold().find(fragment.casefold())
+                if index > 0:
+                    text, entries = remove_fragment(text, fragment, unit["id"], "duplicate_contract_fragment")
+                    removed.extend(entries)
+                else:
+                    # Writer contracts often contain a Unicode minus or a
+                    # different spacing around equations.  Compare sentence
+                    # keys after canonicalising punctuation so a duplicated
+                    # protocol sentence is removed without broad rewriting.
+                    fragment_key = _surface_key(fragment)
+                    spans = _sentence_spans(text)
+                    for start, end, sentence in reversed(spans):
+                        if start == 0 or _surface_key(sentence) != fragment_key:
+                            continue
+                        before = text[:start].rstrip()
+                        after = text[end:].lstrip()
+                        text = before + (" " if before and after else "") + after
+                        removed.append({"unit_id": unit["id"], "kind": "duplicate_contract_sentence",
+                                        "fragment": sentence.strip(), "reason": "retain earlier method description"})
+                        break
+            # Exact sentence duplication is an assembly defect even when the
+            # model paraphrased the surrounding punctuation.
+            spans = _sentence_spans(text)
+            sentence_seen = set()
+            chunks = []
+            for _, _, sentence in spans:
+                key = _normalise_surface(sentence)
+                if key and key in sentence_seen and key not in protected_norm:
+                    removed.append({"unit_id": unit["id"], "kind": "duplicate_sentence",
+                                    "fragment": sentence.strip(), "reason": "retain first occurrence"})
+                    continue
+                sentence_seen.add(key)
+                chunks.append(sentence)
+            text = "".join(chunks).strip()
+            if not text:
+                # A compression pass cannot create an empty unit.  The model
+                # repair path may delete a terminal unit explicitly; this pass
+                # only removes text that is duplicated elsewhere.
+                text = original
+            if text != original:
+                replacements[unit["id"]] = text
+                unit["text"] = text
+    validate_manuscript_draft(candidate)
+    audit = {
+        "schema_version": "surface-compression-1",
+        "policy": "remove duplicated execution/ledger surface; preserve scientific spine and first fact occurrence",
+        "changed_unit_ids": sorted(replacements),
+        "removed": removed,
+        "preserved": preserved,
+    }
+    return candidate, replacements, audit
 
 
 _ARGUMENT_STOPWORDS = {
@@ -281,9 +630,16 @@ class PaperPipelineRunner:
                  initial_review_package=None, review_deadline_seconds=1200.0,
                  release_on_review_limit=False,
                  pipeline_deadline_seconds=DEFAULT_PIPELINE_DEADLINE_SECONDS,
+                 review_max_output_tokens=4096, review_reasoning_effort="medium",
+                 review_call_timeout_seconds=300.0,
+                 review_inter_request_interval_seconds=0.5,
+                 repair_max_output_tokens=6000,
+                 model_call_timeout_seconds=300.0,
+                 review_arbiter_enabled=False,
                  argument=None, argument_review=None, initial_argument_package=None,
                  argument_deadline_seconds=DEFAULT_ARGUMENT_DEADLINE_SECONDS,
-                 min_argument_figures=2, min_argument_tables=1, min_argument_experiments=2):
+                 min_argument_figures=2, min_argument_tables=1, min_argument_experiments=2,
+                 feedback_callback=None):
         self.packet = deepcopy(packet)
         self.model_config = deepcopy(model_config)
         self.paper_config = deepcopy(paper_config)
@@ -305,6 +661,25 @@ class PaperPipelineRunner:
             raise ValidationError("pipeline deadline must be finite and positive")
         self.release_on_review_limit = release_on_review_limit
         self.pipeline_deadline_seconds = float(pipeline_deadline_seconds)
+        if type(review_max_output_tokens) is not int or review_max_output_tokens <= 0:
+            raise ValidationError("review_max_output_tokens must be a positive integer")
+        if review_reasoning_effort not in {"none", "low", "medium", "high"}:
+            raise ValidationError("review_reasoning_effort is unsupported")
+        for name, value in (("review_call_timeout_seconds", review_call_timeout_seconds),
+                            ("review_inter_request_interval_seconds", review_inter_request_interval_seconds),
+                            ("model_call_timeout_seconds", model_call_timeout_seconds)):
+            if (type(value) not in (int, float) or not math.isfinite(value)
+                    or value < 0 or (name != "review_inter_request_interval_seconds" and value <= 0)):
+                raise ValidationError(f"{name} must be finite and positive" if name != "review_inter_request_interval_seconds"
+                                      else f"{name} must be finite and non-negative")
+        if type(repair_max_output_tokens) is not int or repair_max_output_tokens <= 0:
+            raise ValidationError("repair_max_output_tokens must be a positive integer")
+        self.review_max_output_tokens = review_max_output_tokens
+        self.review_reasoning_effort = review_reasoning_effort
+        self.review_call_timeout_seconds = float(review_call_timeout_seconds)
+        self.review_inter_request_interval_seconds = float(review_inter_request_interval_seconds)
+        self.repair_max_output_tokens = repair_max_output_tokens
+        self.model_call_timeout_seconds = float(model_call_timeout_seconds)
         if (type(argument_deadline_seconds) not in (int, float)
                 or not math.isfinite(argument_deadline_seconds) or argument_deadline_seconds <= 0):
             raise ValidationError("argument deadline must be finite and positive")
@@ -329,9 +704,20 @@ class PaperPipelineRunner:
         self.started_at = time.monotonic()
         self.deadline = self.started_at + self.pipeline_deadline_seconds
         self.reviewers = reviewers
+        if feedback_callback is not None and not callable(feedback_callback):
+            raise ValidationError("feedback_callback must be callable or None")
+        self.feedback_callback = feedback_callback
+        if type(review_arbiter_enabled) is not bool:
+            raise ValidationError("review_arbiter_enabled must be boolean")
+        self.review_arbiter_enabled = review_arbiter_enabled
         self.imported_draft = validate_manuscript_draft(deepcopy(draft)) if draft is not None else None
         self.initial_review_package = deepcopy(initial_review_package) if initial_review_package is not None else None
         self.repair_round = 0
+        self.compression_pass = 0
+        self.compression_audits = []
+        self.citation_binding_pass = 0
+        self.citation_binding_audits = []
+        self.repair_failures = []
         if self.output.exists():
             raise ValidationError("paper pipeline output directory must not already exist")
         self.output.mkdir(parents=True)
@@ -341,6 +727,21 @@ class PaperPipelineRunner:
         self.current_stage = "argument"
         self._write_run_metadata()
 
+    def _emit_feedback(self, event):
+        """Forward a bounded stage event to the project Composer.
+
+        The event is a control-plane summary.  Scientific prose, reviewer
+        bodies, and replacement text remain in their immutable stage files;
+        the Composer receives only the identity needed to route work.
+        """
+        if self.feedback_callback is None:
+            return
+        if not isinstance(event, dict) or not event.get("kind"):
+            raise ValidationError("paper feedback event requires a kind")
+        payload = deepcopy(event)
+        payload.setdefault("pipeline_output_dir", str(self.output))
+        self.feedback_callback(payload)
+
     def _write_run_metadata(self):
         self.output.joinpath("run-metadata.json").write_bytes(canonical_bytes({
             "schema_version": "paper-pipeline-run-metadata-2",
@@ -348,6 +749,11 @@ class PaperPipelineRunner:
             "started_epoch": self.started_epoch,
             "elapsed_seconds": max(0.0, time.monotonic() - self.started_at),
             "deadline_seconds": self.pipeline_deadline_seconds,
+            "review_call_timeout_seconds": self.review_call_timeout_seconds,
+            "review_inter_request_interval_seconds": self.review_inter_request_interval_seconds,
+            "repair_max_output_tokens": self.repair_max_output_tokens,
+            "model_call_timeout_seconds": self.model_call_timeout_seconds,
+            "review_arbiter_enabled": self.review_arbiter_enabled,
             "remaining_seconds": max(0.0, self.deadline - time.monotonic()),
             "stage": self.current_stage,
             "error": self.run_error,
@@ -368,7 +774,8 @@ class PaperPipelineRunner:
         remaining = self._remaining() if deadline is None else deadline - time.monotonic()
         if remaining < 0.2:
             raise ValidationError("paper pipeline deadline exceeded")
-        config["timeout_seconds"] = min(float(config["timeout_seconds"]), remaining)
+        config["timeout_seconds"] = min(float(config["timeout_seconds"]), remaining,
+                                         self.model_call_timeout_seconds)
         return ModelClient(**config)
 
     def _prepare_argument(self):
@@ -473,22 +880,104 @@ class PaperPipelineRunner:
             "Do not invent citations, measurements, analyses, or authors. The research_argument is the "
             "adjudicated scientific spine: preserve its question, observed patterns, competing explanations, "
             "primary thesis, scope boundary, and figure/table jobs. Results reports observations; Discussion "
-            "explains mechanisms and labels unresolved alternatives."
+            "explains mechanisms and labels unresolved alternatives. Follow any writer_contract in the packet: "
+            "use its section titles and stable unit IDs, copy its required scientific sentences exactly into the "
+            "named units, include every pinned citation marker, and satisfy its depth and figure requirements. "
+            "The manuscript surface must contain scientific meaning rather than pipeline state or provenance jargon."
         )
-        prompt = json.dumps(self.packet, ensure_ascii=False, sort_keys=True)
-        result = self._client(deadline=self.deadline).complete(system=system, prompt=prompt)
-        if result.finish_reason != "stop":
-            raise ValidationError(f"manuscript writer did not finish normally: {result.finish_reason}")
-        draft = validate_manuscript_draft(result.json_object())
-        (self.output / "writer-response.json").write_bytes(canonical_bytes({
-            "model": result.model, "finish_reason": result.finish_reason,
-            "usage": result.usage, "elapsed_seconds": result.elapsed_seconds,
-            "argument_sha256": (hashlib.sha256(canonical_bytes(argument)).hexdigest()
-                                if argument is not None else None),
-            "draft": draft,
-        }))
-        (self.output / "manuscript-draft-v1.json").write_bytes(canonical_bytes(draft))
-        return draft, result
+        # Composition is a bounded contract boundary.  A provider can return
+        # valid JSON that still violates the manuscript schema (or truncate the
+        # response), so retry with the exact validator error rather than
+        # admitting a malformed candidate or requiring an operator to repair
+        # it by hand.  The evidence packet is resent on every attempt so a
+        # repair cannot silently lose the scientific context.
+        previous = None
+        last_error = None
+        attempts = []
+        usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
+        for attempt in range(3):
+            payload = deepcopy(self.packet)
+            # Keep the transport contract explicit.  The packet contains the
+            # scientific content and section plan, but a model still needs a
+            # machine-readable reminder of the only shape accepted at this
+            # boundary; otherwise a valid narrative can be wrapped in an
+            # envelope or omit the citation policy field.
+            payload["writer_output_contract"] = {
+                "exact_top_level_keys": ["schema_version", "title", "sections", "citation"],
+                "schema_version": DRAFT_SCHEMA_VERSION,
+                "title": "nonempty string",
+                "citation": "nonempty string describing the citation marker policy",
+                "sections": [{
+                    "id": "section id from writer_contract.section_order",
+                    "title": "section title from writer_contract.section_order",
+                    "units": [{"id": "unit id from section_order", "kind": "heading|paragraph|table|figure|caption", "text": "nonempty string"}],
+                }],
+                "constraints": [
+                    "return exactly one JSON object with no markdown fence or wrapper key",
+                    "include every section and unit ID in writer_contract.section_order exactly once",
+                    "use reader-facing scientific prose in unit text",
+                ],
+            }
+            if previous is not None:
+                payload["writer_repair"] = {
+                    "assignment": "repair_invalid_manuscript_draft",
+                    "candidate_response": previous[:50000],
+                    "validation_error": str(last_error),
+                    "instructions": [
+                        "Return only the complete manuscript-draft-2 JSON object.",
+                        "Preserve all valid scientific content while repairing only the reported contract violation.",
+                        "Do not shorten the manuscript to make the schema pass; retain the requested depth and sections.",
+                    ],
+                }
+            prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            result = self._client(max_output_tokens=24000, deadline=self.deadline).complete(
+                system=system, prompt=prompt)
+            attempts.append(result)
+            # Preserve every failed candidate as a durable feedback input.  A
+            # later composer retry can inspect the exact contract failure
+            # without mutating the manuscript or guessing what the provider
+            # returned.
+            (self.output / f"writer-attempt-{attempt + 1}.json").write_bytes(canonical_bytes({
+                "attempt": attempt + 1,
+                "finish_reason": result.finish_reason,
+                "response": result.text,
+                "usage": result.usage,
+            }))
+            for key in usage:
+                usage[key] += result.usage.get(key, 0)
+            if result.finish_reason != "stop":
+                last_error = ValidationError(
+                    f"manuscript writer did not finish normally: {result.finish_reason}")
+                previous = result.text
+                continue
+            try:
+                draft = validate_manuscript_draft(result.json_object())
+            except ValidationError as exc:
+                last_error, previous = exc, result.text
+                continue
+            response = {
+                "model": result.model, "finish_reason": result.finish_reason,
+                "usage": usage, "attempts": len(attempts),
+                "elapsed_seconds": sum(item.elapsed_seconds for item in attempts),
+                "argument_sha256": (hashlib.sha256(canonical_bytes(argument)).hexdigest()
+                                    if argument is not None else None),
+                "draft": draft,
+            }
+            (self.output / "writer-response.json").write_bytes(canonical_bytes(response))
+            (self.output / "manuscript-draft-v1.json").write_bytes(canonical_bytes(draft))
+            result = ModelResult(text=result.text, model=result.model, usage=usage,
+                                 elapsed_seconds=response["elapsed_seconds"],
+                                 finish_reason=result.finish_reason)
+            return draft, result
+        failure = {
+            "status": "blocked",
+            "error": str(last_error or ValidationError("manuscript writer did not produce a valid draft")),
+            "attempts": len(attempts),
+            "attempt_files": [str(self.output / f"writer-attempt-{index}.json")
+                              for index in range(1, len(attempts) + 1)],
+        }
+        (self.output / "writer-failure.json").write_bytes(canonical_bytes(failure))
+        raise last_error or ValidationError("manuscript writer did not produce a valid draft")
 
     @staticmethod
     def _image_descriptors(paths):
@@ -502,6 +991,46 @@ class PaperPipelineRunner:
             descriptors.append({"path": str(path), "media_type": media_type,
                                 "sha256": hashlib.sha256(body).hexdigest()})
         return descriptors
+
+    def _compress_surface(self, draft, *, phase):
+        """Project internal result labels into a reader-facing draft.
+
+        The pass is deterministic and records its exact unit-level changes in
+        the pipeline directory.  It therefore behaves like an editorial desk
+        in the Composer loop rather than an opaque post-processing scrub.
+        """
+        self.compression_pass += 1
+        compressed, replacements, audit = compress_reader_surface(
+            draft, self.packet, self.paper_config)
+        audit = {
+            **audit,
+            "phase": phase,
+            "pass": self.compression_pass,
+            "replacement_sha256": hashlib.sha256(canonical_bytes(replacements)).hexdigest(),
+        }
+        path = self.output / f"editorial-compression-{self.compression_pass}.json"
+        path.write_bytes(canonical_bytes(audit))
+        self.compression_audits.append({"path": str(path), "phase": phase,
+                                       "changed_unit_ids": audit["changed_unit_ids"],
+                                       "removed_count": len(audit["removed"])})
+        return compressed, replacements, audit
+
+    def _bind_claim_citations(self, draft, *, phase):
+        self.citation_binding_pass += 1
+        bound, replacements, audit = bind_claim_citations(draft, self.paper_config)
+        audit = {
+            **audit,
+            "phase": phase,
+            "pass": self.citation_binding_pass,
+            "replacement_sha256": hashlib.sha256(canonical_bytes(replacements)).hexdigest(),
+        }
+        path = self.output / f"claim-citation-binding-{self.citation_binding_pass}.json"
+        path.write_bytes(canonical_bytes(audit))
+        self.citation_binding_audits.append({"path": str(path), "phase": phase,
+                                             "changed_unit_ids": audit["changed_unit_ids"],
+                                             "added": audit["added"],
+                                             "placeholder_removals": audit["placeholder_removals"]})
+        return bound, replacements, audit
 
     @staticmethod
     def _repair_targets(draft, package):
@@ -530,43 +1059,55 @@ class PaperPipelineRunner:
         units = _all_units(draft)
         original_markers = {unit_id: Counter(_citation_markers(units[unit_id]["text"]))
                             for unit_id in all_targets}
-        required_literals = []
-        required_literals.extend(
-            item["description"] for item in self.packet.get("results_package", {}).get("procedures", []))
-        required_literals.extend(
-            item["presentation"] for item in self.packet.get("results_package", {}).get("metrics", []))
-        required_literals.extend(self.packet.get("results_package", {}).get("limitations", []))
-        required_literals.extend(
-            beat["proposition"] for beat in self.paper_config.get("storyline", {}).get("beats", []))
-        required_literals.extend(claim["statement"] for claim in self.paper_config.get("claims", []))
-        required_literals.extend(
-            argument["observation"] for argument in self.paper_config.get("figure_arguments", []))
-        required_literals = tuple(dict.fromkeys(item for item in required_literals if item))
-        original_required = {
-            unit_id: tuple(item for item in required_literals if item in units[unit_id]["text"])
-            for unit_id in all_targets
-        }
+        # Result labels and writer-contract sentences are evidence/provenance
+        # inputs, not immutable surface text.  A reviewer may require a
+        # paragraph to be repaired precisely because that wording is too
+        # mechanical.  Scientific meaning is guarded below by the accepted
+        # argument projection; only citation markers and stable unit addresses
+        # remain literal invariants here.
+        original_required = {unit_id: tuple() for unit_id in all_targets}
         all_findings = [finding for review in package["reviews"] for finding in review["findings"]]
         protected_contract = {
             "storyline_propositions": [beat["proposition"] for beat in self.paper_config.get("storyline", {}).get("beats", [])],
             "claim_statements": [claim["statement"] for claim in self.paper_config.get("claims", [])],
             "required_citation_markers": [f"[[cite:{reference['key']}]]"
                                           for reference in self.paper_config.get("references", [])],
-            "required_results": [
-                *[item["description"] for item in self.packet.get("results_package", {}).get("procedures", [])],
-                *[item["presentation"] for item in self.packet.get("results_package", {}).get("metrics", [])],
-                *self.packet.get("results_package", {}).get("limitations", []),
+            # Preserve these as structured facts for the repair model, not as
+            # exact prose.  Literal copies belong in the internal evidence
+            # ledger and are projected into reader-facing language by the
+            # writer/editor.
+            "result_facts": [
+                {"id": item.get("id"), "presentation": item.get("presentation")}
+                for item in self.packet.get("results_package", {}).get("metrics", [])
+                if isinstance(item, dict)
             ],
-            "evidence_findings": [item["statement"] for item in self.packet.get("results_package", {}).get("findings", [])],
+            "evidence_findings": [
+                {"id": item.get("id"), "statement": item.get("statement")}
+                for item in self.packet.get("results_package", {}).get("findings", [])
+                if isinstance(item, dict)
+            ],
         }
         system = (
             "You are a surgical scientific editor in an autonomous pipeline. "
             "Return exactly one JSON object and no prose outside it. "
             "A replacement is allowed only for a unit named in the packet."
         )
-        batch_size = 5
-        batches = [all_targets[index:index + batch_size]
-                   for index in range(0, len(all_targets), batch_size)]
+        # Keep each repair response small enough to finish inside its own
+        # provider budget.  Two short units can share context, but a long pair
+        # (usually Discussion paragraphs) is split automatically so one
+        # response cannot consume the entire stage deadline.
+        batches = []
+        current = []
+        current_chars = 0
+        for unit_id in all_targets:
+            size = len(units[unit_id]["text"])
+            if current and (len(current) >= 2 or current_chars + size > 2600):
+                batches.append(current)
+                current, current_chars = [], 0
+            current.append(unit_id)
+            current_chars += size
+        if current:
+            batches.append(current)
 
         def run_batch(batch_index, targets):
             findings = [finding for finding in all_findings
@@ -592,7 +1133,12 @@ class PaperPipelineRunner:
             last_error = None
             attempts = []
             citation_restorations = []
+            content_restorations = []
+            structural_preservations = []
             for attempt in range(4):
+                citation_restorations = []
+                content_restorations = []
+                structural_preservations = []
                 if previous is not None:
                     retry_payload = deepcopy(payload)
                     retry_payload["assignment"] = "repair_invalid_surgical_replacements"
@@ -604,7 +1150,8 @@ class PaperPipelineRunner:
                     prompt = json.dumps(retry_payload, ensure_ascii=False, sort_keys=True)
                 else:
                     prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-                result = self._client(max_output_tokens=12000, reasoning_effort="medium").complete(
+                result = self._client(max_output_tokens=self.repair_max_output_tokens,
+                                      reasoning_effort="medium").complete(
                     system=system, prompt=prompt)
                 attempts.append(result)
                 (self.output / f"repair-round-{repair_round}-batch-{batch_index + 1}-attempt-{attempt + 1}.json").write_bytes(
@@ -627,18 +1174,53 @@ class PaperPipelineRunner:
                             text is not None and (not isinstance(text, str) or not text.strip())
                             for text in replacements.values()):
                         raise ValidationError("manuscript repair must replace exactly the targeted units")
+                    # Stable paragraph IDs are part of the document address
+                    # system.  A reviewer may request removal of a duplicate
+                    # p1, but deleting it would punch a hole before p2/p3 and
+                    # invalidate every later reference.  Preserve that address
+                    # with a reader-facing bridge; terminal units can still be
+                    # deleted when no sequence would be broken.
+                    section_units = {
+                        section["id"]: [unit["id"] for unit in section["units"]]
+                        for section in draft["sections"]
+                    }
+                    for unit_id, text in list(replacements.items()):
+                        if text is not None:
+                            continue
+                        section_id = next((sid for sid, ids in section_units.items() if unit_id in ids), None)
+                        ids = section_units.get(section_id, [])
+                        match = re.fullmatch(r".+_p([1-9][0-9]*)", unit_id)
+                        later = False
+                        if match:
+                            number = int(match.group(1))
+                            later = any(
+                                (later_match := re.fullmatch(r".+_p([1-9][0-9]*)", candidate))
+                                and int(later_match.group(1)) > number
+                                for candidate in ids)
+                        if later:
+                            replacements[unit_id] = "The detailed protocol is specified in the following paragraph."
+                            structural_preservations.append({
+                                "unit_id": unit_id,
+                                "action": "preserve_stable_paragraph_address",
+                            })
                     for unit_id, text in replacements.items():
                         before = original_markers[unit_id]
                         if text is None:
-                            if before or original_required[unit_id]:
+                            if before:
                                 raise ValidationError(
-                                    f"repair cannot delete {unit_id}; it contains protected manuscript content")
+                                    f"repair cannot delete {unit_id}; it contains citation bindings")
+                            # Required scientific literals are document-level
+                            # invariants.  If an editorial finding removes a
+                            # duplicate unit that carries one, relocate the
+                            # exact literal to another named unit below rather
+                            # than allowing content loss or rejecting the
+                            # whole repair contract.
+                            for item in original_required[unit_id]:
+                                content_restorations.append({"literal": item, "source_unit_id": unit_id})
                             continue
                         dropped = [item for item in original_required[unit_id] if item not in text]
-                        if dropped:
-                            raise ValidationError(
-                                f"repair must preserve protected manuscript content for {unit_id}; "
-                                f"missing={dropped}")
+                        for item in dropped:
+                            content_restorations.append({"literal": item, "source_unit_id": unit_id})
                         after = Counter(_citation_markers(text))
                         extra = sorted((after - before).elements())
                         if extra:
@@ -662,9 +1244,38 @@ class PaperPipelineRunner:
                 for item in attempts:
                     for key in usage:
                         usage[key] += item.usage.get(key, 0)
+                # Restore any exact scientific literal that a targeted rewrite
+                # dropped.  Prefer the original unit when it remains; for a
+                # requested deletion, use another target in the same section
+                # so the sentence stays close to its source claim.
+                unit_sections = {
+                    unit["id"]: section["id"]
+                    for section in draft["sections"] for unit in section["units"]
+                }
+                for restoration in content_restorations:
+                    literal = restoration["literal"]
+                    current_text = " ".join(
+                        value for value in replacements.values() if isinstance(value, str))
+                    if literal in current_text:
+                        continue
+                    source_id = restoration["source_unit_id"]
+                    recipient = source_id if isinstance(replacements.get(source_id), str) else None
+                    if recipient is None:
+                        same_section = [unit_id for unit_id, value in replacements.items()
+                                        if isinstance(value, str)
+                                        and unit_sections.get(unit_id) == unit_sections.get(source_id)]
+                        recipient = same_section[0] if same_section else next(
+                            (unit_id for unit_id, value in replacements.items() if isinstance(value, str)), None)
+                    if recipient is None:
+                        raise ValidationError(
+                            f"repair removed protected manuscript content for {source_id} and provided no recipient")
+                    replacements[recipient] = replacements[recipient].rstrip() + " " + literal
+                    restoration["recipient_unit_id"] = recipient
                 return {"batch_index": batch_index, "targets": targets, "replacements": replacements,
                         "usage": usage, "attempts": len(attempts),
                         "citation_restorations": citation_restorations,
+                        "content_restorations": content_restorations,
+                        "structural_preservations": structural_preservations,
                         "elapsed_seconds": sum(item.elapsed_seconds for item in attempts)}
             else:
                 raise last_error
@@ -681,13 +1292,22 @@ class PaperPipelineRunner:
                 for future in pending:
                     future.cancel()
                 raise ValidationError("paper pipeline deadline exceeded during surgical repair")
-            outcomes = [future.result() for future in futures]
+            outcomes = []
+            for index, future in enumerate(futures):
+                try:
+                    outcomes.append(future.result())
+                except Exception as exc:
+                    failure = {"batch_index": index, "targets": batches[index],
+                               "error": f"{type(exc).__name__}: {exc}"}
+                    self.repair_failures.append(failure)
+                    (self.output / f"repair-round-{repair_round}-batch-{index + 1}-failure.json").write_bytes(
+                        canonical_bytes(failure))
         finally:
             pool.shutdown(wait=not pending, cancel_futures=True)
         outcomes.sort(key=lambda item: item["batch_index"])
         aggregate_replacements = {}
         aggregate_usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
-        aggregate_elapsed = max(item["elapsed_seconds"] for item in outcomes)
+        aggregate_elapsed = max((item["elapsed_seconds"] for item in outcomes), default=0.0)
         for outcome in outcomes:
             aggregate_replacements.update(outcome["replacements"])
             for key in aggregate_usage:
@@ -695,7 +1315,9 @@ class PaperPipelineRunner:
             (self.output / f"repair-round-{repair_round}-batch-{outcome['batch_index'] + 1}.json").write_bytes(
                 canonical_bytes({"targets": outcome["targets"], "replacements": outcome["replacements"],
                                  "usage": outcome["usage"], "attempts": outcome["attempts"],
-                                 "citation_restorations": outcome.get("citation_restorations", [])}))
+                                 "citation_restorations": outcome.get("citation_restorations", []),
+                                 "content_restorations": outcome.get("content_restorations", []),
+                                 "structural_preservations": outcome.get("structural_preservations", [])}))
         for section in draft["sections"]:
             for unit in section["units"]:
                 if unit["id"] in aggregate_replacements and aggregate_replacements[unit["id"]] is not None:
@@ -711,25 +1333,44 @@ class PaperPipelineRunner:
                 "surgical repair left citation markers inconsistent with the pinned reference set: "
                 f"missing={sorted(expected_references - actual_references)}, "
                 f"unexpected={sorted(actual_references - expected_references)}")
-        manuscript_text = " ".join(unit["text"] for unit in _all_units(draft).values())
-        missing_literals = [item for item in required_literals if item not in manuscript_text]
-        if missing_literals:
-            raise ValidationError(
-                "surgical repair removed protected manuscript content: "
-                f"missing={missing_literals}")
         validate_manuscript_draft(draft)
+        # Re-check the accepted scientific spine after the projection.  This
+        # permits reader-facing paraphrase while rejecting a repair that drops
+        # the research question, thesis, observed patterns, or Discussion
+        # requirement altogether.
+        validate_argument_projection(
+            draft, self.research_argument,
+            require_discussion=self.paper_config.get("document_type") == "research_paper")
         result = ModelResult(text="", model=self.model_config["model"], usage=aggregate_usage,
-                             elapsed_seconds=aggregate_elapsed, finish_reason="stop")
+                             elapsed_seconds=aggregate_elapsed,
+                             finish_reason="partial" if len(outcomes) < len(batches) else "stop")
         return draft, aggregate_replacements, result
 
     def run(self):
         try:
             self._remaining()
             argument, argument_review = self._prepare_argument()
+            self._emit_feedback({
+                "event_id": "paper-argument-accepted",
+                "kind": "argument",
+                "status": "accepted",
+                "decision": argument_review.get("decision"),
+                "artifact_path": str(self.output / "research-argument.json"),
+            })
             draft, writer_result = self._writer(argument)
+            draft, _, _ = self._compress_surface(draft, phase="after_writer")
+            draft, _, _ = self._bind_claim_citations(draft, phase="after_writer")
             validate_argument_projection(
                 draft, argument,
                 require_discussion=self.paper_config.get("document_type") == "research_paper")
+            self._emit_feedback({
+                "event_id": "paper-draft-produced",
+                "kind": "draft",
+                "status": "completed",
+                "section_count": len(draft["sections"]),
+                "word_count": _word_count(draft),
+                "artifact_path": str(self.output / "manuscript-draft-v1.json"),
+            })
         except Exception as exc:
             self.run_status = "failed"
             self.current_stage = "failed"
@@ -754,7 +1395,12 @@ class PaperPipelineRunner:
                 self.current_stage = "review"
                 self._write_run_metadata()
                 self._remaining()
-                input_doc = _review_input(draft)
+                # Reviewers inspect a reader-facing projection.  Citation
+                # bindings remain exact in the structured manuscript and
+                # release ledger, while the internal ``[[cite:key]]`` tokens
+                # are rendered as ordinary numeric citations for editorial
+                # judgement.
+                input_doc = _review_input(draft, references=self.paper_config.get("references"))
                 if round_number == 1 and self.initial_review_package is not None:
                     package = deepcopy(self.initial_review_package)
                     # The standalone review command accepts the structured
@@ -765,8 +1411,22 @@ class PaperPipelineRunner:
                     # resumed without weakening content identity checks.
                     expected_hashes = {
                         hashlib.sha256(canonical_bytes(input_doc)).hexdigest(),
+                        hashlib.sha256(canonical_bytes(_review_input(draft))).hexdigest(),
                         hashlib.sha256(canonical_bytes(draft)).hexdigest(),
                     }
+                    # Claim-local citation binding is a deterministic
+                    # provenance projection.  A cached review created before
+                    # that projection remains valid when its manuscript hash
+                    # names the imported reader surface; the scientific unit
+                    # text is otherwise unchanged.  Keep both hashes in the
+                    # resume contract and retain the binding audit below.
+                    if self.imported_draft is not None:
+                        expected_hashes.update({
+                            hashlib.sha256(canonical_bytes(_review_input(
+                                self.imported_draft, references=self.paper_config.get("references")))).hexdigest(),
+                            hashlib.sha256(canonical_bytes(_review_input(self.imported_draft))).hexdigest(),
+                            hashlib.sha256(canonical_bytes(self.imported_draft)).hexdigest(),
+                        })
                     if package.get("manuscript_sha256") not in expected_hashes:
                         raise ValidationError("cached manuscript review does not match the resumed draft")
                     if package.get("status") not in {"accepted", "needs_revision"}:
@@ -775,13 +1435,72 @@ class PaperPipelineRunner:
                     round_config = deepcopy(review_config)
                     if round_number > 1:
                         round_config["reasoning_effort"] = "medium"
+
+                    def relay_review_event(event, *, _round=round_number):
+                        event = deepcopy(event)
+                        event["round"] = _round
+                        suffix = event.get("reviewer_id", "all")
+                        event["event_id"] = f"paper-{event.get('kind', 'review')}-r{_round}-{suffix}"
+                        self._emit_feedback(event)
+
                     runner = ManuscriptReviewRunner(
                         round_config, reviewers=self.reviewers,
-                        deadline_seconds=min(self.review_deadline_seconds, self._remaining()))
+                        deadline_seconds=min(self.review_deadline_seconds, self._remaining()),
+                        max_output_tokens=self.review_max_output_tokens,
+                        reasoning_effort=self.review_reasoning_effort,
+                        call_timeout_seconds=min(self.review_call_timeout_seconds, self._remaining()),
+                        inter_request_interval_seconds=self.review_inter_request_interval_seconds,
+                        arbiter_enabled=self.review_arbiter_enabled)
                     package = runner.run(input_doc, images=image_descriptors,
                                          interpretation=self.packet.get("scientific_interpretation"),
                                          argument=argument,
-                                         artifact_dir=self.output / f"review-round-{round_number}")
+                                         evidence={
+                                             "results_package": self.packet.get("results_package"),
+                                             "paper_evidence": self.paper_config.get("evidence", []),
+                                             "paper_claims": self.paper_config.get("claims", []),
+                                             "references": self.paper_config.get("references", []),
+                                             "scholarly_depth": {
+                                                 "profile_id": (profile_for_paper(self.paper_config)
+                                                                 if self.paper_config.get("schema_version") == "paper-release-score-3"
+                                                                 else "validation_report"),
+                                                 "depth_profile": self.paper_config.get("depth_profile", {}),
+                                                 "figure_argument_count": len(self.paper_config.get("figure_arguments", [])),
+                                             },
+                                         },
+                                         artifact_dir=self.output / f"review-round-{round_number}",
+                                         feedback_callback=relay_review_event)
+                if round_number == 1 and self.initial_review_package is not None:
+                    # A resumed run imported the package without invoking the
+                    # reviewer workers.  Replay only its compact routing
+                    # summaries so the Composer's organizational ledger stays
+                    # complete without duplicating review bodies.
+                    review_dir = self.output / f"review-round-{round_number}"
+                    for review in package.get("reviews", []):
+                        severities = {severity: 0 for severity in ("blocking", "major", "minor")}
+                        for finding in review.get("findings", []):
+                            if finding.get("severity") in severities:
+                                severities[finding["severity"]] += 1
+                        self._emit_feedback({
+                            "event_id": f"paper-review-r{round_number}-{review['reviewer_id']}",
+                            "kind": "review", "round": round_number,
+                            "reviewer_id": review["reviewer_id"], "stage": review.get("stage"),
+                            "decision": review.get("decision"),
+                            "status": "accepted" if review.get("decision") == "accept" else "needs_revision",
+                            "finding_ids": [finding.get("id") for finding in review.get("findings", [])],
+                            "severity_counts": severities,
+                            "artifact_path": str(review_dir / f"review-{review['reviewer_id']}.json"),
+                        })
+                    synthesis = package.get("synthesis", {})
+                    self._emit_feedback({
+                        "event_id": f"paper-synthesis-r{round_number}",
+                        "kind": "synthesis", "round": round_number,
+                        "decision": synthesis.get("decision"),
+                        "status": "accepted" if synthesis.get("decision") == "accept" else "needs_revision",
+                        "required_repairs": [item.get("finding_id") for item in synthesis.get("required_repairs", [])],
+                        "accepted_reviewers": list(synthesis.get("accepted_reviewers", [])),
+                        "verification_contract": list(synthesis.get("verification_contract", [])),
+                        "artifact_path": str(review_dir / "synthesis.json"),
+                    })
                 review_history.append(package)
                 total_usage = {key: total_usage.get(key, 0) + package["usage"].get(key, 0)
                                for key in {"model_calls", "input_tokens", "output_tokens"}}
@@ -800,7 +1519,29 @@ class PaperPipelineRunner:
                     accepted_package = package
                     review_status = "needs_review"
                     break
-                draft, replacements, repair_result = self._repair(draft, package)
+                try:
+                    draft, replacements, repair_result = self._repair(draft, package)
+                except Exception as exc:
+                    self._emit_feedback({
+                        "event_id": f"paper-repair-failure-r{round_number}",
+                        "kind": "repair_failure", "round": round_number,
+                        "status": "blocked", "error": f"{type(exc).__name__}: {exc}",
+                    })
+                    raise
+                draft, compression_replacements, _ = self._compress_surface(
+                    draft, phase=f"after_repair_round_{round_number}")
+                draft, citation_replacements, _ = self._bind_claim_citations(
+                    draft, phase=f"after_repair_round_{round_number}")
+                replacements = {**replacements, **compression_replacements,
+                                **citation_replacements}
+                self._emit_feedback({
+                    "event_id": f"paper-repair-r{round_number}",
+                    "kind": "repair", "round": round_number,
+                    "status": "completed" if repair_result.finish_reason == "stop" else "partial",
+                    "target_unit_ids": sorted(replacements),
+                    "replacement_count": len(replacements),
+                    "repair_failures": deepcopy(self.repair_failures),
+                })
                 total_usage = {key: total_usage.get(key, 0) + repair_result.usage.get(key, 0)
                                for key in {"model_calls", "input_tokens", "output_tokens"}}
                 project.apply_replacements(draft, replacements)
@@ -837,16 +1578,49 @@ class PaperPipelineRunner:
             release = PaperReleaseBuilder(
                 release_dir, paper_config, research_argument=argument,
                 argument_review=argument_review).build(compile_script=self.compile_script)
+            scholarly_review = release.get("scholarly_depth_review") or {}
+            scholarly_needs_revision = scholarly_review.get("decision") == "revise"
+            if scholarly_review:
+                check_outcomes = {item.get("id"): item.get("outcome")
+                                  for item in scholarly_review.get("checks", [])}
+                severities = {severity: 0 for severity in ("blocking", "major", "minor")}
+                severities["major"] = sum(outcome == "failed" for outcome in check_outcomes.values())
+                self._emit_feedback({
+                    "event_id": "paper-review-journal-editor",
+                    "kind": "review",
+                    "reviewer_id": "journal_editor",
+                    "stage": 6,
+                    "decision": scholarly_review.get("decision"),
+                    "status": "needs_revision" if scholarly_needs_revision else "accepted",
+                    "finding_ids": [finding.get("id") for finding in scholarly_review.get("findings", [])],
+                    "severity_counts": severities,
+                    "artifact_path": str(release_dir / "output" / "scholarly-depth-review.json"),
+                })
+                if scholarly_needs_revision:
+                    final_status = "needs_review"
+            self._emit_feedback({
+                "event_id": "paper-release-built",
+                "kind": "release",
+                "status": final_status,
+                "review_rounds": len(review_history),
+                "pdf_path": str(release_dir / "output" / "pdf" / f"{paper_config['paper_id']}.pdf"),
+                "render_report": release.get("visual_review_report") if isinstance(release, dict) else None,
+            })
             result = {"schema_version": PIPELINE_SCHEMA_VERSION,
                       "status": "completed" if final_status == "accepted" else "candidate_needs_review",
                       "word_count": _word_count(draft), "sections": len(draft["sections"]),
                       "review_rounds": len(review_history), "review_status": final_status,
+                      "scholarly_depth_status": scholarly_review.get("decision") if scholarly_review else None,
+                      "scholarly_profile": scholarly_review.get("profile_id") if scholarly_review else None,
                       "argument_status": argument_review["decision"],
                       "research_argument_path": str(self.output / "research-argument.json"),
                       "research_argument_review_path": str(self.output / "research-argument-review.json"),
                       "research_argument_sha256": hashlib.sha256(canonical_bytes(argument)).hexdigest(),
                       "manuscript_project_dir": str(project_dir), "release_dir": str(release_dir),
                       "pdf": str(release_dir / "output" / "pdf" / f"{paper_config['paper_id']}.pdf"),
+                      "surface_compression": deepcopy(self.compression_audits),
+                      "surface_citation_binding": deepcopy(self.citation_binding_audits),
+                      "repair_failures": deepcopy(self.repair_failures),
                       "usage": total_usage, "elapsed_seconds": time.monotonic() - self.started_at,
                       "deadline_seconds": self.pipeline_deadline_seconds, "release": release}
             (self.output / "pipeline-result.json").write_bytes(canonical_bytes(result))

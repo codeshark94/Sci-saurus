@@ -11,8 +11,10 @@ from concurrent.futures import ThreadPoolExecutor, wait
 import hashlib
 import json
 import math
+import re
 import time
 from copy import deepcopy
+import threading
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
@@ -22,6 +24,7 @@ from scisaurus.runtime.models import ModelClient, ModelResult
 REVIEW_SCHEMA_VERSION = "manuscript-review-2"
 SYNTHESIS_SCHEMA_VERSION = "manuscript-review-synthesis-2"
 PACKAGE_SCHEMA_VERSION = "manuscript-review-package-2"
+ARBITRATION_SCHEMA_VERSION = "manuscript-review-arbitration-1"
 MAX_SCHEMA_ATTEMPTS = 4
 DEFAULT_DEADLINE_SECONDS = 1200.0
 _COMPATIBLE_REVIEW_SCHEMAS = {"manuscript-review-1", REVIEW_SCHEMA_VERSION}
@@ -40,6 +43,8 @@ DEFAULT_REVIEWERS = (
      "focus": "Read as a skeptical human scientist. Check that the research question is explicit, the important pattern is prioritized, the Discussion explains plausible mechanisms, and proposed explanations are distinguished from established observations."},
     {"id": "editorial_compression", "stage": 5,
      "focus": "Act as a scientific copy editor. Detect pipeline vocabulary, repeated numeric facts, duplicated caveats, weak figure integration, unprioritized limitations, and section paragraphs that do not perform a human-paper function."},
+    {"id": "journal_editor", "stage": 6,
+     "focus": "Act as a handling editor for the declared scholarly profile. Judge whether the literature review is deep and relevant enough to position the contribution, whether citations are distributed across the argument, and whether the figures and tables are sufficient to support the paper's claims. Desk-reject a thin validation note presented as a journal article; request scoped literature or experiment work rather than padding."},
 )
 
 
@@ -63,6 +68,108 @@ def _strings(value, name, *, nonempty=False):
     for item in value:
         _text(item, name)
     return value
+
+
+_DECIMAL_TOKEN = re.compile(r"(?<![A-Za-z])[-+]?(?:\d+\.\d+(?:e[-+]?\d+)?|\d+e[-+]?\d+)", re.IGNORECASE)
+
+
+def _compact_evidence(evidence):
+    """Return the bounded evidence view shared by every review role.
+
+    Reviewers need the method and result facts to challenge a manuscript, but
+    the raw observation grid and service bookkeeping can make an otherwise
+    bounded review request unreasonably large.  Keep the source-facing fields
+    that can establish a claim and omit execution payloads.
+    """
+    if evidence is None:
+        return None
+    if not isinstance(evidence, dict):
+        return evidence
+    result = evidence.get("results_package", evidence)
+    if not isinstance(result, dict):
+        return evidence
+    compact = {}
+    for key in ("schema_version", "id", "revision", "study_type", "question", "hypothesis",
+                "procedures", "metrics", "findings", "limitations", "validation"):
+        if key in result:
+            compact[key] = deepcopy(result[key])
+    if "paper_evidence" in evidence:
+        compact["paper_evidence"] = deepcopy(evidence["paper_evidence"])
+    if "paper_claims" in evidence:
+        compact["paper_claims"] = deepcopy(evidence["paper_claims"])
+    if "references" in evidence:
+        compact["references"] = deepcopy(evidence["references"])
+    if "scholarly_depth" in evidence:
+        compact["scholarly_depth"] = deepcopy(evidence["scholarly_depth"])
+    return compact
+
+
+def _evidence_text(evidence):
+    """Flatten reader-facing evidence strings for conservative fact binding."""
+    compact = _compact_evidence(evidence)
+    if compact is None:
+        return ""
+    values = []
+
+    def visit(value):
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(compact)
+    return " ".join(values)
+
+
+def _finding_target_text(finding, manuscript):
+    unit_map = {
+        unit["id"]: unit.get("text", "")
+        for section in manuscript.get("sections", [])
+        for unit in section.get("units", [])
+        if isinstance(unit, dict) and isinstance(unit.get("id"), str)
+    }
+    names = list(finding.get("protected", []))
+    location = finding.get("location", "")
+    if isinstance(location, str):
+        names.extend(unit_id for unit_id in unit_map if unit_id in location)
+    return " ".join(unit_map[name] for name in dict.fromkeys(names) if name in unit_map)
+
+
+def audit_numeric_repair_support(reviews, manuscript, evidence):
+    """Find proposed decimal corrections absent from the frozen evidence.
+
+    A reviewer may be correct that a number is wrong, but a new number must
+    first be established by an evidence or calculation artifact.  This audit
+    never changes the finding; it gives the Composer Arbiter a deterministic
+    reason to defer or reject an unsupported edit instead of allowing a model
+    to overwrite an evidence-backed value by assertion.
+    """
+    evidence_text = _evidence_text(evidence)
+    audit = {}
+    for review in reviews:
+        for finding in review.get("findings", []):
+            proposed = {_normalise_number(token) for token in _DECIMAL_TOKEN.findall(
+                finding.get("surgical_fix", ""))}
+            if not proposed:
+                continue
+            target_text = _finding_target_text(finding, manuscript)
+            target_tokens = {_normalise_number(token) for token in _DECIMAL_TOKEN.findall(target_text)}
+            evidence_tokens = {_normalise_number(token) for token in _DECIMAL_TOKEN.findall(evidence_text)}
+            unsupported = sorted(proposed - target_tokens - evidence_tokens)
+            if unsupported:
+                audit[finding["id"]] = {
+                    "unsupported_decimal_tokens": unsupported,
+                    "reason": "proposed decimal values are absent from the target text and frozen evidence",
+                }
+    return audit
+
+
+def _normalise_number(token):
+    return token.casefold().lstrip("+")
 
 
 def validate_review(value, reviewer_id, stage):
@@ -111,7 +218,131 @@ def validate_review(value, reviewer_id, stage):
     return value
 
 
-def validate_synthesis(value, reviews):
+def validate_adjudication(value, reviews):
+    """Validate an Arbiter's finding-level reconciliation contract."""
+    fields = {"schema_version", "decision", "resolutions", "rationale"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValidationError(f"manuscript adjudication requires exactly {sorted(fields)}")
+    if value["schema_version"] != ARBITRATION_SCHEMA_VERSION:
+        raise ValidationError("unsupported manuscript adjudication schema")
+    if value["decision"] not in {"resolved", "unresolved"}:
+        raise ValidationError("manuscript adjudication decision is invalid")
+    _text(value["rationale"], "adjudication rationale")
+    all_findings = {
+        finding["id"]: finding
+        for review in reviews for finding in review["findings"]
+    }
+    resolutions = value["resolutions"]
+    if not isinstance(resolutions, list):
+        raise ValidationError("adjudication resolutions must be a list")
+    ids = set()
+    for resolution in resolutions:
+        expected = {"id", "finding_ids", "decision", "rationale", "directive"}
+        if not isinstance(resolution, dict) or set(resolution) != expected:
+            raise ValidationError("adjudication resolution has an invalid shape")
+        _id(resolution["id"], "adjudication resolution id")
+        if resolution["id"] in ids or resolution["decision"] not in {"retain", "reject", "merge"}:
+            raise ValidationError("adjudication resolution is duplicated or has an invalid decision")
+        _strings(resolution["finding_ids"], "adjudication finding_ids", nonempty=True)
+        if set(resolution["finding_ids"]) - set(all_findings):
+            raise ValidationError("adjudication names an unknown finding")
+        if ids.intersection(resolution["finding_ids"]):
+            raise ValidationError("adjudication assigns a finding to more than one resolution")
+        _text(resolution["rationale"], "adjudication resolution rationale")
+        _text(resolution["directive"], "adjudication resolution directive")
+        ids.add(resolution["id"])
+        ids.update(resolution["finding_ids"])
+    required = {
+        finding_id for finding_id, finding in all_findings.items()
+        if finding["severity"] in {"blocking", "major"}
+    }
+    if required - ids:
+        raise ValidationError("adjudication omitted a blocking or major finding")
+    # ``resolved`` means that every material finding received an explicit
+    # disposition.  A disposition may be ``reject`` when the Arbiter records
+    # why a competing critique is unsupported or redundant; rejecting a
+    # finding is itself a resolved organisational decision and must not force
+    # the synthesizer to request both mutually exclusive repairs.
+    canonical_bytes(value)
+    return value
+
+
+def apply_numeric_evidence_guard(adjudication, numeric_audit):
+    """Prevent an Arbiter from authorising an ungrounded numeric edit.
+
+    The guard operates on the adjudication contract, not on scientific prose.
+    A finding that introduces a decimal value absent from both its target and
+    the frozen evidence is split into a recorded ``reject`` disposition.  The
+    original finding remains in the review archive, while the editor receives
+    no permission to apply that unsupported number.  Compatible findings in
+    the same resolution remain intact.
+    """
+    if not numeric_audit:
+        return deepcopy(adjudication)
+    guarded = deepcopy(adjudication)
+    resolutions = []
+    used_ids = set()
+
+    def unique_id(base):
+        candidate = base[:96]
+        index = 2
+        while candidate in used_ids:
+            suffix = f"_{index}"
+            candidate = f"{base[:96 - len(suffix)]}{suffix}"
+            index += 1
+        used_ids.add(candidate)
+        return candidate
+
+    for resolution in guarded["resolutions"]:
+        finding_ids = list(resolution["finding_ids"])
+        unsupported = [finding_id for finding_id in finding_ids if finding_id in numeric_audit]
+        supported = [finding_id for finding_id in finding_ids if finding_id not in numeric_audit]
+        if unsupported and resolution["decision"] in {"retain", "merge"}:
+            if supported:
+                kept = deepcopy(resolution)
+                kept["id"] = unique_id(resolution["id"])
+                kept["finding_ids"] = supported
+                resolutions.append(kept)
+            tokens = sorted({token for finding_id in unsupported
+                             for token in numeric_audit[finding_id]["unsupported_decimal_tokens"]})
+            resolutions.append({
+                "id": unique_id(f"{resolution['id']}_evidence_guard"),
+                "finding_ids": unsupported,
+                "decision": "reject",
+                "rationale": (
+                    "The proposed decimal correction was not present in the target text or frozen evidence "
+                    f"({', '.join(tokens)}); the finding remains archived until a fact-verification artifact exists."
+                ),
+                "directive": "Do not alter the manuscript for this numeric proposal; request evidence verification.",
+            })
+        else:
+            kept = deepcopy(resolution)
+            kept["id"] = unique_id(resolution["id"])
+            resolutions.append(kept)
+    guarded["resolutions"] = resolutions
+    return guarded
+
+
+def _normalise_adjudication_candidate(value):
+    """Remove provider-only resolution metadata before strict validation."""
+    if not isinstance(value, dict):
+        return value, []
+    candidate = deepcopy(value)
+    changes = []
+    resolutions = candidate.get("resolutions")
+    if isinstance(resolutions, list):
+        for resolution in resolutions:
+            if not isinstance(resolution, dict):
+                continue
+            if "protected" in resolution:
+                resolution.pop("protected")
+                changes.append({"field": "resolutions.protected",
+                                "resolution_id": resolution.get("id"),
+                                "reason": "provider echoed manuscript protection metadata outside the adjudication contract"})
+    return candidate, changes
+
+
+def validate_synthesis(value, reviews, adjudication=None):
     fields = {"schema_version", "decision", "required_repairs", "accepted_reviewers", "rationale", "verification_contract"}
     if not isinstance(value, dict) or set(value) != fields:
         raise ValidationError(f"manuscript synthesis requires exactly {sorted(fields)}")
@@ -128,19 +359,28 @@ def validate_synthesis(value, reviews):
         raise ValidationError("required_repairs must be a list")
     ids = set()
     all_findings = {finding["id"] for review in reviews for finding in review["findings"]}
+    retained_findings = set(all_findings)
+    if adjudication is not None:
+        validate_adjudication(adjudication, reviews)
+        retained_findings = {
+            finding_id for resolution in adjudication["resolutions"]
+            if resolution["decision"] in {"retain", "merge"}
+            for finding_id in resolution["finding_ids"]
+        }
     for repair in repairs:
         expected = {"finding_id", "owner", "scope", "verification"}
         if not isinstance(repair, dict) or set(repair) != expected:
             raise ValidationError("synthesis repair has an invalid shape")
         _id(repair["finding_id"], "repair finding_id")
-        if repair["finding_id"] in ids or repair["finding_id"] not in all_findings:
+        if repair["finding_id"] in ids or repair["finding_id"] not in retained_findings:
             raise ValidationError("synthesis repair references an unknown or duplicated finding")
         for key in ("owner", "scope", "verification"):
             _text(repair[key], f"repair {key}")
         ids.add(repair["finding_id"])
     if value["decision"] == "revise":
         required = {finding["id"] for review in reviews for finding in review["findings"]
-                    if finding["severity"] in {"blocking", "major"}}
+                    if finding["severity"] in {"blocking", "major"}
+                    and finding["id"] in retained_findings}
         if not required.issubset(ids):
             raise ValidationError("revision synthesis omitted a blocking or major finding")
     if value["decision"] == "accept" and repairs:
@@ -149,6 +389,200 @@ def validate_synthesis(value, reviews):
         raise ValidationError("accepted synthesis must name every reviewer")
     canonical_bytes(value)
     return value
+
+
+def _normalise_synthesis_candidate(value):
+    """Bind unambiguous provider shapes to the synthesis contract.
+
+    Review models occasionally return a unit address list for a repair scope.
+    The Composer keeps the addresses as one readable, deterministic string;
+    no repair text or finding identity is changed.  Other malformed fields
+    remain subject to the strict synthesis validator.
+    """
+    if not isinstance(value, dict):
+        return value, []
+    candidate = deepcopy(value)
+    changes = []
+    repairs = candidate.get("required_repairs")
+    if isinstance(repairs, list):
+        for repair in repairs:
+            if not isinstance(repair, dict):
+                continue
+            scope = repair.get("scope")
+            if isinstance(scope, list) and scope and all(isinstance(item, str) and item.strip() for item in scope):
+                repair["scope"] = "; ".join(scope)
+                changes.append({"field": "required_repairs.scope", "finding_id": repair.get("finding_id"),
+                                "reason": "provider returned unit addresses as a list"})
+            if "verification" not in repair and isinstance(repair.get("verification_check"), str):
+                repair["verification"] = repair.pop("verification_check")
+                changes.append({"field": "required_repairs.verification", "finding_id": repair.get("finding_id"),
+                                "reason": "provider used the unambiguous verification_check alias"})
+    return candidate, changes
+
+
+def _namespace_review_findings(review):
+    """Give findings a stable reviewer-qualified identity before synthesis.
+
+    Reviewers are independent and commonly use local IDs such as ``f1`` or
+    ``F1``.  Treating those labels as globally unique makes a synthesis unable
+    to represent two valid critiques and can silently discard one in the
+    repair map.  Namespacing is a control-plane normalization; the finding's
+    location, protected content, and verification text remain unchanged.
+    """
+    reviewer_id = review["reviewer_id"]
+    for finding in review["findings"]:
+        local_id = finding["id"]
+        prefix = reviewer_id + "_"
+        if not local_id.startswith(prefix):
+            finding["id"] = prefix + local_id
+    return review
+
+
+def _normalise_review_candidate(value, reviewer, manuscript):
+    """Bind provider omissions to the assigned review without editing critique.
+
+    Assignment metadata and unit addresses belong to the control plane.  A
+    provider may omit the echoed schema/stage fields, return a location as a
+    JSON array, or leave ``protected`` empty while naming exact unit IDs in
+    ``location``.  Those cases are unambiguous and can be repaired
+    deterministically.  Scientific text, severity, and decisions are never
+    invented; anything else remains a strict validation error.
+    """
+    if not isinstance(value, dict):
+        return value, []
+    candidate = deepcopy(value)
+    changes = []
+    # Some providers echo the prompt's size-limit instruction as a top-level
+    # field.  It carries no review meaning and is safe to remove before the
+    # strict contract check; every scientific field remains untouched.
+    if "size_limit" in candidate:
+        candidate.pop("size_limit")
+        changes.append({"field": "size_limit", "reason": "prompt metadata was echoed outside the review contract"})
+    expected = {
+        "schema_version", "reviewer_id", "stage", "decision", "checks", "findings",
+        "protected_units", "rationale",
+    }
+    for key, expected_value in (("schema_version", REVIEW_SCHEMA_VERSION),
+                                ("reviewer_id", reviewer["id"]),
+                                ("stage", reviewer["stage"])):
+        if key not in candidate and set(candidate).issubset(expected):
+            candidate[key] = expected_value
+            changes.append({"field": key, "reason": "Composer assignment metadata was omitted by the provider"})
+    unit_ids = [unit["id"] for section in manuscript.get("sections", [])
+                for unit in section.get("units", []) if isinstance(unit, dict) and isinstance(unit.get("id"), str)]
+    for finding in candidate.get("findings", []):
+        if not isinstance(finding, dict):
+            continue
+        # Providers sometimes use descriptive aliases from the prompt rather
+        # than the canonical contract.  These mappings preserve the value
+        # verbatim and only repair an unambiguous field name; a missing or
+        # conflicting severity still fails strict validation.
+        for alias, field in (("repair", "surgical_fix"),
+                             ("fix", "surgical_fix"),
+                             ("suggested_fix", "surgical_fix"),
+                             ("protection", "protected"),
+                             ("protected_content", "protected"),
+                             ("verification_check", "verification"),
+                             ("check", "verification")):
+            if field not in finding and alias in finding:
+                finding[field] = finding[alias]
+                finding.pop(alias)
+                changes.append({"field": f"findings.{field}", "finding_id": finding.get("id"),
+                                "reason": f"provider used the unambiguous alias {alias}"})
+        # Some review models put the requested verification step under the
+        # finding-level ``rationale`` key and omit a separate verification
+        # field.  Preserve that text verbatim as the verification payload;
+        # the scientific problem and repair remain unchanged and a malformed
+        # severity is still rejected below.
+        if "verification" not in finding and isinstance(finding.get("rationale"), str):
+            finding["verification"] = finding.pop("rationale")
+            changes.append({"field": "findings.verification", "finding_id": finding.get("id"),
+                            "reason": "provider used the finding rationale as its verification payload"})
+        if "location" not in finding and isinstance(finding.get("unit_id"), str):
+            finding["location"] = finding["unit_id"]
+            changes.append({"field": "findings.location", "finding_id": finding.get("id"),
+                            "reason": "provider supplied a single unit_id address"})
+        if "protected" not in finding and isinstance(finding.get("unit_id"), str):
+            finding["protected"] = [finding["unit_id"]]
+            changes.append({"field": "findings.protected", "finding_id": finding.get("id"),
+                            "reason": "provider supplied a single unit_id protection address"})
+        finding.pop("unit_id", None)
+        location = finding.get("location")
+        if isinstance(location, list) and all(isinstance(item, str) for item in location):
+            finding["location"] = ", ".join(location)
+            changes.append({"field": "findings.location", "finding_id": finding.get("id"),
+                            "reason": "unit locations were returned as a JSON array"})
+        protected = finding.get("protected")
+        echoed_protected = finding.get("protected_units")
+        if ("protected" not in finding and isinstance(echoed_protected, list)
+                and all(isinstance(item, str) for item in echoed_protected)):
+            # ``protected_units`` is an unambiguous provider alias for the
+            # finding-level ``protected`` field.  It is only promoted when no
+            # competing value exists; conflicting arrays stay invalid.
+            finding["protected"] = list(echoed_protected)
+            protected = finding["protected"]
+            changes.append({"field": "findings.protected", "finding_id": finding.get("id"),
+                            "reason": "provider used the review-level protection alias"})
+        elif ("protected" in finding and "protected_units" in finding
+              and isinstance(protected, list) and isinstance(echoed_protected, list)
+              and protected == echoed_protected):
+            finding.pop("protected_units")
+            changes.append({"field": "findings.protected_units", "finding_id": finding.get("id"),
+                            "reason": "duplicate protection alias matched protected"})
+        if isinstance(protected, list) and protected and all(isinstance(item, dict) for item in protected):
+            extracted = []
+            for item in protected:
+                for key in ("unit_id", "id"):
+                    if isinstance(item.get(key), str):
+                        extracted.append(item[key])
+                        break
+            if len(extracted) == len(protected):
+                finding["protected"] = list(dict.fromkeys(extracted))
+                changes.append({"field": "findings.protected", "finding_id": finding.get("id"),
+                                "reason": "unit addresses were returned as objects"})
+                protected = finding["protected"]
+        if protected == []:
+            location_text = finding.get("location") if isinstance(finding.get("location"), str) else ""
+            bound = [unit_id for unit_id in unit_ids if unit_id in location_text]
+            if bound:
+                finding["protected"] = bound
+                changes.append({"field": "findings.protected", "finding_id": finding.get("id"),
+                                "added": bound, "reason": "location names the exact editable units"})
+    for check in candidate.get("checks", []):
+        if not isinstance(check, dict):
+            continue
+        if "check" in check:
+            if "evidence" not in check and isinstance(check.get("check"), str):
+                check["evidence"] = check["check"]
+                changes.append({"field": "checks.evidence", "reason": "provider used check as the check evidence"})
+            check.pop("check")
+            changes.append({"field": "checks.check", "reason": "provider echoed a check description outside the review contract"})
+        if "id" not in check and isinstance(check.get("name"), str):
+            check["id"] = check["name"]
+            changes.append({"field": "checks.id", "reason": "provider used name as the check identifier"})
+        if "name" in check and "id" in check:
+            check.pop("name")
+            changes.append({"field": "checks.name", "reason": "provider echoed a descriptive alias beside id"})
+        if "outcome" not in check and check.get("status") in {"passed", "failed", "pass", "fail"}:
+            check["outcome"] = check.pop("status")
+            changes.append({"field": "checks.outcome", "reason": "provider used status for the check outcome"})
+        if "outcome" not in check and isinstance(check.get("passed"), bool):
+            check["outcome"] = "passed" if check.pop("passed") else "failed"
+            changes.append({"field": "checks.outcome", "reason": "provider used a Boolean passed flag for the check outcome"})
+        elif "passed" in check:
+            check.pop("passed")
+            changes.append({"field": "checks.passed", "reason": "provider echoed a non-Boolean outcome alias"})
+        outcome_aliases = {"pass": "passed", "fail": "failed"}
+        if check.get("outcome") in outcome_aliases:
+            check["outcome"] = outcome_aliases[check["outcome"]]
+            changes.append({"field": "checks.outcome", "reason": "provider used a singular outcome alias"})
+        if "rationale" in check:
+            if "evidence" not in check and isinstance(check.get("rationale"), str):
+                check["evidence"] = check["rationale"]
+                changes.append({"field": "checks.evidence", "reason": "provider used rationale as the check evidence"})
+            check.pop("rationale")
+            changes.append({"field": "checks.rationale", "reason": "provider echoed review rationale outside the check contract"})
+    return candidate, changes
 
 
 SYSTEM = (
@@ -165,11 +599,13 @@ SYSTEM = (
     "result occurred, which mechanisms remain possible, what evidence supports or contradicts each mechanism, and "
     "which additional experiment would distinguish them. An editorial-compression review must check that Results "
     "report observations, Discussion interprets them, figures are used as arguments, and facts or caveats are not "
-    "repeated without purpose."
+    "repeated without purpose. A journal_editor review must also apply the supplied scholarly-depth profile and "
+    "flag a candidate whose bibliography, full-text basis, citation coverage, or visual evidence is too thin for "
+    "the selected publication tier."
 )
 
 
-def _review_prompt(manuscript, reviewer, interpretation=None, argument=None):
+def _review_prompt(manuscript, reviewer, interpretation=None, argument=None, evidence=None):
     # Reviewers need different slices of a long paper.  Supplying a bounded
     # role view keeps latency predictable while retaining unit identities and
     # enough local text to make location-specific findings.
@@ -181,6 +617,7 @@ def _review_prompt(manuscript, reviewer, interpretation=None, argument=None):
         "human_scientist": {"introduction", "research_question", "methods", "metrics", "results", "interpretation", "discussion", "limitations", "implications", "conclusion"},
         "ai_smell": None,
         "editorial_compression": None,
+        "journal_editor": None,
     }.get(role)
     view_sections = []
     for section in sections:
@@ -201,7 +638,7 @@ def _review_prompt(manuscript, reviewer, interpretation=None, argument=None):
                         "note": "The complete manuscript remains the immutable candidate; this role view is a bounded review projection."}
     packet = {"assignment": "independent_manuscript_review", "reviewer": reviewer,
               "manuscript": review_manuscript, "scientific_interpretation": interpretation,
-              "research_argument": argument,
+              "research_argument": argument, "evidence_context": _compact_evidence(evidence),
               "output_contract": {
                   "schema_version": REVIEW_SCHEMA_VERSION, "reviewer_id": reviewer["id"], "stage": reviewer["stage"],
                   "decision": "accept|revise|insufficient_evidence",
@@ -209,11 +646,13 @@ def _review_prompt(manuscript, reviewer, interpretation=None, argument=None):
                   "findings": "list of {id,severity,location,problem,surgical_fix,protected,verification}; severity MUST be one of blocking, major, or minor; protected MUST be a unique JSON array of plain strings naming unit IDs or protected facts",
                   "protected_units": "unique JSON array of plain strings naming reader-facing units or facts that must remain unchanged",
                   "rationale": "concise evidence-bound rationale; for human_scientist and editorial_compression explicitly address the assigned scientific/editorial questions",
+                  "size_limit": "Return at most four highest-impact findings. Keep each problem, surgical_fix, and verification to one or two sentences.",
               }}
     return json.dumps(packet, ensure_ascii=False, sort_keys=True)
 
 
-def _synthesis_prompt(manuscript, reviews, interpretation=None, argument=None):
+def _synthesis_prompt(manuscript, reviews, interpretation=None, argument=None, adjudication=None,
+                      *, evidence=None):
     # The independent reviewers already inspected the complete manuscript.  The
     # synthesizer needs their concrete findings and a bounded location index,
     # not another full copy of the long paper.  Keeping this prompt compact
@@ -225,7 +664,9 @@ def _synthesis_prompt(manuscript, reviews, interpretation=None, argument=None):
             unit_index.append({"id": unit["id"], "section": section.get("title", "")})
     return json.dumps({"assignment": "independent_editorial_synthesis", "manuscript_unit_index": unit_index,
                        "scientific_interpretation": interpretation, "research_argument": argument, "reviews": reviews,
-                       "instructions": "Reconcile the exact reviews. Do not invent a finding or rewrite the manuscript. Return required_repairs only when a concrete finding needs a scoped repair. Accept only when no blocking or major finding remains and all checks passed, including the human-scientist and editorial-compression perspectives when present. The response MUST contain exactly these six top-level keys and no additional keys: schema_version, decision, required_repairs, accepted_reviewers, rationale, verification_contract. For an accept decision, required_repairs MUST be []. accepted_reviewers and verification_contract MUST be JSON arrays of plain strings.",
+                       "evidence_context": _compact_evidence(evidence),
+                       "arbiter_adjudication": adjudication,
+                       "instructions": "Reconcile the exact reviews and the Arbiter adjudication. Do not invent a finding or rewrite the manuscript. When reviewers give mutually exclusive explanations for the same unit, follow the retained Arbiter directive and do not request both alternatives. A rejected finding is preserved for provenance but must not appear in required_repairs. Return required_repairs only when a retained concrete finding needs a scoped repair. Accept only when no retained blocking or major finding remains and all checks passed, including the human-scientist and editorial-compression perspectives when present. The response MUST contain exactly these six top-level keys and no additional keys: schema_version, decision, required_repairs, accepted_reviewers, rationale, verification_contract. For an accept decision, required_repairs MUST be []. accepted_reviewers and verification_contract MUST be JSON arrays of plain strings.",
                        "output_contract": {"exact_top_level_keys": ["schema_version", "decision", "required_repairs", "accepted_reviewers", "rationale", "verification_contract"],
                                            "schema_version": SYNTHESIS_SCHEMA_VERSION, "decision": "accept|revise|insufficient_evidence",
                                            "required_repairs": "list of {finding_id,owner,scope,verification}; [] when decision=accept",
@@ -233,15 +674,55 @@ def _synthesis_prompt(manuscript, reviews, interpretation=None, argument=None):
                                            "verification_contract": "nonempty JSON array of plain strings naming final checks"}}, ensure_ascii=False, sort_keys=True)
 
 
+def _arbitration_prompt(manuscript, reviews, interpretation=None, argument=None, *, evidence=None,
+                        numeric_audit=None):
+    """Ask the Arbiter to resolve cross-department conflicts before repair."""
+    unit_index = [
+        {"id": unit["id"], "section": section.get("title", "")}
+        for section in manuscript.get("sections", [])
+        for unit in section.get("units", [])
+    ]
+    return json.dumps({
+        "assignment": "independent_review_arbitration",
+        "manuscript_unit_index": unit_index,
+        "scientific_interpretation": interpretation,
+        "research_argument": argument,
+        "reviews": reviews,
+        "evidence_context": _compact_evidence(evidence),
+        "numeric_repair_audit": numeric_audit or {},
+        "instructions": (
+            "Act as an Arbiter between independent reviewers. Inspect every blocking or major finding. "
+            "Where findings are compatible, retain them in one resolution. Where they prescribe mutually "
+            "exclusive mechanisms or edits for the same unit, choose the explanation supported by the frozen "
+            "research argument and supplied evidence, and reject the competing directive with a recorded reason. "
+            "Do not rewrite manuscript text, invent evidence, or turn a hypothesis into a fact. A rejected "
+            "finding remains visible as a retained alternative. Every material finding must appear in exactly "
+            "one resolution. Decimal corrections listed in numeric_repair_audit are not authorised unless the "
+            "frozen evidence contains the value; leave them rejected for a separate fact-verification task. "
+            "Return exactly four top-level keys: schema_version, decision, resolutions, rationale."
+        ),
+        "output_contract": {
+            "exact_top_level_keys": ["schema_version", "decision", "resolutions", "rationale"],
+            "schema_version": ARBITRATION_SCHEMA_VERSION,
+            "decision": "resolved|unresolved",
+            "resolutions": "array of {id,finding_ids,decision,rationale,directive}; decision=retain|reject|merge",
+            "rationale": "string",
+        },
+    }, ensure_ascii=False, sort_keys=True)
+
+
 class ManuscriptReviewRunner:
     """Run independent scientific, methods, adversarial, and editorial reviews."""
 
     def __init__(self, model, *, reviewers=None, max_workers=3,
-                 deadline_seconds=DEFAULT_DEADLINE_SECONDS):
+                 deadline_seconds=DEFAULT_DEADLINE_SECONDS,
+                 max_output_tokens=4096, reasoning_effort="medium",
+                 call_timeout_seconds=300.0, inter_request_interval_seconds=0.5,
+                 arbiter_enabled=False):
         self.model_config = deepcopy(model)
         self.reviewers = deepcopy(reviewers or list(DEFAULT_REVIEWERS))
-        if not 3 <= len(self.reviewers) <= 5:
-            raise ValidationError("manuscript review requires between three and five reviewer perspectives")
+        if not 3 <= len(self.reviewers) <= 6:
+            raise ValidationError("manuscript review requires between three and six reviewer perspectives")
         ids = set()
         for reviewer in self.reviewers:
             if not isinstance(reviewer, dict) or set(reviewer) != {"id", "stage", "focus"}:
@@ -259,6 +740,26 @@ class ManuscriptReviewRunner:
             raise ValidationError("review deadline must be finite and positive")
         self.max_workers = max_workers
         self.deadline_seconds = float(deadline_seconds) if deadline_seconds is not None else None
+        if type(max_output_tokens) is not int or max_output_tokens <= 0:
+            raise ValidationError("review max_output_tokens must be a positive integer")
+        if reasoning_effort not in {"none", "low", "medium", "high"}:
+            raise ValidationError("review reasoning_effort is unsupported")
+        if (type(call_timeout_seconds) not in (int, float)
+                or not math.isfinite(call_timeout_seconds) or call_timeout_seconds <= 0):
+            raise ValidationError("review call timeout must be finite and positive")
+        if (type(inter_request_interval_seconds) not in (int, float)
+                or not math.isfinite(inter_request_interval_seconds)
+                or inter_request_interval_seconds < 0):
+            raise ValidationError("review inter-request interval must be finite and non-negative")
+        self.max_output_tokens = max_output_tokens
+        self.reasoning_effort = reasoning_effort
+        self.call_timeout_seconds = float(call_timeout_seconds)
+        self.inter_request_interval_seconds = float(inter_request_interval_seconds)
+        if type(arbiter_enabled) is not bool:
+            raise ValidationError("arbiter_enabled must be boolean")
+        self.arbiter_enabled = arbiter_enabled
+        self._pace_lock = threading.Lock()
+        self._next_dispatch = 0.0
 
     @staticmethod
     def _remaining(deadline):
@@ -270,7 +771,7 @@ class ManuscriptReviewRunner:
         return remaining
 
     @classmethod
-    def _bounded_model_config(cls, model_config, deadline):
+    def _bounded_model_config(cls, model_config, deadline, *, call_timeout_seconds):
         config = deepcopy(model_config)
         remaining = cls._remaining(deadline)
         if remaining is not None:
@@ -280,11 +781,30 @@ class ManuscriptReviewRunner:
             # before another retry is started.
             if remaining < 0.2:
                 raise ValidationError("manuscript review deadline exceeded")
-            config["timeout_seconds"] = min(float(config["timeout_seconds"]), remaining)
+            config["timeout_seconds"] = min(float(config["timeout_seconds"]), remaining,
+                                             float(call_timeout_seconds))
+        else:
+            config["timeout_seconds"] = min(float(config["timeout_seconds"]),
+                                             float(call_timeout_seconds))
         return config
 
-    def _call_review(self, manuscript, reviewer, images, interpretation, deadline=None, *, argument=None):
-        prompt = _review_prompt(manuscript, reviewer, interpretation, argument)
+    def _pace(self, deadline):
+        """Space provider dispatches without holding a worker slot forever."""
+        if self.inter_request_interval_seconds <= 0:
+            return
+        with self._pace_lock:
+            now = time.monotonic()
+            wait_for = max(0.0, self._next_dispatch - now)
+            if wait_for:
+                if deadline is not None and now + wait_for >= deadline:
+                    raise ValidationError("manuscript review deadline exceeded before paced dispatch")
+                time.sleep(wait_for)
+            self._next_dispatch = time.monotonic() + self.inter_request_interval_seconds
+
+    def _call_review(self, manuscript, reviewer, images, interpretation, deadline=None, *, argument=None,
+                     evidence=None,
+                     artifact_dir=None):
+        prompt = _review_prompt(manuscript, reviewer, interpretation, argument, evidence)
         previous = None
         last_error = None
         usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
@@ -297,6 +817,7 @@ class ManuscriptReviewRunner:
                     "manuscript": manuscript,
                     "scientific_interpretation": interpretation,
                     "research_argument": argument,
+                    "evidence_context": _compact_evidence(evidence),
                     "candidate_response": previous[:24000],
                     "validation_error": str(last_error),
                     "instructions": (
@@ -314,9 +835,33 @@ class ManuscriptReviewRunner:
                                                   "findings", "protected_units", "rationale"],
                     },
                 }, ensure_ascii=False, sort_keys=True)
-            config = self._bounded_model_config(self.model_config, deadline)
-            config["max_output_tokens"] = min(config.get("max_output_tokens", 16384), 8192)
-            result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt, images=images)
+            self._pace(deadline)
+            config = self._bounded_model_config(self.model_config, deadline,
+                                                call_timeout_seconds=self.call_timeout_seconds)
+            config["max_output_tokens"] = min(config.get("max_output_tokens", 16384),
+                                               self.max_output_tokens)
+            if config.get("protocol") == "openai_compatible":
+                config["reasoning_effort"] = self.reasoning_effort
+            try:
+                result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt, images=images)
+            except Exception as exc:
+                # Preserve the transport failure at the review boundary.  A
+                # later Composer resume can distinguish a provider failure
+                # from an invalid review object without weakening the review
+                # contract or fabricating a reviewer decision.
+                if artifact_dir is not None:
+                    artifact_dir.mkdir(parents=True, exist_ok=True)
+                    (artifact_dir / f"review-{reviewer['id']}-attempt-{attempt + 1}-failure.json").write_bytes(
+                        canonical_bytes({"attempt": attempt + 1, "reviewer_id": reviewer["id"],
+                                         "error": f"{type(exc).__name__}: {exc}"}))
+                raise
+            attempt_record = {"attempt": attempt + 1, "reviewer_id": reviewer["id"],
+                              "finish_reason": result.finish_reason, "response": result.text,
+                              "usage": result.usage}
+            if artifact_dir is not None:
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                (artifact_dir / f"review-{reviewer['id']}-attempt-{attempt + 1}.json").write_bytes(
+                    canonical_bytes(attempt_record))
             elapsed += result.elapsed_seconds
             for key in usage:
                 usage[key] += result.usage.get(key, 0)
@@ -326,17 +871,119 @@ class ManuscriptReviewRunner:
                 continue
             try:
                 value = result.json_object()
+                value, normalization = _normalise_review_candidate(value, reviewer, manuscript)
+                if normalization:
+                    attempt_record["normalization"] = normalization
+                    if artifact_dir is not None:
+                        (artifact_dir / f"review-{reviewer['id']}-attempt-{attempt + 1}.json").write_bytes(
+                            canonical_bytes(attempt_record))
                 validate_review(value, reviewer["id"], reviewer["stage"])
             except ValidationError as exc:
+                if artifact_dir is not None:
+                    attempt_record["validation_error"] = str(exc)
+                    (artifact_dir / f"review-{reviewer['id']}-attempt-{attempt + 1}.json").write_bytes(
+                        canonical_bytes(attempt_record))
                 last_error, previous = exc, result.text
                 continue
             return value, ModelResult(text=result.text, model=result.model, usage=usage,
                                       elapsed_seconds=elapsed, finish_reason=result.finish_reason)
         raise last_error
 
+    def _call_arbitration(self, manuscript, reviews, interpretation, argument, artifact_dir=None,
+                          deadline=None, *, evidence=None, numeric_audit=None):
+        """Resolve incompatible material findings before the editor repairs."""
+        prompt = _arbitration_prompt(manuscript, reviews, interpretation, argument,
+                                     evidence=evidence, numeric_audit=numeric_audit)
+        previous = None
+        last_error = None
+        usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
+        elapsed = 0.0
+        for attempt in range(MAX_SCHEMA_ATTEMPTS):
+            if artifact_dir is not None:
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+            if previous is not None:
+                prompt = json.dumps({
+                    "assignment": "repair_invalid_review_arbitration_json",
+                    "reviews": reviews,
+                    "scientific_interpretation": interpretation,
+                    "research_argument": argument,
+                    "evidence_context": _compact_evidence(evidence),
+                    "numeric_audit": numeric_audit or {},
+                    "candidate_response": previous[:24000],
+                    "validation_error": str(last_error),
+                    "instructions": (
+                        "Return a complete replacement object with exactly schema_version, decision, resolutions, "
+                        "and rationale. Every blocking or major finding must occur in exactly one resolution; "
+                        "resolution decisions are retain, reject, or merge. Do not add manuscript text or evidence."
+                    ),
+                }, ensure_ascii=False, sort_keys=True)
+            self._pace(deadline)
+            config = self._bounded_model_config(self.model_config, deadline,
+                                                call_timeout_seconds=self.call_timeout_seconds)
+            config["max_output_tokens"] = min(config.get("max_output_tokens", 16384), self.max_output_tokens)
+            if config.get("protocol") == "openai_compatible":
+                config["reasoning_effort"] = self.reasoning_effort
+            try:
+                result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt)
+            except Exception as exc:
+                if artifact_dir is not None:
+                    (artifact_dir / f"arbitration-attempt-{attempt + 1}-failure.json").write_bytes(
+                        canonical_bytes({"attempt": attempt + 1, "error": f"{type(exc).__name__}: {exc}"}))
+                raise
+            if artifact_dir is not None:
+                (artifact_dir / f"arbitration-attempt-{attempt + 1}.json").write_bytes(
+                    canonical_bytes({"attempt": attempt + 1, "finish_reason": result.finish_reason,
+                                     "response": result.text, "usage": result.usage}))
+            elapsed += result.elapsed_seconds
+            for key in usage:
+                usage[key] += result.usage.get(key, 0)
+            if result.finish_reason != "stop":
+                last_error = ValidationError("review arbitration did not finish normally")
+                previous = result.text
+                continue
+            try:
+                adjudication = result.json_object()
+                adjudication, normalization = _normalise_adjudication_candidate(adjudication)
+                if normalization and artifact_dir is not None:
+                    (artifact_dir / f"arbitration-attempt-{attempt + 1}.json").write_bytes(
+                        canonical_bytes({"attempt": attempt + 1, "finish_reason": result.finish_reason,
+                                         "response": result.text, "usage": result.usage,
+                                         "normalization": normalization}))
+                validate_adjudication(adjudication, reviews)
+            except ValidationError as exc:
+                last_error, previous = exc, result.text
+                continue
+            return adjudication, ModelResult(text=result.text, model=result.model, usage=usage,
+                                             elapsed_seconds=elapsed, finish_reason=result.finish_reason)
+        # Invalid arbitration output cannot erase independent findings. Keep
+        # every material finding as a retained repair and expose the unresolved
+        # state to the Composer/Arbiter instead of fabricating a resolution.
+        resolutions = []
+        for review in reviews:
+            for finding in review["findings"]:
+                if finding["severity"] not in {"blocking", "major"}:
+                    continue
+                resolutions.append({
+                    "id": f"arbiter_{finding['id']}",
+                    "finding_ids": [finding["id"]],
+                    "decision": "retain",
+                    "rationale": "The arbitration response was invalid, so the material finding remains open.",
+                    "directive": finding["surgical_fix"],
+                })
+        adjudication = {"schema_version": ARBITRATION_SCHEMA_VERSION, "decision": "unresolved",
+                        "resolutions": resolutions,
+                        "rationale": "The independent findings were retained because the Arbiter response did not satisfy its schema."}
+        validate_adjudication(adjudication, reviews)
+        if artifact_dir is not None:
+            (artifact_dir / "arbitration-fallback.json").write_bytes(
+                canonical_bytes({"reason": str(last_error), "adjudication": adjudication}))
+        return adjudication, ModelResult(text="", model=self.model_config["model"], usage=usage,
+                                         elapsed_seconds=elapsed, finish_reason="fallback")
+
     def _call_synthesis(self, manuscript, reviews, images, interpretation, artifact_dir=None,
-                        deadline=None, *, argument=None):
-        prompt = _synthesis_prompt(manuscript, reviews, interpretation, argument)
+                        deadline=None, *, argument=None, adjudication=None, evidence=None):
+        prompt = _synthesis_prompt(manuscript, reviews, interpretation, argument, adjudication,
+                                   evidence=evidence)
         previous = None
         last_error = None
         usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
@@ -355,6 +1002,8 @@ class ManuscriptReviewRunner:
                     "reviews": reviews,
                     "scientific_interpretation": interpretation,
                     "research_argument": argument,
+                    "arbiter_adjudication": adjudication,
+                    "evidence_context": _compact_evidence(evidence),
                     "candidate_response": previous[:24000],
                     "validation_error": str(last_error),
                     "instructions": (
@@ -370,8 +1019,13 @@ class ManuscriptReviewRunner:
                                                   "accepted_reviewers", "rationale", "verification_contract"],
                     },
                 }, ensure_ascii=False, sort_keys=True)
-            config = self._bounded_model_config(self.model_config, deadline)
-            config["max_output_tokens"] = min(config.get("max_output_tokens", 16384), 8192)
+            self._pace(deadline)
+            config = self._bounded_model_config(self.model_config, deadline,
+                                                call_timeout_seconds=self.call_timeout_seconds)
+            config["max_output_tokens"] = min(config.get("max_output_tokens", 16384),
+                                               self.max_output_tokens)
+            if config.get("protocol") == "openai_compatible":
+                config["reasoning_effort"] = self.reasoning_effort
             result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt, images=images)
             if artifact_dir is not None:
                 (artifact_dir / f"synthesis-attempt-{attempt + 1}.json").write_bytes(
@@ -386,7 +1040,13 @@ class ManuscriptReviewRunner:
                 continue
             try:
                 synthesis = result.json_object()
-                validate_synthesis(synthesis, reviews)
+                synthesis, normalization = _normalise_synthesis_candidate(synthesis)
+                if normalization and artifact_dir is not None:
+                    (artifact_dir / f"synthesis-attempt-{attempt + 1}.json").write_bytes(
+                        canonical_bytes({"attempt": attempt + 1, "finish_reason": result.finish_reason,
+                                         "response": result.text, "usage": result.usage,
+                                         "normalization": normalization}))
+                validate_synthesis(synthesis, reviews, adjudication)
             except ValidationError as exc:
                 last_error, previous = exc, result.text
                 continue
@@ -401,9 +1061,18 @@ class ManuscriptReviewRunner:
             repairs = []
             verification_contract = []
             seen_repairs = set()
+            retained = None
+            if adjudication is not None:
+                retained = {
+                    finding_id for resolution in adjudication["resolutions"]
+                    if resolution["decision"] in {"retain", "merge"}
+                    for finding_id in resolution["finding_ids"]
+                }
             for review in reviews:
                 for finding in review["findings"]:
-                    if finding["severity"] not in {"blocking", "major"} or finding["id"] in seen_repairs:
+                    if (finding["severity"] not in {"blocking", "major"}
+                            or (retained is not None and finding["id"] not in retained)
+                            or finding["id"] in seen_repairs):
                         continue
                     seen_repairs.add(finding["id"])
                     repairs.append({
@@ -429,7 +1098,8 @@ class ManuscriptReviewRunner:
                                           elapsed_seconds=elapsed, finish_reason="stop")
         raise last_error
 
-    def run(self, manuscript, *, images=None, interpretation=None, argument=None, artifact_dir=None):
+    def run(self, manuscript, *, images=None, interpretation=None, argument=None, evidence=None,
+            artifact_dir=None, feedback_callback=None):
         if not isinstance(manuscript, dict):
             raise ValidationError("manuscript review input must be a structured document")
         canonical_bytes(manuscript)
@@ -437,14 +1107,22 @@ class ManuscriptReviewRunner:
             canonical_bytes(interpretation)
         if argument is not None:
             canonical_bytes(argument)
+        if evidence is not None:
+            canonical_bytes(evidence)
         reviews = []
         results = []
         deadline = (time.monotonic() + self.deadline_seconds
                     if self.deadline_seconds is not None else None)
         pool = ThreadPoolExecutor(max_workers=min(self.max_workers, len(self.reviewers)))
         futures = [pool.submit(self._call_review, manuscript, reviewer, images, interpretation, deadline,
-                               argument=argument)
+                               argument=argument, evidence=evidence, artifact_dir=artifact_dir)
                    for reviewer in self.reviewers]
+        future_reviewers = {future: reviewer for future, reviewer in zip(futures, self.reviewers)}
+
+        def emit(event):
+            """Send a compact control-plane event without changing review content."""
+            if feedback_callback is not None:
+                feedback_callback(deepcopy(event))
         pending = set(futures)
         try:
             remaining = self._remaining(deadline)
@@ -454,25 +1132,113 @@ class ManuscriptReviewRunner:
                     future.cancel()
                 raise ValidationError("manuscript review deadline exceeded before all reviewers finished")
             for future in futures:
-                review, result = future.result()
+                try:
+                    review, result = future.result()
+                except Exception as exc:
+                    reviewer = future_reviewers[future]
+                    emit({
+                        "kind": "review_failure",
+                        "reviewer_id": reviewer["id"],
+                        "stage": reviewer["stage"],
+                        "status": "blocked",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+                    raise
+                review = _namespace_review_findings(review)
                 reviews.append(review)
                 results.append(result)
                 if artifact_dir is not None:
                     artifact_dir.mkdir(parents=True, exist_ok=True)
                     (artifact_dir / f"review-{review['reviewer_id']}.json").write_bytes(canonical_bytes(review))
+                severities = {severity: 0 for severity in ("blocking", "major", "minor")}
+                for finding in review["findings"]:
+                    severities[finding["severity"]] += 1
+                emit({
+                    "kind": "review",
+                    "reviewer_id": review["reviewer_id"],
+                    "stage": review["stage"],
+                    "decision": review["decision"],
+                    "status": "accepted" if review["decision"] == "accept" else "needs_revision",
+                    "finding_ids": [finding["id"] for finding in review["findings"]],
+                    "severity_counts": severities,
+                    "artifact_path": (str(artifact_dir / f"review-{review['reviewer_id']}.json")
+                                      if artifact_dir is not None else None),
+                })
         finally:
             # When the deadline fires, do not add another unbounded wait in a
             # context-manager exit.  In-flight provider calls have received
             # the same remaining timeout and will unwind on their own.
             pool.shutdown(wait=not pending, cancel_futures=True)
         reviews.sort(key=lambda item: item["stage"])
-        synthesis, final_result = self._call_synthesis(
-            manuscript, reviews, images, interpretation, artifact_dir, deadline, argument=argument)
+        numeric_audit = audit_numeric_repair_support(reviews, manuscript, evidence)
+        if artifact_dir is not None:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            (artifact_dir / "evidence-audit.json").write_bytes(canonical_bytes({
+                "schema_version": "manuscript-review-evidence-audit-1",
+                "numeric_repair_findings": numeric_audit,
+            }))
+        adjudication = None
+        arbiter_result = ModelResult(text="", model=self.model_config["model"],
+                                     usage={"model_calls": 0, "input_tokens": 0, "output_tokens": 0},
+                                     elapsed_seconds=0.0, finish_reason="disabled")
+        if self.arbiter_enabled:
+            try:
+                adjudication, arbiter_result = self._call_arbitration(
+                    manuscript, reviews, interpretation, argument, artifact_dir, deadline,
+                    evidence=evidence, numeric_audit=numeric_audit)
+                adjudication = apply_numeric_evidence_guard(adjudication, numeric_audit)
+                validate_adjudication(adjudication, reviews)
+            except Exception as exc:
+                emit({"kind": "arbitration_failure", "status": "blocked",
+                      "error": f"{type(exc).__name__}: {exc}"})
+                raise
+            if artifact_dir is not None:
+                (artifact_dir / "adjudication.json").write_bytes(canonical_bytes(adjudication))
+            retained = sum(1 for resolution in adjudication["resolutions"]
+                           if resolution["decision"] in {"retain", "merge"})
+            rejected = sum(1 for resolution in adjudication["resolutions"]
+                           if resolution["decision"] == "reject")
+            emit({
+                "kind": "arbitration",
+                "decision": adjudication["decision"],
+                "status": "completed" if adjudication["decision"] == "resolved" else "needs_revision",
+                "resolution_count": len(adjudication["resolutions"]),
+                "retained_count": retained,
+                "rejected_count": rejected,
+                "evidence_guarded_count": sum(
+                    1 for resolution in adjudication["resolutions"]
+                    if resolution["decision"] == "reject"
+                    and resolution["id"].startswith("res_")
+                    and "evidence_guard" in resolution["id"]),
+                "artifact_path": (str(artifact_dir / "adjudication.json") if artifact_dir is not None else None),
+            })
+        try:
+            synthesis, final_result = self._call_synthesis(
+                manuscript, reviews, images, interpretation, artifact_dir, deadline,
+                argument=argument, adjudication=adjudication, evidence=evidence)
+        except Exception as exc:
+            emit({"kind": "synthesis_failure", "status": "blocked",
+                  "error": f"{type(exc).__name__}: {exc}"})
+            raise
+        if artifact_dir is not None:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            (artifact_dir / "synthesis.json").write_bytes(canonical_bytes(synthesis))
+        emit({
+            "kind": "synthesis",
+            "decision": synthesis["decision"],
+            "status": "accepted" if synthesis["decision"] == "accept" else "needs_revision",
+            "required_repairs": [repair["finding_id"] for repair in synthesis["required_repairs"]],
+            "accepted_reviewers": list(synthesis["accepted_reviewers"]),
+            "verification_contract": list(synthesis["verification_contract"]),
+            "artifact_path": (str(artifact_dir / "synthesis.json") if artifact_dir is not None else None),
+        })
         return {"schema_version": PACKAGE_SCHEMA_VERSION,
                 "manuscript_sha256": hashlib.sha256(canonical_bytes(manuscript)).hexdigest(),
                 "reviewer_ids": [reviewer["id"] for reviewer in self.reviewers],
-                "reviews": reviews, "synthesis": synthesis,
-                "model_calls": len(results) + 1,
-                "usage": {key: sum(result.usage.get(key, 0) for result in results) + final_result.usage.get(key, 0)
+                "reviews": reviews, "adjudication": adjudication, "synthesis": synthesis,
+                "evidence_audit": numeric_audit,
+                "model_calls": len(results) + 1 + (1 if self.arbiter_enabled else 0),
+                "usage": {key: sum(result.usage.get(key, 0) for result in results)
+                           + arbiter_result.usage.get(key, 0) + final_result.usage.get(key, 0)
                            for key in {"model_calls", "input_tokens", "output_tokens"}},
                 "status": "accepted" if synthesis["decision"] == "accept" else "needs_revision"}

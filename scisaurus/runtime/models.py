@@ -175,7 +175,28 @@ class ModelClient:
             try:
                 with urllib.request.build_opener(_NoRedirect()).open(
                         request, timeout=max(0.1, remaining)) as response:
-                    raw = response.read(self.max_response_bytes + 1)
+                    # ``HTTPResponse.read(n)`` can legally return a short
+                    # chunk and then wait for more bytes.  A provider that
+                    # trickles output would therefore evade the original
+                    # one-shot socket timeout.  Read in bounded chunks and
+                    # re-check the absolute request deadline after every
+                    # chunk so the whole response, including body transfer,
+                    # stays inside one budget.
+                    chunks = []
+                    total = 0
+                    while total <= self.max_response_bytes:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise ModelCallError("model request deadline exceeded")
+                        try:
+                            chunk = response.read(min(65536, self.max_response_bytes + 1 - total))
+                        except TimeoutError:
+                            raise ModelCallError("model request deadline exceeded") from None
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        total += len(chunk)
+                    raw = b"".join(chunks)
             except urllib.error.HTTPError as exc:
                 code = exc.code
                 retry_after = exc.headers.get("Retry-After")

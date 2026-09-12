@@ -517,6 +517,15 @@ class SurveyGate:
                     raise ValidationError("assessment dispatch source window is not an exact captured slice")
                 source_values[context["source_ref"]] = source
                 windows[context["source_ref"]] = window
+            # A model may copy a sentence from the abstract while attaching
+            # the same work's full-text reference (or the inverse).  The
+            # runner repairs this unambiguous representation mismatch before
+            # publishing the candidate, so the acceptance gate must apply the
+            # identical repair to the immutable raw reply.  Otherwise a
+            # scientifically valid candidate can be published and then be
+            # rejected solely because its transport-level source label was
+            # broader than the quotation's actual representation.
+            reply = self._rebind_assessment_sources(reply, source_values, windows)
             reply = bind_source_spans(reply, source_values, windows=windows)
         fields = ("state", "rationale", "comparisons", "checks", "evidence")
         if any(key not in body or reply.get(key) != body[key] for key in fields):
@@ -578,6 +587,66 @@ class SurveyGate:
                 item["relationship"] in {"solves", "uncertain"} for item in comparisons)):
             raise ValidationError("eligibility requires resolved comparisons without a known solution")
         return assessment, body
+
+    @staticmethod
+    def _rebind_assessment_sources(value, sources, windows):
+        """Repair only a unique quote/source mismatch within one work.
+
+        The quotation remains authoritative.  Rebinding is permitted only
+        when the exact quote occurs once in exactly one other displayed source
+        for the same work and within that source's recorded window.  Ambiguous
+        or unsupported text is left untouched so the normal span validator
+        still fails closed.
+        """
+        value = json.loads(json.dumps(value, ensure_ascii=False))
+        by_work = {}
+        for ref, source in sources.items():
+            by_work.setdefault(source.get("work_id"), []).append((ref, source))
+
+        def repair(items):
+            if not isinstance(items, list):
+                return
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                quote, ref, work_id = item.get("quote"), item.get("source_ref"), item.get("work_id")
+                if not all(isinstance(part, str) for part in (quote, ref, work_id)):
+                    continue
+                source = sources.get(ref)
+                window = windows.get(ref, {})
+                if source is not None and isinstance(source.get("text"), str):
+                    start, end = window.get("start"), window.get("end")
+                    visible = source["text"][start:end] if type(start) is int and type(end) is int else ""
+                    if visible.count(quote) == 1:
+                        continue
+                    # Preserve the supplied representation when the only
+                    # difference is renderer whitespace or typography.  The
+                    # shared binder returns the exact source slice and keeps
+                    # decisive full-text evidence attached to full text.
+                    try:
+                        bound = bind_source_spans({"evidence": [item]}, sources, windows=windows)
+                        item.clear()
+                        item.update(bound["evidence"][0])
+                        continue
+                    except ValidationError:
+                        pass
+                candidates = []
+                for candidate_ref, candidate in by_work.get(work_id, []):
+                    candidate_window = windows.get(candidate_ref, {})
+                    start, end = candidate_window.get("start"), candidate_window.get("end")
+                    if type(start) is not int or type(end) is not int:
+                        continue
+                    visible = candidate.get("text", "")[start:end]
+                    if visible.count(quote) == 1:
+                        candidates.append(candidate_ref)
+                if len(candidates) == 1:
+                    item["source_ref"] = candidates[0]
+
+        repair(value.get("evidence"))
+        for comparison in value.get("comparisons", []):
+            if isinstance(comparison, dict):
+                repair(comparison.get("evidence"))
+        return value
 
     def _evidence(self, evidence, works, survey, *, required=False, full_text=False, work_id=None):
         if not isinstance(evidence, list) or required and not evidence:

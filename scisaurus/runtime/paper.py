@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 
 from scisaurus.core.documents import Documents
 from scisaurus.core.errors import ValidationError
@@ -19,8 +21,43 @@ from scisaurus.core.surveys import SurveyGate
 from scisaurus.runtime.bibliographic_identity import normalize_doi, normalize_title
 from scisaurus.runtime.results import validate_results_package
 from scisaurus.runtime.research_argument import validate_argument_review, validate_research_argument
+from scisaurus.runtime.scholarly_depth import (
+    evaluate_scholarly_depth,
+    profile_for_paper,
+    validate_profile_id,
+    validate_scholarly_depth_review,
+)
 from scisaurus.runtime.scientific_interpretation import validate_interpretation
 from scisaurus.runtime.scientific_surface import validate_scientific_surface
+
+
+_SEMANTIC_STOPWORDS = {
+    "about", "after", "again", "also", "among", "because", "being", "between", "could",
+    "does", "from", "have", "into", "more", "most", "only", "over", "that", "than", "their",
+    "there", "these", "this", "those", "under", "were", "which", "while", "with", "would",
+}
+
+
+def _semantic_tokens(value):
+    return {token for token in re.findall(r"[a-z][a-z0-9'-]{2,}|[-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?", value.casefold())
+            if token not in _SEMANTIC_STOPWORDS}
+
+
+def _text_supports_phrase(phrase, text, *, minimum=2, fraction=0.3):
+    """Bind a reader-facing paraphrase to its controlled proposition.
+
+    Exact source wording remains in the evidence ledger.  The release gate
+    checks that a manuscript unit still expresses the same distinctive terms,
+    allowing a surgical editor to translate procedural or compliance prose.
+    """
+    if phrase in text:
+        return True
+    source = _semantic_tokens(phrase)
+    if not source:
+        return False
+    target = _semantic_tokens(text)
+    matched = len(source & target)
+    return matched >= min(minimum, len(source)) and matched / len(source) >= fraction
 
 
 def _exact(value, fields, name):
@@ -69,8 +106,12 @@ def validate_paper_config(value):
             storyline_ids.add(beat["id"])
             _text(beat["proposition"], "storyline beat proposition")
     elif schema == "paper-release-score-3":
-        _exact(value, base_fields | {"storyline", "depth_profile", "interpretation_file", "figure_arguments",
-                                     "surface_policy"}, "paper configuration")
+        required_fields = base_fields | {"storyline", "depth_profile", "interpretation_file", "figure_arguments",
+                                         "surface_policy"}
+        allowed_fields = required_fields | {"scholarly_profile"}
+        if (not isinstance(value, dict) or set(value) - allowed_fields
+                or not required_fields.issubset(set(value))):
+            raise ValidationError(f"paper configuration requires only {sorted(allowed_fields)}")
         storyline = value["storyline"]
         _exact(storyline, {"id", "revision", "thesis", "beats"}, "paper storyline")
         _identifier(storyline["id"], "storyline id")
@@ -135,6 +176,11 @@ def validate_paper_config(value):
         for key in ("max_numeric_repetitions", "max_caveat_repetitions"):
             if type(surface[key]) is not int or surface[key] < 1:
                 raise ValidationError(f"surface_policy.{key} must be a positive integer")
+        if "scholarly_profile" in value:
+            validate_profile_id(value["scholarly_profile"])
+            if (value.get("document_type") == "research_paper"
+                    and value["scholarly_profile"] == "validation_report"):
+                raise ValidationError("research_paper cannot use the validation_report scholarly profile")
     else:
         raise ValidationError("unsupported paper release score")
     _identifier(value["paper_id"], "paper id")
@@ -222,10 +268,64 @@ def validate_paper_config(value):
 
 
 def _latex(value):
-    replacements = {"\\": r"\textbackslash{}", "&": r"\&", "%": r"\%", "$": r"\$",
-                    "#": r"\#", "_": r"\_", "{": r"\{", "}": r"\}",
-                    "~": r"\textasciitilde{}", "^": r"\textasciicircum{}"}
-    return "".join(replacements.get(char, char) for char in value)
+    # The manuscript contract is plain Unicode text, while the release
+    # template is compiled with a conservative text encoding. Translate
+    # common scientific glyphs explicitly so superscripts, Greek symbols,
+    # inequalities, and em dashes remain legible in the rendered PDF.
+    superscript = dict(zip("⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁽⁾ⁿ", "0123456789+-()n"))
+    superscript["⁗"] = "''''"
+    subscript = str.maketrans("₀₁₂₃₄₅₆₇₈₉₊₋₍₎ₙₓ", "0123456789+-()nx")
+    symbols = {
+        "×": r"$\times$", "≈": r"$\approx$", "≤": r"$\leq$", "≥": r"$\geq$",
+        "±": r"$\pm$", "∈": r"$\in$", "∞": r"$\infty$", "≠": r"$\ne$",
+        "→": r"$\to$", "←": r"$\leftarrow$", "Δ": r"$\Delta$", "δ": r"$\delta$",
+        "σ": r"$\sigma$", "μ": r"$\mu$", "α": r"$\alpha$", "β": r"$\beta$",
+        "γ": r"$\gamma$", "λ": r"$\lambda$", "π": r"$\pi$", "ε": r"$\epsilon$",
+        "η": r"$\eta$", "θ": r"$\theta$", "−": "-", "–": "--", "—": "---", "‑": "-",
+    }
+    escaped = {"\\": r"\textbackslash{}", "&": r"\&", "%": r"\%", "$": r"\$",
+               "#": r"\#", "_": r"\_", "{": r"\{", "}": r"\}",
+               "~": r"\textasciitilde{}", "^": r"\textasciicircum{}"}
+    raw_tokens = {}
+
+    def raw(latex):
+        token = f"\ue000{len(raw_tokens)}\ue001"
+        raw_tokens[token] = latex
+        return token
+
+    # Handle a square-root operand before escaping the surrounding text.
+    value = re.sub(r"√([A-Za-z0-9]+)", lambda match: raw(r"$\sqrt{" + match.group(1) + "}$"), value)
+    output, index = [], 0
+    superscript_chars = set("⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁽⁾ⁿ⁗")
+    subscript_chars = set("₀₁₂₃₄₅₆₇₈₉₊₋₍₎ₙₓ")
+    while index < len(value):
+        char = value[index]
+        if char in superscript_chars:
+            end = index + 1
+            while end < len(value) and value[end] in superscript_chars:
+                end += 1
+            output.append(r"\textsuperscript{" + "".join(superscript[char] for char in value[index:end]) + "}")
+            index = end
+            continue
+        if char in subscript_chars:
+            end = index + 1
+            while end < len(value) and value[end] in subscript_chars:
+                end += 1
+            output.append(r"\textsubscript{" + value[index:end].translate(subscript) + "}")
+            index = end
+            continue
+        if char == "^" and index + 1 < len(value):
+            match = re.match(r"\^([+-]?[0-9]+)", value[index:])
+            if match:
+                output.append(r"\textsuperscript{" + match.group(1) + "}")
+                index += len(match.group(0))
+                continue
+        output.append(symbols.get(char, escaped.get(char, char)))
+        index += 1
+    rendered = "".join(output)
+    for token, replacement in raw_tokens.items():
+        rendered = rendered.replace(token, replacement)
+    return rendered
 
 
 def _latex_with_citations(value):
@@ -237,6 +337,35 @@ def _latex_with_citations(value):
     return "".join(parts)
 
 
+def _numeric_values(value):
+    """Extract decimal values while accepting ordinary scientific notation.
+
+    Evidence statements are machine-facing and commonly use ``1e-06``;
+    reader-facing manuscripts use forms such as ``10⁻⁶`` or
+    ``1.110 × 10⁻¹⁶``.  Comparing parsed decimal values preserves the binding
+    requirement without forcing a writer to copy the results package's exact
+    typography.
+    """
+    text = unicodedata.normalize("NFKC", str(value)).replace("−", "-")
+    scientific = re.compile(
+        r"(?:(?P<coefficient>[0-9]+(?:\.[0-9]+)?)\s*(?:[×x*]\s*)?)?"
+        r"10\s*\^?\s*(?P<exponent>[+-][0-9]+)"
+    )
+
+    def replace_scientific(match):
+        coefficient = match.group("coefficient") or "1"
+        return f"{coefficient}e{match.group('exponent')}"
+
+    text = scientific.sub(replace_scientific, text)
+    values = []
+    for token in re.findall(r"(?<![A-Za-z0-9])[-+]?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?", text):
+        try:
+            values.append(Decimal(token))
+        except InvalidOperation:
+            continue
+    return values
+
+
 def _finding_supported(finding, text):
     """Check a reader-facing finding without forcing machine-generated prose.
 
@@ -246,10 +375,10 @@ def _finding_supported(finding, text):
     rather than requiring the results engine's sentence skeleton verbatim.
     """
     statement = finding["statement"]
-    numbers = re.findall(r"[-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?", statement.casefold())
+    numbers = _numeric_values(statement)
+    text_numbers = _numeric_values(text)
     for number in numbers:
-        unsigned = number.lstrip("+-")
-        if number not in text and unsigned not in text:
+        if not any(number == candidate for candidate in text_numbers):
             return False
     metric_terms = re.findall(r"\b(?:log\s+loss|brier(?:\s+score)?|ece)\b", statement.casefold())
     if metric_terms:
@@ -259,6 +388,30 @@ def _finding_supported(finding, text):
     # metric vocabulary exists; qualitative findings must retain their exact
     # reader-facing sentence.
     return bool(numbers) or statement in text
+
+
+def _result_supported(result, evidence, text):
+    """Bind a reader-facing result paraphrase to its metric and values."""
+    quote = evidence.get("quote", "")
+    quote_numbers = _numeric_values(quote)
+    text_numbers = _numeric_values(text)
+    if quote_numbers and not all(any(number == candidate for candidate in text_numbers)
+                                 for number in quote_numbers):
+        return False
+    text_lower = text.casefold()
+    metric_text = " ".join([
+        result.get("id", "") if isinstance(result, dict) else "",
+        result.get("conditions", "") if isinstance(result, dict) else "",
+    ]).casefold()
+    metric_terms = re.findall(r"\b(?:log\s+loss|brier(?:\s+score)?|ece|rank|temperature)\b", metric_text)
+    if metric_terms and not any(term in text_lower for term in metric_terms):
+        return False
+    # When the metric ID is a descriptive experiment label rather than a
+    # named score, retain a distinctive lexical anchor from the quoted result
+    # (for example midpoint, trapezoid, Simpson, or control).
+    anchors = [term for term in re.findall(r"[a-z][a-z-]{3,}", quote.casefold())
+               if term not in _SEMANTIC_STOPWORDS]
+    return not anchors or any(anchor in text_lower for anchor in anchors)
 
 
 class PaperReleaseBuilder:
@@ -400,10 +553,17 @@ class PaperReleaseBuilder:
             if set(claim["unit_ids"]) - set(manuscript["units"]):
                 raise ValidationError("claim references a unit outside the accepted manuscript")
             text = " ".join(manuscript["units"][unit_id]["text"] for unit_id in claim["unit_ids"])
-            if claim["statement"] not in text:
-                raise ValidationError("claim statement is absent from its bound manuscript units")
+            if not _text_supports_phrase(claim["statement"], text):
+                raise ValidationError("claim statement is absent or unsupported in its bound manuscript units")
             for evidence_id in claim["evidence_ids"]:
                 bound_evidence = evidence[evidence_id]
+                # Context evidence records the surrounding result or
+                # literature basis without claiming that this exact unit must
+                # restate its full quote.  Supporting and qualifying edges
+                # retain the strict local projection checks below; context is
+                # still preserved in the claim index and audit trail.
+                if bound_evidence.get("relation") == "context":
+                    continue
                 if bound_evidence["kind"] == "finding":
                     finding = findings[bound_evidence["locator"]]
                     if not _finding_supported(finding, text):
@@ -411,15 +571,7 @@ class PaperReleaseBuilder:
                 elif bound_evidence["quote"] not in text:
                     if bound_evidence["kind"] == "result":
                         metric = metrics.get(bound_evidence["locator"])
-                        metric_text = " ".join([
-                            metric.get("id", "") if metric else "",
-                            metric.get("conditions", "") if metric else "",
-                        ]).casefold()
-                        metric_terms = re.findall(r"\b(?:log\s+loss|brier(?:\s+score)?|ece|rank|temperature)\b",
-                                                  metric_text)
-                        text_lower = text.casefold()
-                        if not any(term in text_lower or (term.startswith("brier") and "brier" in text_lower)
-                                   for term in metric_terms):
+                        if not _result_supported(metric or {}, bound_evidence, text):
                             raise ValidationError("claim unit omits the metric meaning of the result it relies on")
                     elif bound_evidence["kind"] == "literature":
                         source = survey["sources"].get(bound_evidence["locator"])
@@ -427,8 +579,8 @@ class PaperReleaseBuilder:
                         allowed = reference_keys_by_work.get(source.get("work_id") if source else None, set())
                         if not cited.intersection(allowed):
                             raise ValidationError("claim unit omits a citation to the literature evidence it relies on")
-                    else:
-                        raise ValidationError("claim unit omits the exact result or source phrase it relies on")
+                    elif not _text_supports_phrase(bound_evidence["quote"], text):
+                        raise ValidationError("claim unit omits the result or source meaning it relies on")
         if self.config["schema_version"] in {"paper-release-score-2", "paper-release-score-3"}:
             claims_by_beat = {}
             for claim in self.config["claims"]:
@@ -438,7 +590,7 @@ class PaperReleaseBuilder:
             for beat in self.config["storyline"]["beats"]:
                 bound_units = {unit_id for claim in claims_by_beat[beat["id"]] for unit_id in claim["unit_ids"]}
                 text = " ".join(manuscript["units"][unit_id]["text"] for unit_id in bound_units)
-                if beat["proposition"] not in text:
+                if not _text_supports_phrase(beat["proposition"], text):
                     raise ValidationError("accepted manuscript omits a fixed storyline proposition")
                 beat_positions.append(min(unit_positions[unit_id] for unit_id in bound_units))
             if beat_positions != sorted(beat_positions):
@@ -447,6 +599,7 @@ class PaperReleaseBuilder:
         depth = None
         surface_audit = None
         full_text_reference_count = None
+        scholarly_depth_review = None
         if self.config["schema_version"] == "paper-release-score-3":
             depth = self.config["depth_profile"]
             word_count = len(re.findall(r"\b[\w'-]+\b", manuscript_text))
@@ -480,8 +633,8 @@ class PaperReleaseBuilder:
                 *[item["so_what"] for item in interpretation["result_patterns"]],
                 *[item["discriminating_test"] for item in interpretation["competing_explanations"]],
             ])
-            if not any(fragment in manuscript_text for fragment in (
-                    interpretation["research_question"], interpretation["conclusion"])):
+            if not any(_text_supports_phrase(fragment, manuscript_text, minimum=3, fraction=0.25)
+                       for fragment in (interpretation["research_question"], interpretation["conclusion"])):
                 raise ValidationError("manuscript does not project its scientific interpretation")
             figures = {asset["id"] for asset in results["assets"] if asset.get("role") == "figure"}
             arguments = {item["asset_id"]: item for item in self.config["figure_arguments"]}
@@ -490,13 +643,24 @@ class PaperReleaseBuilder:
             for argument in arguments.values():
                 if argument["unit_id"] not in manuscript["units"]:
                     raise ValidationError("figure argument references an unknown manuscript unit")
-                if argument["observation"] not in manuscript["units"][argument["unit_id"]]["text"]:
+                if not _text_supports_phrase(argument["observation"], manuscript["units"][argument["unit_id"]]["text"],
+                                             minimum=3, fraction=0.25):
                     raise ValidationError("figure argument observation is absent from its bound unit")
-        required_results = [procedure["description"] for procedure in results["procedures"]]
-        required_results += [metric["presentation"] for metric in results["metrics"]]
-        required_results += list(results["limitations"])
-        if any(item not in manuscript_text for item in required_results):
-            raise ValidationError("accepted manuscript omits a supplied procedure, metric, finding, or limitation")
+            scholarly_depth_review = validate_scholarly_depth_review(
+                evaluate_scholarly_depth(manuscript, self.config, results, survey))
+        # Evidence strings are retained verbatim in the results package and
+        # claim index.  The manuscript is a reader-facing projection, so bind
+        # each result/procedure/limitation by distinctive terms instead of
+        # forcing the machine sentence onto the page.
+        for item in results["procedures"]:
+            if not _text_supports_phrase(item["description"], manuscript_text, minimum=3, fraction=0.25):
+                raise ValidationError("accepted manuscript omits the meaning of a supplied procedure")
+        for item in results["metrics"]:
+            if not _text_supports_phrase(item["presentation"], manuscript_text, minimum=1, fraction=0.2):
+                raise ValidationError("accepted manuscript omits a supplied metric")
+        for item in results["limitations"]:
+            if not _text_supports_phrase(item, manuscript_text, minimum=3, fraction=0.25):
+                raise ValidationError("accepted manuscript omits a supplied limitation")
         missing_findings = [finding["id"] for finding in results["findings"]
                             if not _finding_supported(finding, manuscript_text)]
         if missing_findings:
@@ -531,7 +695,8 @@ class PaperReleaseBuilder:
             result.update(schema_version="paper-claim-index-4", storyline=self.config["storyline"],
                           depth_profile=self.config["depth_profile"], figure_arguments=self.config["figure_arguments"],
                           interpretation_sha256=sha256_hex(canonical_bytes(manuscript["interpretation"])),
-                          surface_audit=surface_audit, full_text_reference_count=full_text_reference_count)
+                          surface_audit=surface_audit, full_text_reference_count=full_text_reference_count,
+                          scholarly_depth_review=scholarly_depth_review)
         if self.research_argument is not None:
             result.update(schema_version="paper-claim-index-5",
                           research_argument_sha256=sha256_hex(canonical_bytes(self.research_argument)),
@@ -541,7 +706,7 @@ class PaperReleaseBuilder:
     def _tex(self, manuscript, results=None):
         lines = [r"\documentclass[11pt]{article}", r"\usepackage[margin=1in]{geometry}",
                  r"\usepackage[hidelinks]{hyperref}", r"\usepackage{microtype}", r"\usepackage[T1]{fontenc}",
-                 r"\usepackage{graphicx}",
+                 r"\usepackage{graphicx}", r"\usepackage{float}",
                  r"\title{" + _latex(manuscript["title"]) + "}",
                  r"\author{" + _latex(", ".join(self.config["authors"])) + "}", r"\date{}", r"\begin{document}",
                  r"\maketitle"]
@@ -556,19 +721,37 @@ class PaperReleaseBuilder:
                     # the header, and remaining lines the data rows. Keeping
                     # the source as plain text lets the structured manuscript
                     # and review layers inspect exactly the values rendered.
-                    rows = [line.split("|") for line in unit["text"].splitlines() if line.strip()]
-                    if len(rows) < 3 or any(len(row) != len(rows[1]) for row in rows[1:]):
+                    raw_rows = [line.strip() for line in unit["text"].splitlines() if line.strip()]
+                    if len(raw_rows) < 3:
                         raise ValidationError("table units require a caption, header, and rectangular rows")
-                    caption = rows[0][0].strip()
-                    header = [cell.strip() for cell in rows[1]]
-                    data_rows = [[cell.strip() for cell in row] for row in rows[2:]]
+                    caption = raw_rows[0]
+                    header = [cell.strip() for cell in raw_rows[1].split("|")]
+                    data_rows, notes = [], []
+                    for line in raw_rows[2:]:
+                        if "|" not in line or re.match(r"^\([a-z]\)\s", line, re.I):
+                            # Table footnotes are reader-facing scientific
+                            # text, not data rows. Keep them in the rendered
+                            # table instead of dropping their qualification.
+                            notes.append(line)
+                            continue
+                        row = [cell.strip() for cell in line.split("|")]
+                        if len(row) != len(header):
+                            raise ValidationError("table units require a caption, header, and rectangular rows")
+                        data_rows.append(row)
+                    if not header or not data_rows:
+                        raise ValidationError("table units require a caption, header, and rectangular rows")
                     lines.extend([r"\begin{table}[htbp]", r"\centering", r"\scriptsize",
                                   r"\caption{" + _latex(caption) + "}",
+                                  r"\resizebox{\linewidth}{!}{%",
                                   r"\begin{tabular}{" + "r" * len(header) + "}", r"\hline",
                                   " & ".join(r"\textbf{" + _latex(cell) + "}" for cell in header) + r" \\", r"\hline"])
                     for row in data_rows:
                         lines.append(" & ".join(_latex(cell) for cell in row) + r" \\")
-                    lines.extend([r"\hline", r"\end{tabular}", r"\end{table}", ""])
+                    lines.extend([r"\hline", r"\end{tabular}}"])
+                    if notes:
+                        lines.append(r"\parbox{0.95\linewidth}{\footnotesize "
+                                     + _latex(" ".join(notes)) + "}")
+                    lines.extend([r"\end{table}", ""])
                 elif unit["kind"] in {"code", "json"}:
                     lines.extend([r"\begin{verbatim}", unit["text"], r"\end{verbatim}"])
                 else:
@@ -577,9 +760,12 @@ class PaperReleaseBuilder:
         if figures:
             lines.append(r"\section{Figures}")
             for asset in figures:
-                lines.extend([r"\begin{figure}[htbp]", r"\centering",
+                lines.extend([r"\begin{figure}[H]", r"\centering",
                               r"\includegraphics[width=0.78\linewidth]{\detokenize{../assets/" + asset["path"] + "}}",
                               r"\caption{" + _latex(asset["caption"]) + "}", r"\end{figure}"])
+            # Keep the bibliography together rather than leaving a single
+            # orphaned reference below the final figure.
+            lines.append(r"\clearpage")
         lines.append(r"\section*{Keywords}")
         lines.append(_latex(", ".join(self.config["keywords"])))
         lines.extend([r"\begin{thebibliography}{99}", r"\footnotesize", r"\raggedright",
@@ -622,6 +808,9 @@ class PaperReleaseBuilder:
         bibliography = "\n\n".join(entries) + "\n"
         (source_dir / "references.bib").write_text(bibliography)
         (source_dir / "claim-index.json").write_bytes(canonical_bytes(claim_index))
+        if claim_index.get("scholarly_depth_review") is not None:
+            (self.dir / "output" / "scholarly-depth-review.json").write_bytes(
+                canonical_bytes(claim_index["scholarly_depth_review"]))
         compile_result = subprocess.run(
             [sys.executable, str(compile_script), str(source_dir / "main.tex"),
              "--output-directory", str(pdf_dir), "--json"],
@@ -663,7 +852,8 @@ class PaperReleaseBuilder:
             argument_record = self.store.publish_artifact(
                 logical_id="strategy/research-argument", artifact_type="argument", author="strategy.architect",
                 body=canonical_bytes(self.research_argument), media_type="application/json",
-                inputs=[{"ref": results_record["artifact_ref"], "purpose": "premise"}])
+                inputs=[{"ref": results_record["artifact_ref"], "purpose": "premise",
+                         "required_state": "accepted"}])
             argument_review_record = self.store.publish_artifact(
                 logical_id="methods/verifications/research-argument", artifact_type="verification",
                 author="methods.argument-adjudicator", body=canonical_bytes(self.argument_review),
@@ -683,6 +873,13 @@ class PaperReleaseBuilder:
                     "storyline_sha256": (sha256_hex(canonical_bytes(self.config["storyline"]))
                                           if self.config["schema_version"] in {"paper-release-score-2", "paper-release-score-3"} else None),
                     "depth_profile": claim_index.get("depth_profile"),
+                    # Only score-3 descriptors have the scholarly-depth
+                    # contract.  Do not label legacy score-1/2 candidates as
+                    # journal-reviewed merely because they declare a paper.
+                    "scholarly_profile": (profile_for_paper(self.config)
+                                          if self.config["schema_version"] == "paper-release-score-3"
+                                          else None),
+                    "scholarly_depth_review": claim_index.get("scholarly_depth_review"),
                     "interpretation_sha256": claim_index.get("interpretation_sha256"),
                     "research_argument_sha256": (sha256_hex(canonical_bytes(self.research_argument))
                                                   if self.research_argument is not None else None),
