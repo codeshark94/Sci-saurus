@@ -25,6 +25,10 @@ Copy `config/paragraph-run.example.json` to a local configuration file. The exam
 | `model.auth_env` | Environment-variable name, or `null`; never a plaintext key |
 | `model.reasoning_effort` | Optional `none`, `low`, `medium`, `high`, or `xhigh` for compatible servers that support it |
 | `model.output_format` | Optional `json_object` for compatible servers that support structured output |
+| `model.temperature`, `model.top_p` | Optional provider sampling controls; Composer role defaults apply when omitted |
+| `model.seed` | Optional non-negative replay seed; an autonomous Composer mission supplies and persists its exploration seed |
+| `model.presence_penalty`, `model.frequency_penalty` | Optional provider repetition controls in the range `-2` to `2` |
+| `model.role_profiles` | Optional map from role name to sampling overrides; this orchestration metadata is never sent to the provider |
 | `mcp_fetch_command` | Executable and argument list; the example uses `.venv/bin/python -m mcp_server_fetch` |
 | `public_queries`, `source_urls` | Explicit public search and fetch routes; model output cannot invoke arbitrary tools |
 | `required_literals` | Baseline values or phrases that must remain present |

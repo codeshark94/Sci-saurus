@@ -18,7 +18,7 @@ import time
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.models import ModelClient
+from scisaurus.runtime.models import ModelClient, resolve_model_config
 from scisaurus.runtime.scientific_surface import find_control_leaks
 
 
@@ -514,7 +514,7 @@ class ArgumentAdjudicator:
                                      "argument": argument,
                                      "output_contract": {"exact_top_level_keys": ["schema_version", "decision", "checks", "required_repairs", "rationale"],
                                                          "schema_version": REVIEW_SCHEMA_VERSION}}, ensure_ascii=False, sort_keys=True)
-            config = deepcopy(self.model_config)
+            config = resolve_model_config(self.model_config, role="strategy.argument-reviewer")
             if deadline is not None:
                 config["timeout_seconds"] = min(float(config["timeout_seconds"]), max(0.2, remaining))
             result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt)
@@ -577,7 +577,7 @@ class ResearchArgumentRunner:
                 prompt = argument_prompt(evidence_packet, min_figures=min_figures, min_tables=min_tables,
                                          min_experiments=min_experiments,
                                          validation_feedback=prompt_feedback)
-                config = deepcopy(self.model_config)
+                config = resolve_model_config(self.model_config, role="strategy.argument")
                 if deadline is not None:
                     config["timeout_seconds"] = min(float(config["timeout_seconds"]), max(0.2, remaining))
                 result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt)

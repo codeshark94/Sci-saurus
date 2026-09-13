@@ -249,6 +249,21 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertIsNone(runner._retry_policy()["max_attempts"])
             runner.close()
 
+    def test_exploration_seed_is_random_once_and_persisted_for_resume(self):
+        with tempfile.TemporaryDirectory() as path, patch(
+                "scisaurus.runtime.composer.secrets.randbits", return_value=123456):
+            workflow = self._workflow(Path(path))
+            runner = ComposerRunner(workflow)
+            self.assertEqual(runner.exploration_seed, 123456)
+            self.assertEqual(runner._topic_sampling_seed(), runner._topic_sampling_seed())
+            runner._checkpoint("seed-persisted", force=True)
+            progress = json.loads((Path(workflow["project_id"]) / "output" / "progress.json").read_text())
+            self.assertEqual(progress["exploration_seed"], 123456)
+            runner.close()
+            resumed = ComposerRunner(workflow, resume=True)
+            self.assertEqual(resumed.exploration_seed, 123456)
+            resumed.close()
+
     def test_free_topic_selection_projects_question_and_queries_without_manual_bindings(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -792,6 +807,108 @@ class ComposerWorkflowTests(unittest.TestCase):
             runner._run_stage = fake_stage
             result = runner.run()
             self.assertEqual(calls, ["experiment"])
+
+    def test_free_topic_checkpoint_reuse_is_opt_in(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_config = root / "topic.json"
+            topic_config.write_text(json.dumps({"schema_version": "topic-discovery-config-1"}))
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery", "config_path": str(topic_config.resolve()),
+                "project_dir": str(topic_dir.resolve()), "depends_on": [], "estimate_seconds": 1,
+                "bindings": [], "deadline_seconds": 10, "reuse_completed": True,
+                "reuse_output_path": str((root / "accepted-topic.json").resolve()),
+            })
+            checkpoint = root / "accepted-topic.json"
+            checkpoint.write_text(json.dumps({"status": "accepted", "topic": {"research_question": "old"}}))
+            runner = ComposerRunner(workflow)
+            runner._remaining = lambda: 10.0
+            with patch("scisaurus.runtime.topic_discovery.validate_topic_stage_config") as validate, \
+                    patch("scisaurus.runtime.topic_discovery.TopicDiscoveryRunner") as topic_runner:
+                validate.return_value = {
+                    "model_config_path": str((root / "model.json").resolve()),
+                    "output_path": str((root / "topic-output.json").resolve()),
+                    "candidate_count": 3, "max_attempts": 1, "schema_version": "topic-discovery-config-1",
+                }
+                (root / "model.json").write_text("{}")
+                topic_runner.return_value.run.return_value = {
+                    "status": "completed", "topic": {"research_question": "new"}}
+                result = runner._run_stage(workflow["stages"][0])
+            self.assertEqual(result["topic"]["research_question"], "new")
+            runner.close()
+
+    def test_journal_consumer_attaches_default_experiment_quality_contract(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            paper_config = root / "paper-config.json"
+            paper_config.write_text(json.dumps({
+                "schema_version": "paper-release-score-3", "document_type": "research_paper",
+                "depth_profile": {"min_figures": 3},
+            }))
+            paper_dir = root / "paper"
+            paper_dir.mkdir()
+            workflow["stages"].append({
+                "id": "paper", "kind": "paper", "config_path": str(paper_config.resolve()),
+                "project_dir": str(paper_dir.resolve()), "depends_on": ["experiment"],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            runner = ComposerRunner(workflow)
+            config = {"experiment": {"id": "study"}}
+            result = runner._ensure_journal_quality_contract(workflow["stages"][1], config)
+            self.assertEqual(result["experiment"]["quality_contract"]["minimum_figures"], 3)
+            runner.close()
+
+    def test_journal_profile_resolves_nested_paper_descriptor(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            nested = root / "paper-config.json"
+            nested.write_text(json.dumps({
+                "schema_version": "paper-release-score-3",
+                "document_type": "research_paper",
+                "depth_profile": {"min_figures": 4},
+            }))
+            descriptor = root / "paper.json"
+            descriptor.write_text(json.dumps({"paper_config_path": str(nested)}))
+            paper_dir = root / "paper"
+            paper_dir.mkdir()
+            workflow["stages"].append({
+                "id": "paper", "kind": "paper", "config_path": str(descriptor.resolve()),
+                "project_dir": str(paper_dir.resolve()), "depends_on": ["experiment"],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            runner = ComposerRunner(workflow)
+            profile = runner._paper_depth_profile("experiment")
+            self.assertIsNotNone(profile)
+            self.assertEqual(profile[0]["min_figures"], 4)
+            runner.close()
+
+    def test_paper_figure_reconciliation_drops_stale_asset_bindings(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            paper_config = {"schema_version": "paper-release-score-3",
+                            "figure_arguments": [{"asset_id": "old_figure", "unit_id": "results_p1",
+                                                   "why": "old", "observation": "old"}]}
+            packet = {"results_package": {"assets": [
+                {"id": "new_figure", "role": "figure", "caption": "A new observed pattern."},
+            ]}, "writer_contract": {"section_order": [{"id": "results", "unit_ids": ["results_p1"]}],
+                                        "figure_readings": [
+                {"asset_id": "old_figure", "unit_id": "results_p1", "why": "old", "observation": "old"},
+            ]}}
+            argument = {"figure_plan": [{"kind": "figure", "asset_id": "new_figure",
+                                          "purpose": "A new display.", "readout": "A new observed pattern."}]}
+            result = runner._synchronize_paper_figure_arguments(paper_config, packet, argument)
+            self.assertEqual([item["asset_id"] for item in result["figure_arguments"]], ["new_figure"])
+            self.assertEqual(packet["writer_contract"]["figure_readings"][0]["asset_id"], "new_figure")
+            runner.close()
 
     def test_routes_internal_review_feedback_and_deduplicates_resume_replay(self):
         with tempfile.TemporaryDirectory() as path:

@@ -17,6 +17,7 @@ import math
 import platform
 from pathlib import Path
 import re
+import secrets
 import shutil
 import sys
 import threading
@@ -92,10 +93,11 @@ def _positive_number(value, name):
 def validate_workflow(value):
     """Validate the immutable composer workflow contract."""
     fields = {"schema_version", "id", "revision", "project_id", "objective", "stages", "time_policy", "completion"}
-    allowed_fields = fields | {"retry_policy", "continuation_policy", "organization"}
+    allowed_fields = fields | {"retry_policy", "continuation_policy", "organization", "exploration_seed",
+                               "topic_reuse_allowed"}
     if not isinstance(value, dict) or set(value) - allowed_fields or not fields.issubset(value):
         raise ValidationError(
-            f"composer workflow requires {sorted(fields)} and permits ['continuation_policy', 'organization', 'retry_policy']")
+            f"composer workflow requires {sorted(fields)} and permits ['continuation_policy', 'exploration_seed', 'organization', 'retry_policy', 'topic_reuse_allowed']")
     if value["schema_version"] != SCHEMA_VERSION:
         raise ValidationError(f"composer workflow schema must be {SCHEMA_VERSION}")
     _identifier(value["id"], "workflow id")
@@ -103,6 +105,11 @@ def validate_workflow(value):
         raise ValidationError("workflow revision must be a positive integer")
     _text(value["project_id"], "workflow project_id")
     _text(value["objective"], "workflow objective")
+    if "exploration_seed" in value and (
+            type(value["exploration_seed"]) is not int or value["exploration_seed"] < 0):
+        raise ValidationError("workflow exploration_seed must be a non-negative integer when configured")
+    if "topic_reuse_allowed" in value and type(value["topic_reuse_allowed"]) is not bool:
+        raise ValidationError("workflow topic_reuse_allowed must be Boolean when configured")
     stages = value["stages"]
     if not isinstance(stages, list) or not stages:
         raise ValidationError("composer workflow requires at least one stage")
@@ -314,6 +321,14 @@ class ComposerRunner:
         self.deadline = self.started + float(policy["hard_seconds"])
         self.next_checkpoint = self.started
         self.run_id = uuid.uuid4().hex
+        # A fresh mission receives one entropy-backed exploration seed.  It is
+        # persisted in the run input/checkpoints so retries and resumes repeat
+        # the same proposal, while two independently created missions explore
+        # different literature samples and topic generations.  A workflow can
+        # pin the seed when exact replay is desired.
+        configured_seed = self.workflow.get("exploration_seed")
+        self.exploration_seed = (configured_seed if configured_seed is not None
+                                 else secrets.randbits(63))
         self.context = {}
         self.stage_records = {}
         self.feedback = []
@@ -332,6 +347,7 @@ class ComposerRunner:
             "phase": "initialized", "elapsed_seconds": 0.0,
             "remaining_seconds": max(0.0, float(self.workflow["time_policy"]["hard_seconds"])),
             "started_at_epoch": self.started_epoch, "deadline_at_epoch": self.deadline_epoch,
+            "exploration_seed": self.exploration_seed,
             "retry_policy": self._retry_policy(),
             "continuation_policy": self._continuation_policy(),
             "continuation_cycles": 0, "reopened_stage_ids": [],
@@ -347,6 +363,7 @@ class ComposerRunner:
             self._publish("inputs/composer-run", "note", {
                 "schema_version": "composer-run-input-1", "workflow_ref": self._workflow_record["artifact_ref"],
                 "run_id": self.run_id, "resume": False,
+                "exploration_seed": self.exploration_seed,
             }, "command.composer")
         else:
             head = self.store.head("command/composer/workflow")
@@ -836,6 +853,11 @@ class ComposerRunner:
             "project_scoped_execution": True,
         }
 
+    def _topic_sampling_seed(self):
+        """Derive a stable per-cycle seed from the mission exploration seed."""
+        material = f"{self.exploration_seed}:topic:{self.continuation_cycles}".encode("utf-8")
+        return int(hashlib.sha256(material).hexdigest()[:16], 16)
+
     def _requests_for_stage(self, stage_id):
         return [deepcopy(item) for item in self.active_research_requests
                 if item.get("source_stage_id") == stage_id
@@ -949,6 +971,183 @@ class ComposerRunner:
             survey["seed_queries"] = unique_queries
         return config
 
+    def _downstream_paper_stage(self, stage_id):
+        """Find the paper consumer whose publication contract governs a stage."""
+        by_id = {item["id"]: item for item in self.workflow["stages"]}
+        pending = [item["id"] for item in self.workflow["stages"]
+                   if item["kind"] == "paper" and stage_id in item.get("depends_on", [])]
+        seen = set()
+        while pending:
+            candidate = pending.pop(0)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            stage = by_id.get(candidate)
+            if stage is None:
+                continue
+            if stage["kind"] == "paper":
+                return stage
+            pending.extend(next_stage["id"] for next_stage in by_id.values()
+                           if candidate in next_stage.get("depends_on", []))
+        # The direct-dependency walk above is sufficient for the ordinary
+        # Composer graph.  Keep a transitive fallback for a branched workflow.
+        for stage in by_id.values():
+            if stage["kind"] != "paper":
+                continue
+            pending = list(stage.get("depends_on", []))
+            visited = set()
+            while pending:
+                current = pending.pop()
+                if current in visited:
+                    continue
+                visited.add(current)
+                if current == stage_id:
+                    return stage
+                pending.extend(by_id.get(current, {}).get("depends_on", []))
+        return None
+
+    def _paper_depth_profile(self, stage_id):
+        paper_stage = self._downstream_paper_stage(stage_id)
+        if paper_stage is None:
+            return None
+        try:
+            descriptor_path = Path(paper_stage["config_path"])
+            descriptor = json.loads(descriptor_path.read_text())
+            # Composer paper stages normally point at a small descriptor whose
+            # ``paper_config_path`` names the independently versioned release
+            # contract.  Read that nested contract before deciding whether an
+            # upstream experiment/survey must satisfy journal-grade floors.
+            nested_path = descriptor.get("paper_config_path")
+            if isinstance(nested_path, str):
+                candidate = Path(nested_path)
+                if not candidate.is_absolute():
+                    candidate = descriptor_path.parent / candidate
+                if candidate.is_file():
+                    descriptor = json.loads(candidate.read_text())
+        except (OSError, ValueError, TypeError):
+            return None
+        if (descriptor.get("schema_version") == "paper-release-score-3"
+                or descriptor.get("document_type") == "research_paper" and "depth_profile" in descriptor):
+            try:
+                from scisaurus.runtime.scholarly_depth import PROFILES, profile_for_paper
+                return descriptor.get("depth_profile"), PROFILES[profile_for_paper(descriptor)]
+            except (KeyError, ValidationError):
+                return None
+        return None
+
+    def _ensure_journal_quality_contract(self, stage, config):
+        """Bind a substantive analysis floor to experiments feeding a paper."""
+        profile = self._paper_depth_profile(stage["id"])
+        if profile is None or stage["kind"] != "experiment":
+            return config
+        experiment = config.get("experiment")
+        if not isinstance(experiment, dict):
+            return config
+        from scisaurus.runtime.research_quality import ensure_minimum_quality_contract
+        # The downstream journal floor is monotone: retain stricter local
+        # requirements, but never let an older weak contract turn a research
+        # paper into a thin validation note.
+        experiment["quality_contract"] = ensure_minimum_quality_contract(
+            experiment.get("quality_contract"), study_type=experiment.get("study_type"))
+        return config
+
+    def _argument_minimums(self, stage_id, config):
+        """Raise argument display floors to the publication profile."""
+        minimums = {"figures": 2, "tables": 1, "experiments": 2}
+        profile = self._paper_depth_profile(stage_id)
+        if profile is not None:
+            _, floor = profile
+            minimums["figures"] = max(minimums["figures"], int(floor.get("min_figures", 0)))
+            minimums["tables"] = max(minimums["tables"], int(floor.get("min_tables", 0)))
+        return minimums
+
+    @staticmethod
+    def _packet_unit_ids(packet):
+        contract = packet.get("writer_contract", {}) if isinstance(packet, dict) else {}
+        order = contract.get("section_order", []) if isinstance(contract, dict) else []
+        ids = []
+        for section in order:
+            if not isinstance(section, dict):
+                continue
+            for unit_id in section.get("unit_ids", []):
+                if isinstance(unit_id, str) and unit_id not in ids:
+                    ids.append(unit_id)
+        return ids
+
+    def _synchronize_paper_figure_arguments(self, paper_config, packet, argument_package):
+        """Carry every accepted result figure into the release bindings."""
+        if paper_config.get("schema_version") != "paper-release-score-3":
+            return paper_config
+        results = packet.get("results_package") if isinstance(packet, dict) else None
+        assets = [asset for asset in (results or {}).get("assets", [])
+                  if isinstance(asset, dict) and asset.get("role") == "figure"]
+        if not assets:
+            return paper_config
+        asset_ids = {asset.get("id") for asset in assets if isinstance(asset.get("id"), str)}
+        # A paper descriptor can have been prepared against an earlier result
+        # package.  Stale figure bindings are removed as one explicit
+        # reconciliation step; carrying them forward would make the release
+        # claim an asset that is no longer part of the accepted evidence.
+        arguments = [item for item in paper_config.get("figure_arguments", [])
+                     if isinstance(item, dict) and item.get("asset_id") in asset_ids]
+        paper_config["figure_arguments"] = arguments
+        known = {item.get("asset_id") for item in arguments}
+        plan = {}
+        argument = argument_package.get("argument") if isinstance(argument_package, dict) else None
+        for item in (argument or {}).get("figure_plan", []):
+            if isinstance(item, dict) and item.get("kind") == "figure" and isinstance(item.get("asset_id"), str):
+                plan[item["asset_id"]] = item
+        unit_ids = self._packet_unit_ids(packet)
+        used_units = {item.get("unit_id") for item in arguments if isinstance(item, dict)}
+        preferred = [unit_id for unit_id in unit_ids
+                     if unit_id.startswith(("results_", "interpretation_"))]
+        for asset in assets:
+            asset_id = asset.get("id")
+            if not isinstance(asset_id, str) or asset_id in known:
+                continue
+            planned = plan.get(asset_id, {})
+            unit_id = next((item for item in preferred if item not in used_units), None)
+            if unit_id is None:
+                unit_id = next((item for item in preferred), None)
+            if unit_id is None:
+                # Let the normal release validator report an unbindable asset;
+                # inventing a manuscript address would violate surgical edits.
+                continue
+            observation = planned.get("readout") or asset.get("caption")
+            why = planned.get("purpose") or "This display exposes a result pattern needed by the argument."
+            if not isinstance(observation, str) or not observation.strip():
+                continue
+            arguments.append({"asset_id": asset_id, "observation": observation,
+                              "unit_id": unit_id, "why": why})
+            known.add(asset_id)
+            used_units.add(unit_id)
+            contract = packet.get("writer_contract")
+            if isinstance(contract, dict):
+                readings = contract.setdefault("figure_readings", [])
+                if not isinstance(readings, list):
+                    readings = []
+                    contract["figure_readings"] = readings
+                readings[:] = [item for item in readings
+                               if isinstance(item, dict) and item.get("asset_id") in asset_ids]
+                if not any(isinstance(item, dict) and item.get("asset_id") == asset_id for item in readings):
+                    readings.append({"asset_id": asset_id, "observation": observation,
+                                     "unit_id": unit_id, "why": why})
+        return paper_config
+
+    @staticmethod
+    def _extend_paper_images(config, packet, paper_config):
+        images = list(config.get("images", []))
+        result_path = paper_config.get("results_package")
+        base = Path(result_path).resolve().parent if isinstance(result_path, str) else None
+        for asset in (packet.get("results_package", {}) or {}).get("assets", []):
+            if not isinstance(asset, dict) or asset.get("role") != "figure" or base is None:
+                continue
+            candidate = (base / asset.get("path", "")).resolve()
+            if candidate.is_file() and str(candidate) not in images:
+                images.append(str(candidate))
+        config["images"] = images
+        return config
+
     def _adapt_continuation_config(self, stage, config):
         """Derive a fresh stage configuration from explicit research work orders."""
         requests = self._requests_for_stage(stage["id"])
@@ -962,9 +1161,24 @@ class ComposerRunner:
             # Expansion is deliberate and bounded.  It increases discovery,
             # full-text, and citation capacity together so the next gate does
             # not simply see more abstracts while remaining evidence-poor.
-            search["max_works"] = min(1000, max(search.get("max_works", 1) + 10, 20))
-            search["max_full_texts"] = min(100, max(search.get("max_full_texts", 1) + 5, 5))
-            search["max_api_calls"] = min(1000, max(search.get("max_api_calls", 1) + 20, 40))
+            journal_profile = self._paper_depth_profile(stage["id"])
+            if journal_profile is not None:
+                # A journal continuation must widen the search graph and the
+                # full-text frontier together.  Increasing only the abstract
+                # limit creates a larger bibliography without improving the
+                # evidence needed for methods and related-work claims.
+                search["queries_per_role"] = min(8, max(search.get("queries_per_role", 1) + 1, 4))
+                search["results_per_query"] = min(100, max(search.get("results_per_query", 1) + 10, 50))
+                search["max_works"] = min(1000, max(search.get("max_works", 1) + 50, 120))
+                search["max_full_texts"] = min(100, max(search.get("max_full_texts", 1) + 10, 20))
+                search["max_api_calls"] = min(1000, max(search.get("max_api_calls", 1) + 60, 100))
+                search["challenge_reserve"] = min(20, max(search.get("challenge_reserve", 0), 5))
+                search["saturation_rounds"] = min(8, max(search.get("saturation_rounds", 1), 3))
+                search["expansion_seed_count"] = min(20, max(search.get("expansion_seed_count", 1), 4))
+            else:
+                search["max_works"] = min(1000, max(search.get("max_works", 1) + 10, 20))
+                search["max_full_texts"] = min(100, max(search.get("max_full_texts", 1) + 5, 5))
+                search["max_api_calls"] = min(1000, max(search.get("max_api_calls", 1) + 20, 40))
             search["expansion_rounds"] = min(8, search.get("expansion_rounds", 0) + 1)
             survey["revision"] = int(survey.get("revision", 1)) + self.continuation_cycles
             extra_queries = [item["objective"][:2048] for item in requests
@@ -1131,6 +1345,7 @@ class ComposerRunner:
             "started_at_epoch": self.started_epoch, "deadline_at_epoch": self.deadline_epoch,
             "retry_policy": self._retry_policy(),
             "continuation_policy": self._continuation_policy(),
+            "exploration_seed": self.exploration_seed,
             "continuation_cycles": self.continuation_cycles,
             "reopened_stage_ids": sorted(self.reopened_stage_ids),
             "continuation_pending_stage_ids": sorted(self.continuation_pending_stage_ids),
@@ -1225,6 +1440,17 @@ class ComposerRunner:
 
     def _restore(self):
         timing_state = None
+        # The run input is the earliest durable record and carries the seed
+        # even when a process exits before its first stage checkpoint.
+        run_input = self.store.head("inputs/composer-run")
+        if run_input is not None:
+            try:
+                input_body = json.loads(self.store.read_body(run_input["body_hash"]))
+            except (OSError, TypeError, ValueError):
+                input_body = None
+            if (isinstance(input_body, dict) and type(input_body.get("exploration_seed")) is int
+                    and input_body["exploration_seed"] >= 0):
+                self.exploration_seed = input_body["exploration_seed"]
         head = self.store.head("command/composer/run")
         head_status = None
         if head is not None:
@@ -1242,6 +1468,9 @@ class ComposerRunner:
             self.active_research_requests = body.get("active_research_requests", [])
             self.department_activity = body.get("department_activity", [])
             self.deadline_extensions = body.get("deadline_extensions", [])
+            if (type(body.get("exploration_seed")) is int
+                    and body["exploration_seed"] >= 0):
+                self.exploration_seed = body["exploration_seed"]
             if isinstance(body.get("organization"), dict):
                 self.organization_snapshot = deepcopy(body["organization"])
             self._progress_snapshot = deepcopy(body)
@@ -1272,6 +1501,9 @@ class ComposerRunner:
                     "active_research_requests", self.active_research_requests)
                 self.department_activity = checkpoint.get("department_activity", self.department_activity)
                 self.deadline_extensions = checkpoint.get("deadline_extensions", self.deadline_extensions)
+                if (type(checkpoint.get("exploration_seed")) is int
+                        and checkpoint["exploration_seed"] >= 0):
+                    self.exploration_seed = checkpoint["exploration_seed"]
                 if isinstance(checkpoint.get("organization"), dict):
                     self.organization_snapshot = deepcopy(checkpoint["organization"])
                 self._progress_snapshot = deepcopy(checkpoint)
@@ -1555,12 +1787,18 @@ class ComposerRunner:
 
     def _run_stage(self, stage, *, attempt_number=1):
         """Dispatch one allowlisted specialist runner and return its context."""
+        kind = stage["kind"]
         project_dir = Path(stage["project_dir"])
         stage_deadline = min(float(stage["deadline_seconds"]), self._remaining())
         prior_run = (Path(stage["reuse_output_path"])
                      if stage["reuse_output_path"] is not None
                      else project_dir / "output" / "run.json")
-        if stage["reuse_completed"] and prior_run.is_file():
+        # A fresh free-topic mission must sample a new scholarly pool.  Topic
+        # reuse is an explicit replay mode and is opt-in at workflow level;
+        # other stages retain their existing checkpoint-reuse contract.
+        topic_reuse_allowed = (kind != "topic_discovery"
+                               or self.workflow.get("topic_reuse_allowed", False))
+        if stage["reuse_completed"] and topic_reuse_allowed and prior_run.is_file():
             try:
                 prior = json.loads(prior_run.read_text())
             except (OSError, ValueError) as exc:
@@ -1582,7 +1820,6 @@ class ComposerRunner:
                 return context
         config = json.loads(Path(stage["config_path"]).read_text())
         config = self._adapt_continuation_config(stage, config)
-        kind = stage["kind"]
         # A deadline-governed Composer mission carries its repair contract
         # into specialist model-validation loops as well.  This keeps one
         # malformed response local to its assignment instead of making the
@@ -1625,7 +1862,7 @@ class ComposerRunner:
                 max_attempts=descriptor["max_attempts"],
                 repair_mode=descriptor.get("repair_mode", "bounded"),
                 runtime_context=self._runtime_context(model),
-                sampling_seed=(self.workflow["revision"] + self.continuation_cycles),
+                sampling_seed=self._topic_sampling_seed(),
             )
             output_path = Path(descriptor["output_path"])
             if attempt_number > 1 or stage["id"] in self.reopened_stage_ids:
@@ -1636,6 +1873,8 @@ class ComposerRunner:
             if kind == "survey":
                 config = self._apply_topic_to_survey_config(stage, config)
             config = self._apply_bindings(config, stage["bindings"])
+            if kind == "experiment":
+                config = self._ensure_journal_quality_contract(stage, config)
             config.setdefault("limits", {})["wall_clock_seconds"] = min(
                 float(config["limits"]["wall_clock_seconds"]), stage_deadline)
             if "time_policy" in config and isinstance(config["time_policy"], dict):
@@ -1722,8 +1961,10 @@ class ComposerRunner:
                         value = json.loads(Path(value).read_text())
                     _set_path(packet, binding["target"][len("packet."):], value)
             model = json.loads(model_path.read_text())
+            minimums = self._argument_minimums(stage["id"], config)
             result = ResearchArgumentRunner(model, deadline_seconds=stage_deadline).run(
-                argument_evidence_packet(packet), min_figures=2, min_tables=1, min_experiments=2)
+                argument_evidence_packet(packet), min_figures=minimums["figures"],
+                min_tables=minimums["tables"], min_experiments=minimums["experiments"])
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(canonical_bytes(result))
             result = {"status": "completed", "output_path": str(output_path.resolve()),
@@ -1780,6 +2021,9 @@ class ComposerRunner:
                 paper_config = self._synchronize_paper_references(paper_config)
             argument_package_path = config["argument_package_path"]
             argument_package = json.loads(Path(argument_package_path).read_text()) if argument_package_path else None
+            paper_config = self._synchronize_paper_figure_arguments(
+                paper_config, packet, argument_package)
+            config = self._extend_paper_images(config, packet, paper_config)
             runner = PaperPipelineRunner(packet=packet, model_config=model, paper_config=paper_config,
                 output_dir=config["output_dir"], image_paths=config["images"],
                 max_review_rounds=config["max_review_rounds"],

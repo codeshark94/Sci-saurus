@@ -17,6 +17,98 @@ import urllib.request
 from scisaurus.core.errors import ValidationError
 
 
+SAMPLING_FIELDS = frozenset({
+    "temperature", "top_p", "seed", "presence_penalty", "frequency_penalty",
+})
+OLLAMA_SAMPLING_FIELDS = frozenset({"temperature", "top_p", "seed"})
+
+# Sampling changes how a role explores or checks a response; it does not
+# replace the role's prompt or its validation contract.  These defaults are
+# deliberately modest so a model can vary the search direction while the
+# evidence and review roles remain conservative.  A model configuration may
+# override any profile below through ``role_profiles``.
+DEFAULT_ROLE_PROFILES = {
+    "topic_discovery": {"temperature": 1.1, "top_p": 0.95, "presence_penalty": 0.2},
+    "research.topic-discovery": {"temperature": 1.1, "top_p": 0.95, "presence_penalty": 0.2},
+    "research.search-planner": {"temperature": 1.0, "top_p": 0.95, "presence_penalty": 0.15},
+    "methods.blind-search-planner": {"temperature": 1.05, "top_p": 0.95, "presence_penalty": 0.2},
+    "research.literature-mapper": {"temperature": 0.25, "top_p": 0.9},
+    "research.literature-reviewer": {"temperature": 0.25, "top_p": 0.9},
+    "strategy.interpretation": {"temperature": 0.75, "top_p": 0.92},
+    "strategy.argument": {"temperature": 0.7, "top_p": 0.92},
+    "strategy.argument-reviewer": {"temperature": 0.2, "top_p": 0.9},
+    "editorial.writer": {"temperature": 0.65, "top_p": 0.92},
+    "scientific-author": {"temperature": 0.65, "top_p": 0.92},
+    "editorial.surgical-editor": {"temperature": 0.45, "top_p": 0.9},
+    "review.science": {"temperature": 0.2, "top_p": 0.9},
+    "review.methods": {"temperature": 0.2, "top_p": 0.9},
+    "review.ai_smell": {"temperature": 0.8, "top_p": 0.95, "presence_penalty": 0.2},
+    "review.human_scientist": {"temperature": 0.35, "top_p": 0.9},
+    "review.editorial_compression": {"temperature": 0.25, "top_p": 0.9},
+    "review.journal_editor": {"temperature": 0.2, "top_p": 0.9},
+    "review.arbiter": {"temperature": 0.15, "top_p": 0.9},
+    "review.synthesizer": {"temperature": 0.3, "top_p": 0.9},
+}
+
+
+def _validate_sampling_options(options, *, name="sampling options"):
+    """Validate provider sampling controls before a request is dispatched."""
+    if not isinstance(options, dict):
+        raise ValidationError(f"{name} must be an object")
+    unknown = set(options) - SAMPLING_FIELDS
+    if unknown:
+        raise ValidationError(f"{name} contains unsupported fields: {', '.join(sorted(unknown))}")
+    for field in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+        if field not in options:
+            continue
+        value = options[field]
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise ValidationError(f"{name}.{field} must be finite")
+        if field == "temperature" and not 0 <= value <= 2:
+            raise ValidationError(f"{name}.temperature must be between 0 and 2")
+        if field == "top_p" and not 0 < value <= 1:
+            raise ValidationError(f"{name}.top_p must be greater than 0 and at most 1")
+        if field in {"presence_penalty", "frequency_penalty"} and not -2 <= value <= 2:
+            raise ValidationError(f"{name}.{field} must be between -2 and 2")
+    if "seed" in options and (type(options["seed"]) is not int or options["seed"] < 0):
+        raise ValidationError(f"{name}.seed must be a non-negative integer")
+    return options
+
+
+def resolve_model_config(model, *, role=None, overrides=None):
+    """Resolve a model config plus a role's sampling profile.
+
+    The resolver keeps ``role_profiles`` out of the provider payload while
+    allowing one shared model file to express different exploration and
+    verification personalities.  Explicit global sampling fields win over
+    built-in defaults; a named role profile and call-site overrides then win
+    over those global values.
+    """
+    if not isinstance(model, dict):
+        raise ValidationError("model configuration must be an object")
+    base = dict(model)
+    profiles = base.pop("role_profiles", {})
+    if not isinstance(profiles, dict):
+        raise ValidationError("model.role_profiles must be an object")
+    global_sampling = {key: base.pop(key) for key in list(base) if key in SAMPLING_FIELDS}
+    for profile_name, profile in profiles.items():
+        if not isinstance(profile_name, str) or not profile_name.strip():
+            raise ValidationError("model.role_profiles keys must be nonempty strings")
+        _validate_sampling_options(profile, name=f"model.role_profiles.{profile_name}")
+    _validate_sampling_options(global_sampling, name="model sampling options")
+    if overrides is not None:
+        _validate_sampling_options(overrides, name="sampling overrides")
+    sampling = dict(DEFAULT_ROLE_PROFILES.get(role, {}))
+    sampling.update(global_sampling)
+    if role is not None:
+        sampling.update(profiles.get(role, {}))
+    if overrides:
+        sampling.update(overrides)
+    _validate_sampling_options(sampling)
+    base.update(sampling)
+    return base
+
+
 class ModelCallError(RuntimeError):
     """An invocation failed; unknown outcomes must retain their reservation."""
     def __init__(self, message, *, outcome_known=False):
@@ -53,7 +145,10 @@ class ModelClient:
                  auth_env: str | None = None, max_response_bytes: int = 2_000_000,
                  reasoning_effort: str | None = None, output_format: str | None = None,
                  max_image_bytes: int = 7_000_000, max_request_bytes: int = 10_000_000,
-                 max_retries: int = 2, retry_backoff_seconds: float = 1.0):
+                 max_retries: int = 2, retry_backoff_seconds: float = 1.0,
+                 temperature: float | None = None, top_p: float | None = None,
+                 seed: int | None = None, presence_penalty: float | None = None,
+                 frequency_penalty: float | None = None):
         if not isinstance(base_url, str):
             raise ValidationError("model base_url must be a URL string")
         parsed = urllib.parse.urlsplit(base_url)
@@ -88,6 +183,13 @@ class ModelClient:
             raise ValidationError("reasoning_effort must be none, low, medium, high, or xhigh when configured")
         if output_format is not None and output_format != "json_object":
             raise ValidationError("output_format must be json_object when configured")
+        sampling = {
+            key: value for key, value in {
+                "temperature": temperature, "top_p": top_p, "seed": seed,
+                "presence_penalty": presence_penalty, "frequency_penalty": frequency_penalty,
+            }.items() if value is not None
+        }
+        _validate_sampling_options(sampling)
         if protocol != "openai_compatible" and (reasoning_effort is not None or output_format is not None):
             raise ValidationError("reasoning_effort and output_format require the openai_compatible protocol")
         if auth_env is not None and (not isinstance(auth_env, str) or not auth_env or not os.environ.get(auth_env)):
@@ -98,6 +200,11 @@ class ModelClient:
         self.reasoning_effort, self.output_format = reasoning_effort, output_format
         self.max_image_bytes, self.max_request_bytes = max_image_bytes, max_request_bytes
         self.max_retries, self.retry_backoff_seconds = max_retries, float(retry_backoff_seconds)
+        self.temperature = temperature
+        self.top_p = top_p
+        self.seed = seed
+        self.presence_penalty = presence_penalty
+        self.frequency_penalty = frequency_penalty
 
     @staticmethod
     def _read_image(image):
@@ -144,12 +251,25 @@ class ModelClient:
         user_content = parts if images else prompt
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user_content}]
         body = {"model": self.model, "messages": messages, "stream": False}
+        sampling = {
+            key: value for key, value in {
+                "temperature": self.temperature, "top_p": self.top_p, "seed": self.seed,
+                "presence_penalty": self.presence_penalty,
+                "frequency_penalty": self.frequency_penalty,
+            }.items() if value is not None
+        }
         if self.protocol == "ollama":
             path = "/api/chat"
-            body["options"] = {"num_predict": self.max_output_tokens}
+            # Ollama's native options expose temperature/top-p/seed but not
+            # the OpenAI presence/frequency penalty names.
+            body["options"] = {
+                "num_predict": self.max_output_tokens,
+                **{key: value for key, value in sampling.items() if key in OLLAMA_SAMPLING_FIELDS},
+            }
         else:
             path = "/chat/completions"
             body["max_tokens"] = self.max_output_tokens
+            body.update(sampling)
             if self.reasoning_effort is not None:
                 body["reasoning_effort"] = self.reasoning_effort
             if self.output_format is not None:

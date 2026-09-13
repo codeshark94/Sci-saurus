@@ -21,6 +21,10 @@ from scisaurus.core.surveys import SurveyGate
 from scisaurus.runtime.bibliographic_identity import normalize_doi, normalize_title
 from scisaurus.runtime.results import validate_results_package
 from scisaurus.runtime.research_argument import validate_argument_review, validate_research_argument
+from scisaurus.runtime.research_quality import (
+    default_research_quality_contract,
+    evaluate_result_package_quality,
+)
 from scisaurus.runtime.scholarly_depth import (
     evaluate_scholarly_depth,
     evaluate_scholarly_preflight,
@@ -730,6 +734,20 @@ class PaperReleaseBuilder:
                  r"\title{" + _latex(manuscript["title"]) + "}",
                  r"\author{" + _latex(", ".join(self.config["authors"])) + "}", r"\date{}", r"\begin{document}",
                  r"\maketitle"]
+        figures = [asset for asset in (results or {}).get("assets", []) if asset.get("role") == "figure"]
+        figure_by_unit = {}
+        if self.config.get("schema_version") == "paper-release-score-3":
+            for argument in self.config.get("figure_arguments", []):
+                figure_by_unit.setdefault(argument["unit_id"], []).append(argument["asset_id"])
+        figure_lookup = {asset["id"]: asset for asset in figures if isinstance(asset.get("id"), str)}
+        placed = set()
+
+        def figure_lines(asset):
+            placed.add(asset.get("id", asset["path"]))
+            return [r"\begin{figure}[H]", r"\centering",
+                    r"\includegraphics[width=0.78\linewidth]{\detokenize{../assets/" + asset["path"] + "}}",
+                    r"\caption{" + _latex(asset["caption"]) + "}", r"\end{figure}"]
+
         for group in manuscript["groups"]:
             lines.append(r"\section{" + _latex(group["title"]) + "}")
             for unit in group["units"]:
@@ -776,13 +794,21 @@ class PaperReleaseBuilder:
                     lines.extend([r"\begin{verbatim}", unit["text"], r"\end{verbatim}"])
                 else:
                     lines.extend([_latex_with_citations(unit["text"]), ""])
-        figures = [asset for asset in (results or {}).get("assets", []) if asset.get("role") == "figure"]
-        if figures:
+                # Score-3 figures are part of the argument and belong beside
+                # the unit that states their observation.  Keeping the
+                # binding here preserves the manuscript's claim-to-display
+                # order in the rendered PDF; legacy score-1/2 descriptors
+                # retain their appendix-style figure section below.
+                for asset_id in figure_by_unit.get(unit.get("id"), ()):
+                    asset = figure_lookup.get(asset_id)
+                    if asset is not None:
+                        lines.extend(figure_lines(asset))
+                        lines.append("")
+        unplaced = [asset for asset in figures if asset.get("id", asset["path"]) not in placed]
+        if unplaced:
             lines.append(r"\section{Figures}")
-            for asset in figures:
-                lines.extend([r"\begin{figure}[H]", r"\centering",
-                              r"\includegraphics[width=0.78\linewidth]{\detokenize{../assets/" + asset["path"] + "}}",
-                              r"\caption{" + _latex(asset["caption"]) + "}", r"\end{figure}"])
+            for asset in unplaced:
+                lines.extend(figure_lines(asset))
             # Keep the bibliography together rather than leaving a single
             # orphaned reference below the final figure.
             lines.append(r"\clearpage")
@@ -801,6 +827,22 @@ class PaperReleaseBuilder:
         manuscript, survey = self._manuscript(), self._survey()
         results_path = Path(self.config["results_package"])
         results = validate_results_package(json.loads(results_path.read_text()), base_dir=results_path.parent)
+        # Keep the substantive research gate at the final assembly boundary as
+        # well as in the Composer pipeline.  A caller can build a release
+        # directly, so the paper builder must not let a replayable but thin
+        # result package bypass the declared analysis floor.
+        quality_admission = None
+        if (self.config["schema_version"] == "paper-release-score-3"
+                and profile_for_paper(self.config) == "empirical_journal"):
+            quality_admission = evaluate_result_package_quality(
+                results, minimum_contract=default_research_quality_contract())
+            output_dir = self.dir / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "research-quality-admission.json").write_bytes(
+                canonical_bytes(quality_admission))
+            if quality_admission["decision"] != "proceed":
+                raise ValidationError(
+                    "research paper result package does not meet its substantive quality contract")
         claim_index = self._bind(manuscript, survey, results)
         source_dir = self.dir / "output" / "source"
         pdf_dir = self.dir / "output" / "pdf"
@@ -900,6 +942,7 @@ class PaperReleaseBuilder:
                                           if self.config["schema_version"] == "paper-release-score-3"
                                           else None),
                     "scholarly_depth_review": claim_index.get("scholarly_depth_review"),
+                    "research_quality_admission": quality_admission,
                     "interpretation_sha256": claim_index.get("interpretation_sha256"),
                     "research_argument_sha256": (sha256_hex(canonical_bytes(self.research_argument))
                                                   if self.research_argument is not None else None),

@@ -8,6 +8,11 @@ import re
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
+from scisaurus.runtime.research_quality import (
+    check_analysis_contract,
+    validate_analysis,
+    validate_quality_contract,
+)
 
 
 def _exact(value, fields, name):
@@ -114,17 +119,24 @@ def validate_results_package(value, *, base_dir=None):
         _exact(value, core, "results package")
         asset_version = 1
     elif schema == "results-package-2":
-        _exact(value, core | {"study_type", "question", "hypothesis", "provenance", "validation"},
-               "results package")
+        required = core | {"study_type", "question", "hypothesis", "provenance", "validation"}
+        allowed = required | {"analysis", "quality_contract"}
+        if (set(value) - allowed) or not required.issubset(value):
+            raise ValidationError(
+                f"results package requires {sorted(required)} and permits analysis, quality_contract")
         asset_version = 2
         if value["study_type"] not in {"novel_research", "replication", "methods_validation", "exploratory"}:
             raise ValidationError("results package study_type is unsupported")
         _text(value["question"], "results package question")
         _text(value["hypothesis"], "results package hypothesis")
         provenance = value["provenance"]
-        _exact(provenance, {"score_ref", "literature_survey_ref", "literature_assessment_ref",
-                            "execution_refs", "validator_execution_ref", "execution_profile_ref",
-                            "validation_profile_ref", "replay_sha256"}, "results provenance")
+        provenance_fields = {"score_ref", "literature_survey_ref", "literature_assessment_ref",
+                             "execution_refs", "validator_execution_ref", "execution_profile_ref",
+                             "validation_profile_ref", "replay_sha256"}
+        if (set(provenance) - (provenance_fields | {"design_ref"})
+                or not provenance_fields.issubset(provenance)):
+            raise ValidationError(
+                f"results provenance requires {sorted(provenance_fields)} and permits design_ref")
         _ref(provenance["score_ref"], "results score_ref")
         _ref(provenance["literature_survey_ref"], "literature survey_ref", nullable=True)
         _ref(provenance["literature_assessment_ref"], "literature assessment_ref", nullable=True)
@@ -149,11 +161,28 @@ def validate_results_package(value, *, base_dir=None):
             raise ValidationError("results package requires distinct model review refs")
         for ref in validation["model_review_refs"]:
             _ref(ref, "model review ref")
+        if "design_ref" in provenance:
+            _ref(provenance["design_ref"], "results design_ref")
     else:
         raise ValidationError("unsupported results package schema")
     _identifier(value["id"], "results package id")
     if type(value["revision"]) is not int or value["revision"] < 1:
         raise ValidationError("results package revision must be positive")
     _core(value, asset_version=asset_version, base_dir=base_dir)
+    if schema == "results-package-2":
+        if "analysis" in value:
+            validate_analysis(value["analysis"])
+        if "quality_contract" in value:
+            validate_quality_contract(value["quality_contract"], study_type=value["study_type"])
+            if "analysis" not in value:
+                raise ValidationError("results quality_contract requires analysis")
+            figures = sum(1 for asset in value["assets"]
+                          if asset.get("role") == "figure")
+            deficits = check_analysis_contract(value["analysis"], value["quality_contract"],
+                                               figure_count=figures)
+            if deficits:
+                raise ValidationError(
+                    "results quality contract is not satisfied: "
+                    + ", ".join(item["field"] for item in deficits))
     canonical_bytes(value)
     return value

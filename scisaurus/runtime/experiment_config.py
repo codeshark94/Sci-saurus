@@ -10,6 +10,7 @@ from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.config import _text, configured_worker_slots, validate_common
 from scisaurus.runtime.programs import json_object
+from scisaurus.runtime.research_quality import validate_quality_contract
 from scisaurus.runtime.scores import exact, identifier
 from scisaurus.runtime.time_policy import validate_time_policy
 
@@ -58,17 +59,26 @@ def validate_experiment_config(config):
     if config["limits"]["concurrent_calls"] < 3:
         raise ValidationError("experiment capacity must cover two reviewers and final verification")
     experiment = config.get("experiment")
-    exact(experiment, {
+    experiment_fields = {
         "id", "revision", "study_type", "domain", "research_question", "hypothesis", "method",
         "parameters", "seed", "run_count", "stopping_rule", "primary_outcomes", "limitations",
         "literature_gate", "execution", "validation", "required_assets", "reviewers", "stage_seconds",
         "max_observations", "max_asset_bytes",
-    }, "experiment score")
+    }
+    if (not isinstance(experiment, dict) or set(experiment) - (experiment_fields | {"quality_contract"})
+            or not experiment_fields.issubset(experiment)):
+        raise ValidationError(
+            f"experiment score requires {sorted(experiment_fields)} and permits quality_contract")
     identifier(experiment["id"])
     if type(experiment["revision"]) is not int or experiment["revision"] < 1:
         raise ValidationError("experiment revision must be a positive integer")
     if experiment["study_type"] not in STUDY_TYPES:
         raise ValidationError("experiment study_type is unsupported")
+    quality_contract = experiment.get("quality_contract")
+    if quality_contract is None and experiment["study_type"] == "novel_research":
+        raise ValidationError("novel research requires an explicit quality_contract")
+    if quality_contract is not None:
+        validate_quality_contract(quality_contract, study_type=experiment["study_type"])
     for key in ("domain", "research_question", "hypothesis", "method", "stopping_rule"):
         _text(experiment[key], f"experiment.{key}")
     try:
@@ -110,7 +120,7 @@ def validate_experiment_config(config):
     gate = experiment["literature_gate"]
     if gate is None:
         if experiment["study_type"] == "novel_research":
-            raise ValidationError("novel research requires a current experiment-eligible literature assessment")
+            raise ValidationError("novel research requires a current experiment-eligible literature gate assessment")
     else:
         exact(gate, {"project_dir", "survey_ref", "assessment_ref", "required_state"}, "literature gate")
         path = Path(gate["project_dir"])

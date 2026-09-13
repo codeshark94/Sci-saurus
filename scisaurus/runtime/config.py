@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 
 from scisaurus.core.errors import ValidationError
-from scisaurus.runtime.models import ModelClient
+from scisaurus.runtime.models import resolve_model_config, ModelClient
 
 
 def _text(value, field):
@@ -57,7 +57,10 @@ def validate_common(value, extra_fields, *, retrieval=True):
     if not isinstance(value.get("model"), dict):
         raise ValidationError("model configuration is required")
     try:
-        model = ModelClient(**value["model"])
+        # ``role_profiles`` is orchestration metadata, not a provider field.
+        # Validate the base model after resolving it without a role so profile
+        # definitions are checked but never forwarded as unknown kwargs.
+        model = ModelClient(**resolve_model_config(value["model"]))
     except TypeError as exc:
         raise ValidationError("model configuration contains missing or unsupported fields") from exc
     limits = value.get("limits", {})

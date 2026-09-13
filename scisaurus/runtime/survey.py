@@ -483,7 +483,8 @@ class SurveyRunner(ExecutionRuntime):
                         client.update(job["model_overrides"])
                     specs.append({"task_id": f"survey-{job['name']}-{self.serial}", "kind": "model",
                         "actor": job["actor"], "task_kind": task_kind,
-                        "params": {"client": client, "prompt": json.dumps(assignment, ensure_ascii=False)}})
+                        "params": {"client": client, "role": job["actor"],
+                                   "prompt": json.dumps(assignment, ensure_ascii=False)}})
                 outcomes = self._call_batch(specs, max_parallel=self.worker_slots)
                 failures = []
                 for job, spec in zip(wave, specs):
@@ -757,7 +758,8 @@ class SurveyRunner(ExecutionRuntime):
                 "instructions": "Return {queries:[search strings],rationale:string}. Use a distinct terminology or neighboring method family. Do not assert novelty."}
             plan_ids[task_id] = plan_id
             jobs.append({"task_id": task_id, "kind": "model", "actor": role, "task_kind": "service",
-                         "params": {"client": self.config["model"], "prompt": json.dumps(assignment)}})
+                         "params": {"client": self.config["model"], "role": role,
+                                    "prompt": json.dumps(assignment, ensure_ascii=False)}})
         if not jobs:
             return plans
         self._tick("supervision", count=len(jobs))

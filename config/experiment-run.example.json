@@ -75,6 +75,19 @@
       "A single seeded Monte Carlo run estimates finite-simulation behavior and is not a proof of a general performance guarantee."
     ],
     "literature_gate": null,
+    "quality_contract": {
+      "minimum_conditions": 2,
+      "minimum_independent_seeds": 1,
+      "minimum_controls": 1,
+      "minimum_comparisons": 2,
+      "required_analyses": [
+        "uncertainty",
+        "effect_size",
+        "sensitivity",
+        "raw_data"
+      ],
+      "minimum_figures": 3
+    },
     "execution": {
       "id": "robust_mean_executor",
       "adapter": "local_program",

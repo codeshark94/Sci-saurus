@@ -15,7 +15,7 @@ import time
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.models import ModelClient
+from scisaurus.runtime.models import ModelClient, resolve_model_config
 from scisaurus.runtime.scientific_surface import find_control_leaks
 
 
@@ -216,7 +216,7 @@ class ScientificInterpretationRunner:
         last_error = None
         deadline = time.monotonic() + self.deadline_seconds if self.deadline_seconds is not None else None
         for attempt in range(max_attempts):
-            config = deepcopy(self.model_config)
+            config = resolve_model_config(self.model_config, role="strategy.interpretation")
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.2:

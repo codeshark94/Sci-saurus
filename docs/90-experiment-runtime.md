@@ -10,7 +10,7 @@ The current adapter runs project-configured JSON programs. Their executable, arg
 
 ## 2. Acceptance path
 
-1. Freeze the question, hypothesis, method, parameters, seed, run count, stopping rule, primary outcomes, limitations, required assets, and time policy.
+1. Freeze the question, hypothesis, method, parameters, seed, run count, stopping rule, primary outcomes, limitations, required assets, and time policy. When the study feeds a score-3 research paper, Composer also freezes a domain-neutral `quality_contract` requiring multiple conditions, a control, explicit comparisons, uncertainty, effect-size and sensitivity summaries, raw-data provenance, and three or more figure assets.
 2. Check the declared literature gate when present.
 3. Register and independently probe separate execution and validation programs. Their pinned operational identities must differ.
 4. Run the exact experiment twice. The complete program output and every declared asset hash must reproduce exactly.
@@ -18,7 +18,7 @@ The current adapter runs project-configured JSON programs. Their executable, arg
 6. Give the result to the distinct validation program. It must bind the exact candidate SHA-256, execute explicit checks, and recalculate every primary outcome.
 7. Send the summarized result, deterministic validation, and PNG/JPEG figures to at least two bounded model-review perspectives. They assess method alignment, calculation trace, inference scope, limitation coverage, and every proposed finding.
 8. A final arbiter copies exact reviewer outcomes and evidence references. Acceptance cannot hide a rejected review or omit a finding from review.
-9. Emit and adopt `results-package-2` only after the replay, deterministic recalculation, and model assessment all accept. External publication remains outside this command.
+9. Emit and adopt `results-package-2` only after the replay, deterministic recalculation, and model assessment all accept. The package also carries the pre-analysis design reference and, when configured, the validated analysis summary. External publication remains outside this command.
 
 Exact replay establishes deterministic behavior for the pinned environment and input. It does not prove that the implementation is mathematically correct. Independent recalculation from recorded replicate outputs addresses summary arithmetic, while its stated limitation preserves the fact that omitted sample matrices are not reconstructed.
 
@@ -39,7 +39,7 @@ python3 -m scisaurus.cli run-experiment /tmp/experiment-run \
   --first-result-seconds 720 --target-seconds 960 --deadline-seconds 1200
 ```
 
-The example executes `scripts/experiments/robust_mean_study.py` with NumPy and Matplotlib pinned by `requirements-experiment.txt`. `scripts/experiments/validate_robust_mean.py` uses a separate standard-library implementation of the summary calculations. The output directory contains `experiment.md`, `run.json`, and a `results-package/` directory with the package, raw replicate outputs, and figure.
+The example executes `scripts/experiments/robust_mean_study.py` with NumPy and Matplotlib pinned by `requirements-experiment.txt`. `scripts/experiments/validate_robust_mean.py` uses a separate standard-library implementation of the summary calculations. The output directory contains `experiment.md`, `run.json`, and a `results-package/` directory with the package, raw replicate outputs, three complementary figures, and the analysis summary. The calibration replication program follows the same contract and emits separate score-change, temperature-stability, and uncertainty displays when it is promoted into a score-3 paper.
 
 ## 4. Paper integration
 
@@ -57,4 +57,4 @@ The adopted `artifact:methods/experiment-results/package@1` and its output are u
 
 ## 6. Current limits
 
-The first runtime supports one frozen local-program experiment, exact deterministic replay, bounded image assets, two or more same-model procedural review roles, and one separate deterministic calculator. It does not yet resume an interrupted experiment, schedule a parameter sweep across several machines, preserve full sample matrices unless the study program emits them, provide statistically independent model reviewers, or establish correctness against expert adjudication. Those are explicit follow-on evaluation and scaling tasks, not hidden fallbacks.
+The first runtime supports one frozen local-program experiment, exact deterministic replay, bounded image assets, two or more same-model procedural review roles, and one separate deterministic calculator. A quality contract now makes the distinction between replayability and substantive study design explicit: programs that do not emit the required analysis summary are held for Methods expansion. The runtime still does not resume an interrupted experiment, schedule a parameter sweep across several machines, preserve full sample matrices unless the study program emits them, provide statistically independent model reviewers, or establish correctness against expert adjudication. Those remain explicit follow-on evaluation and scaling tasks, not hidden fallbacks.

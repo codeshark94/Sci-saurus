@@ -179,7 +179,7 @@ def main():
     results_path = evidence / "results.json"; results_path.write_bytes(canonical_bytes(results))
     config = {"schema_version": "paper-release-score-1", "paper_id": "pipeline_validation",
         "title": "Sci-saurus Evidence-Bound Release Pipeline Validation", "revision": 1,
-        "document_type": "research_paper", "manuscript_project_dir": str(evidence / "manuscript"),
+        "document_type": "validation_report", "manuscript_project_dir": str(evidence / "manuscript"),
         "survey_project_dir": str(evidence / "survey"), "survey_ref": survey["survey_ref"],
         "assessment_ref": survey["assessment_ref"], "results_package": str(results_path),
         "evidence": [{"id": "prior_control", "kind": "literature", "locator": survey["source_ref"],

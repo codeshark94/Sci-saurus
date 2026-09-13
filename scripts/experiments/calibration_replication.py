@@ -245,6 +245,65 @@ def make_figure(observations, summary, path):
     plt.close(fig)
 
 
+def make_temperature_stability_figure(observations, path):
+    """Show how the fitted temperature relates to split-level metric changes."""
+    temperature = np.asarray([item["temperature"] for item in observations], dtype=float)
+    metric_specs = (
+        ("test_log_loss_delta", "Log loss delta", "#d1495b"),
+        ("test_brier_delta", "Brier delta", "#31688e"),
+        ("test_ece_delta", "ECE delta", "#2a9d8f"),
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(10.0, 4.2), constrained_layout=True)
+    axes[0].hist(temperature, bins=min(10, max(5, len(temperature) // 3)),
+                 color="#9ec5ab", edgecolor="#333333", linewidth=.5)
+    axes[0].axvline(float(np.median(temperature)), color="#333333", linestyle="--",
+                    linewidth=1.0, label=f"median={np.median(temperature):.3f}")
+    axes[0].set_xlabel("Fitted temperature")
+    axes[0].set_ylabel("Number of held-out splits")
+    axes[0].set_title("Temperature fitted on calibration splits")
+    axes[0].legend(frameon=False, fontsize=8)
+    axes[0].grid(axis="y", alpha=.22, linewidth=.7)
+    for key, label, color in metric_specs:
+        axes[1].scatter(temperature, [item[key] for item in observations],
+                        label=label, color=color, alpha=.78, s=24, edgecolor="white", linewidth=.25)
+    axes[1].axhline(0.0, color="#333333", linewidth=.8)
+    axes[1].set_xlabel("Fitted temperature")
+    axes[1].set_ylabel("Calibrated minus raw score")
+    axes[1].set_title("Split-level metric changes versus temperature")
+    axes[1].legend(frameon=False, fontsize=8)
+    axes[1].grid(alpha=.22, linewidth=.7)
+    fig.suptitle("Finite-split stability of post-hoc calibration", fontsize=12)
+    fig.savefig(path, metadata={"Date": None})
+    plt.close(fig)
+
+
+def make_uncertainty_figure(summary, path):
+    """Display the prespecified mean-delta bootstrap intervals."""
+    specs = (
+        ("test_log_loss_delta", "Log loss", "nats"),
+        ("test_brier_delta", "Brier", "points"),
+        ("test_ece_delta", "ECE", "points"),
+        ("test_ece_raw_reference_delta", "ECE (shared bins)", "points"),
+    )
+    means = [summary[key] for key, _, _ in specs]
+    lows = [summary[f"{key}_mean_ci_low"] for key, _, _ in specs]
+    highs = [summary[f"{key}_mean_ci_high"] for key, _, _ in specs]
+    y = np.arange(len(specs))
+    fig, axis = plt.subplots(figsize=(7.4, 4.2), constrained_layout=True)
+    axis.errorbar(means, y, xerr=[np.asarray(means) - np.asarray(lows),
+                                  np.asarray(highs) - np.asarray(means)],
+                  fmt="o", color="#31688e", ecolor="#31688e", capsize=3, linewidth=1.4)
+    axis.axvline(0.0, color="#333333", linewidth=.9)
+    axis.set_yticks(y, [label for _, label, _ in specs])
+    axis.set_xlabel("Mean calibrated minus raw score")
+    axis.set_title("Bootstrap uncertainty for mean split-level changes")
+    axis.grid(axis="x", alpha=.22, linewidth=.7)
+    axis.text(.01, -.16, "Bars: 2.5th–97.5th percentile of 100,000 deterministic resamples; descriptive only",
+              transform=axis.transAxes, fontsize=8, color="#555555")
+    fig.savefig(path, metadata={"Date": None})
+    plt.close(fig)
+
+
 def main():
     payload = json.load(sys.stdin)
     if payload.get("probe") is True:
@@ -306,6 +365,10 @@ def main():
     summary = summarize(observations)
     figure_path = Path("calibration-replication.png")
     make_figure(observations, summary, figure_path)
+    stability_path = Path("calibration-temperature-stability.png")
+    make_temperature_stability_figure(observations, stability_path)
+    uncertainty_path = Path("calibration-uncertainty.png")
+    make_uncertainty_figure(summary, uncertainty_path)
     findings = [
         {"id": "log_loss_change", "metric_ids": ["test_log_loss_delta"],
          "statement": statement_for_delta("log loss", summary["test_log_loss_delta"], "nats")},
@@ -419,8 +482,40 @@ def main():
             {"id": "temperature_scaling", "description": "Fit L2-regularized logistic regression on training data, fit one positive temperature by calibration-set log loss, and score raw and scaled probabilities only on the untouched test split.", "source": "calibration-replication.py::fit_logistic,fit_temperature"},
         ],
         "observations": observations, "metrics": metrics, "findings": findings, "limitations": limitations,
-        "assets": [{"id": "calibration_figure", "path": str(figure_path), "sha256": hashlib.sha256(figure_path.read_bytes()).hexdigest(),
-                     "role": "figure", "media_type": "image/png", "caption": "Held-out score changes and a pooled shared-partition reliability comparison for raw versus temperature-scaled logistic predictions across 30 WDBC splits (N = 3,450); the left-panel ECE box uses per-score-bin ECE, and the right curve uses shared raw-probability bins rather than a per-score reliability diagram."}],
+        "assets": [
+            {"id": "calibration_figure", "path": str(figure_path), "sha256": hashlib.sha256(figure_path.read_bytes()).hexdigest(),
+             "role": "figure", "media_type": "image/png", "caption": "Held-out score changes and a pooled shared-partition reliability comparison for raw versus temperature-scaled logistic predictions across 30 WDBC splits (N = 3,450); the left-panel ECE box uses per-score-bin ECE, and the right curve uses shared raw-probability bins rather than a per-score reliability diagram."},
+            {"id": "temperature_stability_figure", "path": str(stability_path), "sha256": hashlib.sha256(stability_path.read_bytes()).hexdigest(),
+             "role": "figure", "media_type": "image/png", "caption": "Distribution of fitted temperatures and their association with split-level changes in held-out log loss, Brier score, and expected calibration error."},
+            {"id": "calibration_uncertainty_figure", "path": str(uncertainty_path), "sha256": hashlib.sha256(uncertainty_path.read_bytes()).hexdigest(),
+             "role": "figure", "media_type": "image/png", "caption": "Mean calibrated-minus-raw metric changes with deterministic percentile-bootstrap intervals across the repeated held-out splits."},
+        ],
+        "analysis": {
+            "conditions": [
+                "30 stratified 60/20/20 train-calibration-test splits",
+                "untouched held-out scoring of raw and temperature-scaled probabilities",
+                "shared raw-probability-bin sensitivity calculation for ECE",
+            ],
+            "independent_seeds": [int(experiment["seed"])],
+            "controls": ["uncalibrated logistic probabilities scored on the same held-out samples"],
+            "comparisons": [
+                {"id": "metric_tradeoff", "description": "Compare calibrated-minus-raw changes across log loss, Brier score, and per-score-bin ECE."},
+                {"id": "binning_sensitivity", "description": "Compare ordinary per-score-bin ECE with ECE computed using a shared raw-probability partition."},
+            ],
+            "uncertainty": [
+                "For each mean split-level delta, report the deterministic 2.5th–97.5th percentile interval from 100,000 resamples of the 30 split values; the interval is descriptive for this resampling scheme and is not a population-level guarantee.",
+            ],
+            "effect_sizes": [
+                "Use the calibrated-minus-raw mean deltas, split-level percentile ranges, and bootstrap intervals as the prespecified effect summaries.",
+            ],
+            "sensitivity": [
+                "Recompute ECE with raw-probability bin membership shared by both score vectors and report rank preservation on logits as numerical sensitivity checks.",
+            ],
+            "ablation": [],
+            "raw_data": [
+                "The observations record split identities, fitted temperatures, held-out metric values, reliability-bin values, and ranking checks for every repeated split.",
+            ],
+        },
     }
     json.dump(output, sys.stdout, ensure_ascii=False, separators=(",", ":"))
 

@@ -21,7 +21,7 @@ import time
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.models import ModelClient
+from scisaurus.runtime.models import ModelClient, resolve_model_config
 from scisaurus.runtime.literature import OpenAlexClient
 from scisaurus.runtime.retrieval import CrossrefClient
 from scisaurus.runtime.scientific_surface import find_control_leaks
@@ -178,6 +178,10 @@ SYSTEM = (
     "You are the intake research strategist for a general-purpose scientific organization. "
     "Use the supplied recent scholarly records as prompts, then turn a broad objective into several "
     "genuinely different, testable research questions. "
+    "Explore orthogonal directions before selecting: vary the mechanism, data regime, comparison, "
+    "or measurement rather than producing near-duplicate variants. Preserve one high-risk/high-upside "
+    "direction when it is still feasible, alongside safer directions, so the selector can compare novelty "
+    "risk against evidence and execution cost. "
     "Do not claim novelty, truth, or empirical results before the literature and methods stages run. "
     "Prefer questions that can be investigated with public sources and a bounded reproducible experiment "
     "using the declared runtime capabilities. Reject directions that require unavailable instruments, "
@@ -227,6 +231,8 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, runtime_cont
         "constraints": [
             "use recent_papers as inspiration and retain their provided source identifiers in the candidate rationale when relevant",
             "candidate questions must differ in mechanism or empirical comparison, not just wording",
+            "cover at least three distinct axes across the candidates when the objective and runtime permit: mechanism, data regime, comparison, measurement, or theory",
+            "do not collapse every candidate onto the first familiar method merely because it is easiest to explain",
             "search queries must be usable as ordinary scholarly search strings",
             "capability_requirements must list only exact available executable, Python package, and stage-kind names",
             "if experiment_contract is present, select the candidate that can be answered by it without changing the declared experiment",
@@ -269,7 +275,10 @@ class TopicDiscoveryRunner:
         usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
         attempts = itertools.count() if repair_mode == "until_deadline" else range(max_attempts)
         for attempt in attempts:
-            config = deepcopy(self.model_config)
+            config = resolve_model_config(
+                self.model_config, role="topic_discovery",
+                overrides=({"seed": sampling_seed} if sampling_seed is not None else None),
+            )
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.2:

@@ -66,8 +66,10 @@ replace its two absolute paths before workflow validation.
 For a free-topic mission, `topic_discovery` runs before the survey. It queries
 OpenAlex with objective-derived and broad recent-literature searches, filters to
 a four-year recent publication window (falling back to the newest returned
-records only when the window is empty), and makes a seeded random sample so
-provider ordering does not become an accidental ranking. The output preserves sampled
+records only when the window is empty), and makes an entropy-backed seeded random
+sample so provider ordering does not become an accidental ranking. The seed is
+written to the Composer run input and every checkpoint; resuming repeats the same
+exploration, while a newly created mission gets a different seed. The output preserves sampled
 work IDs, URLs, abstracts, DOI observations, query trace, response capture
 hashes, and the seed. An intake model proposes distinct testable questions and
 selects one against a redacted runtime capability inventory (Python packages,
@@ -75,8 +77,18 @@ executables, configured stage kinds, project inputs, and model protocol). The
 selected question also declares structured executable, Python-package, and
 stage-kind requirements; Composer rejects the selection when any required
 capability is absent. The question and search strings can be bound into the
-survey; metadata is never treated as evidence or a novelty claim. If the
+survey; metadata is never treated as evidence or a novelty claim. A topic stage
+with `reuse_completed: true` is an explicit replay of the pinned output and does
+not perform new topic generation; set it to `false` for a fresh exploration. If the
 scholarly provider fails, topic admission fails rather than fabricating a topic.
+
+Model generation profiles are role-specific. Exploratory topic and blind-search
+roles receive higher temperature and presence diversity by default; interpretation
+and writing use a middle setting; literature mapping, arbitration, and journal
+review use conservative sampling; the adversarial AI-surface reviewer receives a
+separate creative setting. A shared model file can override these defaults with
+`model.role_profiles`; resolved values remain internal execution metadata and do
+not enter reader-facing manuscript prose.
 
 Every stage declares both an `estimate_seconds` planning reservation and a
 `deadline_seconds` execution fence. When a completed stage is intentionally
@@ -143,6 +155,17 @@ emits explicit work orders for literature retrieval, additional discriminating
 experiments, or analysis displays when a floor is missed. The stage returns
 `research_expansion_required` and creates no draft or PDF, so a proposal or
 plot package cannot masquerade as a paper by passing factual binding.
+
+The same admission gate checks the experiment's substantive quality contract.
+For a score-3 research paper, the Composer binds or monotonically upgrades a
+contract requiring at least
+two conditions, a declared control, two comparisons, an uncertainty statement,
+an effect-size statement, a sensitivity analysis, raw-data provenance, and
+three figure assets. The experiment first emits a pre-analysis design, then
+the program's analysis summary is checked against that design before the
+results package is accepted. A replayable package that lacks these components
+creates Methods work orders and is held at research admission; the writer is
+never asked to manufacture the missing scientific content.
 
 After composition, the paper uses a real bounded peer-review cycle. The same
 reviewer panel inspects the incumbent in round one, the author applies only

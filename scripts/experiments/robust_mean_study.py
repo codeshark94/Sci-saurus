@@ -114,7 +114,67 @@ def main():
     fig.suptitle(f"Mean estimation across {experiment['run_count']:,} seeded replicates (n={n})", fontsize=12)
     fig.savefig(figure_path, dpi=180, metadata={"Software": "Sci-saurus robust mean pilot"})
     plt.close(fig)
+
+    # The ECDF shows the full error distribution, but it does not make the
+    # principal summary comparison easy to read.  Keep a separate display for
+    # the median and upper-tail error summaries so the paper can use one figure
+    # for distribution shape and one for the reported effect sizes.
+    summary_path = Path("robust-mean-summary.png")
+    summary_labels = ["Clean\nmean", "Clean\nMoM", "Contaminated\nmean", "Contaminated\nMoM"]
+    summary_medians = [values["clean_mean_median_abs_error"], values["clean_mom_median_abs_error"],
+                       values["contamination_mean_median_abs_error"], values["contamination_mom_median_abs_error"]]
+    summary_p95 = [percentile(errors("clean", "mean"), .95), percentile(errors("clean", "mom"), .95),
+                   contaminated_mean_p95, contaminated_mom_p95]
+    x = np.arange(len(summary_labels))
+    fig, axis = plt.subplots(figsize=(7.6, 4.3), constrained_layout=True)
+    axis.bar(x, summary_medians, color=["#7aa6c2", "#9ec5ab", "#d88989", "#d1495b"],
+             edgecolor="#333333", linewidth=.5)
+    axis.scatter(x, summary_p95, color="#222222", marker="D", s=28, zorder=3, label="95th percentile")
+    axis.set_xticks(x, summary_labels)
+    axis.set_ylabel("Absolute estimation error")
+    axis.set_title("Median and upper-tail error by sampling condition")
+    axis.grid(True, axis="y", alpha=.22, linewidth=.7)
+    axis.legend(frameon=False)
+    fig.savefig(summary_path, dpi=180, metadata={"Software": "Sci-saurus robust mean pilot"})
+    plt.close(fig)
+
+    # Contamination is not a single homogeneous condition: the recorded
+    # outlier count lets the reader see whether the paired advantage changes
+    # with the realised contamination burden.  This is a descriptive
+    # sensitivity analysis over the same frozen replicates, not a new stopping
+    # rule or an unreported parameter sweep.
+    stratified_path = Path("robust-mean-outlier-stratification.png")
+    stratified = {}
+    for row in by_scenario["contaminated"]:
+        count = int(row["outlier_count"])
+        ratio = row["mom_abs_error"] / max(row["mean_abs_error"], np.finfo(float).tiny)
+        bucket = stratified.setdefault(count, {"ratios": [], "wins": []})
+        bucket["ratios"].append(ratio)
+        bucket["wins"].append(row["mom_abs_error"] < row["mean_abs_error"])
+    counts = sorted(stratified)
+    ratio_medians = [percentile(stratified[count]["ratios"], .5) for count in counts]
+    win_rates = [100 * sum(stratified[count]["wins"]) / len(stratified[count]["wins"])
+                 for count in counts]
+    fig, axes = plt.subplots(1, 2, figsize=(9.2, 4.0), constrained_layout=True)
+    axes[0].plot(counts, ratio_medians, marker="o", color="#31688e", linewidth=1.7)
+    axes[0].axhline(1.0, color="#555555", linestyle="--", linewidth=.9)
+    axes[0].set_xlabel("Observed replacement count")
+    axes[0].set_ylabel("Median MoM / mean absolute-error ratio")
+    axes[0].set_title("Relative error by contamination burden")
+    axes[1].plot(counts, win_rates, marker="o", color="#d1495b", linewidth=1.7)
+    axes[1].axhline(50.0, color="#555555", linestyle="--", linewidth=.9)
+    axes[1].set_xlabel("Observed replacement count")
+    axes[1].set_ylabel("MoM win rate (%)")
+    axes[1].set_title("Paired wins by contamination burden")
+    for axis in axes:
+        axis.grid(True, alpha=.22, linewidth=.7)
+    fig.suptitle("Descriptive sensitivity within contaminated replicates", fontsize=12)
+    fig.savefig(stratified_path, dpi=180, metadata={"Software": "Sci-saurus robust mean pilot"})
+    plt.close(fig)
+
     figure = figure_path.read_bytes()
+    summary_figure = summary_path.read_bytes()
+    stratified_figure = stratified_path.read_bytes()
 
     result = {"schema_version": "experiment-program-output-1", "study_id": experiment["id"],
         "revision": experiment["revision"],
@@ -133,9 +193,43 @@ def main():
              "metric_ids": ["contamination_mom_win_rate_percent"]}],
         "limitations": [*experiment["limitations"],
             "The simulation records estimator outputs per replicate rather than every generated sample value."],
-        "assets": [{"id": "error_ecdf_figure", "path": str(figure_path),
-                    "sha256": hashlib.sha256(figure).hexdigest(), "role": "figure", "media_type": "image/png",
-                    "caption": "Empirical cumulative distributions of absolute estimation error for the empirical mean and 20-block median-of-means estimator under clean and symmetric replacement-contamination scenarios."}]}
+        "assets": [
+            {"id": "error_ecdf_figure", "path": str(figure_path),
+             "sha256": hashlib.sha256(figure).hexdigest(), "role": "figure", "media_type": "image/png",
+             "caption": "Empirical cumulative distributions of absolute estimation error for the empirical mean and 20-block median-of-means estimator under clean and symmetric replacement-contamination scenarios."},
+            {"id": "error_summary_figure", "path": str(summary_path),
+             "sha256": hashlib.sha256(summary_figure).hexdigest(), "role": "figure", "media_type": "image/png",
+             "caption": "Median and 95th-percentile absolute estimation errors for the empirical mean and median-of-means estimator in clean and contaminated sampling."},
+            {"id": "outlier_stratification_figure", "path": str(stratified_path),
+             "sha256": hashlib.sha256(stratified_figure).hexdigest(), "role": "figure", "media_type": "image/png",
+             "caption": "Descriptive sensitivity of the paired estimator comparison to the realised number of replacement observations in contaminated replicates."},
+        ],
+        "analysis": {
+            "conditions": [
+                "clean N(0,1) sampling",
+                "5% symmetric replacement contamination",
+                "contaminated replicates stratified by observed replacement count",
+            ],
+            "independent_seeds": [int(experiment["seed"])],
+            "controls": ["clean sampling condition with the same sample size and estimator definitions"],
+            "comparisons": [
+                {"id": "tail_error", "description": "Compare the median and 95th-percentile absolute errors of the two estimators under contamination."},
+                {"id": "paired_burden", "description": "Compare paired wins and relative absolute error across the realised contamination counts."},
+            ],
+            "uncertainty": [
+                "The median, 95th-percentile, and paired win rate summarize the finite replicate distribution; all endpoints are descriptive for the single seeded simulation and are not inferential confidence intervals.",
+            ],
+            "effect_sizes": [
+                "Report the contaminated 95th-percentile reduction, contaminated paired win rate, and clean-data median penalty as prespecified contrasts.",
+            ],
+            "sensitivity": [
+                "Stratify the contaminated paired comparison by observed replacement count to show whether the effect changes with realised contamination burden.",
+            ],
+            "ablation": [],
+            "raw_data": [
+                "raw-data.json records both estimator outputs, absolute errors, scenario labels, replicate IDs, and realised replacement counts for every replicate.",
+            ],
+        }}
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))
 
 

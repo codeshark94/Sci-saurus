@@ -29,9 +29,13 @@ from scisaurus.runtime.manuscript_review import (
     validate_review,
     validate_synthesis,
 )
-from scisaurus.runtime.models import ModelClient, ModelResult
+from scisaurus.runtime.models import ModelClient, ModelResult, resolve_model_config
 from scisaurus.runtime.paper import PaperReleaseBuilder, load_paper_survey, validate_paper_config
 from scisaurus.runtime.results import validate_results_package
+from scisaurus.runtime.research_quality import (
+    default_research_quality_contract,
+    evaluate_result_package_quality,
+)
 from scisaurus.runtime.scholarly_depth import (
     evaluate_scholarly_depth,
     evaluate_scholarly_preflight,
@@ -232,6 +236,49 @@ def bind_claim_citations(draft, paper_config):
 
 def _word_count(draft):
     return len(re.findall(r"\b[\w'-]+\b", " ".join(unit["text"] for unit in _all_units(draft).values())))
+
+
+def draft_depth_report(draft, paper_config):
+    """Compare a structured draft with the one canonical paper depth contract."""
+    profile = paper_config.get("depth_profile") if isinstance(paper_config, dict) else None
+    if not isinstance(profile, dict):
+        return {"applicable": False, "word_count": _word_count(draft),
+                "section_count": len(draft.get("sections", [])), "missing_section_titles": [],
+                "deficits": []}
+    section_titles = [section.get("title") for section in draft.get("sections", [])
+                      if isinstance(section, dict)]
+    observed = {
+        "word_count": _word_count(draft),
+        "section_count": len(draft.get("sections", [])),
+        "missing_section_titles": [title for title in profile.get("required_section_titles", [])
+                                    if title not in section_titles],
+    }
+    deficits = []
+    if observed["word_count"] < profile.get("min_words", 0):
+        deficits.append({"field": "words", "observed": observed["word_count"],
+                         "required": profile["min_words"]})
+    if observed["section_count"] < profile.get("min_sections", 0):
+        deficits.append({"field": "sections", "observed": observed["section_count"],
+                         "required": profile["min_sections"]})
+    if observed["missing_section_titles"]:
+        deficits.append({"field": "required_section_titles",
+                         "observed": section_titles,
+                         "required": profile["required_section_titles"],
+                         "missing": observed["missing_section_titles"]})
+    observed["applicable"] = True
+    observed["deficits"] = deficits
+    return observed
+
+
+def validate_draft_depth(draft, paper_config):
+    """Reject an under-length draft before it can consume review capacity."""
+    report = draft_depth_report(draft, paper_config)
+    if report["deficits"]:
+        details = "; ".join(
+            f"{item['field']}={item.get('observed')} (required {item.get('required')})"
+            for item in report["deficits"])
+        raise ValidationError(f"manuscript draft does not meet its declared depth: {details}")
+    return report
 
 
 def _normalise_surface(text):
@@ -748,6 +795,8 @@ class PaperPipelineRunner:
         if self.output.exists():
             raise ValidationError("paper pipeline output directory must not already exist")
         self.output.mkdir(parents=True)
+        self.writer_contract_sync = self._synchronize_writer_contract()
+        (self.output / "writer-contract-sync.json").write_bytes(canonical_bytes(self.writer_contract_sync))
         self.started_epoch = time.time()
         self.run_status = "running"
         self.run_error = None
@@ -768,6 +817,32 @@ class PaperPipelineRunner:
         payload = deepcopy(event)
         payload.setdefault("pipeline_output_dir", str(self.output))
         self.feedback_callback(payload)
+
+    def _synchronize_writer_contract(self):
+        """Make the paper descriptor the sole source of writer depth limits."""
+        contract = self.packet.get("writer_contract")
+        if not isinstance(contract, dict):
+            contract = {}
+        profile = self.paper_config.get("depth_profile")
+        if isinstance(profile, dict):
+            previous = contract.get("depth") if isinstance(contract.get("depth"), dict) else {}
+            contract["depth"] = {
+                **previous,
+                "minimum_word_count": profile["min_words"],
+                "minimum_reference_count": profile["min_references"],
+                "minimum_full_text_reference_count": profile["min_full_text_references"],
+                "minimum_section_count": profile["min_sections"],
+                "required_section_titles": list(profile["required_section_titles"]),
+            }
+            contract["depth_source"] = "paper_config.depth_profile"
+        self.packet["writer_contract"] = contract
+        return {
+            "schema_version": "writer-contract-sync-1",
+            "source": "paper_config.depth_profile" if isinstance(profile, dict) else None,
+            "depth": deepcopy(contract.get("depth")),
+            "required_section_titles": deepcopy(
+                profile.get("required_section_titles", []) if isinstance(profile, dict) else []),
+        }
 
     def _write_run_metadata(self):
         self.output.joinpath("run-metadata.json").write_bytes(canonical_bytes({
@@ -793,7 +868,8 @@ class PaperPipelineRunner:
             raise ValidationError("paper pipeline deadline exceeded")
         return remaining
 
-    def _client(self, *, max_output_tokens=None, reasoning_effort=None, deadline=None):
+    def _client(self, *, max_output_tokens=None, reasoning_effort=None, deadline=None,
+                role="editorial.writer"):
         config = deepcopy(self.model_config)
         if max_output_tokens is not None:
             config["max_output_tokens"] = max_output_tokens
@@ -804,7 +880,7 @@ class PaperPipelineRunner:
             raise ValidationError("paper pipeline deadline exceeded")
         config["timeout_seconds"] = min(float(config["timeout_seconds"]), remaining,
                                          self.model_call_timeout_seconds)
-        return ModelClient(**config)
+        return ModelClient(**resolve_model_config(config, role=role))
 
     def _research_admission(self, argument, argument_review):
         """Admit only research inputs that can support the declared paper tier.
@@ -832,7 +908,12 @@ class PaperPipelineRunner:
         preflight = validate_scholarly_preflight(preflight)
         preflight_path = self.output / "scholarly-depth-preflight.json"
         preflight_path.write_bytes(canonical_bytes(preflight))
-        if preflight["decision"] == "proceed":
+        quality = evaluate_result_package_quality(
+            results, minimum_contract=default_research_quality_contract())
+        quality_path = self.output / "research-quality-admission.json"
+        quality_path.write_bytes(canonical_bytes(quality))
+        expansion_requests = [*preflight["expansion_requests"], *quality.get("expansion_requests", [])]
+        if preflight["decision"] == "proceed" and quality["decision"] == "proceed":
             self._emit_feedback({
                 "event_id": "paper-research-admission",
                 "kind": "research_gate",
@@ -842,6 +923,7 @@ class PaperPipelineRunner:
                 "status": "accepted",
                 "profile_id": preflight["profile_id"],
                 "artifact_path": str(preflight_path),
+                "quality_artifact_path": str(quality_path),
             })
             return None
         self.run_status = "research_expansion_required"
@@ -852,12 +934,13 @@ class PaperPipelineRunner:
             "kind": "research_gate",
             "reviewer_id": "journal_editor",
             "stage": 6,
-            "decision": preflight["decision"],
+            "decision": "research_expansion_required",
             "status": "research_expansion_required",
             "profile_id": preflight["profile_id"],
-            "finding_ids": [item["id"] for item in preflight["expansion_requests"]],
-            "expansion_requests": preflight["expansion_requests"],
+            "finding_ids": list(dict.fromkeys(item["id"] for item in expansion_requests)),
+            "expansion_requests": expansion_requests,
             "artifact_path": str(preflight_path),
+            "quality_artifact_path": str(quality_path),
         })
         elapsed = time.monotonic() - self.started_at
         result = {
@@ -877,8 +960,10 @@ class PaperPipelineRunner:
             "release_dir": None,
             "pdf": None,
             "preflight_path": str(preflight_path),
-            "research_expansion_requests": preflight["expansion_requests"],
+            "research_quality_path": str(quality_path),
+            "research_expansion_requests": expansion_requests,
             "preflight": preflight,
+            "research_quality": quality,
             "surface_compression": [],
             "surface_citation_binding": [],
             "repair_failures": [],
@@ -1130,6 +1215,7 @@ class PaperPipelineRunner:
         self._write_run_metadata()
         if self.imported_draft is not None:
             draft = deepcopy(self.imported_draft)
+            validate_draft_depth(draft, self.paper_config)
             (self.output / "writer-response.json").write_bytes(canonical_bytes({
                 "mode": "resumed_from_structured_draft", "argument_sha256": (
                     hashlib.sha256(canonical_bytes(argument)).hexdigest() if argument is not None else None),
@@ -1180,10 +1266,14 @@ class PaperPipelineRunner:
                     "title": "section title from writer_contract.section_order",
                     "units": [{"id": "unit id from section_order", "kind": "heading|paragraph|table|figure|caption", "text": "nonempty string"}],
                 }],
+                "depth": deepcopy(payload.get("writer_contract", {}).get("depth", {})),
                 "constraints": [
                     "return exactly one JSON object with no markdown fence or wrapper key",
                     "include every section and unit ID in writer_contract.section_order exactly once",
                     "use reader-facing scientific prose in unit text",
+                    "write the full declared section set; never satisfy a word floor by repeating a result or a limitation",
+                    "Results report observations, Scientific interpretation connects patterns to mechanisms, and Discussion compares explanations and proposes discriminating tests",
+                    "place each figure reading in the prose unit that interprets it; the renderer will place the figure beside that argument",
                 ],
             }
             if previous is not None:
@@ -1198,7 +1288,7 @@ class PaperPipelineRunner:
                     ],
                 }
             prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-            result = self._client(deadline=self.deadline).complete(
+            result = self._client(deadline=self.deadline, role="editorial.writer").complete(
                 system=system, prompt=prompt)
             attempts.append(result)
             # Preserve every failed candidate as a durable feedback input.  A
@@ -1220,6 +1310,7 @@ class PaperPipelineRunner:
                 continue
             try:
                 draft = validate_manuscript_draft(result.json_object())
+                validate_draft_depth(draft, self.paper_config)
             except ValidationError as exc:
                 last_error, previous = exc, result.text
                 continue
@@ -1419,7 +1510,8 @@ class PaperPipelineRunner:
                 else:
                     prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
                 result = self._client(max_output_tokens=self.repair_max_output_tokens,
-                                      reasoning_effort=self.review_reasoning_effort).complete(
+                                      reasoning_effort=self.review_reasoning_effort,
+                                      role="editorial.surgical-editor").complete(
                     system=system, prompt=prompt)
                 attempts.append(result)
                 (self.output / f"repair-round-{repair_round}-batch-{batch_index + 1}-attempt-{attempt + 1}.json").write_bytes(
@@ -1631,6 +1723,7 @@ class PaperPipelineRunner:
             draft, writer_result = self._writer(argument)
             draft, _, _ = self._compress_surface(draft, phase="after_writer")
             draft, _, _ = self._bind_claim_citations(draft, phase="after_writer")
+            validate_draft_depth(draft, self.paper_config)
             validate_argument_projection(
                 draft, argument,
                 require_discussion=self.paper_config.get("document_type") == "research_paper")

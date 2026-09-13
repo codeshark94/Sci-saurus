@@ -24,6 +24,11 @@ from scisaurus.runtime.experiment_config import ASSET_MEDIA_TYPES, validate_expe
 from scisaurus.runtime.models import ModelResult
 from scisaurus.runtime.operations import OperationsCell
 from scisaurus.runtime.results import validate_results_package
+from scisaurus.runtime.research_quality import (
+    build_research_design,
+    check_analysis_contract,
+    validate_analysis,
+)
 from scisaurus.runtime.scores import exact, identifier, output_path
 from scisaurus.runtime.time_policy import TimePolicy
 
@@ -46,8 +51,12 @@ def _finite_scalar(value, name):
 
 
 def validate_program_output(value, experiment):
-    exact(value, {"schema_version", "study_id", "revision", "procedures", "observations",
-                  "metrics", "findings", "limitations", "assets"}, "experiment program output")
+    output_fields = {"schema_version", "study_id", "revision", "procedures", "observations",
+                     "metrics", "findings", "limitations", "assets"}
+    if (not isinstance(value, dict) or set(value) - (output_fields | {"analysis"})
+            or not output_fields.issubset(value)):
+        raise ValidationError(
+            f"experiment program output requires {sorted(output_fields)} and permits analysis")
     if value["schema_version"] != "experiment-program-output-1":
         raise ValidationError("unsupported experiment program output schema")
     if value["study_id"] != experiment["id"] or value["revision"] != experiment["revision"]:
@@ -95,6 +104,19 @@ def validate_program_output(value, experiment):
                    if asset["media_type"] in requirement["media_types"]]
         if len(matches) < requirement["min_count"]:
             raise ValidationError("experiment output omits a required asset")
+    if "analysis" in value:
+        validate_analysis(value["analysis"])
+    quality_contract = experiment.get("quality_contract")
+    if quality_contract is not None:
+        analysis = value.get("analysis")
+        if analysis is None:
+            raise ValidationError("experiment quality contract requires an analysis summary")
+        deficits = check_analysis_contract(
+            analysis, quality_contract,
+            figure_count=sum(1 for asset in value["assets"] if asset.get("role") == "figure"))
+        if deficits:
+            fields = ", ".join(item["field"] for item in deficits)
+            raise ValidationError(f"experiment quality contract is not satisfied: {fields}")
     canonical_bytes(value)
     return value
 
@@ -216,6 +238,7 @@ class ExperimentRunner(ExecutionRuntime):
         self.operations = OperationsCell(self.control, self.store, project_id=config["project_id"])
         self.bindings = {}
         self.profile_refs = {}
+        self.design_ref = None
         self.execution_refs = []
         self.asset_records = []
         self.asset_files = []
@@ -238,6 +261,10 @@ class ExperimentRunner(ExecutionRuntime):
             "schema_version": "experiment-score-1", "experiment": self.experiment,
             "time_policy": self.config.get("time_policy")}, "principal")
         self.score_ref = record["artifact_ref"]
+        design = build_research_design(self.experiment)
+        design_record = self._publish(
+            "inputs/research-design", "note", design, "principal", subjects=[self.score_ref])
+        self.design_ref = design_record["artifact_ref"]
         gate = self.experiment["literature_gate"]
         if gate is not None:
             control = ControlStore(gate["project_dir"])
@@ -298,10 +325,13 @@ class ExperimentRunner(ExecutionRuntime):
         self._checkpoint("experiment_capabilities_ready", force=True)
 
     def _program_input(self):
-        return {"configured_input": self.experiment["execution"]["input"], "experiment": {
+        experiment = {"configured_input": self.experiment["execution"]["input"], "experiment": {
             key: deepcopy(self.experiment[key]) for key in (
                 "id", "revision", "study_type", "domain", "research_question", "hypothesis", "method",
                 "parameters", "seed", "run_count", "stopping_rule", "primary_outcomes", "limitations")}}
+        if self.experiment.get("quality_contract") is not None:
+            experiment["experiment"]["quality_contract"] = deepcopy(self.experiment["quality_contract"])
+        return experiment
 
     def _execute_once(self):
         decision = self.time_policy.admit("production", task_count=1)
@@ -370,6 +400,8 @@ class ExperimentRunner(ExecutionRuntime):
     def _review_assignment(self, reviewer, candidate, deterministic, evidence_refs):
         summary = {key: candidate[key] for key in (
             "schema_version", "study_id", "revision", "procedures", "metrics", "findings", "limitations", "assets")}
+        if "analysis" in candidate:
+            summary["analysis"] = candidate["analysis"]
         return {"phase": "experiment_result_review", "reviewer": reviewer,
             "study": {key: self.experiment[key] for key in (
                 "id", "study_type", "domain", "research_question", "hypothesis", "method", "parameters",
@@ -515,11 +547,16 @@ class ExperimentRunner(ExecutionRuntime):
                 "execution_refs": self.execution_refs, "validator_execution_ref": validator_execution_ref,
                 "execution_profile_ref": self.profile_refs["execution"],
                 "validation_profile_ref": self.profile_refs["validation"],
+                "design_ref": self.design_ref,
                 "replay_sha256": candidate_sha256},
             "validation": {"decision": assessment["decision"],
                 "deterministic_validation_ref": validation_record["artifact_ref"],
                 "model_review_refs": [record["artifact_ref"] for record in self.review_records],
                 "assessment_ref": assessment_record["artifact_ref"]}}
+        if self.experiment.get("quality_contract") is not None:
+            package["quality_contract"] = deepcopy(self.experiment["quality_contract"])
+            if "analysis" in candidate:
+                package["analysis"] = deepcopy(candidate["analysis"])
         validate_results_package(package, base_dir=package_dir)
         path = package_dir / "results-package.json"
         path.write_bytes(canonical_bytes(package))

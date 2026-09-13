@@ -202,6 +202,30 @@ class PaperReleaseTests(unittest.TestCase):
         finally:
             builder.close()
 
+    def test_score_three_figure_is_rendered_at_its_argument_unit(self):
+        builder = PaperReleaseBuilder(self.root / "inline-figure-layout", self.config())
+        try:
+            builder.config["schema_version"] = "paper-release-score-3"
+            builder.config["figure_arguments"] = [{
+                "asset_id": "figure_one", "why": "The display tests the central comparison.",
+                "observation": "The observed result is visible in the comparison.", "unit_id": "metric",
+            }]
+            manuscript = {"title": "Inline figure", "groups": [
+                {"title": "Results", "units": [
+                    {"id": "metric", "kind": "paragraph", "text": "The observed result is visible in the comparison."},
+                ]},
+                {"title": "Discussion", "units": [{"id": "discussion", "kind": "paragraph", "text": "The figure supports the comparison."}]},
+            ]}
+            results = {"assets": [{"id": "figure_one", "path": "figures/result.png", "role": "figure",
+                                    "media_type": "image/png", "caption": "Observed result."}]}
+            tex = builder._tex(manuscript, results)
+            figure_position = tex.index(r"\begin{figure}[H]")
+            next_section = tex.index(r"\section{Discussion}")
+            self.assertLess(figure_position, next_section)
+            self.assertNotIn(r"\section{Figures}", tex)
+        finally:
+            builder.close()
+
     def test_table_renderer_preserves_pipe_table_footnotes(self):
         builder = PaperReleaseBuilder(self.root / "table-layout", self.config())
         try:

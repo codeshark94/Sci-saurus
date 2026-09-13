@@ -18,7 +18,7 @@ import threading
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.models import ModelClient, ModelResult
+from scisaurus.runtime.models import ModelClient, ModelResult, resolve_model_config
 
 
 REVIEW_SCHEMA_VERSION = "manuscript-review-2"
@@ -912,6 +912,7 @@ class ManuscriptReviewRunner:
             if config.get("protocol") == "openai_compatible":
                 config["reasoning_effort"] = self.reasoning_effort
             try:
+                config = resolve_model_config(config, role=f"review.{reviewer['id']}")
                 result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt, images=images)
             except Exception as exc:
                 # Preserve the transport failure at the review boundary.  A
@@ -995,6 +996,7 @@ class ManuscriptReviewRunner:
             if config.get("protocol") == "openai_compatible":
                 config["reasoning_effort"] = self.reasoning_effort
             try:
+                config = resolve_model_config(config, role="review.arbiter")
                 result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt)
             except Exception as exc:
                 if artifact_dir is not None:
@@ -1099,6 +1101,7 @@ class ManuscriptReviewRunner:
                                                    self.max_output_tokens)
             if config.get("protocol") == "openai_compatible":
                 config["reasoning_effort"] = self.reasoning_effort
+            config = resolve_model_config(config, role="review.synthesizer")
             result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt, images=images)
             if artifact_dir is not None:
                 (artifact_dir / f"synthesis-attempt-{attempt + 1}.json").write_bytes(

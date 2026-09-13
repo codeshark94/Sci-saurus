@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from scisaurus.core.errors import ValidationError
-from scisaurus.runtime.models import ModelClient, ModelCallError
+from scisaurus.runtime.models import ModelClient, ModelCallError, resolve_model_config
 
 
 class TestModelClient(unittest.TestCase):
@@ -98,6 +98,52 @@ class TestModelClient(unittest.TestCase):
         self.assertEqual(self.request['max_tokens'], 4096)
         self.assertEqual(result.json_object(), {'revised_text': 'Association observed.'})
         self.assertEqual(result.usage, {'model_calls': 1, 'input_tokens': 14, 'output_tokens': 28})
+
+    def test_sampling_controls_are_sent_to_compatible_provider(self):
+        self.response = {'choices': [{'message': {'content': '{"ok":true}'}, 'finish_reason': 'stop'}]}
+        self.client(
+            'openai_compatible', temperature=1.1, top_p=0.95, seed=17,
+            presence_penalty=0.2, frequency_penalty=-0.1,
+        ).complete(system='Explore.', prompt='Propose a direction.')
+        self.assertEqual({key: self.request[key] for key in (
+            'temperature', 'top_p', 'seed', 'presence_penalty', 'frequency_penalty',
+        )}, {
+            'temperature': 1.1, 'top_p': 0.95, 'seed': 17,
+            'presence_penalty': 0.2, 'frequency_penalty': -0.1,
+        })
+
+    def test_sampling_controls_are_nested_in_ollama_options(self):
+        self.client(temperature=0.25, top_p=0.9, seed=3,
+                    presence_penalty=0.2, frequency_penalty=0.1).complete(
+            system='Check.', prompt='Validate.')
+        self.assertEqual(self.request['options']['temperature'], 0.25)
+        self.assertEqual(self.request['options']['top_p'], 0.9)
+        self.assertEqual(self.request['options']['seed'], 3)
+        self.assertNotIn('presence_penalty', self.request['options'])
+        self.assertNotIn('frequency_penalty', self.request['options'])
+
+    def test_role_profile_resolution_keeps_metadata_out_of_provider_config(self):
+        base = {
+            'base_url': self.url, 'protocol': 'openai_compatible', 'model': 'configured-model',
+            'timeout_seconds': 2, 'max_output_tokens': 64,
+            'role_profiles': {
+                'topic_discovery': {'temperature': 1.3, 'top_p': 0.98},
+            },
+        }
+        resolved = resolve_model_config(base, role='topic_discovery', overrides={'seed': 19})
+        self.assertEqual(resolved['temperature'], 1.3)
+        self.assertEqual(resolved['top_p'], 0.98)
+        self.assertEqual(resolved['seed'], 19)
+        self.assertNotIn('role_profiles', resolved)
+
+    def test_invalid_sampling_controls_fail_before_network(self):
+        for field, value in (
+                ('temperature', -0.1), ('temperature', 2.1), ('top_p', 0),
+                ('top_p', 1.1), ('seed', -1), ('presence_penalty', 2.1),
+                ('frequency_penalty', -2.1)):
+            with self.subTest(field=field, value=value), self.assertRaises(ValidationError):
+                self.client('openai_compatible', **{field: value})
+        self.assertFalse(hasattr(self, 'request'))
 
     def test_explicit_reasoning_none_is_transmitted(self):
         self.response = {'choices': [{'message': {'content': '{"ok":true}'}, 'finish_reason': 'stop'}]}

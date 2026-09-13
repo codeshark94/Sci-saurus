@@ -11,6 +11,8 @@ from scisaurus.runtime.paper_pipeline import (
     _review_input,
     validate_argument_projection,
     validate_manuscript_draft,
+    draft_depth_report,
+    validate_draft_depth,
     PaperPipelineRunner,
 )
 from scisaurus.tests.test_research_argument import argument
@@ -130,6 +132,35 @@ class ManuscriptDraftContractTests(unittest.TestCase):
             self.assertTrue((Path(path) / "editor-decision.json").is_file())
             rejected = runner._editor_decision(package, [package, package])
             self.assertEqual(rejected["decision"], "reject")
+
+    def test_draft_depth_uses_the_paper_descriptor_as_canonical_contract(self):
+        draft = {"schema_version": "manuscript-draft-2", "title": "A paper", "citation": "markers",
+                 "sections": [{"id": "intro", "title": "Introduction",
+                               "units": [{"id": "intro_p1", "kind": "paragraph",
+                                           "text": "A short sentence."}]}]}
+        config = {"schema_version": "paper-release-score-3", "depth_profile": {
+            "min_words": 10, "min_references": 1, "min_full_text_references": 1,
+            "min_sections": 2, "required_section_titles": ["Introduction", "Discussion"],
+            "max_numeric_repetitions": 3, "max_caveat_repetitions": 3}}
+        report = draft_depth_report(draft, config)
+        self.assertEqual(report["word_count"], 3)
+        self.assertEqual(report["missing_section_titles"], ["Discussion"])
+        with self.assertRaisesRegex(ValidationError, "declared depth"):
+            validate_draft_depth(draft, config)
+
+    def test_draft_depth_accepts_complete_declared_structure(self):
+        draft = {"schema_version": "manuscript-draft-2", "title": "A paper", "citation": "markers",
+                 "sections": [{"id": "intro", "title": "Introduction",
+                               "units": [{"id": "intro_p1", "kind": "paragraph",
+                                           "text": "A sufficiently long scientific sentence with evidence."}]},
+                              {"id": "discussion", "title": "Discussion",
+                               "units": [{"id": "discussion_p1", "kind": "paragraph",
+                                           "text": "A second sufficiently long scientific sentence."}]}]}
+        config = {"schema_version": "paper-release-score-3", "depth_profile": {
+            "min_words": 10, "min_references": 1, "min_full_text_references": 1,
+            "min_sections": 2, "required_section_titles": ["Introduction", "Discussion"],
+            "max_numeric_repetitions": 3, "max_caveat_repetitions": 3}}
+        self.assertTrue(validate_draft_depth(draft, config)["applicable"])
 
 
 if __name__ == "__main__":

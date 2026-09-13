@@ -132,6 +132,40 @@ class ExperimentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "contradicts"):
             validate_deterministic_validation(rejected, config, "0" * 64)
 
+    def test_novel_research_requires_a_substantive_quality_contract(self):
+        value = self.config()
+        value["experiment"]["study_type"] = "novel_research"
+        value["experiment"]["literature_gate"] = None
+        with self.assertRaisesRegex(ValidationError, "quality_contract"):
+            validate_experiment_config(value)
+        value["experiment"]["quality_contract"] = {
+            "minimum_conditions": 2, "minimum_independent_seeds": 1,
+            "minimum_controls": 1, "minimum_comparisons": 2,
+            "required_analyses": ["uncertainty", "effect_size", "sensitivity", "raw_data"],
+            "minimum_figures": 3,
+        }
+        with self.assertRaisesRegex(ValidationError, "literature gate"):
+            validate_experiment_config(value)
+
+    def test_quality_contract_rejects_program_without_analysis_summary(self):
+        config = validate_experiment_config(self.config())["experiment"]
+        config["quality_contract"] = {
+            "minimum_conditions": 2, "minimum_independent_seeds": 1,
+            "minimum_controls": 1, "minimum_comparisons": 1,
+            "required_analyses": ["uncertainty", "effect_size", "sensitivity", "raw_data"],
+            "minimum_figures": 1,
+        }
+        candidate = {"schema_version": "experiment-program-output-1", "study_id": "fixture_study", "revision": 1,
+            "procedures": [{"id": "method", "description": config["method"], "source": "execute.py"}],
+            "observations": [{"run": 1}],
+            "metrics": [{"id": "accuracy", "value": .75, "unit": "proportion", "conditions": "fixture",
+                         "source": "raw-data.json", "presentation": "0.75 accuracy"}],
+            "findings": [{"id": "observed", "statement": "Observed.", "metric_ids": ["accuracy"]}],
+            "limitations": config["limitations"], "assets": [{"id": "main_figure", "path": "figure.png",
+                         "sha256": "0" * 64, "role": "figure", "media_type": "image/png", "caption": "Figure."}]}
+        with self.assertRaisesRegex(ValidationError, "analysis summary"):
+            validate_program_output(candidate, config)
+
     def test_assessment_cannot_rephrase_or_duplicate_program_limitations(self):
         value = {"schema_version": "experiment-assessment-1", "study_id": "fixture_study",
             "decision": "accepted_with_limitations", "summary": "Bounded fixture result.",

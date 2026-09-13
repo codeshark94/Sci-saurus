@@ -22,7 +22,7 @@ from scisaurus.core.schema import TASK_KINDS, canonical_bytes
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.tasks import TaskManager
 from scisaurus.review.issues import IssueManager
-from scisaurus.runtime.models import ModelCallError, ModelClient, ModelResult
+from scisaurus.runtime.models import ModelCallError, ModelClient, ModelResult, resolve_model_config
 from scisaurus.runtime.resume import ResumeController, source_manifest
 
 SYSTEM = (
@@ -76,7 +76,9 @@ class _ResultFile:
 def _invoke_worker(kind, params, channel):
     try:
         if kind == "model":
-            client = ModelClient(**params["client"])
+            client = ModelClient(**resolve_model_config(
+                params["client"], role=params.get("role"),
+                overrides=params.get("sampling_overrides")))
             result = asdict(client.complete(system=SYSTEM, prompt=params["prompt"], images=params.get("images")))
         elif kind == "crossref":
             from scisaurus.runtime.retrieval import CrossrefClient
@@ -348,6 +350,15 @@ class ExecutionRuntime:
     def _dispatch(self, entry):
         spec = entry["spec"]
         task_id, actor = spec["task_id"], spec["actor"]
+        # The actor is the source of truth for generation style when a generic
+        # runner did not resolve a role explicitly.  Keep it in the worker
+        # parameters so the child process can apply the same profile without
+        # relying on ambient process state.
+        if spec["kind"] == "model" and "role" not in spec["params"]:
+            spec = dict(spec)
+            spec["params"] = dict(spec["params"])
+            spec["params"]["role"] = actor
+            entry["spec"] = spec
         self.tasks.create(task_id, spec["task_kind"],
                           {"operation": spec["kind"], "objective": self.config["objective"]}, actor)
         self.tasks.admit(task_id, "command.controller")

@@ -181,10 +181,30 @@ def main():
     fig.savefig("quadrature-signed-error.png", dpi=190, metadata={"Software": "Sci-saurus free-topic run"})
     plt.close(fig)
 
+    # A third display exposes computational cost rather than repeating the
+    # same error curve.  This lets a reader inspect the practical trade-off
+    # between accuracy and function evaluations directly.
+    fig, axis = plt.subplots(figsize=(6.4, 4.3), constrained_layout=True)
+    for rule_name in rules:
+        series = sorted((row for row in rows if row["condition"] == "symmetric" and row["rule"] == rule_name),
+                        key=lambda row: row["n"])
+        axis.loglog([row["function_evaluations"] for row in series],
+                    [max(row["abs_error"], 1e-18) for row in series],
+                    marker="o", markersize=3, linewidth=1.6, label=rule_name.title(), color=colors[rule_name])
+    axis.axhline(threshold, color="#555555", linestyle="--", linewidth=.9, label="target threshold")
+    axis.set_xlabel("Function evaluations")
+    axis.set_ylabel("Absolute integration error")
+    axis.set_title("Accuracy versus work on the centred peak")
+    axis.grid(True, which="both", alpha=.22, linewidth=.7)
+    axis.legend(frameon=False, fontsize=8)
+    fig.savefig("quadrature-cost.png", dpi=190, metadata={"Software": "Sci-saurus free-topic run"})
+    plt.close(fig)
+
     assets = []
     for asset_id, filename, caption in (
         ("quadrature_convergence", "quadrature-convergence.png", "Absolute integration error across resolution for midpoint, trapezoidal, and Simpson rules on symmetric and asymmetric sharp Gaussian peaks."),
         ("quadrature_signed_error", "quadrature-signed-error.png", "Signed quadrature error reveals whether apparent accuracy is produced by cancellation on a symmetric peak."),
+        ("quadrature_cost", "quadrature-cost.png", "Accuracy plotted against function evaluations on the centred sharp Gaussian, exposing the practical work required to reach the target threshold."),
     ):
         body = Path(filename).read_bytes()
         assets.append({"id": asset_id, "path": filename, "sha256": hashlib.sha256(body).hexdigest(),
@@ -207,7 +227,25 @@ def main():
               "limitations": [*experiment["limitations"],
                               "The exact-integral reference is analytic for the selected Gaussian peaks; the experiment does not evaluate nonsmooth or oscillatory integrands.",
                               "Fitted rates summarize the configured finite n window and should not be read as universal asymptotic theorems."],
-              "assets": assets}
+              "assets": assets,
+              "analysis": {
+                  "conditions": [
+                      "centred Gaussian peak",
+                      "shifted Gaussian peak",
+                      "constant-function exactness control",
+                  ],
+                  "independent_seeds": [int(experiment["seed"])],
+                  "controls": ["constant-function exactness control"],
+                  "comparisons": [
+                      {"id": "threshold_crossing", "description": "Compare the first grid resolution at which each rule reaches the declared absolute-error threshold."},
+                      {"id": "alignment_rate", "description": "Compare fitted rates and signed-error structure between centred and shifted peaks."},
+                  ],
+                  "uncertainty": ["Floating-point rounding is monitored by the constant-function control and the independent recalculation tolerance."],
+                  "effect_sizes": ["Report the difference in threshold subinterval count and the fitted-rate separation between rules and peak alignments."],
+                  "sensitivity": ["The shifted centre provides a prespecified alignment sensitivity check while the threshold and grid remain fixed."],
+                  "ablation": [],
+                  "raw_data": ["raw-data.json records every condition, grid resolution, and rule row."],
+              }}
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))
 
 
