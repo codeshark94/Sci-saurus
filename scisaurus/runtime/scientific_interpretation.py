@@ -184,6 +184,16 @@ def interpretation_prompt(evidence_packet, *, validation_feedback=None):
             "previous_response": validation_feedback.get("previous_response"),
             "instructions": "Repair only the contract violations; preserve valid scientific content and return the exact top-level shape.",
         }
+    follow_up = evidence_packet.get("scientific_follow_up") if isinstance(evidence_packet, dict) else None
+    if isinstance(follow_up, list) and follow_up:
+        packet["follow_up_contract"] = {
+            "requests": follow_up,
+            "instructions": (
+                "Use each request to focus this fresh interpretation pass. State which supplied observations support or "
+                "fail to support the requested explanation, and keep any explanation provisional when the requested "
+                "evidence is absent. Do not copy these assignment records into the reader-facing fields."
+            ),
+        }
     return json.dumps(packet, ensure_ascii=False, sort_keys=True)
 
 

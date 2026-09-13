@@ -24,10 +24,20 @@ from scisaurus.core.errors import ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.store import ArtifactStore
-from scisaurus.runtime.manuscript_review import ManuscriptReviewRunner
+from scisaurus.runtime.manuscript_review import (
+    ManuscriptReviewRunner,
+    validate_review,
+    validate_synthesis,
+)
 from scisaurus.runtime.models import ModelClient, ModelResult
-from scisaurus.runtime.paper import PaperReleaseBuilder, validate_paper_config
-from scisaurus.runtime.scholarly_depth import profile_for_paper
+from scisaurus.runtime.paper import PaperReleaseBuilder, load_paper_survey, validate_paper_config
+from scisaurus.runtime.results import validate_results_package
+from scisaurus.runtime.scholarly_depth import (
+    evaluate_scholarly_depth,
+    evaluate_scholarly_preflight,
+    profile_for_paper,
+    validate_scholarly_preflight,
+)
 from scisaurus.runtime.research_argument import (
     PACKAGE_SCHEMA_VERSION,
     ResearchArgumentRunner,
@@ -630,11 +640,12 @@ class PaperPipelineRunner:
                  initial_review_package=None, review_deadline_seconds=1200.0,
                  release_on_review_limit=False,
                  pipeline_deadline_seconds=DEFAULT_PIPELINE_DEADLINE_SECONDS,
-                 review_max_output_tokens=4096, review_reasoning_effort="medium",
+                 review_max_output_tokens=None, review_reasoning_effort="xhigh",
                  review_call_timeout_seconds=300.0,
                  review_inter_request_interval_seconds=0.5,
-                 repair_max_output_tokens=6000,
+                 repair_max_output_tokens=None,
                  model_call_timeout_seconds=300.0,
+                 model_concurrency=1,
                  review_arbiter_enabled=False,
                  argument=None, argument_review=None, initial_argument_package=None,
                  argument_deadline_seconds=DEFAULT_ARGUMENT_DEADLINE_SECONDS,
@@ -661,9 +672,17 @@ class PaperPipelineRunner:
             raise ValidationError("pipeline deadline must be finite and positive")
         self.release_on_review_limit = release_on_review_limit
         self.pipeline_deadline_seconds = float(pipeline_deadline_seconds)
-        if type(review_max_output_tokens) is not int or review_max_output_tokens <= 0:
-            raise ValidationError("review_max_output_tokens must be a positive integer")
-        if review_reasoning_effort not in {"none", "low", "medium", "high"}:
+        empirical_profile = (self.paper_config.get("schema_version") == "paper-release-score-3"
+                             and profile_for_paper(self.paper_config) == "empirical_journal")
+        self.empirical_profile = empirical_profile
+        if empirical_profile and max_review_rounds < 3:
+            raise ValidationError("empirical journal papers require three peer-review rounds before editor decision")
+        if empirical_profile and release_on_review_limit:
+            raise ValidationError("empirical journal papers cannot release an unresolved review-limit candidate")
+        if (review_max_output_tokens is not None
+                and (type(review_max_output_tokens) is not int or review_max_output_tokens <= 0)):
+            raise ValidationError("review_max_output_tokens must be a positive integer when supplied")
+        if review_reasoning_effort not in {"none", "low", "medium", "high", "xhigh"}:
             raise ValidationError("review_reasoning_effort is unsupported")
         for name, value in (("review_call_timeout_seconds", review_call_timeout_seconds),
                             ("review_inter_request_interval_seconds", review_inter_request_interval_seconds),
@@ -672,14 +691,18 @@ class PaperPipelineRunner:
                     or value < 0 or (name != "review_inter_request_interval_seconds" and value <= 0)):
                 raise ValidationError(f"{name} must be finite and positive" if name != "review_inter_request_interval_seconds"
                                       else f"{name} must be finite and non-negative")
-        if type(repair_max_output_tokens) is not int or repair_max_output_tokens <= 0:
-            raise ValidationError("repair_max_output_tokens must be a positive integer")
+        if (repair_max_output_tokens is not None
+                and (type(repair_max_output_tokens) is not int or repair_max_output_tokens <= 0)):
+            raise ValidationError("repair_max_output_tokens must be a positive integer when supplied")
+        if type(model_concurrency) is not int or model_concurrency <= 0:
+            raise ValidationError("model_concurrency must be a positive integer")
         self.review_max_output_tokens = review_max_output_tokens
         self.review_reasoning_effort = review_reasoning_effort
         self.review_call_timeout_seconds = float(review_call_timeout_seconds)
         self.review_inter_request_interval_seconds = float(review_inter_request_interval_seconds)
         self.repair_max_output_tokens = repair_max_output_tokens
         self.model_call_timeout_seconds = float(model_call_timeout_seconds)
+        self.model_concurrency = model_concurrency
         if (type(argument_deadline_seconds) not in (int, float)
                 or not math.isfinite(argument_deadline_seconds) or argument_deadline_seconds <= 0):
             raise ValidationError("argument deadline must be finite and positive")
@@ -704,6 +727,10 @@ class PaperPipelineRunner:
         self.started_at = time.monotonic()
         self.deadline = self.started_at + self.pipeline_deadline_seconds
         self.reviewers = reviewers
+        if empirical_profile and reviewers is not None:
+            if not any(isinstance(item, dict) and item.get("id") == "journal_editor" for item in reviewers):
+                raise ValidationError("empirical journal review must include the journal_editor perspective")
+        self.review_panel_ids = None
         if feedback_callback is not None and not callable(feedback_callback):
             raise ValidationError("feedback_callback must be callable or None")
         self.feedback_callback = feedback_callback
@@ -753,6 +780,7 @@ class PaperPipelineRunner:
             "review_inter_request_interval_seconds": self.review_inter_request_interval_seconds,
             "repair_max_output_tokens": self.repair_max_output_tokens,
             "model_call_timeout_seconds": self.model_call_timeout_seconds,
+            "model_concurrency": self.model_concurrency,
             "review_arbiter_enabled": self.review_arbiter_enabled,
             "remaining_seconds": max(0.0, self.deadline - time.monotonic()),
             "stage": self.current_stage,
@@ -777,6 +805,244 @@ class PaperPipelineRunner:
         config["timeout_seconds"] = min(float(config["timeout_seconds"]), remaining,
                                          self.model_call_timeout_seconds)
         return ModelClient(**config)
+
+    def _research_admission(self, argument, argument_review):
+        """Admit only research inputs that can support the declared paper tier.
+
+        The check runs after the argument has been independently accepted but
+        before a writer or manuscript project is created.  A failed check is
+        a request for new scientific work, never a short paper candidate.
+        """
+        if (self.paper_config.get("schema_version") != "paper-release-score-3"
+                or profile_for_paper(self.paper_config) != "empirical_journal"):
+            return None
+        # The final manuscript project is intentionally created only after
+        # admission.  Validate the bound paper descriptor against this fresh
+        # pipeline directory as a temporary existing path; the descriptor is
+        # never persisted with that substitution.
+        validation_config = deepcopy(self.paper_config)
+        validation_config["manuscript_project_dir"] = str(self.output)
+        paper_config = validate_paper_config(validation_config)
+        results_path = Path(paper_config["results_package"])
+        results = validate_results_package(
+            json.loads(results_path.read_text()), base_dir=results_path.parent)
+        survey = load_paper_survey(paper_config)
+        preflight = evaluate_scholarly_preflight(
+            paper_config, results, survey, argument=argument)
+        preflight = validate_scholarly_preflight(preflight)
+        preflight_path = self.output / "scholarly-depth-preflight.json"
+        preflight_path.write_bytes(canonical_bytes(preflight))
+        if preflight["decision"] == "proceed":
+            self._emit_feedback({
+                "event_id": "paper-research-admission",
+                "kind": "research_gate",
+                "reviewer_id": "journal_editor",
+                "stage": 6,
+                "decision": "proceed",
+                "status": "accepted",
+                "profile_id": preflight["profile_id"],
+                "artifact_path": str(preflight_path),
+            })
+            return None
+        self.run_status = "research_expansion_required"
+        self.current_stage = "research_admission"
+        self._write_run_metadata()
+        self._emit_feedback({
+            "event_id": "paper-research-expansion-required",
+            "kind": "research_gate",
+            "reviewer_id": "journal_editor",
+            "stage": 6,
+            "decision": preflight["decision"],
+            "status": "research_expansion_required",
+            "profile_id": preflight["profile_id"],
+            "finding_ids": [item["id"] for item in preflight["expansion_requests"]],
+            "expansion_requests": preflight["expansion_requests"],
+            "artifact_path": str(preflight_path),
+        })
+        elapsed = time.monotonic() - self.started_at
+        result = {
+            "schema_version": PIPELINE_SCHEMA_VERSION,
+            "status": "research_expansion_required",
+            "word_count": 0,
+            "sections": 0,
+            "review_rounds": 0,
+            "review_status": "not_started",
+            "scholarly_depth_status": "research_expansion_required",
+            "scholarly_profile": preflight["profile_id"],
+            "argument_status": argument_review["decision"],
+            "research_argument_path": str(self.output / "research-argument.json"),
+            "research_argument_review_path": str(self.output / "research-argument-review.json"),
+            "research_argument_sha256": hashlib.sha256(canonical_bytes(argument)).hexdigest(),
+            "manuscript_project_dir": None,
+            "release_dir": None,
+            "pdf": None,
+            "preflight_path": str(preflight_path),
+            "research_expansion_requests": preflight["expansion_requests"],
+            "preflight": preflight,
+            "surface_compression": [],
+            "surface_citation_binding": [],
+            "repair_failures": [],
+            "usage": deepcopy(self.argument_usage),
+            "elapsed_seconds": elapsed,
+            "deadline_seconds": self.pipeline_deadline_seconds,
+            "release": None,
+        }
+        (self.output / "pipeline-result.json").write_bytes(canonical_bytes(result))
+        self._write_run_metadata()
+        return result
+
+    def _research_review_result(self, requests, draft, argument, argument_review,
+                                review_history, project_dir):
+        """Persist a peer-review request for new work and stop before release."""
+        if not isinstance(requests, list) or not requests:
+            raise ValidationError("research review result requires at least one request")
+        request_path = self.output / "research-expansion-request.json"
+        request_record = {
+            "schema_version": "research-expansion-request-1",
+            "source": "manuscript_peer_review",
+            "status": "research_expansion_required",
+            "requests": deepcopy(requests),
+            "review_round": len(review_history),
+            "manuscript_sha256": hashlib.sha256(canonical_bytes(draft)).hexdigest(),
+            "argument_sha256": hashlib.sha256(canonical_bytes(argument)).hexdigest(),
+        }
+        request_path.write_bytes(canonical_bytes(request_record))
+        self.run_status = "research_expansion_required"
+        self.current_stage = "review"
+        self._write_run_metadata()
+        self._emit_feedback({
+            "event_id": "paper-peer-review-research-expansion",
+            "kind": "research_gate",
+            "reviewer_id": "manuscript_review",
+            "stage": 5,
+            "decision": "research_expansion_required",
+            "status": "research_expansion_required",
+            "finding_ids": [item["id"] for item in requests],
+            "expansion_requests": deepcopy(requests),
+            "artifact_path": str(request_path),
+        })
+        result = {
+            "schema_version": PIPELINE_SCHEMA_VERSION,
+            "status": "research_expansion_required",
+            "word_count": _word_count(draft),
+            "sections": len(draft["sections"]),
+            "review_rounds": len(review_history),
+            "review_status": "research_expansion_required",
+            "scholarly_depth_status": None,
+            "scholarly_profile": (profile_for_paper(self.paper_config)
+                                   if self.paper_config.get("schema_version") == "paper-release-score-3"
+                                   else None),
+            "argument_status": argument_review["decision"],
+            "research_argument_path": str(self.output / "research-argument.json"),
+            "research_argument_review_path": str(self.output / "research-argument-review.json"),
+            "research_argument_sha256": hashlib.sha256(canonical_bytes(argument)).hexdigest(),
+            "manuscript_project_dir": str(project_dir),
+            "release_dir": None,
+            "pdf": None,
+            "research_expansion_request_path": str(request_path),
+            "research_expansion_requests": deepcopy(requests),
+            "surface_compression": deepcopy(self.compression_audits),
+            "surface_citation_binding": deepcopy(self.citation_binding_audits),
+            "repair_failures": deepcopy(self.repair_failures),
+            "usage": {key: self.argument_usage.get(key, 0) + sum(
+                package.get("usage", {}).get(key, 0) for package in review_history)
+                      for key in ("model_calls", "input_tokens", "output_tokens")},
+            "elapsed_seconds": time.monotonic() - self.started_at,
+            "deadline_seconds": self.pipeline_deadline_seconds,
+            "release": None,
+        }
+        (self.output / "pipeline-result.json").write_bytes(canonical_bytes(result))
+        self._write_run_metadata()
+        return result
+
+    def _editor_decision(self, package, review_history):
+        """Apply the handling editor's final decision after the review cycle."""
+        final_reviews = package.get("reviews", []) if isinstance(package, dict) else []
+        review_ids = [review.get("reviewer_id") for review in final_reviews]
+        all_accept = all(review.get("decision") == "accept" for review in final_reviews)
+        requests = list(package.get("research_requests", [])
+                        or package.get("synthesis", {}).get("research_requests", []))
+        required_rounds = 3 if self.empirical_profile else 1
+        expected_panel = self.review_panel_ids or review_ids
+        checks = {
+            "three_stage_review": len(review_history) >= required_rounds,
+            "same_reviewer_panel": bool(review_ids) and review_ids == expected_panel
+                and (not self.empirical_profile or "journal_editor" in set(review_ids)),
+            "all_reviewers_accept": all_accept,
+            "synthesis_accept": package.get("synthesis", {}).get("decision") == "accept",
+            "no_research_requests": not requests,
+        }
+        decision = "accept" if all(checks.values()) else "reject"
+        editor = {
+            "schema_version": "editor-decision-1",
+            "editor_id": "editorial.editor_in_chief",
+            "decision": decision,
+            "review_rounds": len(review_history),
+            "required_rounds": required_rounds,
+            "reviewer_ids": review_ids,
+            "checks": checks,
+            "research_request_ids": [item.get("id") for item in requests],
+            "rationale": (
+                "The final reviewer panel and synthesis satisfy the release contract."
+                if decision == "accept" else
+                "The final reviewer panel did not satisfy every release condition; the manuscript is rejected for this cycle."
+            ),
+        }
+        path = self.output / "editor-decision.json"
+        path.write_bytes(canonical_bytes(editor))
+        self._emit_feedback({
+            "event_id": "paper-editor-decision",
+            "kind": "editor_decision",
+            "reviewer_id": "editorial.editor_in_chief",
+            "stage": 7,
+            "decision": decision,
+            "status": "accepted" if decision == "accept" else "rejected",
+            "review_rounds": len(review_history),
+            "checks": checks,
+            "artifact_path": str(path),
+        })
+        return editor
+
+    def _review_rejection_result(self, draft, argument, argument_review, review_history,
+                                 project_dir, editor_decision):
+        """Persist a final editor rejection without creating a PDF release."""
+        self.run_status = "review_rejected"
+        self.current_stage = "editorial_decision"
+        self._write_run_metadata()
+        result = {
+            "schema_version": PIPELINE_SCHEMA_VERSION,
+            "status": "review_rejected",
+            "word_count": _word_count(draft),
+            "sections": len(draft["sections"]),
+            "review_rounds": len(review_history),
+            "review_status": "rejected",
+            "scholarly_depth_status": None,
+            "scholarly_profile": (profile_for_paper(self.paper_config)
+                                   if self.paper_config.get("schema_version") == "paper-release-score-3"
+                                   else None),
+            "argument_status": argument_review["decision"],
+            "research_argument_path": str(self.output / "research-argument.json"),
+            "research_argument_review_path": str(self.output / "research-argument-review.json"),
+            "research_argument_sha256": hashlib.sha256(canonical_bytes(argument)).hexdigest(),
+            "manuscript_project_dir": str(project_dir),
+            "release_dir": None,
+            "pdf": None,
+            "editor_decision_path": str(self.output / "editor-decision.json"),
+            "editor_decision": editor_decision,
+            "research_expansion_requests": [],
+            "surface_compression": deepcopy(self.compression_audits),
+            "surface_citation_binding": deepcopy(self.citation_binding_audits),
+            "repair_failures": deepcopy(self.repair_failures),
+            "usage": {key: self.argument_usage.get(key, 0) + sum(
+                package.get("usage", {}).get(key, 0) for package in review_history)
+                      for key in ("model_calls", "input_tokens", "output_tokens")},
+            "elapsed_seconds": time.monotonic() - self.started_at,
+            "deadline_seconds": self.pipeline_deadline_seconds,
+            "release": None,
+        }
+        (self.output / "pipeline-result.json").write_bytes(canonical_bytes(result))
+        self._write_run_metadata()
+        return result
 
     def _prepare_argument(self):
         """Create or validate the argument map before the writer is admitted."""
@@ -881,6 +1147,8 @@ class PaperPipelineRunner:
             "adjudicated scientific spine: preserve its question, observed patterns, competing explanations, "
             "primary thesis, scope boundary, and figure/table jobs. Results reports observations; Discussion "
             "explains mechanisms and labels unresolved alternatives. Follow any writer_contract in the packet: "
+            "when scientific_follow_up is present, address each requested evidence or analysis in the new draft "
+            "and make any remaining uncertainty explicit without copying assignment metadata into the manuscript. "
             "use its section titles and stable unit IDs, copy its required scientific sentences exactly into the "
             "named units, include every pinned citation marker, and satisfy its depth and figure requirements. "
             "The manuscript surface must contain scientific meaning rather than pipeline state or provenance jargon."
@@ -930,7 +1198,7 @@ class PaperPipelineRunner:
                     ],
                 }
             prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-            result = self._client(max_output_tokens=24000, deadline=self.deadline).complete(
+            result = self._client(deadline=self.deadline).complete(
                 system=system, prompt=prompt)
             attempts.append(result)
             # Preserve every failed candidate as a durable feedback input.  A
@@ -1151,7 +1419,7 @@ class PaperPipelineRunner:
                 else:
                     prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
                 result = self._client(max_output_tokens=self.repair_max_output_tokens,
-                                      reasoning_effort="medium").complete(
+                                      reasoning_effort=self.review_reasoning_effort).complete(
                     system=system, prompt=prompt)
                 attempts.append(result)
                 (self.output / f"repair-round-{repair_round}-batch-{batch_index + 1}-attempt-{attempt + 1}.json").write_bytes(
@@ -1282,7 +1550,7 @@ class PaperPipelineRunner:
 
         # Batches read the same immutable draft snapshot and can therefore use
         # the provider's concurrency budget without racing on document state.
-        pool = ThreadPoolExecutor(max_workers=min(3, len(batches)))
+        pool = ThreadPoolExecutor(max_workers=min(self.model_concurrency, len(batches)))
         futures = [pool.submit(run_batch, index, targets) for index, targets in enumerate(batches)]
         pending = set(futures)
         try:
@@ -1357,6 +1625,9 @@ class PaperPipelineRunner:
                 "decision": argument_review.get("decision"),
                 "artifact_path": str(self.output / "research-argument.json"),
             })
+            admission_result = self._research_admission(argument, argument_review)
+            if admission_result is not None:
+                return admission_result
             draft, writer_result = self._writer(argument)
             draft, _, _ = self._compress_surface(draft, phase="after_writer")
             draft, _, _ = self._bind_claim_citations(draft, phase="after_writer")
@@ -1433,8 +1704,6 @@ class PaperPipelineRunner:
                         raise ValidationError("cached manuscript review has an unsupported status")
                 else:
                     round_config = deepcopy(review_config)
-                    if round_number > 1:
-                        round_config["reasoning_effort"] = "medium"
 
                     def relay_review_event(event, *, _round=round_number):
                         event = deepcopy(event)
@@ -1450,7 +1719,8 @@ class PaperPipelineRunner:
                         reasoning_effort=self.review_reasoning_effort,
                         call_timeout_seconds=min(self.review_call_timeout_seconds, self._remaining()),
                         inter_request_interval_seconds=self.review_inter_request_interval_seconds,
-                        arbiter_enabled=self.review_arbiter_enabled)
+                        arbiter_enabled=self.review_arbiter_enabled,
+                        max_workers=self.model_concurrency)
                     package = runner.run(input_doc, images=image_descriptors,
                                          interpretation=self.packet.get("scientific_interpretation"),
                                          argument=argument,
@@ -1469,6 +1739,20 @@ class PaperPipelineRunner:
                                          },
                                          artifact_dir=self.output / f"review-round-{round_number}",
                                          feedback_callback=relay_review_event)
+                panel_ids = [review.get("reviewer_id") for review in package.get("reviews", [])]
+                if not panel_ids or any(not isinstance(item, str) for item in panel_ids):
+                    raise ValidationError("manuscript review package has no reviewer panel")
+                if self.review_panel_ids is None:
+                    self.review_panel_ids = panel_ids
+                elif panel_ids != self.review_panel_ids:
+                    raise ValidationError("manuscript re-review changed the assigned reviewer panel")
+                if self.empirical_profile and "journal_editor" not in set(panel_ids):
+                    raise ValidationError("empirical journal review package omitted the journal_editor perspective")
+                if round_number == 1 and self.initial_review_package is not None:
+                    for review in package.get("reviews", []):
+                        validate_review(review, review.get("reviewer_id"), review.get("stage"))
+                    validate_synthesis(package.get("synthesis"), package.get("reviews", []),
+                                       package.get("adjudication"))
                 if round_number == 1 and self.initial_review_package is not None:
                     # A resumed run imported the package without invoking the
                     # reviewer workers.  Replay only its compact routing
@@ -1487,6 +1771,7 @@ class PaperPipelineRunner:
                             "decision": review.get("decision"),
                             "status": "accepted" if review.get("decision") == "accept" else "needs_revision",
                             "finding_ids": [finding.get("id") for finding in review.get("findings", [])],
+                            "research_request_ids": [request.get("id") for request in review.get("research_requests", [])],
                             "severity_counts": severities,
                             "artifact_path": str(review_dir / f"review-{review['reviewer_id']}.json"),
                         })
@@ -1497,6 +1782,7 @@ class PaperPipelineRunner:
                         "decision": synthesis.get("decision"),
                         "status": "accepted" if synthesis.get("decision") == "accept" else "needs_revision",
                         "required_repairs": [item.get("finding_id") for item in synthesis.get("required_repairs", [])],
+                        "research_request_ids": [item.get("id") for item in synthesis.get("research_requests", [])],
                         "accepted_reviewers": list(synthesis.get("accepted_reviewers", [])),
                         "verification_contract": list(synthesis.get("verification_contract", [])),
                         "artifact_path": str(review_dir / "synthesis.json"),
@@ -1506,13 +1792,29 @@ class PaperPipelineRunner:
                                for key in {"model_calls", "input_tokens", "output_tokens"}}
                 (self.output / f"manuscript-review-round-{round_number}.json").write_bytes(canonical_bytes(package))
                 (self.output / f"manuscript-draft-v{round_number}.json").write_bytes(canonical_bytes(draft))
+                research_requests = deepcopy(
+                    package.get("research_requests")
+                    or package.get("synthesis", {}).get("research_requests", []))
+                if research_requests:
+                    return self._research_review_result(
+                        research_requests, draft, argument, argument_review,
+                        review_history, project_dir)
                 if package["status"] == "accepted":
                     accepted_package = package
                     review_status = "accepted"
+                    # A journal paper receives a genuine re-review cycle even
+                    # when the first panel reports no repair.  The same panel
+                    # is called again on the frozen incumbent so an early
+                    # acceptance cannot bypass the editor's third-stage gate.
+                    if round_number < (3 if self.empirical_profile else 1):
+                        continue
                     break
                 if round_number == self.max_review_rounds:
                     if not self.release_on_review_limit:
-                        raise ValidationError("manuscript review remained in needs_revision after the configured rounds")
+                        editor_decision = self._editor_decision(package, review_history)
+                        return self._review_rejection_result(
+                            draft, argument, argument_review, review_history,
+                            project_dir, editor_decision)
                     # A time-bounded run may publish the incumbent with its
                     # review decision intact.  This is a candidate release,
                     # never an acceptance decision or a silent downgrade.
@@ -1547,6 +1849,11 @@ class PaperPipelineRunner:
                 project.apply_replacements(draft, replacements)
             if accepted_package is None:
                 raise ValidationError("manuscript review produced no accepted package")
+            editor_decision = self._editor_decision(accepted_package, review_history)
+            if editor_decision["decision"] != "accept":
+                return self._review_rejection_result(
+                    draft, argument, argument_review, review_history,
+                    project_dir, editor_decision)
             final_status = "accepted" if review_status == "accepted" else "needs_review"
             verification = project.store.publish_artifact(
                 logical_id="methods/verifications/manuscript", artifact_type="verification", author="editorial.office",
@@ -1617,6 +1924,8 @@ class PaperPipelineRunner:
                       "research_argument_review_path": str(self.output / "research-argument-review.json"),
                       "research_argument_sha256": hashlib.sha256(canonical_bytes(argument)).hexdigest(),
                       "manuscript_project_dir": str(project_dir), "release_dir": str(release_dir),
+                      "editor_decision_path": str(self.output / "editor-decision.json"),
+                      "editor_decision": editor_decision,
                       "pdf": str(release_dir / "output" / "pdf" / f"{paper_config['paper_id']}.pdf"),
                       "surface_compression": deepcopy(self.compression_audits),
                       "surface_citation_binding": deepcopy(self.citation_binding_audits),

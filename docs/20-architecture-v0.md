@@ -56,9 +56,9 @@ Compile the approved mission and Score into readiness conditions, task templates
 Composer may write `command/missions/*`, `command/plans/*`, and operational proposals. It does not rewrite `kb/*`, `strategy/*`, or `methods/*` to force agreement. It may propose a task or a change; the proper owner produces the resulting artifact.
 
 The project-level `run-composer` entry point makes this control loop executable:
-it admits the allowlisted survey, experiment, interpretation, argument, and
-paper stages; binds their exact outputs; records feedback and checkpoints; and
-stops or resumes from the durable stage frontier. The specialist runners retain
+it admits the allowlisted topic-discovery, survey, experiment, interpretation,
+argument, and paper stages; binds their exact outputs; records feedback and
+checkpoints; and stops or resumes from the durable stage frontier. The specialist runners retain
 their independent acceptance checks, so Composer controls procedure without
 becoming the sole source of scientific truth.
 
@@ -308,6 +308,27 @@ The producer may accept and repair, rebut with evidence, or request missing info
 A non-conflicted chief can adjudicate routine matters. Material scientific disputes go to an independent Methods adjudicator or command Arbiter; a dispute about Methods' own judgment requires another qualified adjudicator or the Principal. An appeal is bounded and must state its basis.
 
 Closure requires a separate verification artifact and a recorded disposition. Distinguish `resolved_verified`, `rebutted`, `rejected_invalid`, `duplicate`, and `risk_accepted`. Only the first is a verified repair; `risk_accepted` is not scientific validation and cannot waive a blocking integrity condition.
+
+For a research paper, this protocol is a bounded peer-review cycle rather than
+a one-shot style pass. The same panel reviews the initial manuscript, the
+author applies only the accepted surgical repairs, and the panel re-reviews the
+new incumbent. Three rounds are required before the editor-in-chief decides.
+Any reviewer may issue a structured request for new literature, a discriminating
+experiment, an interpretation expansion, or an analysis display. Such a request
+keeps the manuscript out of release until its success condition is met; an
+unresolved request cannot be hidden by rewriting the affected paragraph.
+
+
+At the workflow level, the Composer treats those requests as executable
+continuations. It maps each request to the smallest owning stage closure,
+creates a cycle-specific project namespace, reruns changed consumers, and
+limits re-entry by `continuation_policy.max_cycles` and the original hard wall.
+A free-topic workflow may begin with the `topic_discovery` stage: recent
+OpenAlex records are sampled with a recorded seed and query/capture trace, then
+an intake model chooses a testable question against a safe runtime capability
+inventory. The selected direction lists structured requirements and is rejected
+if the declared environment cannot provide them. Topic metadata remains an
+intake prompt until the ordinary survey and evidence gates promote it.
 
 ### 5.5 Candidate selection
 

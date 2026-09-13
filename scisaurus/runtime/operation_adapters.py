@@ -299,13 +299,22 @@ def _inspect_openalex(profile, result, params, *, representative=True):
         require(math.isfinite(number))
         return number
 
+    expected = None
+    missing_work = False
     try:
         require(isinstance(params, dict))
         if "client" in params:
             require(canonical_bytes(params["client"]) == canonical_bytes(profile["client"]))
         expected = _openalex_arguments({key: value for key, value in params.items() if key != "client"})
         require(canonical_bytes(metadata.get("request")) == canonical_bytes(expected))
-        require(type(metadata.get("http_status")) is int and metadata["http_status"] == 200)
+        status = metadata.get("http_status")
+        # Citation expansion routinely encounters records that OpenAlex has
+        # removed or never exposed.  A verified 404 for a concrete work is a
+        # valid negative lookup and must not degrade the whole bibliography
+        # capability; search and citing requests still require HTTP 200.
+        missing_work = (not representative and expected["operation"] == "work"
+                        and status == 404 and result.get("outcome") == "not_found")
+        require(type(status) is int and (status == 200 or missing_work))
         endpoint = profile["client"]["endpoint"]
         if expected["operation"] == "work":
             url = endpoint + "/" + expected["work_id"]
@@ -321,92 +330,102 @@ def _inspect_openalex(profile, result, params, *, representative=True):
     check("openalex-request", request_valid, "The exact operation arguments and HTTP URL match the execution context")
 
     expected_works, expected_sources, expected_text, expected_abstract_gaps = [], [], "", []
-    try:
-        require(request_valid and integrity)
-        payload = json.loads(raw, object_pairs_hook=object_pairs, parse_constant=reject_constant, parse_float=finite_float)
-        require(isinstance(payload, dict) and canonical_bytes(payload) == canonical_bytes(result.get("raw_response")))
-        if expected["operation"] == "work":
-            items = [payload]
-            count, cursor = 1, None
-        else:
-            items, page = payload["results"], payload["meta"]
-            require(isinstance(items, list) and isinstance(page, dict))
-            require(type(page["count"]) is int and page["count"] >= len(items))
-            require(type(page["per_page"]) is int and page["per_page"] == expected["limit"]
-                    and len(items) <= expected["limit"])
-            count, cursor = page["count"], page["next_cursor"]
-            require(cursor is None or (isinstance(cursor, str) and 0 < len(cursor) <= 8192
-                                      and not any(ord(c) < 32 for c in cursor)))
-            require(cursor is None or (bool(items) and cursor != (expected["cursor"] or "*")))
-            require(items or expected["cursor"] not in (None, "*") or count == 0)
-        for item in items:
-            require(isinstance(item, dict))
-            identity, title, year = identifier(item["id"]), item["title"], item["publication_year"]
-            require(isinstance(title, str) and bool(title.strip()))
-            require(year is None or (type(year) is int and 1 <= year <= 9999))
-            doi = item.get("doi")
-            if doi is not None:
-                require(isinstance(doi, str))
-                doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi, flags=re.IGNORECASE)
-                require(re.fullmatch(r"10\.[0-9]+/\S+", doi) is not None)
-                doi = doi.lower()
-            relationships = {}
-            for field in ("referenced_works", "related_works"):
-                require(isinstance(item[field], list))
-                relationships[field] = [identifier(value) for value in item[field]]
-            require(expected["operation"] != "work" or identity == expected["work_id"])
-            require(expected["operation"] != "citing" or expected["work_id"] in relationships["referenced_works"])
-            index, abstract = item.get("abstract_inverted_index"), None
-            if index is not None:
-                try:
-                    require(isinstance(index, dict) and bool(index))
-                    tokens = []
-                    for word, offsets in index.items():
-                        require(isinstance(word, str) and bool(word.strip()) and isinstance(offsets, list) and bool(offsets))
-                        require(all(type(offset) is int and offset >= 0 for offset in offsets))
-                        tokens.extend((offset, word) for offset in offsets)
-                    tokens.sort()
-                    require([offset for offset, _ in tokens] == list(range(len(tokens))))
-                    abstract = " ".join(word for _, word in tokens)
-                except ValueError:
-                    expected_abstract_gaps.append({"work_id": identity, "reason": "provider_abstract_index_invalid"})
-            locations = []
-            require(isinstance(item["locations"], list))
-            for location in item["locations"]:
-                require(isinstance(location, dict) and type(location.get("is_oa")) is bool)
-                require(location.get("version") in (None, "publishedVersion", "acceptedVersion", "submittedVersion"))
-                mapped = {"is_oa": location["is_oa"], "version": location.get("version")}
-                for field in ("landing_page_url", "pdf_url"):
-                    value = location.get(field)
-                    if value is not None:
-                        _http_url(value)
-                    mapped[field] = value
-                locations.append(mapped)
-            work = {"id": identity, "doi": doi, "title": title, "year": year, "abstract": abstract,
-                    **relationships, "locations": locations}
-            expected_works.append(work)
-            expected_sources.append({"work_id": identity, "doi": doi, "title": title, "year": year, "abstract": abstract,
-                                     "source_url": "https://openalex.org/" + identity, "representation": "scholarly_metadata"})
-        require(len({work["id"] for work in expected_works}) == len(expected_works))
-        require(type(metadata.get("count")) is int and metadata["count"] == count
-                and metadata.get("next_cursor") == cursor and type(metadata.get("has_more")) is bool
-                and metadata["has_more"] == (cursor is not None)
-                and metadata.get("abstract_gaps", []) == expected_abstract_gaps)
-        require(canonical_bytes(result.get("works")) == canonical_bytes(expected_works))
-        require(canonical_bytes(result.get("sources")) == canonical_bytes(expected_sources))
-        expected_text = "\n\n".join(work["title"] + " — https://openalex.org/" + work["id"]
-                                    + ("\n" + work["abstract"] if work["abstract"] is not None else "")
-                                    for work in expected_works)
-        require(result.get("text") == expected_text)
-        response_valid = True
-    except (KeyError, TypeError, ValueError, ValidationError, RecursionError):
-        response_valid = False
+    if missing_work:
+        response_valid = (request_valid and integrity and result.get("raw_response") is None
+                          and result.get("works") == [] and result.get("sources") == []
+                          and result.get("text") == "" and metadata.get("capture_truncated") is False
+                          and metadata.get("capture_incomplete") is False)
+    else:
+        try:
+            require(request_valid and integrity)
+            payload = json.loads(raw, object_pairs_hook=object_pairs, parse_constant=reject_constant, parse_float=finite_float)
+            require(isinstance(payload, dict) and canonical_bytes(payload) == canonical_bytes(result.get("raw_response")))
+            if expected["operation"] == "work":
+                items = [payload]
+                count, cursor = 1, None
+            else:
+                items, page = payload["results"], payload["meta"]
+                require(isinstance(items, list) and isinstance(page, dict))
+                require(type(page["count"]) is int and page["count"] >= len(items))
+                require(type(page["per_page"]) is int and page["per_page"] == expected["limit"]
+                        and len(items) <= expected["limit"])
+                count, cursor = page["count"], page["next_cursor"]
+                require(cursor is None or (isinstance(cursor, str) and 0 < len(cursor) <= 8192
+                                          and not any(ord(c) < 32 for c in cursor)))
+                require(cursor is None or (bool(items) and cursor != (expected["cursor"] or "*")))
+                require(items or expected["cursor"] not in (None, "*") or count == 0)
+            for item in items:
+                require(isinstance(item, dict))
+                identity, title, year = identifier(item["id"]), item["title"], item["publication_year"]
+                require(isinstance(title, str) and bool(title.strip()))
+                require(year is None or (type(year) is int and 1 <= year <= 9999))
+                doi = item.get("doi")
+                if doi is not None:
+                    require(isinstance(doi, str))
+                    doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi, flags=re.IGNORECASE)
+                    require(re.fullmatch(r"10\.[0-9]+/\S+", doi) is not None)
+                    doi = doi.lower()
+                relationships = {}
+                for field in ("referenced_works", "related_works"):
+                    require(isinstance(item[field], list))
+                    relationships[field] = [identifier(value) for value in item[field]]
+                require(expected["operation"] != "work" or identity == expected["work_id"])
+                require(expected["operation"] != "citing" or expected["work_id"] in relationships["referenced_works"])
+                index, abstract = item.get("abstract_inverted_index"), None
+                if index is not None:
+                    try:
+                        require(isinstance(index, dict) and bool(index))
+                        tokens = []
+                        for word, offsets in index.items():
+                            require(isinstance(word, str) and bool(word.strip()) and isinstance(offsets, list) and bool(offsets))
+                            require(all(type(offset) is int and offset >= 0 for offset in offsets))
+                            tokens.extend((offset, word) for offset in offsets)
+                        tokens.sort()
+                        require([offset for offset, _ in tokens] == list(range(len(tokens))))
+                        abstract = " ".join(word for _, word in tokens)
+                    except ValueError:
+                        expected_abstract_gaps.append({"work_id": identity, "reason": "provider_abstract_index_invalid"})
+                locations = []
+                require(isinstance(item["locations"], list))
+                for location in item["locations"]:
+                    require(isinstance(location, dict) and type(location.get("is_oa")) is bool)
+                    require(location.get("version") in (None, "publishedVersion", "acceptedVersion", "submittedVersion"))
+                    mapped = {"is_oa": location["is_oa"], "version": location.get("version")}
+                    for field in ("landing_page_url", "pdf_url"):
+                        value = location.get(field)
+                        if value is not None:
+                            _http_url(value)
+                        mapped[field] = value
+                    locations.append(mapped)
+                authors = literature._authors(item.get("authorships"))
+                work = {"id": identity, "doi": doi, "title": title, "year": year, "abstract": abstract,
+                        **relationships, "locations": locations,
+                        **({"authors": authors} if authors else {})}
+                expected_works.append(work)
+                expected_sources.append({"work_id": identity, "doi": doi, "title": title, "year": year, "abstract": abstract,
+                                         "source_url": "https://openalex.org/" + identity, "representation": "scholarly_metadata",
+                                         **({"authors": authors} if authors else {})})
+            require(len({work["id"] for work in expected_works}) == len(expected_works))
+            require(type(metadata.get("count")) is int and metadata["count"] == count
+                    and metadata.get("next_cursor") == cursor and type(metadata.get("has_more")) is bool
+                    and metadata["has_more"] == (cursor is not None)
+                    and metadata.get("abstract_gaps", []) == expected_abstract_gaps)
+            require(canonical_bytes(result.get("works")) == canonical_bytes(expected_works))
+            require(canonical_bytes(result.get("sources")) == canonical_bytes(expected_sources))
+            expected_text = "\n\n".join(work["title"] + " — https://openalex.org/" + work["id"]
+                                        + ("\n" + work["abstract"] if work["abstract"] is not None else "")
+                                        for work in expected_works)
+            require(result.get("text") == expected_text)
+            response_valid = True
+        except (KeyError, TypeError, ValueError, ValidationError, RecursionError):
+            response_valid = False
     check("openalex-response", response_valid,
           "Normalized works, citation links, abstracts, locations and pagination match independently reconstructed captured JSON")
     empty = response_valid and not expected_works and not representative and params["operation"] in {"search", "citing"}
-    check("outcome", response_valid and result.get("outcome") == ("empty" if empty else "ok"),
+    expected_outcome = "not_found" if missing_work else ("empty" if empty else "ok")
+    check("outcome", response_valid and result.get("outcome") == expected_outcome,
           f"Observed outcome: {result.get('outcome')}")
-    check("usable-output", response_valid and (empty or bool(expected_works and expected_text)),
+    check("usable-output", response_valid and (missing_work or empty or bool(expected_works and expected_text)),
           "Readiness requires usable scholarly records; a routine no-match page is a valid empty result")
     return checks, schema_identity
 

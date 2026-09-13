@@ -121,6 +121,15 @@ class TimePolicyTests(unittest.TestCase):
         self.assertEqual(estimate["provenance"], "configured_seed_and_observed_max")
         self.assertFalse(plan.admit("production", task_count=4)["allowed"])
 
+    def test_rebudget_recomputes_initial_schedule_without_erasing_observations(self):
+        plan = self.plan(unit_count=10)
+        plan.observe("production", 25)
+        plan.rebudget(4)
+        snapshot = plan.snapshot()
+        self.assertEqual(snapshot["initial_schedule"]["total_seconds"], 93)
+        self.assertEqual(snapshot["stage_estimates"]["production"]["observations"]["count"], 1)
+        self.assertEqual(snapshot["stage_estimates"]["production"]["seconds"], 25)
+
     def test_fast_observation_does_not_erase_conservative_seed(self):
         plan = self.plan()
         plan.observe("revision", 1)

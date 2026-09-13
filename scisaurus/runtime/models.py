@@ -82,9 +82,10 @@ class ModelClient:
         if type(retry_backoff_seconds) not in (int, float) or not math.isfinite(retry_backoff_seconds) or retry_backoff_seconds < 0:
             raise ValidationError("retry_backoff_seconds must be finite and non-negative")
         if reasoning_effort is not None and (
-            not isinstance(reasoning_effort, str) or reasoning_effort not in {"none", "low", "medium", "high"}
+            not isinstance(reasoning_effort, str)
+            or reasoning_effort not in {"none", "low", "medium", "high", "xhigh"}
         ):
-            raise ValidationError("reasoning_effort must be none, low, medium, or high when configured")
+            raise ValidationError("reasoning_effort must be none, low, medium, high, or xhigh when configured")
         if output_format is not None and output_format != "json_object":
             raise ValidationError("output_format must be json_object when configured")
         if protocol != "openai_compatible" and (reasoning_effort is not None or output_format is not None):

@@ -558,6 +558,42 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(SurveyHTTPFixture.requests, [])
         self.assertEqual(result["usage"]["cumulative_usage"], {})
 
+    def test_work_ceiling_is_reduced_when_minimum_survey_fits(self):
+        config = survey_config(self.endpoint)
+        config["survey"]["stage_seconds"] = {stage: 10 for stage in STAGES}
+        config["limits"]["wall_clock_seconds"] = 70
+        config["time_policy"] = {"first_result_seconds": 50, "target_seconds": 50, "hard_seconds": 70}
+        runner = self.runtime(config)
+        self.assertEqual(runner.bounds["max_works"], 2)
+        self.assertEqual(runner.work_budget_adjustments[0]["requested_max_works"], 10)
+        self.assertEqual(runner.work_budget_adjustments[0]["effective_max_works"], 2)
+        self.assertTrue(runner.time_policy.snapshot()["initial_target_feasible"])
+
+    def test_crossref_fallback_projection_preserves_source_identity(self):
+        source = {"doi": "10.1000/Example", "title": "A bounded result",
+                  "source_url": "https://doi.org/10.1000/Example",
+                  "published": {"date-parts": [[2024]]},
+                  "abstract": "<jats:p>Observed error decreases.</jats:p>",
+                  "authors": [{"given": "Ada", "family": "Lovelace"}]}
+        first = SurveyRunner._crossref_work(source)
+        second = SurveyRunner._crossref_work(source)
+        self.assertEqual(first["id"], second["id"])
+        self.assertTrue(first["id"].startswith("W"))
+        self.assertEqual(first["doi"], "10.1000/example")
+        self.assertEqual(first["year"], 2024)
+        self.assertEqual(first["abstract"], "Observed error decreases.")
+        self.assertEqual(first["source_url"], source["source_url"])
+        self.assertEqual(first["bibliography_provider"], "crossref")
+
+    def test_crossref_fallback_rebudgets_large_discovery_pages(self):
+        config = survey_config(self.endpoint)
+        config["survey"]["search"]["max_works"] = 100
+        runner = self.runtime(config)
+        runner._activate_crossref_fallback("rate_limited")
+        self.assertEqual(runner.bounds["max_works"], 20)
+        self.assertEqual(runner.time_policy.unit_count, 20)
+        self.assertEqual(runner.work_budget_adjustments[-1]["kind"], "provider_fallback_fit")
+
     def test_stale_survey_after_dispatch_checkpoint_blocks_gap_worker(self):
         original = SurveyRunner._checkpoint
         changed = []

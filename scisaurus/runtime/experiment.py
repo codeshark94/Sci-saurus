@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ from scisaurus.core.schema import canonical_bytes, sha256_hex
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.surveys import SurveyGate
 from scisaurus.runtime.execution import ExecutionRuntime, _invoke_worker
+from scisaurus.runtime.config import configured_worker_slots
 from scisaurus.runtime.experiment_config import ASSET_MEDIA_TYPES, validate_experiment_config
 from scisaurus.runtime.models import ModelResult
 from scisaurus.runtime.operations import OperationsCell
@@ -220,9 +222,12 @@ class ExperimentRunner(ExecutionRuntime):
         self.review_records = []
         self.serial = 0
         self.literature = {"survey_ref": None, "assessment_ref": None, "state": None}
+        self.literature_gate_mismatch = None
+        self.research_expansion_requests = []
+        self.worker_slots = configured_worker_slots(self.config["limits"])
         self.time_policy = TimePolicy(stage_seconds=self.experiment["stage_seconds"],
             unit_count=len(self.experiment["reviewers"]),
-            worker_slots=self.config["limits"]["concurrent_calls"] - 1,
+            worker_slots=self.worker_slots,
             wall_clock_seconds=self.config["limits"]["wall_clock_seconds"],
             policy=self.config.get("time_policy"))
         self.time_policy.started_at = self.started
@@ -242,10 +247,24 @@ class ExperimentRunner(ExecutionRuntime):
                 survey_gate.require_current(gate["survey_ref"])
                 assessment = survey_gate.require_current_assessment(gate["assessment_ref"])
                 body = json.loads(store.read_body(assessment["body_hash"]))
-                if body["state"] != gate["required_state"]:
-                    raise ValidationError("current literature assessment does not match the experiment gate")
                 self.literature = {"survey_ref": gate["survey_ref"],
                                    "assessment_ref": gate["assessment_ref"], "state": body["state"]}
+                if body["state"] != gate["required_state"]:
+                    self.literature_gate_mismatch = {
+                        "observed_state": body["state"],
+                        "required_state": gate["required_state"],
+                        "survey_ref": gate["survey_ref"],
+                        "assessment_ref": gate["assessment_ref"],
+                    }
+                    self.research_expansion_requests = [{
+                        "id": f"literature-gate-{body['state']}",
+                        "kind": "literature_expansion",
+                        "owner": "research.intelligence",
+                        "objective": "Expand the literature search and secure enough verified full-text evidence to resolve the experiment admission state.",
+                        "why": f"The current literature assessment is {body['state']}, while this experiment requires {gate['required_state']}.",
+                        "success_condition": f"A current literature assessment reports {gate['required_state']} with its source and identity checks satisfied.",
+                        "evidence_needed": "Additional scoped searches, verified source identities, and decisive full-text quotations bound to the accepted survey.",
+                    }]
             finally:
                 control.close()
         self.context = self._publish("inputs/experiment-context", "note", {
@@ -367,7 +386,11 @@ class ExperimentRunner(ExecutionRuntime):
 
     def _model_checked(self, jobs, *, images, stage):
         pending, accepted, feedback = list(jobs), {}, {}
-        for _ in range(self.config["limits"]["max_rounds"]):
+        repair_mode = self.config["limits"].get("repair_mode", "bounded")
+        rounds = (itertools.count() if repair_mode == "until_deadline"
+                  else range(self.config["limits"]["max_rounds"]))
+        for _ in rounds:
+            self._ensure_active()
             admission = self.time_policy.admit(stage, task_count=len(pending))
             if not admission["allowed"]:
                 raise ValidationError(f"time admission deferred experiment review: {admission['reason']}")
@@ -382,7 +405,7 @@ class ExperimentRunner(ExecutionRuntime):
                               "params": {"client": self.config["model"],
                                          "prompt": json.dumps(assignment, ensure_ascii=False),
                                          **({"images": images} if images else {})}})
-            outcomes = self._call_batch(specs, max_parallel=self.config["limits"]["concurrent_calls"] - 1)
+            outcomes = self._call_batch(specs, max_parallel=self.worker_slots)
             rejected = []
             for job, spec in zip(pending, specs):
                 outcome = outcomes[spec["task_id"]]
@@ -529,23 +552,30 @@ class ExperimentRunner(ExecutionRuntime):
             self._initialize()
             if not self.time_policy.snapshot()["initial_hard_limit_feasible"]:
                 raise ValidationError("configured experiment stages do not fit the hard deadline")
-            self._setup()
-            candidate = self._execute_once()
-            self._capture_assets(candidate)
-            replay = self._execute_once()
-            candidate_sha256 = sha256_hex(canonical_bytes(candidate))
-            if canonical_bytes(replay) != canonical_bytes(candidate):
-                raise ValidationError("frozen replay did not reproduce the exact experiment output")
-            replay_assets = self._workspace_assets(replay)
-            if any(body != self.asset_files[index]["body"] for index, (_, body) in enumerate(replay_assets)):
-                raise ValidationError("frozen replay did not reproduce the exact experiment assets")
-            deterministic, validation_record, validator_execution_ref = self._deterministic_validate(
-                candidate, candidate_sha256)
-            reviews, images = self._model_reviews(candidate, deterministic, validation_record)
-            assessment, assessment_record = self._assess(candidate, validation_record, reviews, images)
-            package, package_path = self._package(candidate, candidate_sha256, validation_record,
-                                                  validator_execution_ref, assessment, assessment_record)
-            status = "completed"
+            if self.literature_gate_mismatch is not None:
+                # A missing prerequisite is a research work order, not a
+                # failed experiment attempt.  Return the bounded request so
+                # the Composer can reopen the survey closure automatically.
+                status = "research_expansion_required"
+                error = "literature admission requires additional evidence"
+            else:
+                self._setup()
+                candidate = self._execute_once()
+                self._capture_assets(candidate)
+                replay = self._execute_once()
+                candidate_sha256 = sha256_hex(canonical_bytes(candidate))
+                if canonical_bytes(replay) != canonical_bytes(candidate):
+                    raise ValidationError("frozen replay did not reproduce the exact experiment output")
+                replay_assets = self._workspace_assets(replay)
+                if any(body != self.asset_files[index]["body"] for index, (_, body) in enumerate(replay_assets)):
+                    raise ValidationError("frozen replay did not reproduce the exact experiment assets")
+                deterministic, validation_record, validator_execution_ref = self._deterministic_validate(
+                    candidate, candidate_sha256)
+                reviews, images = self._model_reviews(candidate, deterministic, validation_record)
+                assessment, assessment_record = self._assess(candidate, validation_record, reviews, images)
+                package, package_path = self._package(candidate, candidate_sha256, validation_record,
+                                                      validator_execution_ref, assessment, assessment_record)
+                status = "completed"
         except (Exception, KeyboardInterrupt) as exc:
             error = f"{type(exc).__name__}: {exc}"
             self.blockers.append({"reason": error})
@@ -562,6 +592,7 @@ class ExperimentRunner(ExecutionRuntime):
             "model_review_refs": [record["artifact_ref"] for record in self.review_records],
             "assessment_ref": assessment_record["artifact_ref"] if assessment_record else None,
             "results_package": str(package_path) if package_path else None,
+            "research_expansion_requests": deepcopy(self.research_expansion_requests),
             "usage": self.budget.get_window("run-window"), "unreported_usage": self.usage_gaps,
             "time_plan": self.time_policy.snapshot(), "blockers": self.blockers,
             "event_chain": self.control.verify_chain(), "release_status": "not_released"}

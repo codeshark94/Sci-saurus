@@ -121,6 +121,75 @@ def _restore_unique_source_whitespace(source: dict, quote: str, *, window: dict 
             candidates.append(window_tokens)
         if len(candidates) == 1:
             return text[candidates[0][0][1]:candidates[0][-1][2]]
+
+    # HTML/MathJax-to-Markdown extractors sometimes retain both the rendered
+    # Unicode symbol and its TeX spelling (``ξ\\xi``), or duplicate a
+    # one-letter variable at a word boundary (``ff``).  A model that copies
+    # the rendered sentence may therefore omit the transport alias while
+    # preserving every scientific word.  Match those two representation-only
+    # artifacts as alternatives, but still return the exact original slice
+    # and require one unique candidate inside the displayed window.
+    math_aliases = {
+        "α": "alpha", "β": "beta", "γ": "gamma", "δ": "delta", "ε": "epsilon",
+        "θ": "theta", "λ": "lambda", "μ": "mu", "π": "pi", "σ": "sigma",
+        "τ": "tau", "φ": "phi", "ω": "omega", "ξ": "xi", "∞": "infty",
+        "≤": "leq", "≥": "geq", "≠": "ne", "∈": "in", "∉": "notin",
+        "∥": "Vert", "→": "to", "⇒": "Rightarrow",
+    }
+
+    def transport_tokens(value, *, source_text=False):
+        """Tokenize with representation aliases retained as span metadata.
+
+        The returned token value is deliberately conservative: only a TeX
+        alias immediately following its rendered Unicode symbol is collapsible,
+        and only a standalone duplicated one-letter variable is collapsible.
+        Ordinary prose and repeated letters inside words remain unchanged.
+        """
+        tokens = token_spans(value)
+        if not source_text:
+            # A rendered Unicode symbol is equivalent to its named math
+            # token for transport matching.  This affects only the explicit
+            # symbol characters below; ordinary words such as ``xi`` remain
+            # ordinary words unless they occur as a source-side TeX alias.
+            return [(f"__math_{math_aliases[token].casefold()}__" if token in math_aliases else token,
+                     start, end) for token, start, end in tokens]
+        collapsed = []
+        index = 0
+        while index < len(tokens):
+            token, start, end = tokens[index]
+            canonical = token
+            span_end = end
+            if token in math_aliases and index + 1 < len(tokens):
+                alias, alias_start, alias_end = tokens[index + 1]
+                between = value[end:alias_start]
+                if re.fullmatch(r"\s*\\?", between) and alias.casefold() == math_aliases[token].casefold():
+                    canonical = f"__math_{math_aliases[token].casefold()}__"
+                    span_end = alias_end
+                    index += 1
+            if (len(token) == 2 and token[0] == token[1]
+                    and token.isascii() and token.isalpha()
+                    and (start == 0 or not value[start - 1].isalnum())
+                    and (end == len(value) or not value[end].isalnum())):
+                canonical = token[0]
+            collapsed.append((canonical, start, span_end))
+            index += 1
+        return collapsed
+
+    expected_transport = transport_tokens(quote)
+    observed_transport = transport_tokens(text, source_text=True)
+    expected_values = [token for token, _, _ in expected_transport]
+    candidates = []
+    for offset in range(len(observed_transport) - len(expected_values) + 1):
+        window_tokens = observed_transport[offset:offset + len(expected_values)]
+        if [token for token, _, _ in window_tokens] != expected_values:
+            continue
+        if window_tokens[0][1] < start or window_tokens[-1][2] > end:
+            continue
+        candidates.append(window_tokens)
+    if len(candidates) == 1:
+        return text[candidates[0][0][1]:candidates[0][-1][2]]
+    if len(candidates) > 1:
+        raise ValidationError("evidence quote occurs more than once; provide a longer unique quotation")
     raise ValidationError("evidence quote is absent from the supplied source window")
 
 

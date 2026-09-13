@@ -32,13 +32,16 @@ _COMPATIBLE_SYNTHESIS_SCHEMAS = {"manuscript-review-synthesis-1", SYNTHESIS_SCHE
 DECISIONS = {"accept", "revise", "insufficient_evidence"}
 OUTCOMES = {"passed", "failed", "insufficient_evidence"}
 SEVERITIES = {"blocking", "major", "minor"}
+RESEARCH_REQUEST_KINDS = {
+    "additional_experiment", "literature_expansion", "interpretation_expansion", "analysis_repair",
+}
 DEFAULT_REVIEWERS = (
     {"id": "science", "stage": 1,
      "focus": "Check that the thesis, literature position, claims, and conclusions match the supplied evidence and stated scope."},
     {"id": "methods", "stage": 2,
      "focus": "Check design, data handling, reproducibility, numerical reporting, leakage, uncertainty, and whether the result follows from the method."},
     {"id": "ai_smell", "stage": 3,
-     "focus": "Act as an adversary to generic AI prose, inflated novelty, boilerplate transitions, suspicious symmetry, unsupported certainty, and citation-shaped filler. Treat an explicitly labeled transfer-design precedent as relevant when it names the axis or measurement being proposed; flag only citations that do not change a reader's understanding. Require concrete locations and reader-facing fixes."},
+     "focus": "Act as a relentless, open-ended detector of machine-like scientific writing. Derive the relevant failure modes from the complete manuscript and the norms of human scholarly communication at review time; do not follow a predefined symptom list. Challenge any passage whose wording, structure, evidentiary posture, or argumentative behavior appears optimized to sound acceptable instead of helping a researcher understand and evaluate the work. Demand a concrete unit, the reader harm, and a surgical rewrite for every accusation; never infer authorship from style alone and never raise an aesthetic preference as a defect. Treat an explicitly labeled transfer-design precedent as relevant when it names the axis or measurement being proposed; flag only citations that do not change a reader's understanding."},
     {"id": "human_scientist", "stage": 4,
      "focus": "Read as a skeptical human scientist. Check that the research question is explicit, the important pattern is prioritized, the Discussion explains plausible mechanisms, and proposed explanations are distinguished from established observations."},
     {"id": "editorial_compression", "stage": 5,
@@ -67,6 +70,31 @@ def _strings(value, name, *, nonempty=False):
         raise ValidationError(f"{name} must be a unique string list")
     for item in value:
         _text(item, name)
+    return value
+
+
+def _validate_research_requests(value, name="research_requests"):
+    """Validate reviewer requests that require new scientific work.
+
+    A unit-level finding can be repaired by the manuscript editor.  A request
+    in this list cannot: it asks a named research owner to produce evidence or
+    reasoning that does not exist in the frozen packet.  Keeping this as a
+    first-class contract prevents the editor from silently writing around a
+    missing experiment.
+    """
+    if not isinstance(value, list):
+        raise ValidationError(f"{name} must be a list")
+    ids = set()
+    expected = {"id", "kind", "owner", "objective", "why", "success_condition", "evidence_needed"}
+    for request in value:
+        if not isinstance(request, dict) or set(request) != expected:
+            raise ValidationError(f"{name} item has an invalid shape")
+        _id(request["id"], f"{name} id")
+        if request["id"] in ids or request["kind"] not in RESEARCH_REQUEST_KINDS:
+            raise ValidationError(f"{name} identity or kind is invalid")
+        for key in ("owner", "objective", "why", "success_condition", "evidence_needed"):
+            _text(request[key], f"{name} {key}")
+        ids.add(request["id"])
     return value
 
 
@@ -175,7 +203,8 @@ def _normalise_number(token):
 def validate_review(value, reviewer_id, stage):
     """Validate one independent review and bind its identity to the assignment."""
     fields = {"schema_version", "reviewer_id", "stage", "decision", "checks", "findings", "protected_units", "rationale"}
-    if not isinstance(value, dict) or set(value) != fields:
+    allowed_fields = {frozenset(fields), frozenset(fields | {"research_requests"})}
+    if not isinstance(value, dict) or frozenset(value) not in allowed_fields:
         raise ValidationError(f"manuscript review requires exactly {sorted(fields)}")
     if value["schema_version"] not in _COMPATIBLE_REVIEW_SCHEMAS or value["reviewer_id"] != reviewer_id or value["stage"] != stage:
         raise ValidationError("manuscript review identity does not match its assignment")
@@ -209,6 +238,10 @@ def validate_review(value, reviewer_id, stage):
         _strings(finding["protected"], "manuscript finding protected", nonempty=True)
         finding_ids.add(finding["id"])
     _strings(value["protected_units"], "manuscript protected_units")
+    requests = value.get("research_requests", [])
+    _validate_research_requests(requests)
+    if value["decision"] == "accept" and requests:
+        raise ValidationError("an accepted manuscript review cannot retain research requests")
     _text(value["rationale"], "manuscript review rationale")
     if value["decision"] == "accept" and any(check["outcome"] != "passed" for check in checks):
         raise ValidationError("an accepted manuscript review cannot retain a failed check")
@@ -344,7 +377,8 @@ def _normalise_adjudication_candidate(value):
 
 def validate_synthesis(value, reviews, adjudication=None):
     fields = {"schema_version", "decision", "required_repairs", "accepted_reviewers", "rationale", "verification_contract"}
-    if not isinstance(value, dict) or set(value) != fields:
+    allowed_fields = {frozenset(fields), frozenset(fields | {"research_requests"})}
+    if not isinstance(value, dict) or frozenset(value) not in allowed_fields:
         raise ValidationError(f"manuscript synthesis requires exactly {sorted(fields)}")
     if value["schema_version"] not in _COMPATIBLE_SYNTHESIS_SCHEMAS or value["decision"] not in DECISIONS:
         raise ValidationError("manuscript synthesis identity or decision is invalid")
@@ -352,6 +386,18 @@ def validate_synthesis(value, reviews, adjudication=None):
     _strings(value["accepted_reviewers"], "accepted_reviewers")
     if set(value["accepted_reviewers"]) - reviewer_ids:
         raise ValidationError("synthesis names an unknown reviewer")
+    review_requests = {
+        request["id"]
+        for review in reviews
+        for request in review.get("research_requests", [])
+    }
+    requests = value.get("research_requests", [])
+    _validate_research_requests(requests, "synthesis research_requests")
+    request_ids = {request["id"] for request in requests}
+    if review_requests - request_ids:
+        raise ValidationError("synthesis omitted a reviewer research request")
+    if value["decision"] == "accept" and requests:
+        raise ValidationError("accepted synthesis cannot retain research requests")
     _text(value["rationale"], "synthesis rationale")
     _strings(value["verification_contract"], "verification_contract", nonempty=True)
     repairs = value["required_repairs"]
@@ -403,6 +449,9 @@ def _normalise_synthesis_candidate(value):
         return value, []
     candidate = deepcopy(value)
     changes = []
+    if "research_requests" not in candidate:
+        candidate["research_requests"] = []
+        changes.append({"field": "research_requests", "reason": "legacy synthesis omitted the optional research-work request list"})
     repairs = candidate.get("required_repairs")
     if isinstance(repairs, list):
         for repair in repairs:
@@ -435,6 +484,11 @@ def _namespace_review_findings(review):
         prefix = reviewer_id + "_"
         if not local_id.startswith(prefix):
             finding["id"] = prefix + local_id
+    for request in review.get("research_requests", []):
+        local_id = request["id"]
+        prefix = reviewer_id + "_"
+        if not local_id.startswith(prefix):
+            request["id"] = prefix + local_id
     return review
 
 
@@ -460,8 +514,11 @@ def _normalise_review_candidate(value, reviewer, manuscript):
         changes.append({"field": "size_limit", "reason": "prompt metadata was echoed outside the review contract"})
     expected = {
         "schema_version", "reviewer_id", "stage", "decision", "checks", "findings",
-        "protected_units", "rationale",
+        "protected_units", "rationale", "research_requests",
     }
+    if "research_requests" not in candidate:
+        candidate["research_requests"] = []
+        changes.append({"field": "research_requests", "reason": "legacy review omitted the optional research-work request list"})
     for key, expected_value in (("schema_version", REVIEW_SCHEMA_VERSION),
                                 ("reviewer_id", reviewer["id"]),
                                 ("stage", reviewer["stage"])):
@@ -597,7 +654,13 @@ SYSTEM = (
     "when the manuscript labels it as a transfer-design precedent and states the specific population, regime, target, "
     "or measurement axis it informs. A human-scientist review must ask why the "
     "result occurred, which mechanisms remain possible, what evidence supports or contradicts each mechanism, and "
-    "which additional experiment would distinguish them. An editorial-compression review must check that Results "
+    "which additional experiment would distinguish them. If the answer requires new evidence, an additional "
+    "experiment, a broader literature search, or a substantive interpretation pass, record a research_requests "
+    "item with an owner and a falsifiable success condition; do not pretend a prose edit can satisfy it. The ai_smell "
+    "reviewer is intentionally adversarial and open-ended: infer machine-like failures from the whole argument and "
+    "human scholarly norms rather than applying a fixed vocabulary or checklist. Treat authorship as unknowable; judge "
+    "only reader-facing evidence and do not punish a merely unusual style. Its finding must identify the harm and a "
+    "minimal rewrite or a research request when the missing substance cannot be repaired in prose. An editorial-compression review must check that Results "
     "report observations, Discussion interprets them, figures are used as arguments, and facts or caveats are not "
     "repeated without purpose. A journal_editor review must also apply the supplied scholarly-depth profile and "
     "flag a candidate whose bibliography, full-text basis, citation coverage, or visual evidence is too thin for "
@@ -644,6 +707,7 @@ def _review_prompt(manuscript, reviewer, interpretation=None, argument=None, evi
                   "decision": "accept|revise|insufficient_evidence",
                   "checks": "list of {id,outcome,evidence}; outcome=passed|failed|insufficient_evidence",
                   "findings": "list of {id,severity,location,problem,surgical_fix,protected,verification}; severity MUST be one of blocking, major, or minor; protected MUST be a unique JSON array of plain strings naming unit IDs or protected facts",
+                  "research_requests": "list of {id,kind,owner,objective,why,success_condition,evidence_needed}; use for additional_experiment, literature_expansion, interpretation_expansion, or analysis_repair that cannot be satisfied by editing the manuscript",
                   "protected_units": "unique JSON array of plain strings naming reader-facing units or facts that must remain unchanged",
                   "rationale": "concise evidence-bound rationale; for human_scientist and editorial_compression explicitly address the assigned scientific/editorial questions",
                   "size_limit": "Return at most four highest-impact findings. Keep each problem, surgical_fix, and verification to one or two sentences.",
@@ -666,10 +730,11 @@ def _synthesis_prompt(manuscript, reviews, interpretation=None, argument=None, a
                        "scientific_interpretation": interpretation, "research_argument": argument, "reviews": reviews,
                        "evidence_context": _compact_evidence(evidence),
                        "arbiter_adjudication": adjudication,
-                       "instructions": "Reconcile the exact reviews and the Arbiter adjudication. Do not invent a finding or rewrite the manuscript. When reviewers give mutually exclusive explanations for the same unit, follow the retained Arbiter directive and do not request both alternatives. A rejected finding is preserved for provenance but must not appear in required_repairs. Return required_repairs only when a retained concrete finding needs a scoped repair. Accept only when no retained blocking or major finding remains and all checks passed, including the human-scientist and editorial-compression perspectives when present. The response MUST contain exactly these six top-level keys and no additional keys: schema_version, decision, required_repairs, accepted_reviewers, rationale, verification_contract. For an accept decision, required_repairs MUST be []. accepted_reviewers and verification_contract MUST be JSON arrays of plain strings.",
-                       "output_contract": {"exact_top_level_keys": ["schema_version", "decision", "required_repairs", "accepted_reviewers", "rationale", "verification_contract"],
+                       "instructions": "Reconcile the exact reviews and the Arbiter adjudication. Do not invent a finding or rewrite the manuscript. When reviewers give mutually exclusive explanations for the same unit, follow the retained Arbiter directive and do not request both alternatives. A rejected finding is preserved for provenance but must not appear in required_repairs. Preserve every research request that requires new evidence, an additional experiment, or a substantive interpretation expansion; a manuscript repair cannot discharge such a request. Return required_repairs only when a retained concrete finding needs a scoped repair. Accept only when no retained blocking or major finding remains, all checks passed, and no research request remains, including the human-scientist and editorial-compression perspectives when present. The response MUST contain exactly these seven top-level keys and no additional keys: schema_version, decision, required_repairs, research_requests, accepted_reviewers, rationale, verification_contract. For an accept decision, required_repairs and research_requests MUST be []. accepted_reviewers and verification_contract MUST be JSON arrays of plain strings.",
+                       "output_contract": {"exact_top_level_keys": ["schema_version", "decision", "required_repairs", "research_requests", "accepted_reviewers", "rationale", "verification_contract"],
                                            "schema_version": SYNTHESIS_SCHEMA_VERSION, "decision": "accept|revise|insufficient_evidence",
                                            "required_repairs": "list of {finding_id,owner,scope,verification}; [] when decision=accept",
+                                           "research_requests": "list of research-work requests copied from the reviews; [] only when none remain",
                                            "accepted_reviewers": "unique JSON array of reviewer ID strings", "rationale": "string",
                                            "verification_contract": "nonempty JSON array of plain strings naming final checks"}}, ensure_ascii=False, sort_keys=True)
 
@@ -716,7 +781,7 @@ class ManuscriptReviewRunner:
 
     def __init__(self, model, *, reviewers=None, max_workers=3,
                  deadline_seconds=DEFAULT_DEADLINE_SECONDS,
-                 max_output_tokens=4096, reasoning_effort="medium",
+                 max_output_tokens=None, reasoning_effort="xhigh",
                  call_timeout_seconds=300.0, inter_request_interval_seconds=0.5,
                  arbiter_enabled=False):
         self.model_config = deepcopy(model)
@@ -738,11 +803,14 @@ class ManuscriptReviewRunner:
                 (type(deadline_seconds) not in (int, float) or not math.isfinite(deadline_seconds)
                  or deadline_seconds <= 0)):
             raise ValidationError("review deadline must be finite and positive")
+        if type(max_workers) is not int or max_workers <= 0:
+            raise ValidationError("manuscript review max_workers must be a positive integer")
         self.max_workers = max_workers
         self.deadline_seconds = float(deadline_seconds) if deadline_seconds is not None else None
-        if type(max_output_tokens) is not int or max_output_tokens <= 0:
-            raise ValidationError("review max_output_tokens must be a positive integer")
-        if reasoning_effort not in {"none", "low", "medium", "high"}:
+        if (max_output_tokens is not None
+                and (type(max_output_tokens) is not int or max_output_tokens <= 0)):
+            raise ValidationError("review max_output_tokens must be a positive integer when supplied")
+        if reasoning_effort not in {"none", "low", "medium", "high", "xhigh"}:
             raise ValidationError("review reasoning_effort is unsupported")
         if (type(call_timeout_seconds) not in (int, float)
                 or not math.isfinite(call_timeout_seconds) or call_timeout_seconds <= 0):
@@ -838,8 +906,9 @@ class ManuscriptReviewRunner:
             self._pace(deadline)
             config = self._bounded_model_config(self.model_config, deadline,
                                                 call_timeout_seconds=self.call_timeout_seconds)
-            config["max_output_tokens"] = min(config.get("max_output_tokens", 16384),
-                                               self.max_output_tokens)
+            if self.max_output_tokens is not None:
+                config["max_output_tokens"] = min(config.get("max_output_tokens", self.max_output_tokens),
+                                                   self.max_output_tokens)
             if config.get("protocol") == "openai_compatible":
                 config["reasoning_effort"] = self.reasoning_effort
             try:
@@ -920,7 +989,9 @@ class ManuscriptReviewRunner:
             self._pace(deadline)
             config = self._bounded_model_config(self.model_config, deadline,
                                                 call_timeout_seconds=self.call_timeout_seconds)
-            config["max_output_tokens"] = min(config.get("max_output_tokens", 16384), self.max_output_tokens)
+            if self.max_output_tokens is not None:
+                config["max_output_tokens"] = min(config.get("max_output_tokens", self.max_output_tokens),
+                                                   self.max_output_tokens)
             if config.get("protocol") == "openai_compatible":
                 config["reasoning_effort"] = self.reasoning_effort
             try:
@@ -1010,20 +1081,22 @@ class ManuscriptReviewRunner:
                         "Return a complete replacement object matching the synthesis contract. "
                         "Use required_repairs=[] for an accept decision and keep every array item a plain string where required. "
                         "Each required_repairs item must contain exactly finding_id, owner, scope, and verification; "
-                        "decision=revise must include every blocking or major finding, while decision=accept must include "
-                        "all reviewer IDs and no repairs. Do not add any top-level key."
+                        "decision=revise must include every blocking or major finding and every reviewer research request, "
+                        "while decision=accept must include all reviewer IDs, no repairs, and no research requests. "
+                        "Do not add any top-level key."
                     ),
                     "output_contract": {
                         "schema_version": SYNTHESIS_SCHEMA_VERSION,
-                        "exact_top_level_keys": ["schema_version", "decision", "required_repairs",
+                        "exact_top_level_keys": ["schema_version", "decision", "required_repairs", "research_requests",
                                                   "accepted_reviewers", "rationale", "verification_contract"],
                     },
                 }, ensure_ascii=False, sort_keys=True)
             self._pace(deadline)
             config = self._bounded_model_config(self.model_config, deadline,
                                                 call_timeout_seconds=self.call_timeout_seconds)
-            config["max_output_tokens"] = min(config.get("max_output_tokens", 16384),
-                                               self.max_output_tokens)
+            if self.max_output_tokens is not None:
+                config["max_output_tokens"] = min(config.get("max_output_tokens", self.max_output_tokens),
+                                                   self.max_output_tokens)
             if config.get("protocol") == "openai_compatible":
                 config["reasoning_effort"] = self.reasoning_effort
             result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt, images=images)
@@ -1059,8 +1132,10 @@ class ManuscriptReviewRunner:
         # manufacture an acceptance decision.
         if reviews:
             repairs = []
+            research_requests = []
             verification_contract = []
             seen_repairs = set()
+            seen_requests = set()
             retained = None
             if adjudication is not None:
                 retained = {
@@ -1069,6 +1144,10 @@ class ManuscriptReviewRunner:
                     for finding_id in resolution["finding_ids"]
                 }
             for review in reviews:
+                for request in review.get("research_requests", []):
+                    if request["id"] not in seen_requests:
+                        research_requests.append(deepcopy(request))
+                        seen_requests.add(request["id"])
                 for finding in review["findings"]:
                     if (finding["severity"] not in {"blocking", "major"}
                             or (retained is not None and finding["id"] not in retained)
@@ -1087,6 +1166,7 @@ class ManuscriptReviewRunner:
                 "schema_version": SYNTHESIS_SCHEMA_VERSION,
                 "decision": "revise",
                 "required_repairs": repairs,
+                "research_requests": research_requests,
                 "accepted_reviewers": [review["reviewer_id"] for review in reviews],
                 "rationale": "The independent review findings were preserved as scoped repairs after synthesis output failed schema validation.",
                 "verification_contract": verification_contract or ["Re-run every independent reviewer after the scoped repairs."],
@@ -1160,6 +1240,7 @@ class ManuscriptReviewRunner:
                     "decision": review["decision"],
                     "status": "accepted" if review["decision"] == "accept" else "needs_revision",
                     "finding_ids": [finding["id"] for finding in review["findings"]],
+                    "research_request_ids": [request["id"] for request in review.get("research_requests", [])],
                     "severity_counts": severities,
                     "artifact_path": (str(artifact_dir / f"review-{review['reviewer_id']}.json")
                                       if artifact_dir is not None else None),
@@ -1228,6 +1309,7 @@ class ManuscriptReviewRunner:
             "decision": synthesis["decision"],
             "status": "accepted" if synthesis["decision"] == "accept" else "needs_revision",
             "required_repairs": [repair["finding_id"] for repair in synthesis["required_repairs"]],
+            "research_request_ids": [request["id"] for request in synthesis.get("research_requests", [])],
             "accepted_reviewers": list(synthesis["accepted_reviewers"]),
             "verification_contract": list(synthesis["verification_contract"]),
             "artifact_path": (str(artifact_dir / "synthesis.json") if artifact_dir is not None else None),
@@ -1236,6 +1318,7 @@ class ManuscriptReviewRunner:
                 "manuscript_sha256": hashlib.sha256(canonical_bytes(manuscript)).hexdigest(),
                 "reviewer_ids": [reviewer["id"] for reviewer in self.reviewers],
                 "reviews": reviews, "adjudication": adjudication, "synthesis": synthesis,
+                "research_requests": deepcopy(synthesis.get("research_requests", [])),
                 "evidence_audit": numeric_audit,
                 "model_calls": len(results) + 1 + (1 if self.arbiter_enabled else 0),
                 "usage": {key: sum(result.usage.get(key, 0) for result in results)

@@ -12,6 +12,7 @@ import time
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes, parse_ref
+from scisaurus.runtime.config import configured_worker_slots
 from scisaurus.runtime.contracts import required_checks, required_strings, preserves_literals, validate_verdict
 from scisaurus.runtime.execution import ExecutionRuntime, _invoke_worker
 from scisaurus.runtime.models import ModelResult
@@ -53,7 +54,7 @@ class ProjectRunner(ExecutionRuntime):
         self.operations = OperationsCell(self.control, self.store, project_id=self.config["project_id"])
         self.registered_capabilities = []
         self.time_policy = (TimePolicy(stage_seconds=self.score["stage_seconds"], unit_count=len(self.editable),
-            worker_slots=self.config["limits"]["concurrent_calls"] - 1,
+            worker_slots=configured_worker_slots(self.config["limits"]),
             wall_clock_seconds=self.config["limits"]["wall_clock_seconds"], policy=self.config.get("time_policy"))
             if self.score["stage_seconds"] else None)
         if self.time_policy:

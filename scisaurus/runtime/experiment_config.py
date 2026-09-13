@@ -8,7 +8,7 @@ from pathlib import Path
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.config import _text, validate_common
+from scisaurus.runtime.config import _text, configured_worker_slots, validate_common
 from scisaurus.runtime.programs import json_object
 from scisaurus.runtime.scores import exact, identifier
 from scisaurus.runtime.time_policy import validate_time_policy
@@ -50,6 +50,9 @@ def _program(value, name):
 
 def validate_experiment_config(config):
     validate_common(config, {"experiment", "time_policy"}, retrieval=False)
+    repair_mode = config.get("limits", {}).get("repair_mode")
+    if repair_mode is not None and repair_mode not in {"bounded", "until_deadline"}:
+        raise ValidationError("limits.repair_mode must be bounded or until_deadline")
     if config["model"]["protocol"] != "openai_compatible":
         raise ValidationError("experiment review requires an openai_compatible multimodal model")
     if config["limits"]["concurrent_calls"] < 3:
@@ -157,7 +160,7 @@ def validate_experiment_config(config):
     for stage, value in experiment["stage_seconds"].items() if isinstance(experiment["stage_seconds"], dict) else ():
         _positive_number(value, f"experiment.stage_seconds.{stage}")
     validate_time_policy(config.get("time_policy"), stage_seconds=experiment["stage_seconds"],
-                         unit_count=len(reviewers), worker_slots=config["limits"]["concurrent_calls"] - 1,
+                         unit_count=len(reviewers), worker_slots=configured_worker_slots(config["limits"]),
                          wall_clock_seconds=config["limits"]["wall_clock_seconds"])
     canonical_bytes(config)
     return deepcopy(config)

@@ -5,8 +5,10 @@ import unittest
 from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.scholarly_depth import (
     evaluate_scholarly_depth,
+    evaluate_scholarly_preflight,
     profile_for_paper,
     validate_profile_id,
+    validate_scholarly_preflight,
     validate_scholarly_depth_review,
 )
 
@@ -79,3 +81,28 @@ class ScholarlyDepthTests(unittest.TestCase):
         review["findings"] = []
         with self.assertRaises(ValidationError):
             validate_scholarly_depth_review(review)
+
+    def test_preflight_blocks_thin_inputs_before_composition(self):
+        config = self.config(5) | {"document_type": "research_paper", "figure_arguments": [
+            {"asset_id": "fig0"}, {"asset_id": "fig1"},
+        ]}
+        preflight = evaluate_scholarly_preflight(config, self.results(2), self.survey(5))
+        self.assertEqual(preflight["decision"], "research_expansion_required")
+        self.assertEqual({item["id"] for item in preflight["expansion_requests"]}, {
+            "expand_literature_reference_set", "run_additional_discriminating_experiment", "expand_analysis_display_set",
+        })
+        validate_scholarly_preflight(preflight)
+
+    def test_preflight_counts_only_argument_linked_figures(self):
+        config = self.config(20) | {"document_type": "research_paper", "figure_arguments": [
+            {"asset_id": "fig0"}, {"asset_id": "fig1"}, {"asset_id": "unused"},
+        ]}
+        argument = {"figure_plan": [
+            {"kind": "figure", "asset_id": "fig0"},
+            {"kind": "figure", "asset_id": "fig1"},
+            {"kind": "table", "asset_id": None},
+        ]}
+        preflight = evaluate_scholarly_preflight(config, self.results(3), self.survey(20), argument=argument)
+        self.assertEqual(preflight["observed"]["figures"], 2)
+        self.assertEqual(preflight["observed"]["tables"], 1)
+        self.assertEqual(preflight["decision"], "research_expansion_required")

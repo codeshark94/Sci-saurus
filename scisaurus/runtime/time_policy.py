@@ -132,6 +132,17 @@ class TimePolicy:
         observation["max_seconds"] = max(duration, observation["max_seconds"] or 0.0)
         self.estimates[stage] = max(self.seeds[stage], observation["max_seconds"])
 
+    def rebudget(self, unit_count):
+        """Recompute the forecast after a bounded workload reduction.
+
+        A provider fallback can expose a much larger result page than the
+        remaining single-worker review window can process.  Rebudgeting keeps
+        the observed stage durations and deadline intact while making the
+        revised work ceiling visible in every subsequent admission decision.
+        """
+        self.unit_count = _count(unit_count, "unit_count")
+        self.initial_schedule = self.schedule()
+
     def mark_first_verified_result(self, artifact_ref=None):
         if artifact_ref is not None and (not isinstance(artifact_ref, str) or not artifact_ref.strip()):
             raise ValidationError("artifact_ref must be a nonempty string when supplied")

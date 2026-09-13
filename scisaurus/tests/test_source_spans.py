@@ -32,6 +32,19 @@ class SourceSpanTests(unittest.TestCase):
         self.assertEqual(source["text"][bound["start"]:bound["end"]], bound["quote"])
         validate(bound, source, require_span=True)
 
+    def test_bind_restores_rendered_math_aliases_and_standalone_variable_duplication(self):
+        source = {"work_id": "W1", "text": (
+            "Unless we know something about ff beyond continuity of its\n"
+            "derivatives, it is impossible to say what ξ\\xi is.")}
+        value = {"work_id": "W1", "source_ref": "artifact:source@1",
+                 "quote": "Unless we know something about f beyond continuity of its derivatives, "
+                          "it is impossible to say what ξ is."}
+        bound = bind(value, {"artifact:source@1": source})
+        self.assertEqual(source["text"][bound["start"]:bound["end"]], bound["quote"])
+        self.assertIn("ff", bound["quote"])
+        self.assertIn("ξ\\xi", bound["quote"])
+        validate(bound, source, require_span=True)
+
     def test_bind_does_not_repair_changed_words_or_punctuation(self):
         source = {"work_id": "W1", "text": "The sample mean is optimal, under Gaussian data."}
         with self.assertRaisesRegex(ValidationError, "exact captured text"):

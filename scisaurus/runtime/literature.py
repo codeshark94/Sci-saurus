@@ -151,6 +151,34 @@ def _doi(value):
     return value.lower()
 
 
+def _authors(value):
+    """Extract bounded display names when the provider supplies authorships.
+
+    Author metadata is optional in OpenAlex responses.  Omitting it is safer
+    than manufacturing an attribution, while preserving real names lets a
+    later paper continuation produce conventional references.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("OpenAlex authorships must be a list or null")
+    names = []
+    for authorship in value:
+        if not isinstance(authorship, dict):
+            raise ValueError("OpenAlex authorship must be an object")
+        author = authorship.get("author")
+        if not isinstance(author, dict):
+            continue
+        name = author.get("display_name")
+        if not isinstance(name, str) or not name.strip() or len(name) > 512:
+            continue
+        if name not in names:
+            names.append(name)
+        if len(names) >= 64:
+            break
+    return names or None
+
+
 def normalize_work(item, *, tolerate_invalid_abstract=False, abstract_gaps=None):
     if not isinstance(item, dict):
         raise ValueError("OpenAlex work must be an object")
@@ -189,9 +217,11 @@ def normalize_work(item, *, tolerate_invalid_abstract=False, abstract_gaps=None)
         abstract = None
         if abstract_gaps is not None:
             abstract_gaps.append({"work_id": identity, "reason": "provider_abstract_index_invalid"})
+    authors = _authors(item.get("authorships"))
     return {"id": identity, "doi": _doi(item.get("doi")), "title": item["title"],
             "year": year, "abstract": abstract,
-            **relationships, "locations": locations}
+            **relationships, "locations": locations,
+            **({"authors": authors} if authors else {})}
 
 
 def _page(payload, arguments):
@@ -232,7 +262,9 @@ def _page(payload, arguments):
 def _sources(works):
     return [{"work_id": work["id"], "doi": work["doi"], "title": work["title"], "year": work["year"],
              "abstract": work["abstract"], "source_url": "https://openalex.org/" + work["id"],
-             "representation": "scholarly_metadata"} for work in works]
+             "representation": "scholarly_metadata",
+             **({"authors": work["authors"]} if work.get("authors") else {})}
+            for work in works]
 
 
 def _text(works):

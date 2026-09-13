@@ -23,7 +23,7 @@ Copy `config/paragraph-run.example.json` to a local configuration file. The exam
 | `model.base_url` | Explicit authorized endpoint; no embedded credentials or query parameters |
 | `model.model` | Exact deployed model name |
 | `model.auth_env` | Environment-variable name, or `null`; never a plaintext key |
-| `model.reasoning_effort` | Optional `none`, `low`, `medium`, or `high` for compatible servers that support it |
+| `model.reasoning_effort` | Optional `none`, `low`, `medium`, `high`, or `xhigh` for compatible servers that support it |
 | `model.output_format` | Optional `json_object` for compatible servers that support structured output |
 | `mcp_fetch_command` | Executable and argument list; the example uses `.venv/bin/python -m mcp_server_fetch` |
 | `public_queries`, `source_urls` | Explicit public search and fetch routes; model output cannot invoke arbitrary tools |

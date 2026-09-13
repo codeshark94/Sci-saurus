@@ -158,7 +158,8 @@ class TestModelClient(unittest.TestCase):
         for value in ('', 'json_schema', True, {'type': 'json_object'}):
             with self.subTest(output_format=value), self.assertRaises(ValidationError):
                 self.client('openai_compatible', output_format=value)
-        for options in ({'reasoning_effort': 'none'}, {'reasoning_effort': 'high'}, {'output_format': 'json_object'}):
+        for options in ({'reasoning_effort': 'none'}, {'reasoning_effort': 'high'},
+                        {'reasoning_effort': 'xhigh'}, {'output_format': 'json_object'}):
             with self.subTest(ollama_options=options), self.assertRaises(ValidationError):
                 self.client('ollama', **options)
         self.assertFalse(hasattr(self, 'request'))

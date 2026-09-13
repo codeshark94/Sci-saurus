@@ -77,6 +77,11 @@ def validate_common(value, extra_fields, *, retrieval=True):
             raise ValidationError(f"limits.{key} must be finite and positive")
     if limits["concurrent_calls"] < 2:
         raise ValidationError("capacity must cover one worker and its independently reserved verification call")
+    if "worker_concurrency" in limits:
+        if type(limits["worker_concurrency"]) is not int or limits["worker_concurrency"] <= 0:
+            raise ValidationError("limits.worker_concurrency must be a positive integer")
+        if limits["worker_concurrency"] > limits["concurrent_calls"] - 1:
+            raise ValidationError("limits.worker_concurrency cannot exceed worker capacity")
     if retrieval and model.timeout_seconds >= limits["wall_clock_seconds"]:
         raise ValidationError("model timeout must fit within the run deadline")
     if not retrieval:
@@ -90,3 +95,21 @@ def validate_common(value, extra_fields, *, retrieval=True):
     if not isinstance(mcp, list) or not mcp or any(not isinstance(p, str) or not p for p in mcp):
         raise ValidationError("mcp_fetch_command must be an explicit executable argument list")
     return value
+
+
+def configured_worker_slots(limits):
+    """Return the effective worker count while preserving verification capacity.
+
+    ``concurrent_calls`` includes one reserved slot for an independent
+    verification call.  Deployments whose provider serializes requests can set
+    ``worker_concurrency`` to one without falsifying that capacity reservation.
+    """
+    if not isinstance(limits, dict):
+        raise ValidationError("limits must be an object")
+    capacity = limits.get("concurrent_calls")
+    if type(capacity) is not int or capacity < 2:
+        raise ValidationError("limits.concurrent_calls must leave one worker and one verification slot")
+    configured = limits.get("worker_concurrency", capacity - 1)
+    if type(configured) is not int or configured <= 0 or configured > capacity - 1:
+        raise ValidationError("limits.worker_concurrency must be between one and worker capacity")
+    return configured

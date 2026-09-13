@@ -1,6 +1,6 @@
 # Sci-saurus — Concept SSOT
 
-> **Version:** v1.3 · **Date:** 2026-09-11 · **Status:** normative design; implemented slices and evidence are documented separately.
+> **Version:** v1.5 · **Date:** 2026-09-13 · **Status:** normative design; the project-scoped department runtime and Composer work-order loop are implemented, with operational capability use remaining explicitly configured.
 > This is the normative source for purpose, authority, terminology, and design decisions. [System Concept](05-system-concept.md) explains the organizing model. Architecture and execution contracts implement these decisions.
 > Preserve prior decisions. Amend them with explicit superseding decisions rather than rewriting history. Historical decision entries below are retained; this checkout does not contain a separate historical document archive.
 
@@ -166,6 +166,89 @@ recorded before synthesis; only retained finding IDs may become repair
 instructions, while rejected alternatives remain visible and cannot be silently
 converted into acceptance.
 
+**D56 — Research admission precedes manuscript composition.** A declared
+research-paper profile must clear its literature, full-text, figure, and table
+floors before a writer is admitted. A missed floor creates a versioned
+`research_expansion_required` request with an owning department and a concrete
+success condition; it creates no draft, manuscript project, or PDF. A
+validation report may use its separately declared shorter profile, but a thin
+proposal or plot package cannot be released by relabeling it.
+
+**D57 — Peer review can demand new science.** Reviewer contracts distinguish
+surgical manuscript findings from first-class requests for an additional
+experiment, literature expansion, interpretation expansion, or analysis repair.
+The editor must carry every unresolved request into the decision; prose edits
+cannot discharge a missing-evidence request. The same reviewer panel receives
+the revised incumbent, and a research-paper release requires three bounded
+rounds followed by an editor-in-chief decision. Unresolved material findings
+produce `review_rejected`, never a review-limit release candidate.
+
+**D58 — AI-surface review is adaptive, not a vocabulary filter.** The
+AI-adversarial reviewer infers machine-like failure modes from the complete
+argument and human scholarly norms, then records only location-specific,
+reader-impacting objections with a minimal repair or research request. Fixed
+phrase lists and authorship accusations are not acceptance criteria; the
+deterministic control-vocabulary check remains limited to preventing internal
+provenance state from leaking into the public manuscript.
+
+**D59 — Composer retries are isolated and deadline-governed.** A workflow may
+declare a `retry_policy` with a backoff. Its `mode: until_deadline` setting
+keeps retrying a failed stage in fresh attempt directories while the same hard
+deadline and downstream reservation remain in force; it has no arbitrary
+attempt-count stop. This deadline-governed mode is the default. A small
+deterministic job may opt into `mode: bounded` with a maximum of one to eight
+attempts. Every attempt, error, and retry decision is persisted, and a ten-hour mission is an explicit
+`hard_seconds: 36000` policy. When no retry policy is declared, Composer uses
+this deadline-governed mode by default; a small deterministic job may opt into
+`mode: bounded` explicitly. The hard wall, provider outcome, or a genuine
+control-plane failure remains the termination condition.
+
+
+**D60 — Free-topic intake is sampled, recent, and capability-aware.** When a
+mission does not supply a research object, the Composer first queries the
+configured scholarly index (OpenAlex by default) with objective-derived and
+broad recent-literature searches. It filters to a four-year recent window,
+falling back to the newest returned records only when that window is empty, and
+selects a reproducible seeded random sample, preserving query, work, URL,
+abstract, DOI observation, response capture hash, and sampling seed. A bounded
+intake model proposes distinct questions from that sample and a redacted
+runtime capability inventory, including available programs, Python packages,
+configured stage kinds, and project inputs. It may select only a question that
+can be tested with declared project resources. The selected candidate carries
+structured executable, Python-package, and stage-kind requirements; an
+unavailable requirement blocks that candidate rather than being hidden inside
+a feasibility paragraph. It may not turn metadata into a novelty or evidence
+claim. Provider failure blocks intake rather than fabricating a topic.
+
+**D61 — Research requests re-enter the Composer through deadline-governed continuation.**
+A structured literature, full-text, experiment, interpretation, analysis, or
+manuscript request is an executable work order. After the graph reaches its
+current terminal state, Composer admits only the affected stage closure until
+the same hard deadline by default. A small deterministic job may opt into
+`continuation_policy.mode: bounded` with `max_cycles` from zero through eight.
+Each cycle receives a fresh project namespace; survey capacity and routes are
+expanded when needed, newly accepted sources are synchronized into the paper
+reference set, and every downstream consumer is rerun. Prior attempts and
+artifacts remain immutable. The hard deadline remains the termination condition,
+so automatic research cannot become an infinite loop.
+An unresolved research or review hold never satisfies a dependency while the
+current graph is being scheduled: the owning closure is reopened before any
+consumer can read that hold's packet, or the workflow returns the hold when no
+authorized continuation remains.
+
+**D62 — Templates seed a live project organization; they do not prescribe its work.**
+Each Composer project materializes a versioned department charter, durable
+department inbox, and typed work-order backlog. The default template supplies
+safe responsibility and capability scopes, while observed stage results,
+evidence gaps, review objections, and capability state generate the next
+admitted work. A valid request is activated and resolved through the owning
+stage closure; malformed or unauthorized requests become explicit rejection
+artifacts. Replayed requests are idempotent, changed objectives create new
+immutable work-order generations, and all department activity is included in
+checkpoints and run reports. This realizes organic operation without granting
+any department unrestricted artifact overwrite, host execution, or authority to
+change the Principal's intent.
+
 ### 3.3 Effective interpretation of earlier rules
 
 | Earlier wording | Effective interpretation |
@@ -313,3 +396,5 @@ These defaults make the blueprint internally concrete; they do not falsely mark 
 | v1.1 | D45; reusable hash-pinned multimodal review, exact perspective reconciliation, and purpose-scoped visual repair |
 | v1.2 | D46–D47; frozen experiment execution with replay and distinct validation, plus storyline-first paper assembly with explicit evidence relations |
 | v1.3 | D48; research-argument discovery and adjudication become a mandatory pre-composition gate with evidence-bound hypotheses, discriminating tests, and figure/table jobs |
+| v1.4 | D60–D61; sampled capability-aware free-topic intake and deadline-governed Composer continuation for executable research requests |
+| v1.5 | D62; durable project department charters, inbox/work-order backlog, autonomous activation/resolution, and template-as-default organization runtime |

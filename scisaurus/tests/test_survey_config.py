@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from scisaurus.core.errors import ValidationError
+from scisaurus.runtime.config import configured_worker_slots
 from scisaurus.runtime.survey_config import load_survey_config, validate_survey_config
 
 
@@ -56,6 +57,14 @@ class TestSurveyConfig(unittest.TestCase):
                 value[field] = invalid
                 with self.assertRaises(ValidationError):
                     validate_survey_config(value)
+
+    def test_serial_provider_can_limit_worker_dispatch_without_dropping_verification_capacity(self):
+        value = survey_config()
+        value["limits"]["worker_concurrency"] = 1
+        self.assertEqual(configured_worker_slots(validate_survey_config(value)["limits"]), 1)
+        value["limits"]["worker_concurrency"] = value["limits"]["concurrent_calls"]
+        with self.assertRaisesRegex(ValidationError, "worker_concurrency"):
+            validate_survey_config(value)
 
     def test_unknown_and_missing_survey_fields_are_rejected(self):
         for field in ("survey", "proposed_gap", "search", "full_text_sources"):

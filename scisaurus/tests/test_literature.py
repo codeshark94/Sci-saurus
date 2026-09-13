@@ -131,6 +131,11 @@ class OpenAlexFixture(BaseHTTPRequestHandler):
             del work["referenced_works"]
         elif mode == "duplicate-works":
             items.append(deepcopy(work))
+        elif mode == "with-authors":
+            work["authorships"] = [
+                {"author": {"display_name": "Ada Lovelace"}},
+                {"author": {"display_name": "Alan Turing"}},
+            ]
         if query.get("filter") == ["cites:W999"]:
             work["referenced_works"] = []
         payload = {"meta": {"count": 0 if mode == "empty" else 3, "per_page": int(query.get("per_page", [5])[0]),
@@ -153,6 +158,8 @@ class OpenAlexFixture(BaseHTTPRequestHandler):
         elif parsed.path != "/works":
             payload = work
         status, body = 200, json.dumps(payload, indent=2).encode()
+        if parsed.path != "/works" and parsed.path.endswith("/W404"):
+            status, body = 404, b'{"error":"work not found"}'
         if mode == "rate-limited":
             status, body = 429, b'{"error": "slow down"}'
         elif mode == "redirect":
@@ -239,6 +246,13 @@ class TestOpenAlex(unittest.TestCase):
                            "is_oa": True, "version": "acceptedVersion"}]})
         self.assertTrue(all(check["outcome"] == "passed" for check in self.inspect(result)))
 
+    def test_optional_author_metadata_is_preserved_and_independently_checked(self):
+        arguments = self.arguments("with-authors")
+        result = self.client().run(**arguments)
+        self.assertEqual(result["works"][0]["authors"], ["Ada Lovelace", "Alan Turing"])
+        self.assertEqual(result["sources"][0]["authors"], ["Ada Lovelace", "Alan Turing"])
+        self.assertTrue(all(check["outcome"] == "passed" for check in self.inspect(result, arguments)))
+
     def test_transient_rate_limit_is_retried_inside_total_timeout(self):
         result = self.client(max_retries=1, retry_backoff_seconds=0).run(
             **self.arguments("rate-limit-once"))
@@ -303,6 +317,14 @@ class TestOpenAlex(unittest.TestCase):
         self.assertEqual(OpenAlexFixture.requests[-1]["query"]["cursor"], ["some-cursor"])
         self.assertTrue(all(check["outcome"] == "passed" for check in self.inspect(result, arguments)))
         self.assertEqual(self.client().run(operation="citing", work_id="W999")["outcome"], "parse_error")
+
+    def test_missing_citation_work_is_a_valid_negative_workload(self):
+        arguments = {"operation": "work", "query": None, "work_id": "W404", "limit": 2, "cursor": None}
+        result = self.client().run(**arguments)
+        self.assertEqual(result["outcome"], "not_found")
+        self.assertEqual(result["metadata"]["http_status"], 404)
+        checks = self.inspect(result, arguments, representative=False)
+        self.assertTrue(all(check["outcome"] == "passed" for check in checks))
 
     def test_cursor_completion_and_routine_empty_are_not_readiness(self):
         result = self.client().run(**self.arguments())

@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 
 from scisaurus.core.errors import ValidationError
-from scisaurus.runtime.config import _text, validate_common
+from scisaurus.runtime.config import _text, configured_worker_slots, validate_common
 from scisaurus.runtime.operation_adapters import get_adapter
 from scisaurus.runtime.scores import exact, identifier
 from scisaurus.runtime.time_policy import validate_time_policy
@@ -40,6 +40,9 @@ def _strings(value, name, *, empty=False):
 
 def validate_survey_config(value):
     validate_common(value, {"survey", "time_policy"}, retrieval=False)
+    repair_mode = value.get("limits", {}).get("repair_mode")
+    if repair_mode is not None and repair_mode not in {"bounded", "until_deadline"}:
+        raise ValidationError("limits.repair_mode must be bounded or until_deadline")
     survey = value.get("survey")
     fields = {"id", "revision", "question", "seed_queries", "seed_work_ids", "proposed_gap", "bibliography",
               "full_text", "full_text_sources", "search", "stage_seconds"}
@@ -121,7 +124,7 @@ def validate_survey_config(value):
         raise ValidationError("full text mappings require an explicit capability")
     validate_time_policy(value.get("time_policy"), stage_seconds=survey["stage_seconds"],
                          unit_count=survey["search"]["max_works"],
-                         worker_slots=value["limits"]["concurrent_calls"] - 1,
+                         worker_slots=configured_worker_slots(value["limits"]),
                          wall_clock_seconds=value["limits"]["wall_clock_seconds"])
     return deepcopy(value)
 

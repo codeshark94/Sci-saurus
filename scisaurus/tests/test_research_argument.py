@@ -8,6 +8,7 @@ from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.models import ModelResult
 from scisaurus.runtime.research_argument import (
     ResearchArgumentRunner,
+    _normalise_argument_candidate,
     validate_argument_review,
     validate_research_argument,
 )
@@ -74,6 +75,16 @@ def argument():
 
 
 class ResearchArgumentTests(unittest.TestCase):
+    def test_argument_normalizer_only_repairs_unambiguous_provider_formatting(self):
+        candidate = {"argument": argument()}
+        candidate["argument"]["figure_plan"][0]["kind"] = "plot"
+        normalized, changes = _normalise_argument_candidate(
+            candidate, available_asset_ids={"figure_metric", "figure_split"})
+        validate_research_argument(normalized, evidence_ids={"e1", "e2", "e3"},
+                                   asset_ids={"figure_metric", "figure_split"})
+        self.assertEqual(normalized["figure_plan"][0]["kind"], "figure")
+        self.assertTrue(any(item["action"] == "unwrap_provider_envelope" for item in changes))
+
     def test_requires_competing_hypotheses_and_figure_jobs(self):
         validate_research_argument(argument(), evidence_ids={"e1", "e2", "e3"})
 

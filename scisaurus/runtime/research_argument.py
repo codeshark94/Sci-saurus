@@ -384,6 +384,13 @@ def argument_prompt(evidence_packet, *, min_figures=2, min_tables=1, min_experim
             "Use [] only for an unresolved candidate hypothesis with no supplied support; observed patterns and "
             "figure source_refs must be nonempty."
         ),
+        "asset_binding_policy": {
+            "available_asset_ids": list(evidence_packet.get("asset_ids", [])),
+            "instructions": (
+                "For a figure, copy asset_id exactly from available_asset_ids. Never invent a filename or an asset ID. "
+                "A table may use asset_id=null when it is a reader-facing tabulation produced from supplied evidence."
+            ),
+        },
     }
     if validation_feedback is not None:
         payload["repair_request"] = {
@@ -392,6 +399,63 @@ def argument_prompt(evidence_packet, *, min_figures=2, min_tables=1, min_experim
             "instructions": "Repair only contract violations while preserving valid scientific content.",
         }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _normalise_argument_candidate(value, *, available_asset_ids=None, available_assets=None):
+    """Repair unambiguous provider formatting without changing scientific content."""
+    if not isinstance(value, dict):
+        return value, []
+    candidate = deepcopy(value)
+    changes = []
+    required = {"schema_version", "research_question", "observed_patterns", "hypotheses",
+                "primary_argument", "discriminating_experiments", "figure_plan", "limitations"}
+    if not required.issubset(candidate):
+        for wrapper in ("argument", "research_argument", "research_argument_map", "proposal"):
+            nested = candidate.get(wrapper)
+            if isinstance(nested, dict) and required.issubset(nested):
+                candidate = deepcopy(nested)
+                changes.append({"field": wrapper, "action": "unwrap_provider_envelope"})
+                break
+    asset_ids = set(item for item in (available_asset_ids or []) if isinstance(item, str))
+    path_to_id = {}
+    for asset in available_assets or []:
+        if not isinstance(asset, dict) or not isinstance(asset.get("id"), str):
+            continue
+        path = asset.get("path")
+        if isinstance(path, str) and path:
+            path_to_id[path] = asset["id"]
+            path_to_id[path.rsplit("/", 1)[-1]] = asset["id"]
+    plans = candidate.get("figure_plan")
+    if isinstance(plans, list):
+        aliases = {
+            "plot": "figure", "chart": "figure", "graph": "figure",
+            "visual": "figure", "visualization": "figure", "data_table": "table",
+            "datatable": "table",
+        }
+        for index, item in enumerate(plans):
+            if not isinstance(item, dict):
+                continue
+            if "kind" not in item and isinstance(item.get("type"), str):
+                item["kind"] = item.pop("type")
+                changes.append({"field": f"figure_plan[{index}].type", "action": "rename_to_kind"})
+            if isinstance(item.get("kind"), str):
+                normalized = aliases.get(item["kind"].strip().casefold(), item["kind"])
+                if normalized != item["kind"]:
+                    item["kind"] = normalized
+                    changes.append({"field": f"figure_plan[{index}].kind", "action": "normalize_visual_kind"})
+            if "asset_id" not in item and isinstance(item.get("asset"), str):
+                item["asset_id"] = item.pop("asset")
+                changes.append({"field": f"figure_plan[{index}].asset", "action": "rename_to_asset_id"})
+            asset_id = item.get("asset_id")
+            if isinstance(asset_id, dict) and isinstance(asset_id.get("id"), str):
+                item["asset_id"] = asset_id["id"]
+                changes.append({"field": f"figure_plan[{index}].asset_id", "action": "extract_asset_id"})
+            if isinstance(item.get("asset_id"), str) and item["asset_id"] not in asset_ids:
+                mapped = path_to_id.get(item["asset_id"])
+                if mapped is not None:
+                    item["asset_id"] = mapped
+                    changes.append({"field": f"figure_plan[{index}].asset_id", "action": "bind_asset_path"})
+    return candidate, changes
 
 
 def review_prompt(argument, evidence_packet):
@@ -453,7 +517,6 @@ class ArgumentAdjudicator:
             config = deepcopy(self.model_config)
             if deadline is not None:
                 config["timeout_seconds"] = min(float(config["timeout_seconds"]), max(0.2, remaining))
-            config["max_output_tokens"] = min(config.get("max_output_tokens", 16384), 8192)
             result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt)
             for key in usage:
                 usage[key] += result.usage.get(key, 0)
@@ -517,7 +580,6 @@ class ResearchArgumentRunner:
                 config = deepcopy(self.model_config)
                 if deadline is not None:
                     config["timeout_seconds"] = min(float(config["timeout_seconds"]), max(0.2, remaining))
-                config["max_output_tokens"] = min(config.get("max_output_tokens", 16384), 24000)
                 result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt)
                 for key in usage:
                     usage[key] += result.usage.get(key, 0)
@@ -527,6 +589,12 @@ class ResearchArgumentRunner:
                     continue
                 try:
                     argument = result.json_object()
+                    argument, _ = _normalise_argument_candidate(
+                        argument,
+                        available_asset_ids=evidence_packet.get("asset_ids"),
+                        available_assets=(evidence_packet.get("results_package") or {}).get("assets", [])
+                        if isinstance(evidence_packet.get("results_package"), dict) else [],
+                    )
                     validate_research_argument(argument, evidence_ids=evidence_ids,
                                                 asset_ids=evidence_packet.get("asset_ids"),
                                                 min_figures=min_figures, min_tables=min_tables,
@@ -570,5 +638,5 @@ __all__ = [
     "SCHEMA_VERSION", "PACKAGE_SCHEMA_VERSION", "REVIEW_SCHEMA_VERSION",
     "validate_research_argument", "validate_argument_review", "evidence_ids_from_packet",
     "argument_evidence_packet", "argument_prompt", "review_prompt",
-    "ResearchArgumentRunner", "ArgumentAdjudicator",
+    "_normalise_argument_candidate", "ResearchArgumentRunner", "ArgumentAdjudicator",
 ]

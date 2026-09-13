@@ -9,7 +9,7 @@ import unicodedata
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.config import _text, validate_common
+from scisaurus.runtime.config import _text, configured_worker_slots, validate_common
 from scisaurus.runtime.contracts import preserves_literals
 from scisaurus.runtime.time_policy import validate_time_policy
 
@@ -212,7 +212,7 @@ def validate_scored_config(config):
                     raise ValidationError("result_path must contain object keys or array indices")
     canonical_bytes(score)
     validate_time_policy(config.get("time_policy"), stage_seconds=score["stage_seconds"], unit_count=len(editable),
-                         worker_slots=config["limits"]["concurrent_calls"] - 1,
+                         worker_slots=configured_worker_slots(config["limits"]),
                          wall_clock_seconds=config["limits"]["wall_clock_seconds"])
     return config
 

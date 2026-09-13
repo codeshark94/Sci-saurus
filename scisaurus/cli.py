@@ -148,6 +148,13 @@ def main(argv=None) -> int:
         "run-composer", help="run a project-scoped end-to-end research workflow under Executive Command")
     p_composer.add_argument("--workflow", required=True, help="immutable composer workflow JSON")
     p_composer.add_argument("--resume", action="store_true", help="resume the matching composer project")
+    p_composer.add_argument(
+        "--extend-deadline-seconds", type=float,
+        help="extend the existing Composer mission wall before resuming (requires --resume)")
+
+    p_interim = sub.add_parser(
+        "composer-interim-report", help="print the latest concise Composer stop/progress report")
+    p_interim.add_argument("project_dir")
 
     args = parser.parse_args(argv)
     if args.cmd == "run-composer":
@@ -156,14 +163,31 @@ def main(argv=None) -> int:
         try:
             workflow = json.loads(Path(args.workflow).read_text())
             result = ComposerRunner(workflow, resume=args.resume,
+                                    additional_seconds=args.extend_deadline_seconds,
                                     on_progress=lambda state: print(json.dumps(state), flush=True)).run()
         except (OSError, ValueError, ValidationError) as exc:
             print(f"composer workflow rejected: {exc}", file=sys.stderr)
             return 2
         print(json.dumps({"status": result["status"], "elapsed_seconds": result["elapsed_seconds"],
+                          "deadline_seconds": result.get("deadline_seconds"),
                           "stages": result["stages"], "release_status": result["release_status"],
-                          "report": str(Path(workflow["project_id"]).resolve() / "output" / "run.json")}, indent=2))
+                          "continuation_policy": result.get("continuation_policy"),
+                          "continuation_cycles": result.get("continuation_cycles", 0),
+                          "active_research_requests": result.get("active_research_requests", []),
+                          "organization": result.get("organization"),
+                          "report": str(Path(workflow["project_id"]).resolve() / "output" / "run.json"),
+                          "interim_report": result.get("interim_report_path")}, indent=2))
         return 0 if result["status"] == "completed" else 3
+    if args.cmd == "composer-interim-report":
+        from scisaurus.core.errors import ValidationError
+        from scisaurus.runtime.composer import read_interim_report
+        try:
+            report = read_interim_report(args.project_dir)
+        except (OSError, ValueError, ValidationError) as exc:
+            print(f"composer interim report unavailable: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
     if args.cmd == "run-paper":
         from scisaurus.core.errors import ValidationError
         from scisaurus.runtime.paper_pipeline import PaperPipelineRunner
@@ -192,10 +216,13 @@ def main(argv=None) -> int:
         except (OSError, ValueError, ValidationError) as exc:
             print(f"paper pipeline rejected: {exc}", file=sys.stderr)
             return 2
-        print(json.dumps({"status": result["status"], "word_count": result["word_count"],
-                          "review_rounds": result["review_rounds"], "review_status": result["review_status"],
-                          "elapsed_seconds": result.get("elapsed_seconds"), "pdf": result["pdf"]}, indent=2))
-        return 0
+        print(json.dumps({"status": result["status"], "word_count": result.get("word_count", 0),
+                          "review_rounds": result.get("review_rounds", 0),
+                          "review_status": result.get("review_status"),
+                          "elapsed_seconds": result.get("elapsed_seconds"), "pdf": result.get("pdf"),
+                          "preflight": result.get("preflight_path"),
+                          "research_expansion_requests": result.get("research_expansion_requests", [])}, indent=2))
+        return 0 if result["status"] in {"completed", "accepted"} else 3
     if args.cmd == "run-interpretation":
         from scisaurus.core.errors import ValidationError
         from scisaurus.runtime.scientific_interpretation import ScientificInterpretationRunner

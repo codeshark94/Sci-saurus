@@ -8,6 +8,7 @@ from unittest.mock import patch
 from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.manuscript_review import (
     ManuscriptReviewRunner,
+    DEFAULT_REVIEWERS,
     _review_prompt,
     _namespace_review_findings,
     _normalise_review_candidate,
@@ -41,9 +42,11 @@ def review_for(reviewer, *, finding=False):
 
 class FakeClient:
     calls = []
+    configs = []
 
     def __init__(self, **config):
         self.config = config
+        FakeClient.configs.append(config)
 
     def complete(self, *, system, prompt, images=None):
         import json
@@ -84,6 +87,12 @@ class MissingStageClient(FakeClient):
 
 
 class ManuscriptReviewTests(unittest.TestCase):
+    def test_review_accepts_provider_xhigh_reasoning_effort(self):
+        runner = ManuscriptReviewRunner({"base_url": "http://example.invalid", "model": "fake",
+                                         "protocol": "openai_compatible", "timeout_seconds": 1,
+                                         "max_output_tokens": 10}, reasoning_effort="xhigh")
+        self.assertEqual(runner.reasoning_effort, "xhigh")
+
     def test_namespaces_local_finding_ids_before_synthesis(self):
         first = review_for("science", finding=True)
         second = review_for("methods", finding=True)
@@ -92,9 +101,60 @@ class ManuscriptReviewTests(unittest.TestCase):
         self.assertEqual(_namespace_review_findings(first)["findings"][0]["id"], "science_f1")
         self.assertEqual(_namespace_review_findings(second)["findings"][0]["id"], "methods_f1")
 
+    def test_ai_smell_review_derives_failures_from_complete_surface(self):
+        manuscript = {
+            "title": "A candidate study",
+            "sections": [
+                {"id": "introduction", "title": "Introduction",
+                 "units": [{"id": "introduction_p1", "text": "The question is explicit."}]},
+                {"id": "discussion", "title": "Discussion",
+                 "units": [{"id": "discussion_p1", "text": "The result has two possible explanations."}]},
+            ],
+        }
+        reviewer = next(item for item in DEFAULT_REVIEWERS if item["id"] == "ai_smell")
+        packet = json.loads(_review_prompt(manuscript, reviewer))
+        self.assertEqual([section["id"] for section in packet["manuscript"]["sections"]],
+                         ["introduction", "discussion"])
+        focus = packet["reviewer"]["focus"].casefold()
+        self.assertIn("open-ended", focus)
+        self.assertIn("predefined symptom list", focus)
+        self.assertNotIn("boilerplate transitions", focus)
+
     def test_validator_rejects_accepted_review_with_major_finding(self):
         with self.assertRaisesRegex(ValidationError, "accepted manuscript review"):
             validate_review(review_for("science", finding=True) | {"decision": "accept"}, "science", 1)
+
+    def test_reviewer_research_request_is_a_first_class_blocker(self):
+        review = review_for("methods")
+        review["decision"] = "revise"
+        review["research_requests"] = [{
+            "id": "run_control_experiment", "kind": "additional_experiment", "owner": "methods.validation",
+            "objective": "Run a control that separates the two live mechanisms.",
+            "why": "The supplied observations do not distinguish the explanations.",
+            "success_condition": "The control produces a validated comparison for both hypotheses.",
+            "evidence_needed": "Raw outputs, deterministic checks, and an interpretable figure.",
+        }]
+        validate_review(review, "methods", 2)
+        with self.assertRaisesRegex(ValidationError, "accepted manuscript review"):
+            validate_review(review | {"decision": "accept"}, "methods", 2)
+
+    def test_synthesis_cannot_drop_research_request(self):
+        review = review_for("methods")
+        review["decision"] = "revise"
+        review["research_requests"] = [{
+            "id": "methods_run_control", "kind": "additional_experiment", "owner": "methods.validation",
+            "objective": "Run a control experiment.", "why": "The current data are non-discriminating.",
+            "success_condition": "The control separates the hypotheses.", "evidence_needed": "Validated raw output.",
+        }]
+        synthesis = {
+            "schema_version": "manuscript-review-synthesis-1", "decision": "revise", "required_repairs": [],
+            "research_requests": [], "accepted_reviewers": [], "rationale": "New evidence is needed.",
+            "verification_contract": ["Re-run the review after the control."],
+        }
+        with self.assertRaisesRegex(ValidationError, "research request"):
+            validate_synthesis(synthesis, [review])
+        synthesis["research_requests"] = list(review["research_requests"])
+        validate_synthesis(synthesis, [review])
 
     def test_normalizer_binds_assignment_metadata_and_empty_protection_to_unit(self):
         candidate = review_for("science", finding=True)
@@ -293,6 +353,7 @@ class ManuscriptReviewTests(unittest.TestCase):
 
     def test_runner_executes_scientific_and_editorial_roles_then_final_gate(self):
         FakeClient.calls = []
+        FakeClient.configs = []
         manuscript = {"title": "Calibration", "units": [{"id": "results-1", "text": "Held-out log loss changed."}]}
         feedback = []
         with patch("scisaurus.runtime.manuscript_review.ModelClient", FakeClient):
@@ -307,6 +368,16 @@ class ManuscriptReviewTests(unittest.TestCase):
         self.assertEqual(FakeClient.calls.count("independent_manuscript_review"), 6)
         self.assertEqual([event["kind"] for event in feedback], ["review"] * 6 + ["synthesis"])
         self.assertEqual(feedback[-1]["status"], "accepted")
+        self.assertTrue(FakeClient.configs)
+        self.assertEqual({config["max_output_tokens"] for config in FakeClient.configs}, {10})
+        self.assertEqual({config["reasoning_effort"] for config in FakeClient.configs}, {"xhigh"})
+
+    def test_default_review_budget_inherits_the_model_configuration(self):
+        runner = ManuscriptReviewRunner({"base_url": "http://example.invalid", "model": "fake",
+                                         "protocol": "openai_compatible", "timeout_seconds": 1,
+                                         "max_output_tokens": 32768})
+        self.assertIsNone(runner.max_output_tokens)
+        self.assertEqual(runner.reasoning_effort, "xhigh")
 
     def test_runner_binds_provider_review_that_omits_assignment_stage(self):
         manuscript = {"title": "Calibration", "units": [{"id": "results-1", "text": "Held-out log loss changed."}]}

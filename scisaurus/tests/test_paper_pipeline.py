@@ -1,6 +1,8 @@
 """Pure contract tests for the AI-native manuscript pipeline boundary."""
 
 import unittest
+from pathlib import Path
+import tempfile
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.paper_pipeline import (
@@ -9,6 +11,7 @@ from scisaurus.runtime.paper_pipeline import (
     _review_input,
     validate_argument_projection,
     validate_manuscript_draft,
+    PaperPipelineRunner,
 )
 from scisaurus.tests.test_research_argument import argument
 
@@ -107,6 +110,26 @@ class ManuscriptDraftContractTests(unittest.TestCase):
         self.assertTrue(bound["sections"][0]["units"][1]["text"].endswith("[[cite:talvila2012]]"))
         self.assertEqual(sorted(replacements), ["intro_p1", "intro_p2"])
         self.assertEqual(audit["added"][0]["reference_key"], "talvila2012")
+
+    def test_editor_decision_requires_three_rounds_and_full_panel(self):
+        runner = PaperPipelineRunner.__new__(PaperPipelineRunner)
+        runner.empirical_profile = True
+        runner.review_panel_ids = ["science", "methods", "ai_smell", "human_scientist", "editorial_compression", "journal_editor"]
+        runner.reviewers = None
+        runner._emit_feedback = lambda event: None
+        with tempfile.TemporaryDirectory() as path:
+            runner.output = Path(path)
+            package = {
+                "reviews": [{"reviewer_id": reviewer, "decision": "accept"}
+                            for reviewer in runner.review_panel_ids],
+                "synthesis": {"decision": "accept", "research_requests": []},
+                "research_requests": [],
+            }
+            decision = runner._editor_decision(package, [package, package, package])
+            self.assertEqual(decision["decision"], "accept")
+            self.assertTrue((Path(path) / "editor-decision.json").is_file())
+            rejected = runner._editor_decision(package, [package, package])
+            self.assertEqual(rejected["decision"], "reject")
 
 
 if __name__ == "__main__":

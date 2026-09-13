@@ -1,6 +1,6 @@
 # Sci-saurus — Project Organization and Operations
 
-> **Version:** v0.8 · **Date:** 2026-09-10 · **Status:** organization design; bounded configured-adapter lifecycle implemented in [the project runtime](65-project-runtime.md).
+> **Version:** v1.5 · **Date:** 2026-09-13 · **Status:** project-scoped department runtime and Composer-controlled work-order lifecycle implemented; configured operational adapters remain the execution boundary.
 > Governed by [SSOT](00-SSOT.md) D35–D36. Integrates the [activity model](05-system-concept.md), [web/tool adapters](50-web-intelligence-integration.md), and [scoped artifact changes](45-artifact-change-control.md).
 
 ## 1. One operating organization per project
@@ -10,6 +10,25 @@ A project instantiates its own organization: PrincipalIntent and missions, Comma
 Research, Strategy, Methods, and Editorial retain responsibility throughout a project. Their active specialists change with the work. An Operations Cell is activated when actual environment, program, or service operation is needed. It is a practical support function under Command, with no authority to set research goals or decide that tool output is scientifically valid.
 
 Shared infrastructure may supply worker/GPU pools, role templates, approved adapter implementations, and immutable public software caches. Mutable workspaces, credentials, private context, evidence, accepted heads, grants, and decision histories remain project-scoped. A shared capacity scheduler accounts for aggregate provider/GPU limits while project ledgers retain attribution; a project cannot grant itself another project's capacity or data.
+
+The runtime realization is `DepartmentRuntime` in
+[`scisaurus/runtime/departments.py`](../scisaurus/runtime/departments.py). It
+materializes a project organization when the Composer opens a run: a default
+charter is published as an immutable command artifact, each incoming handoff
+is copied into the addressed department inbox, and a validated request becomes
+a typed work-order task. A workflow may supply a different organization
+charter, but the template is only a starting contract; actual inbox requests,
+stage results, and capability state determine which work is admitted. The
+Composer records activation and resolution of scoped work orders in every
+checkpoint, so the backlog describes live work rather than a diagram of roles.
+
+Autonomy is deadline-governed. A malformed proposal is rejected into a durable
+department record and does not terminate unrelated work. A valid blocker is
+retried or reopened through its owning stage closure until the immutable mission
+wall, while the Arbiter and the Principal retain authority over disputes,
+material scope changes, and release. Department workers cannot overwrite an
+incumbent artifact or grant themselves an unconfigured host, API, or MCP
+capability.
 
 ```mermaid
 flowchart TD

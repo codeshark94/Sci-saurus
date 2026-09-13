@@ -20,12 +20,12 @@ from scisaurus.core.events import ControlStore
 TERMINAL_STATES = frozenset({"completed", "failed", "rejected", "cancelled", "stale"})
 
 TRANSITIONS = {
-    "proposed": {"queued", "rejected", "cancelled"},
+    "proposed": {"queued", "rejected", "cancelled", "stale"},
     "queued": {"running", "blocked", "cancelled", "stale"},
     "running": {"awaiting_review", "blocked", "failed", "paused", "cancelled", "stale"},
     "awaiting_review": {"queued", "blocked", "stale", "completed", "cancelled"},
     "blocked": {"queued", "cancelled", "stale"},
-    "paused": {"queued", "cancelled"},
+    "paused": {"queued", "cancelled", "stale"},
 }
 
 ATTEMPT_OUTCOMES = frozenset({"succeeded", "failed", "cancelled", "result_unknown"})

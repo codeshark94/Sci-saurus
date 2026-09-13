@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from scisaurus.core.errors import ValidationError
-from scisaurus.runtime.config import _text, validate_common
+from scisaurus.runtime.config import _text, configured_worker_slots, validate_common
 from scisaurus.runtime.scores import exact, identifier
 from scisaurus.runtime.time_policy import validate_time_policy
 
@@ -18,6 +18,9 @@ MEDIA_TYPES = {"image/png", "image/jpeg"}
 
 def validate_visual_review_config(config):
     validate_common(config, {"visual_review", "time_policy"}, retrieval=False)
+    repair_mode = config.get("limits", {}).get("repair_mode")
+    if repair_mode is not None and repair_mode not in {"bounded", "until_deadline"}:
+        raise ValidationError("limits.repair_mode must be bounded or until_deadline")
     if config["model"]["protocol"] != "openai_compatible":
         raise ValidationError("visual review requires an openai_compatible multimodal model")
     review = config.get("visual_review")
@@ -71,7 +74,7 @@ def validate_visual_review_config(config):
         _text(perspective["focus"], "visual perspective focus")
 
     validate_time_policy(config.get("time_policy"), stage_seconds=review["stage_seconds"],
-                         unit_count=len(perspectives), worker_slots=config["limits"]["concurrent_calls"] - 1,
+                         unit_count=len(perspectives), worker_slots=configured_worker_slots(config["limits"]),
                          wall_clock_seconds=config["limits"]["wall_clock_seconds"])
     return deepcopy(config)
 

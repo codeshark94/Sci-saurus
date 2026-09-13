@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import itertools
 import json
 from pathlib import Path
 import signal
@@ -10,6 +11,7 @@ import threading
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes, sha256_hex
+from scisaurus.runtime.config import configured_worker_slots
 from scisaurus.runtime.execution import ExecutionRuntime, _invoke_worker
 from scisaurus.runtime.models import ModelResult
 from scisaurus.runtime.time_policy import TimePolicy
@@ -260,7 +262,7 @@ class VisualReviewRunner(ExecutionRuntime):
         self.serial = 0
         self.time_policy = TimePolicy(stage_seconds=self.review["stage_seconds"],
             unit_count=len(self.review["perspectives"]),
-            worker_slots=self.config["limits"]["concurrent_calls"] - 1,
+            worker_slots=configured_worker_slots(self.config["limits"]),
             wall_clock_seconds=self.config["limits"]["wall_clock_seconds"],
             policy=self.config.get("time_policy"))
         self.time_policy.started_at = self.started
@@ -306,7 +308,11 @@ class VisualReviewRunner(ExecutionRuntime):
     def _models_checked(self, jobs, *, stage, task_kind):
         """Retry only schema-rejected visual judgments against the same pinned images."""
         pending, accepted, feedback = list(jobs), {}, {}
-        for _ in range(self.config["limits"]["max_rounds"]):
+        repair_mode = self.config["limits"].get("repair_mode", "bounded")
+        rounds = (itertools.count() if repair_mode == "until_deadline"
+                  else range(self.config["limits"]["max_rounds"]))
+        for _ in rounds:
+            self._ensure_active()
             decision = self.time_policy.admit(stage, task_count=len(pending))
             if not decision["allowed"]:
                 raise ValidationError(f"time admission deferred visual {stage}: {decision['reason']}")
@@ -321,7 +327,7 @@ class VisualReviewRunner(ExecutionRuntime):
                               "params": {"client": self.config["model"],
                                          "prompt": json.dumps(assignment, ensure_ascii=False),
                                          "images": self.image_descriptors}})
-            outcomes = self._call_batch(specs, max_parallel=self.config["limits"]["concurrent_calls"] - 1)
+            outcomes = self._call_batch(specs, max_parallel=configured_worker_slots(self.config["limits"]))
             rejected = []
             for job, spec in zip(pending, specs):
                 outcome = outcomes[spec["task_id"]]

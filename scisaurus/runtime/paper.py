@@ -23,6 +23,7 @@ from scisaurus.runtime.results import validate_results_package
 from scisaurus.runtime.research_argument import validate_argument_review, validate_research_argument
 from scisaurus.runtime.scholarly_depth import (
     evaluate_scholarly_depth,
+    evaluate_scholarly_preflight,
     profile_for_paper,
     validate_profile_id,
     validate_scholarly_depth_review,
@@ -58,6 +59,36 @@ def _text_supports_phrase(phrase, text, *, minimum=2, fraction=0.3):
     target = _semantic_tokens(text)
     matched = len(source & target)
     return matched >= min(minimum, len(source)) and matched / len(source) >= fraction
+
+
+def load_paper_survey(config):
+    """Load the current accepted survey basis named by a paper config.
+
+    Survey loading is shared by the pre-composition admission gate and the
+    release builder so both decisions inspect the same content-addressed
+    assessment and source records.
+    """
+    control = ControlStore(config["survey_project_dir"])
+    try:
+        store = ArtifactStore(control)
+        gate = SurveyGate(control, store)
+        gate.require_current(config["survey_ref"])
+        assessment = gate.require_current_assessment(config["assessment_ref"])
+        body = json.loads(store.read_body(assessment["body_hash"]))
+        if config["document_type"] == "research_paper" and body["state"] != "eligible_for_experiment":
+            raise ValidationError("a research paper candidate requires an experiment-eligible accepted gap assessment")
+        survey_record = store.get(config["survey_ref"])
+        survey = json.loads(store.read_body(survey_record["body_hash"]))
+        sources = {ref: json.loads(store.read_body(store.get(ref)["body_hash"]))
+                   for ref in survey["source_refs"]}
+        identities = {ref: json.loads(store.read_body(store.get(ref)["body_hash"]))
+                      for ref in survey.get("identity_refs", [])}
+        return {"state": body["state"], "sources": sources,
+                "schema_version": survey["schema_version"], "identities": identities,
+                "survey_ref": config["survey_ref"], "assessment_ref": config["assessment_ref"],
+                "event_chain": control.verify_chain()}
+    finally:
+        control.close()
 
 
 def _exact(value, fields, name):
@@ -485,27 +516,16 @@ class PaperReleaseBuilder:
             control.close()
 
     def _survey(self):
-        control = ControlStore(self.config["survey_project_dir"])
-        try:
-            store = ArtifactStore(control)
-            gate = SurveyGate(control, store)
-            gate.require_current(self.config["survey_ref"])
-            assessment = gate.require_current_assessment(self.config["assessment_ref"])
-            body = self._body(store, assessment)
-            if self.config["document_type"] == "research_paper" and body["state"] != "eligible_for_experiment":
-                raise ValidationError("a research paper candidate requires an experiment-eligible accepted gap assessment")
-            survey = self._body(store, store.get(self.config["survey_ref"]))
-            sources = {ref: self._body(store, store.get(ref)) for ref in survey["source_refs"]}
-            identities = {ref: self._body(store, store.get(ref))
-                          for ref in survey.get("identity_refs", [])}
-            return {"state": body["state"], "sources": sources,
-                    "schema_version": survey["schema_version"], "identities": identities,
-                    "survey_ref": self.config["survey_ref"], "assessment_ref": self.config["assessment_ref"],
-                    "event_chain": control.verify_chain()}
-        finally:
-            control.close()
+        return load_paper_survey(self.config)
 
     def _bind(self, manuscript, survey, results):
+        if self.config["schema_version"] == "paper-release-score-3":
+            preflight = evaluate_scholarly_preflight(
+                self.config, results, survey, argument=self.research_argument)
+            if preflight["decision"] != "proceed":
+                raise ValidationError(
+                    "research expansion is required before paper composition: "
+                    + ", ".join(item["id"] for item in preflight["expansion_requests"]))
         if results["schema_version"] == "results-package-2":
             provenance = results["provenance"]
             if provenance["literature_survey_ref"] is not None and (
