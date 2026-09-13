@@ -249,6 +249,41 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertIsNone(runner._retry_policy()["max_attempts"])
             runner.close()
 
+    def test_topic_history_path_requires_an_absolute_path(self):
+        with tempfile.TemporaryDirectory() as path:
+            workflow = self._workflow(Path(path))
+            workflow["topic_history_path"] = "relative-topic-history.json"
+            with self.assertRaisesRegex(ValidationError, "absolute"):
+                validate_workflow(workflow)
+
+    def test_topic_history_is_append_only_and_rotates_recent_capability(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            history_path = root / "shared" / "topic-history.json"
+            capability_a = root / "cap-a.json"
+            capability_b = root / "cap-b.json"
+            for capability in (capability_a, capability_b):
+                capability.write_text(json.dumps({"schema_version": "experiment-capability-1",
+                                                   "capability_id": capability.stem,
+                                                   "experiment": {}}))
+            workflow["experiment_catalog"] = [
+                {"id": "cap_a", "config_path": str(capability_a.resolve())},
+                {"id": "cap_b", "config_path": str(capability_b.resolve())},
+            ]
+            workflow["topic_history_path"] = str(history_path.resolve())
+            runner = ComposerRunner(workflow)
+            topic = {"id": "direction_a", "title": "Direction A", "domain": "science",
+                     "research_question": "Does mechanism A change the measured outcome?"}
+            runner._record_topic_history({"topic": {**topic, "experiment_capability_id": "cap_a"}})
+            runner.close()
+
+            resumed = ComposerRunner(workflow, resume=True)
+            self.assertEqual(resumed.topic_history["entries"][0]["topic_id"], "direction_a")
+            self.assertEqual(resumed._effective_topic_exclusions()["capability_ids"], ["cap_a"])
+            self.assertIn("direction_a", resumed._effective_topic_exclusions()["topic_ids"])
+            resumed.close()
+
     def test_exploration_seed_is_random_once_and_persisted_for_resume(self):
         with tempfile.TemporaryDirectory() as path, patch(
                 "scisaurus.runtime.composer.secrets.randbits", return_value=123456):
@@ -278,16 +313,134 @@ class ComposerWorkflowTests(unittest.TestCase):
             # The workflow's topic descriptor is not needed for this projection
             # test; the context is the same packet a completed topic stage emits.
             runner = ComposerRunner(workflow)
+            # Catalog-backed free-topic runs must not promote the broad
+            # discovery sampler's records to evidence seeds for the selected
+            # question.
+            runner.workflow["experiment_catalog"] = [{"id": "capability"}]
             runner.context["topic"] = {
                 "kind": "topic_discovery",
                 "topic": {"research_question": "Does mechanism change the measured outcome?",
-                          "search_queries": ["mechanism comparison", "controlled experiment", "public data"]},
+                          "search_queries": ["mechanism comparison", "controlled experiment", "public data"],
+                          "recent_papers": [{"work_id": "W123456789"}]},
             }
-            config = {"survey": {"question": "placeholder", "seed_queries": ["old query"]}}
+            config = {"survey": {"question": "placeholder", "seed_queries": ["old query"],
+                                  "seed_work_ids": ["W999"]}}
             projected = runner._apply_topic_to_survey_config(workflow["stages"][1], config)
             self.assertEqual(projected["survey"]["question"], "Does mechanism change the measured outcome?")
             self.assertEqual(projected["survey"]["seed_queries"],
                              ["mechanism comparison", "controlled experiment", "public data"])
+            self.assertEqual(projected["survey"]["seed_work_ids"], [])
+            runner.close()
+
+    def test_topic_query_projection_adds_exact_hyphenated_concept(self):
+        queries = ComposerRunner._topic_search_queries({
+            "title": "Contamination tail benefit of median-of-means",
+            "research_question": "How does median-of-means behave under contamination?",
+            "search_queries": [
+                "median of means estimator contamination",
+                "median of means finite sample comparison",
+            ],
+        })
+        self.assertEqual(queries[0], '"median of means"')
+        self.assertEqual(len(queries), 3)
+
+    def test_free_topic_selection_switches_between_pinned_experiment_capabilities(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            catalog = root / "capability.json"
+            catalog.write_text(json.dumps({
+                "schema_version": "experiment-capability-1",
+                "capability_id": "cap_b",
+                "experiment": {
+                    "id": "capability_b_study",
+                    "revision": 1,
+                    "study_type": "methods_validation",
+                    "domain": "robust statistics",
+                    "research_question": "Does the robust estimator reduce tail error under contamination?",
+                    "hypothesis": "The robust estimator reduces contaminated tail error.",
+                    "method": "Run a frozen paired simulation.",
+                    "parameters": {}, "seed": 1, "run_count": 1,
+                    "stopping_rule": "Run the declared simulation once.",
+                    "primary_outcomes": [], "limitations": [], "literature_gate": None,
+                    "execution": {}, "validation": {}, "required_assets": [], "reviewers": [],
+                    "stage_seconds": {}, "max_observations": 1, "max_asset_bytes": 1,
+                },
+            }))
+            workflow["experiment_catalog"] = [{"id": "cap_b", "config_path": str(catalog.resolve())}]
+            runner = ComposerRunner(workflow)
+            template = json.loads(Path("config/experiment-capabilities/free_quadrature_peak.json").read_text())
+            config = {"experiment": template["experiment"], "supplied_context": "base"}
+            runner.context["topic"] = {"kind": "topic_discovery", "topic": {
+                "experiment_capability_id": "cap_b",
+                "research_question": "Does the robust estimator reduce tail error under contamination?",
+            }}
+            selected = runner._apply_topic_to_experiment_config(workflow["stages"][1], config)
+            self.assertEqual(selected["experiment"]["id"], "capability_b_study")
+            self.assertEqual(selected["experiment"]["research_question"],
+                             "Does the robust estimator reduce tail error under contamination?")
+            runner.close()
+
+    def test_catalog_paper_projection_replaces_stale_scientific_identity(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            capability = Path("config/experiment-capabilities/robust_mean.json").resolve()
+            workflow["experiment_catalog"] = [{"id": "robust_mean", "config_path": str(capability)}]
+            runner = ComposerRunner(workflow)
+            runner.context["topic"] = {
+                "kind": "topic_discovery",
+                "topic": {"title": "Robust tail behavior under contamination",
+                          "research_question": "Does median-of-means reduce contaminated tail error?"},
+            }
+            packet = {
+                "writer_contract": {"section_order": [
+                    {"id": "introduction", "unit_ids": ["intro_p1"]},
+                    {"id": "question", "unit_ids": ["question_p1"]},
+                    {"id": "methods", "unit_ids": ["methods_p1"]},
+                    {"id": "results", "unit_ids": ["results_p1"]},
+                    {"id": "interpretation", "unit_ids": ["interpretation_p1"]},
+                    {"id": "limitations", "unit_ids": ["limitations_p1"]},
+                    {"id": "conclusion", "unit_ids": ["conclusion_p1"]},
+                ]},
+                "results_package": {
+                    "id": "robust_mean_pilot",
+                    "question": "Does median-of-means reduce contaminated tail error?",
+                    "procedures": [{"id": "robust_protocol", "description":
+                                    "Run seeded samples comparing the empirical mean and median-of-means under replacement contamination."}],
+                    "metrics": [{"id": "tail_reduction", "presentation":
+                                  "median-of-means reduced the contaminated 95th percentile error by 48.2 percent"}],
+                    "findings": [{"id": "robustness_gain", "statement":
+                                  "Under contamination, median-of-means reduced the 95th percentile error by 48.2 percent."}],
+                    "limitations": ["The result applies only to the declared univariate simulation."],
+                    "assets": [],
+                },
+            }
+            paper_config = {
+                "schema_version": "paper-release-score-3", "paper_id": "dynamic_test",
+                "title": "old quadrature title", "revision": 1, "document_type": "research_paper",
+                "manuscript_project_dir": str(root / "manuscript"),
+                "survey_project_dir": str(root / "survey"), "survey_ref": "x", "assessment_ref": "y",
+                "results_package": "z", "evidence": [], "claims": [], "references": [],
+                "authors": ["Sci-saurus"], "keywords": ["test"],
+                "storyline": {"id": "old", "revision": 1, "thesis": "old",
+                              "beats": [{"id": "old", "role": "question", "proposition": "old"}]},
+                "depth_profile": {"min_words": 1, "min_references": 1, "min_full_text_references": 0,
+                                  "min_sections": 1, "required_section_titles": ["Results"],
+                                  "max_numeric_repetitions": 4, "max_caveat_repetitions": 3},
+                "interpretation_file": str(root / "interpretation.json"), "figure_arguments": [],
+                "surface_policy": {"allow_control_patterns": [], "max_numeric_repetitions": 4,
+                                   "max_caveat_repetitions": 3},
+            }
+            (root / "interpretation.json").write_text("{}")
+            projected_paper, projected_packet = runner._synchronize_catalog_paper_inputs(
+                paper_config, packet, {"argument": {"primary_argument": {
+                    "thesis": "Median-of-means trades a small clean-data penalty for lower contaminated tail error."
+                }}})
+            self.assertEqual(projected_paper["title"], "Robust tail behavior under contamination")
+            self.assertNotIn("quadrature", json.dumps(projected_paper).casefold())
+            self.assertIn("median-of-means", json.dumps(projected_packet).casefold())
+            self.assertEqual(len(projected_paper["storyline"]["beats"]), 7)
             runner.close()
 
     def test_reopens_only_requested_stage_in_a_bounded_continuation_cycle(self):

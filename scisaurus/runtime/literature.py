@@ -224,6 +224,17 @@ def normalize_work(item, *, tolerate_invalid_abstract=False, abstract_gaps=None)
             **({"authors": authors} if authors else {})}
 
 
+def _is_omittable_work(item):
+    """Identify a provider row that cannot form a reader-facing reference.
+
+    The exception is deliberately narrow: only list responses may omit a row
+    with a valid provider identifier and no title.  Other malformed fields
+    remain fatal so schema drift cannot be silently normalized.
+    """
+    return (isinstance(item, dict) and item.get("title") in {None, ""}
+            and isinstance(item.get("id"), str))
+
+
 def _page(payload, arguments):
     if not isinstance(payload, dict):
         raise ValueError("OpenAlex response must be an object")
@@ -249,14 +260,26 @@ def _page(payload, arguments):
         raise ValueError("OpenAlex cursor did not advance")
     if not items and arguments["cursor"] in (None, "*") and meta["count"] != 0:
         raise ValueError("OpenAlex initial empty page conflicts with result count")
-    works = [normalize_work(item, tolerate_invalid_abstract=True, abstract_gaps=abstract_gaps) for item in items]
+    works = []
+    omitted_work_gaps = []
+    for index, item in enumerate(items):
+        # OpenAlex occasionally emits a bibliographic row whose title is an
+        # empty string while the rest of the page remains well formed.  That
+        # row cannot become a reader-facing reference, but it must not poison
+        # the valid records in the same page.  Keep the omission explicit in
+        # the page metadata; all other schema violations remain fatal.
+        if _is_omittable_work(item):
+            omitted_work_gaps.append({"index": index, "work_id": item["id"],
+                                      "reason": "provider_work_title_empty"})
+            continue
+        works.append(normalize_work(item, tolerate_invalid_abstract=True, abstract_gaps=abstract_gaps))
     if len({item["id"] for item in works}) != len(works):
         raise ValueError("OpenAlex page contains duplicate work identifiers")
     if arguments["operation"] == "citing" and any(
             arguments["work_id"] not in item["referenced_works"] for item in works):
         raise ValueError("OpenAlex citing result does not reference the requested work")
     return works, {"count": meta["count"], "next_cursor": cursor, "has_more": cursor is not None,
-                   "abstract_gaps": abstract_gaps}
+                   "abstract_gaps": abstract_gaps, "omitted_work_gaps": omitted_work_gaps}
 
 
 def _sources(works):
@@ -444,6 +467,8 @@ class OpenAlexClient:
             result["gaps"].append("Scholarly metadata, abstracts and location URLs do not establish acquired full text or claim support.")
             if page.get("abstract_gaps"):
                 result["gaps"].append("One or more provider abstract indexes were malformed; affected abstracts were omitted.")
+            if page.get("omitted_work_gaps"):
+                result["gaps"].append("One or more provider work rows had empty titles and were omitted.")
         except (TimeoutError, OSError, HTTPException) as exc:
             result["outcome"] = "timeout" if expired.is_set() or isinstance(exc, TimeoutError) else "provider_error"
             result["error"] = f"OpenAlex HTTP transaction failed: {type(exc).__name__}"

@@ -21,6 +21,10 @@ SAMPLING_FIELDS = frozenset({
     "temperature", "top_p", "seed", "presence_penalty", "frequency_penalty",
 })
 OLLAMA_SAMPLING_FIELDS = frozenset({"temperature", "top_p", "seed"})
+# OpenAI-compatible providers commonly expose ``seed`` as a signed int64.
+# Keep internally derived seeds inside that wire-level contract so a valid
+# exploration hash cannot become a provider-side 400.
+MAX_PROVIDER_SEED = (1 << 63) - 1
 
 # Sampling changes how a role explores or checks a response; it does not
 # replace the role's prompt or its validation contract.  These defaults are
@@ -70,8 +74,11 @@ def _validate_sampling_options(options, *, name="sampling options"):
             raise ValidationError(f"{name}.top_p must be greater than 0 and at most 1")
         if field in {"presence_penalty", "frequency_penalty"} and not -2 <= value <= 2:
             raise ValidationError(f"{name}.{field} must be between -2 and 2")
-    if "seed" in options and (type(options["seed"]) is not int or options["seed"] < 0):
-        raise ValidationError(f"{name}.seed must be a non-negative integer")
+    if "seed" in options and (
+            type(options["seed"]) is not int
+            or not 0 <= options["seed"] <= MAX_PROVIDER_SEED):
+        raise ValidationError(
+            f"{name}.seed must be an integer between 0 and {MAX_PROVIDER_SEED}")
     return options
 
 

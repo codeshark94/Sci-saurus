@@ -14,6 +14,7 @@ import hashlib
 import itertools
 import json
 import math
+import os
 import platform
 from pathlib import Path
 import re
@@ -94,10 +95,11 @@ def validate_workflow(value):
     """Validate the immutable composer workflow contract."""
     fields = {"schema_version", "id", "revision", "project_id", "objective", "stages", "time_policy", "completion"}
     allowed_fields = fields | {"retry_policy", "continuation_policy", "organization", "exploration_seed",
-                               "topic_reuse_allowed"}
+                               "topic_reuse_allowed", "experiment_catalog", "topic_exclusions",
+                               "topic_history_path"}
     if not isinstance(value, dict) or set(value) - allowed_fields or not fields.issubset(value):
         raise ValidationError(
-            f"composer workflow requires {sorted(fields)} and permits ['continuation_policy', 'exploration_seed', 'organization', 'retry_policy', 'topic_reuse_allowed']")
+            f"composer workflow requires {sorted(fields)} and permits ['continuation_policy', 'exploration_seed', 'organization', 'retry_policy', 'topic_reuse_allowed', 'experiment_catalog', 'topic_exclusions', 'topic_history_path']")
     if value["schema_version"] != SCHEMA_VERSION:
         raise ValidationError(f"composer workflow schema must be {SCHEMA_VERSION}")
     _identifier(value["id"], "workflow id")
@@ -110,6 +112,42 @@ def validate_workflow(value):
         raise ValidationError("workflow exploration_seed must be a non-negative integer when configured")
     if "topic_reuse_allowed" in value and type(value["topic_reuse_allowed"]) is not bool:
         raise ValidationError("workflow topic_reuse_allowed must be Boolean when configured")
+    if "topic_history_path" in value:
+        history_path = value["topic_history_path"]
+        if not isinstance(history_path, str) or not history_path.strip():
+            raise ValidationError("workflow topic_history_path must be a nonempty absolute path")
+        if not Path(history_path).is_absolute():
+            raise ValidationError("workflow topic_history_path must be an absolute path")
+        if Path(history_path).exists() and not Path(history_path).is_file():
+            raise ValidationError("workflow topic_history_path must name a file")
+    if "topic_exclusions" in value:
+        exclusions = value["topic_exclusions"]
+        if (not isinstance(exclusions, dict)
+                or set(exclusions) != {"capability_ids", "topic_ids"}
+                or not isinstance(exclusions["capability_ids"], list)
+                or not isinstance(exclusions["topic_ids"], list)):
+            raise ValidationError("workflow topic_exclusions requires capability_ids and topic_ids lists")
+        for name in ("capability_ids", "topic_ids"):
+            if len(exclusions[name]) != len(set(exclusions[name])):
+                raise ValidationError(f"workflow topic_exclusions.{name} must be unique")
+            for item in exclusions[name]:
+                _identifier(item, f"workflow topic exclusion {name} entry")
+    if "experiment_catalog" in value:
+        catalog = value["experiment_catalog"]
+        if (not isinstance(catalog, list) or not catalog
+                or len(catalog) > 16):
+            raise ValidationError("workflow experiment_catalog must contain one to sixteen entries")
+        catalog_ids = set()
+        for entry in catalog:
+            if not isinstance(entry, dict) or set(entry) != {"id", "config_path"}:
+                raise ValidationError("workflow experiment_catalog entries require exactly id and config_path")
+            entry_id = _identifier(entry["id"], "experiment catalog id")
+            if entry_id in catalog_ids:
+                raise ValidationError("workflow experiment_catalog IDs must be unique")
+            catalog_ids.add(entry_id)
+            path = Path(entry["config_path"])
+            if not path.is_absolute() or not path.is_file():
+                raise ValidationError("experiment catalog config_path must be an existing absolute file")
     stages = value["stages"]
     if not isinstance(stages, list) or not stages:
         raise ValidationError("composer workflow requires at least one stage")
@@ -286,6 +324,9 @@ class ComposerRunner:
         # project_id is the stable identity; the workflow's project directory
         # is derived from it so a config cannot redirect the control ledger.
         self.root.mkdir(parents=True, exist_ok=True)
+        self.topic_history_path = self._resolve_topic_history_path()
+        self.topic_history_scope = self._topic_history_scope_key()
+        self.topic_history = self._load_topic_history()
         existing = (self.root / "state" / "control.sqlite").exists()
         if existing and not resume:
             raise ValidationError("composer project already exists; pass resume=True to continue it")
@@ -356,6 +397,9 @@ class ComposerRunner:
             "blockers": [], "usage": deepcopy(self.usage),
             "deadline_extensions": [],
             "organization": deepcopy(self.organization_snapshot),
+            "topic_history_path": str(self.topic_history_path),
+            "topic_history_scope": self.topic_history_scope,
+            "topic_history_entries": len(self.topic_history.get("entries", [])),
         }
         self._workflow_record = None
         if not existing:
@@ -813,8 +857,38 @@ class ComposerRunner:
         except OSError:
             project_files = []
         experiment_contract = None
+        experiment_catalog = []
+        catalog = self.workflow.get("experiment_catalog") or []
+        for entry in catalog:
+            try:
+                configured = json.loads(Path(entry["config_path"]).read_text())
+            except (OSError, ValueError) as exc:
+                raise ValidationError(
+                    f"experiment capability template is unreadable: {entry['config_path']}") from exc
+            experiment = configured.get("experiment") if isinstance(configured, dict) else None
+            if not isinstance(experiment, dict):
+                raise ValidationError("experiment capability template must contain an experiment object")
+            experiment_catalog.append({
+                "id": entry["id"],
+                "study_type": experiment.get("study_type"),
+                "domain": experiment.get("domain"),
+                "research_question": experiment.get("research_question"),
+                "method": experiment.get("method"),
+                "stopping_rule": experiment.get("stopping_rule"),
+                "primary_outcomes": [
+                    {key: outcome.get(key) for key in ("id", "definition", "unit")}
+                    for outcome in experiment.get("primary_outcomes", [])
+                    if isinstance(outcome, dict)
+                ],
+                "required_asset_roles": [
+                    {key: asset.get(key) for key in ("role", "media_types", "min_count")}
+                    for asset in experiment.get("required_assets", [])
+                    if isinstance(asset, dict)
+                ],
+                "execution_adapter": (experiment.get("execution") or {}).get("adapter"),
+            })
         experiment_stages = [stage for stage in self.workflow["stages"] if stage["kind"] == "experiment"]
-        if experiment_stages:
+        if experiment_stages and not catalog:
             try:
                 configured = json.loads(Path(experiment_stages[0]["config_path"]).read_text())
                 experiment = configured.get("experiment") if isinstance(configured, dict) else None
@@ -849,6 +923,9 @@ class ComposerRunner:
             "model_name": model.get("model") if isinstance(model, dict) else None,
             "configured_stage_kinds": [stage["kind"] for stage in self.workflow["stages"]],
             "experiment_contract": experiment_contract,
+            "experiment_catalog": experiment_catalog,
+            "topic_exclusions": self._effective_topic_exclusions(),
+            "topic_history": self._topic_history_context(),
             "project_files": project_files,
             "project_scoped_execution": True,
         }
@@ -856,7 +933,215 @@ class ComposerRunner:
     def _topic_sampling_seed(self):
         """Derive a stable per-cycle seed from the mission exploration seed."""
         material = f"{self.exploration_seed}:topic:{self.continuation_cycles}".encode("utf-8")
-        return int(hashlib.sha256(material).hexdigest()[:16], 16)
+        # The digest is intentionally wide for entropy, then reduced to the
+        # signed-int64 range accepted by the configured model endpoint.
+        from scisaurus.runtime.models import MAX_PROVIDER_SEED
+        return int(hashlib.sha256(material).hexdigest()[:16], 16) % MAX_PROVIDER_SEED
+
+    def _resolve_topic_history_path(self):
+        """Resolve the durable history shared by a family of Composer runs.
+
+        A Composer project is intentionally immutable and each fresh mission
+        gets its own project directory.  Topic memory therefore lives beside
+        that directory, rather than inside a mutable stage checkpoint.  A
+        workflow may pin an explicit path; otherwise the parent of the run
+        family receives a hidden, project-local history file.
+        """
+        configured = self.workflow.get("topic_history_path")
+        if isinstance(configured, str) and configured.strip():
+            return Path(configured).expanduser().resolve()
+        family_root = self.root.parent.parent
+        # Avoid turning a shallow project path such as ``/tmp/composer`` into
+        # a write to the filesystem root.  Normal run families (for example
+        # ``project/.runs/run/composer``) still share the stable ``.runs``
+        # parent; a shallow project keeps history beside its composer root.
+        if family_root == Path(self.root.anchor or "/"):
+            family_root = self.root.parent
+        if family_root == Path(self.root.anchor or "/"):
+            family_root = Path.cwd()
+        return (family_root / ".scisaurus-topic-history.json").resolve()
+
+    def _topic_history_scope_key(self):
+        """Keep topic memory isolated by objective and executable portfolio."""
+        catalog = [
+            item.get("id") for item in self.workflow.get("experiment_catalog", [])
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        ]
+        material = {
+            "objective": self.workflow["objective"],
+            "experiment_capability_ids": sorted(catalog),
+            "stage_kinds": [item["kind"] for item in self.workflow["stages"]],
+        }
+        return hashlib.sha256(canonical_bytes(material)).hexdigest()
+
+    @staticmethod
+    def _validate_topic_history_document(document):
+        """Validate the small append-only topic-history envelope."""
+        if not isinstance(document, dict) or document.get("schema_version") != "topic-history-1":
+            raise ValidationError("topic history has an unsupported schema")
+        scopes = document.get("scopes")
+        if not isinstance(scopes, dict):
+            raise ValidationError("topic history scopes must be an object")
+        for scope_key, scope in scopes.items():
+            if not isinstance(scope_key, str) or not isinstance(scope, dict):
+                raise ValidationError("topic history contains an invalid scope")
+            entries = scope.get("entries", [])
+            if not isinstance(entries, list):
+                raise ValidationError("topic history entries must be a list")
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise ValidationError("topic history entry must be an object")
+                if not isinstance(entry.get("topic_id"), str) or not entry["topic_id"].strip():
+                    raise ValidationError("topic history entry requires topic_id")
+                for key in ("title", "research_question", "domain"):
+                    if key in entry and entry[key] is not None and not isinstance(entry[key], str):
+                        raise ValidationError(f"topic history entry {key} must be a string")
+        return document
+
+    def _load_topic_history(self):
+        """Load the current objective's topic memory, or an empty scope."""
+        empty = {"schema_version": "topic-history-1", "scope_key": self.topic_history_scope,
+                 "entries": [], "capability_counts": {}}
+        path = self.topic_history_path
+        if not path.is_file():
+            return empty
+        try:
+            document = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            raise ValidationError(f"topic history is unreadable: {path}") from exc
+        self._validate_topic_history_document(document)
+        scope = document["scopes"].get(self.topic_history_scope, {})
+        if not isinstance(scope, dict):
+            raise ValidationError("topic history scope is invalid")
+        entries = scope.get("entries", [])
+        if not isinstance(entries, list):
+            raise ValidationError("topic history scope entries must be a list")
+        # Keep the durable file complete.  Prompt projections are bounded in
+        # `_topic_history_context`, but an old attempt remains available for
+        # deterministic repeat checks and audit.
+        entries = deepcopy(entries)
+        counts = {}
+        for entry in entries:
+            capability = entry.get("experiment_capability_id")
+            if isinstance(capability, str) and capability:
+                counts[capability] = counts.get(capability, 0) + 1
+        return {"schema_version": "topic-history-1", "scope_key": self.topic_history_scope,
+                "entries": entries, "capability_counts": counts}
+
+    def _effective_topic_exclusions(self):
+        """Merge configured exclusions with automatic recent-direction memory."""
+        configured = self.workflow.get("topic_exclusions") or {}
+        capability_ids = list(configured.get("capability_ids", [])) if isinstance(configured, dict) else []
+        topic_ids = list(configured.get("topic_ids", [])) if isinstance(configured, dict) else []
+        entries = self.topic_history.get("entries", [])
+        for entry in entries:
+            topic_id = entry.get("topic_id") if isinstance(entry, dict) else None
+            if isinstance(topic_id, str) and topic_id and topic_id not in topic_ids:
+                topic_ids.append(topic_id)
+        catalog_ids = [
+            item.get("id") for item in self.workflow.get("experiment_catalog", [])
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        ]
+        # Rotate the most recently attempted capability while another
+        # capability remains eligible.  Once the portfolio has been covered,
+        # the next direction may return to the least-recent capability.
+        if len(catalog_ids) > 1:
+            explicit = set(capability_ids)
+            available = [item for item in catalog_ids if item not in explicit]
+            recent_capability = next(
+                (entry.get("experiment_capability_id") for entry in reversed(entries)
+                 if isinstance(entry, dict) and isinstance(entry.get("experiment_capability_id"), str)),
+                None,
+            )
+            if (recent_capability in available
+                    and any(item != recent_capability for item in available)
+                    and recent_capability not in capability_ids):
+                capability_ids.append(recent_capability)
+        return {"capability_ids": list(dict.fromkeys(capability_ids)),
+                "topic_ids": list(dict.fromkeys(topic_ids))}
+
+    def _topic_history_context(self):
+        """Return bounded history summaries suitable for the intake prompt."""
+        entries = []
+        for entry in self.topic_history.get("entries", [])[-24:]:
+            if not isinstance(entry, dict):
+                continue
+            entries.append({key: entry.get(key) for key in (
+                "topic_id", "title", "domain", "research_question", "experiment_capability_id")})
+        return {
+            "schema_version": "topic-history-1",
+            "scope_key": self.topic_history_scope,
+            "entries": entries,
+            "capability_counts": deepcopy(self.topic_history.get("capability_counts", {})),
+        }
+
+    def _record_topic_history(self, context):
+        """Append an accepted topic selection to the project-family memory."""
+        topic = context.get("topic") if isinstance(context, dict) else None
+        if not isinstance(topic, dict) or not isinstance(topic.get("id"), str):
+            return
+        from scisaurus.runtime.topic_discovery import topic_signature
+        entry = {
+            "topic_id": topic["id"],
+            "title": topic.get("title"),
+            "domain": topic.get("domain"),
+            "research_question": topic.get("research_question"),
+            "experiment_capability_id": topic.get("experiment_capability_id"),
+            "signature": topic_signature(topic),
+            "run_id": self.run_id,
+            "recorded_at": now_iso(),
+        }
+        path = self.topic_history_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = Path(str(path) + ".lock")
+        lock = lock_path.open("a+")
+        flock = None
+        try:
+            try:
+                import fcntl
+                flock = fcntl
+                flock.flock(lock.fileno(), flock.LOCK_EX)
+            except (ImportError, OSError):
+                flock = None
+            if path.is_file():
+                try:
+                    document = json.loads(path.read_text())
+                except (OSError, ValueError) as exc:
+                    raise ValidationError(f"topic history is unreadable: {path}") from exc
+                self._validate_topic_history_document(document)
+            else:
+                document = {"schema_version": "topic-history-1", "scopes": {}}
+            scope = document["scopes"].setdefault(self.topic_history_scope, {"entries": []})
+            entries = scope.setdefault("entries", [])
+            fingerprint = entry["signature"]["fingerprint"]
+            new_entry = False
+            if not any(
+                    isinstance(item, dict)
+                    and (item.get("run_id") == self.run_id
+                         or ((item.get("signature") or {}).get("fingerprint") == fingerprint))
+                    for item in entries):
+                entries.append(entry)
+                new_entry = True
+            scope["entries"] = entries
+            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            temporary.write_bytes(canonical_bytes(document))
+            os.replace(temporary, path)
+            self.topic_history = self._load_topic_history()
+            if new_entry and self.control is not None:
+                self._publish(
+                    f"command/composer/topic-history/{topic['id']}",
+                    "note",
+                    {"schema_version": "topic-history-entry-1",
+                     "scope_key": self.topic_history_scope, "entry": entry},
+                    "command.composer",
+                )
+        finally:
+            if flock is not None:
+                try:
+                    flock.flock(lock.fileno(), flock.LOCK_UN)
+                except OSError:
+                    pass
+            lock.close()
 
     def _requests_for_stage(self, stage_id):
         return [deepcopy(item) for item in self.active_research_requests
@@ -958,10 +1243,54 @@ class ComposerRunner:
         topic = topic_context["topic"]
         if not isinstance(survey, dict):
             return config
+        # A catalog-backed stage is a new project identity.  Reusing the
+        # template's project or capability IDs would leak the previous
+        # experiment into the survey ledger and can collide with its reserved
+        # verification capacity.  Keep one worker slot for the single-request
+        # provider while reserving the independent verification slot required
+        # by the survey contract.
+        config["project_id"] = str(Path(stage["project_dir"]).resolve())
+        limits = config.setdefault("limits", {})
+        if type(limits.get("concurrent_calls")) is int and limits["concurrent_calls"] < 2:
+            limits["concurrent_calls"] = 2
+        limits["worker_concurrency"] = 1
+        if isinstance(topic.get("id"), str):
+            topic_key = re.sub(r"[^a-z0-9_-]+", "-", topic["id"].casefold()).strip("-")[:48]
+            if topic_key:
+                survey["id"] = f"topic-{topic_key}-literature"[:64]
+                for capability_key in ("bibliography", "identity", "full_text"):
+                    capability = survey.get(capability_key)
+                    if isinstance(capability, dict) and isinstance(capability.get("id"), str):
+                        capability["id"] = f"topic-{topic_key}-{capability_key}"[:64]
         survey["question"] = topic["research_question"]
+        if isinstance(topic.get("id"), str):
+            survey["proposed_gap"] = {
+                "id": f"topic-{topic['id']}"[:64],
+                "statement": topic.get("why_promising") or topic["research_question"],
+            }
+        # The discovery sampler is intentionally broad: it gives the topic
+        # selector a current landscape, but those records are not evidence
+        # for the selected question.  Carrying their IDs into the survey
+        # would silently mix unrelated papers into the new study.  A
+        # catalog-backed mission therefore starts from the selected queries;
+        # the survey provider, planner, and expansion rounds build the seed
+        # set from question-relevant records.  Legacy non-catalog workflows
+        # retain their explicit seed IDs.
+        if self.workflow.get("experiment_catalog"):
+            survey["seed_work_ids"] = []
+        else:
+            recent = topic_context.get("recent_papers", [])
+            seed_work_ids = [item.get("work_id") for item in recent
+                             if isinstance(item, dict) and re.fullmatch(r"W\d+", str(item.get("work_id", "")))]
+            survey["seed_work_ids"] = list(dict.fromkeys(seed_work_ids))[:max(0, survey.get("search", {}).get("max_works", 0) - survey.get("search", {}).get("challenge_reserve", 0))]
+        if self.workflow.get("experiment_catalog"):
+            # Explicit full-text routes are part of a fixed study template.
+            # Let the current survey discover open locations for the selected
+            # question instead of fetching the previous topic's URLs.
+            survey["full_text_sources"] = []
         queries = topic.get("search_queries")
         if isinstance(queries, list) and queries:
-            unique_queries = list(dict.fromkeys(queries))
+            unique_queries = self._topic_search_queries(topic)
             # The survey's configured planner width is the explicit intake
             # budget.  A topic may propose more discovery terms, but silently
             # dispatching all of them would defeat provider-aware quotas.
@@ -969,7 +1298,150 @@ class ComposerRunner:
             if type(width) is int and width > 0:
                 unique_queries = unique_queries[:width]
             survey["seed_queries"] = unique_queries
+        if isinstance(config.get("objective"), str):
+            config["objective"] = (
+                f"Investigate the selected question with a bounded scholarly survey: "
+                f"{topic['research_question']}")
+        if isinstance(config.get("supplied_context"), str):
+            config["supplied_context"] = (
+                "A catalog-backed free-topic intake selected this direction. "
+                "Rebuild the literature map around the current question and preserve only evidence "
+                "that is relevant to the selected study.\n" + topic["research_question"])
         return config
+
+    @staticmethod
+    def _topic_search_queries(topic):
+        """Add one compact exact-concept query to the selected topic.
+
+        OpenAlex's stemmed ``search`` endpoint treats long mixed queries as a
+        relevance bag.  A broad first query can therefore return unrelated
+        records before a distinctive method phrase is ever searched.  The
+        selected topic already supplies the terminology; recover a repeated
+        two-to-four-token phrase (or a hyphenated method name) and place its
+        exact form first.  The rest of the model's queries remain intact.
+        """
+        raw = [item.strip() for item in topic.get("search_queries", [])
+               if isinstance(item, str) and item.strip()]
+        raw = list(dict.fromkeys(raw))
+        if not raw:
+            return []
+        text = " ".join([
+            str(topic.get("title", "")),
+            str(topic.get("research_question", "")),
+            *raw,
+        ])
+        phrase_candidates = []
+        for match in re.finditer(r"\b[a-zA-Z][a-zA-Z0-9]*(?:-[a-zA-Z0-9]+)+\b", text):
+            pieces = [piece.casefold() for piece in match.group(0).split("-") if piece]
+            if len(pieces) >= 2:
+                phrase_candidates.append(" ".join(pieces))
+        token_lists = [re.findall(r"[a-zA-Z][a-zA-Z0-9]*", query.casefold()) for query in raw]
+        stop = {
+            "a", "an", "and", "at", "by", "for", "from", "how", "in", "of", "on", "or", "the", "to",
+            "under", "with", "without", "versus", "relative", "does", "do", "can", "what", "when", "which",
+            "using", "across", "between", "within", "on",
+        }
+        if token_lists:
+            first = token_lists[0]
+            for width in range(4, 1, -1):
+                for start in range(0, len(first) - width + 1):
+                    window = first[start:start + width]
+                    content = [token for token in window if token not in stop and not token.isdigit()]
+                    if len(content) < 2:
+                        continue
+                    support = sum(set(window).issubset(set(other)) for other in token_lists[1:])
+                    if support:
+                        phrase_candidates.append(" ".join(window))
+        phrase = next((candidate for candidate in phrase_candidates
+                       if len(candidate.split()) >= 2), None)
+        if phrase:
+            exact_query = f'"{phrase}"'
+            raw = [exact_query, *raw]
+        return list(dict.fromkeys(raw))
+
+    def _apply_topic_to_experiment_config(self, stage, config):
+        """Select a pinned executable capability for a free-topic mission.
+
+        A topic proposal is only actionable when the workflow exposes more
+        than one independently pinned experiment capability.  The selected
+        template supplies the scientific design and program pair; the current
+        run supplies the accepted literature gate and project-local paths.
+        This keeps topic discovery genuinely exploratory without granting a
+        model authority to invent an unreviewed command.
+        """
+        catalog = self.workflow.get("experiment_catalog")
+        if not catalog:
+            return config
+        topic_context = next((value for value in self.context.values()
+                              if isinstance(value, dict)
+                              and value.get("kind") == "topic_discovery"
+                              and isinstance(value.get("topic"), dict)), None)
+        if topic_context is None:
+            return config
+        selected = topic_context["topic"]
+        capability_id = selected.get("experiment_capability_id")
+        entry = next((item for item in catalog if item["id"] == capability_id), None)
+        if entry is None:
+            raise ValidationError(
+                "topic selection must name one configured experiment capability")
+        try:
+            template = json.loads(Path(entry["config_path"]).read_text())
+        except (OSError, ValueError) as exc:
+            raise ValidationError(
+                f"experiment capability template is unreadable: {entry['config_path']}") from exc
+        experiment = template.get("experiment") if isinstance(template, dict) else None
+        if not isinstance(experiment, dict):
+            raise ValidationError("experiment capability template must contain an experiment object")
+        current = config.get("experiment")
+        if not isinstance(current, dict):
+            raise ValidationError("experiment stage config must contain an experiment object")
+        selected_experiment = deepcopy(experiment)
+        # The template is a pinned capability, while the live literature gate
+        # belongs to this mission and is supplied by Composer bindings below.
+        selected_experiment["literature_gate"] = deepcopy(current.get("literature_gate"))
+        selected_experiment["revision"] = int(current.get("revision", selected_experiment.get("revision", 1)))
+        config["experiment"] = selected_experiment
+        config["project_id"] = str(Path(stage["project_dir"]).resolve())
+        for branch in ("execution", "validation"):
+            client = config["experiment"][branch].get("client")
+            if isinstance(client, dict):
+                client["cwd"] = str(Path(stage["project_dir"]).resolve())
+        context = config.get("supplied_context", "")
+        config["supplied_context"] = (
+            f"{context}\nSelected executable capability: {capability_id}.\n"
+            f"Selected research question: {selected.get('research_question', '')}"
+        )
+        return config
+
+    @staticmethod
+    def _synchronize_research_packet_identity(packet):
+        """Replace stale template identity after a current result is bound."""
+        if not isinstance(packet, dict):
+            return packet
+        results = packet.get("results_package")
+        if not isinstance(results, dict):
+            return packet
+        question = results.get("question")
+        if isinstance(question, str) and question.strip():
+            packet["study_question"] = question
+        procedure = next((item.get("description") for item in results.get("procedures", [])
+                          if isinstance(item, dict) and isinstance(item.get("description"), str)
+                          and item.get("description").strip()), None)
+        if isinstance(procedure, str) and procedure.strip():
+            packet["scope_statement"] = procedure
+        # A packet prepared for another experiment must not retain its old
+        # evidence IDs or literature prose.  The current survey projection is
+        # added by the paper synchronizer; result IDs remain authoritative for
+        # the interpretation and argument stages.
+        result_ids = []
+        for key in ("procedures", "metrics", "findings"):
+            result_ids.extend(item.get("id") for item in results.get(key, [])
+                              if isinstance(item, dict) and isinstance(item.get("id"), str))
+        result_ids.extend(f"limitation-{index}" for index, _ in enumerate(results.get("limitations", [])))
+        packet["evidence_ids"] = list(dict.fromkeys(result_ids))
+        packet["literature_evidence"] = []
+        packet["reference_cards"] = []
+        return packet
 
     def _downstream_paper_stage(self, stage_id):
         """Find the paper consumer whose publication contract governs a stage."""
@@ -1133,6 +1605,236 @@ class ComposerRunner:
                     readings.append({"asset_id": asset_id, "observation": observation,
                                      "unit_id": unit_id, "why": why})
         return paper_config
+
+    def _synchronize_catalog_paper_inputs(self, paper_config, packet, argument_package):
+        """Rebuild topic-dependent paper contracts from the accepted run.
+
+        Free-topic stages begin with reusable descriptors so the Composer can
+        validate a workflow before any provider call.  Those descriptors are
+        structural templates, not scientific content.  Once a capability has
+        produced a result, carrying the old claims, storyline, or figure jobs
+        forward would make a new experiment wear the previous paper's skin.
+        This projection keeps the section tree stable while replacing every
+        content-bearing edge with the current result and accepted argument.
+        """
+        if not self.workflow.get("experiment_catalog"):
+            return paper_config, packet
+        if not isinstance(packet, dict):
+            return paper_config, packet
+        results = packet.get("results_package")
+        if not isinstance(results, dict):
+            return paper_config, packet
+
+        argument = argument_package.get("argument") if isinstance(argument_package, dict) else None
+        if isinstance(argument, dict):
+            packet["research_argument"] = deepcopy(argument)
+            if isinstance(argument_package.get("review"), dict):
+                packet["research_argument_review"] = deepcopy(argument_package["review"])
+
+        question = results.get("question") or packet.get("study_question")
+        if not isinstance(question, str) or not question.strip():
+            question = "What mechanism explains the observed difference under the declared study conditions?"
+        procedure = next((item.get("description") for item in results.get("procedures", [])
+                           if isinstance(item, dict) and isinstance(item.get("description"), str)
+                           and item["description"].strip()), None)
+        scope = procedure or packet.get("scope_statement") or question
+        if not isinstance(scope, str) or not scope.strip():
+            scope = question
+        packet["study_question"] = question
+        packet["scope_statement"] = scope
+        packet["composition_goal"] = (
+            "Write a complete scientific paper for the selected study. Preserve the observed results, "
+            "explain competing mechanisms, connect each figure to an argument, and keep the conclusion "
+            "inside the declared data and design boundary."
+        )
+
+        # The packet is the writer's literature-facing context.  It is rebuilt
+        # from the current accepted survey so background prose cannot inherit a
+        # prior experiment's source cards.
+        survey = None
+        if "survey" in self.context:
+            from scisaurus.runtime.paper import load_paper_survey
+            # An accepted survey is a hard dependency of a research-paper
+            # stage.  Let a broken or stale survey identity reach the normal
+            # Composer retry path instead of silently falling back to an old
+            # packet with no literature basis.
+            survey = load_paper_survey(paper_config)
+        if isinstance(survey, dict):
+            cards, literature = [], []
+            for source_ref, source in list(survey.get("sources", {}).items())[:50]:
+                if not isinstance(source, dict):
+                    continue
+                work_id = source.get("work_id")
+                if not isinstance(work_id, str) or not work_id:
+                    continue
+                title = source.get("title") or work_id
+                abstract = source.get("abstract") or source.get("text") or ""
+                if not isinstance(abstract, str):
+                    abstract = str(abstract)
+                authors = source.get("authors") or "Authors not supplied by the survey."
+                if isinstance(authors, list):
+                    authors = ", ".join(
+                        item if isinstance(item, str) else str(item)
+                        for item in authors)
+                cards.append({
+                    "source_ref": source_ref, "work_id": work_id,
+                    "title": str(title), "authors": str(authors),
+                    "year": source.get("year"),
+                    "abstract": abstract[:1800],
+                    "representation": source.get("representation"),
+                    "reader_use": "Use this record only for the background and related-work context supported by the survey.",
+                })
+                literature.append({
+                    "id": f"literature-{len(literature)}", "work_id": work_id,
+                    "source_ref": source_ref, "quote": str(title),
+                    "relation": "context",
+                })
+            packet["reference_cards"] = cards
+            packet["literature_evidence"] = literature
+
+        unit_ids = self._packet_unit_ids(packet)
+        if not unit_ids:
+            return paper_config, packet
+
+        def unit_for(*prefixes):
+            return next((item for item in unit_ids
+                         if item.startswith(prefixes)), unit_ids[0])
+
+        def first_text(items, key):
+            return next((item.get(key) for item in items
+                         if isinstance(item, dict) and isinstance(item.get(key), str)
+                         and item[key].strip()), None)
+
+        procedures = [item for item in results.get("procedures", []) if isinstance(item, dict)]
+        metrics = [item for item in results.get("metrics", []) if isinstance(item, dict)]
+        findings = [item for item in results.get("findings", []) if isinstance(item, dict)]
+        raw_limitations = [item for item in results.get("limitations", []) if isinstance(item, str) and item.strip()]
+        evidence, evidence_by_kind = [], {key: [] for key in ("procedure", "result", "finding", "limitation")}
+        evidence_ids = set()
+
+        def add_evidence(kind, locator, quote, relation="support"):
+            if not isinstance(locator, str) or not locator.strip() or not isinstance(quote, str) or not quote.strip():
+                return None
+            prefix = {"procedure": "procedure", "result": "result", "finding": "finding",
+                      "limitation": "limitation"}[kind]
+            base = f"{prefix}-{locator.replace('/', '-') }".replace(" ", "-")
+            base = re.sub(r"[^a-zA-Z0-9_-]", "-", base).strip("-").casefold()
+            if not base or not base[0].isalpha():
+                base = f"evidence-{prefix}"
+            evidence_id = base[:64]
+            suffix = 2
+            while evidence_id in evidence_ids:
+                stem = base[: max(1, 63 - len(str(suffix)))]
+                evidence_id = f"{stem}-{suffix}"
+                suffix += 1
+            item = {"id": evidence_id, "kind": kind, "locator": locator,
+                    "quote": quote, "relation": relation}
+            evidence.append(item)
+            evidence_ids.add(evidence_id)
+            evidence_by_kind[kind].append(evidence_id)
+            return evidence_id
+
+        for item in procedures:
+            add_evidence("procedure", item.get("id"), item.get("description"))
+        for item in metrics:
+            add_evidence("result", item.get("id"), item.get("presentation"))
+        for item in findings:
+            add_evidence("finding", item.get("id"), item.get("statement"))
+        for index, limitation in enumerate(raw_limitations):
+            add_evidence("limitation", f"limitation/{index}", limitation, "qualify")
+
+        fallback_evidence = next((items for items in evidence_by_kind.values() if items), [])
+        if not fallback_evidence:
+            return paper_config, packet
+
+        thesis = None
+        if isinstance(argument, dict):
+            primary = argument.get("primary_argument")
+            if isinstance(primary, dict) and isinstance(primary.get("thesis"), str) and primary["thesis"].strip():
+                thesis = primary["thesis"].strip()
+        thesis = thesis or (findings[0].get("statement") if findings else question)
+        result_proposition = first_text(findings, "statement") or first_text(metrics, "presentation") or question
+        limitation_proposition = raw_limitations[0] if raw_limitations else (
+            "The interpretation is limited to the declared data, model, and parameter range.")
+        method_proposition = procedure or "The study follows the declared reproducible comparison protocol."
+        beats = [
+            {"id": "motivation", "role": "motivation",
+             "proposition": f"The study examines {question.rstrip('?')} under a defined empirical boundary."},
+            {"id": "question", "role": "question", "proposition": question},
+            {"id": "method", "role": "method", "proposition": method_proposition},
+            {"id": "result", "role": "result", "proposition": result_proposition},
+            {"id": "interpretation", "role": "interpretation", "proposition": thesis},
+            {"id": "limitation", "role": "limitation", "proposition": limitation_proposition},
+            {"id": "conclusion", "role": "conclusion", "proposition": thesis},
+        ]
+        beat_evidence = {
+            "motivation": evidence_by_kind["procedure"] or evidence_by_kind["result"] or fallback_evidence,
+            "question": evidence_by_kind["procedure"] or evidence_by_kind["result"] or fallback_evidence,
+            "method": evidence_by_kind["procedure"] or fallback_evidence,
+            "result": evidence_by_kind["finding"] or evidence_by_kind["result"] or fallback_evidence,
+            "interpretation": evidence_by_kind["finding"] or evidence_by_kind["result"] or fallback_evidence,
+            "limitation": evidence_by_kind["limitation"] or fallback_evidence,
+            "conclusion": evidence_by_kind["finding"] or evidence_by_kind["result"] or fallback_evidence,
+        }
+        beat_units = {
+            "motivation": [unit_for("intro_")], "question": [unit_for("question_")],
+            "method": [unit_for("methods_")], "result": [unit_for("results_")],
+            "interpretation": [unit_for("interpretation_", "discussion_")],
+            "limitation": [unit_for("limitations_")], "conclusion": [unit_for("conclusion_")],
+        }
+
+        if paper_config.get("schema_version") in {"paper-release-score-2", "paper-release-score-3"}:
+            paper_config["storyline"] = {
+                "id": str(paper_config.get("storyline", {}).get("id", "study-storyline")),
+                "revision": int(paper_config.get("storyline", {}).get("revision", 1)) + 1,
+                "thesis": thesis, "beats": beats,
+            }
+            paper_config["evidence"] = evidence
+            paper_config["claims"] = [{
+                "id": f"claim-{beat['id']}", "statement": beat["proposition"],
+                "unit_ids": beat_units[beat["id"]],
+                "evidence_ids": list(dict.fromkeys(beat_evidence[beat["id"]])),
+                "storyline_id": beat["id"],
+            } for beat in beats]
+            topic = next((value.get("topic") for value in self.context.values()
+                          if isinstance(value, dict) and value.get("kind") == "topic_discovery"
+                          and isinstance(value.get("topic"), dict)), None)
+            if isinstance(topic, dict) and isinstance(topic.get("title"), str) and topic["title"].strip():
+                paper_config["title"] = topic["title"].strip()
+            elif isinstance(results.get("id"), str):
+                paper_config["title"] = results["id"].replace("_", " ").replace("-", " ").title()
+
+        contract = packet.get("writer_contract") if isinstance(packet.get("writer_contract"), dict) else {}
+        exact = []
+        if procedure:
+            exact.append({"text": procedure, "unit_id": unit_for("methods_")})
+        for item in findings[:4]:
+            exact.append({"text": item["statement"], "unit_id": unit_for("results_")})
+        for item in raw_limitations[:2]:
+            exact.append({"text": item, "unit_id": unit_for("limitations_")})
+        exact.extend([
+            {"text": question, "unit_id": unit_for("question_")},
+            {"text": thesis, "unit_id": unit_for("interpretation_", "discussion_")},
+        ])
+        contract["required_exact_content"] = exact
+        contract["required_citation_markers"] = [
+            f"[[cite:{reference['key']}]]" for reference in paper_config.get("references", [])
+            if isinstance(reference, dict) and isinstance(reference.get("key"), str)
+        ]
+        contract["figure_readings"] = [
+            {"asset_id": item["asset_id"], "observation": item["observation"],
+             "unit_id": item["unit_id"], "why": item["why"]}
+            for item in paper_config.get("figure_arguments", [])
+            if isinstance(item, dict)
+        ]
+        contract["surface_rules"] = [
+            "Write for a scientific reader and keep execution bookkeeping out of the manuscript.",
+            "Results report observations; interpretation and Discussion explain mechanisms and distinguish possibilities from established findings.",
+            "Use each numeric result where it advances the argument and avoid repeating the same fact across sections.",
+            "Limitations must state how the declared design boundary changes the interpretation.",
+        ]
+        packet["writer_contract"] = contract
+        return paper_config, packet
 
     @staticmethod
     def _extend_paper_images(config, packet, paper_config):
@@ -1356,6 +2058,9 @@ class ComposerRunner:
             "feedback": deepcopy(self.feedback),
             "blockers": deepcopy(self.blockers), "usage": deepcopy(self.usage),
             "organization": deepcopy(self.organization_snapshot),
+            "topic_history_path": str(self.topic_history_path),
+            "topic_history_scope": self.topic_history_scope,
+            "topic_history_entries": len(self.topic_history.get("entries", [])),
         }
         with self._progress_lock:
             self._progress_snapshot = deepcopy(state)
@@ -1642,6 +2347,11 @@ class ComposerRunner:
         finally:
             control.close()
 
+        # Catalog-backed missions are a new scientific identity.  Their
+        # references must be projected from the current survey rather than
+        # appended to a descriptor inherited from a previous topic.
+        if self.workflow.get("experiment_catalog"):
+            paper_config["references"] = []
         existing_refs = paper_config.get("references", [])
         existing_source_refs = {item.get("source_ref") for item in existing_refs if isinstance(item, dict)}
         existing_keys = {item.get("key") for item in existing_refs if isinstance(item, dict)}
@@ -1665,17 +2375,23 @@ class ComposerRunner:
                 continue
             work_id = source.get("work_id")
             work = works.get(work_id, {})
-            key = f"oa_{str(work_id).casefold()}"
+            key = re.sub(r"[^a-z0-9_-]+", "-", f"oa_{str(work_id).casefold()}").strip("-")[:64]
+            if not key or not key[0].isalpha():
+                key = f"ref_{len(existing_keys)}"
             if key in existing_keys:
                 key = f"oa_{str(work_id).casefold()}_{len(existing_keys)}"
             identity = identities.get(work_id, {})
             # DOI fields are only emitted when an independently reconciled
             # identity exists.  A catalog record alone remains a URL citation.
             doi = identity.get("doi") if identity.get("status") == "verified" else None
+            authors = work.get("authors") or source.get("authors") or "Authors not supplied by OpenAlex"
+            if isinstance(authors, list):
+                authors = ", ".join(
+                    item if isinstance(item, str) else str(item) for item in authors)
             paper_config["references"].append({
                 "key": key,
                 "title": work.get("title") or source.get("title") or f"OpenAlex work {work_id}",
-                "authors": work.get("authors") or source.get("authors") or "Authors not supplied by OpenAlex",
+                "authors": str(authors),
                 "year": str(work.get("year") or "unknown"),
                 "doi": doi,
                 "url": source.get("url") or f"https://openalex.org/{work_id}",
@@ -1853,6 +2569,11 @@ class ComposerRunner:
             from scisaurus.runtime.topic_discovery import (
                 TopicDiscoveryRunner, validate_topic_stage_config,
             )
+            # Another fresh Composer mission may have recorded a direction
+            # after this process was initialized.  Refresh the family memory
+            # at the admission boundary so parallel missions see the latest
+            # completed selection before they ask the model for a topic.
+            self.topic_history = self._load_topic_history()
             descriptor = validate_topic_stage_config(config)
             model = json.loads(Path(descriptor["model_config_path"]).read_text())
             runner = TopicDiscoveryRunner(model, deadline_seconds=stage_deadline)
@@ -1872,6 +2593,8 @@ class ComposerRunner:
         elif kind in {"survey", "experiment"}:
             if kind == "survey":
                 config = self._apply_topic_to_survey_config(stage, config)
+            elif kind == "experiment":
+                config = self._apply_topic_to_experiment_config(stage, config)
             config = self._apply_bindings(config, stage["bindings"])
             if kind == "experiment":
                 config = self._ensure_journal_quality_contract(stage, config)
@@ -1937,6 +2660,7 @@ class ComposerRunner:
                     if isinstance(value, str) and Path(value).is_file() and binding["target"].endswith("results_package"):
                         value = json.loads(Path(value).read_text())
                     _set_path(packet, binding["target"][len("packet."):], value)
+            self._synchronize_research_packet_identity(packet)
             result = ScientificInterpretationRunner(
                 json.loads(model_path.read_text()), deadline_seconds=stage_deadline).run(packet)
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1960,6 +2684,7 @@ class ComposerRunner:
                     if isinstance(value, str) and Path(value).is_file() and binding["target"].endswith("results_package"):
                         value = json.loads(Path(value).read_text())
                     _set_path(packet, binding["target"][len("packet."):], value)
+            self._synchronize_research_packet_identity(packet)
             model = json.loads(model_path.read_text())
             minimums = self._argument_minimums(stage["id"], config)
             result = ResearchArgumentRunner(model, deadline_seconds=stage_deadline).run(
@@ -2012,6 +2737,7 @@ class ComposerRunner:
                     if binding["target"] == "paper_config.interpretation_file":
                         value = self._interpretation_binding_path(value)
                     _set_path(paper_config, binding["target"][len("paper_config."):], value)
+            self._synchronize_research_packet_identity(packet)
             # The paper descriptor is often prepared before discovery.  Once
             # the current survey has been accepted, project its actual source
             # set into the fresh paper input on the first pass as well as on a
@@ -2022,6 +2748,8 @@ class ComposerRunner:
             argument_package_path = config["argument_package_path"]
             argument_package = json.loads(Path(argument_package_path).read_text()) if argument_package_path else None
             paper_config = self._synchronize_paper_figure_arguments(
+                paper_config, packet, argument_package)
+            paper_config, packet = self._synchronize_catalog_paper_inputs(
                 paper_config, packet, argument_package)
             config = self._extend_paper_images(config, packet, paper_config)
             runner = PaperPipelineRunner(packet=packet, model_config=model, paper_config=paper_config,
@@ -2422,6 +3150,13 @@ class ComposerRunner:
                             if outcome not in {"completed", "accepted", "candidate_needs_review",
                                                "research_expansion_required", "review_rejected"}:
                                 raise ValidationError(f"stage {stage_id} did not complete: {outcome}")
+                            if stage["kind"] == "topic_discovery":
+                                # Record the direction at admission time, even
+                                # when a later survey or experiment hold stops
+                                # the mission.  A failed attempt is still an
+                                # attempted direction and must not be selected
+                                # again by the next free-topic mission.
+                                self._record_topic_history(context)
                             for key in self.usage:
                                 value = context.get("usage", {}).get(key, 0)
                                 if type(value) in (int, float) and math.isfinite(value) and value >= 0:
@@ -2590,6 +3325,9 @@ class ComposerRunner:
             "active_research_requests": deepcopy(self.active_research_requests),
             "department_activity": deepcopy(self.department_activity),
             "deadline_extensions": deepcopy(self.deadline_extensions),
+            "topic_history_path": str(self.topic_history_path),
+            "topic_history_scope": self.topic_history_scope,
+            "topic_history_entries": len(self.topic_history.get("entries", [])),
             "started_at_epoch": self.started_epoch, "deadline_at_epoch": self.deadline_epoch,
             "elapsed_seconds": elapsed, "deadline_seconds": self.workflow["time_policy"]["hard_seconds"],
             "release_status": (

@@ -1,0 +1,203 @@
+{
+  "schema_version": "experiment-capability-1",
+  "capability_id": "free_quadrature_peak",
+  "experiment": {
+    "domain": "numerical analysis and reproducible scientific computing",
+    "execution": {
+      "adapter": "local_program",
+      "client": {
+        "command": [
+          "/Users/seungyeop/workspace/Research/Sci-saurus/.runs/experiment-runtime/bin/python",
+          "/Users/seungyeop/workspace/Research/Sci-saurus/scripts/experiments/free_quadrature_peak_study.py"
+        ],
+        "cwd": "/Users/seungyeop/workspace/Research/Sci-saurus",
+        "env": {},
+        "max_bytes": 50000000,
+        "own_process_group": false,
+        "timeout": 180
+      },
+      "environment_files": [
+        "/Users/seungyeop/workspace/Research/Sci-saurus/requirements-experiment.txt",
+        "/Users/seungyeop/workspace/Research/Sci-saurus/scripts/experiments/free_quadrature_peak_study.py"
+      ],
+      "id": "free_quadrature_executor",
+      "input": {},
+      "representative": {
+        "input": {
+          "probe": true
+        }
+      }
+    },
+    "hypothesis": "Simpson will reach the 1e-6 threshold at the smallest n, while midpoint may appear unusually competitive on the symmetric peak if cancellation is present; an asymmetric peak should remove that advantage.",
+    "id": "free_quadrature_peak",
+    "limitations": [
+      "The experiment uses two analytic Gaussian peaks and one constant function, so it does not represent nonsmooth, oscillatory, singular, or high-dimensional integrands.",
+      "Fitted rates summarize the finite n window from 50 to 1000 and are not universal asymptotic theorems.",
+      "The practical threshold and grid are fixed before the calculations and do not optimize each method separately."
+    ],
+    "literature_gate": null,
+    "max_asset_bytes": 20000000,
+    "max_observations": 500,
+    "method": "Evaluate midpoint, composite trapezoidal, and composite Simpson rules on f(x)=exp(-100(x-c)^2) over [0,1] at a fixed grid of even subinterval counts for c=0.5 and c=0.4. Compare each estimate with the analytic integral, fit log-log rates on n from 50 to 1000, inspect signed-error changes, and run f(x)=1 as an exactness control. No adaptive stopping or post hoc grid extension is allowed.",
+    "parameters": {
+      "asymmetric_center": 0.4,
+      "n_values": [
+        10,
+        14,
+        20,
+        30,
+        40,
+        50,
+        70,
+        100,
+        140,
+        200,
+        300,
+        500,
+        700,
+        1000,
+        1400,
+        2000,
+        3000
+      ],
+      "sharpness": 100.0,
+      "symmetric_center": 0.5,
+      "threshold": 1e-06
+    },
+    "primary_outcomes": [
+      {
+        "definition": "Smallest declared n at which midpoint absolute error on the symmetric peak is below 1e-6.",
+        "direction": "lower",
+        "id": "symmetric_midpoint_n_min",
+        "threshold": null,
+        "unit": "subintervals"
+      },
+      {
+        "definition": "Smallest declared n at which trapezoidal absolute error on the symmetric peak is below 1e-6.",
+        "direction": "lower",
+        "id": "symmetric_trapezoid_n_min",
+        "threshold": null,
+        "unit": "subintervals"
+      },
+      {
+        "definition": "Smallest declared n at which Simpson absolute error on the symmetric peak is below 1e-6.",
+        "direction": "lower",
+        "id": "symmetric_simpson_n_min",
+        "threshold": null,
+        "unit": "subintervals"
+      },
+      {
+        "definition": "Fitted log-log convergence exponent for midpoint on the symmetric peak over n=50..1000.",
+        "direction": "higher",
+        "id": "symmetric_midpoint_rate",
+        "threshold": null,
+        "unit": "exponent"
+      },
+      {
+        "definition": "Fitted log-log convergence exponent for trapezoidal rule on the symmetric peak over n=50..1000.",
+        "direction": "higher",
+        "id": "symmetric_trapezoid_rate",
+        "threshold": null,
+        "unit": "exponent"
+      },
+      {
+        "definition": "Fitted log-log convergence exponent for Simpson on the symmetric peak over n=50..1000.",
+        "direction": "higher",
+        "id": "symmetric_simpson_rate",
+        "threshold": null,
+        "unit": "exponent"
+      },
+      {
+        "definition": "Fitted log-log convergence exponent for midpoint on the asymmetric peak over n=50..1000.",
+        "direction": "higher",
+        "id": "asymmetric_midpoint_rate",
+        "threshold": null,
+        "unit": "exponent"
+      },
+      {
+        "definition": "Fitted log-log convergence exponent for Simpson on the asymmetric peak over n=50..1000.",
+        "direction": "higher",
+        "id": "asymmetric_simpson_rate",
+        "threshold": null,
+        "unit": "exponent"
+      },
+      {
+        "definition": "Number of sign changes in the symmetric midpoint signed error over the declared n grid.",
+        "direction": "descriptive",
+        "id": "midpoint_symmetric_sign_changes",
+        "threshold": null,
+        "unit": "count"
+      },
+      {
+        "definition": "Maximum absolute error of all three rules on the constant-function control.",
+        "direction": "lower",
+        "id": "flat_max_abs_error",
+        "threshold": null,
+        "unit": "absolute error"
+      }
+    ],
+    "required_assets": [
+      {
+        "media_types": [
+          "image/png"
+        ],
+        "min_count": 2,
+        "role": "figure"
+      }
+    ],
+    "research_question": "For a smooth sharply localized integrand, when do composite midpoint, trapezoidal, and Simpson rules reach a practical error threshold, and can symmetry change the observed crossover beyond their nominal orders?",
+    "reviewers": [
+      {
+        "focus": "Rule definitions, analytic reference, convergence-rate calculation, and deterministic replay.",
+        "id": "numerical_analysis"
+      },
+      {
+        "focus": "Look for false symmetry explanations, threshold cherry-picking, unsupported asymptotic language, and missing controls.",
+        "id": "adversarial_claims"
+      },
+      {
+        "focus": "Distinguish observed error patterns from mechanisms and state what extra experiment would discriminate explanations.",
+        "id": "scientific_interpretation"
+      }
+    ],
+    "revision": 1,
+    "run_count": 51,
+    "seed": 20260912,
+    "stage_seconds": {
+      "setup": 180,
+      "supervision": 120,
+      "production": 180,
+      "unit_review": 300,
+      "integrated_review": 300,
+      "reassessment": 240
+    },
+    "stopping_rule": "Evaluate exactly the declared n grid and both peak centers plus the constant control; do not add points based on observed errors.",
+    "study_type": "methods_validation",
+    "validation": {
+      "adapter": "local_program",
+      "client": {
+        "command": [
+          "/Users/seungyeop/workspace/Research/Sci-saurus/.runs/experiment-runtime/bin/python",
+          "/Users/seungyeop/workspace/Research/Sci-saurus/scripts/experiments/validate_free_quadrature_peak.py"
+        ],
+        "cwd": "/Users/seungyeop/workspace/Research/Sci-saurus",
+        "env": {},
+        "max_bytes": 12000000,
+        "own_process_group": false,
+        "timeout": 180
+      },
+      "environment_files": [
+        "/Users/seungyeop/workspace/Research/Sci-saurus/requirements-experiment.txt",
+        "/Users/seungyeop/workspace/Research/Sci-saurus/scripts/experiments/validate_free_quadrature_peak.py"
+      ],
+      "id": "free_quadrature_validator",
+      "input": {},
+      "representative": {
+        "input": {
+          "probe": true
+        }
+      }
+    },
+    "project_id": "free-topic-autonomous-20260913t175109z-experiment"
+  }
+}

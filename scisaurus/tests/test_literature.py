@@ -119,6 +119,9 @@ class OpenAlexFixture(BaseHTTPRequestHandler):
             work["abstract_inverted_index"] = {"one": [False]}
         elif mode == "bad-abstract-empty":
             work["abstract_inverted_index"] = {}
+        elif mode == "empty-title":
+            work["title"] = ""
+            items.append(deepcopy(work_fixture("W124")))
         elif mode == "bad-work-id":
             work["id"] = "https://different.example/W123"
         elif mode == "bad-year":
@@ -373,6 +376,15 @@ class TestOpenAlex(unittest.TestCase):
                 self.assertEqual(result["metadata"]["abstract_gaps"],
                                  [{"work_id": "W123", "reason": "provider_abstract_index_invalid"}])
                 self.assertTrue(all(check["outcome"] == "passed" for check in self.inspect(result, self.arguments(mode))))
+
+    def test_empty_provider_title_is_omitted_without_poisoning_the_page(self):
+        result = self.client().run(**self.arguments("empty-title"))
+        self.assertEqual(result["outcome"], "ok")
+        self.assertEqual([work["id"] for work in result["works"]], ["W124"])
+        self.assertEqual(result["metadata"]["omitted_work_gaps"], [
+            {"index": 0, "work_id": "https://openalex.org/W123", "reason": "provider_work_title_empty"}
+        ])
+        self.assertTrue(all(check["outcome"] == "passed" for check in self.inspect(result, self.arguments("empty-title"))))
 
     def test_retry_policy_can_disable_retries_and_redirects_remain_terminal(self):
         for mode, outcome in (("rate-limited", "rate_limited"), ("redirect", "provider_error")):

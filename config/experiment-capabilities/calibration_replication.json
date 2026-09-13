@@ -1,0 +1,279 @@
+{
+  "schema_version": "experiment-capability-1",
+  "capability_id": "calibration_replication",
+  "experiment": {
+    "id": "calibration_replication_wdbc",
+    "revision": 1,
+    "study_type": "replication",
+    "domain": "probabilistic calibration and reproducible tabular classification",
+    "research_question": "When does post-hoc temperature scaling improve held-out probabilistic calibration on a small public tabular classification dataset, and how stable are its gains across repeated calibration and test splits?",
+    "hypothesis": "On the fixed WDBC dataset and logistic baseline, fitting one positive temperature on a separate calibration split will reduce held-out Brier score and ECE on average across 30 repeated stratified splits while preserving ranking; log-loss behavior and the shared-bin ECE outcome will be reported with a separate bootstrap uncertainty estimate.",
+    "method": "Use the official UCI WDBC CSV (569 rows, 30 predictors). For 30 fixed seeds, split each class into 60% training, 20% calibration, and 20% held-out test rows. Standardize from training rows only, fit L2-regularized logistic regression on training rows, fit temperature by calibration-set log loss, and report raw versus scaled probabilities only on untouched test rows. Report the shared raw-probability-bin 10-bin ECE as the like-for-like headline, retain the per-score 10-bin ECE as a binning sensitivity, recalculate all aggregates with an independent standard-library validator.",
+    "parameters": {
+      "dataset_url": "https://archive.ics.uci.edu/ml/machine-learning-databases/breast-cancer-wisconsin/wdbc.data",
+      "dataset_path": "/Users/seungyeop/workspace/Research/Sci-saurus/.runs/proper-calibration-20260911/input/wdbc.data",
+      "dataset_sha256": "d606af411f3e5be8a317a5a8b652b425aaf0ff38ca683d5327ffff94c3695f4a",
+      "split": "stratified 60/20/20 per class",
+      "repetitions": 30,
+      "calibration_method": "positive scalar temperature fitted on calibration log loss",
+      "model": "L2-regularized logistic regression",
+      "realized_split_sizes": {
+        "train": 341,
+        "calibration": 113,
+        "test": 115
+      }
+    },
+    "seed": 20260911,
+    "run_count": 30,
+    "stopping_rule": "Execute exactly 30 fixed splits; do not inspect interim values or extend the run based on observed effects.",
+    "primary_outcomes": [
+      {
+        "id": "test_log_loss_delta",
+        "definition": "Mean held-out calibrated minus raw log loss across 30 splits; negative favors calibration.",
+        "unit": "nats",
+        "direction": "lower",
+        "threshold": null
+      },
+      {
+        "id": "test_brier_delta",
+        "definition": "Mean held-out calibrated minus raw Brier score across 30 splits; negative favors calibration.",
+        "unit": "Brier points",
+        "direction": "lower",
+        "threshold": null
+      },
+      {
+        "id": "test_ece_delta",
+        "definition": "Mean held-out calibrated minus raw 10-bin ECE across 30 splits; negative favors calibration.",
+        "unit": "ECE points",
+        "direction": "lower",
+        "threshold": null
+      },
+      {
+        "id": "rank_invariance_delta",
+        "definition": "Mean rank-preservation sanity delta across held-out predictions; zero is expected because positive temperature scaling is monotone.",
+        "unit": "rank agreement delta",
+        "direction": "descriptive",
+        "threshold": 0.0
+      },
+      {
+        "id": "temperature_median",
+        "definition": "Median positive temperature fitted on the calibration splits.",
+        "unit": "temperature",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_log_loss_delta_p025",
+        "definition": "Empirical 2.5th percentile of split-level calibrated minus raw log_loss deltas across 30 held-out splits; descriptive split-range endpoint, not an inferential confidence interval.",
+        "unit": "nats",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_log_loss_delta_p975",
+        "definition": "Empirical 97.5th percentile of split-level calibrated minus raw log_loss deltas across 30 held-out splits; descriptive split-range endpoint, not an inferential confidence interval.",
+        "unit": "nats",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_brier_delta_p025",
+        "definition": "Empirical 2.5th percentile of split-level calibrated minus raw brier deltas across 30 held-out splits; descriptive split-range endpoint, not an inferential confidence interval.",
+        "unit": "Brier points",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_brier_delta_p975",
+        "definition": "Empirical 97.5th percentile of split-level calibrated minus raw brier deltas across 30 held-out splits; descriptive split-range endpoint, not an inferential confidence interval.",
+        "unit": "Brier points",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_ece_delta_p025",
+        "definition": "Empirical 2.5th percentile of split-level calibrated minus raw ece deltas across 30 held-out splits; descriptive split-range endpoint, not an inferential confidence interval.",
+        "unit": "ECE points",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_ece_delta_p975",
+        "definition": "Empirical 97.5th percentile of split-level calibrated minus raw ece deltas across 30 held-out splits; descriptive split-range endpoint, not an inferential confidence interval.",
+        "unit": "ECE points",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_ece_raw_reference_delta",
+        "definition": "Mean held-out calibrated minus raw 10-bin ECE using raw-probability bin membership for both scores across 30 splits; negative favors calibration.",
+        "unit": "ECE points",
+        "direction": "lower",
+        "threshold": null
+      },
+      {
+        "id": "test_ece_raw_reference_delta_p025",
+        "definition": "Empirical 2.5th percentile of split-level calibrated minus raw ECE deltas using raw-probability bin membership for both scores across 30 splits; descriptive split-range endpoint, not an inferential confidence interval.",
+        "unit": "ECE points",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_ece_raw_reference_delta_p975",
+        "definition": "Empirical 97.5th percentile of split-level calibrated minus raw ECE deltas using raw-probability bin membership for both scores across 30 splits; descriptive split-range endpoint, not an inferential confidence interval.",
+        "unit": "ECE points",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_log_loss_delta_mean_ci_low",
+        "definition": "2.5th percentile of a 100,000-resample percentile bootstrap for the mean test_log_loss_delta across 30 held-out splits; distinct from split-level percentile endpoints.",
+        "unit": "nats",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_log_loss_delta_mean_ci_high",
+        "definition": "97.5th percentile of a 100,000-resample percentile bootstrap for the mean test_log_loss_delta across 30 held-out splits; distinct from split-level percentile endpoints.",
+        "unit": "nats",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_brier_delta_mean_ci_low",
+        "definition": "2.5th percentile of a 100,000-resample percentile bootstrap for the mean test_brier_delta across 30 held-out splits; distinct from split-level percentile endpoints.",
+        "unit": "Brier points",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_brier_delta_mean_ci_high",
+        "definition": "97.5th percentile of a 100,000-resample percentile bootstrap for the mean test_brier_delta across 30 held-out splits; distinct from split-level percentile endpoints.",
+        "unit": "Brier points",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_ece_delta_mean_ci_low",
+        "definition": "2.5th percentile of a 100,000-resample percentile bootstrap for the mean test_ece_delta across 30 held-out splits; distinct from split-level percentile endpoints.",
+        "unit": "ECE points",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_ece_delta_mean_ci_high",
+        "definition": "97.5th percentile of a 100,000-resample percentile bootstrap for the mean test_ece_delta across 30 held-out splits; distinct from split-level percentile endpoints.",
+        "unit": "ECE points",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_ece_raw_reference_delta_mean_ci_low",
+        "definition": "2.5th percentile of a 100,000-resample percentile bootstrap for the mean test_ece_raw_reference_delta across 30 held-out splits; distinct from split-level percentile endpoints.",
+        "unit": "ECE points",
+        "direction": "descriptive",
+        "threshold": null
+      },
+      {
+        "id": "test_ece_raw_reference_delta_mean_ci_high",
+        "definition": "97.5th percentile of a 100,000-resample percentile bootstrap for the mean test_ece_raw_reference_delta across 30 held-out splits; distinct from split-level percentile endpoints.",
+        "unit": "ECE points",
+        "direction": "descriptive",
+        "threshold": null
+      }
+    ],
+    "limitations": [
+      "The study uses one public diagnostic dataset, one logistic model family, and one temperature-scaling implementation.",
+      "Thirty repeated splits describe finite-sample stability; they do not establish a universal calibration guarantee or compare every calibration method.",
+      "The WDBC features are diagnostic measurements, so this analysis does not evaluate clinical deployment or decision utility.",
+      "The percentile endpoints summarize variation across the prespecified splits and are descriptive ranges rather than inferential confidence intervals."
+    ],
+    "literature_gate": null,
+    "execution": {
+      "id": "calibration_executor",
+      "adapter": "local_program",
+      "client": {
+        "command": [
+          "/Users/seungyeop/workspace/Research/Sci-saurus/.runs/experiment-runtime/bin/python",
+          "/Users/seungyeop/workspace/Research/Sci-saurus/scripts/experiments/calibration_replication.py"
+        ],
+        "timeout": 300,
+        "max_bytes": 60000000,
+        "cwd": "/Users/seungyeop/workspace/Research/Sci-saurus",
+        "env": {},
+        "own_process_group": false
+      },
+      "representative": {
+        "input": {
+          "probe": true
+        }
+      },
+      "environment_files": [
+        "/Users/seungyeop/workspace/Research/Sci-saurus/requirements-experiment.txt",
+        "/Users/seungyeop/workspace/Research/Sci-saurus/scripts/experiments/calibration_replication.py"
+      ],
+      "input": {
+        "dataset_path": "/Users/seungyeop/workspace/Research/Sci-saurus/.runs/proper-calibration-20260911/input/wdbc.data",
+        "dataset_sha256": "d606af411f3e5be8a317a5a8b652b425aaf0ff38ca683d5327ffff94c3695f4a"
+      }
+    },
+    "validation": {
+      "id": "calibration_validator",
+      "adapter": "local_program",
+      "client": {
+        "command": [
+          "/Users/seungyeop/workspace/Research/Sci-saurus/.runs/experiment-runtime/bin/python",
+          "/Users/seungyeop/workspace/Research/Sci-saurus/scripts/experiments/validate_calibration_replication.py"
+        ],
+        "timeout": 300,
+        "max_bytes": 60000000,
+        "cwd": "/Users/seungyeop/workspace/Research/Sci-saurus",
+        "env": {},
+        "own_process_group": false
+      },
+      "representative": {
+        "input": {
+          "probe": true
+        }
+      },
+      "environment_files": [
+        "/Users/seungyeop/workspace/Research/Sci-saurus/requirements-experiment.txt",
+        "/Users/seungyeop/workspace/Research/Sci-saurus/scripts/experiments/validate_calibration_replication.py"
+      ],
+      "input": {}
+    },
+    "required_assets": [
+      {
+        "role": "figure",
+        "media_types": [
+          "image/png"
+        ],
+        "min_count": 1
+      }
+    ],
+    "reviewers": [
+      {
+        "id": "scientific_scope",
+        "focus": "Audit the replication question, literature-facing interpretation, hypothesis, external-validity limits, and whether every statement stays within the WDBC study."
+      },
+      {
+        "id": "methods_statistics",
+        "focus": "Audit split isolation, calibration leakage, optimization, metrics, exact replay, independent recalculation, and numerical traceability."
+      },
+      {
+        "id": "ai_smell_adversary",
+        "focus": "Search aggressively for generic AI prose, inflated novelty, unsupported certainty, citation-shaped filler, suspiciously symmetrical claims, and hidden negative or mixed results; require concrete evidence."
+      }
+    ],
+    "stage_seconds": {
+      "setup": 120,
+      "supervision": 60,
+      "production": 300,
+      "unit_review": 240,
+      "integrated_review": 420,
+      "reassessment": 120
+    },
+    "max_observations": 1000,
+    "max_asset_bytes": 10000000
+  }
+}

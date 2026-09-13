@@ -82,6 +82,28 @@ with `reuse_completed: true` is an explicit replay of the pinned output and does
 not perform new topic generation; set it to `false` for a fresh exploration. If the
 scholarly provider fails, topic admission fails rather than fabricating a topic.
 
+An exploratory workflow may declare an `experiment_catalog` containing two to
+sixteen pinned capability descriptors. Each candidate then names one exact
+capability ID, the candidate portfolio must cover the available capabilities,
+and Composer replaces the experiment descriptor with the selected capability
+before dispatch. `topic_exclusions` carries explicit project-local exclusions;
+excluded directions may be retained for comparison but can never be selected.
+The selected topic gets a fresh survey identity and its own search
+question. Broad discovery records are not copied as evidence seeds. During
+initial retrieval, Composer divides the work budget across the seed and blind
+search families and adds a compact exact-concept query when the topic exposes a
+distinctive phrase, so one high-recall query cannot starve independent search
+families.
+
+A free-topic family also has an append-only topic history. Set
+`topic_history_path` to share that history across fresh Composer project
+directories; when omitted, Composer stores it beside the run-family root. The
+history is scoped by objective and capability portfolio, records every admitted
+direction, rotates the most recently used capability when another one is
+available, and rejects an exact or near-identical selected question before the
+survey begins. It is an execution-memory guard, not a novelty claim: scholarly
+novelty still requires the survey and review gates.
+
 Model generation profiles are role-specific. Exploratory topic and blind-search
 roles receive higher temperature and presence diversity by default; interpretation
 and writing use a middle setting; literature mapping, arbitration, and journal

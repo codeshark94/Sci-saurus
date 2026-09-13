@@ -10,7 +10,9 @@ from scisaurus.runtime.topic_discovery import (
     SCHEMA_VERSION,
     STAGE_CONFIG_SCHEMA_VERSION,
     TopicDiscoveryRunner,
+    topic_signature,
     validate_topic_package,
+    validate_topic_novelty,
     validate_topic_stage_config,
 )
 
@@ -145,6 +147,90 @@ class TopicDiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "unavailable capabilities"):
             from scisaurus.runtime.topic_discovery import validate_topic_feasibility
             validate_topic_feasibility(value, {"executables": {}, "python_packages": {}, "configured_stage_kinds": []})
+
+    def test_catalog_bound_candidates_must_name_an_available_experiment(self):
+        value = package("Choose a feasible research direction")
+        for candidate in value["candidates"]:
+            candidate["experiment_capability_id"] = "cap_a"
+        self.assertEqual(
+            validate_topic_package(value, objective=value["objective"], candidate_count=3,
+                                   experiment_capability_ids={"cap_a"}), value)
+        value["candidates"][0]["experiment_capability_id"] = "cap_missing"
+        with self.assertRaisesRegex(ValidationError, "configured experiment capability"):
+            validate_topic_package(value, objective=value["objective"], candidate_count=3,
+                                   experiment_capability_ids={"cap_a"})
+
+    def test_catalog_bound_candidates_must_cover_the_available_portfolio(self):
+        value = package("Choose a feasible research direction")
+        for candidate in value["candidates"]:
+            candidate["experiment_capability_id"] = "cap_a"
+        with self.assertRaisesRegex(ValidationError, "distinct experiment capabilities"):
+            validate_topic_package(value, objective=value["objective"], candidate_count=3,
+                                   experiment_capability_ids={"cap_a", "cap_b", "cap_c"},
+                                   require_capability_coverage=True)
+        value["candidates"][1]["experiment_capability_id"] = "cap_b"
+        value["candidates"][2]["experiment_capability_id"] = "cap_c"
+        validate_topic_package(value, objective=value["objective"], candidate_count=3,
+                               experiment_capability_ids={"cap_a", "cap_b", "cap_c"},
+                               require_capability_coverage=True)
+
+    def test_exploration_history_cannot_select_an_excluded_direction(self):
+        value = package("Choose a feasible research direction")
+        for candidate in value["candidates"]:
+            candidate["experiment_capability_id"] = "cap_a"
+        with self.assertRaisesRegex(ValidationError, "excluded"):
+            validate_topic_package(value, objective=value["objective"], candidate_count=3,
+                                   experiment_capability_ids={"cap_a"},
+                                   excluded_capability_ids={"cap_a"})
+
+    def test_topic_history_rejects_same_question_with_new_identifier(self):
+        value = package("Choose a feasible research direction")
+        selected = value["candidates"][1]
+        prior = {
+            "topic_id": "old_direction",
+            "title": selected["title"],
+            "domain": selected["domain"],
+            "research_question": selected["research_question"],
+            "signature": topic_signature(selected),
+        }
+        selected["id"] = "new_direction"
+        with self.assertRaisesRegex(ValidationError, "too similar|repeats"):
+            validate_topic_novelty(selected, {"entries": [prior]})
+
+    def test_topic_history_keeps_different_questions_in_same_portfolio(self):
+        value = package("Choose a feasible research direction")
+        prior = {
+            "topic_id": "old_direction",
+            "title": "Robust estimator under contamination",
+            "domain": "robust statistics",
+            "research_question": "Does a median-of-means estimator reduce contaminated tail error?",
+            "experiment_capability_id": "robust_mean",
+        }
+        candidate = {
+            **value["candidates"][0],
+            "id": "different_direction",
+            "title": "Clean-data efficiency penalty",
+            "domain": "robust statistics",
+            "research_question": "What is the finite-sample variance cost of median-of-means on clean Gaussian data?",
+            "experiment_capability_id": "robust_mean",
+        }
+        self.assertTrue(validate_topic_novelty(candidate, {"entries": [prior]}))
+
+    def test_runner_retries_instead_of_accepting_a_historical_repeat(self):
+        objective = "Choose a feasible research direction"
+        selected = package(objective)["candidates"][1]
+        history = {"entries": [{
+            "topic_id": "old_direction", "title": selected["title"],
+            "domain": selected["domain"], "research_question": selected["research_question"],
+            "signature": topic_signature(selected),
+        }]}
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", FakeModel):
+            with self.assertRaisesRegex(ValidationError, "too similar|repeats"):
+                TopicDiscoveryRunner({
+                    "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                    "timeout_seconds": 1, "max_output_tokens": 4096,
+                }).run(objective, candidate_count=3, bibliography=False,
+                       runtime_context={"topic_history": history}, max_attempts=1)
 
     def test_provider_failure_does_not_turn_into_a_fabricated_topic(self):
         class FailedOpenAlex(FakeOpenAlex):

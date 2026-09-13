@@ -825,7 +825,7 @@ class SurveyRunner(ExecutionRuntime):
         return added
 
     def _bibliographic_call(self, operation, *, role, query=None, work_id=None, cursor=None,
-                            plan_ref=None, admission="discovery"):
+                            plan_ref=None, admission="discovery", result_limit=None):
         self._ensure_active()
         # The discovery/expansion budget must not consume the calls reserved
         # for the independent challenge.  ``challenge_reserve`` already
@@ -840,8 +840,13 @@ class SurveyRunner(ExecutionRuntime):
         if self.api_calls >= api_limit:
             self.gaps.append({"kind": "api_call_limit", "operation": operation, "query": query, "work_id": work_id})
             return None
+        if result_limit is None:
+            result_limit = self.bounds["results_per_query"]
+        if type(result_limit) is not int or result_limit < 1:
+            raise ValidationError("bibliographic result_limit must be a positive integer")
+        result_limit = min(result_limit, self.bounds["results_per_query"])
         arguments = {"operation": operation, "query": query, "work_id": work_id,
-                     "limit": self.bounds["results_per_query"], "cursor": cursor}
+                     "limit": result_limit, "cursor": cursor}
         if self.bibliography_mode == "crossref":
             if operation == "citing":
                 self.gaps.append({"kind": "bibliography_fallback_unsupported", "operation": operation,
@@ -881,7 +886,25 @@ class SurveyRunner(ExecutionRuntime):
         self._checkpoint("literature_captured", force=True)
         return body
 
-    def _search(self, queries, role, plan_ref=None, *, admission="discovery"):
+    @staticmethod
+    def _balanced_query_limit(work_slots, query_count, provider_limit):
+        """Reserve discovery capacity for every independent query family.
+
+        A provider's first broad query can return enough records to fill the
+        whole work budget.  Later terminology families then appear to have
+        found nothing even when they returned distinct records.  A per-query
+        ceiling gives each family a bounded chance to contribute; remaining
+        capacity can still be used by expansion and challenge passes.
+        """
+        if type(provider_limit) is not int or provider_limit < 1:
+            raise ValidationError("provider_limit must be a positive integer")
+        if type(work_slots) is not int or work_slots < 1:
+            return 1
+        if type(query_count) is not int or query_count < 1:
+            return provider_limit
+        return max(1, min(provider_limit, (work_slots + query_count - 1) // query_count))
+
+    def _search(self, queries, role, plan_ref=None, *, admission="discovery", result_limit=None):
         seen = ({normalized(row["request"]["query"]) for row in self.search_log
                  if (row.get("request", {}).get("operation") == "search"
                      and row["request"].get("query")
@@ -892,7 +915,7 @@ class SurveyRunner(ExecutionRuntime):
                 continue
             seen.add(normalized(query))
             self._bibliographic_call("search", role=role, query=query, plan_ref=plan_ref,
-                                     admission=admission)
+                                     admission=admission, result_limit=result_limit)
 
     def _expand(self):
         quiet = 0
@@ -924,7 +947,7 @@ class SurveyRunner(ExecutionRuntime):
         # candidates so a stale seed route cannot cap the entire full-text
         # campaign.  The route remains a normal bounded source capture; only
         # its provenance is marked locally as auto-discovered.
-        if self.bibliography_mode == "crossref":
+        if self.bibliography_mode == "crossref" or not routes:
             known = {route.get("work_id") for route, _ in routes if isinstance(route, dict)}
             for work in self.works.values():
                 wid = work.get("work_id")
@@ -1743,9 +1766,26 @@ class SurveyRunner(ExecutionRuntime):
                         for wid in self.score["seed_work_ids"]:
                             if wid not in self.aliases:
                                 self._bibliographic_call("work", role="research.seed-reader", work_id=wid)
-                        self._search(self.score["seed_queries"], "research.seed-searcher", self.protocol["artifact_ref"])
-                        for role, queries, ref in plans:
-                            self._search(queries, role, ref)
+                        # Do not let the first broad seed query consume the
+                        # entire discovery work budget.  The seed search and
+                        # each blind planner represent independent terminology
+                        # families; reserve a small, deterministic slice for
+                        # every family before expansion or challenge work.
+                        search_families = [
+                            ("research.seed-searcher", self.score["seed_queries"], self.protocol["artifact_ref"]),
+                            *plans,
+                        ]
+                        query_count = sum(
+                            len({normalized(query) for query in queries if isinstance(query, str) and query.strip()})
+                            for _, queries, _ in search_families)
+                        discovery_slots = max(
+                            1,
+                            self.bounds["max_works"] - self.bounds.get("challenge_reserve", 0) - len(self.works),
+                        )
+                        family_limit = self._balanced_query_limit(
+                            discovery_slots, query_count, self.bounds["results_per_query"])
+                        for role, queries, ref in search_families:
+                            self._search(queries, role, ref, result_limit=family_limit)
                         self._expand()
                         self._full_texts()
                         self._accept_survey()

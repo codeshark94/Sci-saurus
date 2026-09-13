@@ -262,6 +262,12 @@ class TestSurveyRunner(unittest.TestCase):
         SurveyHTTPFixture.refresh_target = False
         SurveyHTTPFixture.rate_limit_once = None
 
+    def test_balanced_query_limit_preserves_capacity_for_independent_families(self):
+        from scisaurus.runtime.survey import SurveyRunner
+        self.assertEqual(SurveyRunner._balanced_query_limit(21, 12, 50), 2)
+        self.assertEqual(SurveyRunner._balanced_query_limit(10, 1, 2), 2)
+        self.assertEqual(SurveyRunner._balanced_query_limit(0, 3, 50), 1)
+
     def runtime(self, config=None, *, on_progress=None, resume_policy=None):
         runner = SurveyRunner(self.root / "run", config or survey_config(self.endpoint),
                               on_progress=on_progress, resume_policy=resume_policy)

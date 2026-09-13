@@ -354,7 +354,14 @@ def _inspect_openalex(profile, result, params, *, representative=True):
                                           and not any(ord(c) < 32 for c in cursor)))
                 require(cursor is None or (bool(items) and cursor != (expected["cursor"] or "*")))
                 require(items or expected["cursor"] not in (None, "*") or count == 0)
-            for item in items:
+            omitted_work_gaps = []
+            for index, item in enumerate(items):
+                if expected["operation"] != "work" and literature._is_omittable_work(item):
+                    omitted_work_gaps.append({
+                        "index": index, "work_id": item["id"],
+                        "reason": "provider_work_title_empty",
+                    })
+                    continue
                 require(isinstance(item, dict))
                 identity, title, year = identifier(item["id"]), item["title"], item["publication_year"]
                 require(isinstance(title, str) and bool(title.strip()))
@@ -409,7 +416,8 @@ def _inspect_openalex(profile, result, params, *, representative=True):
             require(type(metadata.get("count")) is int and metadata["count"] == count
                     and metadata.get("next_cursor") == cursor and type(metadata.get("has_more")) is bool
                     and metadata["has_more"] == (cursor is not None)
-                    and metadata.get("abstract_gaps", []) == expected_abstract_gaps)
+                    and metadata.get("abstract_gaps", []) == expected_abstract_gaps
+                    and metadata.get("omitted_work_gaps", []) == omitted_work_gaps)
             require(canonical_bytes(result.get("works")) == canonical_bytes(expected_works))
             require(canonical_bytes(result.get("sources")) == canonical_bytes(expected_sources))
             expected_text = "\n\n".join(work["title"] + " — https://openalex.org/" + work["id"]

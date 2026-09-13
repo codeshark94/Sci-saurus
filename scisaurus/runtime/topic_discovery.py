@@ -21,7 +21,7 @@ import time
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.models import ModelClient, resolve_model_config
+from scisaurus.runtime.models import MAX_PROVIDER_SEED, ModelClient, resolve_model_config
 from scisaurus.runtime.literature import OpenAlexClient
 from scisaurus.runtime.retrieval import CrossrefClient
 from scisaurus.runtime.scientific_surface import find_control_leaks
@@ -29,6 +29,7 @@ from scisaurus.runtime.scientific_surface import find_control_leaks
 
 SCHEMA_VERSION = "topic-discovery-1"
 STAGE_CONFIG_SCHEMA_VERSION = "topic-discovery-config-1"
+TOPIC_HISTORY_SCHEMA_VERSION = "topic-history-1"
 RECENT_YEAR_WINDOW = 4
 CANDIDATE_FIELDS = {
     "id", "title", "domain", "research_question", "scope", "search_queries",
@@ -36,8 +37,17 @@ CANDIDATE_FIELDS = {
     "capability_requirements",
 }
 LEGACY_CANDIDATE_FIELDS = CANDIDATE_FIELDS - {"capability_requirements"}
+CATALOG_CANDIDATE_FIELDS = CANDIDATE_FIELDS | {"experiment_capability_id"}
+CATALOG_LEGACY_CANDIDATE_FIELDS = LEGACY_CANDIDATE_FIELDS | {"experiment_capability_id"}
 CAPABILITY_FIELDS = {"executables", "python_packages", "stage_kinds"}
 KNOWN_STAGE_KINDS = {"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"}
+
+_TOPIC_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "does", "do", "for", "from",
+    "how", "in", "into", "is", "of", "on", "or", "relative", "the", "their", "this", "to",
+    "under", "versus", "what", "when", "which", "with", "without", "using", "across", "between",
+    "within", "will", "may", "than", "that", "these", "those", "over", "same", "one", "two",
+}
 
 
 def _text(value, name, *, public=True):
@@ -104,7 +114,11 @@ def validate_topic_stage_config(value):
     return deepcopy(value)
 
 
-def validate_topic_package(value, *, objective=None, candidate_count=None):
+def validate_topic_package(value, *, objective=None, candidate_count=None,
+                           experiment_capability_ids=None,
+                           require_capability_coverage=False,
+                           excluded_capability_ids=None,
+                           excluded_topic_ids=None, topic_history=None):
     """Validate a complete topic proposal before it enters the survey stage."""
     fields = {"schema_version", "objective", "candidates", "selected_id", "selection_rationale"}
     if not isinstance(value, dict) or set(value) != fields:
@@ -119,9 +133,13 @@ def validate_topic_package(value, *, objective=None, candidate_count=None):
             or candidate_count is not None and len(candidates) != candidate_count):
         raise ValidationError("topic discovery requires the configured number of candidates")
     ids = set()
+    capability_ids = set(experiment_capability_ids or [])
+    excluded_capabilities = set(excluded_capability_ids or [])
+    excluded_topics = set(excluded_topic_ids or [])
     for candidate in candidates:
         if (not isinstance(candidate, dict)
-                or set(candidate) not in (CANDIDATE_FIELDS, LEGACY_CANDIDATE_FIELDS)):
+                or set(candidate) not in (CANDIDATE_FIELDS, LEGACY_CANDIDATE_FIELDS,
+                                          CATALOG_CANDIDATE_FIELDS, CATALOG_LEGACY_CANDIDATE_FIELDS)):
             raise ValidationError("topic candidate has an invalid shape")
         _identifier(candidate["id"], "topic candidate id")
         if candidate["id"] in ids:
@@ -133,12 +151,130 @@ def validate_topic_package(value, *, objective=None, candidate_count=None):
         _strings(candidate["search_queries"], "topic candidate search_queries", minimum=3, maximum=8)
         if "capability_requirements" in candidate:
             _validate_capability_requirements(candidate["capability_requirements"])
+        if capability_ids:
+            selected_capability = candidate.get("experiment_capability_id")
+            if not isinstance(selected_capability, str) or selected_capability not in capability_ids:
+                raise ValidationError(
+                    "topic candidate must select one configured experiment capability")
+    if capability_ids and require_capability_coverage:
+        observed = {candidate.get("experiment_capability_id") for candidate in candidates}
+        required = min(len(capability_ids), len(candidates))
+        if len(observed) < required:
+            missing = sorted(capability_ids - observed)
+            raise ValidationError(
+                f"topic candidates must cover {required} distinct experiment capabilities; "
+                f"missing={missing}")
     _identifier(value["selected_id"], "selected topic id")
     if value["selected_id"] not in ids:
         raise ValidationError("selected topic is not one of the candidates")
+    selected = next(candidate for candidate in candidates if candidate["id"] == value["selected_id"])
+    if selected["id"] in excluded_topics:
+        raise ValidationError("selected topic is excluded by the exploration history")
+    if excluded_capabilities and selected.get("experiment_capability_id") in excluded_capabilities:
+        raise ValidationError("selected experiment capability is excluded by the exploration history")
+    if topic_history:
+        validate_topic_novelty(selected, topic_history)
     _text(value["selection_rationale"], "topic selection rationale")
     canonical_bytes(value)
     return deepcopy(value)
+
+
+def _topic_tokens(value):
+    """Return content-bearing tokens used for a conservative repeat check.
+
+    This is deliberately a small lexical guard, not a novelty or plagiarism
+    detector.  It catches a model reusing the same question with a new title
+    while leaving scientific novelty to the literature and reviewer stages.
+    Numbers are normalized so changing a threshold or a split count does not
+    make an otherwise identical direction look new.
+    """
+    text = value if isinstance(value, str) else ""
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9]*", text.casefold())
+    return {"<number>" if token.isdigit() else token
+            for token in tokens if token not in _TOPIC_STOPWORDS and len(token) > 2}
+
+
+def topic_signature(candidate):
+    """Create a stable, reader-independent signature for a topic direction."""
+    if not isinstance(candidate, dict):
+        raise ValidationError("topic signature requires a candidate object")
+    title = candidate.get("title", "")
+    question = candidate.get("research_question", "")
+    domain = candidate.get("domain", "")
+    normalized_question = " ".join(str(question).casefold().split())
+    normalized_title = " ".join(str(title).casefold().split())
+    combined = "\n".join((normalized_title, normalized_question, str(domain).casefold()))
+    return {
+        "question": normalized_question,
+        "title": normalized_title,
+        "question_tokens": sorted(_topic_tokens(question)),
+        "title_tokens": sorted(_topic_tokens(title)),
+        "content_tokens": sorted(_topic_tokens(combined)),
+        "fingerprint": hashlib.sha256(combined.encode("utf-8")).hexdigest(),
+    }
+
+
+def _topic_history_entries(topic_history):
+    if isinstance(topic_history, dict):
+        entries = topic_history.get("entries", [])
+    else:
+        entries = topic_history
+    return [item for item in entries if isinstance(item, dict)] if isinstance(entries, list) else []
+
+
+def _jaccard(left, right):
+    left, right = set(left), set(right)
+    union = left | right
+    return len(left & right) / len(union) if union else 0.0
+
+
+def _topic_repeat_score(candidate, prior):
+    """Score likely reuse of a previous selected direction in [0, 1]."""
+    current = topic_signature(candidate)
+    previous = prior.get("signature") if isinstance(prior, dict) else None
+    if not isinstance(previous, dict):
+        previous = topic_signature(prior)
+    if current["fingerprint"] == previous.get("fingerprint"):
+        return 1.0
+    if current["question"] and current["question"] == previous.get("question"):
+        return 1.0
+    question_score = _jaccard(current["question_tokens"], previous.get("question_tokens", []))
+    title_score = _jaccard(current["title_tokens"], previous.get("title_tokens", []))
+    content_score = _jaccard(current["content_tokens"], previous.get("content_tokens", []))
+    same_capability = (
+        candidate.get("experiment_capability_id") is not None
+        and candidate.get("experiment_capability_id") == prior.get("experiment_capability_id")
+    )
+    # A repeated method/comparison tends to retain several content anchors
+    # even when the model changes the prose.  Require both a high question
+    # overlap or several shared anchors and the same pinned capability; this
+    # avoids rejecting genuinely different questions in one capability.
+    shared_anchors = len(set(current["title_tokens"]) & set(previous.get("title_tokens", [])))
+    if question_score >= 0.78:
+        return question_score
+    if same_capability and shared_anchors >= 3 and content_score >= 0.32:
+        return max(content_score, 0.78)
+    return max(question_score, title_score * 0.85, content_score * 0.55)
+
+
+def validate_topic_novelty(candidate, topic_history, *, threshold=0.78):
+    """Reject a selected direction that repeats a recorded project direction.
+
+    History is an execution-memory guard.  It never proves novelty and it does
+    not inspect external literature; it only prevents a free-topic Composer
+    from silently spending another mission on the same direction.
+    """
+    if type(threshold) not in (int, float) or not math.isfinite(threshold) or not 0 < threshold <= 1:
+        raise ValidationError("topic novelty threshold must be finite and in (0, 1]")
+    current_id = candidate.get("id") if isinstance(candidate, dict) else None
+    for prior in _topic_history_entries(topic_history):
+        if current_id and current_id == prior.get("topic_id"):
+            raise ValidationError("selected topic repeats a previously attempted direction")
+        score = _topic_repeat_score(candidate, prior)
+        if score >= threshold:
+            raise ValidationError(
+                "selected topic is too similar to a previously attempted direction")
+    return True
 
 
 def validate_topic_feasibility(package, runtime_context):
@@ -152,6 +288,15 @@ def validate_topic_feasibility(package, runtime_context):
     if not isinstance(runtime_context, dict):
         return {"status": "not_checked", "unavailable": []}
     selected = next(item for item in package["candidates"] if item["id"] == package["selected_id"])
+    catalog = runtime_context.get("experiment_catalog") or []
+    if catalog:
+        allowed = {item.get("id") for item in catalog if isinstance(item, dict)}
+        if selected.get("experiment_capability_id") not in allowed:
+            raise ValidationError(
+                "selected topic must bind to one configured experiment capability")
+        excluded = set((runtime_context.get("topic_exclusions") or {}).get("capability_ids", []))
+        if selected.get("experiment_capability_id") in excluded:
+            raise ValidationError("selected topic uses a capability excluded by the exploration history")
     requirements = selected.get("capability_requirements")
     if requirements is None:
         return {"status": "legacy_unchecked", "unavailable": []}
@@ -186,59 +331,107 @@ SYSTEM = (
     "Prefer questions that can be investigated with public sources and a bounded reproducible experiment "
     "using the declared runtime capabilities. Reject directions that require unavailable instruments, "
     "private cohorts, or unconfigured software. "
+    "When runtime_context includes an experiment_catalog, every candidate must name one exact capability ID "
+    "and align its phenomenon, comparison, data boundary, method, and primary outcomes with that capability. "
     "When runtime_context includes an experiment_contract, the selected candidate must be directly executable "
-    "under that contract: align its phenomenon, comparison, data boundary, method, and primary outcomes with "
-    "the declared experiment rather than silently proposing a different study. "
+    "under that contract rather than silently proposing a different study. "
     "Keep scope explicit, include a way the idea could be disproved, and select one candidate only after "
     "comparing the alternatives. Use reader-facing scientific language; do not mention workflow state, "
     "artifacts, validators, hashes, acceptance, or internal control terms. Return JSON only. "
     "For capability_requirements, copy exact names from the supplied runtime inventory and leave a list empty "
-    "when a requirement is unnecessary."
+    "when a requirement is unnecessary. If topic_exclusions are supplied, retain an excluded direction only as "
+    "a rejected alternative and never select it."
 )
 
 
 def topic_prompt(objective, candidate_count, *, recent_papers=None, runtime_context=None):
+    runtime_context = runtime_context or {}
+    candidate_contract = {
+        "id": "lowercase identifier",
+        "title": "short working title",
+        "domain": "research domain",
+        "research_question": "one testable question",
+        "scope": "population, system, data, or phenomenon boundary",
+        "search_queries": "3 to 8 concrete literature search strings",
+        "why_promising": "why this is worth investigating without claiming novelty",
+        "disconfirmation_test": "what result or prior work would make this direction unhelpful",
+        "feasibility": "why the declared runtime can execute the study within the mission budget",
+        "resource_plan": "data, programs, tools, and compute the study would use",
+        "capability_requirements": {
+            "executables": "exact names from runtime_context.executables",
+            "python_packages": "exact names from runtime_context.python_packages",
+            "stage_kinds": "exact names from runtime_context.configured_stage_kinds",
+        },
+    }
+    constraints = [
+        "use recent_papers as inspiration and retain their provided source identifiers in the candidate rationale when relevant",
+        "candidate questions must differ in mechanism or empirical comparison, not just wording",
+        "cover at least three distinct axes across the candidates when the objective and runtime permit: mechanism, data regime, comparison, measurement, or theory",
+        "do not collapse every candidate onto the first familiar method merely because it is easiest to explain",
+        "search queries must be usable as ordinary scholarly search strings",
+        "capability_requirements must list only exact names from the supplied runtime inventory",
+        "never invent a citation, dataset, result, or prior-work claim",
+    ]
+    catalog = runtime_context.get("experiment_catalog") or []
+    if catalog:
+        candidate_contract["experiment_capability_id"] = (
+            "exact id copied from runtime_context.experiment_catalog")
+        constraints.append(
+            "every candidate must copy one exact experiment_capability_id from runtime_context.experiment_catalog and remain executable under that capability")
+        capability_ids = [item.get("id") for item in catalog
+                          if isinstance(item, dict) and isinstance(item.get("id"), str)]
+        if len(capability_ids) > 1:
+            constraints.append(
+                "cover every listed experiment capability at least once when candidate_count allows; "
+                "do not put all candidates in the first or most familiar capability")
+            constraints.append(
+                "the candidate list is a portfolio: preserve distinct capabilities even when the recent-paper sample favors one domain")
+        exclusions = runtime_context.get("topic_exclusions") or {}
+        excluded_caps = exclusions.get("capability_ids", []) if isinstance(exclusions, dict) else []
+        excluded_topics = exclusions.get("topic_ids", []) if isinstance(exclusions, dict) else []
+        if excluded_caps or excluded_topics:
+            constraints.append(
+                "do not select any capability or topic listed in topic_exclusions; excluded directions may remain only as alternatives")
+        if (runtime_context.get("topic_history") or {}).get("entries"):
+            constraints.append(
+                "avoid repeating any previously attempted direction in topic_history; select a materially different question or capability")
+    elif runtime_context.get("experiment_contract"):
+        constraints.append(
+            "the selected candidate must be directly executable under experiment_contract without changing the declared experiment")
     return json.dumps({
         "assignment": "free_topic_discovery",
         "principal_objective": objective,
         "candidate_count": candidate_count,
         "recent_papers": recent_papers or [],
-        "runtime_context": runtime_context or {},
+        "runtime_context": runtime_context,
         "output_contract": {
             "schema_version": SCHEMA_VERSION,
             "objective": "copy principal_objective exactly",
             "candidates": "list of distinct candidate objects",
-            "candidate": {
-                "id": "lowercase identifier",
-                "title": "short working title",
-                "domain": "research domain",
-                "research_question": "one testable question",
-                "scope": "population, system, data, or phenomenon boundary",
-                "search_queries": "3 to 8 concrete literature search strings",
-                "why_promising": "why this is worth investigating without claiming novelty",
-                "disconfirmation_test": "what result or prior work would make this direction unhelpful",
-                "feasibility": "why the declared runtime can execute the study within the mission budget",
-                "resource_plan": "data, programs, tools, and compute the study would use",
-                "capability_requirements": {
-                    "executables": "exact names from runtime_context.executables",
-                    "python_packages": "exact names from runtime_context.python_packages",
-                    "stage_kinds": "stage kinds from runtime_context.configured_stage_kinds",
-                },
-            },
+            "candidate": candidate_contract,
             "selected_id": "one candidate id",
             "selection_rationale": "compare evidence availability, testability, and disconfirmation risk",
         },
-        "constraints": [
-            "use recent_papers as inspiration and retain their provided source identifiers in the candidate rationale when relevant",
-            "candidate questions must differ in mechanism or empirical comparison, not just wording",
-            "cover at least three distinct axes across the candidates when the objective and runtime permit: mechanism, data regime, comparison, measurement, or theory",
-            "do not collapse every candidate onto the first familiar method merely because it is easiest to explain",
-            "search queries must be usable as ordinary scholarly search strings",
-            "capability_requirements must list only exact available executable, Python package, and stage-kind names",
-            "if experiment_contract is present, select the candidate that can be answered by it without changing the declared experiment",
-            "never invent a citation, dataset, result, or prior-work claim",
-        ],
+        "constraints": constraints,
     }, ensure_ascii=False, sort_keys=True)
+
+
+def _capability_coverage_plan(runtime_context, candidate_count, seed):
+    """Return a seeded portfolio plan for a catalog-backed intake.
+
+    The model still invents the scientific question and comparison.  The plan
+    only prevents a deterministic provider from collapsing every candidate
+    onto the first executable template, which was the failure mode that made a
+    supposedly free-topic mission repeat one old domain.
+    """
+    catalog = (runtime_context or {}).get("experiment_catalog") or []
+    ids = [item.get("id") for item in catalog
+           if isinstance(item, dict) and isinstance(item.get("id"), str)]
+    if len(ids) < 2:
+        return []
+    rng = Random(seed if type(seed) is int and seed >= 0 else 0)
+    rng.shuffle(ids)
+    return [ids[index % len(ids)] for index in range(candidate_count)]
 
 
 class TopicDiscoveryRunner:
@@ -274,10 +467,15 @@ class TopicDiscoveryRunner:
         last_error = None
         usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
         attempts = itertools.count() if repair_mode == "until_deadline" else range(max_attempts)
+        catalog_ids = {
+            item.get("id") for item in (runtime_context or {}).get("experiment_catalog", [])
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
         for attempt in attempts:
+            generation_seed = (sampling_seed + attempt) % MAX_PROVIDER_SEED if sampling_seed is not None else None
             config = resolve_model_config(
                 self.model_config, role="topic_discovery",
-                overrides=({"seed": sampling_seed} if sampling_seed is not None else None),
+                overrides=({"seed": generation_seed} if generation_seed is not None else None),
             )
             if deadline is not None:
                 remaining = deadline - time.monotonic()
@@ -291,6 +489,14 @@ class TopicDiscoveryRunner:
             prompt = topic_prompt(objective, candidate_count,
                                   recent_papers=recent_papers,
                                   runtime_context=runtime_context)
+            if catalog_ids:
+                payload = json.loads(prompt)
+                payload["capability_coverage_plan"] = _capability_coverage_plan(
+                    runtime_context, candidate_count, generation_seed)
+                payload["capability_coverage_requirement"] = (
+                    f"Use at least {min(len(catalog_ids), candidate_count)} distinct capability IDs "
+                    "across the candidate list; preserve every listed ID when candidate_count allows.")
+                prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             if previous is not None:
                 prompt = json.dumps({
                     "assignment": "repair_invalid_topic_discovery",
@@ -298,6 +504,13 @@ class TopicDiscoveryRunner:
                     "candidate_count": candidate_count,
                     "recent_papers": recent_papers,
                     "runtime_context": runtime_context or {},
+                    "required_capability_ids": sorted(catalog_ids),
+                    "excluded_capability_ids": sorted((runtime_context or {}).get("topic_exclusions", {}).get("capability_ids", [])),
+                    "excluded_topic_ids": sorted((runtime_context or {}).get("topic_exclusions", {}).get("topic_ids", [])),
+                    "topic_history": (runtime_context or {}).get("topic_history", {}),
+                    "capability_coverage_requirement": (
+                        f"Use at least {min(len(catalog_ids), candidate_count)} distinct capability IDs "
+                        "across the candidates; replace a duplicate with a genuinely different executable direction."),
                     "candidate_response": previous[:40000],
                     "validation_error": str(last_error),
                     "instruction": "Return a complete package satisfying the exact contract; preserve valid candidates and repair only the violations.",
@@ -312,7 +525,13 @@ class TopicDiscoveryRunner:
                 continue
             try:
                 package = result.json_object()
-                validate_topic_package(package, objective=objective, candidate_count=candidate_count)
+                validate_topic_package(
+                    package, objective=objective, candidate_count=candidate_count,
+                    experiment_capability_ids=catalog_ids,
+                    require_capability_coverage=bool(catalog_ids),
+                    excluded_capability_ids=(runtime_context or {}).get("topic_exclusions", {}).get("capability_ids", []),
+                    excluded_topic_ids=(runtime_context or {}).get("topic_exclusions", {}).get("topic_ids", []),
+                    topic_history=(runtime_context or {}).get("topic_history"))
                 if runtime_context is not None:
                     feasibility = validate_topic_feasibility(package, runtime_context)
                     if feasibility["status"] == "legacy_unchecked":
@@ -333,6 +552,7 @@ class TopicDiscoveryRunner:
                 "feasibility_check": feasibility,
                 "recent_papers": recent_papers,
                 "sampling_seed": sampling_seed,
+                "generation_seed": generation_seed,
                 "sampling_trace": sampling_trace,
                 "usage": usage,
             }
@@ -477,9 +697,10 @@ class TopicDiscoveryRunner:
         pool = recent or sorted(records, key=lambda item: item.get("year") if type(item.get("year")) is int else 0,
                                  reverse=True)
         if sampling_seed is None:
-            sampling_seed = int(hashlib.sha256(objective.encode("utf-8")).hexdigest()[:16], 16)
-        if type(sampling_seed) is not int or sampling_seed < 0:
-            raise ValidationError("topic sampling_seed must be a nonnegative integer")
+            sampling_seed = int(hashlib.sha256(objective.encode("utf-8")).hexdigest()[:16], 16) % MAX_PROVIDER_SEED
+        if type(sampling_seed) is not int or not 0 <= sampling_seed <= MAX_PROVIDER_SEED:
+            raise ValidationError(
+                f"topic sampling_seed must be an integer between 0 and {MAX_PROVIDER_SEED}")
         rng = Random(sampling_seed)
         if len(pool) > 24:
             pool = rng.sample(pool, 24)
@@ -492,6 +713,7 @@ class TopicDiscoveryRunner:
 
 
 __all__ = [
-    "SCHEMA_VERSION", "STAGE_CONFIG_SCHEMA_VERSION", "RECENT_YEAR_WINDOW", "TopicDiscoveryRunner",
+    "SCHEMA_VERSION", "STAGE_CONFIG_SCHEMA_VERSION", "TOPIC_HISTORY_SCHEMA_VERSION",
+    "RECENT_YEAR_WINDOW", "TopicDiscoveryRunner", "topic_signature", "validate_topic_novelty",
     "validate_topic_stage_config", "validate_topic_package", "validate_topic_feasibility", "topic_prompt",
 ]

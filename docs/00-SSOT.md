@@ -249,6 +249,14 @@ checkpoints and run reports. This realizes organic operation without granting
 any department unrestricted artifact overwrite, host execution, or authority to
 change the Principal's intent.
 
+**D63 — Free-topic exploration remembers attempted directions.** A Composer
+family maintains an append-only topic history across fresh project directories.
+The intake receives prior selected questions and capability usage, rotates the
+most recently used executable capability when an alternative is available, and
+rejects exact or near-identical selected directions before literature work is
+admitted. This memory controls repeated execution only; it never substitutes
+for a scholarly novelty claim or the survey and review gates.
+
 ### 3.3 Effective interpretation of earlier rules
 
 | Earlier wording | Effective interpretation |
@@ -398,3 +406,4 @@ These defaults make the blueprint internally concrete; they do not falsely mark 
 | v1.3 | D48; research-argument discovery and adjudication become a mandatory pre-composition gate with evidence-bound hypotheses, discriminating tests, and figure/table jobs |
 | v1.4 | D60–D61; sampled capability-aware free-topic intake and deadline-governed Composer continuation for executable research requests |
 | v1.5 | D62; durable project department charters, inbox/work-order backlog, autonomous activation/resolution, and template-as-default organization runtime |
+| v1.6 | D63; append-only cross-run topic memory, capability rotation, and selected-direction novelty gate |
