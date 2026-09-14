@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 from scisaurus.runtime.composer import ComposerRunner, read_interim_report, validate_workflow
 from scisaurus.runtime.departments import default_organization
+from scisaurus.runtime.literature import ProviderCooldownError
 from scisaurus.core.errors import ValidationError
 
 
@@ -204,6 +206,34 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(result["blockers"][0]["attempts"], 2)
             self.assertEqual(sum(item["action"] == "retry_stage" for item in result["feedback"]), 1)
 
+    def test_provider_reset_delay_overrides_generic_retry_curve(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            workflow["retry_policy"] = {"max_attempts": 2, "backoff_seconds": 0}
+            runner = ComposerRunner(workflow)
+            calls = []
+
+            def cooldown_then_complete(stage, **kwargs):
+                calls.append(stage["id"])
+                if len(calls) == 1:
+                    raise ProviderCooldownError(
+                        "provider reset pending", retry_after_seconds=0.03,
+                        rate_limit={"kind": "daily_budget"},
+                    )
+                output = root / f"{stage['id']}-result.json"
+                output.write_text(json.dumps({"stage": stage["id"]}))
+                return {"status": "completed", "output_path": str(output),
+                        "project_dir": stage["project_dir"], "stage_id": stage["id"]}
+
+            runner._run_stage = cooldown_then_complete
+            started = time.monotonic()
+            result = runner.run()
+            self.assertEqual(result["status"], "completed")
+            self.assertGreaterEqual(time.monotonic() - started, 0.025)
+            retry = next(item for item in result["feedback"] if item["action"] == "retry_stage")
+            self.assertEqual(retry["delay_seconds"], 0.03)
+
     def test_until_deadline_retry_mode_does_not_stop_at_attempt_counter(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -336,6 +366,79 @@ class ComposerWorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "absolute"):
                 validate_workflow(workflow)
 
+    def test_foundry_backed_topic_hides_templates_and_materializes_admitted_program(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            model_path = root / "model.json"
+            model_path.write_text(json.dumps({
+                "protocol": "openai_compatible", "base_url": "https://example.invalid/v1",
+                "model": "stub", "timeout_seconds": 60, "max_output_tokens": 128,
+            }))
+            requirements = root / "requirements.txt"
+            requirements.write_text("numpy==2.5.2\n")
+            descriptor_path = root / "generated-capability.json"
+            descriptor_path.write_text(json.dumps({
+                "schema_version": "experiment-capability-1", "capability_id": "generated_frontier",
+                "experiment": {
+                    "id": "generated_frontier", "revision": 1, "study_type": "exploratory",
+                    "domain": "marine ecology", "research_question": "Does transport alter patch recovery?",
+                    "hypothesis": "Transport alters recovery.", "method": "Run a seeded comparison.",
+                    "parameters": {}, "seed": 3, "run_count": 5,
+                    "stopping_rule": "Run five replicates.", "primary_outcomes": [],
+                    "limitations": ["Synthetic boundary."], "literature_gate": None,
+                    "execution": {}, "validation": {}, "required_assets": [], "reviewers": [],
+                    "stage_seconds": {}, "max_observations": 5, "max_asset_bytes": 100,
+                },
+            }))
+            foundry_config = root / "foundry.json"
+            foundry_config.write_text(json.dumps({
+                "schema_version": "capability-foundry-config-1",
+                "model_config_path": str(model_path.resolve()),
+                "runtime_python": str(Path(sys.executable).resolve()),
+                "workspace_root": str((root / "foundry-workspace").resolve()),
+                "registry_root": str((root / "registry").resolve()),
+                "repo_root": str(root.resolve()),
+                "requirements_file": str(requirements.resolve()),
+                "runtime_packages": [{"name": "numpy", "version": "2.5.2"}],
+                "max_attempts": 2, "timeout_seconds": 30,
+            }))
+            workflow["capability_foundry_config_path"] = str(foundry_config.resolve())
+            workflow["experiment_catalog"] = [{
+                "id": "fallback", "config_path": str(descriptor_path.resolve())}]
+            validate_workflow(workflow)
+            runner = ComposerRunner(workflow)
+            runtime_context = runner._runtime_context(json.loads(model_path.read_text()))
+            self.assertEqual(runtime_context["experiment_catalog"], [])
+            self.assertEqual(len(runtime_context["fallback_experiment_catalog"]), 1)
+            self.assertTrue(runtime_context["capability_foundry"]["enabled"])
+            result = {
+                "status": "completed",
+                "topic": {"id": "frontier", "title": "Patch recovery", "domain": "marine ecology",
+                          "research_question": "Does transport alter patch recovery?", "scope": "Synthetic patches",
+                          "disconfirmation_test": "No recovery difference.", "resource_plan": "Seeded simulation."},
+                "candidates": [{"id": "frontier"}], "candidate_prior_work": [],
+                "source_challenge": {"decision": "admit_to_survey"},
+            }
+            generated = {
+                "status": "registered", "attempts": 1,
+                "registration": {"capability_id": "generated_frontier",
+                                 "descriptor_path": str(descriptor_path.resolve())},
+                "admission": {"gates": ["static_scan", "independent_recalculation"]},
+            }
+            with patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate",
+                       return_value=generated) as call:
+                result = runner._materialize_topic_capability(result)
+            self.assertEqual(result["topic"]["experiment_capability_id"], "generated_frontier")
+            self.assertEqual(call.call_args.kwargs["required_intent"]["research_question"],
+                             "Does transport alter patch recovery?")
+            runner.context["topic"] = {"kind": "topic_discovery", **result}
+            config = {"experiment": {"revision": 1, "literature_gate": {"required_state": "eligible_for_experiment"}},
+                      "supplied_context": "base"}
+            projected = runner._apply_topic_to_experiment_config(workflow["stages"][1], config)
+            self.assertEqual(projected["experiment"]["id"], "generated_frontier")
+            runner.close()
+
     def test_topic_history_is_append_only_and_rotates_recent_capability(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -363,6 +466,59 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(resumed._effective_topic_exclusions()["capability_ids"], ["cap_a"])
             self.assertIn("direction_a", resumed._effective_topic_exclusions()["topic_ids"])
             resumed.close()
+
+    def test_explicit_topic_history_survives_objective_wording_changes(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            history_path = root / "shared-topic-history.json"
+            first_root = root / "first"
+            second_root = root / "second"
+            first_root.mkdir(); second_root.mkdir()
+            first_workflow = self._workflow(first_root)
+            first_workflow["topic_history_path"] = str(history_path.resolve())
+            first = ComposerRunner(first_workflow)
+            first._record_topic_history({"topic": {
+                "id": "prior_direction", "title": "Prior direction",
+                "domain": "ecology",
+                "research_question": "Does dispersal change recovery after disturbance?",
+            }})
+            first.close()
+
+            second_workflow = self._workflow(second_root)
+            second_workflow["objective"] = "Explore a newly worded scientific frontier"
+            second_workflow["topic_history_path"] = str(history_path.resolve())
+            second = ComposerRunner(second_workflow)
+            self.assertEqual(
+                [item["topic_id"] for item in second.topic_history["entries"]],
+                ["prior_direction"],
+            )
+            self.assertIn("prior_direction", second._effective_topic_exclusions()["topic_ids"])
+            second.close()
+
+    def test_default_family_history_survives_objective_wording_changes(self):
+        with tempfile.TemporaryDirectory() as path:
+            family = Path(path)
+            first_root = family / "run-1"
+            second_root = family / "run-2"
+            first_root.mkdir(); second_root.mkdir()
+            first_workflow = self._workflow(first_root)
+            first = ComposerRunner(first_workflow)
+            first._record_topic_history({"topic": {
+                "id": "prior_default_direction", "title": "Prior default direction",
+                "domain": "ecology",
+                "research_question": "Does dispersal change recovery after disturbance?",
+            }})
+            first.close()
+
+            second_workflow = self._workflow(second_root)
+            second_workflow["objective"] = "Explore a reworded frontier under the same mission"
+            second = ComposerRunner(second_workflow)
+            self.assertEqual(first.topic_history_path, second.topic_history_path)
+            self.assertEqual(
+                [item["topic_id"] for item in second.topic_history["entries"]],
+                ["prior_default_direction"],
+            )
+            second.close()
 
     def test_exploration_seed_is_random_once_and_persisted_for_resume(self):
         with tempfile.TemporaryDirectory() as path, patch(
@@ -410,6 +566,7 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(projected["survey"]["seed_queries"],
                              ["mechanism comparison", "controlled experiment", "public data"])
             self.assertEqual(projected["survey"]["seed_work_ids"], [])
+            self.assertEqual(projected["survey"]["bibliography_fallback"], "disabled")
             runner.close()
 
     def test_topic_query_projection_adds_exact_hyphenated_concept(self):

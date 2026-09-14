@@ -4,12 +4,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.capability_foundry import CapabilityFoundry
 from scisaurus.runtime.capability_registry import load_registry
+from scisaurus.runtime.experiment import ExperimentRunner
 from scisaurus.runtime.models import ModelResult
+from scisaurus.tests.test_experiment import fixture_worker
 from scisaurus.tests.test_program_admission import INTENT
 
-ROOT = Path("/Users/seungyeop/Sci-saurus")
+ROOT = Path(__file__).resolve().parents[2]
 
 MINI_EXECUTOR = '''
 import hashlib
@@ -121,23 +124,31 @@ class StubClient:
 
 
 class CapabilityFoundryTests(unittest.TestCase):
-    def test_model_proposed_program_is_admitted_and_registered(self):
-        payload = {
+    @staticmethod
+    def _payload():
+        return {
             "executor_source": MINI_EXECUTOR,
             "validator_source": MINI_VALIDATOR,
             "runtime": {"python": "3.14", "packages": [{"name": "numpy", "version": "2.5.2"}]},
             "test_input": {"probe": True},
             "experiment_intent": INTENT,
         }
+
+    @staticmethod
+    def _foundry(root):
+        return CapabilityFoundry(
+            {"protocol": "openai_compatible", "base_url": "https://example.invalid/v1",
+             "model": "stub", "timeout_seconds": 60, "max_output_tokens": 128},
+            runtime_python=sys.executable, workspace_root=root / "workspace",
+            registry_root=root / "registry", repo_root=ROOT,
+            requirements_file=ROOT / "requirements-experiment.txt",
+            runtime_packages=[("numpy", "2.5.2")], max_attempts=2)
+
+    def test_model_proposed_program_is_admitted_and_registered(self):
+        payload = self._payload()
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
-            foundry = CapabilityFoundry(
-                {"protocol": "openai_compatible", "base_url": "https://example.invalid/v1",
-                 "model": "stub", "timeout_seconds": 60, "max_output_tokens": 128},
-                runtime_python=sys.executable, workspace_root=root / "workspace",
-                registry_root=root / "registry", repo_root=ROOT,
-                requirements_file=ROOT / "requirements-experiment.txt",
-                runtime_packages=[("numpy", "2.5.2")], max_attempts=2)
+            foundry = self._foundry(root)
             client = StubClient(payload)
             outcome = foundry.generate("compare a declared estimator against a baseline", client=client)
             self.assertEqual(outcome["status"], "registered")
@@ -150,6 +161,63 @@ class CapabilityFoundryTests(unittest.TestCase):
             registry = load_registry(ROOT if False else root / "registry")
             self.assertEqual(len(registry["capabilities"]), 1)
             self.assertTrue(Path(descriptor["experiment"]["execution"]["client"]["command"][1]).is_file())
+            self.assertEqual(descriptor["experiment"]["execution"]["input"], {"probe": True})
+
+    def test_registered_generated_program_runs_end_to_end_under_required_sandbox(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            outcome = self._foundry(root).generate(
+                "compare a declared estimator against a baseline",
+                client=StubClient(self._payload()),
+            )
+            descriptor = json.loads(Path(
+                outcome["registration"]["descriptor_path"]).read_text())
+            config = {
+                "live_dispatch_allowed": True, "data_classification": "public",
+                "allocation_mode": "capacity_pool", "project_id": "generated-e2e",
+                "objective": "Exercise an admitted generated experiment end to end.",
+                "supplied_context": "Synthetic deterministic integration fixture.",
+                "model": {"protocol": "openai_compatible",
+                          "base_url": "http://example.invalid/v1", "model": "fixture-model",
+                          "timeout_seconds": 5, "max_output_tokens": 2000,
+                          "auth_env": None},
+                "limits": {"max_rounds": 2, "wall_clock_seconds": 120,
+                           "checkpoint_seconds": 1, "max_result_bytes": 10_000_000,
+                           "concurrent_calls": 3, "worker_concurrency": 1},
+                "time_policy": {"first_result_seconds": 60, "target_seconds": 90,
+                                "hard_seconds": 120},
+                "experiment": descriptor["experiment"],
+            }
+            runner = ExperimentRunner(root / "experiment-run", config)
+            runner.worker_target = fixture_worker
+            result = runner.run()
+            self.assertEqual(result["status"], "completed", result)
+            self.assertEqual(len(result["execution_refs"]), 2)
+            self.assertTrue(result["event_chain"][0])
+
+    def test_required_scientific_intent_cannot_be_paraphrased(self):
+        payload = {
+            "executor_source": MINI_EXECUTOR, "validator_source": MINI_VALIDATOR,
+            "runtime": {"python": "3.14", "packages": [{"name": "numpy", "version": "2.5.2"}]},
+            "test_input": {"probe": True}, "experiment_intent": dict(INTENT),
+        }
+        payload["experiment_intent"] = dict(payload["experiment_intent"])
+        payload["experiment_intent"]["research_question"] = "A convenient replacement question"
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundry(
+                {"protocol": "openai_compatible", "base_url": "https://example.invalid/v1",
+                 "model": "stub", "timeout_seconds": 60, "max_output_tokens": 128},
+                runtime_python=sys.executable, workspace_root=root / "workspace",
+                registry_root=root / "registry", repo_root=ROOT,
+                requirements_file=ROOT / "requirements-experiment.txt",
+                runtime_packages=[("numpy", "2.5.2")], max_attempts=1)
+            with self.assertRaisesRegex(ValidationError, "required scientific intent"):
+                foundry.generate(
+                    "bounded question", required_intent={
+                        "domain": INTENT["domain"],
+                        "research_question": INTENT["research_question"]},
+                    client=StubClient(payload))
 
     def test_broken_program_is_never_registered(self):
         payload = {

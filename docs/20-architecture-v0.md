@@ -323,12 +323,22 @@ At the workflow level, the Composer treats those requests as executable
 continuations. It maps each request to the smallest owning stage closure,
 creates a cycle-specific project namespace, reruns changed consumers, and
 limits re-entry by `continuation_policy.max_cycles` and the original hard wall.
-A free-topic workflow may begin with the `topic_discovery` stage: recent
-OpenAlex records are sampled with a recorded seed and query/capture trace, then
-an intake model chooses a testable question against a safe runtime capability
-inventory. The selected direction lists structured requirements and is rejected
-if the declared environment cannot provide them. Topic metadata remains an
-intake prompt until the ordinary survey and evidence gates promote it.
+A free-topic workflow may begin with the `topic_discovery` stage. A horizon
+scanner first creates cross-domain scientific seeds without seeing experiment
+templates. Recent OpenAlex records are relevance-filtered, balanced across the
+seed domains, and retained with the exploration seed and query/capture trace.
+Each candidate must bind a real seed and supplied work IDs, while the candidate
+portfolio must cover multiple seed groups and domains. The selected question
+also receives a deterministic distance check against hidden fallback templates.
+A targeted source challenge and maturity review must both admit the selected
+question. With a configured capability foundry, the question is then copied
+unchanged into a generated executor and independently authored validator; only
+a sandboxed, deterministically replayed, digest-matched, independently
+recalculated, readiness-probed, adversarially admitted descriptor becomes
+executable. Its immutable registry graph is hash-verified on every load, and
+the deny-by-default sandbox remains mandatory during actual execution. Topic
+metadata remains provisional until the ordinary survey and evidence gates
+promote it.
 
 ### 5.5 Candidate selection
 

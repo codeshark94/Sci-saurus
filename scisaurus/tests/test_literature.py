@@ -5,6 +5,7 @@ import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+from pathlib import Path
 import socket
 import tempfile
 import threading
@@ -12,13 +13,16 @@ import time
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
+from email.utils import formatdate
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.tasks import TaskManager
-from scisaurus.runtime.literature import DEFAULT_ENDPOINT, MAX_REQUEST_URL_BYTES, OpenAlexClient, request_url
+from scisaurus.runtime.literature import (
+    DEFAULT_ENDPOINT, MAX_REQUEST_URL_BYTES, OpenAlexClient, _retry_after_seconds, request_url,
+)
 from scisaurus.runtime.operation_adapters import get_adapter
 from scisaurus.runtime.operations import OperationsCell
 
@@ -76,7 +80,9 @@ class OpenAlexFixture(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlsplit(self.path)
         query = parse_qs(parsed.query)
-        self.requests.append({"path": parsed.path, "query": query, "authorization": self.headers.get("Authorization")})
+        self.requests.append({"path": parsed.path, "query": query,
+                              "authorization": self.headers.get("Authorization"),
+                              "received_at": time.monotonic()})
         mode = query.get("search", ["ok"])[0]
         if mode == "rate-limit-once" and self.rate_limit_count == 0:
             type(self).rate_limit_count += 1
@@ -165,6 +171,23 @@ class OpenAlexFixture(BaseHTTPRequestHandler):
             status, body = 404, b'{"error":"work not found"}'
         if mode == "rate-limited":
             status, body = 429, b'{"error": "slow down"}'
+        elif mode == "anonymous-load":
+            status, body = 429, json.dumps({
+                "error": "Rate limit exceeded",
+                "message": "Anonymous search is temporarily rate-limited while the search cluster is under elevated load.",
+                "retryAfter": 37,
+            }).encode()
+        elif mode == "daily-budget":
+            status, body = 429, json.dumps({
+                "error": "Rate limit exceeded",
+                "message": "Daily budget exhausted.",
+            }).encode()
+        elif mode == "insufficient-budget":
+            status, body = 429, json.dumps({
+                "error": "Rate limit exceeded",
+                "message": ("Insufficient budget. This request costs $0.001 but you only have "
+                            "$0.0007 remaining. Resets at midnight UTC."),
+            }).encode()
         elif mode == "redirect":
             status, body = 302, b""
         elif mode == "malformed":
@@ -187,8 +210,14 @@ class OpenAlexFixture(BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body) + (10 if mode == "short-body" else 0)))
-            self.send_header("X-RateLimit-Remaining", "42")
-            self.send_header("Retry-After", "7")
+            self.send_header("X-RateLimit-Limit", "100000")
+            self.send_header("X-RateLimit-Remaining", (
+                "0" if mode == "daily-budget" else "7"
+                if mode in {"insufficient-budget", "last-affordable-search"} else "42"))
+            self.send_header("X-RateLimit-Reset", "123" if mode == "insufficient-budget" else "60")
+            if mode == "last-affordable-search":
+                self.send_header("X-RateLimit-Credits-Used", "10")
+            self.send_header("Retry-After", "37" if mode == "anonymous-load" else "7")
             if mode == "redirect":
                 self.send_header("Location", "/works?search=redirect-target")
             if mode in {"short-body", "body-trickle"}:
@@ -265,6 +294,166 @@ class TestOpenAlex(unittest.TestCase):
         self.assertEqual(OpenAlexFixture.rate_limit_count, 1)
         self.assertTrue(all(check["outcome"] == "passed" for check in self.inspect(result,
                                                                                        self.arguments("rate-limit-once"))))
+
+    def test_rate_limit_cause_and_retry_budget_are_preserved(self):
+        started = time.monotonic()
+        result = self.client(timeout=0.2, max_retries=2).run(**self.arguments("anonymous-load"))
+        self.assertEqual(result["outcome"], "rate_limited")
+        self.assertLess(time.monotonic() - started, 0.8)
+        limit = result["metadata"]["rate_limit"]
+        self.assertEqual(limit["kind"], "anonymous_search_load")
+        self.assertEqual(limit["retry_after_seconds"], 37.0)
+        self.assertFalse(limit["authenticated"])
+        self.assertTrue(result["metadata"]["retry_budget_exhausted"])
+        self.assertIn("elevated load", result["error"])
+
+        daily = self.client(max_retries=0).run(**self.arguments("daily-budget"))
+        self.assertEqual(daily["metadata"]["rate_limit"]["kind"], "daily_budget")
+        self.assertEqual(daily["metadata"]["rate_limit"]["remaining"], 0)
+
+        insufficient = self.client(max_retries=0).run(**self.arguments("insufficient-budget"))
+        self.assertEqual(insufficient["metadata"]["rate_limit"]["kind"], "daily_budget")
+        self.assertEqual(insufficient["metadata"]["rate_limit"]["remaining"], 7)
+
+    def test_persistent_cooldown_prevents_cross_client_and_cross_query_hammering(self):
+        with tempfile.TemporaryDirectory(prefix="scisaurus-openalex-rate-state-") as directory:
+            state_path = os.path.join(directory, "provider", "openalex.json")
+            before = len(OpenAlexFixture.requests)
+            first = self.client(max_retries=0, rate_state_path=state_path).run(
+                **self.arguments("daily-budget"))
+            self.assertEqual(first["outcome"], "rate_limited")
+            self.assertEqual(len(OpenAlexFixture.requests), before + 1)
+
+            second = self.client(max_retries=3, rate_state_path=state_path).run(
+                **self.arguments("a different query"))
+            self.assertEqual(second["outcome"], "rate_limited")
+            self.assertEqual(second["metadata"]["attempts"], 0)
+            self.assertTrue(second["metadata"]["cooldown_cache_hit"])
+            self.assertTrue(second["metadata"]["retry_suppressed_by_persistent_cooldown"])
+            self.assertGreater(second["metadata"]["rate_limit"]["retry_after_seconds"], 0)
+            self.assertEqual(len(OpenAlexFixture.requests), before + 1)
+
+            # A search-budget cooldown does not suppress free singleton work
+            # lookups, which have a separate OpenAlex request-cost class.
+            singleton = self.client(rate_state_path=state_path).run(
+                **self.arguments(None, operation="work", work_id="W456"))
+            self.assertEqual(singleton["outcome"], "ok")
+            self.assertEqual(len(OpenAlexFixture.requests), before + 2)
+
+            # Authentication has a separate provider budget scope. The state
+            # file never contains the credential itself.
+            with patch.dict(os.environ, {"SCISAURUS_OPENALEX_TEST": "another-credential"}):
+                authenticated = self.client(
+                    auth_env="SCISAURUS_OPENALEX_TEST", rate_state_path=state_path,
+                ).run(**self.arguments("authenticated query"))
+            self.assertEqual(authenticated["outcome"], "ok")
+            self.assertEqual(len(OpenAlexFixture.requests), before + 3)
+            with open(state_path) as stream:
+                self.assertNotIn("another-credential", stream.read())
+
+    def test_persistent_request_reservation_prevents_concurrent_429_herd(self):
+        with tempfile.TemporaryDirectory(prefix="scisaurus-openalex-rate-state-") as directory:
+            state_path = os.path.join(directory, "provider", "openalex.json")
+            before = len(OpenAlexFixture.requests)
+            barrier = threading.Barrier(6)
+            results = []
+            errors = []
+
+            def invoke(index):
+                try:
+                    barrier.wait(timeout=2)
+                    results.append(self.client(
+                        max_retries=0, rate_state_path=state_path,
+                    ).run(**self.arguments(f"daily-budget")))
+                except Exception as exc:
+                    errors.append(exc)
+
+            workers = [threading.Thread(target=invoke, args=(index,)) for index in range(6)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=5)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 6)
+            self.assertEqual(len(OpenAlexFixture.requests), before + 1)
+            self.assertEqual(sum(item["metadata"]["attempts"] == 1 for item in results), 1)
+            self.assertEqual(sum(item["metadata"]["attempts"] == 0 for item in results), 5)
+
+    def test_provider_reservation_wait_is_bounded_by_the_call_timeout(self):
+        with tempfile.TemporaryDirectory(prefix="scisaurus-openalex-rate-state-") as directory:
+            state_path = os.path.join(directory, "provider", "openalex.json")
+            before = len(OpenAlexFixture.requests)
+            first_result = []
+            first = threading.Thread(target=lambda: first_result.append(
+                self.client(timeout=1, rate_state_path=state_path).run(
+                    **self.arguments("slow"))))
+            first.start()
+            deadline = time.monotonic() + 1
+            while len(OpenAlexFixture.requests) == before and time.monotonic() < deadline:
+                time.sleep(0.005)
+            started = time.monotonic()
+            second = self.client(timeout=0.03, rate_state_path=state_path).run(
+                **self.arguments("must not dispatch"))
+            elapsed = time.monotonic() - started
+            first.join(timeout=2)
+            self.assertLess(elapsed, 0.2)
+            self.assertEqual(second["outcome"], "timeout")
+            self.assertEqual(second["metadata"]["attempts"], 0)
+            self.assertEqual(len(OpenAlexFixture.requests), before + 1)
+            self.assertEqual(first_result[0]["outcome"], "ok")
+
+    def test_rate_scope_follows_credential_identity_not_environment_alias(self):
+        with tempfile.TemporaryDirectory(prefix="scisaurus-openalex-rate-state-") as directory:
+            state_path = os.path.join(directory, "openalex.json")
+            before = len(OpenAlexFixture.requests)
+            with patch.dict(os.environ, {
+                    "SCISAURUS_OPENALEX_A": "same-principal",
+                    "SCISAURUS_OPENALEX_B": "same-principal"}):
+                first = self.client(
+                    auth_env="SCISAURUS_OPENALEX_A", max_retries=0,
+                    rate_state_path=state_path,
+                ).run(**self.arguments("daily-budget"))
+                second = self.client(
+                    auth_env="SCISAURUS_OPENALEX_B", max_retries=0,
+                    rate_state_path=state_path,
+                ).run(**self.arguments("different wording"))
+                os.environ["SCISAURUS_OPENALEX_B"] = "rotated-principal"
+                rotated = self.client(
+                    auth_env="SCISAURUS_OPENALEX_B", max_retries=0,
+                    rate_state_path=state_path,
+                ).run(**self.arguments("different wording"))
+            self.assertEqual(first["outcome"], "rate_limited")
+            self.assertEqual(second["metadata"]["attempts"], 0)
+            self.assertEqual(rotated["outcome"], "ok")
+            self.assertEqual(len(OpenAlexFixture.requests), before + 2)
+            state = Path(state_path).read_text()
+            self.assertNotIn("same-principal", state)
+            self.assertNotIn("rotated-principal", state)
+
+    def test_success_headers_prevent_the_next_known_unaffordable_search(self):
+        with tempfile.TemporaryDirectory(prefix="scisaurus-openalex-rate-state-") as directory:
+            state_path = os.path.join(directory, "openalex.json")
+            before = len(OpenAlexFixture.requests)
+            last = self.client(rate_state_path=state_path).run(
+                **self.arguments("last-affordable-search"))
+            self.assertEqual(last["outcome"], "ok")
+            self.assertEqual(last["metadata"]["preventive_cooldown_seconds"], 60)
+            blocked = self.client(rate_state_path=state_path).run(
+                **self.arguments("would exceed remaining credits"))
+            self.assertEqual(blocked["outcome"], "rate_limited")
+            self.assertEqual(blocked["metadata"]["attempts"], 0)
+            self.assertEqual(len(OpenAlexFixture.requests), before + 1)
+
+    def test_retry_after_http_date_and_client_pacing(self):
+        future = formatdate(time.time() + 3, usegmt=True)
+        parsed = _retry_after_seconds(future, now=time.time())
+        self.assertGreaterEqual(parsed, 1.0)
+        self.assertLessEqual(parsed, 3.1)
+        client = self.client(min_interval_seconds=0.04)
+        client.run(**self.arguments("first paced request"))
+        client.run(**self.arguments("second paced request"))
+        delta = OpenAlexFixture.requests[-1]["received_at"] - OpenAlexFixture.requests[-2]["received_at"]
+        self.assertGreaterEqual(delta, 0.03)
 
     def test_operations_readiness_and_routine_workloads_use_full_execution_context(self):
         with tempfile.TemporaryDirectory(prefix="scisaurus-openalex-operations-") as directory:
@@ -508,10 +697,33 @@ class TestOpenAlex(unittest.TestCase):
         for client in ({"timeout": 1}, {"timeout": 1, "max_bytes": 1, "api_key": "not-allowed"},
                        {"timeout": 1, "max_bytes": 1, "endpoint": self.endpoint + "?api_key=x"},
                        {"timeout": 1, "max_bytes": 1, "endpoint": "https://api.openalex.org:bad/works"},
-                       {"timeout": 1, "max_bytes": 1, "auth_env": "contains spaces"}):
+                       {"timeout": 1, "max_bytes": 1, "auth_env": "contains spaces"},
+                       {"timeout": 1, "max_bytes": 1, "rate_state_path": "relative.json"},
+                       {"timeout": 1, "max_bytes": 1,
+                        "rate_state_path": "/var/tmp/openalex-outside-project.json"}):
             with self.assertRaises(ValidationError):
                 adapter.validate_client(client, "/tmp", [])
         self.assertEqual(len(OpenAlexFixture.requests), before)
+
+    def test_rate_state_path_is_shared_only_within_the_stable_stage_root(self):
+        adapter = get_adapter("openalex")
+        with tempfile.TemporaryDirectory(prefix="scisaurus-openalex-stage-") as directory:
+            stage = os.path.join(directory, "survey")
+            attempt = os.path.join(stage, "attempts", "attempt-2")
+            continuation_attempt = os.path.join(
+                stage, "continuations", "cycle-1", "attempts", "attempt-2")
+            os.makedirs(attempt)
+            os.makedirs(continuation_attempt)
+            state_path = os.path.join(stage, "provider-state", "openalex.json")
+            client = {"timeout": 1, "max_bytes": 1024,
+                      "endpoint": self.endpoint, "rate_state_path": state_path}
+            validated = adapter.validate_client(deepcopy(client), attempt, [])
+            self.assertEqual(validated["rate_state_path"], str(Path(state_path).resolve()))
+            continued = adapter.validate_client(deepcopy(client), continuation_attempt, [])
+            self.assertEqual(continued["rate_state_path"], str(Path(state_path).resolve()))
+            outside = {**client, "rate_state_path": os.path.join(directory, "outside.json")}
+            with self.assertRaisesRegex(ValidationError, "stable project stage"):
+                adapter.validate_client(outside, attempt, [])
 
     def test_stemmed_search_rejects_wildcards_without_changing_the_query(self):
         adapter = get_adapter("openalex")

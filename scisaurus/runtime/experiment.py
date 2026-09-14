@@ -5,6 +5,7 @@ from copy import deepcopy
 import hashlib
 import itertools
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -12,6 +13,7 @@ import shutil
 import signal
 import threading
 import time
+import uuid
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.events import ControlStore
@@ -151,12 +153,21 @@ def validate_deterministic_validation(value, experiment, candidate_sha256):
         if metric["metric_id"] in metric_ids or type(metric["matches"]) is not bool:
             raise ValidationError("metric recalculation is duplicated or invalid")
         metric_ids.add(metric["metric_id"])
-        _finite_scalar(metric["reported_value"], "reported metric")
-        _finite_scalar(metric["recalculated_value"], "recalculated metric")
-        if (type(metric["tolerance"]) not in (int, float) or metric["tolerance"] < 0):
+        reported = metric["reported_value"]
+        recalculated = metric["recalculated_value"]
+        if (type(reported) not in (int, float) or not math.isfinite(reported)
+                or type(recalculated) not in (int, float) or not math.isfinite(recalculated)):
+            raise ValidationError("metric recalculation values must be finite numbers")
+        if (type(metric["tolerance"]) not in (int, float)
+                or not math.isfinite(metric["tolerance"]) or metric["tolerance"] < 0):
             raise ValidationError("metric recalculation tolerance is invalid")
-    if {item["id"] for item in experiment["primary_outcomes"]} - metric_ids:
-        raise ValidationError("deterministic validation omits a primary outcome")
+        observed_match = abs(float(reported) - float(recalculated)) <= float(metric["tolerance"])
+        if metric["matches"] is not observed_match:
+            raise ValidationError("metric recalculation match flag contradicts its values")
+    configured_metric_ids = {item["id"] for item in experiment["primary_outcomes"]}
+    if metric_ids != configured_metric_ids:
+        raise ValidationError(
+            "deterministic validation must recalculate exactly the primary outcomes")
     if not isinstance(value["limitations"], list):
         raise ValidationError("deterministic validation limitations must be a list")
     for limitation in value["limitations"]:
@@ -165,6 +176,23 @@ def validate_deterministic_validation(value, experiment, candidate_sha256):
               and all(item["matches"] for item in recalculations))
     if value["decision"] != ("accepted" if passed else "rejected"):
         raise ValidationError("deterministic validation decision contradicts its checks")
+    return value
+
+
+def bind_deterministic_validation(value, candidate, experiment):
+    """Bind validator metric claims to the exact candidate metric values."""
+    declared = {item["id"] for item in experiment["primary_outcomes"]}
+    reported = {item["id"]: item["value"] for item in candidate["metrics"]}
+    recalculations = value["metric_recalculations"]
+    if {item["metric_id"] for item in recalculations} != declared:
+        raise ValidationError(
+            "deterministic validation must bind exactly the declared primary outcomes")
+    for item in recalculations:
+        metric_id = item["metric_id"]
+        if metric_id not in reported \
+                or canonical_bytes(item["reported_value"]) != canonical_bytes(reported[metric_id]):
+            raise ValidationError(
+                "deterministic validation changed a reported primary metric")
     return value
 
 
@@ -305,11 +333,34 @@ class ExperimentRunner(ExecutionRuntime):
             client = deepcopy(capability["client"])
             command = list(client["command"])
             command[0] = str(Path(command[0]).absolute()) if "/" in command[0] else (shutil.which(command[0]) or command[0])
-            client.update(command=command, cwd=str(self.operations.workspace_dir(capability["id"])),
+            workspace = self.operations.workspace_dir(capability["id"])
+            environment_files = list(capability["environment_files"])
+            if client.get("sandbox_required"):
+                if len(command) != 2:
+                    raise ValidationError(
+                        "generated experiment programs require one pinned source argument")
+                source = Path(command[1])
+                if (not source.is_absolute() or not source.is_file()
+                        or str(source) not in environment_files):
+                    raise ValidationError(
+                        "generated experiment source is not pinned by its capability descriptor")
+                local_source = workspace / f"{name}.py"
+                temporary = workspace / f".{name}.{uuid.uuid4().hex}.tmp"
+                try:
+                    temporary.write_bytes(source.read_bytes())
+                    os.replace(temporary, local_source)
+                finally:
+                    try:
+                        temporary.unlink()
+                    except FileNotFoundError:
+                        pass
+                command[1] = str(local_source)
+                environment_files.append(str(local_source))
+            client.update(command=command, cwd=str(workspace),
                           own_process_group=False)
             state = self.operations.register(capability["id"], adapter="local_program", client=client,
                 representative=capability["representative"], engineer=f"operations.engineer.{name}",
-                environment_files=capability["environment_files"])
+                environment_files=environment_files)
             state = self.operations.ensure_ready(capability["id"], self._call,
                 operator=f"operations.operator.{name}", verifier=f"operations.verifier.{name}",
                 purpose=f"Prepare the frozen experiment {name} program")
@@ -390,6 +441,7 @@ class ExperimentRunner(ExecutionRuntime):
             operator="methods.independent-calculator")
         self.time_policy.observe("unit_review", time.monotonic() - started)
         value = validate_deterministic_validation(result["document"], self.experiment, candidate_sha256)
+        bind_deterministic_validation(value, candidate, self.experiment)
         record = self._publish("methods/experiment-deterministic-validation", "verification", {
             **value, "execution_ref": execution_ref}, "methods.independent-calculator",
             subjects=[*self.execution_refs, execution_ref, *[item["artifact_ref"] for item in self.asset_records]])

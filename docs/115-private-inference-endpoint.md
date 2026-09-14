@@ -18,7 +18,7 @@ variable through `model.auth_env`; the value is read from the process
 environment at call time.
 
 ```bash
-cd ~/Sci-saurus
+cd "$(git rev-parse --show-toplevel)"
 set -a; . local-private/private-qwen.env; set +a   # owner-only file, mode 600
 export PATH=/opt/homebrew/bin:$PATH                # Node.js for the source extractor
 ```

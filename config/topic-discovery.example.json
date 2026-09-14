@@ -4,5 +4,17 @@
   "output_path": "/absolute/path/to/topic-discovery.json",
   "candidate_count": 4,
   "max_attempts": 3,
-  "maturity_review_rounds": 2
+  "maturity_review_rounds": 2,
+  "bibliography": {
+    "timeout": 120,
+    "max_bytes": 2000000,
+    "endpoint": "https://api.openalex.org/works",
+    "auth_env": null,
+    "max_retries": 5,
+    "retry_backoff_seconds": 1.0,
+    "min_interval_seconds": 1.05,
+    "rate_state_path": "/absolute/project/path/provider-state/openalex-rate-state.json",
+    "cache_path": "/absolute/project/path/cache/topic-openalex.json",
+    "cache_ttl_seconds": 604800
+  }
 }

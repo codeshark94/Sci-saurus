@@ -5,17 +5,24 @@ remain metadata; neither proves that source full text has been acquired.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
 from http.client import HTTPConnection, HTTPSConnection, HTTPException, IncompleteRead
+import hashlib
+import errno
 import json
 import math
 import os
+from pathlib import Path
 import queue
 import re
 import socket
 import threading
 import time
+import uuid
 from urllib.parse import urlencode, urlsplit
 
+from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.retrieval import _capture, _limits, _now, _url
 
 
@@ -26,6 +33,136 @@ DEFAULT_ENDPOINT = "https://api.openalex.org/works"
 MAX_REQUEST_URL_BYTES = 4094
 SEARCH_SYNTAX = "OpenAlex stemmed search: use search terms or quoted phrases, without '*' or '?' wildcards. The percent-encoded request URL must fit 4094 bytes."
 ARGUMENT_KEYS = {"operation", "query", "work_id", "limit", "cursor"}
+TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+RATE_STATE_SCHEMA_VERSION = "openalex-rate-state-1"
+# OpenAlex daily budgets reset at midnight UTC. A two-day ceiling accepts a
+# complete daily reset window plus clock skew without allowing malformed
+# provider metadata to freeze a client indefinitely.
+MAX_PROVIDER_COOLDOWN_SECONDS = 2 * 24 * 3600
+_RATE_STATE_THREAD_LOCK = threading.RLock()
+_PROVIDER_REQUEST_LOCKS_GUARD = threading.Lock()
+_PROVIDER_REQUEST_LOCKS = {}
+
+
+class ProviderCooldownError(ValidationError):
+    """A provider supplied a concrete future time for a safe retry."""
+
+    def __init__(self, message, *, retry_after_seconds, rate_limit=None):
+        if (type(retry_after_seconds) not in (int, float)
+                or not math.isfinite(retry_after_seconds) or retry_after_seconds <= 0):
+            raise ValueError("provider cooldown must be finite and positive")
+        super().__init__(message)
+        self.retry_after_seconds = float(retry_after_seconds)
+        self.rate_limit = dict(rate_limit) if isinstance(rate_limit, dict) else None
+
+
+@contextmanager
+def _locked_rate_state(path):
+    """Serialize state updates across threads and local worker processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    with _RATE_STATE_THREAD_LOCK:
+        lock = lock_path.open("a+")
+        flock = None
+        try:
+            try:
+                import fcntl
+                flock = fcntl
+                flock.flock(lock.fileno(), flock.LOCK_EX)
+            except ImportError:
+                flock = None
+            yield
+        finally:
+            if flock is not None:
+                try:
+                    flock.flock(lock.fileno(), flock.LOCK_UN)
+                except OSError:
+                    pass
+            lock.close()
+
+
+@contextmanager
+def _locked_provider_request(path, deadline):
+    """Reserve one provider transaction across local clients and processes."""
+    if path is None:
+        yield True
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".request.lock")
+    key = str(lock_path)
+    with _PROVIDER_REQUEST_LOCKS_GUARD:
+        thread_lock = _PROVIDER_REQUEST_LOCKS.setdefault(key, threading.Lock())
+    remaining = max(0.0, deadline - time.monotonic())
+    if not thread_lock.acquire(timeout=remaining):
+        yield False
+        return
+    lock = None
+    flock = None
+    locked = False
+    try:
+        lock = lock_path.open("a+")
+        try:
+            try:
+                import fcntl
+            except ImportError as exc:
+                raise ValueError(
+                    "OpenAlex persistent pacing requires an interprocess file lock") from exc
+            flock = fcntl
+            while time.monotonic() < deadline:
+                try:
+                    flock.flock(lock.fileno(), flock.LOCK_EX | flock.LOCK_NB)
+                    locked = True
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                        raise
+                    time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            if not locked:
+                yield False
+                return
+            yield True
+        finally:
+            if locked and flock is not None:
+                flock.flock(lock.fileno(), flock.LOCK_UN)
+            if lock is not None:
+                lock.close()
+    finally:
+        thread_lock.release()
+
+
+def _read_rate_state(path):
+    if not path.exists():
+        return {"schema_version": RATE_STATE_SCHEMA_VERSION, "scopes": {}}
+    if not path.is_file():
+        raise ValueError("OpenAlex rate_state_path must name a file")
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError("OpenAlex rate state is unreadable") from exc
+    if (not isinstance(document, dict) or set(document) != {"schema_version", "scopes"}
+            or document.get("schema_version") != RATE_STATE_SCHEMA_VERSION
+            or not isinstance(document.get("scopes"), dict)):
+        raise ValueError("OpenAlex rate state has an unsupported schema")
+    return document
+
+
+def _write_rate_state(path, document):
+    encoded = json.dumps(
+        document, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def work_id(value):
@@ -295,16 +432,111 @@ def _text(works):
                        + ("\n" + work["abstract"] if work["abstract"] is not None else "") for work in works)
 
 
+def _retry_after_seconds(value, *, now=None):
+    """Parse both legal Retry-After forms without inventing a provider delay."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) if math.isfinite(value) and value >= 0 else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            target = parsedate_to_datetime(value)
+            if target.tzinfo is None:
+                return None
+            seconds = target.timestamp() - (time.time() if now is None else now)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return max(0.0, seconds) if math.isfinite(seconds) else None
+
+
+def _header_number(headers, name):
+    value = headers.get(name)
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _rate_limit_metadata(headers, payload, *, authenticated):
+    """Normalize OpenAlex quota evidence and classify only explicit signals."""
+    payload = payload if isinstance(payload, dict) else {}
+    message = payload.get("message") or payload.get("error")
+    message = message if isinstance(message, str) else None
+    retry_after = _retry_after_seconds(headers.get("retry-after"))
+    if retry_after is None:
+        retry_after = _retry_after_seconds(payload.get("retryAfter"))
+    remaining = _header_number(headers, "x-ratelimit-remaining")
+    limit = _header_number(headers, "x-ratelimit-limit")
+    reset = _header_number(headers, "x-ratelimit-reset")
+    credits_used = _header_number(headers, "x-ratelimit-credits-used")
+    lower = (message or "").casefold()
+    if not authenticated and "anonymous" in lower and ("elevated load" in lower or "temporarily" in lower):
+        kind = "anonymous_search_load"
+    elif (remaining == 0 or "daily budget" in lower or "daily quota" in lower
+            or "credits exhausted" in lower or "insufficient budget" in lower
+            or "resets at midnight" in lower):
+        kind = "daily_budget"
+    elif "per second" in lower or "too many requests" in lower:
+        kind = "request_rate"
+    else:
+        kind = "unknown"
+    return {
+        "kind": kind,
+        "authenticated": authenticated,
+        "retry_after_seconds": retry_after,
+        "limit": limit,
+        "remaining": remaining,
+        "reset": reset,
+        "credits_used": credits_used,
+        "message": message,
+    }
+
+
+def provider_cooldown_seconds(rate_limit, *, now=None):
+    """Return the strongest bounded cooldown stated by OpenAlex metadata."""
+    if not isinstance(rate_limit, dict):
+        return None
+    delays = []
+    retry_after = rate_limit.get("retry_after_seconds")
+    if (type(retry_after) in (int, float) and math.isfinite(retry_after)
+            and retry_after > 0):
+        delays.append(float(retry_after))
+    reset = rate_limit.get("reset")
+    if (rate_limit.get("kind") == "daily_budget" and type(reset) in (int, float)
+            and math.isfinite(reset)):
+        reset_delay = (float(reset) - (time.time() if now is None else now)
+                       if reset > 10_000_000 else float(reset))
+        if reset_delay > 0:
+            delays.append(reset_delay)
+    if not delays:
+        return None
+    return min(max(delays), float(MAX_PROVIDER_COOLDOWN_SECONDS))
+
+
 class OpenAlexClient:
     """Bounded OpenAlex transactions with provider-aware retry handling."""
 
     def __init__(self, *, timeout=30, max_bytes=1_048_576, endpoint=DEFAULT_ENDPOINT, auth_env=None,
-                 max_retries=3, retry_backoff_seconds=1.0):
+                 max_retries=3, retry_backoff_seconds=1.0, min_interval_seconds=0.0,
+                 rate_state_path=None):
         _limits(timeout, max_bytes)
         if type(max_retries) is not int or max_retries < 0 or max_retries > 8:
             raise ValueError("max_retries must be an integer between 0 and 8")
         if type(retry_backoff_seconds) not in (int, float) or not math.isfinite(retry_backoff_seconds) or retry_backoff_seconds < 0:
             raise ValueError("retry_backoff_seconds must be finite and non-negative")
+        if (type(min_interval_seconds) not in (int, float)
+                or not math.isfinite(min_interval_seconds) or min_interval_seconds < 0):
+            raise ValueError("min_interval_seconds must be finite and non-negative")
         endpoint = _url(endpoint)
         parsed = urlsplit(endpoint)
         if parsed.port == 0:
@@ -314,49 +546,302 @@ class OpenAlexClient:
         if auth_env is not None and (not isinstance(auth_env, str)
                                      or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", auth_env)):
             raise ValueError("OpenAlex auth_env must name an environment variable")
+        if rate_state_path is not None:
+            if not isinstance(rate_state_path, (str, os.PathLike)):
+                raise ValueError("OpenAlex rate_state_path must be an absolute file path")
+            rate_state_path = Path(rate_state_path)
+            if (not rate_state_path.is_absolute()
+                    or rate_state_path.exists() and not rate_state_path.is_file()):
+                raise ValueError("OpenAlex rate_state_path must be an absolute file path")
+            rate_state_path = rate_state_path.resolve()
         self.timeout, self.max_bytes, self.endpoint, self.auth_env = timeout, max_bytes, endpoint, auth_env
         self.max_retries, self.retry_backoff_seconds = max_retries, float(retry_backoff_seconds)
+        self.min_interval_seconds = float(min_interval_seconds)
+        self.rate_state_path = rate_state_path
+        self._pacing_lock = threading.Lock()
+        self._next_request_at = 0.0
+
+    @staticmethod
+    def _request_class(arguments):
+        return {"search": "search", "citing": "filter", "work": "singleton"}[
+            arguments["operation"]]
+
+    def _rate_scope_key(self, request_class, principal):
+        return hashlib.sha256(json.dumps({
+            "endpoint": self.endpoint,
+            "principal": principal,
+            "request_class": request_class,
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def _legacy_anonymous_scope_key(self, request_class):
+        return hashlib.sha256(json.dumps({
+            "endpoint": self.endpoint,
+            "auth_env": None,
+            "request_class": request_class,
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def _active_persistent_cooldown(self, request_class, principal):
+        if self.rate_state_path is None:
+            return None
+        with _locked_rate_state(self.rate_state_path):
+            document = _read_rate_state(self.rate_state_path)
+            keys = [self._rate_scope_key("global", principal),
+                    self._rate_scope_key(request_class, principal)]
+            if principal == "anonymous":
+                # Preserve cooldowns written by the previous anonymous scope
+                # format while never reusing a key-specific legacy scope.
+                keys.extend([self._legacy_anonymous_scope_key("global"),
+                             self._legacy_anonymous_scope_key(request_class)])
+            now = time.time()
+            active = []
+            changed = False
+            for key in keys:
+                entry = document["scopes"].get(key)
+                if entry is None:
+                    continue
+                valid = (
+                    isinstance(entry, dict)
+                    and set(entry) == {"blocked_until_epoch", "recorded_at", "rate_limit"}
+                    and type(entry.get("blocked_until_epoch")) in (int, float)
+                    and math.isfinite(entry["blocked_until_epoch"])
+                    and type(entry.get("recorded_at")) in (int, float)
+                    and math.isfinite(entry["recorded_at"])
+                    and entry["blocked_until_epoch"] > entry["recorded_at"]
+                    and entry["blocked_until_epoch"] - entry["recorded_at"]
+                    <= MAX_PROVIDER_COOLDOWN_SECONDS + 1
+                    and isinstance(entry.get("rate_limit"), dict)
+                )
+                if not valid or entry["blocked_until_epoch"] <= now:
+                    document["scopes"].pop(key, None)
+                    changed = True
+                    continue
+                active.append(entry)
+            if changed:
+                _write_rate_state(self.rate_state_path, document)
+            if not active:
+                return None
+            entry = max(active, key=lambda item: item["blocked_until_epoch"])
+            rate_limit = dict(entry["rate_limit"])
+            remaining = entry["blocked_until_epoch"] - now
+            rate_limit["retry_after_seconds"] = remaining
+            if rate_limit.get("kind") == "daily_budget":
+                rate_limit["reset"] = remaining
+            return {
+                "blocked_until_epoch": entry["blocked_until_epoch"],
+                "retry_after_seconds": remaining,
+                "rate_limit": rate_limit,
+            }
+
+    def _persist_cooldown(self, rate_limit, seconds, request_class, principal):
+        if self.rate_state_path is None or seconds is None or seconds <= 0:
+            return
+        now = time.time()
+        bounded = min(float(seconds), float(MAX_PROVIDER_COOLDOWN_SECONDS))
+        preserved = {
+            key: value for key, value in rate_limit.items()
+            if key in {"kind", "authenticated", "retry_after_seconds", "limit",
+                       "remaining", "reset", "credits_used", "message"}
+            and (value is None or isinstance(value, (str, int, float, bool)))
+        }
+        if isinstance(preserved.get("message"), str):
+            preserved["message"] = preserved["message"][:2048]
+        with _locked_rate_state(self.rate_state_path):
+            document = _read_rate_state(self.rate_state_path)
+            scope_class = ("global" if rate_limit.get("kind") in {"request_rate", "unknown"}
+                           else request_class)
+            scope_key = self._rate_scope_key(scope_class, principal)
+            existing = document["scopes"].get(scope_key)
+            blocked_until = now + bounded
+            if (isinstance(existing, dict)
+                    and type(existing.get("blocked_until_epoch")) in (int, float)
+                    and math.isfinite(existing["blocked_until_epoch"])):
+                blocked_until = max(blocked_until, float(existing["blocked_until_epoch"]))
+            document["scopes"][scope_key] = {
+                "blocked_until_epoch": blocked_until,
+                "recorded_at": now,
+                "rate_limit": preserved,
+            }
+            _write_rate_state(self.rate_state_path, document)
+
+    def _cooldown_result(self, arguments, url, cooldown, principal):
+        rate_limit = cooldown["rate_limit"]
+        message = rate_limit.get("message")
+        detail = f": {message}" if isinstance(message, str) and message.strip() else ""
+        timestamp = _now()
+        return {
+            "outcome": "rate_limited", "source_url": url, "text": "", "sources": [],
+            "works": [], "capture_sha256": None, "capture": None, "raw_response": None,
+            "gaps": [],
+            "error": "OpenAlex request suppressed until the recorded provider cooldown expires" + detail,
+            "metadata": {
+                "provider": "openalex", "transport": "http_api",
+                "adapter_version": ADAPTER_VERSION, "schema_version": SCHEMA_VERSION,
+                "representation": "scholarly_metadata", "request": arguments,
+                "authenticated": principal != "anonymous",
+                "attempts": 0, "retry_wait_seconds": 0.0, "pacing_wait_seconds": 0.0,
+                "retry_budget_exhausted": True,
+                "retry_suppressed_by_persistent_cooldown": True,
+                "cooldown_cache_hit": True,
+                "blocked_until_epoch": cooldown["blocked_until_epoch"],
+                "rate_limit": rate_limit,
+                "capture_truncated": False, "capture_incomplete": False,
+                "started_at": timestamp, "completed_at": timestamp,
+            },
+        }
+
+    def _reserve_request_slot(self, deadline):
+        """Serialize this client's requests and honor any provider cooldown."""
+        with self._pacing_lock:
+            now = time.monotonic()
+            scheduled = max(now, self._next_request_at)
+            if scheduled >= deadline:
+                return None
+            self._next_request_at = scheduled + self.min_interval_seconds
+        delay = scheduled - now
+        if delay > 0:
+            time.sleep(delay)
+        return delay
+
+    def _extend_cooldown(self, seconds):
+        if seconds is None or seconds <= 0:
+            return
+        with self._pacing_lock:
+            self._next_request_at = max(self._next_request_at, time.monotonic() + seconds)
 
     def run(self, *, operation, query=None, work_id=None, limit=5, cursor=None):
+        """Serialize persistent-state users before rechecking quota state."""
+        arguments = validate_arguments({"operation": operation, "query": query,
+                                        "work_id": work_id, "limit": limit, "cursor": cursor})
+        url = request_url(self.endpoint, arguments)
+        started = time.monotonic()
+        deadline = started + self.timeout
+        credential = os.environ.get(self.auth_env) if self.auth_env is not None else None
+        credential_ready = self.auth_env is None or bool(
+            credential and all(33 <= ord(character) <= 126 for character in credential))
+        principal = ("anonymous" if self.auth_env is None else
+                     "key:" + hashlib.sha256(credential.encode("utf-8")).hexdigest()
+                     if credential_ready else None)
+        with _locked_provider_request(self.rate_state_path, deadline) as reserved:
+            if not reserved:
+                timestamp = _now()
+                return {
+                    "outcome": "timeout", "source_url": url, "text": "", "sources": [],
+                    "works": [], "capture_sha256": None, "capture": None,
+                    "raw_response": None, "gaps": [],
+                    "error": "OpenAlex request budget expired while waiting for the provider reservation",
+                    "metadata": {
+                        "provider": "openalex", "transport": "http_api",
+                        "adapter_version": ADAPTER_VERSION, "schema_version": SCHEMA_VERSION,
+                        "representation": "scholarly_metadata", "request": arguments,
+                        "authenticated": credential is not None,
+                        "attempts": 0, "retry_wait_seconds": 0.0,
+                        "pacing_wait_seconds": 0.0, "retry_budget_exhausted": True,
+                        "capture_truncated": False, "capture_incomplete": False,
+                        "started_at": timestamp, "completed_at": timestamp,
+                    },
+                }
+            return self._run_serialized(
+                operation=operation, query=query, work_id=work_id, limit=limit,
+                cursor=cursor, credential=credential, principal=principal,
+                credential_ready=credential_ready, started=started, deadline=deadline,
+            )
+
+    def _run_serialized(self, *, operation, query=None, work_id=None, limit=5,
+                        cursor=None, credential=None, principal=None,
+                        credential_ready=True, started=None, deadline=None):
         """Retry transient provider responses inside one operation budget.
 
         The timeout is a total budget for the call, so backoff cannot silently
         turn a nominally bounded request into an unbounded sequence of calls.
         """
-        started = time.monotonic()
+        arguments = validate_arguments({"operation": operation, "query": query, "work_id": work_id,
+                                        "limit": limit, "cursor": cursor})
+        url = request_url(self.endpoint, arguments)
+        request_class = self._request_class(arguments)
+        if credential_ready:
+            cooldown = self._active_persistent_cooldown(request_class, principal)
+            if cooldown is not None:
+                self._extend_cooldown(cooldown["retry_after_seconds"])
+                return self._cooldown_result(arguments, url, cooldown, principal)
+
+        started = time.monotonic() if started is None else started
+        deadline = started + self.timeout if deadline is None else deadline
         last = None
         retry_wait_seconds = 0.0
+        pacing_wait_seconds = 0.0
         for attempt in range(self.max_retries + 1):
-            remaining = self.timeout - (time.monotonic() - started)
+            waited = self._reserve_request_slot(deadline)
+            if waited is None:
+                break
+            pacing_wait_seconds += waited
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             last = self._run_once(operation=operation, query=query, work_id=work_id,
-                                  limit=limit, cursor=cursor, timeout=remaining)
+                                  limit=limit, cursor=cursor, timeout=remaining,
+                                  credential=credential)
             last.setdefault("metadata", {})["attempts"] = attempt + 1
             status = (last.get("metadata") or {}).get("http_status")
-            if status not in {408, 425, 429, 500, 502, 503, 504} or attempt >= self.max_retries:
-                last.setdefault("metadata", {})["retry_wait_seconds"] = retry_wait_seconds
-                return last
-            headers = (last.get("metadata") or {}).get("headers") or {}
             delay = self.retry_backoff_seconds * (2 ** attempt)
-            try:
-                if headers.get("retry-after") is not None:
-                    delay = max(delay, min(60.0, float(headers["retry-after"])))
-            except (TypeError, ValueError):
-                pass
-            if time.monotonic() + delay >= started + self.timeout:
+            if status == 429:
+                rate_limit = (last.get("metadata") or {}).get("rate_limit") or {}
+                provider_delay = provider_cooldown_seconds(rate_limit)
+                if provider_delay is not None:
+                    delay = max(delay, provider_delay)
+                # Preserve the provider's last cooldown even when no retry fits
+                # this call, so another query on the same client cannot hammer.
+                self._extend_cooldown(delay)
+                try:
+                    self._persist_cooldown(rate_limit, delay, request_class, principal)
+                except (OSError, ValueError) as exc:
+                    last.setdefault("metadata", {})["rate_state_error"] = (
+                        f"{type(exc).__name__}: {exc}")
+            if status == 200:
+                rate_limit = (last.get("metadata") or {}).get("rate_limit") or {}
+                remaining_credits = rate_limit.get("remaining")
+                request_credits = rate_limit.get("credits_used")
+                if (type(remaining_credits) in (int, float)
+                        and type(request_credits) in (int, float)
+                        and request_credits > 0 and remaining_credits < request_credits):
+                    preventive = {**rate_limit, "kind": "daily_budget"}
+                    delay = provider_cooldown_seconds(preventive)
+                    if delay is not None:
+                        try:
+                            self._persist_cooldown(preventive, delay, request_class, principal)
+                            last.setdefault("metadata", {})["preventive_cooldown_seconds"] = delay
+                        except (OSError, ValueError) as exc:
+                            last.setdefault("metadata", {})["rate_state_error"] = (
+                                f"{type(exc).__name__}: {exc}")
+            if status not in TRANSIENT_HTTP_STATUSES or attempt >= self.max_retries:
                 last.setdefault("metadata", {})["retry_wait_seconds"] = retry_wait_seconds
+                last["metadata"]["pacing_wait_seconds"] = pacing_wait_seconds
+                if status in TRANSIENT_HTTP_STATUSES:
+                    last["metadata"]["retry_budget_exhausted"] = True
                 return last
-            retry_wait_seconds += delay
-            time.sleep(delay)
+            if time.monotonic() + delay >= deadline:
+                last.setdefault("metadata", {})["retry_wait_seconds"] = retry_wait_seconds
+                last["metadata"]["pacing_wait_seconds"] = pacing_wait_seconds
+                last["metadata"]["retry_budget_exhausted"] = True
+                return last
+            # The shared client pacing slot owns 429 sleeps. Other transient
+            # failures have no provider cooldown and use the local backoff.
+            if status != 429:
+                retry_wait_seconds += delay
+                time.sleep(delay)
         if last is None:
-            last = self._run_once(operation=operation, query=query, work_id=work_id,
-                                  limit=limit, cursor=cursor, timeout=0.001)
-            last.setdefault("metadata", {})["attempts"] = 1
+            last = {"outcome": "timeout", "source_url": None, "text": "", "sources": [],
+                    "works": [], "capture_sha256": None, "capture": None, "raw_response": None,
+                    "gaps": [], "error": "OpenAlex request budget expired before the next paced request",
+                    "metadata": {"provider": "openalex", "transport": "http_api",
+                                 "adapter_version": ADAPTER_VERSION, "schema_version": SCHEMA_VERSION,
+                                 "attempts": 0, "retry_budget_exhausted": True,
+                                 "started_at": _now(), "completed_at": _now()}}
         last.setdefault("metadata", {})["retry_wait_seconds"] = retry_wait_seconds
+        last["metadata"]["pacing_wait_seconds"] = pacing_wait_seconds
         return last
 
-    def _run_once(self, *, operation, query=None, work_id=None, limit=5, cursor=None, timeout=None):
+    def _run_once(self, *, operation, query=None, work_id=None, limit=5, cursor=None,
+                  timeout=None, credential=None):
         request_timeout = self.timeout if timeout is None else timeout
         arguments = validate_arguments({"operation": operation, "query": query, "work_id": work_id,
                                         "limit": limit, "cursor": cursor})
@@ -366,11 +851,11 @@ class OpenAlexClient:
                   "metadata": {"provider": "openalex", "transport": "http_api", "adapter_version": ADAPTER_VERSION,
                                "schema_version": SCHEMA_VERSION, "representation": "scholarly_metadata",
                                "request": arguments, "started_at": _now(),
+                               "authenticated": credential is not None,
                                "capture_truncated": False, "capture_incomplete": False}}
         headers = {"User-Agent": "Sci-saurus/0.8 (scholarly metadata client)",
                    "Accept": "application/json", "Accept-Encoding": "identity"}
         if self.auth_env is not None:
-            credential = os.environ.get(self.auth_env)
             if not credential or any(ord(c) < 33 or ord(c) > 126 for c in credential):
                 result.update(outcome="auth_required", error="Configured OpenAlex credential is unavailable or invalid")
                 result["metadata"]["completed_at"] = _now()
@@ -433,6 +918,8 @@ class OpenAlexClient:
                 key.lower(): value for key, value in response.getheaders()
                 if key.lower().startswith("x-ratelimit-") or key.lower() in {"retry-after", "content-type", "content-length"}
             }})
+            metadata["rate_limit"] = _rate_limit_metadata(
+                metadata["headers"], None, authenticated=credential is not None)
             while len(body) <= self.max_bytes:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or expired.is_set():
@@ -456,7 +943,20 @@ class OpenAlexClient:
             if response.status != 200:
                 result["outcome"] = {401: "auth_required", 403: "access_denied", 404: "not_found",
                                      429: "rate_limited"}.get(response.status, "provider_error")
-                result["error"] = f"OpenAlex returned HTTP {response.status}"
+                payload = None
+                try:
+                    payload = json.loads(body, object_pairs_hook=_object, parse_constant=_constant,
+                                         parse_float=_float) if body else None
+                except (ValueError, TypeError, RecursionError):
+                    payload = None
+                if payload is not None and response.status == 429:
+                    result["raw_response"] = payload
+                if response.status == 429:
+                    metadata["rate_limit"] = _rate_limit_metadata(
+                        metadata["headers"], payload, authenticated=credential is not None)
+                provider_message = payload.get("message") if isinstance(payload, dict) else None
+                result["error"] = (provider_message if isinstance(provider_message, str) and provider_message.strip()
+                                   else f"OpenAlex returned HTTP {response.status}")
                 return result
             payload = json.loads(body, object_pairs_hook=_object, parse_constant=_constant, parse_float=_float)
             json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")

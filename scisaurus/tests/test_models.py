@@ -22,6 +22,8 @@ class TestModelClient(unittest.TestCase):
                 outer.path = self.path
                 outer.request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
                 outer.calls += 1
+                if outer.slow_headers:
+                    time.sleep(0.5)
                 status = outer.status[min(outer.calls - 1, len(outer.status) - 1)] if isinstance(outer.status, list) else outer.status
                 if status != 200:
                     self.send_response(status)
@@ -31,6 +33,8 @@ class TestModelClient(unittest.TestCase):
                     self.wfile.write(b'private provider failure content')
                     return
                 self.send_response(200)
+                if outer.trickle_chunked:
+                    self.send_header('Transfer-Encoding', 'chunked')
                 self.end_headers()
                 response = (outer.response_sequence[min(outer.calls - 1, len(outer.response_sequence) - 1)]
                             if outer.response_sequence else outer.response)
@@ -41,6 +45,25 @@ class TestModelClient(unittest.TestCase):
                     time.sleep(0.25)
                     self.wfile.write(body[1:])
                     self.wfile.flush()
+                elif outer.trickle_body:
+                    try:
+                        for byte in body:
+                            self.wfile.write(bytes([byte]))
+                            self.wfile.flush()
+                            time.sleep(0.02)
+                    except BrokenPipeError:
+                        pass
+                elif outer.trickle_chunked:
+                    try:
+                        header = b'1;' + (b'x' * 64) + b'\r\n'
+                        for byte in header:
+                            self.wfile.write(bytes([byte]))
+                            self.wfile.flush()
+                            time.sleep(0.02)
+                        self.wfile.write(b'x\r\n0\r\n\r\n')
+                        self.wfile.flush()
+                    except BrokenPipeError:
+                        pass
                 else:
                     self.wfile.write(body)
             def log_message(self, *args):
@@ -53,6 +76,9 @@ class TestModelClient(unittest.TestCase):
         self.calls = 0
         self.response_sequence = None
         self.slow_body = False
+        self.slow_headers = False
+        self.trickle_body = False
+        self.trickle_chunked = False
         self.response = {'model':'served-model','message':{'content':'{"value": 4}'}, 'done':True,
                          'done_reason':'stop', 'prompt_eval_count':10, 'eval_count':5}
 
@@ -264,6 +290,39 @@ class TestModelClient(unittest.TestCase):
 
     def test_body_transfer_is_bounded_by_absolute_timeout(self):
         self.slow_body = True
+        client = ModelClient(base_url=self.url + '/v1', protocol='openai_compatible',
+                             model='configured-model', timeout_seconds=0.08, max_output_tokens=5,
+                             max_retries=0)
+        started = time.monotonic()
+        with self.assertRaises(ModelCallError) as error:
+            client.complete(system='x', prompt='x')
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertIn('deadline', str(error.exception))
+
+    def test_trickled_body_cannot_evade_absolute_timeout(self):
+        self.trickle_body = True
+        client = ModelClient(base_url=self.url + '/v1', protocol='openai_compatible',
+                             model='configured-model', timeout_seconds=0.08, max_output_tokens=5,
+                             max_retries=0)
+        started = time.monotonic()
+        with self.assertRaises(ModelCallError) as error:
+            client.complete(system='x', prompt='x')
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertIn('deadline', str(error.exception))
+
+    def test_trickled_chunk_header_cannot_evade_absolute_timeout(self):
+        self.trickle_chunked = True
+        client = ModelClient(base_url=self.url + '/v1', protocol='openai_compatible',
+                             model='configured-model', timeout_seconds=0.08, max_output_tokens=5,
+                             max_retries=0)
+        started = time.monotonic()
+        with self.assertRaises(ModelCallError) as error:
+            client.complete(system='x', prompt='x')
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertIn('deadline', str(error.exception))
+
+    def test_slow_headers_cannot_evade_absolute_timeout(self):
+        self.slow_headers = True
         client = ModelClient(base_url=self.url + '/v1', protocol='openai_compatible',
                              model='configured-model', timeout_seconds=0.08, max_output_tokens=5,
                              max_retries=0)

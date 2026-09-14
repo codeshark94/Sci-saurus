@@ -1,10 +1,12 @@
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from scisaurus.core.errors import ValidationError
+from scisaurus.runtime.literature import ProviderCooldownError
 from scisaurus.runtime.models import ModelResult
 from scisaurus.runtime.topic_discovery import (
     SCHEMA_VERSION,
@@ -16,6 +18,8 @@ from scisaurus.runtime.topic_discovery import (
     validate_topic_maturity_review,
     validate_topic_novelty,
     validate_topic_stage_config,
+    validate_frontier_seed_plan,
+    validate_source_challenge,
 )
 
 
@@ -44,6 +48,24 @@ def package(objective):
     }
 
 
+def frontier_plan(count=6):
+    domains = ["marine ecology", "soft matter", "plant hydraulics", "acoustics",
+               "geomorphology", "microbial evolution", "atmospheric chemistry", "neuroscience"]
+    return {
+        "schema_version": "topic-frontier-seeds-1",
+        "seeds": [{
+            "id": f"frontier_{index}", "domain": domains[index],
+            "phenomenon": f"domain-specific transition {index}",
+            "mechanism": f"competing transport mechanism {index}",
+            "unit_of_analysis": f"observed unit {index}",
+            "search_queries": [
+                f"{domains[index]} transition mechanism",
+                f"{domains[index]} boundary scaling",
+            ],
+        } for index in range(count)],
+    }
+
+
 class FakeOpenAlex:
     queries = []
 
@@ -52,13 +74,16 @@ class FakeOpenAlex:
 
     def run(self, *, operation, query, limit, cursor):
         self.queries.append(query)
+        prefix = int(hashlib.sha256(query.encode()).hexdigest()[:8], 16) * 100
         return {
             "outcome": "ok",
             "works": [{
-                "id": f"W{1000 + i}", "title": f"Recent paper {i}",
-                "year": 2025 if i % 2 else 2022, "abstract": "A scholarly abstract.",
+                "id": f"W{prefix + i + 1}", "title": f"{query} paper {i}",
+                "year": 2025 if i % 2 else 2022,
+                "abstract": f"A scholarly abstract about {query}.",
                 "doi": None, "locations": [],
             } for i in range(10)],
+            "metadata": {"provider": "openalex", "http_status": 200},
         }
 
 
@@ -92,8 +117,46 @@ class FakeModel:
         self.config = config
 
     def complete(self, *, system, prompt, images=None):
-        objective = json.loads(prompt)["principal_objective"]
-        return ModelResult(text=json.dumps(package(objective)), model="fake",
+        payload = json.loads(prompt)
+        if payload.get("assignment") == "science_first_frontier_seed_generation":
+            value = frontier_plan(payload["seed_count"])
+        elif payload.get("assignment") == "topic_source_and_template_challenge":
+            value = {
+                "schema_version": "topic-source-challenge-1",
+                "decision": "admit_to_survey",
+                "selected_id": payload["selected_topic"]["id"],
+                "source_relevance": 4, "template_independence": 4,
+                "prior_work_risk": "low",
+                "closest_work_ids": [payload["targeted_scholarly_records"][0]["work_id"]],
+                "rationale": "The supplied records are relevant and the question tests a distinct mechanism.",
+                "required_changes": [],
+            }
+        else:
+            value = package(payload["principal_objective"])
+            seeds = payload.get("frontier_seeds") or []
+            papers = payload.get("recent_papers") or []
+            if seeds and papers:
+                papers_by_seed = {}
+                for paper in papers:
+                    papers_by_seed.setdefault(paper["frontier_seed_id"], paper)
+                grounded = [seed for seed in seeds if seed["id"] in papers_by_seed][:3]
+                for candidate, seed in zip(value["candidates"], grounded):
+                    paper = papers_by_seed[seed["id"]]
+                    candidate.update({
+                        "title": f"{seed['domain']} {seed['phenomenon']}",
+                        "domain": seed["domain"],
+                        "research_question": (
+                            f"Does {seed['mechanism']} alter {seed['phenomenon']} "
+                            f"for {seed['unit_of_analysis']}?"),
+                        "scope": f"Bounded observations of {seed['unit_of_analysis']}.",
+                        "search_queries": [
+                            seed["search_queries"][0], seed["search_queries"][1],
+                            f"{seed['domain']} {seed['phenomenon']}",
+                        ],
+                        "frontier_seed_id": seed["id"],
+                        "prior_work_ids": [paper["work_id"]],
+                    })
+        return ModelResult(text=json.dumps(value), model="fake",
                            usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
                            elapsed_seconds=0.01, finish_reason="stop")
 
@@ -201,14 +264,46 @@ class TopicDiscoveryTests(unittest.TestCase):
     def test_samples_recent_records_with_unicode_objective_and_reproducible_shuffle(self):
         FakeOpenAlex.queries = []
         with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", FakeOpenAlex):
-            first = TopicDiscoveryRunner._recent_paper_sample("최근 기후 모델 비교", sampling_seed=17)
-            second = TopicDiscoveryRunner._recent_paper_sample("최근 기후 모델 비교", sampling_seed=17)
+            first = TopicDiscoveryRunner._recent_paper_sample(
+                "최근 기후 모델 비교", sampling_seed=17, frontier_seed_plan=frontier_plan())
+            second = TopicDiscoveryRunner._recent_paper_sample(
+                "최근 기후 모델 비교", sampling_seed=17, frontier_seed_plan=frontier_plan())
         self.assertEqual(first, second)
-        self.assertTrue(any("최근" in query for query in FakeOpenAlex.queries))
-        self.assertEqual(len(first[0]), 10)
+        self.assertTrue(any("marine ecology" in query for query in FakeOpenAlex.queries))
+        self.assertEqual(len(first[0]), 12)
         self.assertEqual(first[1], 17)
-        self.assertEqual(len(first[2]), 4)
+        self.assertEqual(len(first[2]), 6)
         self.assertTrue(all(item["year"] >= 2022 for item in first[0]))
+        self.assertGreaterEqual(len({item["frontier_seed_id"] for item in first[0]}), 4)
+
+    def test_topic_sampling_rejects_single_token_provider_false_positives(self):
+        class MixedRelevanceOpenAlex:
+            def __init__(self, **config):
+                pass
+
+            def run(self, *, operation, query, limit, cursor):
+                prefix = int(hashlib.sha256(query.encode()).hexdigest()[:8], 16) * 100
+                first = query.split()[0]
+                return {
+                    "outcome": "ok",
+                    "works": [
+                        {"id": f"W{prefix + 1}", "title": f"{first} unrelated catalog",
+                         "year": 2025, "abstract": "A generic bibliographic record.",
+                         "doi": None, "locations": []},
+                        {"id": f"W{prefix + 2}", "title": query,
+                         "year": 2025, "abstract": f"A focused study of {query}.",
+                         "doi": None, "locations": []},
+                    ],
+                    "metadata": {"provider": "openalex", "http_status": 200},
+                }
+
+        with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", MixedRelevanceOpenAlex):
+            papers, _, trace = TopicDiscoveryRunner._recent_paper_sample(
+                "feasible science", sampling_seed=3, frontier_seed_plan=frontier_plan())
+        self.assertEqual(len(papers), 6)
+        self.assertTrue(all(item["work_id"].endswith("2") for item in papers))
+        self.assertTrue(all(len(item["irrelevant_work_ids"]) == 1 for item in trace))
+        self.assertTrue(all(item["required_query_token_matches"] == 2 for item in trace))
 
     def test_runner_includes_runtime_context_and_sample_provenance(self):
         objective = "Choose a feasible research direction"
@@ -224,6 +319,59 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["sampling_seed"], 9)
         self.assertTrue(result["recent_papers"])
         self.assertEqual(result["feasibility_check"]["status"], "feasible")
+        self.assertGreaterEqual(
+            len({item["frontier_seed_id"] for item in result["candidates"]}), 3)
+        self.assertTrue(all(item["prior_work_ids"] for item in result["candidates"]))
+
+    def test_grounded_portfolio_rejects_invented_sources_and_seed_collapse(self):
+        value = package("Choose a feasible research direction")
+        seeds = frontier_plan(3)["seeds"]
+        papers = []
+        for index, seed in enumerate(seeds):
+            work_id = f"W{index + 1}"
+            papers.append({
+                "work_id": work_id, "title": seed["search_queries"][0],
+                "abstract": f"Evidence about {seed['mechanism']} and {seed['phenomenon']}.",
+                "frontier_seed_id": seed["id"],
+            })
+            candidate = value["candidates"][index]
+            candidate.update({
+                "title": f"{seed['domain']} transition",
+                "domain": seed["domain"],
+                "research_question": f"Does {seed['mechanism']} change {seed['phenomenon']}?",
+                "scope": f"Observed {seed['unit_of_analysis']}.",
+                "search_queries": [*seed["search_queries"], f"{seed['domain']} transition"],
+                "frontier_seed_id": seed["id"], "prior_work_ids": [work_id],
+            })
+        validate_topic_package(
+            value, objective=value["objective"], candidate_count=3,
+            frontier_seeds=seeds, recent_papers=papers, require_grounding=True)
+        value["candidates"][0]["prior_work_ids"] = ["W999"]
+        with self.assertRaisesRegex(ValidationError, "outside the supplied evidence"):
+            validate_topic_package(
+                value, objective=value["objective"], candidate_count=3,
+                frontier_seeds=seeds, recent_papers=papers, require_grounding=True)
+
+    def test_selected_topic_cannot_paraphrase_a_hidden_fallback_template(self):
+        value = package("Choose a feasible research direction")
+        selected = value["candidates"][1]
+        template = {"id": "fixed_template", "domain": selected["domain"],
+                    "research_question": selected["research_question"]}
+        with self.assertRaisesRegex(ValidationError, "fallback experiment template"):
+            validate_topic_package(
+                value, objective=value["objective"], candidate_count=3,
+                fallback_templates=[template])
+
+    def test_admitted_source_challenge_requires_a_closest_work(self):
+        review = {
+            "schema_version": "topic-source-challenge-1", "decision": "admit_to_survey",
+            "selected_id": "direction_1", "source_relevance": 4,
+            "template_independence": 4, "prior_work_risk": "low",
+            "closest_work_ids": [], "rationale": "Relevant bounded evidence.",
+            "required_changes": [],
+        }
+        with self.assertRaisesRegex(ValidationError, "at least one closest"):
+            validate_source_challenge(review, selected_id="direction_1", work_ids=["W1"])
 
     def test_unavailable_selected_capability_is_rejected(self):
         value = package("Choose a feasible research direction")
@@ -356,12 +504,12 @@ class TopicDiscoveryTests(unittest.TestCase):
             def run(self, **kwargs):
                 return {"outcome": "rate_limited", "error": "429", "works": []}
 
-        with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", FailedOpenAlex), \
-                patch("scisaurus.runtime.topic_discovery.CrossrefClient", FailedCrossref):
-            with self.assertRaisesRegex(ValidationError, "sampling failed"):
-                TopicDiscoveryRunner._recent_paper_sample("feasible science")
+        with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", FailedOpenAlex):
+            with self.assertRaisesRegex(ValidationError, "source-diversity floor"):
+                TopicDiscoveryRunner._recent_paper_sample(
+                    "feasible science", sampling_seed=3, frontier_seed_plan=frontier_plan())
 
-    def test_rate_limited_openalex_can_seed_topic_intake_from_crossref(self):
+    def test_rate_limited_openalex_fails_closed_without_crossref_topic_admission(self):
         class FailedOpenAlex:
             def __init__(self, **config):
                 pass
@@ -369,12 +517,43 @@ class TopicDiscoveryTests(unittest.TestCase):
             def run(self, **kwargs):
                 return {"outcome": "rate_limited", "works": [], "metadata": {}}
 
-        with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", FailedOpenAlex), \
-                patch("scisaurus.runtime.topic_discovery.CrossrefClient", FakeCrossref):
-            records, seed, trace = TopicDiscoveryRunner._recent_paper_sample("feasible science", sampling_seed=3)
-        self.assertEqual(seed, 3)
-        self.assertTrue(records)
-        self.assertTrue(any(item.get("provider") == "crossref" for item in trace))
+        with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", FailedOpenAlex):
+            with self.assertRaisesRegex(ValidationError, "source-diversity floor"):
+                TopicDiscoveryRunner._recent_paper_sample(
+                    "feasible science", sampling_seed=3, frontier_seed_plan=frontier_plan())
+
+    def test_rate_limited_topic_propagates_provider_reset_boundary(self):
+        class FailedOpenAlex:
+            def __init__(self, **config):
+                pass
+
+            def run(self, **kwargs):
+                return {
+                    "outcome": "rate_limited", "works": [], "error": "budget exhausted",
+                    "metadata": {"rate_limit": {
+                        "kind": "daily_budget", "retry_after_seconds": 321,
+                        "reset": 321, "remaining": 0,
+                    }},
+                }
+
+        with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", FailedOpenAlex):
+            with self.assertRaises(ProviderCooldownError) as caught:
+                TopicDiscoveryRunner._recent_paper_sample(
+                    "feasible science", sampling_seed=3, frontier_seed_plan=frontier_plan())
+        self.assertEqual(caught.exception.retry_after_seconds, 321)
+
+    def test_frontier_seed_plan_rejects_mission_boilerplate_queries(self):
+        value = frontier_plan()
+        self.assertEqual(validate_frontier_seed_plan(value, seed_count=6), value)
+        value["seeds"][0]["search_queries"][0] = "autonomous research workflow"
+        with self.assertRaisesRegex(ValidationError, "mission boilerplate"):
+            validate_frontier_seed_plan(value, seed_count=6)
+
+    def test_frontier_query_must_be_anchored_to_its_seed(self):
+        value = frontier_plan()
+        value["seeds"][0]["search_queries"][0] = "quantum entanglement entropy"
+        with self.assertRaisesRegex(ValidationError, "anchored"):
+            validate_frontier_seed_plan(value, seed_count=6)
 
 
 if __name__ == "__main__":

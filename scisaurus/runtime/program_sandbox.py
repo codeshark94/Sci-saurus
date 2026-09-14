@@ -49,21 +49,53 @@ def sandbox_status():
     return {"sandbox_exec": SANDBOX_EXEC, "mode": "sandbox-exec" if SANDBOX_EXEC else "rlimits-only"}
 
 
-def sandbox_profile(workspace, *, allow_network=False):
+def _sandbox_read_paths(command, workspace):
+    """Return the minimal immutable runtime roots needed to start Python."""
+    executable = Path(command[0]).resolve()
+    configured = Path(command[0])
+    roots = {
+        Path(workspace).resolve(),
+        Path("/opt/homebrew"),
+    }
+    # A virtual environment keeps its interpreter and site-packages under one
+    # prefix. Never infer a broader user-home root from an arbitrary command.
+    if configured.parent.name == "bin" and configured.parent.parent.name in {".venv", "venv"}:
+        roots.add(configured.parent.parent.resolve())
+    files = {configured.resolve(), executable}
+    for argument in command[1:]:
+        candidate = Path(argument)
+        if candidate.is_absolute() and candidate.exists():
+            files.add(candidate.resolve())
+    return sorted(str(path) for path in roots if path.exists()), sorted(str(path) for path in files)
+
+
+def sandbox_profile(workspace, command, *, allow_network=False):
     """Return a deny-by-default Seatbelt profile for one throwaway workspace."""
     workspace = str(Path(workspace).resolve())
-    temporary = str(Path(os.environ.get("TMPDIR", "/tmp")).resolve())
+    read_roots, read_files = _sandbox_read_paths(command, workspace)
+    metadata_paths = set()
+    for value in [*read_roots, *read_files]:
+        path = Path(value)
+        metadata_paths.add(str(path))
+        metadata_paths.update(str(parent) for parent in path.parents if str(parent) != "/")
     lines = [
         "(version 1)",
         "(deny default)",
+        '(import "system.sb")',
         "(allow process-fork)",
         "(allow process-exec)",
         "(allow sysctl-read)",
         "(allow mach-lookup)",
-        "(allow file-read*)",
+        "(allow file-read-metadata",
+        *[f'  (literal "{path}")' for path in sorted(metadata_paths)],
+        ")",
+        "(allow file-read*",
+        *[f'  (subpath "{path}")' for path in read_roots],
+        *[f'  (literal "{path}")' for path in read_files],
+        '  (literal "/dev/null")',
+        '  (literal "/dev/urandom"))',
         "(allow file-write*",
         f'  (subpath "{workspace}")',
-        f'  (subpath "{temporary}")',
         '  (literal "/dev/null")',
         '  (literal "/dev/stdout")',
         '  (literal "/dev/stderr"))',
@@ -116,7 +148,8 @@ def run_sandboxed(command, *, workspace, input_bytes=b"", timeout_seconds=300.0,
         process_env.update({key: value for key, value in env.items() if key in SAFE_ENV_KEYS})
     mode = "sandbox-exec"
     if SANDBOX_EXEC:
-        command = [SANDBOX_EXEC, "-p", sandbox_profile(workspace, allow_network=allow_network), *command]
+        command = [SANDBOX_EXEC, "-p", sandbox_profile(
+            workspace, command, allow_network=allow_network), *command]
     else:
         mode = "rlimits-only"
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -155,11 +188,14 @@ def run_sandboxed(command, *, workspace, input_bytes=b"", timeout_seconds=300.0,
                     selector.unregister(key.fileobj)
                     continue
                 buffer = key.data
-                if len(buffer) + len(chunk) <= max_bytes:
-                    buffer.extend(chunk)
-                else:
-                    buffer.extend(chunk[: max(0, max_bytes - len(buffer))])
+                remaining_bytes = max_bytes - len(stdout) - len(stderr)
+                if remaining_bytes > 0:
+                    buffer.extend(chunk[:remaining_bytes])
+                if len(chunk) > remaining_bytes:
                     truncated = True
+                    break
+            if truncated:
+                break
             if stdin_open and written < len(input_bytes):
                 try:
                     written += os.write(process.stdin.fileno(), input_bytes[written:written + 65536])
@@ -171,7 +207,7 @@ def run_sandboxed(command, *, workspace, input_bytes=b"", timeout_seconds=300.0,
                     except OSError:
                         pass
                     stdin_open = False
-        if timed_out:
+        if timed_out or truncated:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except OSError:

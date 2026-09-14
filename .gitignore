@@ -10,3 +10,4 @@ projects/*/state/
 .runs/
 .env
 .env.local
+.dsh/

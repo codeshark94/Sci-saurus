@@ -96,7 +96,7 @@ def validate_workflow(value):
     fields = {"schema_version", "id", "revision", "project_id", "objective", "stages", "time_policy", "completion"}
     allowed_fields = fields | {"retry_policy", "continuation_policy", "organization", "exploration_seed",
                                "topic_reuse_allowed", "experiment_catalog", "topic_exclusions",
-                               "topic_history_path"}
+                               "topic_history_path", "capability_foundry_config_path"}
     if not isinstance(value, dict) or set(value) - allowed_fields or not fields.issubset(value):
         raise ValidationError(
             f"composer workflow requires {sorted(fields)} and permits ['continuation_policy', 'exploration_seed', 'organization', 'retry_policy', 'topic_reuse_allowed', 'experiment_catalog', 'topic_exclusions', 'topic_history_path']")
@@ -120,6 +120,17 @@ def validate_workflow(value):
             raise ValidationError("workflow topic_history_path must be an absolute path")
         if Path(history_path).exists() and not Path(history_path).is_file():
             raise ValidationError("workflow topic_history_path must name a file")
+    if "capability_foundry_config_path" in value:
+        foundry_path = value["capability_foundry_config_path"]
+        if (not isinstance(foundry_path, str) or not Path(foundry_path).is_absolute()
+                or not Path(foundry_path).is_file()):
+            raise ValidationError(
+                "workflow capability_foundry_config_path must be an existing absolute file")
+        from scisaurus.runtime.capability_foundry import validate_foundry_config
+        try:
+            validate_foundry_config(json.loads(Path(foundry_path).read_text()))
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValidationError("workflow capability foundry config is unreadable") from exc
     if "topic_exclusions" in value:
         exclusions = value["topic_exclusions"]
         if (not isinstance(exclusions, dict)
@@ -950,6 +961,7 @@ class ComposerRunner:
                     }
             except (OSError, ValueError, TypeError):
                 experiment_contract = None
+        foundry_enabled = bool(self.workflow.get("capability_foundry_config_path"))
         return {
             "operating_system": platform.system(),
             "platform": platform.machine(),
@@ -961,7 +973,19 @@ class ComposerRunner:
             "model_name": model.get("model") if isinstance(model, dict) else None,
             "configured_stage_kinds": [stage["kind"] for stage in self.workflow["stages"]],
             "experiment_contract": experiment_contract,
-            "experiment_catalog": experiment_catalog,
+            # A foundry-backed mission defines the scientific question before
+            # execution design. Frozen templates remain an auditable fallback
+            # inventory but cannot seed or constrain topic generation.
+            "experiment_catalog": [] if foundry_enabled else experiment_catalog,
+            "fallback_experiment_catalog": experiment_catalog if foundry_enabled else [],
+            "capability_foundry": ({
+                "enabled": True,
+                "execution_boundary": "deterministic seeded Python with no network or subprocess access",
+                "admission_gates": [
+                    "static scan", "sandbox execution", "deterministic replay",
+                    "test-vector digest", "independent recalculation", "adversarial review",
+                ],
+            } if foundry_enabled else {"enabled": False}),
             "topic_exclusions": self._effective_topic_exclusions(),
             "topic_history": self._topic_history_context(),
             "project_files": project_files,
@@ -1000,15 +1024,12 @@ class ComposerRunner:
         return (family_root / ".scisaurus-topic-history.json").resolve()
 
     def _topic_history_scope_key(self):
-        """Keep topic memory isolated by objective and executable portfolio."""
-        catalog = [
-            item.get("id") for item in self.workflow.get("experiment_catalog", [])
-            if isinstance(item, dict) and isinstance(item.get("id"), str)
-        ]
+        """Keep topic memory stable across harmless objective/catalog edits."""
         material = {
-            "objective": self.workflow["objective"],
-            "experiment_capability_ids": sorted(catalog),
-            "stage_kinds": [item["kind"] for item in self.workflow["stages"]],
+            "workflow_id": self.workflow["id"],
+            "stage_graph": [{"id": item["id"], "kind": item["kind"],
+                             "depends_on": sorted(item.get("depends_on", []))}
+                            for item in self.workflow["stages"]],
         }
         return hashlib.sha256(canonical_bytes(material)).hexdigest()
 
@@ -1048,16 +1069,24 @@ class ComposerRunner:
         except (OSError, ValueError) as exc:
             raise ValidationError(f"topic history is unreadable: {path}") from exc
         self._validate_topic_history_document(document)
-        scope = document["scopes"].get(self.topic_history_scope, {})
-        if not isinstance(scope, dict):
-            raise ValidationError("topic history scope is invalid")
-        entries = scope.get("entries", [])
-        if not isinstance(entries, list):
-            raise ValidationError("topic history scope entries must be a list")
+        if self.workflow.get("topic_history_path"):
+            # An explicit history path is itself the mission-family boundary.
+            # Preserve prior directions across harmless objective wording or
+            # capability-inventory revisions instead of silently reopening
+            # already explored topics under a new hash scope.
+            entries = [deepcopy(entry)
+                       for scope in document["scopes"].values()
+                       for entry in scope.get("entries", [])]
+        else:
+            scope = document["scopes"].get(self.topic_history_scope, {})
+            if not isinstance(scope, dict):
+                raise ValidationError("topic history scope is invalid")
+            entries = deepcopy(scope.get("entries", []))
+            if not isinstance(entries, list):
+                raise ValidationError("topic history scope entries must be a list")
         # Keep the durable file complete.  Prompt projections are bounded in
         # `_topic_history_context`, but an old attempt remains available for
         # deterministic repeat checks and audit.
-        entries = deepcopy(entries)
         counts = {}
         for entry in entries:
             capability = entry.get("experiment_capability_id")
@@ -1146,8 +1175,9 @@ class ComposerRunner:
                 import fcntl
                 flock = fcntl
                 flock.flock(lock.fileno(), flock.LOCK_EX)
-            except (ImportError, OSError):
-                flock = None
+            except ImportError as exc:
+                raise ValidationError(
+                    "topic history requires an interprocess file lock") from exc
             if path.is_file():
                 try:
                     document = json.loads(path.read_text())
@@ -1160,11 +1190,16 @@ class ComposerRunner:
             entries = scope.setdefault("entries", [])
             fingerprint = entry["signature"]["fingerprint"]
             new_entry = False
+            comparison_entries = (
+                [item for stored_scope in document["scopes"].values()
+                 for item in stored_scope.get("entries", [])]
+                if self.workflow.get("topic_history_path") else entries
+            )
             if not any(
                     isinstance(item, dict)
                     and (item.get("run_id") == self.run_id
                          or ((item.get("signature") or {}).get("fingerprint") == fingerprint))
-                    for item in entries):
+                    for item in comparison_entries):
                 entries.append(entry)
                 new_entry = True
             scope["entries"] = entries
@@ -1518,6 +1553,9 @@ class ComposerRunner:
         topic = topic_context["topic"]
         if not isinstance(survey, dict):
             return config
+        # A free-topic novelty decision requires citation-graph evidence.
+        # Crossref metadata cannot silently replace a failed OpenAlex search.
+        survey["bibliography_fallback"] = "disabled"
         # A catalog-backed stage is a new project identity.  Reusing the
         # template's project or capability IDs would leak the previous
         # experiment into the survey ledger and can collide with its reserved
@@ -1634,19 +1672,99 @@ class ComposerRunner:
             raw = [exact_query, *raw]
         return list(dict.fromkeys(raw))
 
-    def _apply_topic_to_experiment_config(self, stage, config):
-        """Select a pinned executable capability for a free-topic mission.
+    def _materialize_topic_capability(self, result):
+        """Generate and admit a pinned program for one science-first topic."""
+        configured_path = self.workflow.get("capability_foundry_config_path")
+        if not configured_path:
+            return result
+        from scisaurus.runtime.capability_foundry import CapabilityFoundry, validate_foundry_config
+        from scisaurus.runtime.capability_registry import load_registry
 
-        A topic proposal is only actionable when the workflow exposes more
-        than one independently pinned experiment capability.  The selected
-        template supplies the scientific design and program pair; the current
-        run supplies the accepted literature gate and project-local paths.
-        This keeps topic discovery genuinely exploratory without granting a
-        model authority to invent an unreviewed command.
+        configured = validate_foundry_config(json.loads(Path(configured_path).read_text()))
+        selected = result.get("topic") if isinstance(result, dict) else None
+        if not isinstance(selected, dict):
+            raise ValidationError("capability foundry requires a selected topic")
+        question = selected.get("research_question")
+        domain = selected.get("domain")
+        if not isinstance(question, str) or not isinstance(domain, str):
+            raise ValidationError("capability foundry requires topic domain and research question")
+
+        registry_root = Path(configured["registry_root"])
+        existing = None
+        for entry in reversed(load_registry(registry_root).get("capabilities", [])):
+            try:
+                path = Path(entry["path"])
+                descriptor = json.loads(path.read_text())
+                experiment = descriptor.get("experiment", {})
+            except (KeyError, OSError, ValueError, TypeError):
+                continue
+            if (experiment.get("research_question") == question
+                    and experiment.get("domain") == domain):
+                existing = {
+                    "capability_id": descriptor.get("capability_id"),
+                    "descriptor_path": str(path.resolve()), "reused": True,
+                    "registry_entry": deepcopy(entry),
+                }
+                break
+
+        if existing is None:
+            model = json.loads(Path(configured["model_config_path"]).read_text())
+            foundry = CapabilityFoundry(
+                model,
+                runtime_python=configured["runtime_python"],
+                workspace_root=configured["workspace_root"],
+                registry_root=configured["registry_root"],
+                repo_root=configured["repo_root"],
+                requirements_file=configured["requirements_file"],
+                runtime_packages=[(item["name"], item["version"])
+                                  for item in configured["runtime_packages"]],
+                max_attempts=configured["max_attempts"],
+                timeout_seconds=configured["timeout_seconds"],
+            )
+            brief = {
+                "topic": {key: selected.get(key) for key in (
+                    "id", "title", "domain", "research_question", "scope",
+                    "disconfirmation_test", "resource_plan")},
+                "source_challenge": result.get("source_challenge"),
+                "closest_prior_work": [{key: item.get(key) for key in (
+                    "work_id", "title", "year", "abstract", "source_url")}
+                    for item in result.get("candidate_prior_work", [])[:8]
+                    if isinstance(item, dict)],
+                "required_properties": [
+                    "bounded reproducible experiment",
+                    "raw observations sufficient for independent recalculation",
+                    "at least three scientifically informative figures",
+                    "no network access or undeclared data",
+                ],
+            }
+            outcome = foundry.generate(
+                json.dumps(brief, ensure_ascii=False, sort_keys=True),
+                required_intent={"domain": domain, "research_question": question},
+            )
+            existing = {
+                "capability_id": outcome["registration"]["capability_id"],
+                "descriptor_path": outcome["registration"]["descriptor_path"],
+                "reused": False, "attempts": outcome["attempts"],
+                "admission": outcome["admission"],
+            }
+        if not isinstance(existing.get("capability_id"), str):
+            raise ValidationError("capability foundry did not return a capability identity")
+        result["generated_capability"] = existing
+        selected["experiment_capability_id"] = existing["capability_id"]
+        for candidate in result.get("candidates", []):
+            if isinstance(candidate, dict) and candidate.get("id") == selected.get("id"):
+                candidate["experiment_capability_id"] = existing["capability_id"]
+        return result
+
+    def _apply_topic_to_experiment_config(self, stage, config):
+        """Select the admitted generated program or a pinned catalog capability.
+
+        A foundry-backed topic becomes actionable only after its generated
+        program and independent validator pass the complete admission gate.
+        Legacy workflows may still select an explicitly configured template.
+        In both cases, the current run supplies the accepted literature gate
+        and project-local paths; model output never becomes a command directly.
         """
-        catalog = self.workflow.get("experiment_catalog")
-        if not catalog:
-            return config
         topic_context = next((value for value in self.context.values()
                               if isinstance(value, dict)
                               and value.get("kind") == "topic_discovery"
@@ -1654,9 +1772,19 @@ class ComposerRunner:
         if topic_context is None:
             return config
         selected = topic_context["topic"]
-        capability_id = selected.get("experiment_capability_id")
-        entry = next((item for item in catalog if item["id"] == capability_id), None)
+        generated = topic_context.get("generated_capability")
+        if isinstance(generated, dict):
+            capability_id = generated.get("capability_id")
+            entry = {"id": capability_id, "config_path": generated.get("descriptor_path")}
+        else:
+            catalog = self.workflow.get("experiment_catalog") or []
+            capability_id = selected.get("experiment_capability_id")
+            entry = next((item for item in catalog if item["id"] == capability_id), None)
         if entry is None:
+            if self.workflow.get("capability_foundry_config_path"):
+                raise ValidationError("topic stage did not materialize its generated experiment capability")
+            if not self.workflow.get("experiment_catalog"):
+                return config
             raise ValidationError(
                 "topic selection must name one configured experiment capability")
         try:
@@ -2311,6 +2439,13 @@ class ComposerRunner:
             # the only count-independent stop condition.
             base_delay = max(0.25, base_delay)
         delay = min(60.0, base_delay * (2 ** min(max(0, retry_index - 1), 6)))
+        provider_delay = getattr(error, "retry_after_seconds", None)
+        if (type(provider_delay) in (int, float) and math.isfinite(provider_delay)
+                and provider_delay > 0):
+            # A parsed provider reset boundary is stronger than the generic
+            # retry curve. Preserve it instead of waking every minute and
+            # spending another request merely to rediscover the same quota.
+            delay = max(delay, float(provider_delay))
         remaining = self._remaining()
         if policy.get("mode", "bounded") == "until_deadline":
             # In autonomous mode a failed stage may still be retried in the
@@ -2332,7 +2467,7 @@ class ComposerRunner:
                 return True
             self._remaining()
             self._checkpoint(f"{stage['id']}:retry_wait")
-            time.sleep(min(1.0, left))
+            time.sleep(min(5.0, left))
 
     def _checkpoint(self, phase, *, force=False):
         now = self.clock()
@@ -2901,10 +3036,12 @@ class ComposerRunner:
                 max_attempts=descriptor["max_attempts"],
                 repair_mode=descriptor.get("repair_mode", "bounded"),
                 runtime_context=self._runtime_context(model),
+                bibliography=descriptor.get("bibliography"),
                 sampling_seed=self._topic_sampling_seed(),
                 maturity_review_rounds=maturity_rounds,
                 refinement_context=self._topic_refinement_context(stage),
             )
+            result = self._materialize_topic_capability(result)
             output_path = Path(descriptor["output_path"])
             if attempt_number > 1 or stage["id"] in self.reopened_stage_ids:
                 output_path = Path(stage["project_dir"]) / output_path.name

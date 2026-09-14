@@ -15,28 +15,54 @@ import hashlib
 import itertools
 import json
 import math
+import os
 from random import Random
 from pathlib import Path
 import re
 import time
+import uuid
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.models import MAX_PROVIDER_SEED, ModelClient, resolve_model_config
-from scisaurus.runtime.literature import OpenAlexClient
-from scisaurus.runtime.retrieval import CrossrefClient
-from scisaurus.runtime.scientific_surface import find_control_leaks
+from scisaurus.runtime.literature import (
+    OpenAlexClient, ProviderCooldownError, provider_cooldown_seconds,
+)
+from scisaurus.runtime.scientific_surface import find_control_leaks, project_internal_language
 
 
 SCHEMA_VERSION = "topic-discovery-1"
 STAGE_CONFIG_SCHEMA_VERSION = "topic-discovery-config-1"
 TOPIC_HISTORY_SCHEMA_VERSION = "topic-history-1"
 RECENT_YEAR_WINDOW = 4
+# Topic intake only needs a compact inspiration set.  The survey stage owns
+# authoritative retrieval, so carrying full abstracts for dozens of records
+# into the first model call wastes the mission's response budget.
+TOPIC_SAMPLE_LIMIT = 12
+TOPIC_ABSTRACT_CHARS = 1200
+FRONTIER_SEED_SCHEMA_VERSION = "topic-frontier-seeds-1"
+SOURCE_CHALLENGE_SCHEMA_VERSION = "topic-source-challenge-1"
+FRONTIER_SEED_FIELDS = {
+    "id", "domain", "phenomenon", "mechanism", "unit_of_analysis", "search_queries",
+}
+SOURCE_CHALLENGE_FIELDS = {
+    "schema_version", "decision", "selected_id", "source_relevance",
+    "template_independence", "prior_work_risk", "closest_work_ids", "rationale",
+    "required_changes",
+}
+TOPIC_BIBLIOGRAPHY_CLIENT_FIELDS = {
+    "timeout", "max_bytes", "endpoint", "auth_env", "max_retries",
+    "retry_backoff_seconds", "min_interval_seconds", "rate_state_path",
+}
+TOPIC_BIBLIOGRAPHY_FIELDS = TOPIC_BIBLIOGRAPHY_CLIENT_FIELDS | {
+    "cache_path", "cache_ttl_seconds",
+}
 CANDIDATE_FIELDS = {
     "id", "title", "domain", "research_question", "scope", "search_queries",
     "why_promising", "disconfirmation_test", "feasibility", "resource_plan",
     "capability_requirements",
 }
+GROUNDING_FIELDS = {"frontier_seed_id", "prior_work_ids"}
 LEGACY_CANDIDATE_FIELDS = CANDIDATE_FIELDS - {"capability_requirements"}
 CATALOG_CANDIDATE_FIELDS = CANDIDATE_FIELDS | {"experiment_capability_id"}
 CATALOG_LEGACY_CANDIDATE_FIELDS = LEGACY_CANDIDATE_FIELDS | {"experiment_capability_id"}
@@ -135,6 +161,12 @@ _TOPIC_STOPWORDS = {
     "within", "will", "may", "than", "that", "these", "those", "over", "same", "one", "two",
 }
 
+_MISSION_BOILERPLATE = {
+    "autonomous", "workflow", "evidence", "capability", "capabilities", "human", "release",
+    "gate", "gates", "installed", "executable", "research", "scientific", "question", "novel",
+    "testable", "experiment", "paper", "review", "reviewed", "explicit", "selected", "select",
+}
+
 
 def _text(value, name, *, public=True):
     if not isinstance(value, str) or not value.strip():
@@ -177,7 +209,7 @@ def _validate_capability_requirements(value, name="capability_requirements"):
 def validate_topic_stage_config(value):
     """Validate the descriptor consumed by the Composer topic stage."""
     fields = {"schema_version", "model_config_path", "output_path", "candidate_count", "max_attempts"}
-    allowed = fields | {"repair_mode", "maturity_review_rounds"}
+    allowed = fields | {"repair_mode", "maturity_review_rounds", "bibliography"}
     if (not isinstance(value, dict) or set(value) - allowed
             or not fields.issubset(value)):
         raise ValidationError(f"topic discovery config requires {sorted(fields)} and permits repair_mode")
@@ -199,6 +231,102 @@ def validate_topic_stage_config(value):
     maturity_rounds = value.get("maturity_review_rounds", 0)
     if type(maturity_rounds) is not int or not 0 <= maturity_rounds <= 4:
         raise ValidationError("topic discovery maturity_review_rounds must be between 0 and 4")
+    bibliography = value.get("bibliography")
+    if bibliography is not None:
+        if not isinstance(bibliography, dict) or set(bibliography) - TOPIC_BIBLIOGRAPHY_FIELDS:
+            raise ValidationError("topic discovery bibliography contains unsupported fields")
+        client = {key: item for key, item in bibliography.items()
+                  if key in TOPIC_BIBLIOGRAPHY_CLIENT_FIELDS}
+        try:
+            OpenAlexClient(**client)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(str(exc)) from exc
+        cache_path = bibliography.get("cache_path")
+        if cache_path is not None and (
+                not isinstance(cache_path, str) or not Path(cache_path).is_absolute()
+                or Path(cache_path).exists() and not Path(cache_path).is_file()):
+            raise ValidationError("topic discovery bibliography cache_path must be an absolute file path")
+        ttl = bibliography.get("cache_ttl_seconds", 7 * 24 * 3600)
+        if type(ttl) not in (int, float) or not math.isfinite(ttl) or ttl <= 0:
+            raise ValidationError("topic discovery bibliography cache_ttl_seconds must be finite and positive")
+    canonical_bytes(value)
+    return deepcopy(value)
+
+
+def validate_frontier_seed_plan(value, *, seed_count=None):
+    """Validate science-first search directions before capability matching."""
+    fields = {"schema_version", "seeds"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValidationError(f"frontier seed plan requires exactly {sorted(fields)}")
+    if value["schema_version"] != FRONTIER_SEED_SCHEMA_VERSION:
+        raise ValidationError("frontier seed plan schema version is unsupported")
+    seeds = value["seeds"]
+    if (not isinstance(seeds, list) or not 4 <= len(seeds) <= 8
+            or seed_count is not None and len(seeds) != seed_count):
+        raise ValidationError("frontier seed plan requires the configured four to eight seeds")
+    ids, domains, queries = set(), set(), set()
+    for seed in seeds:
+        if not isinstance(seed, dict) or set(seed) != FRONTIER_SEED_FIELDS:
+            raise ValidationError("frontier seed has an invalid shape")
+        identifier = _identifier(seed["id"], "frontier seed id")
+        if identifier in ids:
+            raise ValidationError("frontier seed IDs must be unique")
+        ids.add(identifier)
+        for key in ("domain", "phenomenon", "mechanism", "unit_of_analysis"):
+            _text(seed[key], f"frontier seed {key}")
+        domains.add(seed["domain"].strip().casefold())
+        seed_terms = set().union(*(
+            _topic_tokens(seed[key]) for key in (
+                "domain", "phenomenon", "mechanism", "unit_of_analysis")
+        )) - _MISSION_BOILERPLATE
+        _strings(seed["search_queries"], "frontier seed search_queries", minimum=2, maximum=3)
+        for query in seed["search_queries"]:
+            content = set(_topic_tokens(query)) - _MISSION_BOILERPLATE
+            if len(content) < 2:
+                raise ValidationError("frontier search query is mission boilerplate rather than scientific terminology")
+            if not content.intersection(seed_terms):
+                raise ValidationError(
+                    "frontier search query is not anchored to its declared scientific seed")
+            normalized = " ".join(query.casefold().split())
+            if normalized in queries:
+                raise ValidationError("frontier search queries must be unique across seeds")
+            queries.add(normalized)
+    if len(domains) < min(4, len(seeds)):
+        raise ValidationError("frontier seed plan must span at least four distinct scientific domains")
+    canonical_bytes(value)
+    return deepcopy(value)
+
+
+def validate_source_challenge(value, *, selected_id, work_ids):
+    """Validate the pre-survey relevance and template-independence challenge."""
+    if not isinstance(value, dict) or set(value) != SOURCE_CHALLENGE_FIELDS:
+        raise ValidationError(
+            f"topic source challenge requires exactly {sorted(SOURCE_CHALLENGE_FIELDS)}")
+    if value["schema_version"] != SOURCE_CHALLENGE_SCHEMA_VERSION:
+        raise ValidationError("topic source challenge schema version is unsupported")
+    if value["decision"] not in {"admit_to_survey", "refine"}:
+        raise ValidationError("topic source challenge decision must be admit_to_survey or refine")
+    if value["selected_id"] != selected_id:
+        raise ValidationError("topic source challenge selected_id does not match the selected topic")
+    for key in ("source_relevance", "template_independence"):
+        if type(value[key]) is not int or not 0 <= value[key] <= 4:
+            raise ValidationError(f"topic source challenge {key} must be an integer from 0 to 4")
+    if value["prior_work_risk"] not in {"low", "medium", "high"}:
+        raise ValidationError("topic source challenge prior_work_risk is invalid")
+    _strings(value["closest_work_ids"], "topic source challenge closest_work_ids",
+             minimum=0, maximum=8)
+    if set(value["closest_work_ids"]) - set(work_ids):
+        raise ValidationError("topic source challenge cites work IDs outside its supplied evidence")
+    _text(value["rationale"], "topic source challenge rationale")
+    _strings(value["required_changes"], "topic source challenge required_changes",
+             minimum=0, maximum=8)
+    if value["decision"] == "refine" and not value["required_changes"]:
+        raise ValidationError("refined topic source challenge requires substantive changes")
+    if value["decision"] == "admit_to_survey" and value["required_changes"]:
+        raise ValidationError("admitted topic source challenge cannot retain required changes")
+    if value["decision"] == "admit_to_survey" and work_ids and not value["closest_work_ids"]:
+        raise ValidationError(
+            "admitted topic source challenge must identify at least one closest supplied work")
     canonical_bytes(value)
     return deepcopy(value)
 
@@ -208,7 +336,9 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
                            require_capability_coverage=False,
                            excluded_capability_ids=None,
                            excluded_topic_ids=None, topic_history=None,
-                           design_driven_capability_ids=None):
+                           design_driven_capability_ids=None,
+                           frontier_seeds=None, recent_papers=None,
+                           require_grounding=False, fallback_templates=None):
     """Validate a complete topic proposal before it enters the survey stage."""
     fields = {"schema_version", "objective", "candidates", "selected_id", "selection_rationale"}
     if not isinstance(value, dict) or set(value) != fields:
@@ -227,11 +357,26 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
     design_driven = set(design_driven_capability_ids or [])
     excluded_capabilities = set(excluded_capability_ids or [])
     excluded_topics = set(excluded_topic_ids or [])
+    seed_records = {
+        item.get("id"): item for item in (frontier_seeds or [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    work_records = {
+        item.get("work_id"): item for item in (recent_papers or [])
+        if isinstance(item, dict) and isinstance(item.get("work_id"), str)
+    }
+    grounded_seed_ids = set()
+    grounded_domains = set()
+    if require_grounding and (not seed_records or not work_records):
+        raise ValidationError(
+            "current topic candidates require supplied frontier seeds and scholarly records")
     for candidate in candidates:
         shapes = (CANDIDATE_FIELDS, LEGACY_CANDIDATE_FIELDS,
                   CATALOG_CANDIDATE_FIELDS, CATALOG_LEGACY_CANDIDATE_FIELDS)
         if (not isinstance(candidate, dict)
-                or not any(set(candidate) in (shape, shape | {"experiment_design"})
+                or not any(set(candidate) in (
+                    shape, shape | {"experiment_design"}, shape | GROUNDING_FIELDS,
+                    shape | GROUNDING_FIELDS | {"experiment_design"})
                            for shape in shapes)):
             raise ValidationError("topic candidate has an invalid shape")
         _identifier(candidate["id"], "topic candidate id")
@@ -242,6 +387,48 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
                     "disconfirmation_test", "feasibility", "resource_plan"):
             _text(candidate[key], f"topic candidate {key}")
         _strings(candidate["search_queries"], "topic candidate search_queries", minimum=3, maximum=8)
+        if require_grounding:
+            if not GROUNDING_FIELDS.issubset(candidate):
+                raise ValidationError(
+                    "current topic candidate must bind a frontier_seed_id and prior_work_ids")
+            seed_id = _identifier(candidate["frontier_seed_id"], "topic candidate frontier_seed_id")
+            if seed_id not in seed_records:
+                raise ValidationError("topic candidate frontier_seed_id is outside the supplied seed plan")
+            prior_ids = _strings(
+                candidate["prior_work_ids"], "topic candidate prior_work_ids",
+                minimum=1, maximum=5,
+            )
+            if set(prior_ids) - set(work_records):
+                raise ValidationError(
+                    "topic candidate prior_work_ids cite records outside the supplied evidence")
+            if not any(work_records[work_id].get("frontier_seed_id") == seed_id
+                       for work_id in prior_ids):
+                raise ValidationError(
+                    "topic candidate must cite scholarly evidence from its named frontier seed")
+            candidate_tokens = set().union(*(
+                _topic_tokens(candidate[key]) for key in
+                ("title", "domain", "research_question", "scope")
+            )) - _MISSION_BOILERPLATE
+            seed_tokens = set().union(*(
+                _topic_tokens(seed_records[seed_id].get(key, "")) for key in
+                ("domain", "phenomenon", "mechanism", "unit_of_analysis")
+            )) - _MISSION_BOILERPLATE
+            source_tokens = set().union(*(
+                _topic_tokens(str(work_records[work_id].get("title", "")) + " "
+                              + str(work_records[work_id].get("abstract", "") or ""))
+                for work_id in prior_ids
+            )) - _MISSION_BOILERPLATE
+            if len(candidate_tokens.intersection(seed_tokens | source_tokens)) < 2:
+                raise ValidationError(
+                    "topic candidate prose is not grounded in its seed or cited scholarly records")
+            query_anchors = candidate_tokens | seed_tokens
+            for query in candidate["search_queries"]:
+                query_tokens = set(_topic_tokens(query)) - _MISSION_BOILERPLATE
+                if len(query_tokens) < 2 or not query_tokens.intersection(query_anchors):
+                    raise ValidationError(
+                        "topic candidate search query is not anchored to its scientific direction")
+            grounded_seed_ids.add(seed_id)
+            grounded_domains.add(candidate["domain"].strip().casefold())
         if "capability_requirements" in candidate:
             _validate_capability_requirements(candidate["capability_requirements"])
         if capability_ids:
@@ -267,6 +454,14 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
             raise ValidationError(
                 f"topic candidates must cover {required} distinct experiment capabilities; "
                 f"missing={missing}")
+    if require_grounding:
+        required_groups = min(3, len(candidates), len(seed_records))
+        if len(grounded_seed_ids) < required_groups:
+            raise ValidationError(
+                f"topic candidates must cover at least {required_groups} frontier seed groups")
+        if len(grounded_domains) < required_groups:
+            raise ValidationError(
+                f"topic candidates must span at least {required_groups} scientific domains")
     _identifier(value["selected_id"], "selected topic id")
     if value["selected_id"] not in ids:
         raise ValidationError("selected topic is not one of the candidates")
@@ -277,6 +472,18 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
         raise ValidationError("selected experiment capability is excluded by the exploration history")
     if topic_history:
         validate_topic_novelty(selected, topic_history)
+    for template in fallback_templates or []:
+        if not isinstance(template, dict) or not isinstance(template.get("research_question"), str):
+            continue
+        prior = {
+            "title": str(template.get("id") or template.get("domain") or "template"),
+            "domain": str(template.get("domain") or ""),
+            "research_question": template["research_question"],
+            "experiment_capability_id": template.get("id"),
+        }
+        if _topic_repeat_score(selected, prior) >= 0.72:
+            raise ValidationError(
+                "selected topic is too similar to a fallback experiment template")
     _text(value["selection_rationale"], "topic selection rationale")
     canonical_bytes(value)
     return deepcopy(value)
@@ -474,17 +681,57 @@ def topic_maturity_admitted(review, *, minimum_total=MATURITY_MIN_TOTAL,
         score >= minimum_dimension for score in scores.values())
 
 
+FRONTIER_SYSTEM = (
+    "You are a scientific horizon scanner. Generate independent, science-first search seeds before any "
+    "experiment capability is shown. Deliberately span remote domains and combine a concrete phenomenon, "
+    "a plausible mechanism, and an observable unit. Avoid generic AI, workflow, research-method, and "
+    "autonomous-laboratory topics. Do not copy familiar textbook demonstrations. Search strings must use "
+    "domain terminology that a scholarly index can retrieve. Do not claim novelty or results. Return JSON only."
+)
+
+
+def _frontier_seed_prompt(objective, seed_count, sampling_seed):
+    return json.dumps({
+        "assignment": "science_first_frontier_seed_generation",
+        "principal_boundary": objective,
+        "exploration_seed": sampling_seed,
+        "seed_count": seed_count,
+        "output_contract": {
+            "schema_version": FRONTIER_SEED_SCHEMA_VERSION,
+            "seeds": [{
+                "id": "bounded lowercase identifier",
+                "domain": "specific scientific domain; domains must differ across the portfolio",
+                "phenomenon": "concrete phenomenon or empirical regularity",
+                "mechanism": "competing mechanism or boundary worth discriminating",
+                "unit_of_analysis": "observable or simulated unit",
+                "search_queries": "two or three distinct scholarly queries using field terminology",
+            }],
+        },
+        "constraints": [
+            "produce exactly seed_count seeds spanning at least four distinct scientific domains",
+            "derive scientific directions before considering available software or experiment templates",
+            "include at least two deliberately remote domains that do not usually appear together",
+            "each query must contain at least two domain-specific content terms and no workflow boilerplate",
+            "prefer unresolved mechanism, boundary, scaling, transition, or measurement questions over method demos",
+            "do not mention capabilities, agents, papers to be written, release gates, or internal workflow state",
+            "return only the complete JSON object",
+        ],
+    }, ensure_ascii=False, sort_keys=True)
+
+
 SYSTEM = (
     "You are the intake research strategist for a general-purpose scientific organization. "
-    "Use the supplied recent scholarly records as prompts, then turn a broad objective into several "
+    "Use the supplied science-first frontier seeds and their scholarly records as prompts, then turn a broad objective into several "
     "genuinely different, testable research questions. "
     "Explore orthogonal directions before selecting: vary the mechanism, data regime, comparison, "
     "or measurement rather than producing near-duplicate variants. Preserve one high-risk/high-upside "
     "direction when it is still feasible, alongside safer directions, so the selector can compare novelty "
     "risk against evidence and execution cost. "
     "Do not claim novelty, truth, or empirical results before the literature and methods stages run. "
-    "Prefer questions that can be investigated with public sources and a bounded reproducible experiment "
-    "using the declared runtime capabilities. Reject directions that require unavailable instruments, "
+    "Scientific questions must originate in the frontier evidence, not in the wording of an executable template. "
+    "Only after defining the phenomenon and discriminating test should you check whether it can be investigated "
+    "with public sources and a bounded reproducible experiment using the declared runtime capabilities. "
+    "Reject directions that require unavailable instruments, "
     "private cohorts, or unconfigured software. "
     "When runtime_context includes an experiment_catalog, every candidate must name one exact capability ID "
     "and align its phenomenon, comparison, data boundary, method, and primary outcomes with that capability. "
@@ -506,9 +753,25 @@ SYSTEM = (
 )
 
 
-def topic_prompt(objective, candidate_count, *, recent_papers=None, runtime_context=None,
-                 refinement_context=None):
-    runtime_context = runtime_context or {}
+def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_seeds=None,
+                 runtime_context=None, refinement_context=None):
+    def reader_projection(value):
+        """Keep internal labels out of the model's reader-facing topic prose."""
+        if isinstance(value, dict):
+            return {key: reader_projection(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [reader_projection(item) for item in value]
+        if isinstance(value, str):
+            return project_internal_language(value)
+        return value
+
+    runtime_context = reader_projection(runtime_context or {})
+    # Frozen fallback templates are retained for the independent challenge,
+    # but a foundry-backed candidate generator must never see them as idea
+    # seeds before it has defined the scientific question.
+    runtime_context.pop("fallback_experiment_catalog", None)
+    recent_papers = reader_projection(recent_papers or [])
+    frontier_seeds = reader_projection(frontier_seeds or [])
     candidate_contract = {
         "id": "lowercase identifier",
         "title": "short working title",
@@ -528,13 +791,26 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, runtime_cont
     }
     constraints = [
         "use recent_papers as inspiration and retain their provided source identifiers in the candidate rationale when relevant",
+        "anchor every candidate to a supplied frontier seed and its matching scholarly records",
+        "define the scientific question before choosing an execution capability; never paraphrase a capability template as a topic",
         "candidate questions must differ in mechanism or empirical comparison, not just wording",
         "cover at least three distinct axes across the candidates when the objective and runtime permit: mechanism, data regime, comparison, measurement, or theory",
         "do not collapse every candidate onto the first familiar method merely because it is easiest to explain",
         "search queries must be usable as ordinary scholarly search strings",
         "capability_requirements must list only exact names from the supplied runtime inventory",
         "never invent a citation, dataset, result, or prior-work claim",
+        "keep every narrative field concise (at most 45 words), keep each search query under 12 words, and fit the complete JSON package within 3000 output tokens",
+        "include every required top-level key and every required candidate key; never stop after a partial candidate list",
+        "return only the JSON object with no preface, commentary, markdown, or trailing explanation",
+        "candidate prose is reader-facing: do not use the words frozen, validator, accepted artifact, model calls, release candidate, or SHA-256; say prespecified or independent recalculation where scientifically appropriate",
     ]
+    if frontier_seeds and recent_papers:
+        candidate_contract["frontier_seed_id"] = "exact id copied from frontier_seeds"
+        candidate_contract["prior_work_ids"] = (
+            "one to five work_id values copied from recent_papers, including one from frontier_seed_id")
+        constraints.append(
+            "every candidate must cite its exact frontier_seed_id and one to five supplied prior_work_ids; "
+            "at least one cited work must belong to that same seed")
     catalog = runtime_context.get("experiment_catalog") or []
     if catalog:
         candidate_contract["experiment_capability_id"] = (
@@ -577,6 +853,8 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, runtime_cont
                 "the capability actually supports",
                 "experiment_design must remain executable under the frozen engine: no new estimator names, "
                 "no new data-process kinds, and no field outside the declared schema",
+                "include experiment_design only for a candidate using a design-driven capability; omit that key "
+                "for every other capability",
             ])
     if refinement_context:
         constraints.extend([
@@ -592,6 +870,7 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, runtime_cont
         "assignment": "free_topic_discovery",
         "principal_objective": objective,
         "candidate_count": candidate_count,
+        "frontier_seeds": frontier_seeds,
         "recent_papers": recent_papers or [],
         "runtime_context": runtime_context,
         "refinement_context": refinement_context or {},
@@ -604,6 +883,45 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, runtime_cont
             "selection_rationale": "compare evidence availability, testability, and disconfirmation risk",
         },
         "constraints": constraints,
+    }, ensure_ascii=False, sort_keys=True)
+
+
+SOURCE_CHALLENGE_SYSTEM = (
+    "You are an independent intake challenger. Decide only whether a selected question is relevantly grounded "
+    "enough and sufficiently independent from any supplied executable templates to deserve a full literature "
+    "survey. This is not a novelty verdict. Reject a question that merely restates a template, whose targeted "
+    "search results are mostly irrelevant, or whose closest supplied work already answers the same comparison "
+    "without a meaningful changed mechanism, boundary, or measurement. Cite only supplied work IDs. Return JSON only."
+)
+
+
+def _source_challenge_prompt(selected, works, runtime_context):
+    catalog = ((runtime_context or {}).get("experiment_catalog")
+               or (runtime_context or {}).get("fallback_experiment_catalog") or [])
+    templates = [{key: item.get(key) for key in (
+        "id", "domain", "research_question", "method", "primary_outcomes")}
+        for item in catalog if isinstance(item, dict)]
+    return json.dumps({
+        "assignment": "topic_source_and_template_challenge",
+        "selected_topic": selected,
+        "targeted_scholarly_records": works,
+        "executable_templates": templates,
+        "output_contract": {
+            "schema_version": SOURCE_CHALLENGE_SCHEMA_VERSION,
+            "decision": "admit_to_survey or refine",
+            "selected_id": "copy selected_topic.id exactly",
+            "source_relevance": "integer 0 through 4",
+            "template_independence": "integer 0 through 4; 0 means a template paraphrase",
+            "prior_work_risk": "low, medium, or high",
+            "closest_work_ids": "zero to eight IDs copied from targeted_scholarly_records",
+            "rationale": "specific evidence-grounded rationale without a novelty claim",
+            "required_changes": "empty when admitted; otherwise substantive scientific changes",
+        },
+        "admission_rule": {
+            "minimum_source_relevance": 2,
+            "minimum_template_independence": 3,
+            "high_prior_work_risk_requires_refinement": True,
+        },
     }, ensure_ascii=False, sort_keys=True)
 
 
@@ -635,7 +953,8 @@ MATURITY_SYSTEM = (
     "unless it tests a nontrivial mechanism, a sensitivity frontier, or a theory-versus-observation discrepancy. "
     "Admit only when the question has a concrete phenomenon, a meaningful competing explanation or boundary, "
     "a result that would change the interpretation, and a credible disconfirmation route. If it is thin, "
-    "name the smallest substantive changes needed and identify which dimensions must change. Return JSON only."
+    "name the smallest substantive changes needed and identify which dimensions must change. Copy the selected_id "
+    "from the supplied topic package exactly; never invent or normalize a new identifier. Return JSON only."
 )
 
 
@@ -644,6 +963,7 @@ def _maturity_review_prompt(objective, package, *, refinement_context=None):
         "assignment": "topic_maturity_review",
         "principal_objective": objective,
         "topic_package": package,
+        "selected_id_to_copy_exactly": package.get("selected_id"),
         "refinement_context": refinement_context or {},
         "dimensions": list(MATURITY_DIMENSIONS),
         "score_scale": "integer 0 through 4",
@@ -660,6 +980,7 @@ def _maturity_review_prompt(objective, package, *, refinement_context=None):
             "minimum_each_dimension": MATURITY_MIN_DIMENSION,
             "do_not_reward_feasibility_alone": True,
         },
+        "identity_rule": "selected_id must equal topic_package.selected_id exactly",
     }, ensure_ascii=False, sort_keys=True)
 
 
@@ -691,6 +1012,68 @@ class TopicDiscoveryRunner:
             config["timeout_seconds"] = min(float(timeout_seconds), remaining)
         return ModelClient(**config)
 
+    def _generate_frontier_seed_plan(self, objective, *, seed_count, sampling_seed,
+                                     deadline, usage, max_attempts=3):
+        last_error = None
+        previous = None
+        for attempt in range(max_attempts):
+            client = self._client(
+                "research.frontier-seed-planner",
+                seed=(sampling_seed + attempt) % MAX_PROVIDER_SEED,
+                deadline=deadline,
+            )
+            payload = json.loads(_frontier_seed_prompt(objective, seed_count, sampling_seed))
+            if previous is not None:
+                payload["previous_response"] = previous[:30000]
+                payload["validation_error"] = str(last_error)
+                payload["repair_instruction"] = (
+                    "Return a complete replacement seed plan. Preserve valid scientific seeds, remove mission "
+                    "boilerplate, restore cross-domain diversity, and satisfy the exact output contract."
+                )
+            result = client.complete(
+                system=FRONTIER_SYSTEM,
+                prompt=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            )
+            usage["model_calls"] += 1
+            for key in ("input_tokens", "output_tokens"):
+                usage[key] += result.usage.get(key, 0)
+            previous = result.text
+            if result.finish_reason != "stop":
+                last_error = ValidationError(
+                    f"frontier seed planner did not finish normally: {result.finish_reason}")
+                continue
+            try:
+                plan = result.json_object()
+                return validate_frontier_seed_plan(plan, seed_count=seed_count)
+            except ValidationError as exc:
+                last_error = exc
+        raise last_error or ValidationError("frontier seed planner did not produce a valid plan")
+
+    def _challenge_selected_topic(self, selected, works, runtime_context, *, seed, deadline, usage):
+        reviewer = self._client("research.topic-source-challenger", seed=seed, deadline=deadline)
+        result = reviewer.complete(
+            system=SOURCE_CHALLENGE_SYSTEM,
+            prompt=_source_challenge_prompt(selected, works, runtime_context),
+        )
+        usage["model_calls"] += 1
+        for key in ("input_tokens", "output_tokens"):
+            usage[key] += result.usage.get(key, 0)
+        if result.finish_reason != "stop":
+            raise ValidationError(
+                f"topic source challenge did not finish normally: {result.finish_reason}")
+        review = result.json_object()
+        validate_source_challenge(
+            review, selected_id=selected["id"],
+            work_ids=[item["work_id"] for item in works],
+        )
+        if (review["decision"] != "admit_to_survey"
+                or review["source_relevance"] < 2
+                or review["template_independence"] < 3
+                or review["prior_work_risk"] == "high"):
+            raise ValidationError(
+                "topic source challenge requires substantive refinement: " + review["rationale"])
+        return review
+
     def run(self, objective, *, candidate_count=4, max_attempts=3,
             repair_mode="bounded", recent_papers=None, runtime_context=None,
             bibliography=None, sampling_seed=None, maturity_review_rounds=0,
@@ -709,11 +1092,22 @@ class TopicDiscoveryRunner:
         if refinement_context is not None and not isinstance(refinement_context, dict):
             raise ValidationError("topic discovery refinement_context must be an object when supplied")
         deadline = time.monotonic() + self.deadline_seconds if self.deadline_seconds is not None else None
+        if sampling_seed is None:
+            sampling_seed = int(hashlib.sha256(objective.encode("utf-8")).hexdigest()[:16], 16) % MAX_PROVIDER_SEED
+        if type(sampling_seed) is not int or not 0 <= sampling_seed <= MAX_PROVIDER_SEED:
+            raise ValidationError(
+                f"topic sampling_seed must be an integer between 0 and {MAX_PROVIDER_SEED}")
+        usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
         recent_papers = list(recent_papers or [])
         sampling_trace = []
+        frontier_seed_plan = None
         if bibliography is not False and not recent_papers:
+            frontier_seed_plan = self._generate_frontier_seed_plan(
+                objective, seed_count=max(6, candidate_count), sampling_seed=sampling_seed,
+                deadline=deadline, usage=usage)
             recent_papers, sampling_seed, sampling_trace = self._recent_paper_sample(
-                objective, bibliography=bibliography, deadline=deadline, sampling_seed=sampling_seed)
+                objective, bibliography=bibliography, deadline=deadline, sampling_seed=sampling_seed,
+                frontier_seed_plan=frontier_seed_plan)
         previous = None
         last_error = None
         refinement_feedback = None
@@ -721,7 +1115,6 @@ class TopicDiscoveryRunner:
         refinement_round = 0
         maturity_reviews = []
         maturity_review_history = []
-        usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
         attempts = itertools.count() if repair_mode == "until_deadline" else range(max_attempts)
         catalog_ids = {
             item.get("id") for item in (runtime_context or {}).get("experiment_catalog", [])
@@ -731,60 +1124,58 @@ class TopicDiscoveryRunner:
             generation_seed = (sampling_seed + attempt) % MAX_PROVIDER_SEED if sampling_seed is not None else None
             client = self._client("topic_discovery", seed=generation_seed, deadline=deadline)
             if refinement_feedback is not None:
-                prompt = json.dumps({
-                    "assignment": "refine_topic_discovery",
-                    "principal_objective": objective,
-                    "candidate_count": candidate_count,
-                    "recent_papers": recent_papers,
-                    "runtime_context": runtime_context or {},
-                    "refinement_context": refinement_context or {},
-                    "parent_topic": refinement_parent,
-                    "maturity_review": refinement_feedback,
-                    "required_capability_ids": sorted(catalog_ids),
-                    "excluded_capability_ids": sorted((runtime_context or {}).get("topic_exclusions", {}).get("capability_ids", [])),
-                    "excluded_topic_ids": sorted((runtime_context or {}).get("topic_exclusions", {}).get("topic_ids", [])),
-                    "topic_history": (runtime_context or {}).get("topic_history", {}),
-                    "capability_coverage_requirement": (
-                        f"Use at least {min(len(catalog_ids), candidate_count)} distinct capability IDs "
-                        "across the candidates; preserve every listed ID when candidate_count allows."
-                        if catalog_ids else None),
-                    "instruction": (
-                        "Return a complete package satisfying the exact topic contract. Preserve useful evidence "
-                        "from the parent, but make a substantive change in at least one of mechanism, data regime, "
-                        "comparison, measurement, or theory. The selected direction must not be a cosmetic rewrite."
-                    ),
-                }, ensure_ascii=False, sort_keys=True)
+                # Refinement must keep the same package contract as the first
+                # generation.  A looser prompt here makes a capable model
+                # return a convenient wrapper such as ``selected_candidate``
+                # that cannot cross the validation boundary.
+                refinement_payload = json.loads(topic_prompt(
+                    objective, candidate_count,
+                    recent_papers=recent_papers,
+                    frontier_seeds=(frontier_seed_plan or {}).get("seeds", []),
+                    runtime_context=runtime_context,
+                    refinement_context={
+                        **(refinement_context or {}),
+                        "parent_topic": refinement_parent,
+                        "maturity_review": refinement_feedback,
+                    }))
+                refinement_payload["assignment"] = "refine_topic_discovery"
+                refinement_payload["refinement_instruction"] = (
+                    "Return the complete package described by output_contract. Preserve useful evidence from "
+                    "the parent, but make a substantive change in at least one of mechanism, data regime, "
+                    "comparison, measurement, or theory. The selected direction must not be a cosmetic rewrite."
+                )
+                if previous is not None and last_error is not None:
+                    refinement_payload["previous_response"] = previous[:40000]
+                    refinement_payload["validation_error"] = str(last_error)
+                    refinement_payload["refinement_instruction"] += (
+                        " Repair the previous response against validation_error. In particular, include every "
+                        "required experiment_design field for design-driven candidates and omit experiment_design "
+                        "from all other capabilities."
+                    )
+                prompt = json.dumps(refinement_payload, ensure_ascii=False, sort_keys=True)
             else:
                 prompt = topic_prompt(objective, candidate_count,
                                       recent_papers=recent_papers,
+                                      frontier_seeds=(frontier_seed_plan or {}).get("seeds", []),
                                       runtime_context=runtime_context,
                                       refinement_context=refinement_context)
-            if catalog_ids:
-                payload = json.loads(prompt)
-                payload["capability_coverage_plan"] = _capability_coverage_plan(
-                    runtime_context, candidate_count, generation_seed)
-                payload["capability_coverage_requirement"] = (
-                    f"Use at least {min(len(catalog_ids), candidate_count)} distinct capability IDs "
-                    "across the candidate list; preserve every listed ID when candidate_count allows.")
-                prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             if previous is not None and refinement_feedback is None:
-                prompt = json.dumps({
-                    "assignment": "repair_invalid_topic_discovery",
-                    "principal_objective": objective,
-                    "candidate_count": candidate_count,
-                    "recent_papers": recent_papers,
-                    "runtime_context": runtime_context or {},
-                    "required_capability_ids": sorted(catalog_ids),
-                    "excluded_capability_ids": sorted((runtime_context or {}).get("topic_exclusions", {}).get("capability_ids", [])),
-                    "excluded_topic_ids": sorted((runtime_context or {}).get("topic_exclusions", {}).get("topic_ids", [])),
-                    "topic_history": (runtime_context or {}).get("topic_history", {}),
-                    "capability_coverage_requirement": (
-                        f"Use at least {min(len(catalog_ids), candidate_count)} distinct capability IDs "
-                        "across the candidates; replace a duplicate with a genuinely different executable direction."),
-                    "candidate_response": previous[:40000],
-                    "validation_error": str(last_error),
-                    "instruction": "Return a complete package satisfying the exact contract; preserve valid candidates and repair only the violations.",
-                }, ensure_ascii=False, sort_keys=True)
+                # Invalid-output repair also uses the full contract so repair
+                # cannot drift into a different response shape.
+                repair_payload = json.loads(topic_prompt(
+                    objective, candidate_count,
+                    recent_papers=recent_papers,
+                    frontier_seeds=(frontier_seed_plan or {}).get("seeds", []),
+                    runtime_context=runtime_context,
+                    refinement_context=refinement_context))
+                repair_payload["assignment"] = "repair_invalid_topic_discovery"
+                repair_payload["candidate_response"] = previous[:40000]
+                repair_payload["validation_error"] = str(last_error)
+                repair_payload["repair_instruction"] = (
+                    "Return a complete package satisfying output_contract. Preserve valid candidates and repair "
+                    "only the reported violations; do not return a wrapper object or a partial candidate list."
+                )
+                prompt = json.dumps(repair_payload, ensure_ascii=False, sort_keys=True)
             result = client.complete(system=SYSTEM, prompt=prompt)
             usage["model_calls"] += 1
             for key in ("input_tokens", "output_tokens"):
@@ -798,11 +1189,16 @@ class TopicDiscoveryRunner:
                 validate_topic_package(
                     package, objective=objective, candidate_count=candidate_count,
                     experiment_capability_ids=catalog_ids,
-                    require_capability_coverage=bool(catalog_ids),
+                    require_capability_coverage=False,
                     excluded_capability_ids=(runtime_context or {}).get("topic_exclusions", {}).get("capability_ids", []),
                     excluded_topic_ids=(runtime_context or {}).get("topic_exclusions", {}).get("topic_ids", []),
                     topic_history=(runtime_context or {}).get("topic_history"),
-                    design_driven_capability_ids=_design_driven_ids(runtime_context))
+                    design_driven_capability_ids=_design_driven_ids(runtime_context),
+                    frontier_seeds=(frontier_seed_plan or {}).get("seeds", []),
+                    recent_papers=recent_papers,
+                    require_grounding=frontier_seed_plan is not None,
+                    fallback_templates=(runtime_context or {}).get(
+                        "fallback_experiment_catalog", []))
                 if runtime_context is not None:
                     feasibility = validate_topic_feasibility(package, runtime_context)
                     if feasibility["status"] == "legacy_unchecked":
@@ -813,6 +1209,33 @@ class TopicDiscoveryRunner:
                 continue
             selected = next(item for item in package["candidates"] if item["id"] == package["selected_id"])
             feasibility = validate_topic_feasibility(package, runtime_context)
+            candidate_prior_work = []
+            source_challenge = None
+            candidate_sampling_trace = []
+            if bibliography is not False:
+                try:
+                    targeted = {
+                        "schema_version": FRONTIER_SEED_SCHEMA_VERSION,
+                        "seeds": [{
+                            "id": "selected_direction",
+                            "domain": selected["domain"],
+                            "phenomenon": selected["title"],
+                            "mechanism": selected["research_question"],
+                            "unit_of_analysis": selected["scope"],
+                            "search_queries": selected["search_queries"][:3],
+                        }],
+                    }
+                    candidate_prior_work, _, candidate_sampling_trace = self._recent_paper_sample(
+                        objective, bibliography=bibliography, deadline=deadline,
+                        sampling_seed=(generation_seed + 32452843) % MAX_PROVIDER_SEED,
+                        frontier_seed_plan=targeted, minimum_seed_groups=1)
+                    source_challenge = self._challenge_selected_topic(
+                        selected, candidate_prior_work, runtime_context,
+                        seed=(generation_seed + 49979687) % MAX_PROVIDER_SEED,
+                        deadline=deadline, usage=usage)
+                except ValidationError as exc:
+                    last_error = exc
+                    continue
             if maturity_review_rounds:
                 review_seed = ((generation_seed if generation_seed is not None else 0)
                                + 104729 * (attempt + 1)) % MAX_PROVIDER_SEED
@@ -861,6 +1284,10 @@ class TopicDiscoveryRunner:
                         "proposed_gap": selected["why_promising"],
                         "feasibility_check": feasibility,
                         "recent_papers": recent_papers,
+                        "frontier_seed_plan": frontier_seed_plan,
+                        "candidate_prior_work": candidate_prior_work,
+                        "candidate_sampling_trace": candidate_sampling_trace,
+                        "source_challenge": source_challenge,
                         "sampling_seed": sampling_seed,
                         "generation_seed": generation_seed,
                             "sampling_trace": sampling_trace,
@@ -906,6 +1333,10 @@ class TopicDiscoveryRunner:
                 "proposed_gap": selected["why_promising"],
                 "feasibility_check": feasibility,
                 "recent_papers": recent_papers,
+                "frontier_seed_plan": frontier_seed_plan,
+                "candidate_prior_work": candidate_prior_work,
+                "candidate_sampling_trace": candidate_sampling_trace,
+                "source_challenge": source_challenge,
                 "sampling_seed": sampling_seed,
                 "generation_seed": generation_seed,
                 "sampling_trace": sampling_trace,
@@ -923,161 +1354,240 @@ class TopicDiscoveryRunner:
         raise last_error or ValidationError("topic discovery did not produce a valid package")
 
     @staticmethod
-    def _recent_paper_sample(objective, *, bibliography=None, deadline=None, sampling_seed=None):
-        """Search OpenAlex and retain a reproducible recent-paper sample.
+    def _recent_paper_sample(objective, *, bibliography=None, deadline=None, sampling_seed=None,
+                             frontier_seed_plan=None, minimum_seed_groups=4):
+        """Search OpenAlex from science-first seeds and retain a balanced sample.
 
-        The topic stage is intentionally exploratory: it uses a small recent
-        sample to seed candidate generation, while the survey stage performs
-        the authoritative multi-query search and evidence mapping.
+        Crossref is deliberately not a topic-source fallback: its metadata-only
+        search cannot establish citation relationships and previously admitted
+        unrelated records after an OpenAlex 429. A recent OpenAlex cache may be
+        reused transparently; otherwise source coverage fails closed.
         """
         if deadline is not None and deadline - time.monotonic() <= 0.2:
             raise ValidationError("topic discovery deadline exceeded before literature sampling")
+        if type(sampling_seed) is not int or not 0 <= sampling_seed <= MAX_PROVIDER_SEED:
+            raise ValidationError(
+                f"topic sampling_seed must be an integer between 0 and {MAX_PROVIDER_SEED}")
+        seeds = frontier_seed_plan.get("seeds") if isinstance(frontier_seed_plan, dict) else None
+        if not isinstance(seeds, list) or not seeds:
+            raise ValidationError("topic literature sampling requires a science-first frontier seed plan")
+        if type(minimum_seed_groups) is not int or not 1 <= minimum_seed_groups <= len(seeds):
+            raise ValidationError("minimum_seed_groups must fit the frontier seed plan")
+
+        bibliography = bibliography if isinstance(bibliography, dict) else {}
         client_config = {
-            "timeout": 20, "max_bytes": 2_000_000,
-            "endpoint": "https://api.openalex.org/works",
-            "auth_env": None,
-            "max_retries": 3, "retry_backoff_seconds": 1.0,
+            "timeout": 120, "max_bytes": 2_000_000,
+            "endpoint": "https://api.openalex.org/works", "auth_env": None,
+            "max_retries": 5, "retry_backoff_seconds": 1.0,
+            "min_interval_seconds": 1.05,
         }
-        if isinstance(bibliography, dict):
-            client_config.update({key: bibliography[key] for key in client_config if key in bibliography})
+        client_config.update({key: bibliography[key] for key in TOPIC_BIBLIOGRAPHY_CLIENT_FIELDS
+                              if key in bibliography})
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.2:
+                raise ValidationError("topic discovery deadline exceeded before OpenAlex setup")
+            client_config["timeout"] = min(float(client_config["timeout"]), remaining)
         client = OpenAlexClient(**client_config)
-        # Keep Unicode terms so a Korean or mixed-language objective can seed
-        # the same scholarly search path.  A broad fallback is preferable to
-        # silently skipping topic discovery when punctuation or short tokens
-        # consume the user's wording.
-        words = [word for word in re.findall(r"[^\W_]{2,}(?:[-'][^\W_]+)*", objective, flags=re.UNICODE)][:10]
-        if not words:
-            words = ["scientific method", "empirical study"]
-        queries = [" ".join(words), " ".join(words[:5] + ["method"]),
-                   " ".join(words[-5:] + ["experiment"]), "recent scientific research"]
-        records = []
-        seen = set()
-        provider_errors = []
-        sampling_trace = []
-        for query in queries:
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.2:
-                    raise ValidationError("topic discovery deadline exceeded during literature sampling")
-                client_config["timeout"] = min(20.0, remaining)
-                client = OpenAlexClient(**client_config)
-            result = client.run(operation="search", query=query, limit=10, cursor=None)
+
+        cache_path = Path(bibliography["cache_path"]) if bibliography.get("cache_path") else None
+        cache_ttl = float(bibliography.get("cache_ttl_seconds", 7 * 24 * 3600))
+        cache = {"schema_version": "topic-openalex-cache-1", "entries": {}}
+        if cache_path is not None and cache_path.is_file():
+            try:
+                loaded = json.loads(cache_path.read_text())
+                if (isinstance(loaded, dict) and loaded.get("schema_version") == cache["schema_version"]
+                        and isinstance(loaded.get("entries"), dict)):
+                    cache = loaded
+            except (OSError, ValueError, TypeError):
+                cache = {"schema_version": "topic-openalex-cache-1", "entries": {}}
+
+        def persist_cache():
+            if cache_path is None:
+                return
+            if len(cache["entries"]) > 512:
+                newest = sorted(
+                    cache["entries"].items(),
+                    key=lambda item: float(item[1].get("stored_at", 0))
+                    if isinstance(item[1], dict) else 0,
+                    reverse=True)[:512]
+                cache["entries"] = dict(newest)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = cache_path.with_name(f".{cache_path.name}.{uuid.uuid4().hex}.tmp")
+            temporary.write_bytes(canonical_bytes(cache))
+            os.replace(temporary, cache_path)
+
+        # One query per independent frontier preserves domain balance. A
+        # selected-candidate challenge has one seed and may use up to three
+        # formulations to reduce wording sensitivity.
+        query_specs = []
+        for seed in seeds:
+            queries = seed.get("search_queries") if isinstance(seed, dict) else None
+            if not isinstance(queries, list) or not queries:
+                raise ValidationError("frontier seed is missing scholarly search queries")
+            selected_queries = queries[:3] if len(seeds) == 1 else queries[:1]
+            for query in selected_queries:
+                query_specs.append({"seed_id": seed.get("id"), "seed_domain": seed.get("domain"),
+                                    "query": query})
+
+        grouped, seen = {}, set()
+        provider_errors, sampling_trace = [], []
+        for spec in query_specs:
+            if deadline is not None and deadline - time.monotonic() <= 0.2:
+                raise ValidationError("topic discovery deadline exceeded during literature sampling")
+            query = spec["query"]
+            cache_key = hashlib.sha256(canonical_bytes({
+                "endpoint": client_config["endpoint"], "query": query, "limit": 10,
+            })).hexdigest()
+            cached = cache["entries"].get(cache_key)
+            cache_hit = bool(
+                isinstance(cached, dict)
+                and cached.get("query") == query
+                and isinstance(cached.get("stored_at"), (int, float))
+                and time.time() - float(cached["stored_at"]) <= cache_ttl
+                and isinstance(cached.get("works"), list)
+            )
+            if cache_hit:
+                result = {
+                    "outcome": "ok" if cached["works"] else "empty",
+                    "works": deepcopy(cached["works"]),
+                    "source_url": cached.get("source_url"),
+                    "capture_sha256": cached.get("capture_sha256"),
+                    "metadata": {"provider": "openalex", "http_status": 200,
+                                 "request": {"operation": "search", "query": query,
+                                             "work_id": None, "limit": 10, "cursor": None}},
+                }
+            else:
+                try:
+                    result = client.run(operation="search", query=query, limit=10, cursor=None)
+                except (TypeError, ValueError) as exc:
+                    raise ValidationError(f"invalid frontier scholarly query: {exc}") from exc
+                if result.get("outcome") in {"ok", "empty"}:
+                    cache["entries"][cache_key] = {
+                        "query": query, "stored_at": time.time(),
+                        "works": deepcopy(result.get("works", [])),
+                        "source_url": result.get("source_url"),
+                        "capture_sha256": result.get("capture_sha256"),
+                    }
+                    persist_cache()
             if not isinstance(result, dict):
                 provider_errors.append({"query": query, "outcome": "malformed_response"})
                 continue
             outcome = result.get("outcome")
-            works = result.get("works", []) if isinstance(result.get("works", []), list) else []
+            works = result.get("works", []) if isinstance(result.get("works"), list) else []
             metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
-            sampling_trace.append({
-                "query": query,
-                "outcome": outcome,
-                "returned_work_ids": [item.get("id") for item in works
-                                      if isinstance(item, dict) and isinstance(item.get("id"), str)],
-                "source_url": result.get("source_url"),
-                "capture_sha256": result.get("capture_sha256"),
-                "provider": metadata.get("provider"),
-                "http_status": metadata.get("http_status"),
-                "request": metadata.get("request"),
-            })
-            if outcome not in {"ok", "empty"}:
-                provider_errors.append({"query": query, "outcome": outcome, "error": result.get("error")})
-                continue
+            relevant_ids, irrelevant_ids = [], []
+            query_tokens = set(_topic_tokens(query)) - _MISSION_BOILERPLATE
+            required_token_matches = min(2, len(query_tokens))
+            relevance_matches = {}
+            accepted = []
             for work in works:
                 if not isinstance(work, dict) or not isinstance(work.get("id"), str):
                     continue
                 title = work.get("title")
                 if not isinstance(title, str) or not title.strip():
-                    # A provider response that is useful for discovery must
-                    # still have a reader-facing identity.  Skip malformed
-                    # rows and preserve the request trace rather than letting
-                    # one bad item abort an otherwise valid sample.
                     continue
+                work_tokens = set(_topic_tokens(title + " " + str(work.get("abstract") or "")))
+                matched_tokens = sorted(query_tokens.intersection(work_tokens))
+                relevance_matches[work["id"]] = matched_tokens
+                if len(matched_tokens) < required_token_matches:
+                    irrelevant_ids.append(work["id"])
+                    continue
+                relevant_ids.append(work["id"])
+                accepted.append(work)
+            sampling_trace.append({
+                "seed_id": spec["seed_id"], "seed_domain": spec["seed_domain"],
+                "query": query, "outcome": outcome, "cache_hit": cache_hit,
+                "returned_work_ids": [item.get("id") for item in works if isinstance(item, dict)],
+                "relevant_work_ids": relevant_ids, "irrelevant_work_ids": irrelevant_ids,
+                "required_query_token_matches": required_token_matches,
+                "matched_query_tokens": relevance_matches,
+                "source_url": result.get("source_url"),
+                "capture_sha256": result.get("capture_sha256"),
+                "provider": metadata.get("provider"), "http_status": metadata.get("http_status"),
+                "request": metadata.get("request"), "rate_limit": metadata.get("rate_limit"),
+                "attempts": metadata.get("attempts"),
+                "retry_wait_seconds": metadata.get("retry_wait_seconds"),
+                "pacing_wait_seconds": metadata.get("pacing_wait_seconds"),
+            })
+            if outcome not in {"ok", "empty"}:
+                provider_errors.append({
+                    "query": query, "outcome": outcome, "error": result.get("error"),
+                    "rate_limit": metadata.get("rate_limit"),
+                })
+                # A rate limit applies to the provider, not just this wording.
+                # Stop issuing fresh queries; cached coverage below may still
+                # satisfy the explicit diversity floor.
+                if outcome == "rate_limited":
+                    break
+                continue
+            for work in accepted:
                 if work["id"] in seen:
                     continue
                 seen.add(work["id"])
-                records.append({
-                    "work_id": work["id"], "title": title,
+                grouped.setdefault(spec["seed_id"], []).append({
+                    "work_id": work["id"], "title": work["title"],
                     "year": work.get("year") if type(work.get("year")) is int else None,
-                    "abstract": ((work.get("abstract") or "")[:5000] or None),
+                    "abstract": ((work.get("abstract") or "")[:TOPIC_ABSTRACT_CHARS] or None),
                     "doi": work.get("doi"), "locations": work.get("locations", []),
+                    "frontier_seed_id": spec["seed_id"],
+                    "frontier_domain": spec["seed_domain"], "matched_query": query,
                     **({"authors": work["authors"]} if isinstance(work.get("authors"), list) else {}),
                     "source_url": "https://openalex.org/" + work["id"],
                 })
-        if provider_errors and not records:
-            # OpenAlex's keyless service can exhaust a daily credit pool even
-            # while the rest of the research stack is healthy.  Topic intake
-            # is allowed to switch to Crossref metadata for inspiration; the
-            # authoritative survey still records and verifies its own source
-            # route before any claim is admitted.
-            fallback_client = CrossrefClient(timeout=20, max_bytes=2_000_000)
-            fallback_seen = set()
-            for query in queries:
-                fallback = fallback_client.search(query, limit=10)
-                fallback_meta = fallback.get("metadata") if isinstance(fallback.get("metadata"), dict) else {}
-                sampling_trace.append({
-                    "query": query,
-                    "outcome": fallback.get("outcome"),
-                    "returned_source_ids": [item.get("doi") for item in fallback.get("sources", [])
-                                             if isinstance(item, dict) and isinstance(item.get("doi"), str)],
-                    "source_url": fallback.get("source_url"),
-                    "capture_sha256": fallback.get("capture_sha256"),
-                    "provider": fallback_meta.get("provider"),
-                    "http_status": fallback_meta.get("http_status"),
-                    "request": {"query": query, "limit": 10},
-                })
-                if fallback.get("outcome") not in {"ok", "empty"}:
-                    continue
-                for source in fallback.get("sources", []):
-                    if not isinstance(source, dict) or not isinstance(source.get("doi"), str):
-                        continue
-                    source_id = source["doi"].lower()
-                    if source_id in fallback_seen:
-                        continue
-                    fallback_seen.add(source_id)
-                    published = source.get("published") or {}
-                    parts = published.get("date-parts", [[]]) if isinstance(published, dict) else [[]]
-                    year = parts[0][0] if parts and parts[0] and type(parts[0][0]) is int else None
-                    title = source.get("title")
-                    if not isinstance(title, str) or not title.strip():
-                        continue
-                    records.append({
-                        "work_id": "doi:" + source["doi"], "title": title,
-                        "year": year, "abstract": (source.get("abstract") or "")[:5000] or None,
-                        "doi": source["doi"], "locations": [],
-                        "source_url": source.get("source_url") or "https://doi.org/" + source["doi"],
-                        "provider": "crossref",
-                    })
-            if not records:
-                outcomes = ", ".join(str(item.get("outcome")) for item in provider_errors)
-                raise ValidationError(f"recent scholarly topic sampling failed across OpenAlex and Crossref queries: {outcomes}")
-        if not records:
-            raise ValidationError("OpenAlex returned no scholarly records for topic discovery")
+
+        populated_groups = [key for key, values in grouped.items() if values]
+        if len(populated_groups) < minimum_seed_groups:
+            detail = provider_errors[-1] if provider_errors else {"outcome": "insufficient_relevant_records"}
+            limited = next((item for item in reversed(provider_errors)
+                            if item.get("outcome") == "rate_limited"), None)
+            delay = provider_cooldown_seconds(
+                limited.get("rate_limit") if isinstance(limited, dict) else None)
+            if delay is not None:
+                raise ProviderCooldownError(
+                    "OpenAlex topic sampling is paused until the provider quota resets "
+                    f"({len(populated_groups)}/{minimum_seed_groups} frontier groups)",
+                    retry_after_seconds=delay,
+                    rate_limit=limited.get("rate_limit"),
+                )
+            raise ValidationError(
+                "OpenAlex topic sampling did not meet the source-diversity floor "
+                f"({len(populated_groups)}/{minimum_seed_groups} frontier groups): {detail}")
+
         current_year = time.gmtime().tm_year
         recent_cutoff = current_year - RECENT_YEAR_WINDOW
-        recent = [item for item in records if isinstance(item.get("year"), int)
-                  and item["year"] >= recent_cutoff]
-        # If the objective is niche and the recent window is empty, preserve
-        # the newest provider records instead of fabricating a topic.
-        pool = recent or sorted(records, key=lambda item: item.get("year") if type(item.get("year")) is int else 0,
-                                 reverse=True)
-        if sampling_seed is None:
-            sampling_seed = int(hashlib.sha256(objective.encode("utf-8")).hexdigest()[:16], 16) % MAX_PROVIDER_SEED
-        if type(sampling_seed) is not int or not 0 <= sampling_seed <= MAX_PROVIDER_SEED:
-            raise ValidationError(
-                f"topic sampling_seed must be an integer between 0 and {MAX_PROVIDER_SEED}")
         rng = Random(sampling_seed)
-        if len(pool) > 24:
-            pool = rng.sample(pool, 24)
-        else:
-            # Shuffle even a short pool so provider ordering does not become
-            # an implicit ranking signal; the seed keeps the run reproducible.
-            pool = list(pool)
-            rng.shuffle(pool)
+        for key, values in list(grouped.items()):
+            recent = [item for item in values if isinstance(item.get("year"), int)
+                      and item["year"] >= recent_cutoff]
+            selected_pool = recent or sorted(
+                values, key=lambda item: item.get("year") if type(item.get("year")) is int else 0,
+                reverse=True)
+            rng.shuffle(selected_pool)
+            grouped[key] = selected_pool
+
+        # Round-robin across seeds so one broad query cannot dominate the
+        # model context merely because the provider ranked it first.
+        pool = []
+        ordered_groups = list(populated_groups)
+        rng.shuffle(ordered_groups)
+        while len(pool) < TOPIC_SAMPLE_LIMIT:
+            advanced = False
+            for key in ordered_groups:
+                values = grouped.get(key, [])
+                if values:
+                    pool.append(values.pop(0))
+                    advanced = True
+                    if len(pool) >= TOPIC_SAMPLE_LIMIT:
+                        break
+            if not advanced:
+                break
         return pool, sampling_seed, sampling_trace
 
 
 __all__ = [
     "SCHEMA_VERSION", "STAGE_CONFIG_SCHEMA_VERSION", "TOPIC_HISTORY_SCHEMA_VERSION",
     "RECENT_YEAR_WINDOW", "TopicDiscoveryRunner", "topic_signature", "validate_topic_novelty",
-    "validate_topic_stage_config", "validate_topic_package", "validate_topic_feasibility", "topic_prompt",
+    "validate_frontier_seed_plan", "validate_source_challenge", "validate_topic_stage_config",
+    "validate_topic_package", "validate_topic_feasibility", "topic_prompt",
 ]

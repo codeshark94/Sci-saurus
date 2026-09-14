@@ -17,6 +17,7 @@ from scisaurus.core.events import ControlStore
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.surveys import SurveyGate
 from scisaurus.runtime.execution import _invoke_worker
+from scisaurus.runtime.literature import ProviderCooldownError
 from scisaurus.runtime.survey import (SurveyRunner, apply_scoped_map_repair,
                                       overlay_post_checkpoint_relationships)
 from scisaurus.runtime.survey_config import validate_survey_config
@@ -599,6 +600,22 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(runner.bounds["max_works"], 20)
         self.assertEqual(runner.time_policy.unit_count, 20)
         self.assertEqual(runner.work_budget_adjustments[-1]["kind"], "provider_fallback_fit")
+
+    def test_bibliography_fallback_can_be_disabled_for_novelty_sensitive_runs(self):
+        config = survey_config(self.endpoint)
+        config["survey"]["bibliography_fallback"] = "disabled"
+        runner = self.runtime(config)
+        with self.assertRaisesRegex(ValidationError, "fallback is disabled"):
+            runner._activate_crossref_fallback("rate_limited")
+
+    def test_survey_provider_failure_preserves_reset_boundary(self):
+        detail = {
+            "outcome": "rate_limited",
+            "rate_limit": {"kind": "daily_budget", "retry_after_seconds": 432},
+        }
+        with self.assertRaises(ProviderCooldownError) as caught:
+            SurveyRunner._raise_provider_cooldown(detail, "provider reset pending")
+        self.assertEqual(caught.exception.retry_after_seconds, 432)
 
     def test_stale_survey_after_dispatch_checkpoint_blocks_gap_worker(self):
         original = SurveyRunner._checkpoint

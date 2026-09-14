@@ -50,9 +50,28 @@ def _crossref_client(client, project_path, environment_files):
 
 def _openalex_client(client, project_path, environment_files):
     _limits(client)
-    if set(client) - {"timeout", "max_bytes", "endpoint", "auth_env", "max_retries", "retry_backoff_seconds"}:
+    if set(client) - {"timeout", "max_bytes", "endpoint", "auth_env", "max_retries",
+                      "retry_backoff_seconds", "min_interval_seconds", "rate_state_path"}:
         raise ValidationError("Unsupported OpenAlex client options")
     client.setdefault("endpoint", literature.DEFAULT_ENDPOINT)
+    if "rate_state_path" in client:
+        state_path = Path(client["rate_state_path"])
+        project = Path(project_path).resolve()
+        # Composer retries live below <stage>/attempts/attempt-N. Provider
+        # cooldown state belongs to the stable stage root so every isolated
+        # attempt observes the same upstream reset boundary.
+        stage_root = project
+        if (stage_root.parent.name == "attempts"
+                and re.fullmatch(r"attempt-[1-9][0-9]*", stage_root.name)):
+            stage_root = stage_root.parent.parent
+        if (stage_root.parent.name == "continuations"
+                and re.fullmatch(r"cycle-[1-9][0-9]*", stage_root.name)):
+            stage_root = stage_root.parent.parent
+        if (not state_path.is_absolute()
+                or not state_path.resolve().is_relative_to(stage_root)):
+            raise ValidationError(
+                "OpenAlex rate_state_path must be inside the stable project stage directory")
+        client["rate_state_path"] = str(state_path.resolve())
     try:
         literature.OpenAlexClient(**client)
     except (TypeError, ValueError) as exc:
@@ -62,7 +81,10 @@ def _openalex_client(client, project_path, environment_files):
 
 def _process_client(client, project_path, environment_files, label):
     _limits(client)
-    if set(client) - {"timeout", "max_bytes", "command", "env", "own_process_group", "cwd"}:
+    allowed = {"timeout", "max_bytes", "command", "env", "own_process_group", "cwd"}
+    if label == "Local program":
+        allowed.add("sandbox_required")
+    if set(client) - allowed:
         raise ValidationError(f"Unsupported {label} client options")
     cwd = Path(_text(client.get("cwd"), f"{label} cwd"))
     if not cwd.is_absolute() or not cwd.is_dir() or not cwd.resolve().is_relative_to(Path(project_path)):
@@ -95,6 +117,7 @@ def _mcp_client(client, project_path, environment_files):
 def _program_client(client, project_path, environment_files):
     client = _process_client(client, project_path, environment_files, "Local program")
     client.setdefault("own_process_group", False)
+    client.setdefault("sandbox_required", False)
     if client["own_process_group"]:
         raise ValidationError("Local program processes must remain in the ExecutionRuntime worker group")
     try:
@@ -480,7 +503,10 @@ def _inspect_program(profile, result, params, *, representative=True):
     check("program-execution", type(metadata.get("process_returncode")) is int
           and metadata["process_returncode"] == 0 and metadata.get("command") == client["command"]
           and metadata.get("cwd") == client["cwd"] and metadata.get("command_identity") == identity
-          and metadata.get("own_process_group") == client["own_process_group"],
+          and metadata.get("own_process_group") == client["own_process_group"]
+          and metadata.get("sandbox_required") == client.get("sandbox_required", False)
+          and (not client.get("sandbox_required")
+               or metadata.get("sandbox_mode") == "sandbox-exec"),
           "A zero exit status is bound to the configured command, executable, environment and working directory")
     schema_identity = {"protocol_version": metadata.get("protocol_version")}
     check("program-protocol", schema_identity["protocol_version"] == programs.PROTOCOL_VERSION

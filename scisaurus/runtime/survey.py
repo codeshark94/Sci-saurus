@@ -17,7 +17,9 @@ from scisaurus.runtime.execution import ExecutionRuntime, _invoke_worker
 from scisaurus.runtime.config import configured_worker_slots
 from scisaurus.runtime.bibliographic_identity import reconcile_result
 from scisaurus.runtime.models import ModelResult
-from scisaurus.runtime.literature import SEARCH_SYNTAX
+from scisaurus.runtime.literature import (
+    SEARCH_SYNTAX, ProviderCooldownError, provider_cooldown_seconds,
+)
 from scisaurus.runtime.operations import OperationsCell
 from scisaurus.runtime.scores import exact, identifier
 from scisaurus.runtime.survey_config import validate_survey_config, search_query
@@ -76,6 +78,8 @@ class SurveyRunner(ExecutionRuntime):
         self.gate = SurveyGate(self.control, self.store)
         self.worker_slots = configured_worker_slots(self.config["limits"])
         self.bibliography_mode = "openalex"
+        self.bibliography_fallback_policy = self.score.get(
+            "bibliography_fallback", "crossref_metadata")
         self.bibliography_fallback_reason = None
         self.bibliography_fallback_capability = None
         self.work_budget_adjustments = []
@@ -578,6 +582,15 @@ class SurveyRunner(ExecutionRuntime):
                 verifier="operations.verifier", purpose=self.score["question"])
             if state["state"] != "ready":
                 if key == "bibliography":
+                    if self.bibliography_fallback_policy == "disabled":
+                        detail = self._failure_detail(definition["id"])
+                        self._raise_provider_cooldown(
+                            detail,
+                            "OpenAlex survey readiness is paused until the provider quota resets",
+                        )
+                        raise ValidationError(
+                            "OpenAlex readiness failed while bibliography fallback is disabled: "
+                            + str(state.get("reason") or "unknown provider failure"))
                     # A provider outage or exhausted quota must not strand a
                     # whole run when the configured Crossref identity service
                     # can still supply bounded metadata.  The fallback is
@@ -649,23 +662,55 @@ class SurveyRunner(ExecutionRuntime):
             **({"authors": authors} if authors else {}),
         }
 
-    def _failure_outcome(self, capability_id):
-        """Read the recorded provider outcome after an operational failure."""
+    def _failure_detail(self, capability_id):
+        """Read provider status from either a failed probe or routine workload."""
         try:
             state = self.operations.status(capability_id)
+            execution_ref = None
             failure_ref = state.get("failure_ref")
-            if not failure_ref:
-                return None
-            body = self._body(self.store.get(failure_ref))
-            execution_ref = body.get("execution_ref")
+            if failure_ref:
+                body = self._body(self.store.get(failure_ref))
+                execution_ref = body.get("execution_ref")
+            if not execution_ref and state.get("verification_ref"):
+                verification = self._body(self.store.get(state["verification_ref"]))
+                execution_ref = verification.get("execution_ref")
+            if not execution_ref and state.get("probe_ref"):
+                probe = self._body(self.store.get(state["probe_ref"]))
+                execution_ref = probe.get("execution_ref")
             if execution_ref:
                 execution = self._body(self.store.get(execution_ref))
-                return execution.get("outcome") or execution.get("metadata", {}).get("http_status")
-            return body.get("outcome")
+                metadata = execution.get("metadata")
+                metadata = metadata if isinstance(metadata, dict) else {}
+                return {
+                    "outcome": execution.get("outcome") or metadata.get("http_status"),
+                    "http_status": metadata.get("http_status"),
+                    "rate_limit": metadata.get("rate_limit"),
+                    "execution_ref": execution_ref,
+                }
+            return {"outcome": None, "http_status": None, "rate_limit": None,
+                    "execution_ref": None}
         except (KeyError, TypeError, ValueError, ValidationError):
-            return None
+            return {"outcome": None, "http_status": None, "rate_limit": None,
+                    "execution_ref": None}
+
+    def _failure_outcome(self, capability_id):
+        return self._failure_detail(capability_id)["outcome"]
+
+    @staticmethod
+    def _raise_provider_cooldown(detail, context):
+        if not isinstance(detail, dict) or detail.get("outcome") not in {"rate_limited", 429}:
+            return
+        delay = provider_cooldown_seconds(detail.get("rate_limit"))
+        if delay is not None:
+            raise ProviderCooldownError(
+                context, retry_after_seconds=delay,
+                rate_limit=detail.get("rate_limit"),
+            )
 
     def _activate_crossref_fallback(self, reason):
+        if self.bibliography_fallback_policy == "disabled":
+            raise ValidationError(
+                "OpenAlex failed while bibliography fallback is disabled: " + str(reason))
         if self.bibliography_mode == "crossref":
             return
         self.bibliography_mode = "crossref"
@@ -860,18 +905,29 @@ class SurveyRunner(ExecutionRuntime):
         except Exception as exc:
             self._ensure_active()
             self.gaps.append({"kind": "bibliographic_failure", "request": arguments, "error": str(exc)})
-            outcome = self._failure_outcome(self.score["bibliography"]["id"])
+            detail = self._failure_detail(self.score["bibliography"]["id"])
+            outcome = detail["outcome"]
             fallback_outcomes = {"rate_limited", "timeout", "provider_error", "auth_required", "access_denied", 408, 425, 429, 500, 502, 503, 504}
             if (operation in {"search", "work"} and self.score.get("identity")
-                    and outcome in fallback_outcomes):
+                    and outcome in fallback_outcomes
+                    and self.bibliography_fallback_policy == "crossref_metadata"):
                 self._activate_crossref_fallback(outcome)
                 if operation == "search" or self.works.get(work_id, {}).get("doi"):
                     return self._crossref_bibliographic_call(arguments, role=role, plan_ref=plan_ref, admission=admission)
                 self.gaps.append({"kind": "bibliography_fallback_unsupported", "operation": operation,
                                   "work_id": work_id, "provider": "crossref"})
                 return None
-            if operation in {"work", "citing"} and outcome in fallback_outcomes:
+            if (operation in {"work", "citing"} and outcome in fallback_outcomes
+                    and self.bibliography_fallback_policy == "crossref_metadata"):
                 return None
+            if self.bibliography_fallback_policy == "disabled":
+                try:
+                    self._raise_provider_cooldown(
+                        detail,
+                        "OpenAlex survey retrieval is paused until the provider quota resets",
+                    )
+                except ProviderCooldownError as cooldown:
+                    raise cooldown from exc
             raise
         added = self._ingest(result["works"], execution, admission=admission)
         metadata = result["metadata"]

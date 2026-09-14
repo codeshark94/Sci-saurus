@@ -21,7 +21,7 @@ from scisaurus.core.schema import canonical_bytes, now_iso, sha256_hex
 from scisaurus.runtime.retrieval import SAFE_PROCESS_ENV
 
 
-ADAPTER_VERSION = "1"
+ADAPTER_VERSION = "2"
 PROTOCOL_VERSION = "json-stdin-object-v1"
 
 
@@ -84,7 +84,8 @@ class LocalProgramClient:
     ``max_bytes`` bounds stdout and stderr together. The default leaves the
     process in the worker's group; standalone callers may explicitly own a group.
     """
-    def __init__(self, command, *, timeout, max_bytes, cwd, env, own_process_group=False):
+    def __init__(self, command, *, timeout, max_bytes, cwd, env, own_process_group=False,
+                 sandbox_required=False):
         if (not isinstance(command, list) or not command
                 or any(not isinstance(arg, str) or "\0" in arg for arg in command)
                 or not Path(command[0]).is_absolute() or not Path(command[0]).is_file()
@@ -103,8 +104,21 @@ class LocalProgramClient:
             raise ValueError("Program environment is limited to explicit nonsecret process settings")
         if type(own_process_group) is not bool:
             raise ValueError("own_process_group must be a Boolean")
+        if type(sandbox_required) is not bool:
+            raise ValueError("sandbox_required must be a Boolean")
+        if sandbox_required:
+            from scisaurus.runtime.program_sandbox import sandbox_status
+            if sandbox_status()["mode"] != "sandbox-exec":
+                raise ValueError(
+                    "sandbox_required local programs require the deny-by-default sandbox-exec boundary")
+            if (len(command) != 2 or not Path(command[1]).is_absolute()
+                    or not Path(command[1]).is_file()
+                    or not Path(command[1]).resolve().is_relative_to(Path(cwd))):
+                raise ValueError(
+                    "sandbox_required local programs require one project-workspace source file")
         self.command, self.timeout, self.max_bytes = list(command), timeout, max_bytes
         self.cwd, self.env, self.own_process_group = cwd, dict(env), own_process_group
+        self.sandbox_required = sandbox_required
 
     def run(self, input):
         document = json_object(input)
@@ -118,8 +132,11 @@ class LocalProgramClient:
                                "protocol_version": PROTOCOL_VERSION, "started_at": now_iso(),
                                "command": self.command, "cwd": self.cwd, "command_identity": identity,
                                "own_process_group": self.own_process_group, "process_returncode": None,
+                               "sandbox_required": self.sandbox_required, "sandbox_mode": None,
                                "input_bytes_written": 0, "capture_truncated": False,
                                "capture_incomplete": False}}
+        if self.sandbox_required:
+            return self._run_in_required_sandbox(result, document, stdin)
         stdout, stderr = bytearray(), bytearray()
         process = None
         deadline = time.monotonic() + self.timeout
@@ -208,6 +225,49 @@ class LocalProgramClient:
                           stderr_capture=_capture(bytes(stderr), "text/plain"),
                           capture_sha256=sha256_hex(bytes(stdout)), stderr_sha256=sha256_hex(bytes(stderr)))
             result["metadata"]["finished_at"] = now_iso()
+        return result
+
+    def _run_in_required_sandbox(self, result, document, stdin):
+        """Execute model-authored code under the same boundary used at admission."""
+        from scisaurus.runtime.program_sandbox import run_sandboxed
+
+        sandbox = run_sandboxed(
+            self.command, workspace=Path(self.cwd), input_bytes=stdin,
+            timeout_seconds=self.timeout, max_bytes=self.max_bytes, env=self.env,
+        )
+        stdout, stderr = sandbox.stdout, sandbox.stderr
+        result["metadata"].update(
+            sandbox_mode=sandbox.mode,
+            process_returncode=sandbox.returncode,
+            input_bytes_written=len(stdin) if not sandbox.timed_out else 0,
+            capture_truncated=sandbox.truncated,
+            capture_incomplete=bool(sandbox.truncated or sandbox.timed_out),
+        )
+        if sandbox.mode != "sandbox-exec":
+            result["gaps"].append("Required deny-by-default sandbox was unavailable")
+        elif sandbox.timed_out:
+            result["outcome"] = "timeout"
+            result["gaps"].append("Program exceeded its execution deadline")
+        elif sandbox.truncated:
+            result["outcome"] = "partial"
+            result["gaps"].append("Program stdout and stderr exceeded the shared capture byte limit")
+        elif sandbox.returncode != 0:
+            result["gaps"].append(f"Program exited with status {sandbox.returncode}")
+        else:
+            try:
+                result["document"] = _parse_object(stdout)
+                result["text"] = canonical_bytes(result["document"]).decode("utf-8")
+                result["outcome"] = "ok"
+            except (ValueError, UnicodeDecodeError, RecursionError) as exc:
+                result["outcome"] = "parse_error"
+                result["gaps"].append(
+                    f"Program stdout is not one complete JSON object: {exc}")
+        result.update(
+            capture=_capture(stdout, "application/json"),
+            stderr_capture=_capture(stderr, "text/plain"),
+            capture_sha256=sha256_hex(stdout), stderr_sha256=sha256_hex(stderr),
+        )
+        result["metadata"]["finished_at"] = now_iso()
         return result
 
 

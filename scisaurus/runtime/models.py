@@ -4,15 +4,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 import base64
 import hashlib
+import http.client
 import json
 import math
 import os
 from pathlib import Path
 import re
+import socket
+import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 
 from scisaurus.core.errors import ValidationError
 
@@ -32,6 +33,7 @@ MAX_PROVIDER_SEED = (1 << 63) - 1
 # evidence and review roles remain conservative.  A model configuration may
 # override any profile below through ``role_profiles``.
 DEFAULT_ROLE_PROFILES = {
+    "research.frontier-seed-planner": {"temperature": 1.35, "top_p": 0.97, "presence_penalty": 0.45},
     "topic_discovery": {"temperature": 1.1, "top_p": 0.95, "presence_penalty": 0.2},
     "research.topic-discovery": {"temperature": 1.1, "top_p": 0.95, "presence_penalty": 0.2},
     "research.search-planner": {"temperature": 1.0, "top_p": 0.95, "presence_penalty": 0.15},
@@ -39,6 +41,7 @@ DEFAULT_ROLE_PROFILES = {
     "research.literature-mapper": {"temperature": 0.25, "top_p": 0.9},
     "research.literature-reviewer": {"temperature": 0.25, "top_p": 0.9},
     "research.topic-maturity-reviewer": {"temperature": 0.2, "top_p": 0.9},
+    "research.topic-source-challenger": {"temperature": 0.15, "top_p": 0.9},
     "strategy.interpretation": {"temperature": 0.75, "top_p": 0.92},
     "strategy.argument": {"temperature": 0.7, "top_p": 0.92},
     "strategy.argument-reviewer": {"temperature": 0.2, "top_p": 0.9},
@@ -124,9 +127,12 @@ class ModelCallError(RuntimeError):
         self.outcome_known = outcome_known
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise ModelCallError("model endpoint redirected; configure the final endpoint explicitly", outcome_known=True)
+class _ProviderHTTPError(RuntimeError):
+    """A provider response with an HTTP status other than 200."""
+    def __init__(self, code, retry_after=None):
+        super().__init__(f"model HTTP request failed with status {code}")
+        self.code = code
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True)
@@ -291,7 +297,12 @@ class ModelClient:
         wire = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
         if len(wire) > self.max_request_bytes:
             raise ValidationError("model request exceeds the configured byte limit")
-        request = urllib.request.Request(self.base_url + path, wire, headers)
+        parsed_base = urllib.parse.urlsplit(self.base_url)
+        connection_type = (http.client.HTTPSConnection
+                           if parsed_base.scheme == "https" else http.client.HTTPConnection)
+        request_path = parsed_base.path.rstrip("/") + path
+        if not request_path.startswith("/"):
+            request_path = "/" + request_path
         started = time.monotonic()
         deadline = started + self.timeout_seconds
         retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
@@ -301,35 +312,78 @@ class ModelClient:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ModelCallError("model request deadline exceeded") from None
+            connection = connection_type(parsed_base.hostname, parsed_base.port,
+                                         timeout=max(0.1, remaining))
+            response = None
+            timeout_timer = None
+            expired = threading.Event()
+
+            def expire_request():
+                expired.set()
+                transport_socket = connection.sock
+                if transport_socket is None and response is not None:
+                    raw = getattr(getattr(response, "fp", None), "raw", None)
+                    transport_socket = getattr(raw, "_sock", None)
+                    if transport_socket is None:
+                        transport_socket = getattr(getattr(response, "fp", None), "_sock", None)
+                if transport_socket is not None:
+                    try:
+                        transport_socket.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                if response is not None:
+                    try:
+                        response.close()
+                    except (OSError, ValueError):
+                        pass
+                connection.close()
+
             try:
-                with urllib.request.build_opener(_NoRedirect()).open(
-                        request, timeout=max(0.1, remaining)) as response:
-                    # ``HTTPResponse.read(n)`` can legally return a short
-                    # chunk and then wait for more bytes.  A provider that
-                    # trickles output would therefore evade the original
-                    # one-shot socket timeout.  Read in bounded chunks and
-                    # re-check the absolute request deadline after every
-                    # chunk so the whole response, including body transfer,
-                    # stays inside one budget.
-                    chunks = []
-                    total = 0
-                    while total <= self.max_response_bytes:
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            raise ModelCallError("model request deadline exceeded")
-                        try:
-                            chunk = response.read(min(65536, self.max_response_bytes + 1 - total))
-                        except TimeoutError:
+                timeout_timer = threading.Timer(
+                    max(0.01, deadline - time.monotonic()), expire_request)
+                timeout_timer.daemon = True
+                timeout_timer.start()
+                connection.request("POST", request_path, wire,
+                                   headers={**headers, "Connection": "close"})
+                response = connection.getresponse()
+                code = response.status
+                if 300 <= code < 400:
+                    raise ModelCallError(
+                        "model endpoint redirected; configure the final endpoint explicitly",
+                        outcome_known=True)
+                if code != 200:
+                    raise _ProviderHTTPError(code, response.getheader("Retry-After"))
+                # ``HTTPResponse.read(n)`` can legally wait for the full
+                # requested amount (or for EOF) when a provider sends a
+                # response in small chunks.  ``read1`` returns one currently
+                # available bounded chunk, while the timer above also covers
+                # HTTP header parsing and chunk-framing reads performed inside
+                # ``http.client``.  Together they keep the whole transaction
+                # inside one absolute request budget.
+                chunks = []
+                total = 0
+                read_chunk = getattr(response, "read1", response.read)
+                while total <= self.max_response_bytes:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ModelCallError("model request deadline exceeded")
+                    transport_socket = connection.sock
+                    if transport_socket is not None:
+                        transport_socket.settimeout(max(0.1, remaining))
+                    try:
+                        chunk = read_chunk(min(65536, self.max_response_bytes + 1 - total))
+                    except (AttributeError, OSError, TimeoutError, ValueError):
+                        if expired.is_set() or time.monotonic() >= deadline:
                             raise ModelCallError("model request deadline exceeded") from None
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                        total += len(chunk)
-                    raw = b"".join(chunks)
-            except urllib.error.HTTPError as exc:
+                        raise
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                raw = b"".join(chunks)
+            except _ProviderHTTPError as exc:
                 code = exc.code
-                retry_after = exc.headers.get("Retry-After")
-                exc.close()
+                retry_after = exc.retry_after
                 if code in retryable_statuses and attempt < self.max_retries:
                     delay = self.retry_backoff_seconds * (2 ** attempt)
                     try:
@@ -345,8 +399,21 @@ class ModelClient:
                     continue
                 raise ModelCallError(f"model HTTP request failed with status {code}",
                                      outcome_known=400 <= code < 500) from None
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            except ModelCallError:
+                raise
+            except (http.client.HTTPException, TimeoutError, OSError, ValueError, AttributeError) as exc:
+                if expired.is_set() or time.monotonic() >= deadline:
+                    raise ModelCallError("model request deadline exceeded") from None
                 raise ModelCallError(f"model transport failed: {type(exc).__name__}") from None
+            finally:
+                if timeout_timer is not None:
+                    timeout_timer.cancel()
+                if response is not None:
+                    try:
+                        response.close()
+                    except (OSError, ValueError):
+                        pass
+                connection.close()
             if len(raw) > self.max_response_bytes:
                 raise ModelCallError("model response exceeded the configured byte limit")
             try:

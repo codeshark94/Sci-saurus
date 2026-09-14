@@ -17,17 +17,18 @@ passes.
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from pathlib import Path
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.capability_registry import register_capability
+from scisaurus.runtime.capability_registry import experiment_program_payload, register_capability
 from scisaurus.runtime.models import ModelClient, resolve_model_config
 from scisaurus.runtime.program_admission import scan_program_source, validate_program_candidate
 from scisaurus.runtime.program_gates import admit_program_candidate
-from scisaurus.runtime.program_sandbox import run_sandboxed
+from scisaurus.runtime.program_sandbox import run_sandboxed, sandbox_status
 
 SYSTEM = (
     "You are the program-authoring specialist for an autonomous research laboratory. "
@@ -44,10 +45,52 @@ PROGRAM_OUTPUT_FIELDS = ("schema_version", "study_id", "revision", "procedures",
                          "metrics", "findings", "limitations", "assets")
 ATTEMPT_FIELDS = {"executor_source", "validator_source", "runtime", "test_input", "experiment_intent"}
 IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,63}")
+CONFIG_SCHEMA = "capability-foundry-config-1"
+CONFIG_FIELDS = {
+    "schema_version", "model_config_path", "runtime_python", "workspace_root",
+    "registry_root", "repo_root", "requirements_file", "runtime_packages",
+    "max_attempts", "timeout_seconds",
+}
 
 
-def candidate_prompt(brief, runtime_packages, test_input):
-    return {
+def validate_foundry_config(value):
+    """Validate the immutable host paths and budgets for generated programs."""
+    if not isinstance(value, dict) or set(value) != CONFIG_FIELDS:
+        raise ValidationError(f"capability foundry config requires exactly {sorted(CONFIG_FIELDS)}")
+    if value["schema_version"] != CONFIG_SCHEMA:
+        raise ValidationError("capability foundry config schema version is unsupported")
+    for key in ("model_config_path", "runtime_python", "requirements_file"):
+        path = Path(value[key]) if isinstance(value.get(key), str) else Path("")
+        if not path.is_absolute() or not path.is_file():
+            raise ValidationError(f"capability foundry {key} must be an existing absolute file")
+    for key in ("workspace_root", "registry_root", "repo_root"):
+        path = Path(value[key]) if isinstance(value.get(key), str) else Path("")
+        if not path.is_absolute() or key == "repo_root" and not path.is_dir():
+            raise ValidationError(
+                f"capability foundry {key} must be an absolute path"
+                + (" to an existing directory" if key == "repo_root" else ""))
+    packages = value["runtime_packages"]
+    if (not isinstance(packages, list) or not packages or len(packages) > 32
+            or any(not isinstance(item, dict) or set(item) != {"name", "version"}
+                   or not isinstance(item["name"], str) or not item["name"].strip()
+                   or not isinstance(item["version"], str) or not item["version"].strip()
+                   for item in packages)):
+        raise ValidationError("capability foundry runtime_packages is invalid")
+    if type(value["max_attempts"]) is not int or not 1 <= value["max_attempts"] <= 12:
+        raise ValidationError("capability foundry max_attempts must be between 1 and 12")
+    if (type(value["timeout_seconds"]) not in (int, float)
+            or not math.isfinite(value["timeout_seconds"]) or value["timeout_seconds"] <= 0):
+        raise ValidationError("capability foundry timeout_seconds must be finite and positive")
+    try:
+        model = json.loads(Path(value["model_config_path"]).read_text())
+        ModelClient(**resolve_model_config(model, role="research.experiment-author"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValidationError("capability foundry model config is unreadable") from exc
+    return deepcopy_config(value)
+
+
+def candidate_prompt(brief, runtime_packages, test_input, required_intent=None):
+    prompt = {
         "assignment": "author_experiment_program",
         "capability_brief": brief,
         "output_contract": {
@@ -59,7 +102,9 @@ def candidate_prompt(brief, runtime_packages, test_input):
                                 "{'configured_input','candidate','candidate_sha256'} (or 'primary_outcomes') "
                                 "from stdin and writes {'schema_version':'experiment-validation-1',"
                                 "'study_id','candidate_sha256','decision','checks','metric_recalculations',"
-                                "'limitations'}; decision 'accepted' only when every recalculation matches",
+                                "'limitations'}; decision 'accepted' only when every recalculation matches; "
+                                "when the input is exactly {'readiness_probe':true}, return exactly "
+                                "{'status':'ready'} without running a scientific validation",
             "runtime": {"python": "declared interpreter version", "packages": [
                 {"name": name, "version": version} for name, version in runtime_packages]},
             "test_input": test_input,
@@ -117,13 +162,25 @@ def candidate_prompt(brief, runtime_packages, test_input):
             "read the executor's experiment metadata from request['experiment'], never from configured_input.experiment",
             "the validator must read request['candidate'], request['candidate_sha256'] and request['primary_outcomes'] "
             "from the top level; it must not expect an 'experiment' key",
+            "the validator must implement the exact {'readiness_probe': true} handshake by returning "
+            "exactly {'status': 'ready'}; this handshake proves launchability only and never accepts data",
             "the engine must be fully deterministic: one seed, no clock, no unordered iteration",
             "the executor must emit at least three image/png figure assets with captions",
             "the validator must not import or copy the executor source",
             "the validator must recompute every declared primary_outcome from observations only",
             "every observation row must carry a replicate index and the raw values used for the metrics",
+            "for every primary metric, define one explicit formula and interpolation convention in the method; "
+            "the executor and independently written validator must implement that same declared formula from raw observations",
+            "the validator must emit one metric_recalculations row for every declared primary outcome, including "
+            "reported_value, recalculated_value, tolerance, and matches",
         ],
     }
+    if required_intent:
+        prompt["required_intent_fields"] = required_intent
+        prompt["constraints"].append(
+            "copy every supplied required_intent_fields value exactly into experiment_intent; do not broaden, "
+            "rename, paraphrase, or substitute the admitted scientific question")
+    return prompt
 
 
 class CapabilityFoundry:
@@ -138,19 +195,23 @@ class CapabilityFoundry:
         self.runtime_packages = [(name, version) for name, version in runtime_packages]
         self.max_attempts = int(max_attempts)
         self.timeout_seconds = timeout_seconds
+        if type(max_attempts) is not int or not 1 <= max_attempts <= 12:
+            raise ValidationError("foundry max_attempts must be an integer between 1 and 12")
+        if (type(timeout_seconds) not in (int, float)
+                or not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
+            raise ValidationError("foundry timeout_seconds must be finite and positive")
         for path in (self.runtime_python, self.requirements_file):
             if not path.is_file():
                 raise ValidationError(f"foundry requires an existing file: {path}")
+        if sandbox_status()["mode"] != "sandbox-exec":
+            raise ValidationError(
+                "capability foundry requires the deny-by-default sandbox-exec boundary")
         self.workspace_root.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _payload(intent, configured_input):
         """Build the program input exactly as ExperimentRunner does."""
-        return {"configured_input": configured_input,
-                "experiment": {key: intent[key] for key in (
-                    "id", "revision", "study_type", "domain", "research_question", "hypothesis",
-                    "method", "parameters", "seed", "run_count", "stopping_rule",
-                    "primary_outcomes", "limitations")}}
+        return experiment_program_payload(intent, configured_input)
 
     @staticmethod
     def _validator_input(data, intent):
@@ -170,14 +231,16 @@ class CapabilityFoundry:
         return run_sandboxed([str(self.runtime_python), str(program)], workspace=workdir,
                              input_bytes=payload, timeout_seconds=self.timeout_seconds, max_bytes=60_000_000)
 
-    def generate(self, brief, *, test_input=None, client=None):
+    def generate(self, brief, *, test_input=None, required_intent=None, client=None):
         client = client or ModelClient(**resolve_model_config(self.model_config, role="research.experiment-author"))
         feedback = None
         last_error = None
         last_attempt = None
         for attempt in range(self.max_attempts):
-            prompt_value = candidate_prompt(brief, self.runtime_packages,
-                                            test_input if test_input is not None else {"probe": True})
+            prompt_value = candidate_prompt(
+                brief, self.runtime_packages,
+                test_input if test_input is not None else {"probe": True},
+                required_intent=required_intent)
             if feedback is not None:
                 prompt_value["repair_request"] = {
                     "previous_error": str(feedback)[:4000],
@@ -200,6 +263,12 @@ class CapabilityFoundry:
                     raise ValidationError(
                         f"program author must return exactly {sorted(ATTEMPT_FIELDS)}; "
                         f"observed keys: {sorted(attempt_value)}")
+                if required_intent:
+                    intent = attempt_value.get("experiment_intent")
+                    if not isinstance(intent, dict) or any(
+                            intent.get(key) != value for key, value in required_intent.items()):
+                        raise ValidationError(
+                            "program author changed a required scientific intent field")
                 executor, validator = attempt_value["executor_source"], attempt_value["validator_source"]
                 scan_program_source(executor, "program executor")
                 scan_program_source(validator, "program validator")
@@ -233,6 +302,8 @@ class CapabilityFoundry:
                     execute=lambda data, src=executor: self._execute(src, data),
                     validate=lambda data, src=validator: self._execute(
                         src, self._validator_input(data, attempt_value["experiment_intent"])),
+                    readiness=lambda src=validator: self._execute(
+                        src, canonical_bytes({"readiness_probe": True})),
                     review=self._review)
                 registration = register_capability(
                     self.registry_root, candidate_value, admission,
