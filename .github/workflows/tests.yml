@@ -13,9 +13,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-      - name: Install local JSON validation capability
-        run: |
-          python -m venv .venv
-          .venv/bin/python -m pip install "$(sed -n '/^jsonschema==/p' requirements-runtime.txt)"
+      - name: Install pinned runtime and source extractor
+        run: sh scripts/setup-runtime.sh
       - name: Run acceptance test suite
-        run: python -m unittest discover -s scisaurus/tests -t . -v
+        run: .venv/bin/python -m unittest discover -s scisaurus/tests -t . -v
