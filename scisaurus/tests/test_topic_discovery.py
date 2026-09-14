@@ -259,6 +259,40 @@ class TopicDiscoveryTests(unittest.TestCase):
                                experiment_capability_ids={"cap_a", "cap_b", "cap_c"},
                                require_capability_coverage=True)
 
+    def test_design_driven_capability_requires_a_valid_experiment_design(self):
+        design = {
+            "family": "monte_carlo_estimator_comparison",
+            "data_process": {"kind": "student_t", "sample_size": 300, "df": 4.0},
+            "estimators": ["mean", "median", "trimmed_mean"],
+            "primary": "trimmed_mean", "baseline": "mean",
+            "trim_fraction": 0.1, "seed": 11,
+        }
+        value = package("Choose a feasible research direction")
+        for candidate in value["candidates"]:
+            candidate["experiment_capability_id"] = "design_driven"
+        with self.assertRaisesRegex(ValidationError, "requires an experiment_design"):
+            validate_topic_package(value, objective=value["objective"], candidate_count=3,
+                                   experiment_capability_ids={"design_driven"},
+                                   design_driven_capability_ids={"design_driven"})
+        for candidate in value["candidates"]:
+            candidate["experiment_design"] = json.loads(json.dumps(design))
+        validate_topic_package(value, objective=value["objective"], candidate_count=3,
+                               experiment_capability_ids={"design_driven"},
+                               design_driven_capability_ids={"design_driven"})
+        value["candidates"][0]["experiment_design"]["estimators"] = ["mean", "quantile"]
+        with self.assertRaisesRegex(ValidationError, "estimators"):
+            validate_topic_package(value, objective=value["objective"], candidate_count=3,
+                                   experiment_capability_ids={"design_driven"},
+                                   design_driven_capability_ids={"design_driven"})
+        value["candidates"][0]["experiment_design"] = json.loads(json.dumps(design))
+        for candidate in value["candidates"]:
+            candidate["experiment_capability_id"] = "fixed"
+        with self.assertRaisesRegex(ValidationError, "does not accept one"):
+            validate_topic_package(value, objective=value["objective"], candidate_count=3,
+                                   experiment_capability_ids={"fixed"},
+                                   design_driven_capability_ids={"design_driven"})
+
+
     def test_exploration_history_cannot_select_an_excluded_direction(self):
         value = package("Choose a feasible research direction")
         for candidate in value["candidates"]:

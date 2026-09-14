@@ -572,6 +572,52 @@ class ComposerWorkflowTests(unittest.TestCase):
                              "Does the robust estimator reduce tail error under contamination?")
             runner.close()
 
+    def test_design_driven_capability_injects_the_proposed_design(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            design = {
+                "family": "monte_carlo_estimator_comparison",
+                "data_process": {"kind": "gaussian_contamination", "sample_size": 150,
+                                 "contamination_rate": 0.08, "contamination_scale": 12.0},
+                "estimators": ["mean", "median", "median_of_means"],
+                "primary": "median_of_means", "baseline": "mean", "block_size": 5, "seed": 99,
+            }
+            catalog = root / "capability.json"
+            catalog.write_text(json.dumps({
+                "schema_version": "experiment-capability-1", "capability_id": "design_driven",
+                "experiment": {
+                    "id": "design_driven_study", "revision": 1, "study_type": "methods_validation",
+                    "domain": "computational statistics",
+                    "research_question": "Default question.", "hypothesis": "Pinned hypothesis.",
+                    "method": "Run the pinned design-driven engine.", "parameters": {"design_driven": True},
+                    "seed": 1, "run_count": 1, "stopping_rule": "Run the declared design once.",
+                    "primary_outcomes": [], "limitations": [], "literature_gate": None,
+                    "execution": {"input": {"design": {}}}, "validation": {}, "required_assets": [],
+                    "reviewers": [], "stage_seconds": {}, "max_observations": 1, "max_asset_bytes": 1,
+                },
+            }))
+            workflow["experiment_catalog"] = [{"id": "design_driven", "config_path": str(catalog.resolve())}]
+            runner = ComposerRunner(workflow)
+            config = {"experiment": {"revision": 1, "literature_gate": None}, "supplied_context": "base"}
+            runner.context["topic"] = {"kind": "topic_discovery", "topic": {
+                "experiment_capability_id": "design_driven",
+                "research_question": "Does the pinned engine reproduce the declared contrast?",
+                "domain": "robust statistics", "experiment_design": design}}
+            selected = runner._apply_topic_to_experiment_config(workflow["stages"][1], config)
+            experiment = selected["experiment"]
+            self.assertEqual(experiment["execution"]["input"]["design"], design)
+            self.assertEqual(experiment["seed"], 99)
+            self.assertEqual(experiment["domain"], "robust statistics")
+            self.assertEqual(experiment["research_question"],
+                             "Does the pinned engine reproduce the declared contrast?")
+            self.assertTrue(experiment["parameters"]["design_driven"])
+            with self.assertRaisesRegex(ValidationError, "requires a proposed experiment_design"):
+                runner.context["topic"]["topic"].pop("experiment_design")
+                runner._apply_topic_to_experiment_config(workflow["stages"][1], config)
+            runner.close()
+
+
     def test_catalog_paper_projection_replaces_stale_scientific_identity(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)

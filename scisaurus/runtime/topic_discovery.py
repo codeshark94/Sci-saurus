@@ -42,6 +42,78 @@ CATALOG_CANDIDATE_FIELDS = CANDIDATE_FIELDS | {"experiment_capability_id"}
 CATALOG_LEGACY_CANDIDATE_FIELDS = LEGACY_CANDIDATE_FIELDS | {"experiment_capability_id"}
 CAPABILITY_FIELDS = {"executables", "python_packages", "stage_kinds"}
 KNOWN_STAGE_KINDS = {"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"}
+
+# Design-driven experiment capabilities accept a bounded declarative study
+# DESIGN as data (never code).  This is the shared schema: the topic stage
+# proposes a design, the Composer injects it, and the pinned engine validates it
+# again at execution time.
+EXPERIMENT_DESIGN_FAMILY = "monte_carlo_estimator_comparison"
+DESIGN_ESTIMATORS = ("mean", "median", "trimmed_mean", "winsorized_mean", "median_of_means")
+DESIGN_PROCESSES = ("gaussian_contamination", "student_t", "lognormal_shifted")
+DESIGN_PROCESS_FIELDS = {
+    "gaussian_contamination": {"kind", "sample_size", "contamination_rate", "contamination_scale"},
+    "student_t": {"kind", "sample_size", "df"},
+    "lognormal_shifted": {"kind", "sample_size", "mu", "sigma"},
+}
+DESIGN_OPTIONAL_FIELDS = {"trim_fraction", "block_size"}
+
+
+def _design_driven_ids(runtime_context):
+    """Return the capability ids whose templates accept a proposed design."""
+    catalog = (runtime_context or {}).get("experiment_catalog") or []
+    return {item.get("id") for item in catalog
+            if isinstance(item, dict) and item.get("design_driven")
+            and isinstance(item.get("id"), str)}
+
+
+def validate_experiment_design(value):
+    """Validate one bounded declarative experiment design."""
+    required = {"family", "data_process", "estimators", "primary", "baseline", "seed"}
+    if not isinstance(value, dict) or set(value) - (required | DESIGN_OPTIONAL_FIELDS) \
+            or not required.issubset(value):
+        raise ValidationError(
+            f"experiment_design requires {sorted(required)} and permits {sorted(DESIGN_OPTIONAL_FIELDS)}")
+    if value["family"] != EXPERIMENT_DESIGN_FAMILY:
+        raise ValidationError("experiment_design family is unsupported")
+    process = value["data_process"]
+    kind = process.get("kind") if isinstance(process, dict) else None
+    if kind not in DESIGN_PROCESSES or set(process) != DESIGN_PROCESS_FIELDS[kind]:
+        raise ValidationError("experiment_design data_process is unsupported or incomplete")
+    if type(process["sample_size"]) is not int or not 8 <= process["sample_size"] <= 20000:
+        raise ValidationError("experiment_design sample_size must be an integer between 8 and 20000")
+    if kind == "gaussian_contamination":
+        if not 0.0 <= float(process["contamination_rate"]) <= 0.9:
+            raise ValidationError("experiment_design contamination_rate must be within [0, 0.9]")
+        if not 0.5 <= float(process["contamination_scale"]) <= 1e6:
+            raise ValidationError("experiment_design contamination_scale must be within [0.5, 1e6]")
+    if kind == "student_t" and not 1.0 < float(process["df"]) <= 200.0:
+        raise ValidationError("experiment_design student_t df must be within (1, 200]")
+    if kind == "lognormal_shifted":
+        if not 0.05 <= float(process["sigma"]) <= 5.0:
+            raise ValidationError("experiment_design lognormal sigma must be within [0.05, 5.0]")
+        float(process["mu"])
+    estimators = value["estimators"]
+    if (not isinstance(estimators, list) or not 2 <= len(estimators) <= len(DESIGN_ESTIMATORS)
+            or len(set(estimators)) != len(estimators)
+            or any(item not in DESIGN_ESTIMATORS for item in estimators)):
+        raise ValidationError("experiment_design estimators must be a unique supported list")
+    for key in ("primary", "baseline"):
+        if value[key] not in estimators:
+            raise ValidationError(f"experiment_design {key} must name one of the selected estimators")
+    if value["primary"] == value["baseline"]:
+        raise ValidationError("experiment_design primary and baseline must differ")
+    if type(value["seed"]) is not int or value["seed"] < 0:
+        raise ValidationError("experiment_design seed must be a non-negative integer")
+    if "median_of_means" in estimators:
+        block = value.get("block_size")
+        if type(block) is not int or not 2 <= block <= int(process["sample_size"]):
+            raise ValidationError("experiment_design block_size must be in [2, sample_size] for median_of_means")
+    if {"trimmed_mean", "winsorized_mean"} & set(estimators):
+        fraction = value.get("trim_fraction")
+        if not isinstance(fraction, (int, float)) or not 0.0 <= float(fraction) < 0.5:
+            raise ValidationError("experiment_design trim_fraction must be within [0, 0.5)")
+    canonical_bytes(value)
+    return deepcopy(value)
 MATURITY_DIMENSIONS = (
     "question_specificity", "mechanism_depth", "comparison_design",
     "contribution_potential", "falsifiability",
@@ -135,7 +207,8 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
                            experiment_capability_ids=None,
                            require_capability_coverage=False,
                            excluded_capability_ids=None,
-                           excluded_topic_ids=None, topic_history=None):
+                           excluded_topic_ids=None, topic_history=None,
+                           design_driven_capability_ids=None):
     """Validate a complete topic proposal before it enters the survey stage."""
     fields = {"schema_version", "objective", "candidates", "selected_id", "selection_rationale"}
     if not isinstance(value, dict) or set(value) != fields:
@@ -151,12 +224,15 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
         raise ValidationError("topic discovery requires the configured number of candidates")
     ids = set()
     capability_ids = set(experiment_capability_ids or [])
+    design_driven = set(design_driven_capability_ids or [])
     excluded_capabilities = set(excluded_capability_ids or [])
     excluded_topics = set(excluded_topic_ids or [])
     for candidate in candidates:
+        shapes = (CANDIDATE_FIELDS, LEGACY_CANDIDATE_FIELDS,
+                  CATALOG_CANDIDATE_FIELDS, CATALOG_LEGACY_CANDIDATE_FIELDS)
         if (not isinstance(candidate, dict)
-                or set(candidate) not in (CANDIDATE_FIELDS, LEGACY_CANDIDATE_FIELDS,
-                                          CATALOG_CANDIDATE_FIELDS, CATALOG_LEGACY_CANDIDATE_FIELDS)):
+                or not any(set(candidate) in (shape, shape | {"experiment_design"})
+                           for shape in shapes)):
             raise ValidationError("topic candidate has an invalid shape")
         _identifier(candidate["id"], "topic candidate id")
         if candidate["id"] in ids:
@@ -173,6 +249,16 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
             if not isinstance(selected_capability, str) or selected_capability not in capability_ids:
                 raise ValidationError(
                     "topic candidate must select one configured experiment capability")
+            if "experiment_design" in candidate:
+                validate_experiment_design(candidate["experiment_design"])
+                if selected_capability not in design_driven:
+                    raise ValidationError(
+                        "topic candidate supplies an experiment_design for a capability that does not accept one")
+            elif selected_capability in design_driven:
+                raise ValidationError(
+                    "design-driven experiment capability requires an experiment_design for its candidate")
+        elif "experiment_design" in candidate:
+            raise ValidationError("topic candidate cannot supply an experiment_design without a capability catalog")
     if capability_ids and require_capability_coverage:
         observed = {candidate.get("experiment_capability_id") for candidate in candidates}
         required = min(len(capability_ids), len(candidates))
@@ -472,6 +558,26 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, runtime_cont
         if (runtime_context.get("topic_history") or {}).get("entries"):
             constraints.append(
                 "avoid repeating any previously attempted direction in topic_history; select a materially different question or capability")
+        design_driven = [item for item in catalog
+                         if isinstance(item, dict) and item.get("design_driven")]
+        if design_driven:
+            ids = sorted(item.get("id") for item in design_driven if isinstance(item.get("id"), str))
+            candidate_contract["experiment_design"] = (
+                "REQUIRED for any candidate whose experiment_capability_id is one of "
+                f"{ids}: a bounded declarative study design for the pinned design-driven engine "
+                "(family, data_process, estimators, primary, baseline, seed, and optional "
+                "trim_fraction/block_size). This is data the reviewed engine executes, never code.")
+            for item in design_driven:
+                template = item.get("design_template")
+                if isinstance(template, dict):
+                    candidate_contract[f"experiment_design_template[{item.get('id')}]"] = template
+            constraints.extend([
+                "for a design-driven capability, experiment_design must copy the family and data_process "
+                "shape from the supplied template and choose declared estimators/primary/baseline that "
+                "the capability actually supports",
+                "experiment_design must remain executable under the frozen engine: no new estimator names, "
+                "no new data-process kinds, and no field outside the declared schema",
+            ])
     if refinement_context:
         constraints.extend([
             "this is a topic refinement pass, not a cosmetic rewrite: use the parent topic and the supplied survey feedback as constraints",
@@ -695,7 +801,8 @@ class TopicDiscoveryRunner:
                     require_capability_coverage=bool(catalog_ids),
                     excluded_capability_ids=(runtime_context or {}).get("topic_exclusions", {}).get("capability_ids", []),
                     excluded_topic_ids=(runtime_context or {}).get("topic_exclusions", {}).get("topic_ids", []),
-                    topic_history=(runtime_context or {}).get("topic_history"))
+                    topic_history=(runtime_context or {}).get("topic_history"),
+                    design_driven_capability_ids=_design_driven_ids(runtime_context))
                 if runtime_context is not None:
                     feasibility = validate_topic_feasibility(package, runtime_context)
                     if feasibility["status"] == "legacy_unchecked":

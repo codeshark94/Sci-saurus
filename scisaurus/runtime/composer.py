@@ -921,6 +921,9 @@ class ComposerRunner:
                     if isinstance(asset, dict)
                 ],
                 "execution_adapter": (experiment.get("execution") or {}).get("adapter"),
+                "design_driven": bool((experiment.get("parameters") or {}).get("design_driven")),
+                "design_template": (
+                    (experiment.get("execution") or {}).get("input") or {}).get("design"),
             })
         experiment_stages = [stage for stage in self.workflow["stages"] if stage["kind"] == "experiment"]
         if experiment_stages and not catalog:
@@ -1672,6 +1675,29 @@ class ComposerRunner:
         # belongs to this mission and is supplied by Composer bindings below.
         selected_experiment["literature_gate"] = deepcopy(current.get("literature_gate"))
         selected_experiment["revision"] = int(current.get("revision", selected_experiment.get("revision", 1)))
+        # A design-driven capability executes a bounded declarative design that
+        # the topic stage proposed.  The program, estimators and data-process
+        # families stay pinned; only the declared design and the scientific
+        # identity of this mission are projected in.
+        design_driven = bool((selected_experiment.get("parameters") or {}).get("design_driven"))
+        design = selected.get("experiment_design")
+        if design_driven:
+            from scisaurus.runtime.topic_discovery import validate_experiment_design
+            if not isinstance(design, dict):
+                raise ValidationError(
+                    "design-driven experiment capability requires a proposed experiment_design")
+            design = validate_experiment_design(design)
+            selected_experiment.setdefault("execution", {}).setdefault("input", {})["design"] = design
+            parameters = dict(selected_experiment.get("parameters") or {})
+            parameters["default_design"] = deepcopy(design)
+            selected_experiment["parameters"] = parameters
+            selected_experiment["seed"] = int(design["seed"])
+            for key in ("domain", "research_question"):
+                value = selected.get(key)
+                if isinstance(value, str) and value.strip():
+                    selected_experiment[key] = value.strip()
+        elif isinstance(design, dict):
+            raise ValidationError("fixed experiment capability cannot accept a proposed experiment_design")
         config["experiment"] = selected_experiment
         config["project_id"] = str(Path(stage["project_dir"]).resolve())
         for branch in ("execution", "validation"):
