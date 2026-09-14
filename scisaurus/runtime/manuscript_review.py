@@ -33,7 +33,7 @@ DECISIONS = {"accept", "revise", "insufficient_evidence"}
 OUTCOMES = {"passed", "failed", "insufficient_evidence"}
 SEVERITIES = {"blocking", "major", "minor"}
 RESEARCH_REQUEST_KINDS = {
-    "additional_experiment", "literature_expansion", "interpretation_expansion", "analysis_repair",
+    "topic_refinement", "additional_experiment", "literature_expansion", "interpretation_expansion", "analysis_repair",
 }
 DEFAULT_REVIEWERS = (
     {"id": "science", "stage": 1,
@@ -707,7 +707,7 @@ def _review_prompt(manuscript, reviewer, interpretation=None, argument=None, evi
                   "decision": "accept|revise|insufficient_evidence",
                   "checks": "list of {id,outcome,evidence}; outcome=passed|failed|insufficient_evidence",
                   "findings": "list of {id,severity,location,problem,surgical_fix,protected,verification}; severity MUST be one of blocking, major, or minor; protected MUST be a unique JSON array of plain strings naming unit IDs or protected facts",
-                  "research_requests": "list of {id,kind,owner,objective,why,success_condition,evidence_needed}; use for additional_experiment, literature_expansion, interpretation_expansion, or analysis_repair that cannot be satisfied by editing the manuscript",
+                  "research_requests": "list of {id,kind,owner,objective,why,success_condition,evidence_needed}; use for topic_refinement, additional_experiment, literature_expansion, interpretation_expansion, or analysis_repair that cannot be satisfied by editing the manuscript",
                   "protected_units": "unique JSON array of plain strings naming reader-facing units or facts that must remain unchanged",
                   "rationale": "concise evidence-bound rationale; for human_scientist and editorial_compression explicitly address the assigned scientific/editorial questions",
                   "size_limit": "Return at most four highest-impact findings. Keep each problem, surgical_fix, and verification to one or two sentences.",

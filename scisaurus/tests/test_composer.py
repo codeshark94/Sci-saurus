@@ -232,6 +232,86 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertTrue(all(item.get("retry_mode") == "until_deadline"
                                 for item in result["feedback"] if item["action"] == "retry_stage"))
 
+    def test_until_deadline_dispatches_a_residual_stage_window(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            workflow["stages"][1]["estimate_seconds"] = 20
+            workflow["retry_policy"] = {
+                "mode": "until_deadline", "backoff_seconds": 0,
+            }
+            runner = ComposerRunner(workflow)
+            calls = []
+
+            def residual_stage(stage, **kwargs):
+                calls.append(stage["id"])
+                if stage["id"] == "survey":
+                    # Leave less time than the experiment forecast while
+                    # retaining a safe control-plane dispatch margin.
+                    runner.deadline = runner.clock() + 1.5
+                    runner.deadline_epoch = time.time() + 1.5
+                output = root / f"{stage['id']}-residual.json"
+                output.write_text(json.dumps({"stage": stage["id"]}))
+                return {"status": "completed", "output_path": str(output),
+                        "project_dir": stage["project_dir"], "stage_id": stage["id"]}
+
+            runner._run_stage = residual_stage
+            result = runner.run()
+            self.assertEqual(calls, ["survey", "experiment"])
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["deadline_decisions"][0]["admission"], "residual_window")
+
+    def test_stage_return_after_hard_wall_cannot_be_reported_as_completed(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+
+            def late_stage(stage, **kwargs):
+                output = root / f"{stage['id']}-late.json"
+                output.write_text(json.dumps({"stage": stage["id"]}))
+                if stage["id"] == "experiment":
+                    runner.deadline = runner.clock() - 1
+                    runner.deadline_epoch = time.time() - 1
+                return {"status": "completed", "output_path": str(output),
+                        "project_dir": stage["project_dir"], "stage_id": stage["id"]}
+
+            runner._run_stage = late_stage
+            result = runner.run()
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["interim_report"]["stop_reason"], "hard_deadline")
+            self.assertTrue(any("deadline" in item.get("reason", "")
+                                for item in result["blockers"]))
+
+    def test_bounded_mode_pauses_when_the_required_stage_window_does_not_fit(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            workflow["stages"][1]["estimate_seconds"] = 20
+            workflow["retry_policy"] = {
+                "mode": "bounded", "max_attempts": 1, "backoff_seconds": 0,
+            }
+            runner = ComposerRunner(workflow)
+            calls = []
+
+            def strict_stage(stage, **kwargs):
+                calls.append(stage["id"])
+                if stage["id"] == "survey":
+                    runner.deadline = runner.clock() + 1.5
+                    runner.deadline_epoch = time.time() + 1.5
+                output = root / f"{stage['id']}-strict.json"
+                output.write_text(json.dumps({"stage": stage["id"]}))
+                return {"status": "completed", "output_path": str(output),
+                        "project_dir": stage["project_dir"], "stage_id": stage["id"]}
+
+            runner._run_stage = strict_stage
+            result = runner.run()
+            self.assertEqual(calls, ["survey"])
+            self.assertEqual(result["status"], "paused")
+            self.assertEqual(result["interim_report"]["stop_reason"],
+                             "required_stage_window_does_not_fit_remaining_deadline")
+            self.assertEqual(result["deadline_decisions"][0]["admission"], "deferred")
+
     def test_ten_hour_composer_hard_wall_is_valid(self):
         with tempfile.TemporaryDirectory() as path:
             workflow = self._workflow(Path(path))
@@ -343,6 +423,117 @@ class ComposerWorkflowTests(unittest.TestCase):
         })
         self.assertEqual(queries[0], '"median of means"')
         self.assertEqual(len(queries), 3)
+
+    def test_free_topic_literature_hold_requests_question_refinement(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery", "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(topic_dir.resolve()), "depends_on": [], "estimate_seconds": 1,
+                "bindings": [], "deadline_seconds": 10, "reuse_completed": False,
+                "reuse_output_path": None,
+            })
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            runner = ComposerRunner(workflow)
+            runner.context["topic"] = {
+                "kind": "topic_discovery",
+                "topic": {"id": "direction_a", "title": "A direction",
+                          "domain": "science",
+                          "research_question": "Does mechanism A change the measured outcome?"},
+            }
+            gated = runner._gate_free_topic_survey({
+                "status": "completed", "gap_state": "insufficient_evidence",
+                "survey_ref": "survey-ref", "assessment_ref": "assessment-ref",
+            })
+            self.assertEqual(gated["status"], "research_expansion_required")
+            self.assertEqual({item["kind"] for item in gated["research_expansion_requests"]},
+                             {"literature_expansion"})
+            self.assertEqual(gated["topic_admission"], "expand_literature_before_refine")
+            # A second insufficient assessment after the scoped expansion is
+            # the point at which the question is sent back for redesign.
+            runner.context["survey"] = gated
+            refined_hold = runner._gate_free_topic_survey({
+                "status": "completed", "gap_state": "insufficient_evidence",
+                "survey_ref": "survey-ref-2", "assessment_ref": "assessment-ref-2",
+            })
+            self.assertEqual({item["kind"] for item in refined_hold["research_expansion_requests"]},
+                             {"literature_expansion", "topic_refinement"})
+            self.assertEqual(refined_hold["topic_admission"], "refine_before_experiment")
+            runner.active_research_requests = [
+                {**item, "source_stage_id": "survey"}
+                for item in refined_hold["research_expansion_requests"]
+            ]
+            runner.continuation_cycles = 1
+            runner.reopened_stage_ids = {"topic", "survey"}
+            context = runner._topic_refinement_context(workflow["stages"][0])
+            self.assertEqual(context["parent_topic_id"], "direction_a")
+            self.assertEqual(context["mode"], "refinement")
+            self.assertIn("topic", runner._continuation_targets(
+                runner.active_research_requests, {"topic": workflow["stages"][0],
+                                                  "survey": workflow["stages"][1],
+                                                  "experiment": workflow["stages"][2]}))
+            runner.close()
+
+    def test_identical_continuation_request_cannot_hot_loop_until_deadline(self):
+        """A repeated survey hold must stop after its new work order is attempted."""
+        class FastClock:
+            def __init__(self):
+                self.value = 0.0
+
+            def __call__(self):
+                self.value += 0.05
+                return self.value
+
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 5,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            for stage in workflow["stages"]:
+                stage["deadline_seconds"] = 5
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            workflow["time_policy"] = {
+                "first_result_seconds": 1, "target_seconds": 2,
+                "hard_seconds": 5, "checkpoint_seconds": 1,
+            }
+            workflow["retry_policy"] = {"mode": "until_deadline", "backoff_seconds": 0}
+            runner = ComposerRunner(workflow, clock=FastClock())
+            calls = []
+
+            def staged(stage, **kwargs):
+                calls.append(stage["id"])
+                result = {
+                    "status": "completed",
+                    "output_path": str(Path(stage["project_dir"]) / "result.json"),
+                    "project_dir": stage["project_dir"], "stage_id": stage["id"],
+                }
+                if stage["id"] == "topic":
+                    result["topic"] = {
+                        "id": "direction_x", "title": "Direction X",
+                        "domain": "science", "research_question": "Does X change Y?",
+                    }
+                elif stage["id"] == "survey":
+                    result.update({"gap_state": "insufficient_evidence"})
+                    result = runner._gate_free_topic_survey(result, stage=stage)
+                return result
+
+            runner._run_stage = staged
+            result = runner.run()
+            self.assertEqual(result["status"], "research_expansion_required")
+            self.assertEqual(result["continuation_cycles"], 2)
+            self.assertEqual(calls, ["topic", "survey", "survey", "topic", "survey"])
+            self.assertFalse(result["blockers"])
+            runner.close()
 
     def test_free_topic_selection_switches_between_pinned_experiment_capabilities(self):
         with tempfile.TemporaryDirectory() as path:

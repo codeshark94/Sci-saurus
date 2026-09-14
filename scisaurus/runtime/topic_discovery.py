@@ -1,10 +1,11 @@
 """Bounded, model-assisted topic discovery for a free-topic Composer run.
 
 Topic selection is an intake operation, not a novelty claim.  The stage turns a
-broad Principal objective into several testable research questions, chooses one
-with an explicit rationale, and hands only the selected question and search
-seeds to the literature stage.  The survey, counter-search, experiment, and
-review gates remain the authorities for evidence and release.
+broad Principal objective into several testable research questions, screens the
+selected direction for research maturity, and can regenerate it when the
+question is too thin.  It hands only the selected question and search seeds to
+the literature stage.  The survey, counter-search, experiment, and review
+gates remain the authorities for evidence and release.
 """
 
 from __future__ import annotations
@@ -41,6 +42,19 @@ CATALOG_CANDIDATE_FIELDS = CANDIDATE_FIELDS | {"experiment_capability_id"}
 CATALOG_LEGACY_CANDIDATE_FIELDS = LEGACY_CANDIDATE_FIELDS | {"experiment_capability_id"}
 CAPABILITY_FIELDS = {"executables", "python_packages", "stage_kinds"}
 KNOWN_STAGE_KINDS = {"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"}
+MATURITY_DIMENSIONS = (
+    "question_specificity", "mechanism_depth", "comparison_design",
+    "contribution_potential", "falsifiability",
+)
+REFINEMENT_DIMENSIONS = (
+    "mechanism", "data_regime", "comparison", "measurement", "theory",
+)
+MATURITY_REVIEW_FIELDS = {
+    "decision", "selected_id", "scores", "rationale", "required_changes",
+    "changed_dimensions",
+}
+MATURITY_MIN_TOTAL = 15
+MATURITY_MIN_DIMENSION = 2
 
 _TOPIC_STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "can", "does", "do", "for", "from",
@@ -91,7 +105,7 @@ def _validate_capability_requirements(value, name="capability_requirements"):
 def validate_topic_stage_config(value):
     """Validate the descriptor consumed by the Composer topic stage."""
     fields = {"schema_version", "model_config_path", "output_path", "candidate_count", "max_attempts"}
-    allowed = fields | {"repair_mode"}
+    allowed = fields | {"repair_mode", "maturity_review_rounds"}
     if (not isinstance(value, dict) or set(value) - allowed
             or not fields.issubset(value)):
         raise ValidationError(f"topic discovery config requires {sorted(fields)} and permits repair_mode")
@@ -110,6 +124,9 @@ def validate_topic_stage_config(value):
     repair_mode = value.get("repair_mode", "bounded")
     if repair_mode not in {"bounded", "until_deadline"}:
         raise ValidationError("topic discovery repair_mode must be bounded or until_deadline")
+    maturity_rounds = value.get("maturity_review_rounds", 0)
+    if type(maturity_rounds) is not int or not 0 <= maturity_rounds <= 4:
+        raise ValidationError("topic discovery maturity_review_rounds must be between 0 and 4")
     canonical_bytes(value)
     return deepcopy(value)
 
@@ -319,6 +336,58 @@ def validate_topic_feasibility(package, runtime_context):
     return {"status": "feasible", "unavailable": [], "requirements": deepcopy(requirements)}
 
 
+def validate_topic_maturity_review(value, *, candidate_ids=None):
+    """Validate the independent pre-admission review of a topic portfolio.
+
+    The review is a quality screen, not a novelty verdict.  Its purpose is to
+    stop an executable but scientifically thin direction from entering the
+    survey or experiment unchanged.  A later literature assessment remains
+    authoritative about prior work and the existence of a defensible gap.
+    """
+    if not isinstance(value, dict) or set(value) != MATURITY_REVIEW_FIELDS:
+        raise ValidationError(
+            f"topic maturity review requires exactly {sorted(MATURITY_REVIEW_FIELDS)}")
+    if value["decision"] not in {"admit", "refine"}:
+        raise ValidationError("topic maturity review decision must be admit or refine")
+    _identifier(value["selected_id"], "topic maturity review selected_id")
+    if candidate_ids is not None and value["selected_id"] not in set(candidate_ids):
+        raise ValidationError("topic maturity review selected_id is not a candidate")
+    scores = value["scores"]
+    if (not isinstance(scores, dict) or set(scores) != set(MATURITY_DIMENSIONS)):
+        raise ValidationError(
+            f"topic maturity review scores require exactly {list(MATURITY_DIMENSIONS)}")
+    for dimension in MATURITY_DIMENSIONS:
+        score = scores[dimension]
+        if type(score) is not int or not 0 <= score <= 4:
+            raise ValidationError(f"topic maturity review {dimension} must be an integer from 0 to 4")
+    _text(value["rationale"], "topic maturity review rationale")
+    _strings(value["required_changes"], "topic maturity review required_changes", minimum=0, maximum=8)
+    changed = value["changed_dimensions"]
+    if (not isinstance(changed, list) or len(changed) != len(set(changed))
+            or any(item not in REFINEMENT_DIMENSIONS for item in changed)):
+        raise ValidationError("topic maturity review changed_dimensions is invalid")
+    if value["decision"] == "refine" and not value["required_changes"]:
+        raise ValidationError("topic maturity review refinement requires required_changes")
+    if value["decision"] == "admit" and value["required_changes"]:
+        raise ValidationError("admitted topic maturity review cannot retain required_changes")
+    canonical_bytes(value)
+    return deepcopy(value)
+
+
+def topic_maturity_admitted(review, *, minimum_total=MATURITY_MIN_TOTAL,
+                            minimum_dimension=MATURITY_MIN_DIMENSION):
+    """Return whether a validated review clears the generic research floor."""
+    validate_topic_maturity_review(review)
+    if type(minimum_total) is not int or not 0 <= minimum_total <= 20:
+        raise ValidationError("topic maturity minimum_total must be between 0 and 20")
+    if type(minimum_dimension) is not int or not 0 <= minimum_dimension <= 4:
+        raise ValidationError("topic maturity minimum_dimension must be between 0 and 4")
+    scores = review["scores"]
+    total = sum(scores.values())
+    return review["decision"] == "admit" and total >= minimum_total and all(
+        score >= minimum_dimension for score in scores.values())
+
+
 SYSTEM = (
     "You are the intake research strategist for a general-purpose scientific organization. "
     "Use the supplied recent scholarly records as prompts, then turn a broad objective into several "
@@ -335,6 +404,13 @@ SYSTEM = (
     "and align its phenomenon, comparison, data boundary, method, and primary outcomes with that capability. "
     "When runtime_context includes an experiment_contract, the selected candidate must be directly executable "
     "under that contract rather than silently proposing a different study. "
+    "An executable question is only a starting point for a journal-oriented mission: give it a meaningful "
+    "mechanism or boundary to discriminate, a comparison that can change the interpretation, and a result "
+    "that could distinguish competing explanations. A single fixed parameter point or a two-method toy "
+    "comparison must be treated as provisional unless it tests a nontrivial mechanism, a sensitivity frontier, "
+    "or a theory-versus-observation discrepancy. "
+    "When a refinement_context is supplied, preserve the useful parent idea but materially change at least "
+    "one of mechanism, data regime, comparison, measurement, or theoretical target in response to the evidence. "
     "Keep scope explicit, include a way the idea could be disproved, and select one candidate only after "
     "comparing the alternatives. Use reader-facing scientific language; do not mention workflow state, "
     "artifacts, validators, hashes, acceptance, or internal control terms. Return JSON only. "
@@ -344,7 +420,8 @@ SYSTEM = (
 )
 
 
-def topic_prompt(objective, candidate_count, *, recent_papers=None, runtime_context=None):
+def topic_prompt(objective, candidate_count, *, recent_papers=None, runtime_context=None,
+                 refinement_context=None):
     runtime_context = runtime_context or {}
     candidate_contract = {
         "id": "lowercase identifier",
@@ -395,6 +472,13 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, runtime_cont
         if (runtime_context.get("topic_history") or {}).get("entries"):
             constraints.append(
                 "avoid repeating any previously attempted direction in topic_history; select a materially different question or capability")
+    if refinement_context:
+        constraints.extend([
+            "this is a topic refinement pass, not a cosmetic rewrite: use the parent topic and the supplied survey feedback as constraints",
+            "change at least one substantive dimension (mechanism, data_regime, comparison, measurement, or theory) and explain that change in why_promising",
+            "do not select a direction that the supplied evidence already refutes; if the parent is refuted, pivot to a discriminating unresolved question",
+            "treat the supplied survey evidence and source spans as the reason for the redesign; do not invent a gap that is absent from them",
+        ])
     elif runtime_context.get("experiment_contract"):
         constraints.append(
             "the selected candidate must be directly executable under experiment_contract without changing the declared experiment")
@@ -404,6 +488,7 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, runtime_cont
         "candidate_count": candidate_count,
         "recent_papers": recent_papers or [],
         "runtime_context": runtime_context,
+        "refinement_context": refinement_context or {},
         "output_contract": {
             "schema_version": SCHEMA_VERSION,
             "objective": "copy principal_objective exactly",
@@ -434,6 +519,44 @@ def _capability_coverage_plan(runtime_context, candidate_count, seed):
     return [ids[index % len(ids)] for index in range(candidate_count)]
 
 
+MATURITY_SYSTEM = (
+    "You are an independent scientific-program reviewer at the intake boundary. "
+    "Assess whether the selected direction is developed enough to justify a serious literature survey "
+    "and a journal-oriented experiment. Do not decide novelty or claim that a gap exists; the literature "
+    "stage must establish those points. Score the selected question on five dimensions from 0 to 4: "
+    "question specificity, mechanism or explanatory depth, comparison design, contribution potential, "
+    "and falsifiability. An executable but single-point descriptive simulation should usually be refined "
+    "unless it tests a nontrivial mechanism, a sensitivity frontier, or a theory-versus-observation discrepancy. "
+    "Admit only when the question has a concrete phenomenon, a meaningful competing explanation or boundary, "
+    "a result that would change the interpretation, and a credible disconfirmation route. If it is thin, "
+    "name the smallest substantive changes needed and identify which dimensions must change. Return JSON only."
+)
+
+
+def _maturity_review_prompt(objective, package, *, refinement_context=None):
+    return json.dumps({
+        "assignment": "topic_maturity_review",
+        "principal_objective": objective,
+        "topic_package": package,
+        "refinement_context": refinement_context or {},
+        "dimensions": list(MATURITY_DIMENSIONS),
+        "score_scale": "integer 0 through 4",
+        "output_contract": {
+            "decision": "admit or refine",
+            "selected_id": "candidate id under review",
+            "scores": {dimension: "integer 0 through 4" for dimension in MATURITY_DIMENSIONS},
+            "rationale": "reader-facing scientific rationale",
+            "required_changes": "empty for admit; one to eight substantive changes for refine",
+            "changed_dimensions": f"unique subset of {list(REFINEMENT_DIMENSIONS)}",
+        },
+        "admission_rule": {
+            "minimum_total": MATURITY_MIN_TOTAL,
+            "minimum_each_dimension": MATURITY_MIN_DIMENSION,
+            "do_not_reward_feasibility_alone": True,
+        },
+    }, ensure_ascii=False, sort_keys=True)
+
+
 class TopicDiscoveryRunner:
     """Generate one bounded, validated free-topic proposal."""
 
@@ -445,9 +568,27 @@ class TopicDiscoveryRunner:
             raise ValidationError("topic discovery deadline must be finite and positive")
         self.deadline_seconds = float(deadline_seconds) if deadline_seconds is not None else None
 
+    def _client(self, role, *, seed=None, deadline=None):
+        config = resolve_model_config(
+            self.model_config, role=role,
+            overrides=({"seed": seed} if seed is not None else None),
+        )
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.2:
+                raise ValidationError("topic discovery deadline exceeded")
+            timeout_seconds = config.get("timeout_seconds")
+            if (type(timeout_seconds) not in (int, float)
+                    or not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
+                raise ValidationError(
+                    "topic discovery model config requires a finite positive timeout_seconds")
+            config["timeout_seconds"] = min(float(timeout_seconds), remaining)
+        return ModelClient(**config)
+
     def run(self, objective, *, candidate_count=4, max_attempts=3,
             repair_mode="bounded", recent_papers=None, runtime_context=None,
-            bibliography=None, sampling_seed=None):
+            bibliography=None, sampling_seed=None, maturity_review_rounds=0,
+            refinement_context=None):
         _text(objective, "topic objective", public=False)
         if type(candidate_count) is not int or not 3 <= candidate_count <= 8:
             raise ValidationError("topic discovery candidate_count must be between 3 and 8")
@@ -457,6 +598,10 @@ class TopicDiscoveryRunner:
             raise ValidationError("topic discovery until_deadline mode requires a stage deadline")
         if type(max_attempts) is not int or not 1 <= max_attempts <= 8:
             raise ValidationError("topic discovery max_attempts must be between 1 and 8")
+        if type(maturity_review_rounds) is not int or not 0 <= maturity_review_rounds <= 4:
+            raise ValidationError("topic discovery maturity_review_rounds must be between 0 and 4")
+        if refinement_context is not None and not isinstance(refinement_context, dict):
+            raise ValidationError("topic discovery refinement_context must be an object when supplied")
         deadline = time.monotonic() + self.deadline_seconds if self.deadline_seconds is not None else None
         recent_papers = list(recent_papers or [])
         sampling_trace = []
@@ -465,6 +610,11 @@ class TopicDiscoveryRunner:
                 objective, bibliography=bibliography, deadline=deadline, sampling_seed=sampling_seed)
         previous = None
         last_error = None
+        refinement_feedback = None
+        refinement_parent = None
+        refinement_round = 0
+        maturity_reviews = []
+        maturity_review_history = []
         usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
         attempts = itertools.count() if repair_mode == "until_deadline" else range(max_attempts)
         catalog_ids = {
@@ -473,22 +623,36 @@ class TopicDiscoveryRunner:
         }
         for attempt in attempts:
             generation_seed = (sampling_seed + attempt) % MAX_PROVIDER_SEED if sampling_seed is not None else None
-            config = resolve_model_config(
-                self.model_config, role="topic_discovery",
-                overrides=({"seed": generation_seed} if generation_seed is not None else None),
-            )
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.2:
-                    raise ValidationError("topic discovery deadline exceeded")
-                timeout_seconds = config.get("timeout_seconds")
-                if type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-                    raise ValidationError("topic discovery model config requires a finite positive timeout_seconds")
-                config["timeout_seconds"] = min(float(timeout_seconds), remaining)
-            client = ModelClient(**config)
-            prompt = topic_prompt(objective, candidate_count,
-                                  recent_papers=recent_papers,
-                                  runtime_context=runtime_context)
+            client = self._client("topic_discovery", seed=generation_seed, deadline=deadline)
+            if refinement_feedback is not None:
+                prompt = json.dumps({
+                    "assignment": "refine_topic_discovery",
+                    "principal_objective": objective,
+                    "candidate_count": candidate_count,
+                    "recent_papers": recent_papers,
+                    "runtime_context": runtime_context or {},
+                    "refinement_context": refinement_context or {},
+                    "parent_topic": refinement_parent,
+                    "maturity_review": refinement_feedback,
+                    "required_capability_ids": sorted(catalog_ids),
+                    "excluded_capability_ids": sorted((runtime_context or {}).get("topic_exclusions", {}).get("capability_ids", [])),
+                    "excluded_topic_ids": sorted((runtime_context or {}).get("topic_exclusions", {}).get("topic_ids", [])),
+                    "topic_history": (runtime_context or {}).get("topic_history", {}),
+                    "capability_coverage_requirement": (
+                        f"Use at least {min(len(catalog_ids), candidate_count)} distinct capability IDs "
+                        "across the candidates; preserve every listed ID when candidate_count allows."
+                        if catalog_ids else None),
+                    "instruction": (
+                        "Return a complete package satisfying the exact topic contract. Preserve useful evidence "
+                        "from the parent, but make a substantive change in at least one of mechanism, data regime, "
+                        "comparison, measurement, or theory. The selected direction must not be a cosmetic rewrite."
+                    ),
+                }, ensure_ascii=False, sort_keys=True)
+            else:
+                prompt = topic_prompt(objective, candidate_count,
+                                      recent_papers=recent_papers,
+                                      runtime_context=runtime_context,
+                                      refinement_context=refinement_context)
             if catalog_ids:
                 payload = json.loads(prompt)
                 payload["capability_coverage_plan"] = _capability_coverage_plan(
@@ -497,7 +661,7 @@ class TopicDiscoveryRunner:
                     f"Use at least {min(len(catalog_ids), candidate_count)} distinct capability IDs "
                     "across the candidate list; preserve every listed ID when candidate_count allows.")
                 prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-            if previous is not None:
+            if previous is not None and refinement_feedback is None:
                 prompt = json.dumps({
                     "assignment": "repair_invalid_topic_discovery",
                     "principal_objective": objective,
@@ -542,7 +706,91 @@ class TopicDiscoveryRunner:
                 continue
             selected = next(item for item in package["candidates"] if item["id"] == package["selected_id"])
             feasibility = validate_topic_feasibility(package, runtime_context)
-            return {
+            if maturity_review_rounds:
+                review_seed = ((generation_seed if generation_seed is not None else 0)
+                               + 104729 * (attempt + 1)) % MAX_PROVIDER_SEED
+                reviewer = self._client(
+                    "research.topic-maturity-reviewer", seed=review_seed, deadline=deadline)
+                review_result = reviewer.complete(
+                    system=MATURITY_SYSTEM,
+                    prompt=_maturity_review_prompt(
+                        objective, package, refinement_context=refinement_context),
+                )
+                usage["model_calls"] += 1
+                for key in ("input_tokens", "output_tokens"):
+                    usage[key] += review_result.usage.get(key, 0)
+                if review_result.finish_reason != "stop":
+                    last_error = ValidationError(
+                        f"topic maturity review did not finish normally: {review_result.finish_reason}")
+                    continue
+                try:
+                    review = review_result.json_object()
+                    validate_topic_maturity_review(
+                        review, candidate_ids=[item["id"] for item in package["candidates"]])
+                    if review["selected_id"] != package["selected_id"]:
+                        raise ValidationError(
+                            "topic maturity review must assess the package's selected_id")
+                except ValidationError as exc:
+                    last_error = exc
+                    continue
+                maturity_review_history.append({
+                    "attempt": attempt,
+                    "selected_id": package["selected_id"],
+                    "topic_title": selected["title"],
+                    "topic_research_question": selected["research_question"],
+                    "review": deepcopy(review),
+                })
+                maturity_reviews.append(review)
+                if topic_maturity_admitted(review):
+                    evolution_dimensions = sorted({dimension
+                                                   for item in maturity_reviews
+                                                   for dimension in item.get("changed_dimensions", [])})
+                    output = {
+                        **package,
+                        "status": "completed",
+                        "topic": selected,
+                        "question": selected["research_question"],
+                        "search_queries": selected["search_queries"],
+                        "proposed_gap": selected["why_promising"],
+                        "feasibility_check": feasibility,
+                        "recent_papers": recent_papers,
+                        "sampling_seed": sampling_seed,
+                        "generation_seed": generation_seed,
+                            "sampling_trace": sampling_trace,
+                            "maturity_reviews": deepcopy(maturity_reviews),
+                            "maturity_review_history": deepcopy(maturity_review_history),
+                            "maturity_score": sum(review["scores"].values()),
+                        "usage": usage,
+                    }
+                    if refinement_context:
+                        output["topic_evolution"] = {
+                            "mode": "refinement",
+                            "cycle": refinement_context.get("cycle"),
+                            "parent_topic_id": refinement_context.get("parent_topic_id"),
+                            "changed_dimensions": evolution_dimensions or refinement_context.get("changed_dimensions", []),
+                            "reason": refinement_context.get("reason"),
+                        }
+                    return output
+                if refinement_round >= maturity_review_rounds:
+                    last_error = ValidationError(
+                        "topic maturity review requires substantive refinement: "
+                        + review["rationale"])
+                    # A portfolio that remains thin after its allowed
+                    # refinement passes is abandoned as a whole.  The next
+                    # attempt starts a fresh exploration seed rather than
+                    # polishing the same weak direction until the deadline.
+                    refinement_feedback = None
+                    refinement_parent = None
+                    refinement_round = 0
+                    maturity_reviews = []
+                    previous = None
+                    continue
+                refinement_round += 1
+                refinement_feedback = review
+                refinement_parent = deepcopy(selected)
+                previous = None
+                continue
+            output = {
                 **package,
                 "status": "completed",
                 "topic": selected,
@@ -556,6 +804,15 @@ class TopicDiscoveryRunner:
                 "sampling_trace": sampling_trace,
                 "usage": usage,
             }
+            if refinement_context:
+                output["topic_evolution"] = {
+                    "mode": "refinement",
+                    "cycle": refinement_context.get("cycle"),
+                    "parent_topic_id": refinement_context.get("parent_topic_id"),
+                    "changed_dimensions": refinement_context.get("changed_dimensions", []),
+                    "reason": refinement_context.get("reason"),
+                }
+            return output
         raise last_error or ValidationError("topic discovery did not produce a valid package")
 
     @staticmethod

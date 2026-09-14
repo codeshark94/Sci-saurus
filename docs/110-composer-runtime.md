@@ -61,7 +61,9 @@ missing dependencies block admission rather than silently falling back.
 
 The minimal stage descriptor is shown in
 [`config/topic-discovery.example.json`](../config/topic-discovery.example.json);
-replace its two absolute paths before workflow validation.
+replace its two absolute paths before workflow validation. The optional
+`maturity_review_rounds` field gives the intake an independent scientific-depth
+screen; journal-oriented topic→survey missions default to two rounds when it is omitted.
 
 For a free-topic mission, `topic_discovery` runs before the survey. It queries
 OpenAlex with objective-derived and broad recent-literature searches, filters to
@@ -77,7 +79,13 @@ executables, configured stage kinds, project inputs, and model protocol). The
 selected question also declares structured executable, Python-package, and
 stage-kind requirements; Composer rejects the selection when any required
 capability is absent. The question and search strings can be bound into the
-survey; metadata is never treated as evidence or a novelty claim. A topic stage
+survey; metadata is never treated as evidence or a novelty claim. Before
+admission, the selected direction is independently scored for specificity,
+explanatory depth, comparison design, contribution potential, and
+falsifiability. A low-scoring direction is regenerated with a substantive
+change instead of being polished as a paper. The accepted topic artifact keeps
+the accepted review chain and a separate history of rejected or refined
+directions, so a later selection cannot inherit a misleading aggregate score. A topic stage
 with `reuse_completed: true` is an explicit replay of the pinned output and does
 not perform new topic generation; set it to `false` for a fresh exploration. If the
 scholarly provider fails, topic admission fails rather than fabricating a topic.
@@ -94,6 +102,17 @@ initial retrieval, Composer divides the work budget across the seed and blind
 search families and adds a compact exact-concept query when the topic exposes a
 distinctive phrase, so one high-recall query cannot starve independent search
 families.
+
+The first selection is provisional. When the literature assessment is
+`insufficient_evidence`, Composer first gives the survey a scoped expansion
+pass. If the expanded evidence still cannot support the question, or if the
+assessment is `refuted_by_prior_work`, Composer holds the experiment, creates a
+scoped topic-refinement work order, and reopens the topic→survey closure. The
+next intake receives the parent question, the assessment, and the requested
+scientific change; its lineage is retained in the topic history. A refinement
+must change a substantive dimension such as mechanism, data regime, comparison,
+measurement, or theory, so the loop cannot spend the remaining deadline
+rephrasing the same question.
 
 A free-topic family also has an append-only topic history. Set
 `topic_history_path` to share that history across fresh Composer project
@@ -279,7 +298,11 @@ order to the methods context; paper continuations synchronize the reference
 set to the newly accepted survey. Downstream interpretation, argument, and
 review consumers rerun. Earlier attempts, manifests, references, and review
 decisions remain intact. The hard wall remains the termination condition for
-retry and continuation work.
+retry and continuation work. If a hold returns the identical work order after
+its owning stage has already been attempted in the current invocation, the
+Composer fences that request and returns the hold instead of reopening a hot
+loop; an explicit resume starts a fresh attempt and may retry the unresolved
+request.
 
 Interpretation and composition stages receive the same scoped requests in a
 fresh evidence packet as `scientific_follow_up`: each objective, rationale,
@@ -305,10 +328,13 @@ python3 -m scisaurus.cli composer-interim-report /path/to/composer-project
 `retry_policy` supplies a backoff and may use `mode: until_deadline` for a
 long autonomous mission. In that mode a failed stage is retried in fresh
 isolated directories for as long as the stage and workflow deadlines admit;
-there is no arbitrary attempt-count stop. This deadline-governed mode is the
-default when no retry policy is declared. A small deterministic job that needs
-a finite retry budget must opt into `mode: bounded` explicitly; that mode
-retains the one-through-eight attempt contract.
+there is no arbitrary attempt-count stop. If a full downstream estimate no
+longer fits, the Composer still admits the next stage into the residual window
+until its small control-plane margin, and records any incomplete closure in the
+interim report. This deadline-governed mode is the default when no retry policy
+is declared. A small deterministic job that needs a finite retry budget must
+opt into `mode: bounded` explicitly; that mode retains the one-through-eight
+attempt contract and pauses before a required closure that cannot fit.
 `continuation_policy.mode: until_deadline` likewise keeps research-driven
 re-entry open by default; `mode: bounded` with `max_cycles` is available for
 small deterministic workflows. This is not a retry count. A retry never

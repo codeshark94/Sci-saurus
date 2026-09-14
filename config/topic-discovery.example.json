@@ -3,5 +3,6 @@
   "model_config_path": "/absolute/path/to/model-config.json",
   "output_path": "/absolute/path/to/topic-discovery.json",
   "candidate_count": 4,
-  "max_attempts": 3
+  "max_attempts": 3,
+  "maturity_review_rounds": 2
 }

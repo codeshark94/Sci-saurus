@@ -194,14 +194,18 @@ provenance state from leaking into the public manuscript.
 **D59 — Composer retries are isolated and deadline-governed.** A workflow may
 declare a `retry_policy` with a backoff. Its `mode: until_deadline` setting
 keeps retrying a failed stage in fresh attempt directories while the same hard
-deadline and downstream reservation remain in force; it has no arbitrary
-attempt-count stop. This deadline-governed mode is the default. A small
-deterministic job may opt into `mode: bounded` with a maximum of one to eight
-attempts. Every attempt, error, and retry decision is persisted, and a ten-hour mission is an explicit
-`hard_seconds: 36000` policy. When no retry policy is declared, Composer uses
-this deadline-governed mode by default; a small deterministic job may opt into
-`mode: bounded` explicitly. The hard wall, provider outcome, or a genuine
-control-plane failure remains the termination condition.
+deadline remains in force; it has no arbitrary attempt-count stop. When the
+full downstream forecast no longer fits, this autonomous mode may admit the
+next stage into the residual window until a small control-plane margin remains;
+the specialist's own deadline and acceptance contract still decide whether a
+useful result is produced, and an unfinished closure is never reported as a
+release. This deadline-governed mode is the default. A small deterministic job
+may opt into `mode: bounded` with a maximum of one to eight attempts; bounded
+jobs retain the full-closure reservation and pause when it cannot fit. Every
+attempt, error, retry decision, and residual-window admission is persisted, and
+a ten-hour mission is an explicit `hard_seconds: 36000` policy. The hard wall,
+provider outcome, or a genuine control-plane failure remains the termination
+condition.
 
 
 **D60 — Free-topic intake is sampled, recent, and capability-aware.** When a
@@ -230,7 +234,10 @@ Each cycle receives a fresh project namespace; survey capacity and routes are
 expanded when needed, newly accepted sources are synchronized into the paper
 reference set, and every downstream consumer is rerun. Prior attempts and
 artifacts remain immutable. The hard deadline remains the termination condition,
-so automatic research cannot become an infinite loop.
+so automatic research cannot become an infinite loop. An unchanged work order
+echoed after its owning stage has been attempted is fenced for that Composer
+invocation and leaves the hold visible; an explicit resume creates a fresh
+attempt and can retry the unresolved order.
 An unresolved research or review hold never satisfies a dependency while the
 current graph is being scheduled: the owning closure is reopened before any
 consumer can read that hold's packet, or the workflow returns the hold when no
@@ -256,6 +263,19 @@ most recently used executable capability when an alternative is available, and
 rejects exact or near-identical selected directions before literature work is
 admitted. This memory controls repeated execution only; it never substitutes
 for a scholarly novelty claim or the survey and review gates.
+
+**D64 — A selected topic is provisional until it survives maturation and
+evidence feedback.** Journal-oriented topic→survey missions independently
+score the question's specificity, explanatory depth, comparison design,
+contribution potential, and falsifiability before admitting it to the survey.
+A weak direction is regenerated with a substantive change. If the first survey
+is insufficient, the survey receives one scoped evidence-expansion pass before
+the question is redesigned; if the expanded evidence still cannot establish
+an experiment-worthy distinction, or prior work already answers the question,
+the Composer holds the downstream experiment, issues a typed topic-refinement
+work order, and reopens the topic→survey closure with the parent question and
+assessment attached. Every refinement records its lineage and changed
+scientific dimension; a cosmetic rewrite cannot satisfy the loop.
 
 ### 3.3 Effective interpretation of earlier rules
 
@@ -407,3 +427,4 @@ These defaults make the blueprint internally concrete; they do not falsely mark 
 | v1.4 | D60–D61; sampled capability-aware free-topic intake and deadline-governed Composer continuation for executable research requests |
 | v1.5 | D62; durable project department charters, inbox/work-order backlog, autonomous activation/resolution, and template-as-default organization runtime |
 | v1.6 | D63; append-only cross-run topic memory, capability rotation, and selected-direction novelty gate |
+| v1.7 | D64; topic-maturity admission, evidence-driven topic refinement, and lineage-preserving re-entry |

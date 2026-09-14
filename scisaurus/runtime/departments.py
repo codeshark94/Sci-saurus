@@ -24,7 +24,7 @@ WORK_ORDER_SCHEMA_VERSION = "department-work-order-1"
 _ID = re.compile(r"[a-z][a-z0-9_.-]{0,63}\Z")
 
 PROPOSAL_KINDS = frozenset({
-    "literature_expansion", "full_text_retrieval", "additional_experiment",
+    "topic_refinement", "literature_expansion", "full_text_retrieval", "additional_experiment",
     "analysis_display", "analysis_repair", "interpretation_expansion",
     "manuscript_revision", "capability_acquisition", "recovery",
 })
@@ -32,6 +32,7 @@ STAGE_KINDS = frozenset({
     "topic_discovery", "survey", "experiment", "interpretation", "argument", "paper",
 })
 TASK_KIND_BY_PROPOSAL = {
+    "topic_refinement": "production",
     "literature_expansion": "retrieval",
     "full_text_retrieval": "retrieval",
     "additional_experiment": "production",
@@ -43,6 +44,7 @@ TASK_KIND_BY_PROPOSAL = {
     "recovery": "response",
 }
 REQUEST_STAGE_KINDS = {
+    "topic_refinement": "topic_discovery",
     "literature_expansion": "survey",
     "full_text_retrieval": "survey",
     "additional_experiment": "experiment",
@@ -90,7 +92,7 @@ DEFAULT_DEPARTMENTS = [
         "chief": "chief",
         "adversary": "adversarial-reviewer",
         "subscriptions": ["research_expansion_required", "source_update", "contradiction", "provider_gap"],
-        "proposal_kinds": ["literature_expansion", "full_text_retrieval", "capability_acquisition", "recovery"],
+        "proposal_kinds": ["topic_refinement", "literature_expansion", "full_text_retrieval", "capability_acquisition", "recovery"],
         "stage_kinds": ["topic_discovery", "survey"],
         "capability_scope": ["scholarly_search", "source_fetch", "citation_graph", "mcp"],
     },

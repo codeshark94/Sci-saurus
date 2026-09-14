@@ -381,6 +381,13 @@ class ComposerRunner:
         self.active_research_requests = []
         self.department_activity = []
         self.deadline_extensions = []
+        self.deadline_decisions = []
+        # A hold can echo the same work order in every returned stage packet.
+        # Suppress that exact request for the current Composer invocation after
+        # its owning stage has been attempted.  The set is intentionally
+        # process-local: an explicit resume creates a fresh attempt and may
+        # retry the unresolved request after the operator grants more time.
+        self._attempted_request_signatures = set()
         self.status = "running"
         self._progress_snapshot = {
             "schema_version": "composer-checkpoint-1", "workflow_id": self.workflow["id"],
@@ -394,7 +401,7 @@ class ComposerRunner:
             "continuation_cycles": 0, "reopened_stage_ids": [],
             "continuation_pending_stage_ids": [], "active_research_requests": [],
             "department_activity": [], "stages": {}, "context": {}, "feedback": [],
-            "blockers": [], "usage": deepcopy(self.usage),
+            "blockers": [], "usage": deepcopy(self.usage), "deadline_decisions": [],
             "deadline_extensions": [],
             "organization": deepcopy(self.organization_snapshot),
             "topic_history_path": str(self.topic_history_path),
@@ -434,6 +441,19 @@ class ComposerRunner:
         if remaining <= 0:
             raise ValidationError("composer hard deadline exceeded")
         return remaining
+
+    def _deadline_dispatch_floor(self):
+        """Return the small control-plane window needed for safe dispatch.
+
+        Stage estimates are forecasts, not execution fences.  In the
+        deadline-governed mode, a residual window may still produce a useful
+        accepted stage result, so the Composer keeps admitting work until only
+        this checkpoint-and-ledger margin remains.  The margin follows the
+        configured checkpoint cadence and is capped to keep it small relative
+        to a scientific stage.
+        """
+        checkpoint = float(self.workflow["time_policy"]["checkpoint_seconds"])
+        return max(0.5, min(5.0, checkpoint / 10.0))
 
     def _deadline_exhausted(self):
         """Return whether the immutable mission wall has been reached."""
@@ -526,7 +546,15 @@ class ComposerRunner:
             else:
                 pending.append(stage_id)
         if stop_reason is None:
-            stop_reason = "hard_deadline" if self._deadline_exhausted() else self.status
+            if self._deadline_exhausted():
+                stop_reason = "hard_deadline"
+            elif self.status == "paused" and any(
+                    isinstance(item, dict)
+                    and item.get("reason") == "required_stage_window_does_not_fit_remaining_deadline"
+                    for item in self.blockers):
+                stop_reason = "required_stage_window_does_not_fit_remaining_deadline"
+            else:
+                stop_reason = self.status
         organization = self.organization_snapshot if isinstance(self.organization_snapshot, dict) else {}
         open_orders = organization.get("open_work_orders", [])
         if not isinstance(open_orders, list):
@@ -563,9 +591,11 @@ class ComposerRunner:
             "stages": rows,
             "pending_work_orders": orders,
             "blockers": blockers,
+            "deadline_decisions": deepcopy(self.deadline_decisions),
             "deadline_extensions": deepcopy(self.deadline_extensions),
             "next_actions": [
-                "Extend the deadline and resume the same workflow." if stop_reason == "hard_deadline"
+                "Extend the deadline and resume the same workflow."
+                if stop_reason in {"hard_deadline", "required_stage_window_does_not_fit_remaining_deadline"}
                 else "Inspect the blocker and resume the same workflow after the cause is recoverable.",
                 "Resume reconciles interrupted attempts before dispatching a fresh isolated attempt.",
             ],
@@ -600,8 +630,9 @@ class ComposerRunner:
         """Return the Composer retry policy for this immutable run.
 
         ``until_deadline`` deliberately has no attempt-count stop condition.
-        Time and dependency admission remain the termination conditions, so a
-        run cannot loop past its hard wall or start work that cannot fit.
+        The hard wall and dependency admission remain the termination
+        conditions; a residual stage may be admitted until the small
+        control-plane margin, but it can never extend the mission wall.
         """
         configured = self.workflow.get("retry_policy") or {}
         policy = {**DEFAULT_RETRY_POLICY, **configured}
@@ -686,6 +717,8 @@ class ComposerRunner:
                         continue
                     item.pop("schema_version", None)
                     item["source_stage_id"] = stage_id
+                    if self._research_request_signature(item) in self._attempted_request_signatures:
+                        continue
                     requests.append(item)
                     seen.add(request_id)
             if context.get("status") == "review_rejected" and not has_candidates:
@@ -709,7 +742,9 @@ class ComposerRunner:
         for request in requests:
             kind = request.get("kind")
             owner = request.get("owner")
-            if kind in {"literature_expansion", "full_text_retrieval"} or owner == "research.intelligence":
+            if kind == "topic_refinement":
+                target_kinds.add("topic_discovery")
+            elif kind in {"literature_expansion", "full_text_retrieval"} or owner == "research.intelligence":
                 target_kinds.add("survey")
             elif kind in {"additional_experiment", "analysis_display", "analysis_repair"} \
                     or owner == "methods.validation":
@@ -1067,7 +1102,8 @@ class ComposerRunner:
             if not isinstance(entry, dict):
                 continue
             entries.append({key: entry.get(key) for key in (
-                "topic_id", "title", "domain", "research_question", "experiment_capability_id")})
+                "topic_id", "title", "domain", "research_question", "experiment_capability_id",
+                "parent_topic_id", "refinement_cycle", "changed_dimensions")})
         return {
             "schema_version": "topic-history-1",
             "scope_key": self.topic_history_scope,
@@ -1091,6 +1127,12 @@ class ComposerRunner:
             "run_id": self.run_id,
             "recorded_at": now_iso(),
         }
+        evolution = context.get("topic_evolution") if isinstance(context, dict) else None
+        if isinstance(evolution, dict) and evolution.get("mode") == "refinement":
+            entry["parent_topic_id"] = evolution.get("parent_topic_id")
+            entry["refinement_cycle"] = evolution.get("cycle")
+            entry["refinement_reason"] = evolution.get("reason")
+            entry["changed_dimensions"] = list(evolution.get("changed_dimensions", []))
         path = self.topic_history_path
         path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = Path(str(path) + ".lock")
@@ -1147,6 +1189,236 @@ class ComposerRunner:
         return [deepcopy(item) for item in self.active_research_requests
                 if item.get("source_stage_id") == stage_id
                 or stage_id in self.reopened_stage_ids]
+
+    @staticmethod
+    def _research_request_signature(request):
+        """Return a stable identity for one substantive work-order attempt."""
+        stable = {key: request.get(key) for key in (
+            "id", "kind", "owner", "objective", "why", "success_condition",
+            "evidence_needed", "source_stage_id")}
+        return hashlib.sha256(canonical_bytes(stable)).hexdigest()
+
+    def _mark_research_requests_attempted(self, stage):
+        """Fence echoed work orders after their owning stage has returned.
+
+        A scientific hold remains visible as an open departmental order, but
+        the same request must not reopen the identical stage closure in a hot
+        loop.  A changed request body receives a different signature and can
+        trigger a new continuation in this invocation.
+        """
+        from scisaurus.runtime.departments import REQUEST_STAGE_KINDS
+
+        for request in self.active_research_requests:
+            if not isinstance(request, dict):
+                continue
+            if REQUEST_STAGE_KINDS.get(request.get("kind")) != stage.get("kind"):
+                continue
+            self._attempted_request_signatures.add(self._research_request_signature(request))
+
+    def _free_topic_stage(self):
+        """Return a topic stage that feeds a scholarly survey.
+
+        A free-topic mission is defined by its dependency graph, not by the
+        presence of a particular executable capability catalog.  Catalogs are
+        useful for selecting pinned experiment adapters, while a topic→survey
+        edge is the actual boundary at which literature evidence must be able
+        to send the question back for redesign.
+        """
+        stages = self.workflow.get("stages", [])
+        for topic in stages:
+            if topic.get("kind") != "topic_discovery":
+                continue
+            pending = [topic.get("id")]
+            seen = set()
+            while pending:
+                current = pending.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                for stage in stages:
+                    if current not in stage.get("depends_on", []):
+                        continue
+                    if stage.get("kind") == "survey":
+                        return topic
+                    pending.append(stage.get("id"))
+        return None
+
+    def _topic_stage_for_survey(self, survey_stage=None):
+        """Find the topic ancestor for one survey stage, if any."""
+        if survey_stage is None:
+            return self._free_topic_stage()
+        by_id = {item.get("id"): item for item in self.workflow.get("stages", [])
+                 if isinstance(item, dict)}
+        pending = list(survey_stage.get("depends_on", []))
+        seen = set()
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            candidate = by_id.get(current)
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("kind") == "topic_discovery":
+                return candidate
+            pending.extend(candidate.get("depends_on", []))
+        return None
+
+    def _survey_context_for_topic(self, topic_stage):
+        """Return the latest survey context downstream of a topic stage."""
+        stages = self.workflow.get("stages", [])
+        by_id = {item.get("id"): item for item in stages if isinstance(item, dict)}
+        pending = [topic_stage.get("id")]
+        seen = set()
+        survey_ids = []
+        while pending:
+            current = pending.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            for stage in stages:
+                if current not in stage.get("depends_on", []):
+                    continue
+                if stage.get("kind") == "survey":
+                    survey_ids.append(stage.get("id"))
+                pending.append(stage.get("id"))
+        for survey_id in survey_ids:
+            context = self.context.get(survey_id)
+            if isinstance(context, dict):
+                return context
+        return next((value for value in self.context.values()
+                     if isinstance(value, dict) and value.get("kind") == "survey"), {})
+
+    def _topic_refinement_context(self, stage):
+        """Build the evidence handoff for a substantive topic revision."""
+        if stage.get("kind") != "topic_discovery":
+            return None
+        requests = [item for item in self._requests_for_stage(stage["id"])
+                    if item.get("kind") == "topic_refinement"]
+        if not requests:
+            return None
+        parent_context = self.context.get(stage["id"], {})
+        parent = parent_context.get("topic") if isinstance(parent_context, dict) else None
+        if not isinstance(parent, dict):
+            return None
+        survey = self._survey_context_for_topic(stage)
+        survey_evidence = {}
+        survey_dir = survey.get("project_dir") if isinstance(survey, dict) else None
+        if isinstance(survey_dir, str):
+            survey_root = Path(survey_dir).resolve() / "output"
+            for filename in ("gap-assessment.json", "coverage.json"):
+                path = survey_root / filename
+                if not path.is_file():
+                    continue
+                try:
+                    value = json.loads(path.read_text())
+                except (OSError, ValueError, TypeError):
+                    continue
+                # Keep the handoff bounded; source spans and work IDs are
+                # enough to direct the next search without copying a whole
+                # literature database into the topic model prompt.
+                encoded = json.dumps(value, ensure_ascii=False, sort_keys=True)
+                if len(encoded) > 20000:
+                    encoded = encoded[:20000]
+                survey_evidence[filename] = encoded
+        feedback = {
+            "gap_state": survey.get("gap_state") if isinstance(survey, dict) else None,
+            "nomination": deepcopy(survey.get("nomination")) if isinstance(survey, dict) else None,
+            "assessment_ref": survey.get("assessment_ref") if isinstance(survey, dict) else None,
+            "evidence": survey_evidence,
+            "requests": [{key: item.get(key) for key in (
+                "id", "kind", "objective", "why", "success_condition", "evidence_needed")}
+                         for item in requests],
+        }
+        return {
+            "mode": "refinement",
+            "cycle": self.continuation_cycles,
+            "parent_topic_id": parent.get("id"),
+            "parent_topic": deepcopy(parent),
+            "reason": "The literature and admission review did not support the current question as a sufficient journal study.",
+            "changed_dimensions": list(("mechanism", "data_regime", "comparison", "measurement", "theory")),
+            "survey_feedback": feedback,
+        }
+
+    def _gate_free_topic_survey(self, result, *, stage=None):
+        """Hold a free-topic mission until its question survives literature review.
+
+        A bounded survey can be faithful while still failing to establish an
+        experiment-worthy distinction.  Treat that outcome as a scientific
+        redesign request instead of allowing the Composer to pass a thin
+        question directly to the executable experiment.
+        """
+        if self._topic_stage_for_survey(stage) is None or not isinstance(result, dict):
+            return result
+        if result.get("status") not in {"completed", "accepted"}:
+            return result
+        state = result.get("gap_state")
+        if state == "eligible_for_experiment":
+            return result
+        if state not in {"refuted_by_prior_work", "insufficient_evidence"}:
+            return result
+        gated = deepcopy(result)
+        requests = [deepcopy(item) for item in result.get("research_expansion_requests", [])
+                    if isinstance(item, dict)]
+        known = {item.get("id") for item in requests if isinstance(item.get("id"), str)}
+
+        def add(item):
+            if item["id"] not in known:
+                requests.append(item)
+                known.add(item["id"])
+
+        if state == "insufficient_evidence":
+            # The first insufficient survey is an evidence problem, not a
+            # scientific-direction problem.  Give the survey one scoped
+            # expansion pass before asking the topic stage to pivot.  The
+            # previous Composer result is durable context, so a resumed or
+            # continued run can distinguish that first pass from a repeated
+            # failure without relying on an in-memory counter.
+            prior_survey = self._survey_context_for_topic(
+                self._topic_stage_for_survey(stage))
+            expanded_before = (
+                isinstance(prior_survey, dict)
+                and prior_survey.get("gap_state") == "insufficient_evidence"
+                and prior_survey.get("topic_admission") in {
+                    "expand_literature_before_refine", "refine_before_experiment"
+                })
+            add({
+                "id": "topic-literature-expansion",
+                "kind": "literature_expansion",
+                "owner": "research.intelligence",
+                "objective": "Expand the scholarly search with exact terminology, citation chaining, and verified full text for the selected question before making an admission decision.",
+                "why": "The recorded survey does not yet provide enough comparable evidence to judge whether the question distinguishes unresolved work.",
+                "success_condition": "A current survey and gap assessment either establishes experiment eligibility or supplies evidence for a substantive question redesign.",
+                "evidence_needed": "Relevant primary studies, identity reconciliation, full-text source spans, and a current gap assessment.",
+            })
+            if expanded_before:
+                add({
+                    "id": f"topic-refinement-{state}",
+                    "kind": "topic_refinement",
+                    "owner": "research.intelligence",
+                    "objective": "Redesign the selected question around the expanded survey evidence so that it tests a meaningful mechanism, comparison, boundary, or measurement rather than repeating the current narrow direction.",
+                    "why": "The expanded literature search still cannot establish an experiment-worthy distinction; the question must evolve before execution.",
+                    "success_condition": "A new question materially changes at least one substantive dimension, survives the topic maturity review, and is re-surveyed under its own search terms.",
+                    "evidence_needed": "The parent question, expanded survey map, gap assessment, counter-search findings, and an explicit account of the changed scientific dimension.",
+                })
+        elif state == "refuted_by_prior_work":
+            add({
+                "id": f"topic-refinement-{state}",
+                "kind": "topic_refinement",
+                "owner": "research.intelligence",
+                "objective": "Redesign the selected question around the refuting literature so that it tests a meaningful mechanism, comparison, boundary, or measurement rather than repeating an established result.",
+                "why": "The current literature assessment identifies prior work that already answers the selected question; the question must pivot before execution.",
+                "success_condition": "A new question materially changes at least one substantive dimension, survives the topic maturity review, and is re-surveyed under its own search terms.",
+                "evidence_needed": "The parent question, refuting source spans, survey map, counter-search findings, and an explicit account of the changed scientific dimension.",
+            })
+        gated["status"] = "research_expansion_required"
+        gated["topic_admission"] = (
+            "refine_before_experiment"
+            if any(item.get("kind") == "topic_refinement" for item in requests)
+            else "expand_literature_before_refine"
+        )
+        gated["research_expansion_requests"] = requests
+        return gated
 
     def _address_for_role(self, role):
         """Resolve a role through the live project charter.
@@ -2014,7 +2286,14 @@ class ComposerRunner:
             base_delay = max(0.25, base_delay)
         delay = min(60.0, base_delay * (2 ** min(max(0, retry_index - 1), 6)))
         remaining = self._remaining()
-        required_window = min(float(stage["estimate_seconds"]), downstream_seconds)
+        if policy.get("mode", "bounded") == "until_deadline":
+            # In autonomous mode a failed stage may still be retried in the
+            # residual window.  Keep only the control-plane margin here; the
+            # specialist receives the actual remaining deadline and decides
+            # whether its own contract can finish.
+            required_window = self._deadline_dispatch_floor()
+        else:
+            required_window = min(float(stage["estimate_seconds"]), downstream_seconds)
         if remaining <= delay + max(0.2, required_window):
             return False
         self._record_retry_feedback(stage, attempt_number=attempt_number, retry_index=retry_index,
@@ -2057,6 +2336,7 @@ class ComposerRunner:
             "stages": deepcopy(self.stage_records), "context": deepcopy(self.context),
             "feedback": deepcopy(self.feedback),
             "blockers": deepcopy(self.blockers), "usage": deepcopy(self.usage),
+            "deadline_decisions": deepcopy(self.deadline_decisions),
             "organization": deepcopy(self.organization_snapshot),
             "topic_history_path": str(self.topic_history_path),
             "topic_history_scope": self.topic_history_scope,
@@ -2167,6 +2447,7 @@ class ComposerRunner:
             self.feedback = body.get("feedback", [])
             self.blockers = body.get("blockers", [])
             self.usage = body.get("usage", self.usage)
+            self.deadline_decisions = body.get("deadline_decisions", [])
             self.continuation_cycles = body.get("continuation_cycles", 0)
             self.reopened_stage_ids = set(body.get("reopened_stage_ids", []))
             self.continuation_pending_stage_ids = set(body.get("continuation_pending_stage_ids", []))
@@ -2198,6 +2479,7 @@ class ComposerRunner:
                 self.feedback = checkpoint.get("feedback", self.feedback)
                 self.blockers = checkpoint.get("blockers", self.blockers)
                 self.usage = checkpoint.get("usage", self.usage)
+                self.deadline_decisions = checkpoint.get("deadline_decisions", self.deadline_decisions)
                 self.continuation_cycles = checkpoint.get("continuation_cycles", self.continuation_cycles)
                 self.reopened_stage_ids = set(checkpoint.get("reopened_stage_ids", self.reopened_stage_ids))
                 self.continuation_pending_stage_ids = set(checkpoint.get(
@@ -2505,6 +2787,7 @@ class ComposerRunner:
         """Dispatch one allowlisted specialist runner and return its context."""
         kind = stage["kind"]
         project_dir = Path(stage["project_dir"])
+        output_path = None
         stage_deadline = min(float(stage["deadline_seconds"]), self._remaining())
         prior_run = (Path(stage["reuse_output_path"])
                      if stage["reuse_output_path"] is not None
@@ -2577,6 +2860,15 @@ class ComposerRunner:
             descriptor = validate_topic_stage_config(config)
             model = json.loads(Path(descriptor["model_config_path"]).read_text())
             runner = TopicDiscoveryRunner(model, deadline_seconds=stage_deadline)
+            maturity_rounds = descriptor.get("maturity_review_rounds", 0)
+            # Journal-oriented free-topic missions target a research paper,
+            # not an executable demo.  Give the intake an independent maturity
+            # screen by default; ordinary legacy topic stages keep their
+            # original one-pass contract unless they opt in explicitly.
+            if maturity_rounds == 0 and (
+                    self.workflow.get("experiment_catalog")
+                    or any(item.get("kind") == "paper" for item in self.workflow["stages"])):
+                maturity_rounds = 2
             result = runner.run(
                 self.workflow["objective"],
                 candidate_count=descriptor["candidate_count"],
@@ -2584,6 +2876,8 @@ class ComposerRunner:
                 repair_mode=descriptor.get("repair_mode", "bounded"),
                 runtime_context=self._runtime_context(model),
                 sampling_seed=self._topic_sampling_seed(),
+                maturity_review_rounds=maturity_rounds,
+                refinement_context=self._topic_refinement_context(stage),
             )
             output_path = Path(descriptor["output_path"])
             if attempt_number > 1 or stage["id"] in self.reopened_stage_ids:
@@ -2641,7 +2935,22 @@ class ComposerRunner:
             else:
                 from scisaurus.runtime.experiment import ExperimentRunner
                 result = ExperimentRunner(stage["project_dir"], config, on_progress=self._stage_progress(stage)).run()
-            output_path = Path(stage["project_dir"]) / "output" / "run.json"
+            if kind == "survey":
+                gated = self._gate_free_topic_survey(result, stage=stage)
+                if gated is not result:
+                    # Preserve the SurveyRunner's own output and write the
+                    # Composer admission decision beside it so a process
+                    # interruption can restore the hold and its work orders
+                    # without relying on in-memory state.
+                    gated_path = Path(stage["project_dir"]) / "output" / "composer-gated-run.json"
+                    gated_path.parent.mkdir(parents=True, exist_ok=True)
+                    gated_path.write_bytes(canonical_bytes(gated))
+                    result = gated
+                    output_path = gated_path
+                else:
+                    result = gated
+            if output_path is None:
+                output_path = Path(stage["project_dir"]) / "output" / "run.json"
         elif kind == "interpretation":
             from scisaurus.runtime.scientific_interpretation import ScientificInterpretationRunner
             descriptor_bindings = [item for item in stage["bindings"]
@@ -3055,9 +3364,11 @@ class ComposerRunner:
                         continue
                     if not set(stage["depends_on"]).issubset(completed):
                         continue
-                    # The estimate is a planning reservation, not a promise;
-                    # never admit discretionary work that cannot fit the hard
-                    # window alongside the required downstream closure.
+                    # The estimate is a planning reservation, not a promise.
+                    # Bounded jobs reserve the complete downstream closure;
+                    # an autonomous deadline-governed job may use a residual
+                    # window for the next specialist and let that specialist's
+                    # own contract decide whether a useful result fits.
                     remaining = self._remaining()
                     downstream_ids = set()
                     frontier = [stage_id]
@@ -3069,16 +3380,42 @@ class ComposerRunner:
                         frontier.extend(item for item, candidate in by_id.items()
                                         if current in candidate["depends_on"])
                     downstream = sum(float(by_id[item]["estimate_seconds"]) for item in downstream_ids)
-                    if remaining < min(float(stage["estimate_seconds"]), downstream):
-                        self.status = "paused"
-                        self.blockers.append({"stage_id": stage_id, "reason": "stage estimate does not fit remaining hard window"})
-                        self._checkpoint("paused_deadline", force=True)
-                        return self._finish()
+                    required_window = min(float(stage["estimate_seconds"]), downstream)
+                    retry_policy = self._retry_policy()
+                    if remaining < required_window:
+                        if (retry_policy.get("mode", "bounded") == "until_deadline"
+                                and remaining > self._deadline_dispatch_floor()):
+                            self.deadline_decisions.append({
+                                "stage_id": stage_id,
+                                "admission": "residual_window",
+                                "remaining_seconds": remaining,
+                                "estimated_stage_seconds": float(stage["estimate_seconds"]),
+                                "estimated_downstream_seconds": downstream,
+                                "safety_margin_seconds": self._deadline_dispatch_floor(),
+                                "reason": "full_stage_estimate_does_not_fit; autonomous mode keeps the residual window",
+                            })
+                        else:
+                            self.status = "paused"
+                            self.blockers.append({
+                                "stage_id": stage_id,
+                                "reason": "required_stage_window_does_not_fit_remaining_deadline",
+                                "remaining_seconds": remaining,
+                                "required_stage_seconds": required_window,
+                                "mode": retry_policy.get("mode", "bounded"),
+                            })
+                            self.deadline_decisions.append({
+                                "stage_id": stage_id,
+                                "admission": "deferred",
+                                "remaining_seconds": remaining,
+                                "required_stage_seconds": required_window,
+                                "reason": "required_stage_window_does_not_fit_remaining_deadline",
+                            })
+                            self._checkpoint("paused_deadline", force=True)
+                            return self._finish()
                     # Continuation stages receive a cycle-specific project
                     # namespace.  The original stage descriptor remains the
                     # immutable graph identity; only the dispatch copy changes.
                     stage = self._stage_for_cycle(stage)
-                    retry_policy = self._retry_policy()
                     prior_record = self.stage_records.get(stage_id, {})
                     attempt_history = deepcopy(prior_record.get("attempts", []))
                     if not isinstance(attempt_history, list):
@@ -3168,6 +3505,7 @@ class ComposerRunner:
                             context["stage_id"] = stage_id
                             context["attempt_number"] = attempt_number
                             self.context[stage_id] = context
+                            self._mark_research_requests_attempted(stage)
                             if self.active_research_requests:
                                 self.department_activity.append({
                                     "cycle": self.continuation_cycles,
@@ -3297,6 +3635,16 @@ class ComposerRunner:
             self.close()
 
     def _finish(self):
+        deadline_exhausted = self._deadline_exhausted()
+        # A provider may return just after the fence even when admission was
+        # valid.  Such an artifact remains inspectable, but the mission must
+        # not report graph completion after its hard wall has passed.
+        if deadline_exhausted and self.status not in {"blocked", "paused"}:
+            self.status = "blocked"
+            self.blockers.append({
+                "stage_id": "workflow",
+                "reason": "hard_deadline_after_stage_completion",
+            })
         elapsed = max(0.0, self.clock() - self.started)
         if self.control is not None:
             # Final publication is on the Composer thread, so it is safe to
@@ -3304,10 +3652,16 @@ class ComposerRunner:
             self.organization_snapshot = deepcopy(self.departments.snapshot())
         interim = None
         interim_error = None
-        if self._deadline_exhausted() or self.status in {"blocked", "paused"}:
+        if deadline_exhausted or self.status in {"blocked", "paused"}:
             try:
+                stop_reason = "hard_deadline" if deadline_exhausted else None
+                if stop_reason is None and self.status == "paused" and any(
+                        isinstance(item, dict)
+                        and item.get("reason") == "required_stage_window_does_not_fit_remaining_deadline"
+                        for item in self.blockers):
+                    stop_reason = "required_stage_window_does_not_fit_remaining_deadline"
                 interim = self.interim_report(
-                    stop_reason="hard_deadline" if self._deadline_exhausted() else self.status)
+                    stop_reason=stop_reason or self.status)
             except Exception as exc:
                 # The run report remains publishable even if a secondary
                 # progress projection encounters an I/O or ledger failure.
@@ -3324,6 +3678,7 @@ class ComposerRunner:
             "continuation_pending_stage_ids": sorted(self.continuation_pending_stage_ids),
             "active_research_requests": deepcopy(self.active_research_requests),
             "department_activity": deepcopy(self.department_activity),
+            "deadline_decisions": deepcopy(self.deadline_decisions),
             "deadline_extensions": deepcopy(self.deadline_extensions),
             "topic_history_path": str(self.topic_history_path),
             "topic_history_scope": self.topic_history_scope,

@@ -38,6 +38,7 @@ DEFAULT_ROLE_PROFILES = {
     "methods.blind-search-planner": {"temperature": 1.05, "top_p": 0.95, "presence_penalty": 0.2},
     "research.literature-mapper": {"temperature": 0.25, "top_p": 0.9},
     "research.literature-reviewer": {"temperature": 0.25, "top_p": 0.9},
+    "research.topic-maturity-reviewer": {"temperature": 0.2, "top_p": 0.9},
     "strategy.interpretation": {"temperature": 0.75, "top_p": 0.92},
     "strategy.argument": {"temperature": 0.7, "top_p": 0.92},
     "strategy.argument-reviewer": {"temperature": 0.2, "top_p": 0.9},

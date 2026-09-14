@@ -10,8 +10,10 @@ from scisaurus.runtime.topic_discovery import (
     SCHEMA_VERSION,
     STAGE_CONFIG_SCHEMA_VERSION,
     TopicDiscoveryRunner,
+    topic_maturity_admitted,
     topic_signature,
     validate_topic_package,
+    validate_topic_maturity_review,
     validate_topic_novelty,
     validate_topic_stage_config,
 )
@@ -96,6 +98,53 @@ class FakeModel:
                            elapsed_seconds=0.01, finish_reason="stop")
 
 
+class MaturityModel:
+    """Return a thin first proposal, then a substantively refined proposal."""
+
+    calls = []
+    review_count = 0
+
+    def __init__(self, **config):
+        self.config = config
+
+    def complete(self, *, system, prompt, images=None):
+        payload = json.loads(prompt)
+        self.calls.append(payload.get("assignment"))
+        if payload.get("assignment") == "topic_maturity_review":
+            type(self).review_count += 1
+            decision = "refine" if type(self).review_count == 1 else "admit"
+            review = {
+                "decision": decision,
+                "selected_id": "direction_1",
+                "scores": {
+                    "question_specificity": 4,
+                    "mechanism_depth": 3 if decision == "admit" else 1,
+                    "comparison_design": 4,
+                    "contribution_potential": 3 if decision == "admit" else 1,
+                    "falsifiability": 4,
+                },
+                "rationale": "The refined direction distinguishes a mechanism under a controlled comparison.",
+                "required_changes": [] if decision == "admit" else [
+                    "Vary the data regime and make the mechanism discriminating."],
+                "changed_dimensions": [] if decision == "admit" else ["data_regime", "mechanism"],
+            }
+            return ModelResult(text=json.dumps(review), model="fake",
+                               usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                               elapsed_seconds=0.01, finish_reason="stop")
+        objective = payload["principal_objective"]
+        value = package(objective)
+        if payload.get("assignment") == "refine_topic_discovery":
+            value["candidates"][1]["title"] = "Mechanism-sensitive outcome stability"
+            value["candidates"][1]["research_question"] = (
+                "Does mechanism 1 change the measured outcome across clean and contaminated regimes, "
+                "and which regime separates the competing explanations?")
+            value["candidates"][1]["scope"] = (
+                "Public data and a reproducible local experiment spanning clean and contaminated regimes.")
+        return ModelResult(text=json.dumps(value), model="fake",
+                           usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                           elapsed_seconds=0.01, finish_reason="stop")
+
+
 class TopicDiscoveryTests(unittest.TestCase):
     def test_config_and_package_contracts(self):
         with tempfile.TemporaryDirectory() as path:
@@ -112,6 +161,42 @@ class TopicDiscoveryTests(unittest.TestCase):
             self.assertEqual(validate_topic_stage_config(config), config)
             value = package("Choose a feasible research direction")
             self.assertEqual(validate_topic_package(value, objective=value["objective"], candidate_count=3), value)
+
+    def test_maturity_review_contract_requires_substantive_admission(self):
+        review = {
+            "decision": "admit",
+            "selected_id": "direction_1",
+            "scores": {dimension: 3 for dimension in (
+                "question_specificity", "mechanism_depth", "comparison_design",
+                "contribution_potential", "falsifiability")},
+            "rationale": "The question has a discriminating comparison and a falsifiable outcome.",
+            "required_changes": [],
+            "changed_dimensions": [],
+        }
+        self.assertEqual(validate_topic_maturity_review(review, candidate_ids={"direction_1"}), review)
+        self.assertTrue(topic_maturity_admitted(review))
+        review["scores"]["mechanism_depth"] = 1
+        self.assertFalse(topic_maturity_admitted(review))
+
+    def test_runner_refines_topic_after_maturity_review(self):
+        objective = "Choose a feasible research direction"
+        MaturityModel.calls = []
+        MaturityModel.review_count = 0
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", MaturityModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+            }).run(objective, candidate_count=3, bibliography=False,
+                   maturity_review_rounds=1, max_attempts=4)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(MaturityModel.calls,
+                         ["free_topic_discovery", "topic_maturity_review",
+                          "refine_topic_discovery", "topic_maturity_review"])
+        self.assertEqual(len(result["maturity_reviews"]), 2)
+        self.assertEqual(len(result["maturity_review_history"]), 2)
+        self.assertEqual(result["maturity_review_history"][0]["review"]["decision"], "refine")
+        self.assertEqual(result["maturity_score"], 18)
+        self.assertIn("across clean and contaminated regimes", result["question"])
 
     def test_samples_recent_records_with_unicode_objective_and_reproducible_shuffle(self):
         FakeOpenAlex.queries = []
