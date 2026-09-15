@@ -6,6 +6,11 @@ inference implementation: Ollama resolves the configured `:cloud` model and
 owns the provider credentials. Sci-saurus never silently falls back to a
 different model.
 
+The owner-operated Qwen endpoint remains an authorized private alternative
+when reached from an authenticated Tailnet device. The retired path was the
+old public `:8443` exposure, not the private Tailnet route. The two routes
+must remain separately configured and health-checked.
+
 ## Provider settings
 
 The owner-only file `local-private/ollama-cloud.env` contains model settings,
@@ -38,15 +43,26 @@ set -a; . local-private/ollama-cloud.env; set +a
 ./.venv/bin/python local-private/build_configs.py
 ```
 
-Do not point a run at a local Qwen model, a retired Tailnet endpoint, or a
-provider-specific model credential variable. The launchers automatically load
-`local-private/openalex.env` when present; only the variable name is stored in
-descriptors.
+The local Ollama bridge is the default. The owner-private Tailnet endpoint may
+be selected explicitly with its own `base_url`, exact model, and `auth_env`.
+Never use the retired public `:8443` exposure, embed credentials in a
+configuration, or silently fall back between providers. The launchers
+automatically load `local-private/openalex.env` when present; only the
+variable name is stored in descriptors.
 
 ## Runtime policy
 
-- Dispatch is configured serially (`worker_concurrency = 1`) so one long model
-  request cannot create an unbounded local queue.
+- `model.role_models` provides explicit per-role provider/model overrides.
+  Unlisted roles use DeepSeek; independent reviews, methods judgments, and
+  adversarial checks use GLM.
+- Bounded scholarly/web scouting, cataloging, and citation mapping use the
+  owner-private Qwen route. Simple section and manuscript drafts use
+  `gemma4:31b-cloud`.
+- Qwen authentication is scoped to Qwen routes only; Gemma routes explicitly
+  suppress inherited credentials.
+- Ollama runs reserve one independent verifier slot: the active configuration
+  is `concurrent_calls = 4` and `worker_concurrency = 3`. This is a bounded
+  reservation, not a claim that a provider quota is currently available.
 - Structured stages use `reasoning_effort = none` and `output_format =
   json_object`. The client rejects empty or non-JSON replies instead of
   fabricating a fallback.
@@ -89,11 +105,19 @@ PY
 - `deepseek-v4.1-flash:cloud` passed the adapter preflight and an actual long
   topic-discovery JSON call with a terminating response and valid JSON. It is
   the default for structured Sci-saurus stages.
-- `glm-5.3-flash:cloud` is available through Ollama, but the strict adapter
-  rejected even a short response because a `<think>` marker preceded the JSON;
-  the same long structured topic/maturity workload also exhausted its
-  completion budget. It is therefore not selected as a production fallback
-  until it passes that workload.
+- The owner-private Tailnet endpoint returned HTTP 200 for its `/v1/models`
+  probe on 2026-09-15 from this host. It is available as an explicitly
+  authorized weak research route for scouting and citation work; its old public
+  `:8443` exposure remains retired.
+- `gemma4:31b-cloud` is present in Ollama's model listing and is configured for
+  low-risk roles, but a fresh adapter probe currently returns HTTP 429 because
+  Ollama's five-hour usage window is exhausted. It is not treated as accepted
+  live capacity until a later probe succeeds.
+- `glm-5.3-flash:cloud` is configured for independent reviews, methods
+  judgments, and adversarial checks. An older probe exposed a provider
+  reasoning wrapper and exhausted its completion budget; the adapter now
+  accepts only the exact JSON suffix after that wrapper, but a fresh live
+  GLM acceptance probe is still pending the Ollama quota reset.
 
 These are observed executions, not latency or provider-availability
 guarantees. A provider failure remains visible in the run ledger.

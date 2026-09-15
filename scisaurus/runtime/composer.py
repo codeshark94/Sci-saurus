@@ -1589,14 +1589,15 @@ class ComposerRunner:
         # A catalog-backed stage is a new project identity.  Reusing the
         # template's project or capability IDs would leak the previous
         # experiment into the survey ledger and can collide with its reserved
-        # verification capacity.  Keep one worker slot for the single-request
-        # provider while reserving the independent verification slot required
-        # by the survey contract.
+        # verification capacity.  Preserve the descriptor's worker setting;
+        # the configured capacity must still leave one independent verification
+        # slot required by the survey contract.
         config["project_id"] = str(Path(stage["project_dir"]).resolve())
         limits = config.setdefault("limits", {})
         if type(limits.get("concurrent_calls")) is int and limits["concurrent_calls"] < 2:
             limits["concurrent_calls"] = 2
-        limits["worker_concurrency"] = 1
+        if "worker_concurrency" not in limits and type(limits.get("concurrent_calls")) is int:
+            limits["worker_concurrency"] = limits["concurrent_calls"] - 1
         if isinstance(topic.get("id"), str):
             topic_key = re.sub(r"[^a-z0-9_-]+", "-", topic["id"].casefold()).strip("-")[:48]
             if topic_key:

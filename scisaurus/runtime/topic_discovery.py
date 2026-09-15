@@ -1250,17 +1250,8 @@ class TopicDiscoveryRunner:
         self.deadline_seconds = float(deadline_seconds) if deadline_seconds is not None else None
 
     def _client(self, role, *, seed=None, deadline=None):
-        model_config = deepcopy(self.model_config)
-        role_models = model_config.pop("role_models", {})
-        if not isinstance(role_models, dict):
-            raise ValidationError("topic model role_models must be an object")
-        selected = role_models.get(role)
-        if selected is not None:
-            if not isinstance(selected, dict):
-                raise ValidationError(f"topic model role_models.{role} must be an object")
-            model_config.update(deepcopy(selected))
         config = resolve_model_config(
-            model_config, role=role,
+            self.model_config, role=role,
             overrides=({"seed": seed} if seed is not None else None),
         )
         # TopicBudget charges one logical dispatch.  Do not hide additional

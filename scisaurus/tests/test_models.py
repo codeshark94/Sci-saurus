@@ -162,6 +162,48 @@ class TestModelClient(unittest.TestCase):
         self.assertEqual(resolved['seed'], 19)
         self.assertNotIn('role_profiles', resolved)
 
+    def test_role_model_resolution_routes_provider_and_inherits_base_config(self):
+        base = {
+            'base_url': self.url, 'protocol': 'openai_compatible', 'model': 'strong-model',
+            'timeout_seconds': 2, 'max_output_tokens': 4096,
+            'role_models': {
+                'research.literature-mapper': {
+                    'model': 'bounded-model', 'max_output_tokens': 512,
+                    'temperature': 0.2,
+                },
+            },
+        }
+        resolved = resolve_model_config(base, role='research.literature-mapper')
+        self.assertEqual(resolved['model'], 'bounded-model')
+        self.assertEqual(resolved['base_url'], self.url)
+        self.assertEqual(resolved['protocol'], 'openai_compatible')
+        self.assertEqual(resolved['max_output_tokens'], 512)
+        self.assertEqual(resolved['temperature'], 0.2)
+        self.assertNotIn('role_models', resolved)
+
+    def test_invalid_role_model_config_fails_before_network(self):
+        base = {
+            'base_url': self.url, 'protocol': 'openai_compatible', 'model': 'strong-model',
+            'timeout_seconds': 2, 'max_output_tokens': 64,
+            'role_models': {'research.cataloger': {'unsupported': 'value'}},
+        }
+        with self.assertRaisesRegex(ValidationError, 'unsupported fields'):
+            resolve_model_config(base, role='research.cataloger')
+
+    def test_role_model_can_suppress_inherited_credentials(self):
+        base = {
+            'base_url': self.url, 'protocol': 'openai_compatible', 'model': 'strong-model',
+            'auth_env': 'OWNER_PRIVATE_KEY', 'timeout_seconds': 2, 'max_output_tokens': 64,
+            'role_models': {
+                'low-risk-draft': {
+                    'base_url': self.url, 'model': 'weak-model', 'auth_env': None,
+                },
+            },
+        }
+        resolved = resolve_model_config(base, role='low-risk-draft')
+        self.assertEqual(resolved['model'], 'weak-model')
+        self.assertIsNone(resolved['auth_env'])
+
     def test_invalid_sampling_controls_fail_before_network(self):
         for field, value in (
                 ('temperature', -0.1), ('temperature', 2.1), ('top_p', 0),
@@ -241,6 +283,14 @@ class TestModelClient(unittest.TestCase):
         result = self.client('openai_compatible', output_format='json_object').complete(system='Return JSON.', prompt='Inspect.')
         with self.assertRaises(ValidationError):
             result.json_object()
+
+    def test_json_output_mode_accepts_explicit_reasoning_terminator_suffix(self):
+        self.response = {'choices': [{'message': {
+            'content': 'provider reasoning text</think>{"ok":true}',
+        }, 'finish_reason': 'stop'}]}
+        result = self.client('openai_compatible', output_format='json_object').complete(
+            system='Return JSON.', prompt='Inspect.')
+        self.assertEqual(result.json_object(), {'ok': True})
 
     def test_failure_does_not_expose_provider_body(self):
         self.status=401

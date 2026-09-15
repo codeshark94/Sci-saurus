@@ -22,6 +22,11 @@ SAMPLING_FIELDS = frozenset({
     "temperature", "top_p", "seed", "presence_penalty", "frequency_penalty",
 })
 OLLAMA_SAMPLING_FIELDS = frozenset({"temperature", "top_p", "seed"})
+MODEL_CONFIG_FIELDS = frozenset({
+    "base_url", "model", "protocol", "timeout_seconds", "max_output_tokens",
+    "auth_env", "max_response_bytes", "reasoning_effort", "output_format",
+    "max_image_bytes", "max_request_bytes", "max_retries", "retry_backoff_seconds",
+}) | SAMPLING_FIELDS
 # OpenAI-compatible providers commonly expose ``seed`` as a signed int64.
 # Keep internally derived seeds inside that wire-level contract so a valid
 # exploration hash cannot become a provider-side 400.
@@ -86,18 +91,76 @@ def _validate_sampling_options(options, *, name="sampling options"):
     return options
 
 
-def resolve_model_config(model, *, role=None, overrides=None):
-    """Resolve a model config plus a role's sampling profile.
+def _validate_role_models(role_models):
+    """Validate partial provider configurations used by named runtime roles."""
+    if not isinstance(role_models, dict):
+        raise ValidationError("model.role_models must be an object")
+    for role_name, selected in role_models.items():
+        if not isinstance(role_name, str) or not role_name.strip():
+            raise ValidationError("model.role_models keys must be nonempty strings")
+        if not isinstance(selected, dict) or not selected:
+            raise ValidationError(f"model.role_models.{role_name} must be a nonempty object")
+        unknown = set(selected) - MODEL_CONFIG_FIELDS
+        if unknown:
+            raise ValidationError(
+                f"model.role_models.{role_name} contains unsupported fields: "
+                + ", ".join(sorted(unknown)))
+        _validate_sampling_options(
+            {key: value for key, value in selected.items() if key in SAMPLING_FIELDS},
+            name=f"model.role_models.{role_name} sampling options")
+        if "protocol" in selected and selected["protocol"] not in {"ollama", "openai_compatible"}:
+            raise ValidationError(f"model.role_models.{role_name}.protocol is invalid")
+        if "base_url" in selected:
+            base_url = selected["base_url"]
+            parsed = urllib.parse.urlsplit(base_url) if isinstance(base_url, str) else None
+            if (parsed is None or parsed.scheme not in {"http", "https"} or not parsed.netloc
+                    or parsed.username or parsed.password or parsed.query or parsed.fragment):
+                raise ValidationError(f"model.role_models.{role_name}.base_url is invalid")
+        if "model" in selected and (
+                not isinstance(selected["model"], str)
+                or not selected["model"].strip()
+                or selected["model"] == "runtime_required"):
+            raise ValidationError(f"model.role_models.{role_name}.model must be explicit")
+        for field in ("timeout_seconds", "retry_backoff_seconds"):
+            if field in selected and (
+                    type(selected[field]) not in (int, float)
+                    or not math.isfinite(selected[field])
+                    or selected[field] < 0
+                    or (field == "timeout_seconds" and selected[field] == 0)):
+                raise ValidationError(f"model.role_models.{role_name}.{field} is invalid")
+        for field in ("max_output_tokens", "max_response_bytes", "max_image_bytes",
+                      "max_request_bytes"):
+            if field in selected and (type(selected[field]) is not int or selected[field] <= 0):
+                raise ValidationError(f"model.role_models.{role_name}.{field} is invalid")
+        if "max_retries" in selected and (
+                type(selected["max_retries"]) is not int or not 0 <= selected["max_retries"] <= 8):
+            raise ValidationError(f"model.role_models.{role_name}.max_retries is invalid")
+        if "auth_env" in selected and selected["auth_env"] is not None and (
+                not isinstance(selected["auth_env"], str) or not selected["auth_env"]):
+            raise ValidationError(f"model.role_models.{role_name}.auth_env is invalid")
+        if "reasoning_effort" in selected and selected["reasoning_effort"] not in {
+                None, "none", "low", "medium", "high", "xhigh"}:
+            raise ValidationError(f"model.role_models.{role_name}.reasoning_effort is invalid")
+        if "output_format" in selected and selected["output_format"] not in {None, "json_object"}:
+            raise ValidationError(f"model.role_models.{role_name}.output_format is invalid")
+    return role_models
 
-    The resolver keeps ``role_profiles`` out of the provider payload while
-    allowing one shared model file to express different exploration and
-    verification personalities.  Explicit global sampling fields win over
-    built-in defaults; a named role profile and call-site overrides then win
-    over those global values.
+
+def resolve_model_config(model, *, role=None, overrides=None):
+    """Resolve a model config plus a role's provider and sampling profiles.
+
+    The resolver keeps orchestration metadata out of the provider payload while
+    allowing one shared model file to route named roles to different compatible
+    endpoints or model aliases.  Role model selections inherit unspecified
+    provider settings from the base config.  Explicit global sampling fields
+    win over built-in defaults; the selected role model's sampling fields,
+    named role profile, and call-site overrides then win in that order.
     """
     if not isinstance(model, dict):
         raise ValidationError("model configuration must be an object")
     base = dict(model)
+    role_models = base.pop("role_models", {})
+    _validate_role_models(role_models)
     profiles = base.pop("role_profiles", {})
     if not isinstance(profiles, dict):
         raise ValidationError("model.role_profiles must be an object")
@@ -109,8 +172,18 @@ def resolve_model_config(model, *, role=None, overrides=None):
     _validate_sampling_options(global_sampling, name="model sampling options")
     if overrides is not None:
         _validate_sampling_options(overrides, name="sampling overrides")
+    selected_model = role_models.get(role) if role is not None else None
+    selected_sampling = {}
+    if selected_model is not None:
+        selected_model = dict(selected_model)
+        selected_sampling = {
+            key: selected_model.pop(key)
+            for key in list(selected_model) if key in SAMPLING_FIELDS
+        }
+        base.update(selected_model)
     sampling = dict(DEFAULT_ROLE_PROFILES.get(role, {}))
     sampling.update(global_sampling)
+    sampling.update(selected_sampling)
     if role is not None:
         sampling.update(profiles.get(role, {}))
     if overrides:
@@ -152,10 +225,21 @@ class ModelResult:
     request_attempts: int = 1
 
     def json_object(self):
+        text = self.text.strip()
         try:
-            value = json.loads(self.text)
+            value = json.loads(text)
         except (ValueError, TypeError) as exc:
-            raise ValidationError("model output is not a complete JSON object") from exc
+            # Some structured-output Ollama aliases append a reasoning wrapper
+            # terminator even when the provider returns a valid JSON object.
+            # Accept only the exact suffix after that explicit terminator; any
+            # other prose, markdown, or trailing bytes remains invalid.
+            if "</think>" not in text:
+                raise ValidationError("model output is not a complete JSON object") from exc
+            suffix = text.rsplit("</think>", 1)[1].strip()
+            try:
+                value = json.loads(suffix)
+            except (ValueError, TypeError) as suffix_exc:
+                raise ValidationError("model output is not a complete JSON object") from suffix_exc
         if not isinstance(value, dict):
             raise ValidationError("model output must be a JSON object")
         return value
