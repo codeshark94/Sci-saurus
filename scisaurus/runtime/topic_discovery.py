@@ -311,6 +311,17 @@ class TopicBudget:
         if self._active_event is not None:
             self._active_event.update(status="rejected", error=str(error)[:2048])
             self._active_event = None
+            return
+        # Validation can happen after the external event has already been
+        # closed, for example when an independent source challenger rejects a
+        # valid JSON response.  Keep that decision in the bounded-intake
+        # trace instead of silently turning it into an unexplained retry.
+        self.events.append({
+            "sequence": len(self.events) + 1,
+            "kind": "validation",
+            "status": "rejected",
+            "error": str(error)[:2048],
+        })
 
     def before_openalex_request(self, query=None):
         self._check_available("max_openalex_requests", "openalex_requests")
@@ -415,13 +426,19 @@ def validate_frontier_seed_plan(value, *, seed_count=None):
             raise ValidationError("frontier seed IDs must be unique")
         ids.add(identifier)
         for key in ("domain", "phenomenon", "mechanism", "unit_of_analysis"):
-            _text(seed[key], f"frontier seed {key}")
+            # Frontier seeds are internal scientific search scaffolding, not
+            # reader-facing prose.  Applying the manuscript surface gate here
+            # made a single model word such as "validator" discard an
+            # otherwise useful seed before candidate generation could project
+            # it into clean scientific language.
+            _text(seed[key], f"frontier seed {key}", public=False)
         domains.add(seed["domain"].strip().casefold())
         seed_terms = set().union(*(
             _topic_tokens(seed[key]) for key in (
                 "domain", "phenomenon", "mechanism", "unit_of_analysis")
         )) - _MISSION_BOILERPLATE
-        _strings(seed["search_queries"], "frontier seed search_queries", minimum=2, maximum=3)
+        _strings(seed["search_queries"], "frontier seed search_queries",
+                 minimum=2, maximum=3, public=False)
         for query in seed["search_queries"]:
             content = set(_topic_tokens(query)) - _MISSION_BOILERPLATE
             if len(content) < 2:
@@ -473,6 +490,16 @@ def validate_source_challenge(value, *, selected_id, work_ids):
     return deepcopy(value)
 
 
+def _source_challenge_admitted(review):
+    """Return whether a validated source challenge crosses the intake gate."""
+    return (
+        review["decision"] == "admit_to_survey"
+        and review["source_relevance"] >= 2
+        and review["template_independence"] >= 3
+        and review["prior_work_risk"] != "high"
+    )
+
+
 def validate_topic_package(value, *, objective=None, candidate_count=None,
                            experiment_capability_ids=None,
                            require_capability_coverage=False,
@@ -516,15 +543,31 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
         shapes = (CANDIDATE_FIELDS, LEGACY_CANDIDATE_FIELDS,
                   CATALOG_CANDIDATE_FIELDS, CATALOG_LEGACY_CANDIDATE_FIELDS)
         candidate_keys = set(candidate) if isinstance(candidate, dict) else set()
-        shape_valid = any(
-            shape.issubset(candidate_keys)
-            and candidate_keys <= shape | CANDIDATE_DIMENSION_FIELDS | extra
+        shape_options = [
+            (shape, extra, shape | CANDIDATE_DIMENSION_FIELDS | extra)
             for shape in shapes
             for extra in ({"experiment_design"}, GROUNDING_FIELDS,
                           GROUNDING_FIELDS | {"experiment_design"}, set())
+        ]
+        shape_valid = any(
+            shape.issubset(candidate_keys) and candidate_keys <= allowed
+            for shape, _extra, allowed in shape_options
         )
         if not isinstance(candidate, dict) or not shape_valid:
-            raise ValidationError("topic candidate has an invalid shape")
+            if not isinstance(candidate, dict):
+                detail = f"type={type(candidate).__name__}"
+            else:
+                _shape, _extra, allowed = min(
+                    shape_options,
+                    key=lambda item: (
+                        len(item[0] - candidate_keys) + len(candidate_keys - item[2]),
+                        len(candidate_keys - item[2]),
+                    ),
+                )
+                missing = sorted(_shape - candidate_keys)
+                unexpected = sorted(candidate_keys - allowed)
+                detail = f"missing={missing[:8]}, unexpected={unexpected[:8]}"
+            raise ValidationError(f"topic candidate has an invalid shape ({detail})")
         _identifier(candidate["id"], "topic candidate id")
         if candidate["id"] in ids:
             raise ValidationError("topic candidate IDs must be unique")
@@ -551,8 +594,14 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
                     "topic candidate prior_work_ids cite records outside the supplied evidence")
             if not any(work_records[work_id].get("frontier_seed_id") == seed_id
                        for work_id in prior_ids):
+                available_ids = sorted(
+                    work_id for work_id, record in work_records.items()
+                    if record.get("frontier_seed_id") == seed_id
+                )[:8]
                 raise ValidationError(
-                    "topic candidate must cite scholarly evidence from its named frontier seed")
+                    "topic candidate "
+                    f"{candidate['id']} must cite a supplied work from frontier seed "
+                    f"{seed_id}; available work IDs for that seed are {available_ids}")
             candidate_tokens = set().union(*(
                 _topic_tokens(candidate[key]) for key in
                 ("title", "domain", "research_question", "scope")
@@ -863,10 +912,10 @@ def _frontier_seed_prompt(objective, seed_count, sampling_seed):
         "principal_boundary": objective,
         "exploration_seed": sampling_seed,
         "seed_count": seed_count,
-        "output_contract": {
+            "output_contract": {
             "schema_version": FRONTIER_SEED_SCHEMA_VERSION,
             "seeds": [{
-                "id": "bounded lowercase identifier",
+                "id": "bounded lowercase identifier such as frontier_1; never use spaces or uppercase",
                 "domain": "specific scientific domain; domains must differ across the portfolio",
                 "phenomenon": "concrete phenomenon or empirical regularity",
                 "mechanism": "competing mechanism or boundary worth discriminating",
@@ -939,8 +988,15 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
     runtime_context.pop("fallback_experiment_catalog", None)
     recent_papers = reader_projection(recent_papers or [])
     frontier_seeds = reader_projection(frontier_seeds or [])
+    evidence_by_seed = {}
+    for paper in recent_papers:
+        if not isinstance(paper, dict):
+            continue
+        seed_id = paper.get("frontier_seed_id")
+        if isinstance(seed_id, str) and seed_id:
+            evidence_by_seed.setdefault(seed_id, []).append(paper)
     candidate_contract = {
-        "id": "lowercase identifier",
+        "id": "lowercase identifier such as direction_1; use only a-z, 0-9, _ or - with no spaces",
         "title": "short working title",
         "domain": "research domain",
         "research_question": "one testable question",
@@ -979,12 +1035,17 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "candidate prose is reader-facing: do not use the words frozen, validator, accepted artifact, model calls, release candidate, or SHA-256; say prespecified or independent recalculation where scientifically appropriate",
     ]
     if frontier_seeds and recent_papers:
-        candidate_contract["frontier_seed_id"] = "exact id copied from frontier_seeds"
+        candidate_contract["frontier_seed_id"] = (
+            "exact id copied from frontier_seeds; choose this before selecting evidence")
         candidate_contract["prior_work_ids"] = (
-            "one to five work_id values copied from recent_papers, including one from frontier_seed_id")
+            "one to five work_id values copied from scholarly_records_by_frontier_seed under the "
+            "candidate's exact frontier_seed_id")
         constraints.append(
             "every candidate must cite its exact frontier_seed_id and one to five supplied prior_work_ids; "
             "at least one cited work must belong to that same seed")
+        constraints.append(
+            "for each candidate, choose prior_work_ids only from scholarly_records_by_frontier_seed[frontier_seed_id]; "
+            "never mix a work ID from another frontier seed")
     catalog = runtime_context.get("experiment_catalog") or []
     if catalog:
         candidate_contract["experiment_capability_id"] = (
@@ -1051,6 +1112,7 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "candidate_count": candidate_count,
         "frontier_seeds": frontier_seeds,
         "recent_papers": recent_papers or [],
+        "scholarly_records_by_frontier_seed": evidence_by_seed,
         "runtime_context": runtime_context,
         "refinement_context": refinement_context or {},
         "output_contract": {
@@ -1099,7 +1161,7 @@ def _source_challenge_prompt(selected, works, runtime_context):
             "prior_work_risk": "low, medium, or high",
             "closest_work_ids": "zero to eight IDs copied from targeted_scholarly_records",
             "rationale": "specific evidence-grounded rationale without a novelty claim",
-            "required_changes": "empty when admitted; otherwise substantive scientific changes",
+            "required_changes": "empty when admitted; otherwise a unique JSON array of at most eight substantive scientific changes",
         },
         "admission_rule": {
             "minimum_source_relevance": 2,
@@ -1277,45 +1339,65 @@ class TopicDiscoveryRunner:
     def _challenge_selected_topic(self, selected, works, runtime_context, *, seed, deadline, usage,
                                   budget=None):
         reviewer = self._client("research.topic-source-challenger", seed=seed, deadline=deadline)
-        if budget is not None:
-            budget.before_model_call(
-                "research.topic-source-challenger", getattr(reviewer, "model", None))
-        try:
-            result = reviewer.complete(
-                system=SOURCE_CHALLENGE_SYSTEM,
-                prompt=_source_challenge_prompt(selected, works, runtime_context),
-            )
-        except ModelCallError as exc:
+        previous = None
+        last_error = None
+        for repair_attempt in range(2):
+            payload = json.loads(_source_challenge_prompt(selected, works, runtime_context))
+            if previous is not None and last_error is not None:
+                payload["assignment"] = "repair_topic_source_challenge"
+                payload["previous_response"] = previous[:12000]
+                payload["validation_error"] = str(last_error)
+                payload["repair_instruction"] = (
+                    "Return a complete replacement challenge object. Keep the same selected_id and supplied "
+                    "work IDs, but repair the response against validation_error. required_changes must be a "
+                    "unique JSON array of at most eight substantive strings."
+                )
+            prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             if budget is not None:
-                budget.record_model_error(exc)
-            raise ValidationError(f"topic source challenge model call failed: {exc}") from exc
-        if budget is not None:
-            budget.record_model_result(result)
-        else:
-            usage["model_calls"] += 1
-            for key in ("input_tokens", "output_tokens"):
-                usage[key] += result.usage.get(key, 0)
-        if result.finish_reason != "stop":
-            error = ValidationError(
-                f"topic source challenge did not finish normally: {result.finish_reason}")
+                budget.before_model_call(
+                    "research.topic-source-challenger", getattr(reviewer, "model", None))
+            try:
+                result = reviewer.complete(
+                    system=SOURCE_CHALLENGE_SYSTEM,
+                    prompt=prompt,
+                )
+            except ModelCallError as exc:
+                if budget is not None:
+                    budget.record_model_error(exc)
+                raise ValidationError(f"topic source challenge model call failed: {exc}") from exc
             if budget is not None:
-                budget.record_validation_error(error)
-            raise error
-        review = result.json_object()
-        validate_source_challenge(
-            review, selected_id=selected["id"],
-            work_ids=[item["work_id"] for item in works],
-        )
-        if (review["decision"] != "admit_to_survey"
-                or review["source_relevance"] < 2
-                or review["template_independence"] < 3
-                or review["prior_work_risk"] == "high"):
-            error = ValidationError(
-                "topic source challenge requires substantive refinement: " + review["rationale"])
-            if budget is not None:
-                budget.record_validation_error(error)
-            raise error
-        return review
+                budget.record_model_result(result)
+            else:
+                usage["model_calls"] += 1
+                for key in ("input_tokens", "output_tokens"):
+                    usage[key] += result.usage.get(key, 0)
+            if result.finish_reason != "stop":
+                last_error = ValidationError(
+                    f"topic source challenge did not finish normally: {result.finish_reason}")
+                if budget is not None:
+                    budget.record_validation_error(last_error)
+                previous = result.text
+                continue
+            try:
+                review = result.json_object()
+                # Duplicate references or repeated repair instructions carry
+                # no scientific meaning.  Normalize those harmless formatting
+                # slips before applying the strict challenge contract.
+                for key in ("closest_work_ids", "required_changes"):
+                    if isinstance(review.get(key), list) and all(
+                            isinstance(item, str) for item in review[key]):
+                        review[key] = list(dict.fromkeys(review[key]))
+                validate_source_challenge(
+                    review, selected_id=selected["id"],
+                    work_ids=[item["work_id"] for item in works],
+                )
+                return review
+            except ValidationError as exc:
+                last_error = exc
+                if budget is not None:
+                    budget.record_validation_error(exc)
+                previous = result.text
+        raise last_error or ValidationError("topic source challenge did not produce a valid review")
 
     def run(self, objective, *, candidate_count=4, max_attempts=3,
             repair_mode="bounded", recent_papers=None, runtime_context=None,
@@ -1389,7 +1471,7 @@ class TopicDiscoveryRunner:
                     refinement_context={
                         **(refinement_context or {}),
                         "parent_topic": refinement_parent,
-                        "maturity_review": refinement_feedback,
+                        "refinement_feedback": refinement_feedback,
                     }))
                 refinement_payload["assignment"] = "refine_topic_discovery"
                 refinement_payload["refinement_instruction"] = (
@@ -1495,7 +1577,25 @@ class TopicDiscoveryRunner:
                 except ProviderCooldownError:
                     raise
                 except ValidationError as exc:
+                    budget.record_validation_error(exc)
                     last_error = exc
+                    continue
+                if not _source_challenge_admitted(source_challenge):
+                    last_error = ValidationError(
+                        "topic source challenge requires substantive refinement: "
+                        + source_challenge["rationale"])
+                    budget.record_validation_error(last_error)
+                    # The challenger is an independent gate, but its result
+                    # is also the most useful repair specification.  Carry it
+                    # into the next bounded generation so the model changes
+                    # the rejected mechanism/boundary instead of restarting
+                    # from an uninformed random proposal.
+                    refinement_feedback = {
+                        "review_type": "source_challenge",
+                        **deepcopy(source_challenge),
+                    }
+                    refinement_parent = deepcopy(selected)
+                    previous = None
                     continue
             if maturity_review_rounds:
                 review_seed = ((generation_seed if generation_seed is not None else 0)

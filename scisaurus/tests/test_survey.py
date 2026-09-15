@@ -19,6 +19,7 @@ from scisaurus.core.surveys import SurveyGate
 from scisaurus.runtime.execution import _invoke_worker
 from scisaurus.runtime.literature import ProviderCooldownError
 from scisaurus.runtime.survey import (SurveyRunner, apply_scoped_map_repair,
+                                      normalize_map_relationships,
                                       overlay_post_checkpoint_relationships)
 from scisaurus.runtime.survey_config import validate_survey_config
 from scisaurus.runtime.survey_records import GAP_CHECKS, MAP_FIELDS, SURVEY_CHECKS, validate_map
@@ -56,6 +57,14 @@ class SurveyHTTPFixture(BaseHTTPRequestHandler):
         path = urlsplit(self.path)
         query = parse_qs(path.query)
         self.requests.append({"path": path.path, "query": query})
+        if path.path == "/works/W404":
+            body = json.dumps({"error": "Work not found"}).encode()
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if (self.rate_limit_once is not None
                 and query.get("search", [None])[0] == self.rate_limit_once):
             type(self).rate_limit_once = None
@@ -404,6 +413,19 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertIn({"source": "W301", "target": "W101", "kind": "cites"}, mapping["citation_edges"])
         self.assertIsNotNone(result["time_plan"]["first_verified_result"])
         self.assertTrue(result["event_chain"][0])
+
+    def test_missing_seed_work_is_recorded_without_pagination_key_error(self):
+        config = survey_config(self.endpoint)
+        config["survey"]["seed_work_ids"] = ["W404"]
+        runner = self.runtime(config)
+        result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        missing = [row for row in runner.search_log
+                   if row["request"]["operation"] == "work"
+                   and row["request"]["work_id"] == "W404"]
+        self.assertEqual(len(missing), 1)
+        self.assertEqual({key: missing[0][key] for key in ("count", "next_cursor", "has_more")},
+                         {"count": 0, "next_cursor": None, "has_more": False})
 
     def test_countersearch_reserve_prevents_discovery_from_filling_work_budget(self):
         config = survey_config(self.endpoint)
@@ -971,6 +993,25 @@ class TestSurveyContracts(unittest.TestCase):
             validate_map(value, ["W101"], {"W101", "W102"}, sources)
         claim["evidence"].append({"work_id": "W102", "source_ref": "source-two", "quote": "Recall timing is examined."})
         validate_map(value, ["W101"], {"W101", "W102"}, sources)
+
+    def test_flat_relationship_statement_is_canonicalized_without_dropping_evidence(self):
+        entry = {"work_id": "W101", "inclusion": "included", "reason": "The source examines recall timing.",
+                 **{field: {"text": None, "evidence": []} for field in MAP_FIELDS}}
+        sources = {"source-one": {"work_id": "W101", "text": "Recall timing is examined."},
+                   "source-two": {"work_id": "W102", "text": "Recall timing is examined."}}
+        evidence = [
+            {"work_id": "W101", "source_ref": "source-one", "quote": "Recall timing is examined."},
+            {"work_id": "W102", "source_ref": "source-two", "quote": "Recall timing is examined."},
+        ]
+        value = {"entries": [entry], "relationships": [{
+            "source": "W101", "target": "W102", "kind": "compares",
+            "claim": "Both works examine recall timing.", "evidence": evidence,
+        }]}
+        canonical = normalize_map_relationships(value)
+        self.assertEqual(canonical["relationships"][0]["claim"], {
+            "text": value["relationships"][0]["claim"], "evidence": evidence})
+        self.assertNotIn("evidence", canonical["relationships"][0])
+        validate_map(canonical, ["W101"], {"W101", "W102"}, sources)
 
     def test_invalid_seed_and_time_contract_rejected_before_run(self):
         config = survey_config("http://127.0.0.1:1/works")

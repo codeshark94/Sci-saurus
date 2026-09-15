@@ -209,6 +209,35 @@ class MaturityModel:
                            elapsed_seconds=0.01, finish_reason="stop")
 
 
+class SourceChallengeRefinementModel(FakeModel):
+    """Reject the first source challenge, then admit its bounded repair."""
+
+    calls = []
+    challenge_count = 0
+
+    def complete(self, *, system, prompt, images=None):
+        payload = json.loads(prompt)
+        self.calls.append(payload.get("assignment"))
+        if payload.get("assignment") == "topic_source_and_template_challenge":
+            type(self).challenge_count += 1
+            admitted = type(self).challenge_count > 1
+            review = {
+                "schema_version": "topic-source-challenge-1",
+                "decision": "admit_to_survey" if admitted else "refine",
+                "selected_id": payload["selected_topic"]["id"],
+                "source_relevance": 4,
+                "template_independence": 4 if admitted else 2,
+                "prior_work_risk": "low" if admitted else "high",
+                "closest_work_ids": [payload["targeted_scholarly_records"][0]["work_id"]],
+                "rationale": "The first direction needs a changed boundary; the repaired direction is distinct.",
+                "required_changes": [] if admitted else ["Change the mechanism and comparison boundary."],
+            }
+            return ModelResult(text=json.dumps(review), model="fake",
+                               usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                               elapsed_seconds=0.01, finish_reason="stop")
+        return super().complete(system=system, prompt=prompt, images=images)
+
+
 class TopicDiscoveryTests(unittest.TestCase):
     def test_config_and_package_contracts(self):
         with tempfile.TemporaryDirectory() as path:
@@ -226,6 +255,11 @@ class TopicDiscoveryTests(unittest.TestCase):
             self.assertEqual(validate_topic_stage_config(config), config)
             value = package("Choose a feasible research direction")
             self.assertEqual(validate_topic_package(value, objective=value["objective"], candidate_count=3), value)
+
+    def test_frontier_seed_scaffolding_is_not_checked_as_reader_prose(self):
+        plan = frontier_plan()
+        plan["seeds"][0]["mechanism"] = "independent validator of competing transport"
+        self.assertEqual(validate_frontier_seed_plan(plan), plan)
 
     def test_maturity_review_contract_requires_substantive_admission(self):
         review = {
@@ -262,6 +296,21 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["maturity_review_history"][0]["review"]["decision"], "refine")
         self.assertEqual(result["maturity_score"], 18)
         self.assertIn("across clean and contaminated regimes", result["question"])
+
+    def test_runner_carries_source_challenge_feedback_into_repair(self):
+        SourceChallengeRefinementModel.calls = []
+        SourceChallengeRefinementModel.challenge_count = 0
+        with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", FakeOpenAlex), \
+                patch("scisaurus.runtime.topic_discovery.ModelClient", SourceChallengeRefinementModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+            }).run("Choose a feasible research direction", candidate_count=3,
+                   max_attempts=2, maturity_review_rounds=0)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(SourceChallengeRefinementModel.challenge_count, 2)
+        self.assertEqual(SourceChallengeRefinementModel.calls.count("refine_topic_discovery"), 1)
+        self.assertEqual(result["source_challenge"]["decision"], "admit_to_survey")
 
     def test_samples_recent_records_with_unicode_objective_and_reproducible_shuffle(self):
         FakeOpenAlex.queries = []
@@ -312,6 +361,19 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(len(snapshot["events"]), 3)
         self.assertTrue(all(event["status"] == "error" for event in snapshot["events"]))
         self.assertTrue(all(event["request_attempts"] == 2 for event in snapshot["events"]))
+
+    def test_validation_after_external_response_is_kept_in_diagnostics(self):
+        budget = TopicBudget({"max_model_calls": 2}, {})
+        budget.before_model_call("topic_discovery", "fake")
+        budget.record_model_result(ModelResult(
+            text="{}", model="fake",
+            usage={"model_calls": 1, "input_tokens": 1, "output_tokens": 1},
+            elapsed_seconds=0.01, finish_reason="stop"))
+        budget.record_validation_error(ValidationError("source challenge requires refinement"))
+        events = budget.snapshot()["events"]
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[-1]["kind"], "validation")
+        self.assertIn("source challenge", events[-1]["error"])
 
     def test_topic_sampling_rejects_single_token_provider_false_positives(self):
         class MixedRelevanceOpenAlex:

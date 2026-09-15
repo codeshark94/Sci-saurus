@@ -1306,6 +1306,32 @@ class ComposerWorkflowTests(unittest.TestCase):
                     "SELECT state FROM tasks WHERE task_id=?", (recovery_task,)).fetchone()[0],
                     "completed")
 
+    def test_terminal_run_report_does_not_mask_a_more_advanced_live_checkpoint(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            task = runner._stage_task(workflow["stages"][0])
+            attempt_id = "live-checkpoint-attempt"
+            runner.tasks.start_attempt(attempt_id=attempt_id, task_id=task["task_id"],
+                                       owner="command.composer", lease_ttl_seconds=30)
+            runner.stage_records["survey"] = {
+                "kind": "survey", "status": "completed", "attempt_id": attempt_id,
+                "attempt_number": 1, "project_dir": workflow["stages"][0]["project_dir"],
+                "task_id": task["task_id"],
+            }
+            runner.context["survey"] = {"status": "completed", "kind": "survey"}
+            runner._checkpoint("survey:completed", force=True)
+            runner.stage_records["survey"]["status"] = "blocked"
+            runner.context = {}
+            runner.status = "blocked"
+            runner._finish()
+
+            resumed = ComposerRunner(workflow, resume=True)
+            self.assertEqual(resumed.stage_records["survey"]["status"], "completed")
+            self.assertEqual(resumed.context["survey"]["status"], "completed")
+            resumed.close()
+
     def test_deadline_prevents_continuation_activation(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)

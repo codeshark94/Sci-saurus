@@ -52,6 +52,37 @@ def apply_scoped_map_repair(wid, previous, old_relationships, feedback, patch):
     return {"entries": [entry], "relationships": [*retained, *deepcopy(relations)]}
 
 
+def normalize_map_relationships(value):
+    """Canonicalize the one legacy flat relationship shape emitted by workers.
+
+    The public map contract stores ``claim`` as a Statement. Some model
+    responses place that Statement's ``evidence`` beside a string ``claim``
+    instead. This conversion is deliberately exact-shape and lossless; all
+    evidence and the strict map validator remain in force after conversion.
+    Unknown fields or other malformed shapes are left untouched and must fail
+    validation rather than being silently discarded.
+    """
+    if not isinstance(value, dict) or not isinstance(value.get("relationships"), list):
+        return value
+    normalized = deepcopy(value)
+    relationships = []
+    for relation in normalized["relationships"]:
+        if (isinstance(relation, dict)
+                and set(relation) == {"source", "target", "kind", "claim", "evidence"}
+                and isinstance(relation["claim"], str)
+                and isinstance(relation["evidence"], list)):
+            relationships.append({
+                "source": relation["source"],
+                "target": relation["target"],
+                "kind": relation["kind"],
+                "claim": {"text": relation["claim"], "evidence": relation["evidence"]},
+            })
+        else:
+            relationships.append(relation)
+    normalized["relationships"] = relationships
+    return normalized
+
+
 def overlay_post_checkpoint_relationships(relationships, checkpoint_created_at, candidates):
     """Recover validated relationship versions newer than an aggregate checkpoint."""
     restored = dict(relationships)
@@ -929,11 +960,31 @@ class SurveyRunner(ExecutionRuntime):
                 except ProviderCooldownError as cooldown:
                     raise cooldown from exc
             raise
+        if not isinstance(result, dict) or not isinstance(result.get("works"), list):
+            raise ValidationError("bibliographic capability returned no normalized works list")
+        metadata = result.get("metadata")
+        if not isinstance(metadata, dict):
+            raise ValidationError("bibliographic capability returned no metadata object")
+        # A concrete OpenAlex work lookup can legitimately return a verified
+        # 404.  That negative result has no list-pagination ``meta`` block,
+        # but it still needs a durable query record so citation expansion can
+        # continue.  Search and citing responses must retain the full page
+        # contract; do not turn a malformed successful response into a zero-
+        # result record.
+        if (operation == "work" and result.get("outcome") == "not_found"
+                and metadata.get("http_status") == 404 and not result["works"]):
+            page = {"count": 0, "next_cursor": None, "has_more": False}
+        else:
+            required = ("count", "next_cursor", "has_more")
+            if any(key not in metadata for key in required):
+                raise ValidationError(
+                    "bibliographic capability returned incomplete pagination metadata "
+                    f"for {operation} ({result.get('outcome')})")
+            page = {key: metadata[key] for key in required}
         added = self._ingest(result["works"], execution, admission=admission)
-        metadata = result["metadata"]
         body = {"request": arguments, "role": role, "execution_ref": execution, "plan_ref": plan_ref,
                 "returned_work_ids": [w["id"] for w in result["works"]], "new_unique_works": added,
-                "count": metadata["count"], "next_cursor": metadata["next_cursor"], "has_more": metadata["has_more"]}
+                "count": page["count"], "next_cursor": page["next_cursor"], "has_more": page["has_more"]}
         record = self._publish(f"kb/queries/{self.api_calls}", "query_record", body, role,
                                subjects=[execution, *([plan_ref] if plan_ref else [])])
         self.query_refs.append(record["artifact_ref"])
@@ -1398,6 +1449,7 @@ class SurveyRunner(ExecutionRuntime):
             }
 
         def normalize(value):
+            value = normalize_map_relationships(value)
             if not own_sources:
                 return source_less_value(value)
             return self._bind_visible_spans(value, sources)

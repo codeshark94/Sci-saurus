@@ -8,8 +8,9 @@ different model.
 
 ## Provider settings
 
-The owner-only file `local-private/ollama-cloud.env` contains settings, not
-credentials:
+The owner-only file `local-private/ollama-cloud.env` contains model settings,
+not credentials. OpenAlex authentication, when enabled, is kept separately in
+`local-private/openalex.env` with mode `600`:
 
 ```bash
 SCISAURUS_OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
@@ -38,10 +39,9 @@ set -a; . local-private/ollama-cloud.env; set +a
 ```
 
 Do not point a run at a local Qwen model, a retired Tailnet endpoint, or a
-provider-specific credential variable. OpenAlex authentication is independent:
-set `SCISAURUS_OPENALEX_API_KEY` in the launcher environment or a separate
-owner-only environment file when authenticated bibliography capacity is
-available.
+provider-specific model credential variable. The launchers automatically load
+`local-private/openalex.env` when present; only the variable name is stored in
+descriptors.
 
 ## Runtime policy
 

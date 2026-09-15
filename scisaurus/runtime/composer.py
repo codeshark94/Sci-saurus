@@ -2636,6 +2636,46 @@ class ComposerRunner:
 
         return finish
 
+    @staticmethod
+    def _ready_stage_ids(state):
+        stages = state.get("stages", {}) if isinstance(state, dict) else {}
+        if not isinstance(stages, dict):
+            return set()
+        return {
+            stage_id for stage_id, record in stages.items()
+            if isinstance(record, dict) and record.get("status") in STAGE_READY_STATUSES
+        }
+
+    @classmethod
+    def _checkpoint_advances_terminal_state(cls, checkpoint, terminal):
+        """Recognize an in-flight checkpoint that supersedes a stale final report."""
+        if not isinstance(checkpoint, dict) or checkpoint.get("status") != "running":
+            return False
+        if not isinstance(terminal, dict):
+            return True
+        return cls._ready_stage_ids(checkpoint) > cls._ready_stage_ids(terminal)
+
+    def _latest_inflight_checkpoint(self):
+        """Read the newest durable running checkpoint when output was finalized stale."""
+        rows = self.control._conn.execute(
+            "SELECT manifest_json FROM artifacts "
+            "WHERE logical_id LIKE 'command/composer/checkpoints/%' "
+            "ORDER BY created_at DESC"
+        ).fetchall()
+        for row in rows:
+            try:
+                manifest = json.loads(row["manifest_json"])
+                if manifest.get("artifact_type") != "progress_checkpoint":
+                    continue
+                checkpoint = json.loads(self.store.read_body(manifest["body_hash"]))
+            except (KeyError, OSError, TypeError, ValueError):
+                continue
+            if (isinstance(checkpoint, dict)
+                    and checkpoint.get("workflow_id") == self.workflow["id"]
+                    and checkpoint.get("status") == "running"):
+                return checkpoint
+        return None
+
     def _restore(self):
         timing_state = None
         # The run input is the earliest durable record and carries the seed
@@ -2651,8 +2691,10 @@ class ComposerRunner:
                 self.exploration_seed = input_body["exploration_seed"]
         head = self.store.head("command/composer/run")
         head_status = None
+        head_body = None
         if head is not None:
             body = json.loads(self.store.read_body(head["body_hash"]))
+            head_body = body
             self.status = body.get("status", "running")
             head_status = self.status
             self.stage_records = body.get("stages", {})
@@ -2678,35 +2720,47 @@ class ComposerRunner:
         # A process can die after a checkpoint but before publishing the final
         # run report.  Restore that checkpoint as the authoritative in-flight
         # state so the next Composer invocation can mark an interrupted
-        # attempt unknown and dispatch a fresh one.
-        if (head is None or head_status == "running") and progress_path.is_file():
+        # attempt unknown and dispatch a fresh one.  If cleanup did publish a
+        # stale terminal report afterward, recover the newest durable running
+        # checkpoint only when it contains strictly more admitted stages.
+        checkpoint = None
+        if progress_path.is_file():
             try:
                 checkpoint = json.loads(progress_path.read_text())
             except (OSError, ValueError):
                 checkpoint = None
-            if isinstance(checkpoint, dict):
-                timing_state = checkpoint
-                self.stage_records = checkpoint.get("stages", self.stage_records)
-                if "context" in checkpoint:
-                    self.context = checkpoint.get("context", self.context)
-                self.feedback = checkpoint.get("feedback", self.feedback)
-                self.blockers = checkpoint.get("blockers", self.blockers)
-                self.usage = checkpoint.get("usage", self.usage)
-                self.deadline_decisions = checkpoint.get("deadline_decisions", self.deadline_decisions)
-                self.continuation_cycles = checkpoint.get("continuation_cycles", self.continuation_cycles)
-                self.reopened_stage_ids = set(checkpoint.get("reopened_stage_ids", self.reopened_stage_ids))
-                self.continuation_pending_stage_ids = set(checkpoint.get(
-                    "continuation_pending_stage_ids", self.continuation_pending_stage_ids))
-                self.active_research_requests = checkpoint.get(
-                    "active_research_requests", self.active_research_requests)
-                self.department_activity = checkpoint.get("department_activity", self.department_activity)
-                self.deadline_extensions = checkpoint.get("deadline_extensions", self.deadline_extensions)
-                if (type(checkpoint.get("exploration_seed")) is int
-                        and checkpoint["exploration_seed"] >= 0):
-                    self.exploration_seed = checkpoint["exploration_seed"]
-                if isinstance(checkpoint.get("organization"), dict):
-                    self.organization_snapshot = deepcopy(checkpoint["organization"])
-                self._progress_snapshot = deepcopy(checkpoint)
+        if head is None or head_status == "running":
+            live_checkpoint = checkpoint if isinstance(checkpoint, dict) else self._latest_inflight_checkpoint()
+        elif self._checkpoint_advances_terminal_state(checkpoint, head_body):
+            live_checkpoint = checkpoint
+        else:
+            candidate = self._latest_inflight_checkpoint()
+            live_checkpoint = (candidate
+                               if self._checkpoint_advances_terminal_state(candidate, head_body)
+                               else None)
+        if isinstance(live_checkpoint, dict):
+            timing_state = live_checkpoint
+            self.stage_records = live_checkpoint.get("stages", self.stage_records)
+            if "context" in live_checkpoint:
+                self.context = live_checkpoint.get("context", self.context)
+            self.feedback = live_checkpoint.get("feedback", self.feedback)
+            self.blockers = live_checkpoint.get("blockers", self.blockers)
+            self.usage = live_checkpoint.get("usage", self.usage)
+            self.deadline_decisions = live_checkpoint.get("deadline_decisions", self.deadline_decisions)
+            self.continuation_cycles = live_checkpoint.get("continuation_cycles", self.continuation_cycles)
+            self.reopened_stage_ids = set(live_checkpoint.get("reopened_stage_ids", self.reopened_stage_ids))
+            self.continuation_pending_stage_ids = set(live_checkpoint.get(
+                "continuation_pending_stage_ids", self.continuation_pending_stage_ids))
+            self.active_research_requests = live_checkpoint.get(
+                "active_research_requests", self.active_research_requests)
+            self.department_activity = live_checkpoint.get("department_activity", self.department_activity)
+            self.deadline_extensions = live_checkpoint.get("deadline_extensions", self.deadline_extensions)
+            if (type(live_checkpoint.get("exploration_seed")) is int
+                    and live_checkpoint["exploration_seed"] >= 0):
+                self.exploration_seed = live_checkpoint["exploration_seed"]
+            if isinstance(live_checkpoint.get("organization"), dict):
+                self.organization_snapshot = deepcopy(live_checkpoint["organization"])
+            self._progress_snapshot = deepcopy(live_checkpoint)
         self._restore_context_from_stage_records()
         # Older Composer reports did not carry an epoch fence.  They retain
         # their historical restart behavior; every new run persists the
@@ -2969,7 +3023,7 @@ class ComposerRunner:
             existing = self.tasks.get(task_id)
         except NotFoundError:
             existing = None
-        if (isinstance(prior_record, dict) and prior_record.get("status") == "running"
+        if (isinstance(prior_record, dict) and prior_record.get("status") in {"running", "retrying"}
                 and existing is not None and existing["state"] in {"completed", "failed", "cancelled", "stale"}):
             # The task may have reached a terminal lifecycle state just
             # before the Composer crashed while recording its stage result.
@@ -3110,7 +3164,8 @@ class ComposerRunner:
                     snapshot = getattr(exc, "topic_budget", {})
                     snapshot = snapshot if isinstance(snapshot, dict) else {}
                     raise QuotaExceededError(
-                        "topic discovery exhausted its bounded intake budget",
+                        "topic discovery bounded intake exhausted after "
+                        f"{descriptor['max_attempts']} attempts: {exc}",
                         dimension="topic_attempts", limit=descriptor["max_attempts"],
                         observed=descriptor["max_attempts"],
                         usage=snapshot.get("usage", {}),
