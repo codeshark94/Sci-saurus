@@ -41,6 +41,19 @@ inbox, and admits a request as a typed work-order task with a stable identity.
 The optional workflow `organization` field can replace the default charter
 while preserving the same schema and authority checks.
 
+The runtime organization is `project-organization-2`. Each charter publishes
+an eligible specialist pool with a role contract, bounded input projection,
+internal runner-role aliases, and call/token/time quota. The pool is
+on-demand: stage admission creates a separate task and assignment artifact for
+each selected role, then records `required_agents`, `active_agents`, and a
+separate `verifier_agent` in the checkpoint. Existing stage runners remain the
+execution boundary, so aggregate runner usage is retained as
+`stage_unattributed` until a runner can report role-level usage. A completed
+assignment produces a specialist outcome artifact, a chief synthesis, and an
+independent adversarial verdict; the chief cannot author its own verdict.
+Legacy `project-organization-1` charters are normalized on admission and
+custom chief/adversary appointments are retained.
+
 The command desk turns valid specialist requests into work. A research,
 experiment, interpretation, or manuscript request is activated when its scoped
 continuation closure is admitted and is resolved only after the owning stage

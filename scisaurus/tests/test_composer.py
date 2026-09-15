@@ -89,6 +89,37 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(result["organization"]["backlog_counts"]["research"]["completed"], 1)
             self.assertEqual(result["organization"]["backlog_counts"]["methods"]["completed"], 1)
 
+    def test_fake_stage_end_to_end_records_specialist_activation_and_verdict(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+
+            def fake_stage(stage):
+                output = root / f"{stage['id']}-specialist-result.json"
+                output.write_text(json.dumps({"stage": stage["id"], "checked": True}))
+                return {"status": "completed", "output_path": str(output),
+                        "project_dir": stage["project_dir"], "stage_id": stage["id"]}
+
+            runner._run_stage = fake_stage
+            result = runner.run()
+            self.assertEqual(result["organization"]["schema_version"], "project-organization-2")
+            for stage_id in ("survey", "experiment"):
+                record = result["stages"][stage_id]
+                self.assertTrue(record["active_agents"])
+                self.assertTrue(record["assignment_ids"])
+                self.assertNotEqual(record["chief_agent"], record["verifier_agent"])
+                self.assertTrue(record["verifier_artifact_ref"].startswith("artifact:"))
+                self.assertEqual(record["verifier_outcome"], "accepted")
+            self.assertEqual(result["organization"]["active_assignments"], [])
+            assignment_count = sum(
+                counts["completed"] for counts in result["organization"]["assignment_counts"].values())
+            self.assertGreaterEqual(assignment_count, 2)
+            with sqlite3.connect(root / "composer" / "state" / "control.sqlite") as conn:
+                assignment_tasks = conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE payload_json LIKE '%assignment_id%'").fetchone()[0]
+            self.assertGreaterEqual(assignment_tasks, 2)
+
     def test_candidate_release_is_forwarded_for_principal_review(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -962,7 +993,8 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertIn("continuations/cycle-1", calls[-1][1])
             self.assertEqual(result["stages"]["experiment"]["attempt_count"], 2)
             self.assertTrue(any(item["action"] == "continue_research" for item in result["feedback"]))
-            self.assertEqual(result["department_activity"][0]["action"], "activate_work_orders")
+            self.assertTrue(any(item["action"] == "activate_work_orders"
+                                for item in result["department_activity"]))
             self.assertTrue(any(item["action"] == "resolve_work_orders" and item["outcome"] == "completed"
                                 for item in result["department_activity"]))
 

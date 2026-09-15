@@ -296,6 +296,15 @@ semantics; the producing appointment and adversary must be distinct. Composer
 tasks, handoffs, checkpoints, and organization manifests expose the role,
 department, owner, adversary, and executive command addresses separately.
 
+**D67 — Specialist pools are bounded, role-isolated, and independently checked.**
+The v2 project organization publishes an eligible specialist pool but activates
+only the roles admitted for the current stage and quota. Each activation has a
+separate task, bounded input projection, role contract, artifact namespace, and
+call/token/time reservation. The stage records its required and active agents,
+then a chief synthesis and an adversarial verdict authored by a different
+appointment. Specialist failure or unknown external outcome remains scoped to
+that assignment and is never collapsed into a false whole-workflow success.
+
 ### 3.3 Effective interpretation of earlier rules
 
 | Earlier wording | Effective interpretation |
@@ -449,3 +458,4 @@ These defaults make the blueprint internally concrete; they do not falsely mark 
 | v1.6 | D63; append-only cross-run topic memory, capability rotation, and selected-direction novelty gate |
 | v1.7 | D64; topic-maturity admission, evidence-driven topic refinement, and lineage-preserving re-entry |
 | v1.8 | D65–D66; pre-composition scientific red-team gate and single-source functional routing with concrete agent roster |
+| v1.9 | D67; project-organization-2 bounded specialist pool, role-isolated Composer assignments, independent verdict artifacts, and v1 migration |

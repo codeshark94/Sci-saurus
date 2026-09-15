@@ -343,6 +343,12 @@ class ComposerRunner:
             self.control, self.store, self.messages, self.tasks,
             project_id=self.workflow["project_id"], organization=self.workflow.get("organization"),
         )
+        if resume:
+            # Specialist attempts have their own leases in addition to the
+            # Composer stage attempt.  Reconcile those durable child leases
+            # before restoring the checkpoint so a restarted run cannot
+            # silently reuse an in-flight external call.
+            self.departments.reconcile_interrupted_assignments()
         # The live progress ticker runs in a background thread while the
         # project ledger is deliberately bound to the Composer thread.  Keep a
         # plain-data snapshot for that ticker; SQLite connections are not
@@ -1485,7 +1491,14 @@ class ComposerRunner:
         if isinstance(role, str):
             department = role.split(".", 1)[0]
             if department in self.departments.charters:
-                return self.departments.address(department)
+                try:
+                    assignment = self.departments.resolve_address(role)
+                    return {"dept": assignment["department"], "agent": assignment["agent"]}
+                except ValidationError:
+                    return deepcopy(COMMAND_ADDRESSES["arbiter"])
+            assignment = self.departments.role_for_internal_role(role)
+            if assignment is not None:
+                return {"dept": assignment["department"], "agent": assignment["agent"]}
         return deepcopy(COMMAND_ADDRESSES.get(role, COMMAND_ADDRESSES["arbiter"]))
 
     @staticmethod
@@ -2756,7 +2769,8 @@ class ComposerRunner:
             if (type(body.get("exploration_seed")) is int
                     and body["exploration_seed"] >= 0):
                 self.exploration_seed = body["exploration_seed"]
-            if isinstance(body.get("organization"), dict):
+            if (isinstance(body.get("organization"), dict)
+                    and body["organization"].get("schema_version") == self.departments.organization["schema_version"]):
                 self.organization_snapshot = deepcopy(body["organization"])
             self._progress_snapshot = deepcopy(body)
             timing_state = body
@@ -2802,7 +2816,8 @@ class ComposerRunner:
             if (type(live_checkpoint.get("exploration_seed")) is int
                     and live_checkpoint["exploration_seed"] >= 0):
                 self.exploration_seed = live_checkpoint["exploration_seed"]
-            if isinstance(live_checkpoint.get("organization"), dict):
+            if (isinstance(live_checkpoint.get("organization"), dict)
+                    and live_checkpoint["organization"].get("schema_version") == self.departments.organization["schema_version"]):
                 self.organization_snapshot = deepcopy(live_checkpoint["organization"])
             self._progress_snapshot = deepcopy(live_checkpoint)
         self._restore_context_from_stage_records()
@@ -3092,8 +3107,38 @@ class ComposerRunner:
             "depends_on": stage["depends_on"], "config_path": stage["config_path"],
             "department": route["department"], "role": route["role"],
             "owner_agent": route["chief"], "adversary_agent": route["adversary"],
+            "required_role_ids": route["required_role_ids"],
+            "required_agents": route["required_agents"],
+            "verifier_agent": route["verifier_agent"],
+            "role_quotas": route["role_quotas"],
+            "assignment_policy": "bounded_on_demand_role_isolated",
         }, "command.composer")
         return self.tasks.admit(task_id, "command.composer")
+
+    @staticmethod
+    def _stage_assignment_fields(plan, result=None):
+        """Project role dispatch evidence into a compact stage checkpoint."""
+        if not isinstance(plan, dict):
+            return {}
+        fields = {
+            "required_agents": deepcopy(plan.get("required_agents", [])),
+            "active_agents": deepcopy(plan.get("active_agents", [])),
+            "verifier_agent": plan.get("verifier_agent"),
+            "chief_agent": plan.get("chief_agent"),
+            "role_quotas": deepcopy(plan.get("role_quotas", {})),
+            "assignment_plan_ref": plan.get("plan_ref"),
+            "assignment_ids": deepcopy(plan.get("assignment_ids", [])),
+            "assignment_task_ids": deepcopy(plan.get("task_ids", [])),
+            "assignment_deadline_seconds": plan.get("deadline_seconds"),
+        }
+        if isinstance(result, dict):
+            fields.update({
+                "chief_synthesis_ref": result.get("chief_synthesis_ref"),
+                "verifier_artifact_ref": result.get("verifier_artifact_ref"),
+                "verifier_outcome": result.get("verifier_outcome"),
+                "specialist_assignments": deepcopy(result.get("assignments", [])),
+            })
+        return fields
 
     def _run_stage(self, stage, *, attempt_number=1):
         """Dispatch one allowlisted specialist runner and return its context."""
@@ -3454,6 +3499,7 @@ class ComposerRunner:
 
     def _record_feedback(self, stage, context):
         route = self.departments.stage_route(stage["kind"])
+        assignment = self.stage_records.get(stage["id"], {})
         action = ("advance" if context.get("status") in {"completed", "accepted", "candidate_needs_review"}
                   else "reconcile_blocker")
         if context.get("status") == "research_expansion_required":
@@ -3479,6 +3525,11 @@ class ComposerRunner:
             "department": route["department"],
             "owner_agent": route["chief"],
             "adversary_agent": route["adversary"],
+            "required_agents": deepcopy(assignment.get("required_agents", route["required_agents"])),
+            "active_agents": deepcopy(assignment.get("active_agents", [])),
+            "verifier_agent": assignment.get("verifier_agent", route["verifier_agent"]),
+            "chief_synthesis_ref": assignment.get("chief_synthesis_ref"),
+            "verifier_artifact_ref": assignment.get("verifier_artifact_ref"),
             "from": COMMAND_ADDRESSES["progress"], "to": recipient,
             "status": context.get("status"), "output_path": context.get("output_path"),
             "scientific_state": context.get("gap_state") or context.get("review_status") or context.get("argument_status"),
@@ -3579,6 +3630,21 @@ class ComposerRunner:
         failure = event.get("kind", "").endswith("failure") or status == "blocked"
         recipient = self._feedback_address(event)
         route = self.departments.stage_route(stage["kind"])
+        internal_role = None
+        reviewer_id = event.get("reviewer_id")
+        if reviewer_id == "science":
+            internal_role = "review.science"
+        elif reviewer_id == "methods":
+            internal_role = "review.methods"
+        elif reviewer_id == "journal_editor":
+            internal_role = "review.journal_editor"
+        elif event.get("kind") in {"argument", "draft"}:
+            internal_role = "strategy.argument"
+        elif event.get("kind") == "release":
+            internal_role = "editorial.writer"
+        internal_assignment = (self.departments.role_for_internal_role(internal_role)
+                               if internal_role else None)
+        stage_assignment = self.stage_records.get(stage["id"], {})
         action = ("reconcile_blocker" if failure else
                   "request_research_expansion" if status == "research_expansion_required" else
                   "editor_rejected" if status == "rejected" else
@@ -3593,6 +3659,12 @@ class ComposerRunner:
             "department": route["department"],
             "owner_agent": route["chief"],
             "adversary_agent": route["adversary"],
+            "required_agents": deepcopy(stage_assignment.get("required_agents", route["required_agents"])),
+            "active_agents": deepcopy(stage_assignment.get("active_agents", [])),
+            "verifier_agent": stage_assignment.get("verifier_agent", route["verifier_agent"]),
+            "internal_role": internal_role,
+            "internal_agent": ({"dept": internal_assignment["department"], "agent": internal_assignment["agent"]}
+                                if internal_assignment else None),
             "from": {"dept": "specialist-review", "agent": event["kind"]},
             "to": recipient,
             "status": status,
@@ -3670,11 +3742,17 @@ class ComposerRunner:
 
     def _record_blocker_feedback(self, stage, error):
         route = self.departments.stage_route(stage["kind"])
+        assignment = self.stage_records.get(stage["id"], {})
         feedback = {
             "stage_id": stage["id"], "role": route["role"],
             "department": route["department"],
             "owner_agent": route["chief"],
             "adversary_agent": route["adversary"],
+            "required_agents": deepcopy(assignment.get("required_agents", route["required_agents"])),
+            "active_agents": deepcopy(assignment.get("active_agents", [])),
+            "verifier_agent": assignment.get("verifier_agent", route["verifier_agent"]),
+            "chief_synthesis_ref": assignment.get("chief_synthesis_ref"),
+            "verifier_artifact_ref": assignment.get("verifier_artifact_ref"),
             "from": COMMAND_ADDRESSES["progress"], "to": COMMAND_ADDRESSES["arbiter"],
             "status": "blocked", "action": "reconcile_blocker",
             "error": str(error), "stage_deadline_seconds": stage["deadline_seconds"],
@@ -3844,7 +3922,33 @@ class ComposerRunner:
                         }
                         self._checkpoint(f"{stage_id}:admitted", force=True)
                         stop_live_progress = self._start_live_progress(attempt_stage)
+                        stage_assignment = None
                         try:
+                            stage_assignment = self.departments.begin_stage(
+                                stage_id, stage["kind"], attempt_number=attempt_number,
+                                input_ref={
+                                    "kind": "composer_stage_task", "ref": task_id,
+                                    "digest": hashlib.sha256(canonical_bytes({
+                                        "stage_id": stage_id, "attempt_number": attempt_number,
+                                        "project_dir": attempt_stage["project_dir"],
+                                    })).hexdigest(),
+                                },
+                                deadline_seconds=min(float(stage["deadline_seconds"]), self._remaining()),
+                            )
+                            self.stage_records[stage_id].update(
+                                self._stage_assignment_fields(stage_assignment))
+                            self.department_activity.append({
+                                "cycle": self.continuation_cycles,
+                                "action": "activate_specialist_pool",
+                                "stage_id": stage_id,
+                                "attempt_number": attempt_number,
+                                "required_agents": deepcopy(stage_assignment["required_agents"]),
+                                "active_agents": deepcopy(stage_assignment["active_agents"]),
+                                "verifier_agent": stage_assignment["verifier_agent"],
+                                "assignment_plan_ref": stage_assignment["plan_ref"],
+                                "assignment_ids": deepcopy(stage_assignment["assignment_ids"]),
+                            })
+                            self._checkpoint(f"{stage_id}:specialists_admitted", force=True)
                             context = (self._run_stage(attempt_stage)
                                        if attempt_number == 1
                                        else self._run_stage(attempt_stage, attempt_number=attempt_number))
@@ -3863,6 +3967,20 @@ class ComposerRunner:
                                 value = context.get("usage", {}).get(key, 0)
                                 if type(value) in (int, float) and math.isfinite(value) and value >= 0:
                                     self.usage[key] += value
+                            assignment_result = self.departments.finish_stage(
+                                stage_id, stage["kind"], attempt_number=attempt_number,
+                                outcome=outcome, output_ref=context.get("output_path"),
+                                usage=context.get("usage", {}), actor="command.composer")
+                            self.department_activity.append({
+                                "cycle": self.continuation_cycles,
+                                "action": "complete_specialist_pool",
+                                "stage_id": stage_id,
+                                "attempt_number": attempt_number,
+                                "verifier_agent": assignment_result["verifier_agent"],
+                                "verifier_outcome": assignment_result["verifier_outcome"],
+                                "chief_synthesis_ref": assignment_result["chief_synthesis_ref"],
+                                "verifier_artifact_ref": assignment_result["verifier_artifact_ref"],
+                            })
                             self.tasks.finish_attempt(attempt_id, "succeeded", usage=context.get("usage", {}))
                             self.tasks.transition(task_id, "awaiting_review", "command.composer", reason="stage output returned")
                             if outcome not in STAGE_HOLD_STATUSES:
@@ -3900,6 +4018,7 @@ class ComposerRunner:
                                 "attempts": deepcopy(attempt_history),
                                 "output_path": context.get("output_path"),
                                 "elapsed_seconds": self.clock() - self.started,
+                                **self._stage_assignment_fields(stage_assignment, assignment_result),
                             }
                             stage_succeeded = True
                             break
@@ -3908,6 +4027,31 @@ class ComposerRunner:
                             failure_usage = self._record_failed_stage_usage(exc)
                             provider_paused = isinstance(exc, ProviderCooldownError)
                             quota_exhausted = isinstance(exc, QuotaExceededError)
+                            if stage_assignment is not None:
+                                try:
+                                    assignment_result = self.departments.finish_stage(
+                                        stage_id, stage["kind"], attempt_number=attempt_number,
+                                        outcome="blocked", output_ref=None,
+                                        usage=failure_usage, error=exc,
+                                        actor="command.composer")
+                                    self.department_activity.append({
+                                        "cycle": self.continuation_cycles,
+                                        "action": "fail_specialist_pool",
+                                        "stage_id": stage_id,
+                                        "attempt_number": attempt_number,
+                                        "verifier_agent": assignment_result["verifier_agent"],
+                                        "verifier_outcome": assignment_result["verifier_outcome"],
+                                        "chief_synthesis_ref": assignment_result["chief_synthesis_ref"],
+                                        "verifier_artifact_ref": assignment_result["verifier_artifact_ref"],
+                                    })
+                                    self.stage_records[stage_id].update(
+                                        self._stage_assignment_fields(stage_assignment, assignment_result))
+                                except (NotFoundError, StateError, ValidationError):
+                                    # Preserve the stage failure as the primary
+                                    # signal; the assignment ledger remains
+                                    # inspectable and resume can reconcile any
+                                    # child attempt still marked started.
+                                    assignment_result = None
                             try:
                                 self.tasks.finish_attempt(
                                     attempt_id, "failed", usage=failure_usage)
@@ -3928,6 +4072,16 @@ class ComposerRunner:
                             retry_open = (not provider_paused and not quota_exhausted and (
                                 retry_policy.get("mode", "bounded") == "until_deadline"
                                 or retry_index + 1 < retry_policy.get("max_attempts", 0)))
+                            assignment_fields = {
+                                key: deepcopy(self.stage_records.get(stage_id, {}).get(key))
+                                for key in (
+                                    "required_agents", "active_agents", "verifier_agent", "chief_agent",
+                                    "assignment_plan_ref", "assignment_ids", "assignment_task_ids",
+                                    "assignment_deadline_seconds", "chief_synthesis_ref",
+                                    "verifier_artifact_ref", "verifier_outcome", "specialist_assignments",
+                                )
+                                if key in self.stage_records.get(stage_id, {})
+                            }
                             self.stage_records[stage_id] = {
                                 "kind": stage["kind"],
                                 "status": ("paused" if provider_paused
@@ -3936,6 +4090,7 @@ class ComposerRunner:
                                 "attempt_count": attempt_number, "attempts": deepcopy(attempt_history),
                                 "error": f"{type(exc).__name__}: {exc}",
                                 "usage": deepcopy(failure_usage),
+                                **assignment_fields,
                             }
                             if provider_paused:
                                 retry_after = float(exc.retry_after_seconds)
@@ -3995,11 +4150,22 @@ class ComposerRunner:
                         break
                     error = last_error or ValidationError(
                         f"stage {stage_id} exhausted its retry policy")
+                    assignment_fields = {
+                        key: deepcopy(self.stage_records.get(stage_id, {}).get(key))
+                        for key in (
+                            "required_agents", "active_agents", "verifier_agent", "chief_agent",
+                            "assignment_plan_ref", "assignment_ids", "assignment_task_ids",
+                            "assignment_deadline_seconds", "chief_synthesis_ref",
+                            "verifier_artifact_ref", "verifier_outcome", "specialist_assignments",
+                        )
+                        if key in self.stage_records.get(stage_id, {})
+                    }
                     self.stage_records[stage_id] = {
                         "kind": stage["kind"], "status": "blocked",
                         "task_id": task_id,
                         "attempt_count": len(attempt_history), "attempts": deepcopy(attempt_history),
                         "error": f"{type(error).__name__}: {error}",
+                        **assignment_fields,
                     }
                     blocker = {"stage_id": stage_id, "reason": str(error),
                                "attempts": len(attempt_history)}

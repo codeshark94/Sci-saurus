@@ -38,6 +38,14 @@ The central design hypothesis: **compute → verified progress** toward the Prin
 
 Every department carries a designated **Adversarial Reviewer** with an independently reserved retrieval allowance: produce → blind challenge → respond/rebut → adjudicate → verify → select.
 
+The runtime organization is `project-organization-2`. It exposes an eligible
+bounded pool rather than a set of always-on model processes: the default
+project has 34 specialists plus five chiefs and five adversaries. A Composer
+stage activates only the roles declared by its route, reserves each role's
+call/token/time quota, and records a separate task and artifact namespace.
+The active assignment list is execution evidence; the full roster is only
+eligibility.
+
 ## What is implemented (P1, in progress)
 
 | Slice | Contents | Status |
@@ -168,7 +176,7 @@ components is routed back to Methods for additional work instead of being
 polished into a thin paper. The pre-analysis design and its artifact reference
 are retained in the result package alongside the replay and validation records.
 
-Composer creates a project-scoped organization automatically. Its default department charter is only a starting template: handoffs become durable inbox records, typed research or repair requests become department work orders, and the Composer activates and resolves the affected closure while preserving prior versions. Functional stage roles, concrete chief appointments, and independent adversarial appointments are recorded separately in the organization snapshot; the route has one source of truth in `DepartmentRuntime`. Supply an optional workflow `organization` object when a mission needs different departments or capability scopes; it must still cover every stage owner. A malformed request is retained as a rejection record, and a provider or validation failure stays on the deadline-governed retry/recovery path instead of being hidden or turning into a false completion. See [project organization](docs/15-project-organization.md) and [agent/department flow](docs/16-agent-department-flow.md) for the runtime contract.
+Composer creates a project-scoped organization automatically. Its default department charter is only a starting template: handoffs become durable inbox records, typed research or repair requests become department work orders, and the Composer activates and resolves the affected closure while preserving prior versions. Functional stage roles, concrete specialist appointments, chiefs, and independent adversarial appointments are recorded separately in the organization snapshot; the route has one source of truth in `DepartmentRuntime`. Supply an optional workflow `organization` object when a mission needs different departments or capability scopes; v1 organizations are normalized to v2 on admission and custom chief/adversary names are preserved. A malformed request is retained as a rejection record, and a provider or validation failure stays on the deadline-governed retry/recovery path instead of being hidden or turning into a false completion. See [project organization](docs/15-project-organization.md) and [agent/department flow](docs/16-agent-department-flow.md) for the runtime contract.
 
 ### Organization and agent map
 
@@ -185,20 +193,22 @@ topic/survey  experiment  interpretation paper/review/release proposal
                  Operations Cell (only when a tool/environment is needed)
 ```
 
-| Department | Lead appointment | Independent adversary | Runtime responsibility |
-|---|---|---|---|
-| Research | `research.chief` | `research.adversarial-reviewer` | Topic discovery, literature, source identity, evidence and gap assessment |
-| Methods | `methods.chief` | `methods.adversarial-reviewer` | Experiments, controls, raw outputs, replay, recalculation and analysis validity |
-| Strategy | `strategy.chief` | `strategy.adversarial-reviewer` | Interpretation, alternative mechanisms, thesis and evidence-linked argument |
-| Editorial | `editorial.editor-in-chief` | `editorial.human-scientist-reviewer` | Structured composition, multi-round review, rendering and release proposal |
-| Operations | `operations.coordinator` | `operations.operational-verifier` | Project-scoped programs, APIs, MCP services, environments and execution evidence |
+| Department | Lead appointment | Specialist pool | Independent adversary | Runtime responsibility |
+|---|---|---|---|---|
+| Research | `research.chief` | `frontier-scout`, `search-strategist`, `academic-scout`, `open-web-scout`, `technical-ecosystem-scout`, `standards-patent-scout`, `genealogy-trend-analyst`, `source-acquirer`, `citation-mapper`, `cataloger`, `fact-verifier`, `topic-maturity-reviewer` | `research.adversarial-reviewer` | Topic discovery, literature, source identity, evidence and gap assessment |
+| Methods | `methods.chief` | `methodologist`, `statistical-reviewer`, `reproducibility-reviewer`, `analysis-reviewer`, `control-designer` | `methods.adversarial-reviewer` | Experiments, controls, raw outputs, replay, recalculation and analysis validity |
+| Strategy | `strategy.chief` | `mechanism-interpreter`, `planner`, `narrative-architect`, `evidence-linker`, `section-writer`, `alternative-hypothesis-challenger` | `strategy.adversarial-reviewer` | Interpretation, alternative mechanisms, thesis and evidence-linked argument |
+| Editorial | `editorial.editor-in-chief` | `writer`, `structural-editor`, `format-editor`, `consistency-qa`, `journal-editor`, `ai-surface-reviewer`, `citation-style-editor` | `editorial.human-scientist-reviewer` | Structured composition, multi-round review, rendering and release proposal |
+| Operations | `operations.coordinator` | `tool-environment-engineer`, `execution-operator`, `operational-verifier`, `runtime-auditor` | `operations.operational-adversary` | Project-scoped programs, APIs, MCP services, environments and execution evidence |
 
 Functional stage owners are stable (`research.intelligence`, `methods.validation`,
 `strategy.interpretation`, `strategy.argument`, `editorial.composer`), while the
 concrete lead appointment can be customized per project. The Composer dispatches
 only allowlisted stages and records `role`, `department`, `owner_agent`, and
-`adversary_agent` separately. A department is an accountability boundary, not a
-permanent model process.
+`adversary_agent` separately. It also records `required_agents`, `active_agents`,
+role-isolated assignment tasks, chief synthesis, and an independent adversarial
+verdict. A department is an accountability boundary, not a permanent model
+process.
 
 Research work therefore loops by affected scope: a missing control reopens
 `experiment → interpretation → argument → paper`; a literature gap reopens

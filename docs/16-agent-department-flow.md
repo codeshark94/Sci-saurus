@@ -1,6 +1,6 @@
 # Agent, Department, and Stage Flow
 
-> **Version:** v1.0 · **Date:** 2026-09-15 · **Status:** runtime contract for project-scoped Composer workflows.
+> **Version:** v2.0 · **Date:** 2026-09-15 · **Status:** runtime contract for project-scoped Composer workflows and bounded specialist assignments.
 
 This document defines how a project turns a specialist assignment into a
 durable stage result, a departmental handoff, or a scoped continuation. It is
@@ -16,6 +16,7 @@ The runtime keeps these identities separate:
 | Functional role | The responsibility required by a stage | `methods.validation` | Stage task, feedback, route |
 | Department | The project accountability boundary | `methods` | Charter, inbox, backlog |
 | Concrete agent appointment | The current department appointment receiving work | `methods.chief` or a configured custom chief | Task owner, inbox address, organization snapshot |
+| Specialist appointment | An on-demand role selected for one stage attempt | `research.source-acquirer` | Assignment task, role contract, assignment artifact |
 
 A functional role is not a persistent model process. A department may use a
 new worker for each attempt while retaining the same charter and artifact
@@ -26,8 +27,8 @@ The route and roster are defined in
 [`scisaurus/runtime/departments.py`](../scisaurus/runtime/departments.py):
 `DEFAULT_STAGE_ROUTES` is the single functional ownership map, `stage_route()`
 projects a route through the live charter, and `agent_roster()` projects the
-concrete chief/adversary appointments. The Composer consumes these projections
-instead of maintaining a second ownership definition.
+eligible chief, specialist, and adversary appointments. The Composer consumes
+these projections instead of maintaining a second ownership definition.
 
 ## 2. Project organization
 
@@ -37,7 +38,11 @@ instead of maintaining a second ownership definition.
 | Methods | Experimental execution, controls, analysis, replay and validation | `experiment` | `methods.chief` | `methods.adversarial-reviewer` |
 | Strategy | Scientific interpretation, alternatives, thesis and argument structure | `interpretation`, `argument` | `strategy.chief` | `strategy.adversarial-reviewer` |
 | Editorial | Manuscript composition, review cycle, rendering and release proposal | `paper` | `editorial.editor-in-chief` | `editorial.human-scientist-reviewer` |
-| Operations | Project-scoped programs, APIs, MCP services and environment health | none | `operations.coordinator` | `operations.operational-verifier` |
+| Operations | Project-scoped programs, APIs, MCP services and environment health | none | `operations.coordinator` | `operations.operational-adversary` |
+
+The default Operations adversary is `operations.operational-adversary`; the
+specialist `operations.operational-verifier` is a separate deterministic role.
+Custom v1 chief/adversary names are preserved during migration.
 
 The executive command addresses are outside the departmental roster:
 
@@ -88,6 +93,18 @@ acceptance contract passes. For every stage, the runtime records:
 | `output_path` | Inspectable stage result or failure artifact |
 | `next_condition` | Evidence required before the next admission |
 
+The v2 stage admission additionally records:
+
+| Field | Purpose |
+|---|---|
+| `required_agents` | Concrete specialist appointments required by the route |
+| `active_agents` | Specialists actually activated for this attempt |
+| `verifier_agent` | Independent adversarial appointment; never the chief |
+| `assignment_ids` / `assignment_task_ids` | Role-isolated durable task identities |
+| `assignment_plan_ref` | Quota/deadline/input-projection reservation artifact |
+| `chief_synthesis_ref` | Synthesis artifact authored by the department chief |
+| `verifier_artifact_ref` | Independent verdict artifact authored by the verifier |
+
 An exploratory mission may start with `topic_discovery`; a supplied research
 object may start at `survey` or `experiment` according to its workflow. The
 route does not permit a later stage to bypass a missing upstream acceptance.
@@ -97,7 +114,13 @@ route does not permit a later stage to bypass a missing upstream acceptance.
 Every stage result passes through the same control-plane sequence:
 
 ```text
-specialist output
+Composer stage admission
+    -> bounded role plan and quota/deadline reservation
+    -> one isolated task per active specialist
+    -> existing runner/model/tool execution
+    -> specialist success/failure/unknown artifacts
+    -> chief synthesis
+    -> independent adversarial verdict
     -> stage acceptance / hold / failure
     -> Composer decision note
     -> MessageBus envelope

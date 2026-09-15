@@ -1,6 +1,6 @@
 # Sci-saurus — Project Organization and Operations
 
-> **Version:** v1.6 · **Date:** 2026-09-15 · **Status:** project-scoped department runtime, single-source stage routing, concrete agent roster, and Composer-controlled work-order lifecycle implemented; configured operational adapters remain the execution boundary.
+> **Version:** v2.0 · **Date:** 2026-09-15 · **Status:** project-scoped bounded specialist pool, role-isolated stage assignments, independent verdict artifacts, v1 migration, and Composer-controlled work-order lifecycle implemented; configured operational adapters remain the execution boundary.
 > Governed by [SSOT](00-SSOT.md) D35–D36. Integrates the [activity model](05-system-concept.md), [web/tool adapters](50-web-intelligence-integration.md), and [scoped artifact changes](45-artifact-change-control.md).
 
 ## 1. One operating organization per project
@@ -16,9 +16,10 @@ The runtime realization is `DepartmentRuntime` in
 materializes a project organization when the Composer opens a run: a default
 charter is published as an immutable command artifact, each incoming handoff
 is copied into the addressed department inbox, and a validated request becomes
-a typed work-order task. A workflow may supply a different organization
-charter, but the template is only a starting contract; actual inbox requests,
-stage results, and capability state determine which work is admitted. The
+a typed work-order task. The v2 charter also publishes an eligible specialist
+pool; it does not start one model process per roster entry. A workflow may
+supply a different organization charter, and a v1 charter is normalized by
+adding the v2 role contracts while preserving its chief/adversary names. The
 Composer records activation and resolution of scoped work orders in every
 checkpoint, so the backlog describes live work rather than a diagram of roles.
 
@@ -29,6 +30,43 @@ single route table and the projected roster are documented in
 document when adding a stage or changing a chief: the functional owner must
 remain stable, the live charter supplies the concrete appointment, and the
 checkpoint must expose both the producing chief and its independent adversary.
+
+## 2. Bounded specialist pool
+
+The default roster is 34 specialists plus the five department chiefs and five
+adversaries. Each specialist record carries a `system_contract`, bounded
+`input_projection`, `model_role`, execution kind, internal-role aliases,
+reviewer appointment, and `quota` (`max_calls`, input/output token ceilings,
+and seconds). `activation: on_demand` means a role is eligible until a stage
+admission selects it.
+
+| Department | Specialist roles |
+|---|---|
+| Research | `frontier-scout`, `search-strategist`, `academic-scout`, `open-web-scout`, `technical-ecosystem-scout`, `standards-patent-scout`, `genealogy-trend-analyst`, `source-acquirer`, `citation-mapper`, `cataloger`, `fact-verifier`, `topic-maturity-reviewer` |
+| Methods | `methodologist`, `statistical-reviewer`, `reproducibility-reviewer`, `analysis-reviewer`, `control-designer` |
+| Strategy | `mechanism-interpreter`, `planner`, `narrative-architect`, `evidence-linker`, `section-writer`, `alternative-hypothesis-challenger` |
+| Editorial | `writer`, `structural-editor`, `format-editor`, `consistency-qa`, `journal-editor`, `ai-surface-reviewer`, `citation-style-editor` |
+| Operations | `tool-environment-engineer`, `execution-operator`, `operational-verifier`, `runtime-auditor` |
+
+`DepartmentRuntime.begin_stage()` creates one task and one assignment
+namespace per selected role. The existing stage runner remains the execution
+boundary; internal roles such as `research.search-planner`,
+`research.citation-tracer`, `review.methods`, and `review.journal_editor` are
+stored as aliases on the concrete assignment instead of being free-floating
+labels. `finish_stage()` records each specialist outcome, publishes a chief
+synthesis, and then publishes an adversarial verdict authored by a different
+appointment. Role usage is marked `stage_unattributed` until a runner supplies
+per-role usage; aggregate provider usage is never copied into every role.
+
+The organization snapshot separates:
+
+| Projection | Meaning |
+|---|---|
+| `role_pool` / `agents` | Eligible appointments and their contracts |
+| `required_agents` | Roles the stage route declares as necessary |
+| `active_assignments` | Queued, running, or review-pending role tasks currently admitted |
+| `assignment_counts` / `agent_activity` | Durable role-task lifecycle and outcomes |
+| `verifier_agent` | Independent adversarial appointment for the stage |
 
 Autonomy is deadline-governed. A malformed proposal is rejected into a durable
 department record and does not terminate unrelated work. A valid blocker is
@@ -53,7 +91,7 @@ flowchart TD
     end
 ```
 
-## 2. When to activate the Operations Cell
+## 3. When to activate the Operations Cell
 
 | Trigger | Concrete work | Completion evidence |
 |---|---|---|
@@ -66,7 +104,7 @@ flowchart TD
 
 A routine search through an already enabled adapter does not require spinning up the full cell. Department workers invoke that capability directly through the control plane. An Operations Cell remains idle or inactive when no operational problem needs human-like reasoning; healthy reusable services can continue under ordinary service supervision.
 
-## 3. Responsibilities and authority
+## 4. Responsibilities and authority
 
 The cell uses roles as needed, reusing the worker pool:
 
@@ -81,7 +119,7 @@ The same implementation may serve several roles, but independent verification of
 
 The requesting department states the needed capability, intended inputs, expected output, and acceptance condition. Command binds the work to project delegation. Operations may choose and combine suitable tools within that scope and request missing resources; it cannot convert a source-extraction request into an unapproved research experiment.
 
-## 4. Activation and execution lifecycle
+## 5. Activation and execution lifecycle
 
 ```text
 department need / operational failure
@@ -99,7 +137,7 @@ Each transition is an existing Task/TaskAttempt, capability-state, and artifact/
 
 An unavailable tool, failed dependency installation, missing credential, incompatible model, inaccessible source, or invalid output remains an explicit failure/gap with the next useful action. Other independent project work can continue. A fallback is recorded as a different tool/path and must independently meet the same acceptance condition.
 
-## 5. Project execution boundary
+## 6. Project execution boundary
 
 A project ExecutionProfile binds permitted setup/run actions, hosts, package/source policies, network/data access, secret references, resource limits, mounts/output paths, and service lifetime. It can explicitly delegate installation/build and execution of suitable open-source programs inside the project environment. Within such a delegation, Operations completes setup and use without asking for another confirmation at every command or dependency.
 
@@ -109,7 +147,7 @@ Use the least complex environment that meets the tool's requirements: an isolate
 
 MCP discovery and calls occur through a real client bound to an actual project-accessible server. Verify transport, tool schema/version, allowed operations, credential scope, and a representative call. A host-app plugin listing or generated server file is not that evidence. Tool schema changes invalidate the affected binding until checked.
 
-## 6. Execution evidence and artifact control
+## 7. Execution evidence and artifact control
 
 TaskAttempts record the effective program/repository revision, package/image or environment digest where applicable, adapter version, executable/entry point, redacted parameters, working environment, exact input refs/hashes, allowed capabilities, resource use, process/request identity, start/end status, and output/error artifact refs.
 
@@ -117,7 +155,7 @@ An immutable execution report links those facts to the representative probe or w
 
 Tools write only to project staging/run directories. Outputs become candidate SourceCaptures, evidence, ContentUnits, or assets through the same publication service as model proposals. A program, MCP server, or operations engineer cannot write an accepted manuscript directly. Replacing paragraphs, citation bindings, templates, or shared assets requires the applicable ChangeRequest/EditGrant; downstream adoption uses exact verified manifests.
 
-## 7. Project state and service lifecycle
+## 8. Project state and service lifecycle
 
 The initial project layout extends the architecture's workspace with `workspace/operations/` for plans, capability profiles, and execution reports, and `runs/` for attempt/probe/output records. Environments, credentials, and active service state live outside immutable document artifacts and curated Git exports, under project-specific paths or isolated runtime volumes.
 
@@ -125,13 +163,13 @@ Service ownership records project ID, host/runtime identity, process or containe
 
 Pause/cancel fences new work and handles active execution according to the profile. Teardown affects only resources owned by the project and preserves committed evidence/history. Restart reconciles actual process/provider state before reuse; a saved `ready` marker cannot establish that a service still runs. Project completion stops or retains services according to explicit lifecycle policy.
 
-## 8. First scope
+## 9. First scope
 
 Operations is available in v1 for source acquisition/extraction, API/MCP connectivity, bibliography checking, document transformation, rendering, and the programs needed to carry out the mission. The first live slice must demonstrate one tool from discovery/setup through an actual workload and validated artifact publication; one independently checked program is sufficient before expanding the catalog.
 
 New scientific experiments or statistical estimation remain a distinct mission capability, requiring their own input/method/result-validation contract. Deferring that research capability does not defer practical program setup and execution. Broad interoperability and reuse come later; an actual useful MCP or open-source dependency can be used in the first project.
 
-## 9. Initial paper-tool cases
+## 10. Initial paper-tool cases
 
 Select tools for an actual capability need and check their current supported versions before installation. These official sources were reviewed on 2026-09-10; the table is an implementation plan, not a record of installed programs.
 

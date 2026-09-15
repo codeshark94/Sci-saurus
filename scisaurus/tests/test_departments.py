@@ -2,14 +2,16 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scisaurus.core.events import ControlStore
 from scisaurus.core.messages import MessageBus
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.tasks import TaskManager
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import QuotaExceededError, ValidationError
 from scisaurus.runtime.departments import (
-    DepartmentRuntime, default_organization, stage_role, validate_charter, validate_organization,
+    LEGACY_SCHEMA_VERSION, DepartmentRuntime, default_organization, stage_role,
+    validate_charter, validate_organization,
 )
 
 
@@ -39,7 +41,10 @@ class DepartmentRuntimeTests(unittest.TestCase):
         self.assertTrue(self.store.head("command/departments/research/charter"))
         manifest = json.loads(self.store.read_body(
             self.store.head("command/organization")["body_hash"]))
-        self.assertEqual(len(manifest["agents"]), 10)
+        self.assertGreater(len(manifest["agents"]), 30)
+        self.assertEqual(manifest["schema_version"], "project-organization-2")
+        self.assertTrue(any(item["id"] == "research.source-acquirer" for item in manifest["agents"]))
+        self.assertEqual(manifest["active_assignments"], [])
         self.assertEqual(
             [item["stage_kind"] for item in manifest["stage_routes"]],
             ["topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"],
@@ -53,7 +58,8 @@ class DepartmentRuntimeTests(unittest.TestCase):
 
     def test_snapshot_exposes_concrete_agents_and_functional_stage_routes(self):
         snapshot = self.runtime.snapshot()
-        self.assertEqual(len(snapshot["agents"]), 10)
+        self.assertGreater(len(snapshot["agents"]), 30)
+        self.assertEqual(snapshot["role_pool"], snapshot["agents"])
         experiment = next(item for item in snapshot["stage_routes"]
                           if item["stage_kind"] == "experiment")
         self.assertEqual(experiment["role"], "methods.validation")
@@ -61,6 +67,120 @@ class DepartmentRuntimeTests(unittest.TestCase):
         self.assertTrue(any(item["appointment"] == "adversary"
                             and item["department"] == "methods"
                             for item in snapshot["agents"]))
+
+    def test_v1_organization_is_migrated_and_preserves_named_appointments(self):
+        legacy = default_organization()
+        legacy["schema_version"] = LEGACY_SCHEMA_VERSION
+        for charter in legacy["departments"]:
+            charter.pop("agent_roles", None)
+        legacy["departments"][0]["chief"] = "research-lead"
+        legacy["departments"][0]["adversary"] = "research-red-team"
+        migrated = validate_organization(legacy)
+        self.assertEqual(migrated["schema_version"], "project-organization-2")
+        research = next(item for item in migrated["departments"] if item["id"] == "research")
+        self.assertEqual(research["chief"], "research-lead")
+        self.assertEqual(research["adversary"], "research-red-team")
+        self.assertTrue(any(item["id"] == "source-acquirer" for item in research["agent_roles"]))
+
+    def test_specialist_owner_is_recorded_and_functional_owner_remains_chief(self):
+        with self.assertRaisesRegex(ValidationError, "does not admit topic_refinement"):
+            self.runtime.propose({
+                "schema_version": "department-work-order-1", "id": "wrong-specialist-scope",
+                "kind": "topic_refinement", "owner": "research.source-acquirer",
+                "objective": "Refine the question.", "why": "The selected question is broad.",
+                "success_condition": "A falsifiable question is recorded.",
+                "evidence_needed": "A cited gap and boundary condition.",
+            })
+        specialist = self.runtime.propose({
+            "schema_version": "department-work-order-1", "id": "acquire-more",
+            "kind": "full_text_retrieval", "owner": "research.source-acquirer",
+            "objective": "Acquire the decisive source.", "why": "The survey has metadata only.",
+            "success_condition": "A point-in-time full-text capture is inspectable.",
+            "evidence_needed": "Source identity, transport, and capture digest.",
+        })
+        self.assertEqual(specialist["assigned_role"], "research.source-acquirer")
+        self.assertEqual(specialist["assigned_agent"], "source-acquirer")
+        task = self.tasks.get(specialist["task_id"])
+        self.assertEqual(task["payload"]["assignment_kind"], "specialist")
+        chief = self.runtime.propose({
+            "schema_version": "department-work-order-1", "id": "refine-topic",
+            "kind": "topic_refinement", "owner": "research",
+            "objective": "Refine the question.", "why": "The gap is broad.",
+            "success_condition": "A falsifiable question is recorded.",
+            "evidence_needed": "A cited gap and boundary condition.",
+        })
+        self.assertEqual(chief["assigned_role"], "research.chief")
+
+    def test_stage_dispatch_isolated_pool_and_adversarial_artifact(self):
+        plan = self.runtime.begin_stage(
+            "survey", "survey", attempt_number=2, input_ref={"ref": "artifact:input", "secret": "not copied"},
+            deadline_seconds=30, active_role_ids=["search-strategist", "source-acquirer"],
+        )
+        self.assertEqual(plan["active_agents"], ["research.search-strategist", "research.source-acquirer"])
+        self.assertEqual(plan["verifier_agent"], "research.adversarial-reviewer")
+        self.assertEqual(len(plan["assignments"]), 3)
+        self.assertTrue(all(item["assigned_role"] != plan["verifier_agent"] for item in plan["assignments"][:2]))
+        self.assertEqual(plan["assignments"][0]["input_ref"], {"ref": "artifact:input"})
+        result = self.runtime.finish_stage(
+            "survey", "survey", attempt_number=2, outcome="completed",
+            output_ref="/tmp/survey.json", usage={"model_calls": 2},
+        )
+        self.assertEqual(result["verifier_outcome"], "accepted")
+        self.assertNotEqual(result["chief_agent"], result["verifier_agent"])
+        verdict_logical = result["verifier_artifact_ref"].split("@", 1)[0].removeprefix("artifact:")
+        verdict = json.loads(self.store.read_body(
+            self.store.head(verdict_logical)["body_hash"]))
+        self.assertTrue(verdict["independence_check"])
+        self.assertEqual(verdict["verifier_agent"], "research.adversarial-reviewer")
+        self.assertEqual(self.runtime.snapshot()["active_assignments"], [])
+
+    def test_stage_pool_quota_and_deadline_are_enforced(self):
+        route = self.runtime.stage_route("survey")
+        route["max_active_agents"] = 1
+        with patch.object(self.runtime, "stage_route", return_value=route):
+            with self.assertRaises(QuotaExceededError):
+                self.runtime.begin_stage(
+                    "survey", "survey", deadline_seconds=20,
+                    active_role_ids=["search-strategist", "academic-scout"],
+                )
+        with self.assertRaises(ValidationError):
+            self.runtime.begin_stage(
+                "survey", "survey", deadline_seconds=20,
+                active_role_ids=["search-strategist"],
+                quotas={"search-strategist": {"max_calls": 0, "max_input_tokens": 1,
+                                               "max_output_tokens": 1, "max_seconds": 1}},
+            )
+
+    def test_interrupted_specialist_attempt_is_reconciled_as_unknown(self):
+        plan = self.runtime.begin_stage(
+            "experiment", "experiment", deadline_seconds=20,
+            active_role_ids=["methodologist"],
+        )
+        reconciled = self.runtime.reconcile_interrupted_assignments()
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(reconciled[0]["outcome"], "result_unknown")
+        assignment = self.runtime.snapshot()["agent_activity"][0]
+        self.assertEqual(assignment["attempt_state"], "result_unknown")
+        self.assertEqual(assignment["task_state"], "blocked")
+        self.assertEqual(self.runtime.snapshot()["active_assignments"], [])
+
+    def test_invalid_quota_is_rejected_before_any_role_is_admitted(self):
+        with self.assertRaises(ValidationError):
+            self.runtime.begin_stage(
+                "survey", "survey", deadline_seconds=20,
+                active_role_ids=["search-strategist", "source-acquirer"],
+                quotas={
+                    "research.search-strategist": {
+                        "max_calls": 1, "max_input_tokens": 100,
+                        "max_output_tokens": 100, "max_seconds": 1,
+                    },
+                    "source-acquirer": {
+                        "max_calls": 0, "max_input_tokens": 100,
+                        "max_output_tokens": 100, "max_seconds": 1,
+                    },
+                },
+            )
+        self.assertEqual(self.runtime.snapshot()["agent_activity"], [])
 
     def test_stage_role_is_shared_with_composer_functional_mapping(self):
         self.assertEqual(stage_role("topic_discovery"), "research.intelligence")
