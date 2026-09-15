@@ -240,6 +240,22 @@ class CapabilityFoundryTests(unittest.TestCase):
                 foundry.generate("compare a declared estimator", client=StubClient(payload))
             self.assertEqual(load_registry(root / "registry")["capabilities"], [])
 
+    def test_malformed_asset_contract_returns_actionable_repair_feedback(self):
+        payload = self._payload()
+        payload["executor_source"] = MINI_EXECUTOR.replace(
+            '"id": asset_id, "path": name, "sha256":',
+            '"id": asset_id, "sha256":',
+        )
+        self.assertNotEqual(payload["executor_source"], MINI_EXECUTOR)
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            foundry.max_attempts = 1
+            with self.assertRaisesRegex(
+                    ValidationError, "experiment asset requires exactly"):
+                foundry.generate("compare a declared estimator", client=StubClient(payload))
+            self.assertEqual(load_registry(root / "registry")["capabilities"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

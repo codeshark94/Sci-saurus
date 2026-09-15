@@ -177,6 +177,13 @@ class OpenAlexFixture(BaseHTTPRequestHandler):
                 "message": "Anonymous search is temporarily rate-limited while the search cluster is under elevated load.",
                 "retryAfter": 37,
             }).encode()
+        elif mode == "anonymous-load-503":
+            status, body = 503, json.dumps({
+                "error": "Search unavailable",
+                "message": ("Anonymous search is paused while the search cluster recovers from heavy load. "
+                            "Please retry shortly, or use a free API key for uninterrupted access."),
+                "retryAfter": 37,
+            }).encode()
         elif mode == "daily-budget":
             status, body = 429, json.dumps({
                 "error": "Rate limit exceeded",
@@ -217,7 +224,8 @@ class OpenAlexFixture(BaseHTTPRequestHandler):
             self.send_header("X-RateLimit-Reset", "123" if mode == "insufficient-budget" else "60")
             if mode == "last-affordable-search":
                 self.send_header("X-RateLimit-Credits-Used", "10")
-            self.send_header("Retry-After", "37" if mode == "anonymous-load" else "7")
+            self.send_header("Retry-After", "37" if mode in {
+                "anonymous-load", "anonymous-load-503"} else "7")
             if mode == "redirect":
                 self.send_header("Location", "/works?search=redirect-target")
             if mode in {"short-body", "body-trickle"}:
@@ -350,6 +358,24 @@ class TestOpenAlex(unittest.TestCase):
             self.assertEqual(len(OpenAlexFixture.requests), before + 3)
             with open(state_path) as stream:
                 self.assertNotIn("another-credential", stream.read())
+
+    def test_anonymous_load_on_503_uses_the_same_persistent_throttle_boundary(self):
+        with tempfile.TemporaryDirectory(prefix="scisaurus-openalex-rate-state-") as directory:
+            state_path = os.path.join(directory, "provider", "openalex.json")
+            before = len(OpenAlexFixture.requests)
+            first = self.client(
+                timeout=0.2, max_retries=2, rate_state_path=state_path,
+            ).run(**self.arguments("anonymous-load-503"))
+            self.assertEqual(first["outcome"], "rate_limited")
+            self.assertEqual(first["metadata"]["rate_limit"]["kind"], "anonymous_search_load")
+            self.assertEqual(first["metadata"]["attempts"], 1)
+
+            second = self.client(rate_state_path=state_path).run(
+                **self.arguments("different query after anonymous load"))
+            self.assertEqual(second["outcome"], "rate_limited")
+            self.assertEqual(second["metadata"]["attempts"], 0)
+            self.assertTrue(second["metadata"]["cooldown_cache_hit"])
+            self.assertEqual(len(OpenAlexFixture.requests), before + 1)
 
     def test_persistent_request_reservation_prevents_concurrent_429_herd(self):
         with tempfile.TemporaryDirectory(prefix="scisaurus-openalex-rate-state-") as directory:

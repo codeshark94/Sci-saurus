@@ -72,23 +72,13 @@ def validate_program_output(value, experiment):
             raise ValidationError("every experiment observation must be an object")
         canonical_bytes(observation)
 
-    core = {"schema_version": "results-package-1", "id": value["study_id"], "revision": value["revision"],
-            "procedures": value["procedures"], "metrics": value["metrics"], "findings": value["findings"],
-            "limitations": value["limitations"], "assets": [
-                {key: asset[key] for key in ("path", "sha256", "role")} for asset in value["assets"]]}
-    validate_results_package(core)
-    configured = {item["id"]: item for item in experiment["primary_outcomes"]}
-    observed = {item["id"]: item for item in value["metrics"]}
-    if set(configured) - set(observed):
-        raise ValidationError("experiment output omits a configured primary outcome")
-    if any(observed[key]["unit"] != contract["unit"] for key, contract in configured.items()):
-        raise ValidationError("experiment output changes a configured primary outcome unit")
-    if not set(experiment["limitations"]).issubset(value["limitations"]):
-        raise ValidationError("experiment output omits a frozen design limitation")
-
+    assets = value["assets"]
+    if not isinstance(assets, list):
+        raise ValidationError("experiment assets must be an explicit list")
     roles = {}
-    for asset in value["assets"]:
-        exact(asset, {"id", "path", "sha256", "role", "media_type", "caption"}, "experiment asset")
+    for asset in assets:
+        exact(asset, {"id", "path", "sha256", "role", "media_type", "caption"},
+              "experiment asset")
         identifier(asset["id"])
         output_path(asset["path"])
         identifier(asset["role"])
@@ -101,6 +91,21 @@ def validate_program_output(value, experiment):
                 or asset["caption"] is None):
             raise ValidationError("experiment figures require a renderable type and caption")
         roles.setdefault(asset["role"], []).append(asset)
+
+    core = {"schema_version": "results-package-1", "id": value["study_id"], "revision": value["revision"],
+            "procedures": value["procedures"], "metrics": value["metrics"], "findings": value["findings"],
+            "limitations": value["limitations"], "assets": [
+                {key: asset[key] for key in ("path", "sha256", "role")} for asset in assets]}
+    validate_results_package(core)
+    configured = {item["id"]: item for item in experiment["primary_outcomes"]}
+    observed = {item["id"]: item for item in value["metrics"]}
+    if set(configured) - set(observed):
+        raise ValidationError("experiment output omits a configured primary outcome")
+    if any(observed[key]["unit"] != contract["unit"] for key, contract in configured.items()):
+        raise ValidationError("experiment output changes a configured primary outcome unit")
+    if not set(experiment["limitations"]).issubset(value["limitations"]):
+        raise ValidationError("experiment output omits a frozen design limitation")
+
     for requirement in experiment["required_assets"]:
         matches = [asset for asset in roles.get(requirement["role"], [])
                    if asset["media_type"] in requirement["media_types"]]

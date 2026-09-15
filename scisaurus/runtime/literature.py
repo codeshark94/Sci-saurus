@@ -34,6 +34,9 @@ MAX_REQUEST_URL_BYTES = 4094
 SEARCH_SYNTAX = "OpenAlex stemmed search: use search terms or quoted phrases, without '*' or '?' wildcards. The percent-encoded request URL must fit 4094 bytes."
 ARGUMENT_KEYS = {"operation", "query", "work_id", "limit", "cursor"}
 TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+PROVIDER_THROTTLE_KINDS = frozenset({
+    "anonymous_search_load", "daily_budget", "request_rate",
+})
 RATE_STATE_SCHEMA_VERSION = "openalex-rate-state-1"
 # OpenAlex daily budgets reset at midnight UTC. A two-day ceiling accepts a
 # complete daily reset window plus clock skew without allowing malformed
@@ -480,7 +483,10 @@ def _rate_limit_metadata(headers, payload, *, authenticated):
     reset = _header_number(headers, "x-ratelimit-reset")
     credits_used = _header_number(headers, "x-ratelimit-credits-used")
     lower = (message or "").casefold()
-    if not authenticated and "anonymous" in lower and ("elevated load" in lower or "temporarily" in lower):
+    if (not authenticated and "anonymous" in lower
+            and ("temporarily" in lower or "elevated load" in lower
+                 or "heavy load" in lower or "search is paused" in lower
+                 or "cluster recovers" in lower)):
         kind = "anonymous_search_load"
     elif (remaining == 0 or "daily budget" in lower or "daily quota" in lower
             or "credits exhausted" in lower or "insufficient budget" in lower
@@ -782,8 +788,9 @@ class OpenAlexClient:
                                   credential=credential)
             last.setdefault("metadata", {})["attempts"] = attempt + 1
             status = (last.get("metadata") or {}).get("http_status")
+            provider_throttle = last.get("outcome") == "rate_limited"
             delay = self.retry_backoff_seconds * (2 ** attempt)
-            if status == 429:
+            if provider_throttle:
                 rate_limit = (last.get("metadata") or {}).get("rate_limit") or {}
                 provider_delay = provider_cooldown_seconds(rate_limit)
                 if provider_delay is not None:
@@ -825,7 +832,7 @@ class OpenAlexClient:
                 return last
             # The shared client pacing slot owns 429 sleeps. Other transient
             # failures have no provider cooldown and use the local backoff.
-            if status != 429:
+            if not provider_throttle:
                 retry_wait_seconds += delay
                 time.sleep(delay)
         if last is None:
@@ -941,8 +948,6 @@ class OpenAlexClient:
             if response.length not in (None, 0):
                 raise IncompleteRead(b"", response.length)
             if response.status != 200:
-                result["outcome"] = {401: "auth_required", 403: "access_denied", 404: "not_found",
-                                     429: "rate_limited"}.get(response.status, "provider_error")
                 payload = None
                 try:
                     payload = json.loads(body, object_pairs_hook=_object, parse_constant=_constant,
@@ -951,9 +956,13 @@ class OpenAlexClient:
                     payload = None
                 if payload is not None and response.status == 429:
                     result["raw_response"] = payload
-                if response.status == 429:
-                    metadata["rate_limit"] = _rate_limit_metadata(
-                        metadata["headers"], payload, authenticated=credential is not None)
+                metadata["rate_limit"] = _rate_limit_metadata(
+                    metadata["headers"], payload, authenticated=credential is not None)
+                rate_kind = metadata["rate_limit"].get("kind")
+                result["outcome"] = (
+                    "rate_limited" if response.status == 429 or rate_kind in PROVIDER_THROTTLE_KINDS
+                    else {401: "auth_required", 403: "access_denied", 404: "not_found"}.get(
+                        response.status, "provider_error"))
                 provider_message = payload.get("message") if isinstance(payload, dict) else None
                 result["error"] = (provider_message if isinstance(provider_message, str) and provider_message.strip()
                                    else f"OpenAlex returned HTTP {response.status}")

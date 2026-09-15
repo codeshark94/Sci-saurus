@@ -132,6 +132,27 @@ class ExperimentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "contradicts"):
             validate_deterministic_validation(rejected, config, "0" * 64)
 
+    def test_program_asset_shape_failure_is_actionable_validation_error(self):
+        config = validate_experiment_config(self.config())["experiment"]
+        candidate = {
+            "schema_version": "experiment-program-output-1",
+            "study_id": "fixture_study", "revision": 1,
+            "procedures": [{"id": "method", "description": config["method"],
+                            "source": "execute.py"}],
+            "observations": [{"run": 1, "accuracy": .75}],
+            "metrics": [{"id": "accuracy", "value": .75, "unit": "proportion",
+                         "conditions": "fixture", "source": "raw-data.json",
+                         "presentation": "0.75 accuracy"}],
+            "findings": [{"id": "observed", "statement": "Observed.",
+                          "metric_ids": ["accuracy"]}],
+            "limitations": config["limitations"],
+            "assets": [{"id": "main_figure", "sha256": "0" * 64,
+                        "role": "figure", "media_type": "image/png",
+                        "caption": "Fixture result."}],
+        }
+        with self.assertRaisesRegex(ValidationError, "experiment asset requires exactly"):
+            validate_program_output(candidate, config)
+
     def test_novel_research_requires_a_substantive_quality_contract(self):
         value = self.config()
         value["experiment"]["study_type"] = "novel_research"

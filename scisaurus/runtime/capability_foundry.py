@@ -25,6 +25,7 @@ from pathlib import Path
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.capability_registry import experiment_program_payload, register_capability
+from scisaurus.runtime.experiment import validate_program_output
 from scisaurus.runtime.models import ModelClient, resolve_model_config
 from scisaurus.runtime.program_admission import scan_program_source, validate_program_candidate
 from scisaurus.runtime.program_gates import admit_program_candidate
@@ -141,6 +142,21 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None):
                 "primary_outcomes": "the declared primary_outcomes list",
             },
         },
+        "executor_output_exact_shapes": {
+            "procedures": [{"id": "protocol", "description": "nonempty text",
+                            "source": "nonempty provenance text"}],
+            "observations": [{"replicate": 1, "raw_measurement": 0.0}],
+            "metrics": [{"id": "exact primary_outcomes id", "value": 0.0,
+                         "unit": "exact primary_outcomes unit", "conditions": "nonempty text",
+                         "source": "observations", "presentation": "nonempty text"}],
+            "findings": [{"id": "bounded_lowercase_id", "statement": "nonempty text",
+                          "metric_ids": ["exact metric id"]}],
+            "limitations": ["include every experiment_intent limitation verbatim"],
+            "assets": [{"id": "figure_1", "path": "figure_1.png",
+                        "sha256": "lowercase sha256 of the exact file bytes",
+                        "role": "figure", "media_type": "image/png",
+                        "caption": "nonempty scientific caption"}],
+        },
         "experiment_intent_example": {
             "id": "skewed_tail_comparison", "revision": 1, "study_type": "methods_validation",
             "domain": "robust statistics", "research_question": "Does estimator A lower tail error than B?",
@@ -166,6 +182,11 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None):
             "exactly {'status': 'ready'}; this handshake proves launchability only and never accepts data",
             "the engine must be fully deterministic: one seed, no clock, no unordered iteration",
             "the executor must emit at least three image/png figure assets with captions",
+            "write each asset into the current working directory with Path(relative_path).write_bytes; "
+            "the assets array must contain exactly id, path, sha256, role, media_type and caption; "
+            "never embed image bytes or base64 data in stdout",
+            "procedures, metrics and findings must be arrays of objects in executor_output_exact_shapes; "
+            "never emit those fields as strings or use undeclared object keys",
             "the validator must not import or copy the executor source",
             "the validator must recompute every declared primary_outcome from observations only",
             "every observation row must carry a replicate index and the raw values used for the metrics",
@@ -286,6 +307,8 @@ class CapabilityFoundry:
                     document = json.loads(first.stdout)
                 except (ValueError, TypeError) as exc:
                     raise ValidationError("executor did not return a JSON document") from exc
+                document = validate_program_output(
+                    document, attempt_value["experiment_intent"])
                 digest = hashlib.sha256(canonical_bytes(document)).hexdigest()
                 candidate_value = {
                     "schema_version": "method-program-candidate-1",
@@ -312,8 +335,10 @@ class CapabilityFoundry:
                 return {"status": "registered", "attempts": attempt + 1, "admission": admission,
                         "registration": registration, "candidate": candidate_value}
             except (ValidationError, KeyError, TypeError, ValueError) as exc:
-                last_error = exc
-                feedback = exc
+                last_error = (ValidationError(
+                    f"generated program omitted required field {exc.args[0]!r}")
+                    if isinstance(exc, KeyError) and exc.args else exc)
+                feedback = last_error
                 last_attempt = {key: (value[:20000] if isinstance(value, str) else value)
                                 for key, value in (attempt_value.items() if isinstance(attempt_value, dict) else [])}
                 continue
