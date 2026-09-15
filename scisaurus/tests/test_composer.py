@@ -11,7 +11,7 @@ from unittest.mock import patch
 from scisaurus.runtime.composer import ComposerRunner, read_interim_report, validate_workflow
 from scisaurus.runtime.departments import default_organization
 from scisaurus.runtime.literature import ProviderCooldownError
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import QuotaExceededError, ValidationError
 
 
 class ComposerWorkflowTests(unittest.TestCase):
@@ -206,7 +206,7 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(result["blockers"][0]["attempts"], 2)
             self.assertEqual(sum(item["action"] == "retry_stage" for item in result["feedback"]), 1)
 
-    def test_provider_reset_delay_overrides_generic_retry_curve(self):
+    def test_provider_cooldown_pauses_without_spending_another_attempt(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
             workflow = self._workflow(root)
@@ -227,12 +227,60 @@ class ComposerWorkflowTests(unittest.TestCase):
                         "project_dir": stage["project_dir"], "stage_id": stage["id"]}
 
             runner._run_stage = cooldown_then_complete
-            started = time.monotonic()
             result = runner.run()
-            self.assertEqual(result["status"], "completed")
-            self.assertGreaterEqual(time.monotonic() - started, 0.025)
-            retry = next(item for item in result["feedback"] if item["action"] == "retry_stage")
-            self.assertEqual(retry["delay_seconds"], 0.03)
+            self.assertEqual(result["status"], "paused")
+            self.assertEqual(calls, ["survey"])
+            self.assertEqual(result["stages"]["survey"]["status"], "paused")
+            blocker = result["blockers"][0]
+            self.assertEqual(blocker["reason"], "provider_cooldown")
+            self.assertEqual(blocker["retry_after_seconds"], 0.03)
+            self.assertEqual(result["interim_report"]["stop_reason"], "provider_cooldown")
+
+    def test_quota_exhaustion_does_not_recreate_a_stage_budget(self):
+        class FastClock:
+            def __init__(self):
+                self.value = 0.0
+
+            def __call__(self):
+                self.value += 1.0
+                return self.value
+
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery", "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(topic_dir.resolve()), "depends_on": [], "estimate_seconds": 1,
+                "bindings": [], "deadline_seconds": 5, "reuse_completed": False,
+                "reuse_output_path": None,
+            })
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            workflow["retry_policy"] = {"mode": "until_deadline", "backoff_seconds": 0}
+            runner = ComposerRunner(workflow, clock=FastClock())
+            calls = []
+
+            def quota_exhausted(stage, **kwargs):
+                calls.append(stage["id"])
+                raise QuotaExceededError(
+                    "topic budget exhausted", dimension="model_calls", limit=1, observed=1,
+                    usage={"model_calls": 1, "input_tokens": 11,
+                           "output_tokens": 7, "openalex_requests": 2},
+                    diagnostics=[{"kind": "model", "status": "error"}],
+                )
+
+            runner._run_stage = quota_exhausted
+            result = runner.run()
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(calls, ["topic"])
+            self.assertEqual(result["stages"]["topic"]["status"], "blocked")
+            self.assertEqual(result["interim_report"]["stop_reason"], "blocked")
+            self.assertEqual(result["usage"], {
+                "model_calls": 1, "input_tokens": 11,
+                "output_tokens": 7, "openalex_requests": 2,
+            })
+            self.assertEqual(result["stages"]["topic"]["attempts"][0]["usage"]["model_calls"], 1)
 
     def test_until_deadline_retry_mode_does_not_stop_at_attempt_counter(self):
         with tempfile.TemporaryDirectory() as path:
@@ -437,6 +485,19 @@ class ComposerWorkflowTests(unittest.TestCase):
                       "supplied_context": "base"}
             projected = runner._apply_topic_to_experiment_config(workflow["stages"][1], config)
             self.assertEqual(projected["experiment"]["id"], "generated_frontier")
+            lazy_result = json.loads(json.dumps(result))
+            lazy_result.pop("generated_capability")
+            lazy_result["topic"].pop("experiment_capability_id", None)
+            runner.context["topic"] = {"kind": "topic_discovery", **lazy_result}
+            with patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate",
+                       return_value=generated), \
+                    patch.object(runner, "_materialize_topic_capability",
+                                 wraps=runner._materialize_topic_capability) as materialize:
+                runner._apply_topic_to_experiment_config(workflow["stages"][1], {
+                    "experiment": {"revision": 1,
+                                   "literature_gate": {"required_state": "eligible_for_experiment"}},
+                    "supplied_context": "base"})
+            materialize.assert_called_once()
             runner.close()
 
     def test_topic_history_is_append_only_and_rotates_recent_capability(self):
@@ -529,6 +590,7 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(runner._topic_sampling_seed(), runner._topic_sampling_seed())
             runner._checkpoint("seed-persisted", force=True)
             progress = json.loads((Path(workflow["project_id"]) / "output" / "progress.json").read_text())
+            self.assertEqual(progress["status"], "running")
             self.assertEqual(progress["exploration_seed"], 123456)
             runner.close()
             resumed = ComposerRunner(workflow, resume=True)

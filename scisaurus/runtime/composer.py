@@ -25,12 +25,13 @@ import threading
 import time
 import uuid
 
-from scisaurus.core.errors import NotFoundError, StateError, ValidationError
+from scisaurus.core.errors import NotFoundError, QuotaExceededError, StateError, ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.messages import MessageBus
 from scisaurus.core.schema import canonical_bytes, now_iso
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.tasks import TaskManager
+from scisaurus.runtime.literature import ProviderCooldownError
 
 
 SCHEMA_VERSION = "composer-workflow-1"
@@ -385,7 +386,10 @@ class ComposerRunner:
         self.stage_records = {}
         self.feedback = []
         self.blockers = []
-        self.usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
+        self.usage = {
+            "model_calls": 0, "input_tokens": 0, "output_tokens": 0,
+            "openalex_requests": 0,
+        }
         self.continuation_cycles = 0
         self.reopened_stage_ids = set()
         self.continuation_pending_stage_ids = set()
@@ -403,7 +407,7 @@ class ComposerRunner:
         self._progress_snapshot = {
             "schema_version": "composer-checkpoint-1", "workflow_id": self.workflow["id"],
             "run_id": self.run_id,
-            "phase": "initialized", "elapsed_seconds": 0.0,
+            "status": self.status, "phase": "initialized", "elapsed_seconds": 0.0,
             "remaining_seconds": max(0.0, float(self.workflow["time_policy"]["hard_seconds"])),
             "started_at_epoch": self.started_epoch, "deadline_at_epoch": self.deadline_epoch,
             "exploration_seed": self.exploration_seed,
@@ -444,6 +448,22 @@ class ComposerRunner:
         return self.store.publish_artifact(logical_id=logical_id, artifact_type=artifact_type,
                                            author=author, body=canonical_bytes(body),
                                            media_type="application/json")
+
+    def _record_failed_stage_usage(self, error):
+        """Merge bounded work consumed by a failed stage into run accounting."""
+        usage = getattr(error, "usage", None)
+        if not isinstance(usage, dict) or not usage:
+            snapshot = getattr(error, "topic_budget", None)
+            usage = snapshot.get("usage", {}) if isinstance(snapshot, dict) else {}
+        if not isinstance(usage, dict):
+            usage = {}
+        actual = {}
+        for key in self.usage:
+            value = usage.get(key, 0)
+            if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                self.usage[key] += value
+                actual[key] = value
+        return actual
 
     def _remaining(self):
         remaining = self.deadline - self.clock()
@@ -564,6 +584,11 @@ class ComposerRunner:
                     and item.get("reason") == "required_stage_window_does_not_fit_remaining_deadline"
                     for item in self.blockers):
                 stop_reason = "required_stage_window_does_not_fit_remaining_deadline"
+            elif self.status == "paused" and any(
+                    isinstance(item, dict)
+                    and item.get("reason") == "provider_cooldown"
+                    for item in self.blockers):
+                stop_reason = "provider_cooldown"
             else:
                 stop_reason = self.status
         organization = self.organization_snapshot if isinstance(self.organization_snapshot, dict) else {}
@@ -579,7 +604,10 @@ class ComposerRunner:
         blockers = []
         for item in self.blockers[-3:]:
             if isinstance(item, dict):
-                blockers.append({key: item[key] for key in ("stage_id", "reason", "attempts") if key in item})
+                blockers.append({key: item[key] for key in (
+                    "stage_id", "reason", "provider_error", "retry_after_seconds",
+                    "retry_after_epoch", "rate_limit", "attempts", "usage",
+                    "diagnostics") if key in item})
             else:
                 blockers.append({"reason": str(item)[:240]})
         report = {
@@ -1709,6 +1737,21 @@ class ComposerRunner:
 
         if existing is None:
             model = json.loads(Path(configured["model_config_path"]).read_text())
+            # The foundry's sandbox timeout is not a model-request timeout.
+            # Keep the two fences explicit and cap the authoring call to the
+            # smaller of the configured foundry budget and this mission's
+            # remaining wall, so a stalled provider cannot consume hours of
+            # the experiment stage before its own gates even start.
+            remaining = self._remaining()
+            if remaining <= 0.2:
+                raise ValidationError("capability foundry model has no safe request window remaining")
+            model_timeout = min(
+                float(configured.get("model_timeout_seconds", 300.0)), remaining)
+            if (type(model.get("timeout_seconds")) not in (int, float)
+                    or not math.isfinite(model["timeout_seconds"])
+                    or model["timeout_seconds"] <= 0):
+                raise ValidationError("capability foundry model timeout_seconds must be finite and positive")
+            model["timeout_seconds"] = max(0.2, min(float(model["timeout_seconds"]), model_timeout))
             foundry = CapabilityFoundry(
                 model,
                 runtime_python=configured["runtime_python"],
@@ -1720,6 +1763,7 @@ class ComposerRunner:
                                   for item in configured["runtime_packages"]],
                 max_attempts=configured["max_attempts"],
                 timeout_seconds=configured["timeout_seconds"],
+                model_timeout_seconds=configured.get("model_timeout_seconds", 300.0),
             )
             brief = {
                 "topic": {key: selected.get(key) for key in (
@@ -1773,6 +1817,13 @@ class ComposerRunner:
             return config
         selected = topic_context["topic"]
         generated = topic_context.get("generated_capability")
+        if generated is None and self.workflow.get("capability_foundry_config_path"):
+            # Capability authoring is downstream of the accepted literature
+            # gate.  Do not spend the topic-stage wall generating an executable
+            # program before the survey has tested whether the question is
+            # actually worth executing.
+            self._materialize_topic_capability(topic_context)
+            generated = topic_context.get("generated_capability")
         if isinstance(generated, dict):
             capability_id = generated.get("capability_id")
             entry = {"id": capability_id, "config_path": generated.get("descriptor_path")}
@@ -1782,7 +1833,7 @@ class ComposerRunner:
             entry = next((item for item in catalog if item["id"] == capability_id), None)
         if entry is None:
             if self.workflow.get("capability_foundry_config_path"):
-                raise ValidationError("topic stage did not materialize its generated experiment capability")
+                raise ValidationError("experiment stage could not materialize its generated experiment capability")
             if not self.workflow.get("experiment_catalog"):
                 return config
             raise ValidationError(
@@ -2482,7 +2533,8 @@ class ComposerRunner:
         state = {
             "schema_version": "composer-checkpoint-1", "workflow_id": self.workflow["id"],
             "run_id": self.run_id,
-            "phase": phase, "elapsed_seconds": max(0.0, now - self.started),
+            "status": self.status, "phase": phase,
+            "elapsed_seconds": max(0.0, now - self.started),
             "remaining_seconds": max(0.0, remaining_snapshot),
             "started_at_epoch": self.started_epoch, "deadline_at_epoch": self.deadline_epoch,
             "retry_policy": self._retry_policy(),
@@ -2989,7 +3041,11 @@ class ComposerRunner:
             config.setdefault("limits", {})["repair_mode"] = "until_deadline"
         if (kind == "topic_discovery"
                 and self._retry_policy().get("mode", "bounded") == "until_deadline"):
-            config["repair_mode"] = "until_deadline"
+            # A descriptor may deliberately impose a tighter intake repair
+            # budget.  Only inherit the workflow mode when the descriptor did
+            # not state one; otherwise the generic Composer policy silently
+            # defeats the topic quota.
+            config.setdefault("repair_mode", "until_deadline")
         if stage["id"] in self.reopened_stage_ids and self.continuation_cycles:
             # A continuation must never overwrite its incumbent.  Specialist
             # runners create new output roots, so remap their configured
@@ -3030,18 +3086,37 @@ class ComposerRunner:
                     self.workflow.get("experiment_catalog")
                     or any(item.get("kind") == "paper" for item in self.workflow["stages"])):
                 maturity_rounds = 2
-            result = runner.run(
-                self.workflow["objective"],
-                candidate_count=descriptor["candidate_count"],
-                max_attempts=descriptor["max_attempts"],
-                repair_mode=descriptor.get("repair_mode", "bounded"),
-                runtime_context=self._runtime_context(model),
-                bibliography=descriptor.get("bibliography"),
-                sampling_seed=self._topic_sampling_seed(),
-                maturity_review_rounds=maturity_rounds,
-                refinement_context=self._topic_refinement_context(stage),
-            )
-            result = self._materialize_topic_capability(result)
+            try:
+                result = runner.run(
+                    self.workflow["objective"],
+                    candidate_count=descriptor["candidate_count"],
+                    max_attempts=descriptor["max_attempts"],
+                    repair_mode=descriptor.get("repair_mode", "bounded"),
+                    runtime_context=self._runtime_context(model),
+                    bibliography=descriptor.get("bibliography"),
+                    budgets=descriptor.get("budgets"),
+                    sampling_seed=self._topic_sampling_seed(),
+                    maturity_review_rounds=maturity_rounds,
+                    refinement_context=self._topic_refinement_context(stage),
+                )
+            except ProviderCooldownError:
+                raise
+            except ValidationError as exc:
+                # A bounded topic descriptor owns its repair budget.  Do not
+                # let the outer Composer retry loop recreate a fresh budget
+                # indefinitely after that bounded intake has failed.
+                if (descriptor.get("budgets")
+                        and descriptor.get("repair_mode", "bounded") == "bounded"):
+                    snapshot = getattr(exc, "topic_budget", {})
+                    snapshot = snapshot if isinstance(snapshot, dict) else {}
+                    raise QuotaExceededError(
+                        "topic discovery exhausted its bounded intake budget",
+                        dimension="topic_attempts", limit=descriptor["max_attempts"],
+                        observed=descriptor["max_attempts"],
+                        usage=snapshot.get("usage", {}),
+                        diagnostics=snapshot.get("events", []),
+                    ) from exc
+                raise
             output_path = Path(descriptor["output_path"])
             if attempt_number > 1 or stage["id"] in self.reopened_stage_ids:
                 output_path = Path(stage["project_dir"]) / output_path.name
@@ -3703,9 +3778,15 @@ class ComposerRunner:
                             break
                         except Exception as exc:
                             last_error = exc
+                            failure_usage = self._record_failed_stage_usage(exc)
+                            provider_paused = isinstance(exc, ProviderCooldownError)
+                            quota_exhausted = isinstance(exc, QuotaExceededError)
                             try:
-                                self.tasks.finish_attempt(attempt_id, "failed", usage={})
-                                self.tasks.transition(task_id, "blocked", "command.composer", reason=str(exc))
+                                self.tasks.finish_attempt(
+                                    attempt_id, "failed", usage=failure_usage)
+                                self.tasks.transition(
+                                    task_id, "paused" if provider_paused else "blocked",
+                                    "command.composer", reason=str(exc))
                             except Exception:
                                 pass
                             attempt_history.append({
@@ -3714,20 +3795,56 @@ class ComposerRunner:
                                 "state": "failed",
                                 "project_dir": attempt_stage["project_dir"],
                                 "error": f"{type(exc).__name__}: {exc}",
+                                "usage": deepcopy(failure_usage),
                                 "elapsed_seconds": self.clock() - attempt_started,
                             })
-                            retry_open = (
+                            retry_open = (not provider_paused and not quota_exhausted and (
                                 retry_policy.get("mode", "bounded") == "until_deadline"
-                                or retry_index + 1 < retry_policy.get("max_attempts", 0)
-                            )
+                                or retry_index + 1 < retry_policy.get("max_attempts", 0)))
                             self.stage_records[stage_id] = {
                                 "kind": stage["kind"],
-                                "status": "retrying" if retry_open else "blocked",
+                                "status": ("paused" if provider_paused
+                                           else "retrying" if retry_open else "blocked"),
                                 "task_id": task_id, "attempt_id": attempt_id, "attempt_number": attempt_number,
                                 "attempt_count": attempt_number, "attempts": deepcopy(attempt_history),
                                 "error": f"{type(exc).__name__}: {exc}",
+                                "usage": deepcopy(failure_usage),
                             }
+                            if provider_paused:
+                                retry_after = float(exc.retry_after_seconds)
+                                cooldown_blocker = {
+                                    "stage_id": stage_id,
+                                    "reason": "provider_cooldown",
+                                    "provider_error": str(exc),
+                                    "retry_after_seconds": retry_after,
+                                    "retry_after_epoch": time.time() + retry_after,
+                                    "rate_limit": deepcopy(exc.rate_limit),
+                                    "attempts": len(attempt_history),
+                                }
+                                cooldown_snapshot = getattr(exc, "topic_budget", {})
+                                cooldown_snapshot = (
+                                    cooldown_snapshot if isinstance(cooldown_snapshot, dict) else {})
+                                cooldown_usage = getattr(exc, "usage", None)
+                                if not isinstance(cooldown_usage, dict) or not cooldown_usage:
+                                    cooldown_usage = cooldown_snapshot.get("usage", {})
+                                cooldown_diagnostics = getattr(exc, "diagnostics", None)
+                                if not isinstance(cooldown_diagnostics, list) or not cooldown_diagnostics:
+                                    cooldown_diagnostics = cooldown_snapshot.get("events", [])
+                                if isinstance(cooldown_usage, dict) and cooldown_usage:
+                                    cooldown_blocker["usage"] = deepcopy(cooldown_usage)
+                                if isinstance(cooldown_diagnostics, list) and cooldown_diagnostics:
+                                    cooldown_blocker["diagnostics"] = deepcopy(cooldown_diagnostics)
+                                self.blockers.append(cooldown_blocker)
+                                self.status = "paused"
+                                self._checkpoint(f"{stage_id}:provider_cooldown", force=True)
+                                return self._finish()
                             self._checkpoint(f"{stage_id}:retrying" if retry_open else f"{stage_id}:failed", force=True)
+                            if quota_exhausted:
+                                # The stage has consumed its declared work
+                                # budget.  In particular, do not let an
+                                # until-deadline Composer policy recreate a
+                                # fresh stage budget on the next retry.
+                                break
                         finally:
                             stop_live_progress()
                     if stage_succeeded:
@@ -3757,8 +3874,13 @@ class ComposerRunner:
                         "attempt_count": len(attempt_history), "attempts": deepcopy(attempt_history),
                         "error": f"{type(error).__name__}: {error}",
                     }
-                    self.blockers.append({"stage_id": stage_id, "reason": str(error),
-                                          "attempts": len(attempt_history)})
+                    blocker = {"stage_id": stage_id, "reason": str(error),
+                               "attempts": len(attempt_history)}
+                    if isinstance(getattr(error, "usage", None), dict) and error.usage:
+                        blocker["usage"] = deepcopy(error.usage)
+                    if isinstance(getattr(error, "diagnostics", None), list) and error.diagnostics:
+                        blocker["diagnostics"] = deepcopy(error.diagnostics)
+                    self.blockers.append(blocker)
                     self._record_blocker_feedback(stage, error)
                     self.status = "blocked"
                     self._checkpoint(f"{stage_id}:blocked", force=True)
@@ -3823,6 +3945,11 @@ class ComposerRunner:
                         and item.get("reason") == "required_stage_window_does_not_fit_remaining_deadline"
                         for item in self.blockers):
                     stop_reason = "required_stage_window_does_not_fit_remaining_deadline"
+                if stop_reason is None and self.status == "paused" and any(
+                        isinstance(item, dict)
+                        and item.get("reason") == "provider_cooldown"
+                        for item in self.blockers):
+                    stop_reason = "provider_cooldown"
                 interim = self.interim_report(
                     stop_reason=stop_reason or self.status)
             except Exception as exc:

@@ -259,6 +259,7 @@ class TestModelClient(unittest.TestCase):
         result = self.client('openai_compatible', max_retries=2, retry_backoff_seconds=0).complete(
             system='x', prompt='x')
         self.assertEqual(self.calls, 2)
+        self.assertEqual(result.request_attempts, 2)
         self.assertEqual(result.json_object(), {'value': 4})
 
     def test_rate_limit_exhaustion_reports_status_without_provider_body(self):
@@ -268,6 +269,8 @@ class TestModelClient(unittest.TestCase):
                 system='x', prompt='x')
         self.assertEqual(self.calls, 3)
         self.assertTrue(error.exception.outcome_known)
+        self.assertEqual(error.exception.attempts, 3)
+        self.assertIsNotNone(error.exception.elapsed_seconds)
         self.assertNotIn('private', str(error.exception))
 
     def test_malformed_response_is_retried_within_one_request_budget(self):

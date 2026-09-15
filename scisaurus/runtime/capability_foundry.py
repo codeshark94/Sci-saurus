@@ -52,12 +52,17 @@ CONFIG_FIELDS = {
     "registry_root", "repo_root", "requirements_file", "runtime_packages",
     "max_attempts", "timeout_seconds",
 }
+CONFIG_OPTIONAL_FIELDS = {"model_timeout_seconds"}
 
 
 def validate_foundry_config(value):
     """Validate the immutable host paths and budgets for generated programs."""
-    if not isinstance(value, dict) or set(value) != CONFIG_FIELDS:
-        raise ValidationError(f"capability foundry config requires exactly {sorted(CONFIG_FIELDS)}")
+    if (not isinstance(value, dict)
+            or set(value) - (CONFIG_FIELDS | CONFIG_OPTIONAL_FIELDS)
+            or not CONFIG_FIELDS.issubset(value)):
+        raise ValidationError(
+            f"capability foundry config requires {sorted(CONFIG_FIELDS)} and permits "
+            f"{sorted(CONFIG_OPTIONAL_FIELDS)}")
     if value["schema_version"] != CONFIG_SCHEMA:
         raise ValidationError("capability foundry config schema version is unsupported")
     for key in ("model_config_path", "runtime_python", "requirements_file"):
@@ -82,6 +87,10 @@ def validate_foundry_config(value):
     if (type(value["timeout_seconds"]) not in (int, float)
             or not math.isfinite(value["timeout_seconds"]) or value["timeout_seconds"] <= 0):
         raise ValidationError("capability foundry timeout_seconds must be finite and positive")
+    model_timeout = value.get("model_timeout_seconds", 300.0)
+    if (type(model_timeout) not in (int, float)
+            or not math.isfinite(model_timeout) or model_timeout <= 0):
+        raise ValidationError("capability foundry model_timeout_seconds must be finite and positive")
     try:
         model = json.loads(Path(value["model_config_path"]).read_text())
         ModelClient(**resolve_model_config(model, role="research.experiment-author"))
@@ -206,7 +215,8 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None):
 
 class CapabilityFoundry:
     def __init__(self, model_config, *, runtime_python, workspace_root, registry_root, repo_root,
-                 requirements_file, runtime_packages, max_attempts=4, timeout_seconds=900.0):
+                 requirements_file, runtime_packages, max_attempts=4, timeout_seconds=900.0,
+                 model_timeout_seconds=300.0):
         self.model_config = deepcopy_config(model_config)
         self.runtime_python = Path(runtime_python)
         self.workspace_root = Path(workspace_root)
@@ -216,11 +226,15 @@ class CapabilityFoundry:
         self.runtime_packages = [(name, version) for name, version in runtime_packages]
         self.max_attempts = int(max_attempts)
         self.timeout_seconds = timeout_seconds
+        self.model_timeout_seconds = model_timeout_seconds
         if type(max_attempts) is not int or not 1 <= max_attempts <= 12:
             raise ValidationError("foundry max_attempts must be an integer between 1 and 12")
         if (type(timeout_seconds) not in (int, float)
                 or not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
             raise ValidationError("foundry timeout_seconds must be finite and positive")
+        if (type(model_timeout_seconds) not in (int, float)
+                or not math.isfinite(model_timeout_seconds) or model_timeout_seconds <= 0):
+            raise ValidationError("foundry model_timeout_seconds must be finite and positive")
         for path in (self.runtime_python, self.requirements_file):
             if not path.is_file():
                 raise ValidationError(f"foundry requires an existing file: {path}")
@@ -253,7 +267,12 @@ class CapabilityFoundry:
                              input_bytes=payload, timeout_seconds=self.timeout_seconds, max_bytes=60_000_000)
 
     def generate(self, brief, *, test_input=None, required_intent=None, client=None):
-        client = client or ModelClient(**resolve_model_config(self.model_config, role="research.experiment-author"))
+        if client is None:
+            model_config = resolve_model_config(
+                self.model_config, role="research.experiment-author")
+            model_config["timeout_seconds"] = min(
+                float(model_config["timeout_seconds"]), float(self.model_timeout_seconds))
+            client = ModelClient(**model_config)
         feedback = None
         last_error = None
         last_attempt = None

@@ -22,9 +22,11 @@ import re
 import time
 import uuid
 
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import QuotaExceededError, ValidationError
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.models import MAX_PROVIDER_SEED, ModelClient, resolve_model_config
+from scisaurus.runtime.models import (
+    MAX_PROVIDER_SEED, ModelCallError, ModelClient, resolve_model_config,
+)
 from scisaurus.runtime.literature import (
     OpenAlexClient, ProviderCooldownError, provider_cooldown_seconds,
 )
@@ -53,14 +55,26 @@ SOURCE_CHALLENGE_FIELDS = {
 TOPIC_BIBLIOGRAPHY_CLIENT_FIELDS = {
     "timeout", "max_bytes", "endpoint", "auth_env", "max_retries",
     "retry_backoff_seconds", "min_interval_seconds", "rate_state_path",
+    "allow_anonymous_fallback",
 }
 TOPIC_BIBLIOGRAPHY_FIELDS = TOPIC_BIBLIOGRAPHY_CLIENT_FIELDS | {
     "cache_path", "cache_ttl_seconds",
+}
+TOPIC_BUDGET_FIELDS = {
+    "max_model_calls", "max_openalex_requests", "max_input_tokens", "max_output_tokens",
 }
 CANDIDATE_FIELDS = {
     "id", "title", "domain", "research_question", "scope", "search_queries",
     "why_promising", "disconfirmation_test", "feasibility", "resource_plan",
     "capability_requirements",
+}
+# These dimensions are optional for compatibility with earlier topic packages,
+# but are part of the current research-direction contract when supplied.  The
+# prompt explicitly asks the model to vary them, so rejecting them as unknown
+# fields turns a scientifically richer answer into an intake failure.
+CANDIDATE_DIMENSION_FIELDS = {
+    "mechanism", "data_regime", "comparison", "measurement", "theory_target",
+    "phenomenon", "disconfirmation_test_note",
 }
 GROUNDING_FIELDS = {"frontier_seed_id", "prior_work_ids"}
 LEGACY_CANDIDATE_FIELDS = CANDIDATE_FIELDS - {"capability_requirements"}
@@ -206,13 +220,139 @@ def _validate_capability_requirements(value, name="capability_requirements"):
     return value
 
 
+def _validate_topic_budgets(value):
+    """Validate finite intake quotas before a provider or model is called."""
+    if (not isinstance(value, dict) or not value
+            or set(value) - TOPIC_BUDGET_FIELDS):
+        raise ValidationError(
+            f"topic discovery budgets require at least one of {sorted(TOPIC_BUDGET_FIELDS)}")
+    maximums = {
+        "max_model_calls": 128,
+        "max_openalex_requests": 128,
+        "max_input_tokens": 2_000_000,
+        "max_output_tokens": 2_000_000,
+    }
+    for key, maximum in maximums.items():
+        if key not in value:
+            continue
+        limit = value[key]
+        if type(limit) is not int or not 1 <= limit <= maximum:
+            raise ValidationError(
+                f"topic discovery budgets.{key} must be an integer between 1 and {maximum}")
+    canonical_bytes(value)
+    return deepcopy(value)
+
+
+class TopicBudget:
+    """Account for the finite external work allowed by one topic intake."""
+
+    def __init__(self, limits=None, usage=None):
+        self.limits = _validate_topic_budgets(limits) if limits is not None else {}
+        self.usage = usage if isinstance(usage, dict) else {}
+        self.usage.setdefault("openalex_requests", 0)
+        self.events = []
+        self._active_event = None
+
+    def _raise(self, dimension, limit, observed):
+        snapshot = self.snapshot()
+        raise QuotaExceededError(
+            f"topic discovery quota exhausted: {dimension}={observed}, limit={limit}",
+            dimension=dimension, limit=limit, observed=observed,
+            usage=snapshot["usage"], diagnostics=snapshot["events"])
+
+    def _check_available(self, key, dimension):
+        limit = self.limits.get(key)
+        observed = self.usage.get(dimension, 0)
+        if limit is not None and observed >= limit:
+            self._raise(dimension, limit, observed)
+
+    def before_model_call(self, role=None, model=None):
+        self._check_available("max_model_calls", "model_calls")
+        # Count the dispatch before the provider call.  A transport timeout or
+        # other model error still consumed an external call and must not be
+        # invisible to the intake quota.
+        self.usage["model_calls"] = self.usage.get("model_calls", 0) + 1
+        event = {
+            "sequence": len(self.events) + 1, "kind": "model",
+            "role": role, "model": model, "status": "dispatched",
+            "model_call_number": self.usage["model_calls"],
+        }
+        self.events.append(event)
+        self._active_event = event
+
+    def record_model_result(self, result):
+        if self._active_event is not None:
+            self._active_event.update(
+                status="response", finish_reason=result.finish_reason,
+                elapsed_seconds=result.elapsed_seconds,
+                request_attempts=getattr(result, "request_attempts", 1),
+                reported_usage=deepcopy(result.usage),
+            )
+        for key in ("input_tokens", "output_tokens"):
+            value = result.usage.get(key, 0)
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                value = 0
+            self.usage[key] = self.usage.get(key, 0) + value
+            limit = self.limits.get(f"max_{key}")
+            if limit is not None and self.usage[key] > limit:
+                self._raise(key, limit, self.usage[key])
+        self._active_event = None
+
+    def record_model_error(self, error):
+        if self._active_event is not None:
+            self._active_event.update(
+                status="error", error=str(error)[:2048],
+                request_attempts=getattr(error, "attempts", 0),
+                elapsed_seconds=getattr(error, "elapsed_seconds", None),
+            )
+            self._active_event = None
+
+    def record_validation_error(self, error):
+        if self._active_event is not None:
+            self._active_event.update(status="rejected", error=str(error)[:2048])
+            self._active_event = None
+
+    def before_openalex_request(self, query=None):
+        self._check_available("max_openalex_requests", "openalex_requests")
+        self.usage["openalex_requests"] = self.usage.get("openalex_requests", 0) + 1
+        event = {
+            "sequence": len(self.events) + 1, "kind": "openalex",
+            "query": query[:512] if isinstance(query, str) else None,
+            "status": "dispatched",
+            "request_number": self.usage["openalex_requests"],
+        }
+        self.events.append(event)
+        self._active_event = event
+
+    def record_openalex_result(self, result):
+        if self._active_event is not None:
+            metadata = result.get("metadata") if isinstance(result, dict) else {}
+            metadata = metadata if isinstance(metadata, dict) else {}
+            rate_limit = metadata.get("rate_limit")
+            self._active_event.update(
+                status="response", outcome=result.get("outcome") if isinstance(result, dict) else None,
+                error=(str(result.get("error"))[:2048]
+                       if isinstance(result, dict) and result.get("error") else None),
+                attempts=metadata.get("attempts"),
+                rate_limit_kind=(rate_limit.get("kind") if isinstance(rate_limit, dict) else None),
+            )
+            self._active_event = None
+
+    def snapshot(self):
+        return {"limits": deepcopy(self.limits),
+                "usage": {key: self.usage.get(key, 0) for key in (
+                    "model_calls", "input_tokens", "output_tokens", "openalex_requests")},
+                "events": deepcopy(self.events)}
+
+
 def validate_topic_stage_config(value):
     """Validate the descriptor consumed by the Composer topic stage."""
     fields = {"schema_version", "model_config_path", "output_path", "candidate_count", "max_attempts"}
-    allowed = fields | {"repair_mode", "maturity_review_rounds", "bibliography"}
+    allowed = fields | {"repair_mode", "maturity_review_rounds", "bibliography", "budgets"}
     if (not isinstance(value, dict) or set(value) - allowed
             or not fields.issubset(value)):
-        raise ValidationError(f"topic discovery config requires {sorted(fields)} and permits repair_mode")
+        raise ValidationError(
+            f"topic discovery config requires {sorted(fields)} and permits repair_mode, bibliography, budgets")
     if value["schema_version"] != STAGE_CONFIG_SCHEMA_VERSION:
         raise ValidationError("topic discovery config schema version is unsupported")
     model_path = Path(value["model_config_path"])
@@ -231,6 +371,8 @@ def validate_topic_stage_config(value):
     maturity_rounds = value.get("maturity_review_rounds", 0)
     if type(maturity_rounds) is not int or not 0 <= maturity_rounds <= 4:
         raise ValidationError("topic discovery maturity_review_rounds must be between 0 and 4")
+    if "budgets" in value:
+        _validate_topic_budgets(value["budgets"])
     bibliography = value.get("bibliography")
     if bibliography is not None:
         if not isinstance(bibliography, dict) or set(bibliography) - TOPIC_BIBLIOGRAPHY_FIELDS:
@@ -373,11 +515,15 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
     for candidate in candidates:
         shapes = (CANDIDATE_FIELDS, LEGACY_CANDIDATE_FIELDS,
                   CATALOG_CANDIDATE_FIELDS, CATALOG_LEGACY_CANDIDATE_FIELDS)
-        if (not isinstance(candidate, dict)
-                or not any(set(candidate) in (
-                    shape, shape | {"experiment_design"}, shape | GROUNDING_FIELDS,
-                    shape | GROUNDING_FIELDS | {"experiment_design"})
-                           for shape in shapes)):
+        candidate_keys = set(candidate) if isinstance(candidate, dict) else set()
+        shape_valid = any(
+            shape.issubset(candidate_keys)
+            and candidate_keys <= shape | CANDIDATE_DIMENSION_FIELDS | extra
+            for shape in shapes
+            for extra in ({"experiment_design"}, GROUNDING_FIELDS,
+                          GROUNDING_FIELDS | {"experiment_design"}, set())
+        )
+        if not isinstance(candidate, dict) or not shape_valid:
             raise ValidationError("topic candidate has an invalid shape")
         _identifier(candidate["id"], "topic candidate id")
         if candidate["id"] in ids:
@@ -385,6 +531,8 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
         ids.add(candidate["id"])
         for key in ("title", "domain", "research_question", "scope", "why_promising",
                     "disconfirmation_test", "feasibility", "resource_plan"):
+            _text(candidate[key], f"topic candidate {key}")
+        for key in CANDIDATE_DIMENSION_FIELDS.intersection(candidate):
             _text(candidate[key], f"topic candidate {key}")
         _strings(candidate["search_queries"], "topic candidate search_queries", minimum=3, maximum=8)
         if require_grounding:
@@ -462,6 +610,25 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
         if len(grounded_domains) < required_groups:
             raise ValidationError(
                 f"topic candidates must span at least {required_groups} scientific domains")
+        # A model can satisfy the seed/domain floor while repeating one generic
+        # question skeleton.  Reject that collapse when two candidates share
+        # a domain or capability; distinct domains may legitimately reuse a
+        # short interrogative form while testing different phenomena.
+        for index, left in enumerate(candidates):
+            left_tokens = _topic_tokens(left["research_question"])
+            for right in candidates[index + 1:]:
+                question_overlap = _jaccard(
+                    left_tokens, _topic_tokens(right["research_question"]))
+                same_domain = (
+                    left["domain"].strip().casefold()
+                    == right["domain"].strip().casefold())
+                same_capability = (
+                    left.get("experiment_capability_id") is not None
+                    and left.get("experiment_capability_id")
+                    == right.get("experiment_capability_id"))
+                if question_overlap >= 0.9 and (same_domain or same_capability):
+                    raise ValidationError(
+                        "topic candidate portfolio contains near-duplicate research questions")
     _identifier(value["selected_id"], "selected topic id")
     if value["selected_id"] not in ids:
         raise ValidationError("selected topic is not one of the candidates")
@@ -777,10 +944,17 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "title": "short working title",
         "domain": "research domain",
         "research_question": "one testable question",
+        "phenomenon": "the concrete phenomenon being measured",
+        "mechanism": "mechanism or explanatory variable to discriminate",
+        "data_regime": "data, boundary condition, or population regime",
+        "comparison": "the comparison that could separate competing explanations",
+        "measurement": "primary observable and how it is measured",
+        "theory_target": "theory, scaling relation, or boundary under test",
         "scope": "population, system, data, or phenomenon boundary",
         "search_queries": "3 to 8 concrete literature search strings",
         "why_promising": "why this is worth investigating without claiming novelty",
         "disconfirmation_test": "what result or prior work would make this direction unhelpful",
+        "disconfirmation_test_note": "optional detail about how the disconfirmation test separates explanations",
         "feasibility": "why the declared runtime can execute the study within the mission budget",
         "resource_plan": "data, programs, tools, and compute the study would use",
         "capability_requirements": {
@@ -825,6 +999,11 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
                 "do not put all candidates in the first or most familiar capability")
             constraints.append(
                 "the candidate list is a portfolio: preserve distinct capabilities even when the recent-paper sample favors one domain")
+        coverage_plan = runtime_context.get("candidate_capability_plan")
+        if isinstance(coverage_plan, list) and coverage_plan:
+            constraints.append(
+                "assign candidate positions to the exact experiment_capability_id values in "
+                "candidate_capability_plan; keep the scientific question distinct within each assignment")
         exclusions = runtime_context.get("topic_exclusions") or {}
         excluded_caps = exclusions.get("capability_ids", []) if isinstance(exclusions, dict) else []
         excluded_topics = exclusions.get("topic_ids", []) if isinstance(exclusions, dict) else []
@@ -883,6 +1062,11 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
             "selection_rationale": "compare evidence availability, testability, and disconfirmation risk",
         },
         "constraints": constraints,
+        "output_constraints": [
+            "Return exactly one JSON object with exactly the five top-level keys in output_contract.",
+            "Each candidate may contain only the fields described by candidate and the explicitly required grounding or design fields.",
+            "Do not echo assignment, constraints, runtime_context, frontier_seeds, or any other metadata.",
+        ],
     }, ensure_ascii=False, sort_keys=True)
 
 
@@ -922,6 +1106,10 @@ def _source_challenge_prompt(selected, works, runtime_context):
             "minimum_template_independence": 3,
             "high_prior_work_risk_requires_refinement": True,
         },
+        "output_constraints": [
+            "Return exactly one JSON object with exactly the nine keys in output_contract.",
+            "Do not echo assignment, selected_topic, targeted_scholarly_records, executable_templates, or any other metadata.",
+        ],
     }, ensure_ascii=False, sort_keys=True)
 
 
@@ -980,6 +1168,10 @@ def _maturity_review_prompt(objective, package, *, refinement_context=None):
             "minimum_each_dimension": MATURITY_MIN_DIMENSION,
             "do_not_reward_feasibility_alone": True,
         },
+        "output_constraints": [
+            "Return exactly one JSON object with exactly the six keys in output_contract.",
+            "Do not echo assignment, dimensions, score_scale, admission_rule, topic_package, or any other metadata.",
+        ],
         "identity_rule": "selected_id must equal topic_package.selected_id exactly",
     }, ensure_ascii=False, sort_keys=True)
 
@@ -996,10 +1188,23 @@ class TopicDiscoveryRunner:
         self.deadline_seconds = float(deadline_seconds) if deadline_seconds is not None else None
 
     def _client(self, role, *, seed=None, deadline=None):
+        model_config = deepcopy(self.model_config)
+        role_models = model_config.pop("role_models", {})
+        if not isinstance(role_models, dict):
+            raise ValidationError("topic model role_models must be an object")
+        selected = role_models.get(role)
+        if selected is not None:
+            if not isinstance(selected, dict):
+                raise ValidationError(f"topic model role_models.{role} must be an object")
+            model_config.update(deepcopy(selected))
         config = resolve_model_config(
-            self.model_config, role=role,
+            model_config, role=role,
             overrides=({"seed": seed} if seed is not None else None),
         )
+        # TopicBudget charges one logical dispatch.  Do not hide additional
+        # provider requests inside ModelClient retries; bounded repair is
+        # owned by this runner and is recorded as a separate event.
+        config["max_retries"] = 0
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0.2:
@@ -1013,7 +1218,7 @@ class TopicDiscoveryRunner:
         return ModelClient(**config)
 
     def _generate_frontier_seed_plan(self, objective, *, seed_count, sampling_seed,
-                                     deadline, usage, max_attempts=3):
+                                     deadline, usage, budget=None, max_attempts=3):
         last_error = None
         previous = None
         for attempt in range(max_attempts):
@@ -1030,37 +1235,72 @@ class TopicDiscoveryRunner:
                     "Return a complete replacement seed plan. Preserve valid scientific seeds, remove mission "
                     "boilerplate, restore cross-domain diversity, and satisfy the exact output contract."
                 )
-            result = client.complete(
-                system=FRONTIER_SYSTEM,
-                prompt=json.dumps(payload, ensure_ascii=False, sort_keys=True),
-            )
-            usage["model_calls"] += 1
-            for key in ("input_tokens", "output_tokens"):
-                usage[key] += result.usage.get(key, 0)
+            if budget is not None:
+                budget.before_model_call(
+                    "research.frontier-seed-planner", getattr(client, "model", None))
+            try:
+                result = client.complete(
+                    system=FRONTIER_SYSTEM,
+                    prompt=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                )
+            except ModelCallError as exc:
+                if budget is not None:
+                    budget.record_model_error(exc)
+                last_error = ValidationError(
+                    f"frontier seed planner model call failed: {exc}")
+                continue
+            if budget is not None:
+                budget.record_model_result(result)
+            else:
+                usage["model_calls"] += 1
+                for key in ("input_tokens", "output_tokens"):
+                    usage[key] += result.usage.get(key, 0)
             previous = result.text
             if result.finish_reason != "stop":
                 last_error = ValidationError(
                     f"frontier seed planner did not finish normally: {result.finish_reason}")
+                if budget is not None:
+                    budget.record_validation_error(last_error)
                 continue
             try:
                 plan = result.json_object()
                 return validate_frontier_seed_plan(plan, seed_count=seed_count)
             except ValidationError as exc:
+                if budget is not None:
+                    budget.record_validation_error(exc)
                 last_error = exc
-        raise last_error or ValidationError("frontier seed planner did not produce a valid plan")
+        error = last_error or ValidationError("frontier seed planner did not produce a valid plan")
+        if budget is not None:
+            setattr(error, "topic_budget", budget.snapshot())
+        raise error
 
-    def _challenge_selected_topic(self, selected, works, runtime_context, *, seed, deadline, usage):
+    def _challenge_selected_topic(self, selected, works, runtime_context, *, seed, deadline, usage,
+                                  budget=None):
         reviewer = self._client("research.topic-source-challenger", seed=seed, deadline=deadline)
-        result = reviewer.complete(
-            system=SOURCE_CHALLENGE_SYSTEM,
-            prompt=_source_challenge_prompt(selected, works, runtime_context),
-        )
-        usage["model_calls"] += 1
-        for key in ("input_tokens", "output_tokens"):
-            usage[key] += result.usage.get(key, 0)
+        if budget is not None:
+            budget.before_model_call(
+                "research.topic-source-challenger", getattr(reviewer, "model", None))
+        try:
+            result = reviewer.complete(
+                system=SOURCE_CHALLENGE_SYSTEM,
+                prompt=_source_challenge_prompt(selected, works, runtime_context),
+            )
+        except ModelCallError as exc:
+            if budget is not None:
+                budget.record_model_error(exc)
+            raise ValidationError(f"topic source challenge model call failed: {exc}") from exc
+        if budget is not None:
+            budget.record_model_result(result)
+        else:
+            usage["model_calls"] += 1
+            for key in ("input_tokens", "output_tokens"):
+                usage[key] += result.usage.get(key, 0)
         if result.finish_reason != "stop":
-            raise ValidationError(
+            error = ValidationError(
                 f"topic source challenge did not finish normally: {result.finish_reason}")
+            if budget is not None:
+                budget.record_validation_error(error)
+            raise error
         review = result.json_object()
         validate_source_challenge(
             review, selected_id=selected["id"],
@@ -1070,14 +1310,17 @@ class TopicDiscoveryRunner:
                 or review["source_relevance"] < 2
                 or review["template_independence"] < 3
                 or review["prior_work_risk"] == "high"):
-            raise ValidationError(
+            error = ValidationError(
                 "topic source challenge requires substantive refinement: " + review["rationale"])
+            if budget is not None:
+                budget.record_validation_error(error)
+            raise error
         return review
 
     def run(self, objective, *, candidate_count=4, max_attempts=3,
             repair_mode="bounded", recent_papers=None, runtime_context=None,
             bibliography=None, sampling_seed=None, maturity_review_rounds=0,
-            refinement_context=None):
+            refinement_context=None, budgets=None):
         _text(objective, "topic objective", public=False)
         if type(candidate_count) is not int or not 3 <= candidate_count <= 8:
             raise ValidationError("topic discovery candidate_count must be between 3 and 8")
@@ -1098,16 +1341,17 @@ class TopicDiscoveryRunner:
             raise ValidationError(
                 f"topic sampling_seed must be an integer between 0 and {MAX_PROVIDER_SEED}")
         usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
+        budget = TopicBudget(budgets, usage)
         recent_papers = list(recent_papers or [])
         sampling_trace = []
         frontier_seed_plan = None
         if bibliography is not False and not recent_papers:
             frontier_seed_plan = self._generate_frontier_seed_plan(
                 objective, seed_count=max(6, candidate_count), sampling_seed=sampling_seed,
-                deadline=deadline, usage=usage)
+                deadline=deadline, usage=usage, budget=budget)
             recent_papers, sampling_seed, sampling_trace = self._recent_paper_sample(
                 objective, bibliography=bibliography, deadline=deadline, sampling_seed=sampling_seed,
-                frontier_seed_plan=frontier_seed_plan)
+                frontier_seed_plan=frontier_seed_plan, budget=budget)
         previous = None
         last_error = None
         refinement_feedback = None
@@ -1120,6 +1364,15 @@ class TopicDiscoveryRunner:
             item.get("id") for item in (runtime_context or {}).get("experiment_catalog", [])
             if isinstance(item, dict) and isinstance(item.get("id"), str)
         }
+        prompt_runtime_context = runtime_context
+        coverage_plan = _capability_coverage_plan(
+            runtime_context, candidate_count, sampling_seed)
+        if coverage_plan:
+            prompt_runtime_context = deepcopy(runtime_context or {})
+            prompt_runtime_context["candidate_capability_plan"] = [
+                {"candidate_index": index, "experiment_capability_id": capability_id}
+                for index, capability_id in enumerate(coverage_plan)
+            ]
         for attempt in attempts:
             generation_seed = (sampling_seed + attempt) % MAX_PROVIDER_SEED if sampling_seed is not None else None
             client = self._client("topic_discovery", seed=generation_seed, deadline=deadline)
@@ -1132,7 +1385,7 @@ class TopicDiscoveryRunner:
                     objective, candidate_count,
                     recent_papers=recent_papers,
                     frontier_seeds=(frontier_seed_plan or {}).get("seeds", []),
-                    runtime_context=runtime_context,
+                    runtime_context=prompt_runtime_context,
                     refinement_context={
                         **(refinement_context or {}),
                         "parent_topic": refinement_parent,
@@ -1157,7 +1410,7 @@ class TopicDiscoveryRunner:
                 prompt = topic_prompt(objective, candidate_count,
                                       recent_papers=recent_papers,
                                       frontier_seeds=(frontier_seed_plan or {}).get("seeds", []),
-                                      runtime_context=runtime_context,
+                                      runtime_context=prompt_runtime_context,
                                       refinement_context=refinement_context)
             if previous is not None and refinement_feedback is None:
                 # Invalid-output repair also uses the full contract so repair
@@ -1166,7 +1419,7 @@ class TopicDiscoveryRunner:
                     objective, candidate_count,
                     recent_papers=recent_papers,
                     frontier_seeds=(frontier_seed_plan or {}).get("seeds", []),
-                    runtime_context=runtime_context,
+                    runtime_context=prompt_runtime_context,
                     refinement_context=refinement_context))
                 repair_payload["assignment"] = "repair_invalid_topic_discovery"
                 repair_payload["candidate_response"] = previous[:40000]
@@ -1176,20 +1429,25 @@ class TopicDiscoveryRunner:
                     "only the reported violations; do not return a wrapper object or a partial candidate list."
                 )
                 prompt = json.dumps(repair_payload, ensure_ascii=False, sort_keys=True)
-            result = client.complete(system=SYSTEM, prompt=prompt)
-            usage["model_calls"] += 1
-            for key in ("input_tokens", "output_tokens"):
-                usage[key] += result.usage.get(key, 0)
+            budget.before_model_call("topic_discovery", getattr(client, "model", None))
+            try:
+                result = client.complete(system=SYSTEM, prompt=prompt)
+            except ModelCallError as exc:
+                budget.record_model_error(exc)
+                last_error = ValidationError(f"topic discovery model call failed: {exc}")
+                continue
+            budget.record_model_result(result)
             previous = result.text
             if result.finish_reason != "stop":
                 last_error = ValidationError(f"topic discovery did not finish normally: {result.finish_reason}")
+                budget.record_validation_error(last_error)
                 continue
             try:
                 package = result.json_object()
                 validate_topic_package(
                     package, objective=objective, candidate_count=candidate_count,
                     experiment_capability_ids=catalog_ids,
-                    require_capability_coverage=False,
+                    require_capability_coverage=bool(catalog_ids),
                     excluded_capability_ids=(runtime_context or {}).get("topic_exclusions", {}).get("capability_ids", []),
                     excluded_topic_ids=(runtime_context or {}).get("topic_exclusions", {}).get("topic_ids", []),
                     topic_history=(runtime_context or {}).get("topic_history"),
@@ -1205,6 +1463,7 @@ class TopicDiscoveryRunner:
                         raise ValidationError(
                             "current topic discovery output must include capability_requirements")
             except ValidationError as exc:
+                budget.record_validation_error(exc)
                 last_error = exc
                 continue
             selected = next(item for item in package["candidates"] if item["id"] == package["selected_id"])
@@ -1228,11 +1487,13 @@ class TopicDiscoveryRunner:
                     candidate_prior_work, _, candidate_sampling_trace = self._recent_paper_sample(
                         objective, bibliography=bibliography, deadline=deadline,
                         sampling_seed=(generation_seed + 32452843) % MAX_PROVIDER_SEED,
-                        frontier_seed_plan=targeted, minimum_seed_groups=1)
+                        frontier_seed_plan=targeted, minimum_seed_groups=1, budget=budget)
                     source_challenge = self._challenge_selected_topic(
                         selected, candidate_prior_work, runtime_context,
                         seed=(generation_seed + 49979687) % MAX_PROVIDER_SEED,
-                        deadline=deadline, usage=usage)
+                        deadline=deadline, usage=usage, budget=budget)
+                except ProviderCooldownError:
+                    raise
                 except ValidationError as exc:
                     last_error = exc
                     continue
@@ -1241,17 +1502,24 @@ class TopicDiscoveryRunner:
                                + 104729 * (attempt + 1)) % MAX_PROVIDER_SEED
                 reviewer = self._client(
                     "research.topic-maturity-reviewer", seed=review_seed, deadline=deadline)
-                review_result = reviewer.complete(
-                    system=MATURITY_SYSTEM,
-                    prompt=_maturity_review_prompt(
-                        objective, package, refinement_context=refinement_context),
-                )
-                usage["model_calls"] += 1
-                for key in ("input_tokens", "output_tokens"):
-                    usage[key] += review_result.usage.get(key, 0)
+                budget.before_model_call(
+                    "research.topic-maturity-reviewer", getattr(reviewer, "model", None))
+                try:
+                    review_result = reviewer.complete(
+                        system=MATURITY_SYSTEM,
+                        prompt=_maturity_review_prompt(
+                            objective, package, refinement_context=refinement_context),
+                    )
+                except ModelCallError as exc:
+                    budget.record_model_error(exc)
+                    last_error = ValidationError(
+                        f"topic maturity review model call failed: {exc}")
+                    continue
+                budget.record_model_result(review_result)
                 if review_result.finish_reason != "stop":
                     last_error = ValidationError(
                         f"topic maturity review did not finish normally: {review_result.finish_reason}")
+                    budget.record_validation_error(last_error)
                     continue
                 try:
                     review = review_result.json_object()
@@ -1261,6 +1529,7 @@ class TopicDiscoveryRunner:
                         raise ValidationError(
                             "topic maturity review must assess the package's selected_id")
                 except ValidationError as exc:
+                    budget.record_validation_error(exc)
                     last_error = exc
                     continue
                 maturity_review_history.append({
@@ -1295,6 +1564,7 @@ class TopicDiscoveryRunner:
                             "maturity_review_history": deepcopy(maturity_review_history),
                             "maturity_score": sum(review["scores"].values()),
                         "usage": usage,
+                        "budget": budget.snapshot(),
                     }
                     if refinement_context:
                         output["topic_evolution"] = {
@@ -1341,6 +1611,7 @@ class TopicDiscoveryRunner:
                 "generation_seed": generation_seed,
                 "sampling_trace": sampling_trace,
                 "usage": usage,
+                "budget": budget.snapshot(),
             }
             if refinement_context:
                 output["topic_evolution"] = {
@@ -1351,11 +1622,14 @@ class TopicDiscoveryRunner:
                     "reason": refinement_context.get("reason"),
                 }
             return output
-        raise last_error or ValidationError("topic discovery did not produce a valid package")
+        error = last_error or ValidationError("topic discovery did not produce a valid package")
+        snapshot = budget.snapshot()
+        setattr(error, "topic_budget", snapshot)
+        raise error
 
     @staticmethod
     def _recent_paper_sample(objective, *, bibliography=None, deadline=None, sampling_seed=None,
-                             frontier_seed_plan=None, minimum_seed_groups=4):
+                             frontier_seed_plan=None, minimum_seed_groups=4, budget=None):
         """Search OpenAlex from science-first seeds and retain a balanced sample.
 
         Crossref is deliberately not a topic-source fallback: its metadata-only
@@ -1383,6 +1657,14 @@ class TopicDiscoveryRunner:
         }
         client_config.update({key: bibliography[key] for key in TOPIC_BIBLIOGRAPHY_CLIENT_FIELDS
                               if key in bibliography})
+        if bibliography.get("auth_env") is None:
+            # Prefer an available OpenAlex key without forcing a secret into
+            # the checked-in descriptor.  The explicit anonymous fallback is
+            # still retained for hosts that intentionally have no key.
+            for candidate in ("SCISAURUS_OPENALEX_API_KEY", "OPENALEX_API_KEY"):
+                if os.environ.get(candidate):
+                    client_config["auth_env"] = candidate
+                    break
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0.2:
@@ -1458,10 +1740,14 @@ class TopicDiscoveryRunner:
                                              "work_id": None, "limit": 10, "cursor": None}},
                 }
             else:
+                if budget is not None:
+                    budget.before_openalex_request(query)
                 try:
                     result = client.run(operation="search", query=query, limit=10, cursor=None)
                 except (TypeError, ValueError) as exc:
                     raise ValidationError(f"invalid frontier scholarly query: {exc}") from exc
+                if budget is not None:
+                    budget.record_openalex_result(result)
                 if result.get("outcome") in {"ok", "empty"}:
                     cache["entries"][cache_key] = {
                         "query": query, "stored_at": time.time(),
@@ -1544,15 +1830,21 @@ class TopicDiscoveryRunner:
             delay = provider_cooldown_seconds(
                 limited.get("rate_limit") if isinstance(limited, dict) else None)
             if delay is not None:
-                raise ProviderCooldownError(
+                error = ProviderCooldownError(
                     "OpenAlex topic sampling is paused until the provider quota resets "
                     f"({len(populated_groups)}/{minimum_seed_groups} frontier groups)",
                     retry_after_seconds=delay,
                     rate_limit=limited.get("rate_limit"),
                 )
-            raise ValidationError(
+                if budget is not None:
+                    setattr(error, "topic_budget", budget.snapshot())
+                raise error
+            error = ValidationError(
                 "OpenAlex topic sampling did not meet the source-diversity floor "
                 f"({len(populated_groups)}/{minimum_seed_groups} frontier groups): {detail}")
+            if budget is not None:
+                setattr(error, "topic_budget", budget.snapshot())
+            raise error
 
         current_year = time.gmtime().tm_year
         recent_cutoff = current_year - RECENT_YEAR_WINDOW

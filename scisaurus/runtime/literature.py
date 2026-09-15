@@ -534,7 +534,7 @@ class OpenAlexClient:
 
     def __init__(self, *, timeout=30, max_bytes=1_048_576, endpoint=DEFAULT_ENDPOINT, auth_env=None,
                  max_retries=3, retry_backoff_seconds=1.0, min_interval_seconds=0.0,
-                 rate_state_path=None):
+                 rate_state_path=None, allow_anonymous_fallback=False):
         _limits(timeout, max_bytes)
         if type(max_retries) is not int or max_retries < 0 or max_retries > 8:
             raise ValueError("max_retries must be an integer between 0 and 8")
@@ -543,6 +543,8 @@ class OpenAlexClient:
         if (type(min_interval_seconds) not in (int, float)
                 or not math.isfinite(min_interval_seconds) or min_interval_seconds < 0):
             raise ValueError("min_interval_seconds must be finite and non-negative")
+        if type(allow_anonymous_fallback) is not bool:
+            raise ValueError("allow_anonymous_fallback must be a Boolean")
         endpoint = _url(endpoint)
         parsed = urlsplit(endpoint)
         if parsed.port == 0:
@@ -564,6 +566,7 @@ class OpenAlexClient:
         self.max_retries, self.retry_backoff_seconds = max_retries, float(retry_backoff_seconds)
         self.min_interval_seconds = float(min_interval_seconds)
         self.rate_state_path = rate_state_path
+        self.allow_anonymous_fallback = allow_anonymous_fallback
         self._pacing_lock = threading.Lock()
         self._next_request_at = 0.0
 
@@ -724,9 +727,14 @@ class OpenAlexClient:
         credential = os.environ.get(self.auth_env) if self.auth_env is not None else None
         credential_ready = self.auth_env is None or bool(
             credential and all(33 <= ord(character) <= 126 for character in credential))
-        principal = ("anonymous" if self.auth_env is None else
+        anonymous_fallback = self.auth_env is not None and not credential_ready \
+            and self.allow_anonymous_fallback
+        if anonymous_fallback:
+            credential = None
+        principal = ("anonymous" if self.auth_env is None or anonymous_fallback else
                      "key:" + hashlib.sha256(credential.encode("utf-8")).hexdigest()
                      if credential_ready else None)
+        auth_required = self.auth_env is not None and not anonymous_fallback
         with _locked_provider_request(self.rate_state_path, deadline) as reserved:
             if not reserved:
                 timestamp = _now()
@@ -749,12 +757,13 @@ class OpenAlexClient:
             return self._run_serialized(
                 operation=operation, query=query, work_id=work_id, limit=limit,
                 cursor=cursor, credential=credential, principal=principal,
-                credential_ready=credential_ready, started=started, deadline=deadline,
+                credential_ready=credential_ready or anonymous_fallback,
+                auth_required=auth_required, started=started, deadline=deadline,
             )
 
     def _run_serialized(self, *, operation, query=None, work_id=None, limit=5,
                         cursor=None, credential=None, principal=None,
-                        credential_ready=True, started=None, deadline=None):
+                        credential_ready=True, auth_required=None, started=None, deadline=None):
         """Retry transient provider responses inside one operation budget.
 
         The timeout is a total budget for the call, so backoff cannot silently
@@ -762,6 +771,8 @@ class OpenAlexClient:
         """
         arguments = validate_arguments({"operation": operation, "query": query, "work_id": work_id,
                                         "limit": limit, "cursor": cursor})
+        if auth_required is None:
+            auth_required = self.auth_env is not None
         url = request_url(self.endpoint, arguments)
         request_class = self._request_class(arguments)
         if credential_ready:
@@ -785,7 +796,7 @@ class OpenAlexClient:
                 break
             last = self._run_once(operation=operation, query=query, work_id=work_id,
                                   limit=limit, cursor=cursor, timeout=remaining,
-                                  credential=credential)
+                                  credential=credential, auth_required=auth_required)
             last.setdefault("metadata", {})["attempts"] = attempt + 1
             status = (last.get("metadata") or {}).get("http_status")
             provider_throttle = last.get("outcome") == "rate_limited"
@@ -848,7 +859,7 @@ class OpenAlexClient:
         return last
 
     def _run_once(self, *, operation, query=None, work_id=None, limit=5, cursor=None,
-                  timeout=None, credential=None):
+                  timeout=None, credential=None, auth_required=None):
         request_timeout = self.timeout if timeout is None else timeout
         arguments = validate_arguments({"operation": operation, "query": query, "work_id": work_id,
                                         "limit": limit, "cursor": cursor})
@@ -860,9 +871,11 @@ class OpenAlexClient:
                                "request": arguments, "started_at": _now(),
                                "authenticated": credential is not None,
                                "capture_truncated": False, "capture_incomplete": False}}
+        if auth_required is None:
+            auth_required = self.auth_env is not None
         headers = {"User-Agent": "Sci-saurus/0.8 (scholarly metadata client)",
                    "Accept": "application/json", "Accept-Encoding": "identity"}
-        if self.auth_env is not None:
+        if auth_required:
             if not credential or any(ord(c) < 33 or ord(c) > 126 for c in credential):
                 result.update(outcome="auth_required", error="Configured OpenAlex credential is unavailable or invalid")
                 result["metadata"]["completed_at"] = _now()

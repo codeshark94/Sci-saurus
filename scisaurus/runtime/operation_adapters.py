@@ -51,7 +51,8 @@ def _crossref_client(client, project_path, environment_files):
 def _openalex_client(client, project_path, environment_files):
     _limits(client)
     if set(client) - {"timeout", "max_bytes", "endpoint", "auth_env", "max_retries",
-                      "retry_backoff_seconds", "min_interval_seconds", "rate_state_path"}:
+                      "retry_backoff_seconds", "min_interval_seconds", "rate_state_path",
+                      "allow_anonymous_fallback"}:
         raise ValidationError("Unsupported OpenAlex client options")
     client.setdefault("endpoint", literature.DEFAULT_ENDPOINT)
     if "rate_state_path" in client:

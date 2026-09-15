@@ -643,6 +643,19 @@ class TestOpenAlex(unittest.TestCase):
         self.assertEqual(result["outcome"], "auth_required")
         self.assertEqual(len(OpenAlexFixture.requests), before)
 
+    def test_configured_auth_can_explicitly_fall_back_to_anonymous_request(self):
+        before = len(OpenAlexFixture.requests)
+        with patch.dict(os.environ, {}, clear=True):
+            result = self.client(
+                auth_env="SCISAURUS_OPENALEX_TEST",
+                allow_anonymous_fallback=True,
+                max_retries=0,
+            ).run(**self.arguments("anonymous-fallback"))
+        self.assertEqual(result["outcome"], "ok")
+        self.assertFalse(result["metadata"]["authenticated"])
+        self.assertIsNone(OpenAlexFixture.requests[-1]["authorization"])
+        self.assertEqual(len(OpenAlexFixture.requests), before + 1)
+
     def test_dns_deadline_returns_without_late_http_request(self):
         before = len(OpenAlexFixture.requests)
         resolver = socket.getaddrinfo

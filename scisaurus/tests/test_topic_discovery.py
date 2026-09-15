@@ -5,12 +5,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import QuotaExceededError, ValidationError
 from scisaurus.runtime.literature import ProviderCooldownError
-from scisaurus.runtime.models import ModelResult
+from scisaurus.runtime.models import ModelCallError, ModelResult
 from scisaurus.runtime.topic_discovery import (
     SCHEMA_VERSION,
     STAGE_CONFIG_SCHEMA_VERSION,
+    TopicBudget,
     TopicDiscoveryRunner,
     topic_maturity_admitted,
     topic_signature,
@@ -220,6 +221,7 @@ class TopicDiscoveryTests(unittest.TestCase):
                 "output_path": str((root / "topic.json").resolve()),
                 "candidate_count": 3,
                 "max_attempts": 2,
+                "budgets": {"max_model_calls": 4, "max_openalex_requests": 5},
             }
             self.assertEqual(validate_topic_stage_config(config), config)
             value = package("Choose a feasible research direction")
@@ -275,6 +277,41 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(len(first[2]), 6)
         self.assertTrue(all(item["year"] >= 2022 for item in first[0]))
         self.assertGreaterEqual(len({item["frontier_seed_id"] for item in first[0]}), 4)
+
+    def test_topic_budget_stops_openalex_before_the_next_network_request(self):
+        FakeOpenAlex.queries = []
+        with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", FakeOpenAlex):
+            with self.assertRaisesRegex(QuotaExceededError, "openalex_requests"):
+                TopicDiscoveryRunner._recent_paper_sample(
+                    "bounded science", sampling_seed=17, frontier_seed_plan=frontier_plan(),
+                    budget=TopicBudget({"max_openalex_requests": 1}, {}))
+        self.assertEqual(len(FakeOpenAlex.queries), 1)
+
+    def test_failed_model_attempts_leave_usage_and_event_diagnostics(self):
+        class AlwaysUnavailableModel:
+            def __init__(self, **config):
+                self.config = config
+
+            def complete(self, *, system, prompt, images=None):
+                raise ModelCallError(
+                    "provider unavailable", outcome_known=False,
+                    attempts=2, elapsed_seconds=0.25)
+
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", AlwaysUnavailableModel):
+            with self.assertRaises(ValidationError) as caught:
+                TopicDiscoveryRunner({
+                    "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                    "timeout_seconds": 1, "max_output_tokens": 4096,
+                }).run(
+                    "Choose a feasible research direction", candidate_count=3,
+                    bibliography=False, max_attempts=3,
+                    budgets={"max_model_calls": 3},
+                )
+        snapshot = caught.exception.topic_budget
+        self.assertEqual(snapshot["usage"]["model_calls"], 3)
+        self.assertEqual(len(snapshot["events"]), 3)
+        self.assertTrue(all(event["status"] == "error" for event in snapshot["events"]))
+        self.assertTrue(all(event["request_attempts"] == 2 for event in snapshot["events"]))
 
     def test_topic_sampling_rejects_single_token_provider_false_positives(self):
         class MixedRelevanceOpenAlex:
@@ -350,6 +387,32 @@ class TopicDiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "outside the supplied evidence"):
             validate_topic_package(
                 value, objective=value["objective"], candidate_count=3,
+                frontier_seeds=seeds, recent_papers=papers, require_grounding=True)
+
+    def test_grounded_portfolio_rejects_near_duplicate_questions(self):
+        value = package("Choose a feasible research direction")
+        seeds = frontier_plan(3)["seeds"]
+        papers = []
+        for index, seed in enumerate(seeds):
+            work_id = f"W{index + 1}"
+            papers.append({
+                "work_id": work_id, "title": seed["search_queries"][0],
+                "abstract": f"Evidence about {seed['mechanism']} and {seed['phenomenon']}.",
+                "frontier_seed_id": seed["id"],
+            })
+            candidate = value["candidates"][index]
+            candidate.update({
+                "domain": seed["domain"],
+                "research_question": "Does the same mechanism alter the same measured outcome?",
+                "scope": f"Observed {seed['unit_of_analysis']}.",
+                "search_queries": [*seed["search_queries"], f"{seed['domain']} transition"],
+                "frontier_seed_id": seed["id"], "prior_work_ids": [work_id],
+                "experiment_capability_id": "shared_capability",
+            })
+        with self.assertRaisesRegex(ValidationError, "near-duplicate"):
+            validate_topic_package(
+                value, objective=value["objective"], candidate_count=3,
+                experiment_capability_ids={"shared_capability"},
                 frontier_seeds=seeds, recent_papers=papers, require_grounding=True)
 
     def test_selected_topic_cannot_paraphrase_a_hidden_fallback_template(self):

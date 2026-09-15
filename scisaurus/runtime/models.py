@@ -122,9 +122,16 @@ def resolve_model_config(model, *, role=None, overrides=None):
 
 class ModelCallError(RuntimeError):
     """An invocation failed; unknown outcomes must retain their reservation."""
-    def __init__(self, message, *, outcome_known=False):
+    def __init__(self, message, *, outcome_known=False, attempts=0,
+                 elapsed_seconds=None):
         super().__init__(message)
         self.outcome_known = outcome_known
+        self.attempts = attempts if type(attempts) is int and attempts >= 0 else 0
+        self.elapsed_seconds = (
+            float(elapsed_seconds)
+            if type(elapsed_seconds) in (int, float) and math.isfinite(elapsed_seconds)
+            and elapsed_seconds >= 0 else None
+        )
 
 
 class _ProviderHTTPError(RuntimeError):
@@ -142,6 +149,7 @@ class ModelResult:
     usage: dict
     elapsed_seconds: float
     finish_reason: str
+    request_attempts: int = 1
 
     def json_object(self):
         try:
@@ -307,11 +315,20 @@ class ModelClient:
         deadline = started + self.timeout_seconds
         retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
         attempt = 0
+        attempts_made = 0
         parsed = None
+
+        def failure(message, *, outcome_known=False):
+            return ModelCallError(
+                message, outcome_known=outcome_known, attempts=attempts_made,
+                elapsed_seconds=time.monotonic() - started,
+            )
+
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise ModelCallError("model request deadline exceeded") from None
+                raise failure("model request deadline exceeded") from None
+            attempts_made += 1
             connection = connection_type(parsed_base.hostname, parsed_base.port,
                                          timeout=max(0.1, remaining))
             response = None
@@ -348,7 +365,7 @@ class ModelClient:
                 response = connection.getresponse()
                 code = response.status
                 if 300 <= code < 400:
-                    raise ModelCallError(
+                    raise failure(
                         "model endpoint redirected; configure the final endpoint explicitly",
                         outcome_known=True)
                 if code != 200:
@@ -366,7 +383,7 @@ class ModelClient:
                 while total <= self.max_response_bytes:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise ModelCallError("model request deadline exceeded")
+                        raise failure("model request deadline exceeded")
                     transport_socket = connection.sock
                     if transport_socket is not None:
                         transport_socket.settimeout(max(0.1, remaining))
@@ -374,7 +391,7 @@ class ModelClient:
                         chunk = read_chunk(min(65536, self.max_response_bytes + 1 - total))
                     except (AttributeError, OSError, TimeoutError, ValueError):
                         if expired.is_set() or time.monotonic() >= deadline:
-                            raise ModelCallError("model request deadline exceeded") from None
+                            raise failure("model request deadline exceeded") from None
                         raise
                     if not chunk:
                         break
@@ -392,19 +409,19 @@ class ModelClient:
                     except (TypeError, ValueError):
                         pass
                     if time.monotonic() + delay >= deadline:
-                        raise ModelCallError(f"model HTTP request failed with status {code}",
-                                              outcome_known=400 <= code < 500) from None
+                        raise failure(f"model HTTP request failed with status {code}",
+                                      outcome_known=400 <= code < 500) from None
                     time.sleep(delay)
                     attempt += 1
                     continue
-                raise ModelCallError(f"model HTTP request failed with status {code}",
-                                     outcome_known=400 <= code < 500) from None
-            except ModelCallError:
-                raise
+                raise failure(f"model HTTP request failed with status {code}",
+                              outcome_known=400 <= code < 500) from None
+            except ModelCallError as exc:
+                raise failure(str(exc), outcome_known=exc.outcome_known) from None
             except (http.client.HTTPException, TimeoutError, OSError, ValueError, AttributeError) as exc:
                 if expired.is_set() or time.monotonic() >= deadline:
-                    raise ModelCallError("model request deadline exceeded") from None
-                raise ModelCallError(f"model transport failed: {type(exc).__name__}") from None
+                    raise failure("model request deadline exceeded") from None
+                raise failure(f"model transport failed: {type(exc).__name__}") from None
             finally:
                 if timeout_timer is not None:
                     timeout_timer.cancel()
@@ -415,7 +432,7 @@ class ModelClient:
                         pass
                 connection.close()
             if len(raw) > self.max_response_bytes:
-                raise ModelCallError("model response exceeded the configured byte limit")
+                raise failure("model response exceeded the configured byte limit")
             try:
                 data = json.loads(raw)
                 if self.protocol == "ollama":
@@ -440,10 +457,10 @@ class ModelClient:
                 parsed = (text, reason, usage, data.get("model", self.model))
             except (ValueError, TypeError, KeyError, IndexError):
                 if attempt >= self.max_retries:
-                    raise ModelCallError("model returned an invalid or incomplete response") from None
+                    raise failure("model returned an invalid or incomplete response") from None
                 delay = self.retry_backoff_seconds * (2 ** attempt)
                 if time.monotonic() + delay >= deadline:
-                    raise ModelCallError("model returned an invalid or incomplete response") from None
+                    raise failure("model returned an invalid or incomplete response") from None
                 time.sleep(delay)
                 attempt += 1
                 continue
@@ -451,4 +468,5 @@ class ModelClient:
         elapsed = time.monotonic() - started
         text, reason, usage, served_model = parsed
         return ModelResult(text, served_model,
-                           {"model_calls": 1, **usage}, elapsed, reason)
+                           {"model_calls": 1, **usage}, elapsed, reason,
+                           request_attempts=attempts_made)
