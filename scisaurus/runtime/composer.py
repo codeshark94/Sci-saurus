@@ -32,6 +32,11 @@ from scisaurus.core.schema import canonical_bytes, now_iso
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.tasks import TaskManager
 from scisaurus.runtime.literature import ProviderCooldownError
+from scisaurus.runtime.departments import (
+    COMMAND_ADDRESSES,
+    DEFAULT_STAGE_ROUTES,
+    stage_role,
+)
 
 
 SCHEMA_VERSION = "composer-workflow-1"
@@ -43,26 +48,10 @@ STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretat
 # be reopened before any consumer can read the incumbent packet.
 STAGE_READY_STATUSES = frozenset({"completed", "accepted", "candidate_needs_review"})
 STAGE_HOLD_STATUSES = frozenset({"research_expansion_required", "review_rejected"})
-STAGE_ROLES = {
-    "topic_discovery": "research.intelligence",
-    "survey": "research.intelligence",
-    "experiment": "methods.validation",
-    "interpretation": "strategy.interpretation",
-    "argument": "strategy.argument",
-    "paper": "editorial.composer",
-}
-DEPARTMENT_ADDRESSES = {
-    "research.intelligence": {"dept": "research", "agent": "chief"},
-    "methods.validation": {"dept": "methods", "agent": "chief"},
-    "strategy.interpretation": {"dept": "strategy", "agent": "chief"},
-    "strategy.argument": {"dept": "strategy", "agent": "chief"},
-    "editorial.composer": {"dept": "editorial", "agent": "editor-in-chief"},
-}
-COMMAND_ADDRESSES = {
-    "arbiter": {"dept": "executive-command", "agent": "arbiter"},
-    "progress": {"dept": "executive-command", "agent": "progress-controller"},
-    "intent": {"dept": "executive-command", "agent": "intent-keeper"},
-}
+# Compatibility projection for callers that imported the old Composer map.
+# Ownership is defined in runtime.departments.DEFAULT_STAGE_ROUTES.
+STAGE_ROLES = {route["stage_kind"]: stage_role(route["stage_kind"])
+               for route in DEFAULT_STAGE_ROUTES}
 IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 # Autonomous execution is the safe default: a transient model, provider, or
 # validation failure cannot terminate a workflow merely because a counter was
@@ -277,7 +266,7 @@ def validate_workflow(value):
         from scisaurus.runtime.departments import validate_organization
         validated_organization = validate_organization(organization)
         configured_departments = {item["id"] for item in validated_organization["departments"]}
-        required_departments = {STAGE_ROLES[stage["kind"]].split(".", 1)[0] for stage in stages}
+        required_departments = {stage_role(stage["kind"]).split(".", 1)[0] for stage in stages}
         if required_departments - configured_departments:
             raise ValidationError(
                 "project organization is missing stage-owning departments: "
@@ -1489,15 +1478,15 @@ class ComposerRunner:
     def _address_for_role(self, role):
         """Resolve a role through the live project charter.
 
-        The static map remains a compatibility fallback for command roles and
-        old workflows.  A custom organization chief is authoritative for its
-        department, so every new handoff uses that chief automatically.
+        The functional role identifies the owning department; the live charter
+        supplies the concrete chief appointment.  Command roles are the only
+        addresses outside a project department.
         """
         if isinstance(role, str):
             department = role.split(".", 1)[0]
             if department in self.departments.charters:
                 return self.departments.address(department)
-        return deepcopy(DEPARTMENT_ADDRESSES.get(role, COMMAND_ADDRESSES["arbiter"]))
+        return deepcopy(COMMAND_ADDRESSES.get(role, COMMAND_ADDRESSES["arbiter"]))
 
     @staticmethod
     def _prior_stage_project(stage_id, context):
@@ -1700,8 +1689,25 @@ class ComposerRunner:
             raw = [exact_query, *raw]
         return list(dict.fromkeys(raw))
 
-    def _materialize_topic_capability(self, result):
-        """Generate and admit a pinned program for one science-first topic."""
+    @staticmethod
+    def _continuation_capability_id(topic, cycle):
+        """Derive a new registry identity for a substantive experiment pass."""
+        base = topic.get("id") if isinstance(topic, dict) else None
+        base = re.sub(r"[^a-z0-9_-]+", "-", str(base or "topic").casefold()).strip("-")
+        if not base or not re.match(r"[a-z]", base):
+            base = f"topic-{base}" if base else "topic"
+        suffix = f"-cycle-{cycle}"
+        return f"{base[:64 - len(suffix)]}{suffix}"
+
+    def _materialize_topic_capability(self, result, *, force_regenerate=False,
+                                      continuation_requests=(), continuation_revision=None):
+        """Generate and admit a pinned program for one science-first topic.
+
+        A substantive methods continuation must not silently execute the same
+        generated capability again.  Forced generations receive a new
+        deterministic study identity and the red-team work orders in their
+        authoring brief, while the original question and domain stay pinned.
+        """
         configured_path = self.workflow.get("capability_foundry_config_path")
         if not configured_path:
             return result
@@ -1719,21 +1725,23 @@ class ComposerRunner:
 
         registry_root = Path(configured["registry_root"])
         existing = None
-        for entry in reversed(load_registry(registry_root).get("capabilities", [])):
-            try:
-                path = Path(entry["path"])
-                descriptor = json.loads(path.read_text())
-                experiment = descriptor.get("experiment", {})
-            except (KeyError, OSError, ValueError, TypeError):
-                continue
-            if (experiment.get("research_question") == question
-                    and experiment.get("domain") == domain):
-                existing = {
-                    "capability_id": descriptor.get("capability_id"),
-                    "descriptor_path": str(path.resolve()), "reused": True,
-                    "registry_entry": deepcopy(entry),
-                }
-                break
+        prior_capability = deepcopy(result.get("generated_capability"))
+        if not force_regenerate:
+            for entry in reversed(load_registry(registry_root).get("capabilities", [])):
+                try:
+                    path = Path(entry["path"])
+                    descriptor = json.loads(path.read_text())
+                    experiment = descriptor.get("experiment", {})
+                except (KeyError, OSError, ValueError, TypeError):
+                    continue
+                if (experiment.get("research_question") == question
+                        and experiment.get("domain") == domain):
+                    existing = {
+                        "capability_id": descriptor.get("capability_id"),
+                        "descriptor_path": str(path.resolve()), "reused": True,
+                        "registry_entry": deepcopy(entry),
+                    }
+                    break
 
         if existing is None:
             model = json.loads(Path(configured["model_config_path"]).read_text())
@@ -1770,6 +1778,15 @@ class ComposerRunner:
                     "id", "title", "domain", "research_question", "scope",
                     "disconfirmation_test", "resource_plan")},
                 "source_challenge": result.get("source_challenge"),
+                "continuation": {
+                    "cycle": self.continuation_cycles if force_regenerate else None,
+                    "prior_capability_id": (
+                        prior_capability.get("capability_id")
+                        if isinstance(prior_capability, dict) else None
+                    ),
+                    "requests": self._follow_up_projection(continuation_requests)
+                    if force_regenerate else [],
+                },
                 "closest_prior_work": [{key: item.get(key) for key in (
                     "work_id", "title", "year", "abstract", "source_url")}
                     for item in result.get("candidate_prior_work", [])[:8]
@@ -1781,9 +1798,18 @@ class ComposerRunner:
                     "no network access or undeclared data",
                 ],
             }
+            required_intent = {"domain": domain, "research_question": question}
+            if force_regenerate:
+                revision = continuation_revision
+                if type(revision) is not int or revision < 1:
+                    revision = max(1, self.continuation_cycles + 1)
+                required_intent.update({
+                    "id": self._continuation_capability_id(selected, self.continuation_cycles),
+                    "revision": revision,
+                })
             outcome = foundry.generate(
                 json.dumps(brief, ensure_ascii=False, sort_keys=True),
-                required_intent={"domain": domain, "research_question": question},
+                required_intent=required_intent,
             )
             existing = {
                 "capability_id": outcome["registration"]["capability_id"],
@@ -1791,6 +1817,8 @@ class ComposerRunner:
                 "reused": False, "attempts": outcome["attempts"],
                 "admission": outcome["admission"],
             }
+            if force_regenerate:
+                existing["continuation_cycle"] = self.continuation_cycles
         if not isinstance(existing.get("capability_id"), str):
             raise ValidationError("capability foundry did not return a capability identity")
         result["generated_capability"] = existing
@@ -1817,7 +1845,23 @@ class ComposerRunner:
             return config
         selected = topic_context["topic"]
         generated = topic_context.get("generated_capability")
-        if generated is None and self.workflow.get("capability_foundry_config_path"):
+        continuation_requests = self._requests_for_stage(stage["id"])
+        needs_fresh_capability = (
+            bool(self.continuation_cycles and continuation_requests)
+            and any(item.get("kind") in {"additional_experiment", "analysis_display", "analysis_repair"}
+                    for item in continuation_requests)
+        )
+        if needs_fresh_capability and not self.workflow.get("capability_foundry_config_path"):
+            raise ValidationError(
+                "a substantive experiment continuation requires capability_foundry_config_path; "
+                "a pinned catalog cannot silently repeat the prior experiment")
+        if needs_fresh_capability and self.workflow.get("capability_foundry_config_path"):
+            self._materialize_topic_capability(
+                topic_context, force_regenerate=True,
+                continuation_requests=continuation_requests,
+                continuation_revision=int((config.get("experiment") or {}).get("revision", 1)))
+            generated = topic_context.get("generated_capability")
+        elif generated is None and self.workflow.get("capability_foundry_config_path"):
             # Capability authoring is downstream of the accepted literature
             # gate.  Do not spend the topic-stage wall generating an executable
             # program before the survey has tested whether the question is
@@ -3042,11 +3086,12 @@ class ComposerRunner:
             self.tasks.transition(task_id, "queued", "command.composer", reason="scoped stage recovery")
         if existing is not None:
             return self.tasks.get(task_id)
-        role = STAGE_ROLES[stage["kind"]]
+        route = self.departments.stage_route(stage["kind"])
         self.tasks.create(task_id, "production", {
             "stage_id": stage["id"], "kind": stage["kind"], "objective": self.workflow["objective"],
             "depends_on": stage["depends_on"], "config_path": stage["config_path"],
-            "department": role.split(".", 1)[0], "role": role,
+            "department": route["department"], "role": route["role"],
+            "owner_agent": route["chief"], "adversary_agent": route["adversary"],
         }, "command.composer")
         return self.tasks.admit(task_id, "command.composer")
 
@@ -3312,7 +3357,8 @@ class ComposerRunner:
                         "review_max_output_tokens", "review_reasoning_effort",
                         "review_call_timeout_seconds", "review_inter_request_interval_seconds",
                         "repair_max_output_tokens", "model_call_timeout_seconds",
-                        "review_arbiter_enabled", "model_concurrency"}
+                        "review_arbiter_enabled", "model_concurrency",
+                        "research_redteam_deadline_seconds", "research_redteam_max_attempts"}
             if set(config) - required - optional or not required.issubset(config):
                 raise ValidationError(
                     f"paper descriptor requires {sorted(required)} and permits {sorted(optional)}")
@@ -3320,6 +3366,16 @@ class ComposerRunner:
                 raise ValidationError("paper descriptor release_on_review_limit must be Boolean")
             if "review_arbiter_enabled" in config and type(config["review_arbiter_enabled"]) is not bool:
                 raise ValidationError("paper descriptor review_arbiter_enabled must be Boolean")
+            if "research_redteam_deadline_seconds" in config:
+                value = config["research_redteam_deadline_seconds"]
+                if (type(value) not in (int, float) or not math.isfinite(value) or value <= 0):
+                    raise ValidationError(
+                        "paper descriptor research_redteam_deadline_seconds must be finite and positive")
+            if "research_redteam_max_attempts" in config:
+                value = config["research_redteam_max_attempts"]
+                if type(value) is not int or not 1 <= value <= 8:
+                    raise ValidationError(
+                        "paper descriptor research_redteam_max_attempts must be an integer from 1 to 8")
             packet = json.loads(Path(config["packet_path"]).read_text())
             packet = self._project_continuation_requests(packet, stage)
             model = json.loads(Path(config["model_config_path"]).read_text())
@@ -3368,6 +3424,9 @@ class ComposerRunner:
                 model_call_timeout_seconds=min(config.get("model_call_timeout_seconds", 300.0), stage_deadline),
                 model_concurrency=config.get("model_concurrency", 1),
                 review_arbiter_enabled=bool(config.get("review_arbiter_enabled", True)),
+                research_redteam_deadline_seconds=min(
+                    config.get("research_redteam_deadline_seconds", 900.0), stage_deadline),
+                research_redteam_max_attempts=config.get("research_redteam_max_attempts", 3),
                 draft=draft, initial_review_package=initial_review_package,
                 release_on_review_limit=bool(config.get("release_on_review_limit", False)),
                 initial_argument_package=argument_package,
@@ -3394,7 +3453,7 @@ class ComposerRunner:
         return callback
 
     def _record_feedback(self, stage, context):
-        role = STAGE_ROLES[stage["kind"]]
+        route = self.departments.stage_route(stage["kind"])
         action = ("advance" if context.get("status") in {"completed", "accepted", "candidate_needs_review"}
                   else "reconcile_blocker")
         if context.get("status") == "research_expansion_required":
@@ -3416,7 +3475,10 @@ class ComposerRunner:
             elif action == "editor_rejected":
                 recipient = self._address_for_role("editorial.composer")
         feedback = {
-            "stage_id": stage["id"], "role": STAGE_ROLES[stage["kind"]],
+            "stage_id": stage["id"], "role": route["role"],
+            "department": route["department"],
+            "owner_agent": route["chief"],
+            "adversary_agent": route["adversary"],
             "from": COMMAND_ADDRESSES["progress"], "to": recipient,
             "status": context.get("status"), "output_path": context.get("output_path"),
             "scientific_state": context.get("gap_state") or context.get("review_status") or context.get("argument_status"),
@@ -3453,6 +3515,8 @@ class ComposerRunner:
                       if isinstance(item, dict)}
             if len(owners) == 1 and next(iter(owners)):
                 return self._address_for_role(next(iter(owners)))
+            if event.get("decision") in {"proceed", "accept"}:
+                return self._address_for_role("editorial.composer")
             return COMMAND_ADDRESSES["arbiter"]
         if kind == "editor_decision":
             return self._address_for_role("editorial.composer")
@@ -3514,6 +3578,7 @@ class ComposerRunner:
         status = event.get("status", "needs_revision")
         failure = event.get("kind", "").endswith("failure") or status == "blocked"
         recipient = self._feedback_address(event)
+        route = self.departments.stage_route(stage["kind"])
         action = ("reconcile_blocker" if failure else
                   "request_research_expansion" if status == "research_expansion_required" else
                   "editor_rejected" if status == "rejected" else
@@ -3525,6 +3590,9 @@ class ComposerRunner:
             "event_id": event_id,
             "stage_id": stage["id"],
             "role": STAGE_ROLES[stage["kind"]],
+            "department": route["department"],
+            "owner_agent": route["chief"],
+            "adversary_agent": route["adversary"],
             "from": {"dept": "specialist-review", "agent": event["kind"]},
             "to": recipient,
             "status": status,
@@ -3601,8 +3669,12 @@ class ComposerRunner:
             raise ValidationError("message bus returned a different feedback message ID")
 
     def _record_blocker_feedback(self, stage, error):
+        route = self.departments.stage_route(stage["kind"])
         feedback = {
-            "stage_id": stage["id"], "role": STAGE_ROLES[stage["kind"]],
+            "stage_id": stage["id"], "role": route["role"],
+            "department": route["department"],
+            "owner_agent": route["chief"],
+            "adversary_agent": route["adversary"],
             "from": COMMAND_ADDRESSES["progress"], "to": COMMAND_ADDRESSES["arbiter"],
             "status": "blocked", "action": "reconcile_blocker",
             "error": str(error), "stage_deadline_seconds": stage["deadline_seconds"],

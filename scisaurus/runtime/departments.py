@@ -53,6 +53,23 @@ REQUEST_STAGE_KINDS = {
     "interpretation_expansion": "interpretation",
     "manuscript_revision": "paper",
 }
+# A stage's functional role is not a model process and is not the concrete
+# chief appointment in a project.  Keeping this routing table beside the
+# department charters prevents the Composer and the organization runtime from
+# silently developing different ownership maps.
+DEFAULT_STAGE_ROUTES = (
+    {"stage_kind": "topic_discovery", "department": "research", "functional_role": "intelligence"},
+    {"stage_kind": "survey", "department": "research", "functional_role": "intelligence"},
+    {"stage_kind": "experiment", "department": "methods", "functional_role": "validation"},
+    {"stage_kind": "interpretation", "department": "strategy", "functional_role": "interpretation"},
+    {"stage_kind": "argument", "department": "strategy", "functional_role": "argument"},
+    {"stage_kind": "paper", "department": "editorial", "functional_role": "composer"},
+)
+COMMAND_ADDRESSES = {
+    "arbiter": {"dept": "executive-command", "agent": "arbiter"},
+    "progress": {"dept": "executive-command", "agent": "progress-controller"},
+    "intent": {"dept": "executive-command", "agent": "intent-keeper"},
+}
 VOLATILE_FIELDS = frozenset({
     "created_at", "received_at", "updated_at", "source_event_id", "source_note_ref",
     "source_stage_id",
@@ -83,6 +100,71 @@ def _strings(value, name, *, empty=False):
 def _exact(value, fields, name):
     if not isinstance(value, dict) or set(value) != set(fields):
         raise ValidationError(f"{name} requires exactly {sorted(fields)}")
+
+
+def default_stage_routes():
+    """Return the immutable functional stage map as fresh plain data."""
+    return deepcopy(list(DEFAULT_STAGE_ROUTES))
+
+
+def stage_role(stage_kind):
+    """Return the stable functional role used in task and feedback records."""
+    _identifier(stage_kind, "stage kind")
+    for route in DEFAULT_STAGE_ROUTES:
+        if route["stage_kind"] == stage_kind:
+            return f"{route['department']}.{route['functional_role']}"
+    raise ValidationError(f"unsupported stage kind: {stage_kind}")
+
+
+def stage_route(stage_kind, charters=None):
+    """Resolve one functional route plus its project-specific appointments."""
+    _identifier(stage_kind, "stage kind")
+    route = next((item for item in DEFAULT_STAGE_ROUTES
+                  if item["stage_kind"] == stage_kind), None)
+    if route is None:
+        raise ValidationError(f"unsupported stage kind: {stage_kind}")
+    charter = (charters or {}).get(route["department"])
+    if charter is None:
+        raise ValidationError(
+            f"stage {stage_kind} has no owning department: {route['department']}")
+    return {
+        **deepcopy(route),
+        "role": f"{route['department']}.{route['functional_role']}",
+        "chief": charter["chief"],
+        "adversary": charter["adversary"],
+        "owner_address": {"dept": route["department"], "agent": charter["chief"]},
+        "review_address": {"dept": route["department"], "agent": charter["adversary"]},
+    }
+
+
+def agent_roster(charters):
+    """Project concrete chief/adversary appointments from validated charters."""
+    if not isinstance(charters, dict):
+        raise ValidationError("agent roster requires department charters")
+    roster = []
+    for department in sorted(charters):
+        charter = charters[department]
+        roster.extend((
+            {
+                "id": f"{department}.{charter['chief']}",
+                "department": department,
+                "agent": charter["chief"],
+                "appointment": "chief",
+                "independent_review": False,
+                "stage_kinds": list(charter["stage_kinds"]),
+                "proposal_kinds": list(charter["proposal_kinds"]),
+            },
+            {
+                "id": f"{department}.{charter['adversary']}",
+                "department": department,
+                "agent": charter["adversary"],
+                "appointment": "adversary",
+                "independent_review": True,
+                "stage_kinds": list(charter["stage_kinds"]),
+                "proposal_kinds": list(charter["proposal_kinds"]),
+            },
+        ))
+    return roster
 
 
 DEFAULT_DEPARTMENTS = [
@@ -162,6 +244,8 @@ def validate_charter(value):
     _text(value["label"], "department label")
     _identifier(value["chief"], "department chief")
     _identifier(value["adversary"], "department adversary")
+    if value["chief"] == value["adversary"]:
+        raise ValidationError("department chief and adversary must be distinct appointments")
     _strings(value["subscriptions"], "department subscriptions")
     _strings(value["proposal_kinds"], "department proposal_kinds")
     if set(value["proposal_kinds"]) - PROPOSAL_KINDS:
@@ -250,7 +334,9 @@ class DepartmentRuntime:
     def _ensure_manifests(self):
         org_record = self._publish_idempotent(
             "command/organization", "note",
-            {"project_id": self.project_id, **self.organization},
+            {"project_id": self.project_id, **self.organization,
+             "agents": self.agents(), "stage_routes": self.stage_routes(),
+             "command_agents": deepcopy(COMMAND_ADDRESSES)},
         )
         self.manifest_refs["organization"] = org_record["artifact_ref"]
         for charter in self.organization["departments"]:
@@ -269,6 +355,22 @@ class DepartmentRuntime:
             else:
                 _identifier(role, "department role")
         return {"dept": department, "agent": role}
+
+    def stage_route(self, stage_kind):
+        """Return the functional owner and concrete appointments for a stage."""
+        return stage_route(stage_kind, self.charters)
+
+    def agents(self):
+        """Return the concrete project appointments derived from the charters."""
+        return agent_roster(self.charters)
+
+    def stage_routes(self):
+        """Return all configured default routes that have a live owner."""
+        return [
+            self.stage_route(route["stage_kind"])
+            for route in DEFAULT_STAGE_ROUTES
+            if route["department"] in self.charters
+        ]
 
     def _charter_for_owner(self, owner, kind):
         department = _department_for_owner(owner)
@@ -647,6 +749,9 @@ class DepartmentRuntime:
             "project_id": self.project_id,
             "template": self.organization["template"],
             "departments": deepcopy(self.organization["departments"]),
+            "agents": self.agents(),
+            "stage_routes": self.stage_routes(),
+            "command_agents": deepcopy(COMMAND_ADDRESSES),
             "manifest_refs": deepcopy(self.manifest_refs),
             "allow_dynamic_proposals": self.organization["allow_dynamic_proposals"],
             "backlog_counts": counts,
@@ -656,6 +761,7 @@ class DepartmentRuntime:
 
 __all__ = [
     "SCHEMA_VERSION", "CHARTER_SCHEMA_VERSION", "WORK_ORDER_SCHEMA_VERSION", "PROPOSAL_KINDS",
-    "DEFAULT_DEPARTMENTS", "default_organization", "validate_charter", "validate_organization",
-    "validate_work_order", "DepartmentRuntime",
+    "DEFAULT_DEPARTMENTS", "DEFAULT_STAGE_ROUTES", "COMMAND_ADDRESSES",
+    "default_organization", "default_stage_routes", "stage_role", "stage_route", "agent_roster",
+    "validate_charter", "validate_organization", "validate_work_order", "DepartmentRuntime",
 ]

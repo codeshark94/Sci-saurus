@@ -32,13 +32,28 @@ def normalized(text):
     return " ".join(re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold()))
 
 
-def apply_scoped_map_repair(wid, previous, old_relationships, feedback, patch):
-    """Compose a narrow repair without asking a worker to reproduce protected state."""
+def apply_scoped_map_repair(wid, previous, old_relationships, feedback, patch, *,
+                            reject_ungranted_changes=False):
+    """Compose a narrow repair without asking a worker to reproduce protected state.
+
+    The pure composition helper may discard fields echoed beside a valid patch
+    for compatibility with older callers.  A live provider response must use
+    ``reject_ungranted_changes=True`` so an actual out-of-scope edit is a
+    validation failure rather than a silently accepted response.
+    """
     exact(patch, {"entry_updates", "relationships"}, "scoped map repair")
     updates = patch["entry_updates"]
     relations = patch["relationships"]
-    if not isinstance(updates, dict) or set(updates) != set(feedback["entry_fields"]):
+    granted_fields = set(feedback["entry_fields"])
+    if not isinstance(updates, dict) or not granted_fields.issubset(updates):
+        raise ValidationError("scoped map repair omitted a granted entry field")
+    if reject_ungranted_changes and set(updates) != granted_fields:
         raise ValidationError("scoped map repair must return exactly the granted entry fields")
+    # A repair worker sometimes echoes the protected fields from the previous
+    # entry along with the requested patch.  The control plane owns those
+    # fields, so project the response to the explicit grant before composing
+    # it.  No out-of-scope value can affect the accepted entry.
+    updates = {field: updates[field] for field in feedback["entry_fields"]}
     if not isinstance(relations, list):
         raise ValidationError("scoped map repair relationships must be a list")
     targets = set(feedback["relationship_targets"])
@@ -1457,7 +1472,9 @@ class SurveyRunner(ExecutionRuntime):
         effective = {}
         def validate(value):
             if review_feedback is not None:
-                value = apply_scoped_map_repair(wid, previous, old_relationships, review_feedback, value)
+                value = apply_scoped_map_repair(
+                    wid, previous, old_relationships, review_feedback, value,
+                    reject_ungranted_changes=True)
             validate_map(value, [wid], set(self.works), self.source_docs, require_spans=True)
             if not own_sources:
                 entry = value["entries"][0]

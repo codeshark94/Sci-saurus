@@ -277,6 +277,25 @@ work order, and reopens the topic→survey closure with the parent question and
 assessment attached. Every refinement records its lineage and changed
 scientific dimension; a cosmetic rewrite cannot satisfy the loop.
 
+**D65 — Scientific sufficiency is red-teamed before composition.** After the
+research argument and deterministic admission floors pass, a paper must receive
+independent pre-composition reviews from methods, mechanism, and journal-editor
+perspectives. The fixed checks cover the question, evidence, result coverage,
+controls, alternatives, reproducibility, and argument. A missing experiment,
+analysis, literature basis, or defensible interpretation becomes a typed
+research work order and blocks the writer; prose cannot discharge it. The
+red-team package, per-review artifacts, model usage, deadline, and aggregate
+decision are immutable inputs to the later manuscript review. This gate is a
+scientific sufficiency check, not a positivity or disagreement quota.
+
+**D66 — Functional roles and concrete appointments are separate.** The
+project organization keeps one stage-route table for functional ownership and
+projects each validated charter into concrete chief and independent-adversary
+appointments. A custom chief changes routing identity without changing stage
+semantics; the producing appointment and adversary must be distinct. Composer
+tasks, handoffs, checkpoints, and organization manifests expose the role,
+department, owner, adversary, and executive command addresses separately.
+
 ### 3.3 Effective interpretation of earlier rules
 
 | Earlier wording | Effective interpretation |
@@ -404,6 +423,7 @@ These defaults make the blueprint internally concrete; they do not falsely mark 
 | `80-completion-runtime.md` | Implemented recovery, executable plans, capability acquisition, blinded evaluation, and paper release-candidate contracts |
 | `90-experiment-runtime.md` | Implemented bounded scientific execution, exact replay, independent recalculation, result review, and generated-result provenance |
 | `100-research-argument-runtime.md` | Pre-composition question, hypothesis, discriminating-test, and figure/table argument contract |
+| `16-agent-department-flow.md` | Functional stage routes, concrete appointments, handoffs, lifecycle, and scoped continuation |
 | `85-multimodal-visual-review.md` | Hash-pinned image inputs, independent visual judgment, exact synthesis, and scoped repair actions |
 | `web-search-campaign.yaml` | Illustrative search campaign; not a working runtime |
 | `25-p0-freeze.md` | P0 contract-freeze record: frozen principles, selected first fixture, deployment-configuration template, acceptance state |
@@ -428,3 +448,4 @@ These defaults make the blueprint internally concrete; they do not falsely mark 
 | v1.5 | D62; durable project department charters, inbox/work-order backlog, autonomous activation/resolution, and template-as-default organization runtime |
 | v1.6 | D63; append-only cross-run topic memory, capability rotation, and selected-direction novelty gate |
 | v1.7 | D64; topic-maturity admission, evidence-driven topic refinement, and lineage-preserving re-entry |
+| v1.8 | D65–D66; pre-composition scientific red-team gate and single-source functional routing with concrete agent roster |

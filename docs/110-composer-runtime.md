@@ -24,6 +24,13 @@ judgment into a fact, or grant itself final publication authority. Research,
 Methods, and Editorial workers retain their own checks; an Arbiter handles a
 material dispute and the Principal retains material scope and release control.
 
+The identity and routing contract is defined separately in
+[`Agent, Department, and Stage Flow`](16-agent-department-flow.md). In brief,
+`role` names the functional owner, `department` names the accountability
+boundary, and `owner_agent`/`adversary_agent` name the concrete appointments for
+this project. This prevents a custom department chief from changing scientific
+stage semantics or making the producing worker its own independent verifier.
+
 ## Durable project organization
 
 Every Composer project opens a `DepartmentRuntime` with Research, Methods,
@@ -207,6 +214,17 @@ the program's analysis summary is checked against that design before the
 results package is accepted. A replayable package that lacks these components
 creates Methods work orders and is held at research admission; the writer is
 never asked to manufacture the missing scientific content.
+
+When the deterministic floors and quality contract both pass, a separate
+pre-composition scientific red-team runs before the writer. The Methods,
+mechanism, and journal-editor perspectives inspect the same frozen
+result/interpretation/argument packet and must cover the question, evidence,
+result coverage, controls, alternatives, reproducibility, and argument. Any
+missing experiment, analysis, literature support, or unjustified
+interpretation becomes a typed departmental work order and blocks manuscript
+creation. Only an aggregate `accept` with no outstanding research request
+admits the writer; the later manuscript review remains a distinct reader-facing
+and release gate.
 
 After composition, the paper uses a real bounded peer-review cycle. The same
 reviewer panel inspects the incumbent in round one, the author applies only

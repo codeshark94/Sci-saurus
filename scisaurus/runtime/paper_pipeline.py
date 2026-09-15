@@ -51,12 +51,18 @@ from scisaurus.runtime.research_argument import (
     validate_argument_review,
     validate_research_argument,
 )
+from scisaurus.runtime.research_redteam import (
+    ResearchRedTeamRunner,
+    research_redteam_packet,
+    validate_redteam_package,
+)
 
 
 DRAFT_SCHEMA_VERSION = "manuscript-draft-2"
 PIPELINE_SCHEMA_VERSION = "paper-pipeline-run-2"
 DEFAULT_PIPELINE_DEADLINE_SECONDS = 3600.0
 DEFAULT_ARGUMENT_DEADLINE_SECONDS = 900.0
+DEFAULT_RESEARCH_REDTEAM_DEADLINE_SECONDS = 900.0
 
 
 def _text(value, name):
@@ -680,7 +686,7 @@ class _ManuscriptProject:
 
 
 class PaperPipelineRunner:
-    """Run argument discovery -> writer -> scoped repair -> review -> PDF release."""
+    """Run argument -> scientific red-team -> writer -> review -> PDF release."""
 
     def __init__(self, *, packet, model_config, paper_config, output_dir, image_paths=(),
                  compile_script=None, max_review_rounds=3, reviewers=None, draft=None,
@@ -697,7 +703,9 @@ class PaperPipelineRunner:
                  argument=None, argument_review=None, initial_argument_package=None,
                  argument_deadline_seconds=DEFAULT_ARGUMENT_DEADLINE_SECONDS,
                  min_argument_figures=2, min_argument_tables=1, min_argument_experiments=2,
-                 feedback_callback=None):
+                 feedback_callback=None,
+                 research_redteam_deadline_seconds=DEFAULT_RESEARCH_REDTEAM_DEADLINE_SECONDS,
+                 research_redteam_max_attempts=3):
         self.packet = deepcopy(packet)
         self.model_config = deepcopy(model_config)
         self.paper_config = deepcopy(paper_config)
@@ -762,6 +770,15 @@ class PaperPipelineRunner:
         self.min_argument_figures = min_argument_figures
         self.min_argument_tables = min_argument_tables
         self.min_argument_experiments = min_argument_experiments
+        if (type(research_redteam_deadline_seconds) not in (int, float)
+                or not math.isfinite(research_redteam_deadline_seconds)
+                or research_redteam_deadline_seconds <= 0):
+            raise ValidationError("research red-team deadline must be finite and positive")
+        if (type(research_redteam_max_attempts) is not int
+                or not 1 <= research_redteam_max_attempts <= 8):
+            raise ValidationError("research red-team max attempts must be between one and eight")
+        self.research_redteam_deadline_seconds = float(research_redteam_deadline_seconds)
+        self.research_redteam_max_attempts = research_redteam_max_attempts
         self.supplied_argument = deepcopy(argument) if argument is not None else deepcopy(
             self.packet.get("research_argument"))
         self.supplied_argument_review = deepcopy(argument_review) if argument_review is not None else deepcopy(
@@ -771,6 +788,8 @@ class PaperPipelineRunner:
         self.research_argument = None
         self.argument_review = None
         self.argument_usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
+        self.research_redteam = None
+        self.research_redteam_usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
         self.started_at = time.monotonic()
         self.deadline = self.started_at + self.pipeline_deadline_seconds
         self.reviewers = reviewers
@@ -857,10 +876,34 @@ class PaperPipelineRunner:
             "model_call_timeout_seconds": self.model_call_timeout_seconds,
             "model_concurrency": self.model_concurrency,
             "review_arbiter_enabled": self.review_arbiter_enabled,
+            "research_redteam_deadline_seconds": self.research_redteam_deadline_seconds,
+            "research_redteam_max_attempts": self.research_redteam_max_attempts,
+            "research_redteam_status": (
+                self.research_redteam.get("status")
+                if isinstance(self.research_redteam, dict) else None
+            ),
+            "research_redteam_usage": deepcopy(self.research_redteam_usage),
             "remaining_seconds": max(0.0, self.deadline - time.monotonic()),
             "stage": self.current_stage,
             "error": self.run_error,
         }))
+
+    def _pipeline_usage(self, review_history=(), extra=()):
+        """Return one usage projection for every pipeline outcome path."""
+        usage = {
+            key: self.argument_usage.get(key, 0) + self.research_redteam_usage.get(key, 0)
+            for key in ("model_calls", "input_tokens", "output_tokens")
+        }
+        for package in review_history or ():
+            package_usage = package.get("usage", {}) if isinstance(package, dict) else {}
+            for key in usage:
+                usage[key] += package_usage.get(key, 0)
+        for value in extra or ():
+            if not isinstance(value, dict):
+                continue
+            for key in usage:
+                usage[key] += value.get(key, 0)
+        return usage
 
     def _remaining(self):
         remaining = self.deadline - time.monotonic()
@@ -914,6 +957,86 @@ class PaperPipelineRunner:
         quality_path.write_bytes(canonical_bytes(quality))
         expansion_requests = [*preflight["expansion_requests"], *quality.get("expansion_requests", [])]
         if preflight["decision"] == "proceed" and quality["decision"] == "proceed":
+            redteam_packet = research_redteam_packet(
+                results=results,
+                interpretation=self.packet.get("scientific_interpretation"),
+                argument=argument,
+                paper_evidence=paper_config.get("evidence", []),
+                paper_claims=paper_config.get("claims", []),
+                references=paper_config.get("references", []),
+            )
+            redteam_input_path = self.output / "research-red-team-input.json"
+            redteam_input_path.write_bytes(canonical_bytes(redteam_packet))
+            redteam_runner = ResearchRedTeamRunner(
+                self.model_config,
+                deadline_seconds=min(self.research_redteam_deadline_seconds, self._remaining()),
+                max_attempts=self.research_redteam_max_attempts,
+                max_workers=min(self.model_concurrency, 3),
+            )
+            redteam = redteam_runner.run(
+                redteam_packet,
+                artifact_dir=self.output / "research-red-team",
+            )
+            validate_redteam_package(redteam)
+            self.research_redteam = redteam
+            self.research_redteam_usage = deepcopy(redteam["usage"])
+            redteam_path = self.output / "research-red-team.json"
+            redteam_path.write_bytes(canonical_bytes(redteam))
+            self._emit_feedback({
+                "event_id": "paper-research-red-team",
+                "kind": "research_gate",
+                "reviewer_id": "research_red_team",
+                "stage": 6,
+                "decision": redteam["decision"],
+                "status": redteam["status"],
+                "reviewer_ids": list(redteam["reviewer_ids"]),
+                "finding_ids": [finding["id"] for review in redteam["reviews"]
+                                for finding in review.get("findings", [])],
+                "research_request_ids": [request["id"] for request in redteam["research_requests"]],
+                "expansion_requests": deepcopy(redteam["research_requests"]),
+                "artifact_path": str(redteam_path),
+                "input_path": str(redteam_input_path),
+            })
+            expansion_requests = deepcopy(redteam["research_requests"])
+            if redteam["decision"] == "research_expansion_required":
+                self.run_status = "research_expansion_required"
+                self.current_stage = "research_admission"
+                self._write_run_metadata()
+                elapsed = time.monotonic() - self.started_at
+                result = {
+                    "schema_version": PIPELINE_SCHEMA_VERSION,
+                    "status": "research_expansion_required",
+                    "word_count": 0,
+                    "sections": 0,
+                    "review_rounds": 0,
+                    "review_status": "not_started",
+                    "scholarly_depth_status": "research_expansion_required",
+                    "scholarly_profile": preflight["profile_id"],
+                    "argument_status": argument_review["decision"],
+                    "research_argument_path": str(self.output / "research-argument.json"),
+                    "research_argument_review_path": str(self.output / "research-argument-review.json"),
+                    "research_argument_sha256": hashlib.sha256(canonical_bytes(argument)).hexdigest(),
+                    "manuscript_project_dir": None,
+                    "release_dir": None,
+                    "preflight_path": str(preflight_path),
+                    "research_quality_path": str(quality_path),
+                    "research_redteam_input_path": str(redteam_input_path),
+                    "research_redteam_path": str(redteam_path),
+                    "research_expansion_requests": expansion_requests,
+                    "preflight": preflight,
+                    "research_quality": quality,
+                    "research_redteam": redteam,
+                    "surface_compression": [],
+                    "surface_citation_binding": [],
+                    "repair_failures": [],
+                    "usage": self._pipeline_usage(),
+                    "elapsed_seconds": elapsed,
+                    "deadline_seconds": self.pipeline_deadline_seconds,
+                    "release": None,
+                }
+                (self.output / "pipeline-result.json").write_bytes(canonical_bytes(result))
+                self._write_run_metadata()
+                return result
             self._emit_feedback({
                 "event_id": "paper-research-admission",
                 "kind": "research_gate",
@@ -924,6 +1047,7 @@ class PaperPipelineRunner:
                 "profile_id": preflight["profile_id"],
                 "artifact_path": str(preflight_path),
                 "quality_artifact_path": str(quality_path),
+                "research_redteam_path": str(redteam_path),
             })
             return None
         self.run_status = "research_expansion_required"
@@ -961,13 +1085,15 @@ class PaperPipelineRunner:
             "pdf": None,
             "preflight_path": str(preflight_path),
             "research_quality_path": str(quality_path),
+            "research_redteam_input_path": None,
+            "research_redteam_path": None,
             "research_expansion_requests": expansion_requests,
             "preflight": preflight,
             "research_quality": quality,
             "surface_compression": [],
             "surface_citation_binding": [],
             "repair_failures": [],
-            "usage": deepcopy(self.argument_usage),
+            "usage": self._pipeline_usage(),
             "elapsed_seconds": elapsed,
             "deadline_seconds": self.pipeline_deadline_seconds,
             "release": None,
@@ -990,6 +1116,10 @@ class PaperPipelineRunner:
             "review_round": len(review_history),
             "manuscript_sha256": hashlib.sha256(canonical_bytes(draft)).hexdigest(),
             "argument_sha256": hashlib.sha256(canonical_bytes(argument)).hexdigest(),
+            "precomposition_redteam_path": (
+                str(self.output / "research-red-team.json")
+                if self.research_redteam is not None else None
+            ),
         }
         request_path.write_bytes(canonical_bytes(request_record))
         self.run_status = "research_expansion_required"
@@ -1025,13 +1155,16 @@ class PaperPipelineRunner:
             "release_dir": None,
             "pdf": None,
             "research_expansion_request_path": str(request_path),
+            "research_redteam_path": (
+                str(self.output / "research-red-team.json")
+                if self.research_redteam is not None else None
+            ),
+            "research_redteam": deepcopy(self.research_redteam),
             "research_expansion_requests": deepcopy(requests),
             "surface_compression": deepcopy(self.compression_audits),
             "surface_citation_binding": deepcopy(self.citation_binding_audits),
             "repair_failures": deepcopy(self.repair_failures),
-            "usage": {key: self.argument_usage.get(key, 0) + sum(
-                package.get("usage", {}).get(key, 0) for package in review_history)
-                      for key in ("model_calls", "input_tokens", "output_tokens")},
+            "usage": self._pipeline_usage(review_history),
             "elapsed_seconds": time.monotonic() - self.started_at,
             "deadline_seconds": self.pipeline_deadline_seconds,
             "release": None,
@@ -1114,13 +1247,16 @@ class PaperPipelineRunner:
             "pdf": None,
             "editor_decision_path": str(self.output / "editor-decision.json"),
             "editor_decision": editor_decision,
+            "research_redteam_path": (
+                str(self.output / "research-red-team.json")
+                if self.research_redteam is not None else None
+            ),
+            "research_redteam": deepcopy(self.research_redteam),
             "research_expansion_requests": [],
             "surface_compression": deepcopy(self.compression_audits),
             "surface_citation_binding": deepcopy(self.citation_binding_audits),
             "repair_failures": deepcopy(self.repair_failures),
-            "usage": {key: self.argument_usage.get(key, 0) + sum(
-                package.get("usage", {}).get(key, 0) for package in review_history)
-                      for key in ("model_calls", "input_tokens", "output_tokens")},
+            "usage": self._pipeline_usage(review_history),
             "elapsed_seconds": time.monotonic() - self.started_at,
             "deadline_seconds": self.pipeline_deadline_seconds,
             "release": None,
@@ -1746,12 +1882,7 @@ class PaperPipelineRunner:
         review_config = deepcopy(self.model_config)
         image_descriptors = self._image_descriptors(self.image_paths)
         review_history = []
-        total_usage = {"model_calls": self.argument_usage.get("model_calls", 0)
-                       + writer_result.usage.get("model_calls", 0),
-                       "input_tokens": writer_result.usage.get("input_tokens", 0),
-                       "output_tokens": writer_result.usage.get("output_tokens", 0)}
-        for key in ("input_tokens", "output_tokens"):
-            total_usage[key] += self.argument_usage.get(key, 0)
+        total_usage = self._pipeline_usage(extra=[writer_result.usage])
         try:
             accepted_package = None
             review_status = None

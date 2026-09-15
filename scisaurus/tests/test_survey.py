@@ -968,6 +968,20 @@ class TestSurveyContracts(unittest.TestCase):
         self.assertEqual(repaired["relationships"], [{key: relationship[key]
                          for key in ("source", "target", "kind", "claim")}])
 
+    def test_scoped_map_patch_ignores_echoed_protected_entry_fields(self):
+        previous = {"work_id": "W101", "inclusion": "included", "reason": "Old reason",
+                    **{field: {"text": None, "evidence": []} for field in MAP_FIELDS}}
+        repaired = apply_scoped_map_repair(
+            "W101", previous, [],
+            {"entry_fields": ["reason"], "relationship_targets": []},
+            {"entry_updates": {
+                "reason": "Narrow reason", "inclusion": "uncertain",
+                "problem": {"text": "Out of scope", "evidence": []}},
+             "relationships": []})
+        self.assertEqual(repaired["entries"][0]["reason"], "Narrow reason")
+        self.assertEqual(repaired["entries"][0]["inclusion"], "included")
+        self.assertEqual(repaired["entries"][0]["problem"], previous["problem"])
+
     def test_unknown_statement_has_no_evidence_and_scope_is_exact(self):
         unknown = {"text": None, "evidence": []}
         entry = {"work_id": "W101", "inclusion": "uncertain", "reason": "No available text.",

@@ -3,6 +3,7 @@
 import unittest
 from pathlib import Path
 import tempfile
+from unittest.mock import patch
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.paper_pipeline import (
@@ -161,6 +162,83 @@ class ManuscriptDraftContractTests(unittest.TestCase):
             "min_sections": 2, "required_section_titles": ["Introduction", "Discussion"],
             "max_numeric_repetitions": 3, "max_caveat_repetitions": 3}}
         self.assertTrue(validate_draft_depth(draft, config)["applicable"])
+
+    def test_precomposition_redteam_hold_blocks_writer_and_persists_requests(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            results_path = root / "results.json"
+            results_path.write_text("{}")
+            runner = PaperPipelineRunner(
+                packet={"scientific_interpretation": {}},
+                model_config={},
+                paper_config={"schema_version": "paper-release-score-3",
+                              "document_type": "research_paper"},
+                output_dir=root / "output",
+                pipeline_deadline_seconds=30,
+                research_redteam_deadline_seconds=5,
+                research_redteam_max_attempts=1,
+            )
+            events = []
+            runner.feedback_callback = events.append
+            package = {
+                "schema_version": "research-red-team-package-1",
+                "decision": "research_expansion_required",
+                "reviews": [],
+                "research_requests": [{
+                    "id": "redteam_methods_run_control", "kind": "additional_experiment",
+                    "owner": "methods.validation", "objective": "Run a discriminating control.",
+                    "why": "The mechanisms remain confounded.",
+                    "success_condition": "The control changes the mechanism decision.",
+                    "evidence_needed": "Raw output and independent recalculation.",
+                }],
+                "reviewer_ids": ["methods", "mechanisms", "journal_editor"],
+                "rationale": "The current evidence is insufficient for composition.",
+                "usage": {"model_calls": 3, "input_tokens": 30, "output_tokens": 60},
+                "elapsed_seconds": 0.1,
+                "status": "research_expansion_required",
+            }
+
+            class FakeRedTeamRunner:
+                def __init__(self, *args, **kwargs):
+                    self.kwargs = kwargs
+
+                def run(self, packet, *, artifact_dir):
+                    self.packet = packet
+                    self.artifact_dir = artifact_dir
+                    return package
+
+            preflight = {"decision": "proceed", "profile_id": "empirical_journal",
+                         "expansion_requests": []}
+            quality = {"decision": "proceed", "expansion_requests": []}
+            results = {"question": "Does X change Y?", "assets": []}
+            with patch("scisaurus.runtime.paper_pipeline.validate_paper_config",
+                       return_value={"results_package": str(results_path)}), \
+                    patch("scisaurus.runtime.paper_pipeline.validate_results_package",
+                          return_value=results), \
+                    patch("scisaurus.runtime.paper_pipeline.load_paper_survey",
+                          return_value={}), \
+                    patch("scisaurus.runtime.paper_pipeline.evaluate_scholarly_preflight",
+                          return_value=preflight), \
+                    patch("scisaurus.runtime.paper_pipeline.validate_scholarly_preflight",
+                          side_effect=lambda value: value), \
+                    patch("scisaurus.runtime.paper_pipeline.evaluate_result_package_quality",
+                          return_value=quality), \
+                    patch("scisaurus.runtime.paper_pipeline.ResearchRedTeamRunner",
+                          FakeRedTeamRunner), \
+                    patch("scisaurus.runtime.paper_pipeline.validate_redteam_package"):
+                result = runner._research_admission(
+                    {"primary_argument": {"thesis": "X changes Y."}},
+                    {"decision": "accept"},
+                )
+
+            self.assertEqual(result["status"], "research_expansion_required")
+            self.assertIsNone(result["manuscript_project_dir"])
+            self.assertEqual(result["research_expansion_requests"][0]["kind"], "additional_experiment")
+            self.assertTrue(Path(result["research_redteam_input_path"]).is_file())
+            self.assertTrue(Path(result["research_redteam_path"]).is_file())
+            self.assertEqual(events[-1]["event_id"], "paper-research-red-team")
+            self.assertEqual(events[-1]["research_request_ids"], ["redteam_methods_run_control"])
+            self.assertFalse((root / "output" / "manuscript-project").exists())
 
 
 if __name__ == "__main__":

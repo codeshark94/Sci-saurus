@@ -1,6 +1,6 @@
 # Sci-saurus — Project Organization and Operations
 
-> **Version:** v1.5 · **Date:** 2026-09-13 · **Status:** project-scoped department runtime and Composer-controlled work-order lifecycle implemented; configured operational adapters remain the execution boundary.
+> **Version:** v1.6 · **Date:** 2026-09-15 · **Status:** project-scoped department runtime, single-source stage routing, concrete agent roster, and Composer-controlled work-order lifecycle implemented; configured operational adapters remain the execution boundary.
 > Governed by [SSOT](00-SSOT.md) D35–D36. Integrates the [activity model](05-system-concept.md), [web/tool adapters](50-web-intelligence-integration.md), and [scoped artifact changes](45-artifact-change-control.md).
 
 ## 1. One operating organization per project
@@ -21,6 +21,14 @@ charter, but the template is only a starting contract; actual inbox requests,
 stage results, and capability state determine which work is admitted. The
 Composer records activation and resolution of scoped work orders in every
 checkpoint, so the backlog describes live work rather than a diagram of roles.
+
+The distinction between functional stage role, accountable department, and
+concrete agent appointment is normative; it is not just presentation. The
+single route table and the projected roster are documented in
+[`agent, department, and stage flow`](16-agent-department-flow.md). Use that
+document when adding a stage or changing a chief: the functional owner must
+remain stable, the live charter supplies the concrete appointment, and the
+checkpoint must expose both the producing chief and its independent adversary.
 
 Autonomy is deadline-governed. A malformed proposal is rejected into a durable
 department record and does not terminate unrelated work. A valid blocker is

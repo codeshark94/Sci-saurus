@@ -498,6 +498,32 @@ class ComposerWorkflowTests(unittest.TestCase):
                                    "literature_gate": {"required_state": "eligible_for_experiment"}},
                     "supplied_context": "base"})
             materialize.assert_called_once()
+            runner.continuation_cycles = 1
+            runner.reopened_stage_ids = {"experiment"}
+            runner.active_research_requests = [{
+                "id": "run-control", "kind": "additional_experiment", "owner": "methods.validation",
+                "objective": "Run a control that separates the mechanisms.",
+                "why": "The first result left both explanations viable.",
+                "success_condition": "The new result changes the mechanism decision.",
+                "evidence_needed": "Raw observations and independent recalculation.",
+            }]
+            runner.context["topic"] = {"kind": "topic_discovery", "topic": result["topic"],
+                                         "generated_capability": generated}
+            regenerated = {
+                **generated,
+                "registration": {
+                    "capability_id": "frontier-cycle-1",
+                    "descriptor_path": str(descriptor_path.resolve()),
+                },
+            }
+            with patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate",
+                       return_value=regenerated) as regenerate:
+                runner._apply_topic_to_experiment_config(workflow["stages"][1], {
+                    "experiment": {"revision": 2,
+                                   "literature_gate": {"required_state": "eligible_for_experiment"}},
+                    "supplied_context": "base"})
+            self.assertEqual(regenerate.call_args.kwargs["required_intent"]["id"], "frontier-cycle-1")
+            self.assertEqual(regenerate.call_args.kwargs["required_intent"]["revision"], 2)
             runner.close()
 
     def test_topic_history_is_append_only_and_rotates_recent_capability(self):

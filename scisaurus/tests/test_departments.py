@@ -9,7 +9,7 @@ from scisaurus.core.store import ArtifactStore
 from scisaurus.core.tasks import TaskManager
 from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.departments import (
-    DepartmentRuntime, default_organization, validate_organization,
+    DepartmentRuntime, default_organization, stage_role, validate_charter, validate_organization,
 )
 
 
@@ -37,6 +37,34 @@ class DepartmentRuntimeTests(unittest.TestCase):
         self.assertEqual(set(self.runtime.charters), {"research", "methods", "strategy", "editorial", "operations"})
         self.assertTrue(self.store.head("command/organization"))
         self.assertTrue(self.store.head("command/departments/research/charter"))
+        manifest = json.loads(self.store.read_body(
+            self.store.head("command/organization")["body_hash"]))
+        self.assertEqual(len(manifest["agents"]), 10)
+        self.assertEqual(
+            [item["stage_kind"] for item in manifest["stage_routes"]],
+            ["topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"],
+        )
+        self.assertEqual(manifest["command_agents"]["arbiter"]["agent"], "arbiter")
+
+    def test_charter_cannot_assign_the_same_agent_to_chief_and_adversary(self):
+        charter = default_organization()["departments"][0]
+        with self.assertRaisesRegex(ValidationError, "distinct"):
+            validate_charter({**charter, "adversary": charter["chief"]})
+
+    def test_snapshot_exposes_concrete_agents_and_functional_stage_routes(self):
+        snapshot = self.runtime.snapshot()
+        self.assertEqual(len(snapshot["agents"]), 10)
+        experiment = next(item for item in snapshot["stage_routes"]
+                          if item["stage_kind"] == "experiment")
+        self.assertEqual(experiment["role"], "methods.validation")
+        self.assertEqual(experiment["owner_address"], {"dept": "methods", "agent": "chief"})
+        self.assertTrue(any(item["appointment"] == "adversary"
+                            and item["department"] == "methods"
+                            for item in snapshot["agents"]))
+
+    def test_stage_role_is_shared_with_composer_functional_mapping(self):
+        self.assertEqual(stage_role("topic_discovery"), "research.intelligence")
+        self.assertEqual(stage_role("paper"), "editorial.composer")
 
     def test_proposal_creates_scoped_work_order_and_backlog(self):
         result = self.runtime.propose({

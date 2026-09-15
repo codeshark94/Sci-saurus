@@ -168,7 +168,46 @@ components is routed back to Methods for additional work instead of being
 polished into a thin paper. The pre-analysis design and its artifact reference
 are retained in the result package alongside the replay and validation records.
 
-Composer creates a project-scoped organization automatically. Its default department charter is only a starting template: handoffs become durable inbox records, typed research or repair requests become department work orders, and the Composer activates and resolves the affected closure while preserving prior versions. Supply an optional workflow `organization` object when a mission needs different departments or capability scopes; it must still cover every stage owner. A malformed request is retained as a rejection record, and a provider or validation failure stays on the deadline-governed retry/recovery path instead of being hidden or turning into a false completion. See [project organization](docs/15-project-organization.md) for the runtime contract.
+Composer creates a project-scoped organization automatically. Its default department charter is only a starting template: handoffs become durable inbox records, typed research or repair requests become department work orders, and the Composer activates and resolves the affected closure while preserving prior versions. Functional stage roles, concrete chief appointments, and independent adversarial appointments are recorded separately in the organization snapshot; the route has one source of truth in `DepartmentRuntime`. Supply an optional workflow `organization` object when a mission needs different departments or capability scopes; it must still cover every stage owner. A malformed request is retained as a rejection record, and a provider or validation failure stays on the deadline-governed retry/recovery path instead of being hidden or turning into a false completion. See [project organization](docs/15-project-organization.md) and [agent/department flow](docs/16-agent-department-flow.md) for the runtime contract.
+
+### Organization and agent map
+
+```text
+Principal
+   |
+Executive Command: intent keeper · progress controller · arbiter
+   |
+Research ──> Methods ──> Strategy ──> Editorial
+   |           |          |             |
+topic/survey  experiment  interpretation paper/review/release proposal
+   \___________ evidence + critique + scoped continuation ___________/
+                         |
+                 Operations Cell (only when a tool/environment is needed)
+```
+
+| Department | Lead appointment | Independent adversary | Runtime responsibility |
+|---|---|---|---|
+| Research | `research.chief` | `research.adversarial-reviewer` | Topic discovery, literature, source identity, evidence and gap assessment |
+| Methods | `methods.chief` | `methods.adversarial-reviewer` | Experiments, controls, raw outputs, replay, recalculation and analysis validity |
+| Strategy | `strategy.chief` | `strategy.adversarial-reviewer` | Interpretation, alternative mechanisms, thesis and evidence-linked argument |
+| Editorial | `editorial.editor-in-chief` | `editorial.human-scientist-reviewer` | Structured composition, multi-round review, rendering and release proposal |
+| Operations | `operations.coordinator` | `operations.operational-verifier` | Project-scoped programs, APIs, MCP services, environments and execution evidence |
+
+Functional stage owners are stable (`research.intelligence`, `methods.validation`,
+`strategy.interpretation`, `strategy.argument`, `editorial.composer`), while the
+concrete lead appointment can be customized per project. The Composer dispatches
+only allowlisted stages and records `role`, `department`, `owner_agent`, and
+`adversary_agent` separately. A department is an accountability boundary, not a
+permanent model process.
+
+Research work therefore loops by affected scope: a missing control reopens
+`experiment → interpretation → argument → paper`; a literature gap reopens
+`survey → experiment → interpretation → argument → paper`; an interpretation
+gap starts at `interpretation`. Each handoff becomes a decision note, message
+envelope, receiving inbox item, and typed work order. The red-team gate and
+post-composition peer review can request new science; prose alone cannot close
+those requests. The live roster, stage routes, inbox backlog, and work-order
+states are exposed in `output/run.json`. See [Agent, Department, and Stage Flow](docs/16-agent-department-flow.md).
 
 ## Design entry points
 
@@ -178,15 +217,16 @@ Composer creates a project-scoped organization automatically. Its default depart
 4. [Execution contract](docs/40-execution-contract.md) — exact identifiers, lifecycle rules, schema contracts
 5. [P0 freeze record](docs/25-p0-freeze.md) — frozen principles, first fixture, deployment template
 6. [Project organization](docs/15-project-organization.md) — per-project scope, Operations Cell, real execution
-7. [Structured artifact changes](docs/45-artifact-change-control.md) — surgical revision contracts
-8. [Multimodal visual review](docs/85-multimodal-visual-review.md) — figures, rendered pages, concepts, and scoped visual repair
-8. [Web intelligence integration](docs/50-web-intelligence-integration.md) — active search and adapters
-9. [Roadmap](docs/30-roadmap.md) — phases P0–P6 and acceptance scenarios
-10. [Search campaign](docs/web-search-campaign.yaml) — illustrative configuration
-11. [Scored project runtime](docs/70-scored-project-runtime.md) — generic artifacts, real program checks, and time planning
-12. [Literature Survey Score](docs/75-literature-survey-score.md) — bounded discovery, per-work maps, and independent gap assessment
-13. [Completion runtime](docs/80-completion-runtime.md) — resume, executable plans, tool acquisition, blinded evaluation, and paper/PDF release candidates
-14. [Scientific experiment runtime](docs/90-experiment-runtime.md) — frozen methods, replay, independent recalculation, result review, and generated result packages
+7. [Agent, department, and stage flow](docs/16-agent-department-flow.md) — role identities, routing, handoffs, and scoped continuation
+8. [Structured artifact changes](docs/45-artifact-change-control.md) — surgical revision contracts
+9. [Multimodal visual review](docs/85-multimodal-visual-review.md) — figures, rendered pages, concepts, and scoped visual repair
+10. [Web intelligence integration](docs/50-web-intelligence-integration.md) — active search and adapters
+11. [Roadmap](docs/30-roadmap.md) — phases P0–P6 and acceptance scenarios
+12. [Search campaign](docs/web-search-campaign.yaml) — illustrative configuration
+13. [Scored project runtime](docs/70-scored-project-runtime.md) — generic artifacts, real program checks, and time planning
+14. [Literature Survey Score](docs/75-literature-survey-score.md) — bounded discovery, per-work maps, and independent gap assessment
+15. [Completion runtime](docs/80-completion-runtime.md) — resume, executable plans, tool acquisition, blinded evaluation, and paper/PDF release candidates
+16. [Scientific experiment runtime](docs/90-experiment-runtime.md) — frozen methods, replay, independent recalculation, result review, and generated result packages
 
 ## Current state
 
