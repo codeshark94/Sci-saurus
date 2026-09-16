@@ -9,6 +9,7 @@ Human-led · evidence-first · resumable · provider-aware
 [![CI](https://github.com/codeshark94/Sci-saurus/actions/workflows/tests.yml/badge.svg)](https://github.com/codeshark94/Sci-saurus/actions/workflows/tests.yml)
 ![Python 3.14](https://img.shields.io/badge/python-3.14-3776AB?logo=python&logoColor=white)
 [![Concept SSOT](https://img.shields.io/badge/docs-concept%20SSOT-5B5F97)](docs/00-SSOT.md)
+[MIT License](LICENSE)
 
 </div>
 

@@ -342,18 +342,30 @@ class _StdioMCP:
     def __exit__(self, *_):
         self.timer.cancel()
         self.stop.set()
-        self.process.stdin.close()
+        # The expiry timer can kill the process while the parent still owns
+        # the pipe. Cleanup must not turn the recorded timeout into a generic
+        # provider error by surfacing a close race.
+        try:
+            self.process.stdin.close()
+        except (OSError, ValueError):
+            pass
         try:
             self.process.wait(timeout=0.5)
         except subprocess.TimeoutExpired:
             self._kill()
-            self.process.wait(timeout=1)
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self._kill()
         finally:
             # A child may outlive a normally exiting server while holding its pipes.
             if self.own_process_group and os.name == "posix":
                 self._kill()
-            self.process.stdout.close()
-            self.process.stderr.close()
+            for stream in (self.process.stdout, self.process.stderr):
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
             for thread in self.threads:
                 thread.join(timeout=0.2)
 

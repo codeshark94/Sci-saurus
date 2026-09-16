@@ -7,12 +7,14 @@ on:
 
 jobs:
   unittest:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
+      - name: Verify required sandbox boundary
+        run: command -v sandbox-exec
       - name: Install pinned runtime and source extractor
         run: sh scripts/setup-runtime.sh
       - name: Run acceptance test suite
