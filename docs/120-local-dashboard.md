@@ -15,6 +15,15 @@ when `local-private/autolab` exists:
 ./dashboard
 ```
 
+The default Composer mission has the same short root-level entry point:
+
+```bash
+./run
+```
+
+It resumes `local-private/autolab` and exits without starting a duplicate when
+the matching Composer process is already running.
+
 The equivalent module command also auto-selects that project:
 
 ```bash

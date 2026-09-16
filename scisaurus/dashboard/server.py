@@ -42,6 +42,9 @@ MAX_LOG_FILES = 10
 MAX_LOG_LINES = 180
 MAX_LOG_BYTES = 600_000
 MAX_RECENT_WORK = 32
+MAX_MODEL_CALLS = 8
+MAX_MODEL_HISTORY_CALLS = 8
+MAX_MODEL_CONTEXT_BYTES = 512_000
 MAX_ACTION_BYTES = 64_000
 MAX_PROJECTS = 64
 MAX_WORKSPACE_RECENT_PROJECTS = 12
@@ -67,6 +70,7 @@ TEXT_SUFFIXES = {
 }
 CHECKPOINT_NAMES = {"progress.json", "interim_report.json", "checkpoint.json", "run.json"}
 ACTIVE_STATES = {"proposed", "queued", "running", "awaiting_review", "started"}
+MODEL_LIVE_STATES = {"queued", "running", "started"}
 TERMINAL_STATES = {"completed", "failed", "rejected", "cancelled", "stale"}
 
 
@@ -1014,6 +1018,208 @@ class DashboardSnapshot:
             "interpretation": "role assignments are logical scopes; provider capacity is enforced separately",
         }
 
+    def _artifact_body(self, artifact):
+        """Read a bounded JSON object from the content-addressed store.
+
+        Model context and result artifacts can contain prompts or long
+        responses.  The dashboard only needs their structured routing and
+        accounting fields, so it reads a small, read-only projection and
+        never returns the prompt through the snapshot.
+        """
+        if not isinstance(artifact, dict):
+            return {}
+        root_key = artifact.get("root_key")
+        body_hash = artifact.get("body_hash")
+        root = self.roots.get(root_key)
+        if (root is None or not isinstance(body_hash, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", body_hash)):
+            return {}
+        path = root / "objects" / "sha256" / body_hash
+        try:
+            if path.stat().st_size > MAX_MODEL_CONTEXT_BYTES:
+                return {}
+            value = _json(path.read_bytes(), {})
+        except (OSError, ValueError, UnicodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _model_endpoint(base_url):
+        """Return a credential-free provider and host label for a route."""
+        if not isinstance(base_url, str) or not base_url.strip():
+            return {"provider": "unknown", "host": None}
+        raw = base_url.strip()
+        try:
+            parsed = urlsplit(raw)
+            host = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            host, port = None, None
+        host = host or raw.split("/", 1)[0]
+        host = str(host)
+        host_lower = host.lower()
+        if "taila57d41.ts.net" in host_lower or "tailnet" in host_lower:
+            provider = "Tailnet"
+        elif host_lower in {"127.0.0.1", "localhost"} or "ollama" in host_lower:
+            provider = "Ollama"
+        else:
+            provider = host
+        host_label = host if port is None else f"{host}:{port}"
+        return {"provider": provider, "host": host_label}
+
+    def _model_calls(self, db):
+        """Project real provider model calls into bounded, inspectable cards.
+
+        Assignment tasks represent logical work scopes; these records are
+        different.  Only tasks explicitly dispatched with operation=model are
+        included, and their model/route comes from the immutable call context
+        or the recorded execution result.
+        """
+        tasks = [item for item in db.get("tasks") or []
+                 if isinstance(item, dict)
+                 and isinstance(item.get("payload"), dict)
+                 and item["payload"].get("operation") == "model"]
+        attempts = {}
+        for item in db.get("attempts") or []:
+            if not isinstance(item, dict) or not item.get("task_id"):
+                continue
+            key = (item.get("root_key"), item.get("task_id"))
+            previous = attempts.get(key)
+            if previous is None or str(item.get("created_at") or "") > str(previous.get("created_at") or ""):
+                attempts[key] = item
+
+        artifacts_by_logical_id = {}
+        for item in db.get("artifacts") or []:
+            if not isinstance(item, dict) or not isinstance(item.get("logical_id"), str):
+                continue
+            key = (item.get("root_key"), item["logical_id"])
+            previous = artifacts_by_logical_id.get(key)
+            if previous is None or (
+                _safe_int(item.get("version")), str(item.get("created_at") or "")
+            ) > (
+                _safe_int(previous.get("version")), str(previous.get("created_at") or "")
+            ):
+                artifacts_by_logical_id[key] = item
+
+        now = datetime.now(timezone.utc)
+        state_priority = {"running": 0, "queued": 1, "started": 2}
+        calls = []
+        for task in tasks:
+            root_key = task.get("root_key")
+            task_id = task.get("task_id")
+            if not isinstance(task_id, str):
+                continue
+            attempt = attempts.get((root_key, task_id), {})
+            context_artifact = artifacts_by_logical_id.get((root_key, f"command/contexts/{task_id}"))
+            execution_artifact = artifacts_by_logical_id.get((root_key, f"command/executions/{task_id}"))
+            context = self._artifact_body(context_artifact)
+            execution = self._artifact_body(execution_artifact)
+            client = context.get("client") if isinstance(context.get("client"), dict) else {}
+            role = context.get("role") or attempt.get("lease_owner") or task.get("role")
+            role_config = {}
+            role_models = client.get("role_models") if isinstance(client.get("role_models"), dict) else {}
+            if isinstance(role, str) and isinstance(role_models.get(role), dict):
+                role_config = role_models[role]
+            model = execution.get("model") if isinstance(execution.get("model"), str) else None
+            if not model:
+                model = role_config.get("model") if isinstance(role_config.get("model"), str) else None
+            if not model and isinstance(client.get("model"), str):
+                model = client["model"]
+            base_url = execution.get("base_url") if isinstance(execution.get("base_url"), str) else None
+            if not base_url:
+                base_url = role_config.get("base_url") if isinstance(role_config.get("base_url"), str) else None
+            if not base_url and isinstance(client.get("base_url"), str):
+                base_url = client["base_url"]
+            endpoint = self._model_endpoint(base_url)
+
+            state = _display_status(task.get("state"))
+            usage = execution.get("usage") if isinstance(execution.get("usage"), dict) else None
+            if usage is None and isinstance(attempt.get("usage"), dict):
+                usage = attempt["usage"].get("actual") or attempt["usage"].get("reserved")
+            usage = usage if isinstance(usage, dict) else {}
+            response_status = {
+                "queued": "queued",
+                "running": "awaiting response",
+                "awaiting_review": "response recorded · awaiting review",
+            }.get(state)
+            if response_status is None:
+                response_status = "response recorded" if execution_artifact else (
+                    "result unknown" if (attempt.get("usage") or {}).get("outcome") == "result_unknown"
+                    else "not recorded"
+                )
+
+            started_at = _iso_timestamp(attempt.get("created_at"))
+            finished_at = _iso_timestamp(attempt.get("finished_at"))
+            elapsed_seconds = _safe_float(execution.get("elapsed_seconds"))
+            if elapsed_seconds is None and started_at:
+                try:
+                    started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                    end = datetime.fromisoformat(finished_at.replace("Z", "+00:00")) if finished_at else now
+                    elapsed_seconds = max(0, (end - started).total_seconds())
+                except ValueError:
+                    elapsed_seconds = None
+            stage_id = (context.get("stage_id") if isinstance(context.get("stage_id"), str)
+                        else (task.get("stage_id") or None))
+            if not isinstance(stage_id, str) or not stage_id:
+                stage_id = root_key.split(":", 2)[1] if isinstance(root_key, str) and root_key.startswith("stage:") else None
+            calls.append({
+                "root_key": root_key,
+                "task_id": task_id,
+                "attempt_id": attempt.get("attempt_id"),
+                "state": state,
+                "role": role if isinstance(role, str) else None,
+                "stage_id": stage_id,
+                "model": model or "model not recorded",
+                "provider": endpoint["provider"],
+                "endpoint": endpoint["host"],
+                "response_status": response_status,
+                "response_ref": execution_artifact.get("file_ref") if execution_artifact else None,
+                "artifact_ref": execution_artifact.get("artifact_ref") if execution_artifact else None,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "updated_at": _iso_timestamp(task.get("updated_at")),
+                "elapsed_seconds": elapsed_seconds,
+                "usage": {key: value for key, value in usage.items()
+                          if key in {"model_calls", "input_tokens", "output_tokens"}
+                          and type(value) is int and value >= 0},
+            })
+
+        def timestamp(value):
+            if not isinstance(value, str) or not value:
+                return 0.0
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return 0.0
+
+        live_calls = [item for item in calls if item.get("state") in MODEL_LIVE_STATES]
+        review_calls = [item for item in calls if item.get("state") == "awaiting_review"]
+        recent_calls = [item for item in calls if item.get("state") not in MODEL_LIVE_STATES
+                        and item.get("state") != "awaiting_review"]
+        live_calls.sort(key=lambda item: (
+            state_priority.get(item.get("state"), 3),
+            -timestamp(item.get("updated_at") or item.get("started_at")),
+        ))
+        review_calls.sort(key=lambda item: -timestamp(item.get("updated_at") or item.get("started_at")))
+        recent_calls.sort(key=lambda item: -timestamp(item.get("updated_at") or item.get("started_at")))
+        history = review_calls + recent_calls
+        return {
+            # `items` remains the compact compatibility field, but it now
+            # intentionally means live provider work only.
+            "items": live_calls[:MAX_MODEL_CALLS],
+            "live_items": live_calls[:MAX_MODEL_CALLS],
+            "review_items": review_calls[:MAX_MODEL_HISTORY_CALLS],
+            "recent_items": recent_calls[:MAX_MODEL_HISTORY_CALLS],
+            "total": len(calls),
+            "active": len(live_calls),
+            "review_pending": len(review_calls),
+            "displayed": min(len(live_calls), MAX_MODEL_CALLS),
+            "truncated": len(live_calls) > MAX_MODEL_CALLS,
+            "history_total": len(history),
+            "history_displayed": min(len(history), MAX_MODEL_HISTORY_CALLS * 2),
+            "history_truncated": len(history) > MAX_MODEL_HISTORY_CALLS * 2,
+        }
+
     def _research_view(self, live_value, stages):
         """Project scientific content separately from control-plane records."""
         live_value = live_value if isinstance(live_value, dict) else {}
@@ -1310,6 +1516,7 @@ class DashboardSnapshot:
         organization_raw = live_value.get("organization") if isinstance(live_value.get("organization"), dict) else None
         specialists = self._specialists(stages, db, organization_raw)
         execution = self._execution_view(stages, db, organization_raw)
+        model_calls = self._model_calls(db)
         recent_work = self._recent_work(db, organization_raw)
         organization = self._organization_view(organization_raw)
         return {
@@ -1343,6 +1550,7 @@ class DashboardSnapshot:
             "specialists_active": sum(item.get("engaged") is True for item in specialists),
             "specialists_roster": len(specialists),
             "execution": execution,
+            "model_calls": model_calls,
             "recent_work": recent_work["items"],
             "recent_work_meta": {
                 "total": recent_work["total"],

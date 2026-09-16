@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>Sci-saurus · Research Console</title>
   <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/styles.css?v=8">
+    <link rel="stylesheet" href="/assets/styles.css?v=12">
 </head>
 <body>
   <div class="app-shell">
@@ -25,11 +25,12 @@
         </div>
         <nav class="nav-list" aria-label="Project navigation">
           <a class="nav-link" href="#research"><span class="nav-index">01</span><span>Research brief</span></a>
-          <a class="nav-link" href="#pipeline"><span class="nav-index">02</span><span>Pipeline</span></a>
+          <a class="nav-link" href="#calls"><span class="nav-index">02</span><span>Model calls</span></a>
           <a class="nav-link" href="#specialists"><span class="nav-index">03</span><span>Agents</span></a>
           <a class="nav-link" href="#activity"><span class="nav-index">04</span><span>Run log</span></a>
-          <a class="nav-link" href="#structure"><span class="nav-index">05</span><span>Structure</span></a>
-          <a class="nav-link" href="#inventory"><span class="nav-index">06</span><span>Inventory</span></a>
+          <a class="nav-link" href="#resources"><span class="nav-index">05</span><span>Resources</span></a>
+          <a class="nav-link" href="#structure"><span class="nav-index">06</span><span>Structure</span></a>
+          <a class="nav-link" href="#inventory"><span class="nav-index">07</span><span>Inventory</span></a>
         </nav>
       </div>
       <div class="sidebar-divider" id="project-divider"></div>
@@ -175,14 +176,9 @@
 
         <div class="metrics-grid" aria-label="Mission metrics">
           <article class="metric-card">
-            <div class="metric-label">PIPELINE</div>
-            <div class="metric-value" id="metric-pipeline">—</div>
-            <div class="metric-note" id="metric-pipeline-note">stages complete</div>
-          </article>
-          <article class="metric-card">
-            <div class="metric-label">ROLE SLOTS</div>
-            <div class="metric-value" id="metric-specialists">—</div>
-            <div class="metric-note" id="metric-specialists-note">logical assignments</div>
+            <div class="metric-label">ACTIVE CALLS</div>
+            <div class="metric-value" id="metric-calls">—</div>
+            <div class="metric-note" id="metric-calls-note">provider activity</div>
           </article>
           <article class="metric-card">
             <div class="metric-label">TASKS</div>
@@ -194,24 +190,28 @@
             <div class="metric-value" id="metric-artifacts">—</div>
             <div class="metric-note">content-addressed records</div>
           </article>
-          <article class="metric-card metric-card--wide">
+          <article class="metric-card">
             <div class="metric-label">EVENT INTEGRITY</div>
             <div class="metric-value metric-value--compact" id="metric-integrity">—</div>
             <div class="metric-note" id="metric-integrity-note">read-only verification</div>
           </article>
         </div>
 
-        <section class="section-anchor panel-section" id="pipeline">
+        <section class="section-anchor panel-section calls-section" id="calls">
           <div class="section-heading">
             <div>
-              <div class="eyebrow">EXECUTION GRAPH</div>
-              <h2>Execution pipeline</h2>
+              <div class="eyebrow">LIVE NOW</div>
+              <h2>Model calls</h2>
             </div>
-            <div class="section-caption" id="pipeline-caption">—</div>
+            <div class="section-caption" id="model-calls-caption">current provider work</div>
           </div>
-          <div class="pipeline-grid" id="pipeline-grid">
-            <div class="loading-block">Loading stage state…</div>
+          <div class="model-call-grid" id="model-call-grid">
+            <div class="loading-block">Loading model calls…</div>
           </div>
+          <details class="model-call-history" id="model-call-history" hidden>
+            <summary><span>RECORDED OUTPUTS</span><strong id="model-call-history-summary">review queue and recent responses</strong></summary>
+            <div class="model-call-history-grid" id="model-call-history-grid"></div>
+          </details>
         </section>
 
         <section class="section-anchor panel-section" id="specialists">
@@ -363,6 +363,6 @@
     <div class="inspector-footer"><span>Only validated Composer workflows under this workspace can be created or started.</span></div>
   </dialog>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script src="/assets/app.js?v=6" defer></script>
+  <script src="/assets/app.js?v=11" defer></script>
 </body>
 </html>

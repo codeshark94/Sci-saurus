@@ -128,7 +128,7 @@ authorized model endpoint and set `live_dispatch_allowed` to `true`:
 | Multi-paragraph project | `scripts/prepare-project-config.py` | `python3 -m scisaurus.cli run-project PROJECT --config CONFIG.json` |
 | Literature survey | `scripts/prepare-survey-config.py` | `python3 -m scisaurus.cli run-survey PROJECT --config CONFIG.json` |
 | Scientific experiment | `scripts/setup-experiment-runtime.sh` + `scripts/prepare-experiment-config.py` | `python3 -m scisaurus.cli run-experiment PROJECT --config CONFIG.json` |
-| Composer mission | workflow JSON | `python3 -m scisaurus.cli run-composer --workflow WORKFLOW.json` |
+| Composer mission | `./run` | `./run` |
 | Local workspace console | `./dashboard [WORKSPACE]` | `./dashboard` |
 
 The templates are intentionally inert until the operator supplies the

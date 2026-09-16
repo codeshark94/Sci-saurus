@@ -130,6 +130,39 @@
       : "loading project state";
   }
 
+  let navSyncFrame = null;
+
+  function syncProjectNav() {
+    navSyncFrame = null;
+    if (state.view !== "project") return;
+    const links = $$("#project-nav .nav-link");
+    const sections = links.map((link) => {
+      const id = link.getAttribute("href")?.replace(/^#/, "");
+      const section = id ? document.getElementById(id) : null;
+      return section ? { id, section, link } : null;
+    }).filter(Boolean);
+    if (!sections.length) return;
+    const threshold = ($(".topbar")?.offsetHeight || 54) + 26;
+    let active = sections[0].id;
+    sections.forEach((item) => {
+      if (item.section.getBoundingClientRect().top <= threshold) active = item.id;
+    });
+    if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 4) {
+      active = sections[sections.length - 1].id;
+    }
+    links.forEach((link) => link.classList.toggle("is-active", link.getAttribute("href") === `#${active}`));
+    if (window.location.hash !== `#${active}`) {
+      const url = new URL(window.location.href);
+      url.hash = active;
+      window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+    }
+  }
+
+  function scheduleProjectNavSync() {
+    if (navSyncFrame !== null) return;
+    navSyncFrame = window.requestAnimationFrame(syncProjectNav);
+  }
+
   function setView(view, projectRef = null) {
     state.view = view;
     state.projectRef = view === "project" ? (projectRef || ".") : null;
@@ -152,6 +185,7 @@
     });
     renderCurrentProject();
     renderSidebar(state.workspace?.projects || state.projects);
+    scheduleProjectNavSync();
   }
 
   function navigateWorkspace() {
@@ -290,12 +324,13 @@
     const coverage = survey.coverage || {};
     const priorSurvey = survey.last_result_status && survey.last_result_status !== survey.current_status
       ? `prior ${String(survey.last_result_status).replaceAll("_", " ")}` : "latest checkpoint";
-    const gapState = survey.current ? text(survey.gap_state, "not assessed") : priorSurvey;
+    const gapState = survey.current ? text(survey.gap_state, "not assessed") : "rebuilding";
+    const gapNote = survey.current ? "current assessment" : priorSurvey;
     const evidenceItems = [
       ["SURVEY GATE", text(survey.current_status, "not recorded").replaceAll("_", " "), priorSurvey],
       ["LAST RECORDED WORKS", number(coverage.unique_works), "literature map"],
       ["VERIFIED FULL TEXTS", number(coverage.verified_full_texts), "source spans"],
-      ["GAP STATE", gapState, survey.current ? "current assessment" : "current survey is rebuilding"],
+      ["GAP STATE", gapState, gapNote],
       ["RELEASE GATE", text(survey.release_status, "not recorded").replaceAll("_", " "), "human release remains required"],
     ];
     $("#research-evidence").innerHTML = evidenceItems.map(([label, value, note]) => `<div class="research-evidence-cell"><div class="research-evidence-label">${escapeHtml(label)}</div><strong>${escapeHtml(value)}</strong><div class="research-evidence-note">${escapeHtml(note)}</div></div>`).join("");
@@ -309,8 +344,9 @@
     $("#research-progress").innerHTML = stages.map((stage, index) => {
       const currentStatus = stage.status || "unknown";
       const displayStatus = currentStatus === "unknown" ? "planned" : currentStatus;
+      const resultNoteLabel = stage.current ? "previous attempt" : "last recorded result";
       const lastResult = stage.last_result_status && stage.last_result_status !== currentStatus
-        ? `<div class="research-progress-note">last result: ${escapeHtml(String(stage.last_result_status).replaceAll("_", " "))}</div>` : "";
+        ? `<div class="research-progress-note">${resultNoteLabel}: ${escapeHtml(String(stage.last_result_status).replaceAll("_", " "))}</div>` : "";
       return `<article class="research-progress-card research-progress-card--${statusClass(currentStatus)}">
         <div class="research-progress-number">0${index + 1}</div>
         <div class="research-progress-name">${escapeHtml(text(stage.label, stage.id))}</div>
@@ -322,20 +358,17 @@
   }
 
   function renderMetrics(snapshot) {
-    const pipeline = snapshot.pipeline || {};
     const counts = snapshot.counts || {};
     const execution = snapshot.execution || {};
-    const roleAssignments = execution.role_assignments || {};
     const provider = execution.provider || {};
-    $("#metric-pipeline").textContent = `${number(pipeline.completed)} / ${number(pipeline.total)}`;
-    $("#metric-pipeline-note").textContent = `${Math.round((pipeline.completion_ratio || 0) * 100)}% of stages complete`;
-    const activeSpecialists = snapshot.specialists_active ?? (snapshot.specialists || []).filter((item) => item.engaged || ["running", "queued", "awaiting_review", "started"].includes(item.status)).length;
-    $("#metric-specialists").textContent = roleAssignments.limit
-      ? `${number(roleAssignments.running)} / ${number(roleAssignments.limit)}` : number(activeSpecialists);
+    const modelCalls = snapshot.model_calls || {};
+    const recordedCalls = modelCalls.total ?? modelCalls.items?.length ?? 0;
+    const activeCalls = modelCalls.active ?? (modelCalls.items || []).filter((item) => ["running", "queued", "started"].includes(item.state)).length;
     const providerCapacity = provider.worker_capacity ?? provider.durable_window_capacity ?? provider.configured_capacity;
-    $("#metric-specialists-note").textContent = providerCapacity
-      ? `${number(provider.running_tasks)} / ${number(providerCapacity)} provider calls · ${number(roleAssignments.queued)} queued`
-      : "logical assignments · provider capacity unavailable";
+    $("#metric-calls").textContent = number(activeCalls);
+    $("#metric-calls-note").textContent = providerCapacity
+      ? `${number(providerCapacity)} worker slots · ${number(recordedCalls)} recorded`
+      : `${number(recordedCalls)} recorded · capacity unavailable`;
     $("#metric-tasks").textContent = number(counts.tasks ?? snapshot.tasks?.length);
     $("#metric-tasks-note").textContent = `${number(counts.active_tasks)} active · ledger records`;
     $("#metric-artifacts").textContent = number(counts.artifacts ?? snapshot.artifacts?.length);
@@ -344,28 +377,82 @@
     const integrityStatus = !integrity.length ? "not available" : statuses.every((item) => item === "ok") ? "verified" : statuses.some((item) => item === "failed") ? "failed" : "review needed";
     $("#metric-integrity").textContent = integrityStatus;
     $("#metric-integrity-note").textContent = integrity.length ? `${integrity.length} database${integrity.length === 1 ? "" : "s"} checked` : "no SQLite ledger discovered";
-    $("#pipeline-caption").textContent = `${number(pipeline.completed)} of ${number(pipeline.total)} stages complete`;
   }
 
-  function renderPipeline(snapshot) {
-    const stages = snapshot.pipeline?.stages || [];
-    if (!stages.length) {
-      $("#pipeline-grid").innerHTML = '<div class="loading-block">No stage definitions found in the workflow.</div>';
-      return;
-    }
-    setGridColumns("#pipeline-grid", "--pipeline-columns", stages.length, layoutPreference("pipeline"));
-    $("#pipeline-grid").innerHTML = stages.map((stage, index) => {
-      const active = stage.active_agents || [];
-      const researchStage = (snapshot.research?.stage_progress || []).find((item) => item.id === stage.id) || {};
-      const roles = active.length ? `${active.length} role slot${active.length === 1 ? "" : "s"}` : "no active roles";
-      return `<article class="stage-card stage-card--${statusClass(stage.status)}">
-        <div class="stage-number">0${index + 1}</div>
-        <div class="stage-name">${escapeHtml(text(stage.label, stage.id))}</div>
-        <div class="stage-deliverable">${escapeHtml(text(researchStage.deliverable, "stage result"))}</div>
-        <div class="stage-status">${statusPill(stage.status)}</div>
-        <div class="stage-footer"><span>${escapeHtml(roles)}</span><span>${number(stage.attempts)} attempt${stage.attempts === 1 ? "" : "s"}</span></div>
+  function modelCallUsage(call) {
+    const usage = call.usage || {};
+    const parts = [];
+    if (Number.isFinite(Number(usage.input_tokens))) parts.push(`${number(usage.input_tokens)} in`);
+    if (Number.isFinite(Number(usage.output_tokens))) parts.push(`${number(usage.output_tokens)} out`);
+    return parts.length ? parts.join(" · ") : "usage pending";
+  }
+
+  function shortTaskId(value) {
+    const task = text(value, "not recorded");
+    return task.length > 27 ? `${task.slice(0, 12)}…${task.slice(-12)}` : task;
+  }
+
+  function renderModelCalls(snapshot) {
+    const modelCalls = snapshot.model_calls || {};
+    const liveCalls = Array.isArray(modelCalls.live_items)
+      ? modelCalls.live_items
+      : (Array.isArray(modelCalls.items) ? modelCalls.items : []);
+    const reviewCalls = Array.isArray(modelCalls.review_items) ? modelCalls.review_items : [];
+    const recentCalls = Array.isArray(modelCalls.recent_items) ? modelCalls.recent_items : [];
+    const provider = snapshot.execution?.provider || {};
+    const capacity = provider.worker_capacity ?? provider.durable_window_capacity ?? provider.configured_capacity;
+    const active = modelCalls.active ?? liveCalls.length;
+    const reviewPending = modelCalls.review_pending ?? reviewCalls.length;
+    const slotText = capacity === null || capacity === undefined ? "call capacity not recorded" : `${number(capacity)} call slots`;
+    const reviewText = reviewPending ? ` · ${number(reviewPending)} awaiting review` : "";
+    const liveSuffix = modelCalls.truncated ? " · live list capped" : "";
+    $("#model-calls-caption").textContent = `${number(active)} live · ${slotText}${reviewText}${liveSuffix}`;
+
+    const renderCard = (call, history = false) => {
+      const stateValue = call.state || "unknown";
+      const responseRef = call.response_ref;
+      const timing = ["running", "queued", "started"].includes(call.state)
+        ? `${duration(call.elapsed_seconds)} elapsed`
+        : call.finished_at ? relativeDate(call.finished_at) : "finish time not recorded";
+      const endpoint = call.endpoint ? ` · ${escapeHtml(call.endpoint)}` : "";
+      return `<article class="model-call-card${history ? " model-call-card--history" : ""} model-call-card--${statusClass(stateValue)}">
+        <div class="model-call-top">
+          <div class="model-call-heading">
+            <div class="model-call-provider">${escapeHtml(text(call.provider, "ROUTE"))}${endpoint}</div>
+            <div class="model-call-model">${escapeHtml(text(call.model, "model not recorded"))}</div>
+          </div>
+          ${statusPill(stateValue)}
+        </div>
+        <div class="model-call-role">${escapeHtml(text(call.role, "role not recorded"))}</div>
+        <div class="model-call-meta">
+          <span><small>STAGE</small><b>${escapeHtml(call.stage_id ? stageName(snapshot, call.stage_id) : "not recorded")}</b></span>
+          <span><small>TASK</small><code title="${escapeHtml(text(call.task_id))}">${escapeHtml(shortTaskId(call.task_id))}</code></span>
+          <span><small>RESPONSE</small><b class="response-state response-state--${statusClass(call.response_status)}">${escapeHtml(text(call.response_status, "not recorded"))}</b></span>
+          <span><small>USAGE</small><b>${escapeHtml(modelCallUsage(call))}</b></span>
+        </div>
+        <div class="model-call-footer"><span>${escapeHtml(timing)}</span><span>${escapeHtml(relativeDate(call.updated_at || call.started_at))}</span></div>
+        <div class="model-call-action">${responseRef
+          ? `<button class="model-call-inspect" type="button" data-model-response-ref="${escapeHtml(responseRef)}">Inspect response</button>`
+          : `<span class="model-call-no-action">response artifact pending</span>`}</div>
       </article>`;
-    }).join("");
+    };
+
+    $("#model-call-grid").innerHTML = liveCalls.length
+      ? liveCalls.map((call) => renderCard(call)).join("")
+      : '<div class="model-call-empty"><strong>No provider call is running.</strong><span>Live cards appear here when a queued or running model task is admitted.</span></div>';
+
+    const historyCalls = [...reviewCalls, ...recentCalls].slice(0, 16);
+    const history = $("#model-call-history");
+    history.hidden = !historyCalls.length;
+    if (historyCalls.length) {
+      const recentCount = recentCalls.length;
+      const historySuffix = modelCalls.history_truncated ? " · bounded" : "";
+      $("#model-call-history-summary").textContent = `${number(reviewPending)} review pending · ${number(recentCount)} recent outputs${historySuffix}`;
+      $("#model-call-history-grid").innerHTML = historyCalls.map((call) => renderCard(call, true)).join("");
+    } else {
+      $("#model-call-history-grid").innerHTML = "";
+    }
+    $$('[data-model-response-ref]').forEach((button) => button.addEventListener("click", () => openInspector(button.dataset.modelResponseRef)));
   }
 
   function qualifyRole(department, role) {
@@ -419,12 +506,16 @@
       const failures = items.filter((item) => ["failed", "blocked", "rejected"].includes(item.status)).length;
       const chief = qualifyRole(department.id, department.chief);
       const adversary = qualifyRole(department.id, department.adversary);
-      const rows = items.length ? items.map((item) => `<div class="agent-row agent-row--clickable" data-agent-role="${escapeHtml(item.role)}" tabindex="0" role="button" title="${escapeHtml(item.role)}">
+      const visibleItems = items.filter((item) => item.engaged || ["failed", "blocked", "rejected"].includes(item.status));
+      const idleItems = items.filter((item) => !visibleItems.includes(item));
+      const agentRow = (item) => `<div class="agent-row agent-row--clickable" data-agent-role="${escapeHtml(item.role)}" tabindex="0" role="button" title="${escapeHtml(item.role)}">
         <span class="status-dot status-dot--${statusClass(item.status)}"></span>
         <span class="agent-row-name">${escapeHtml(text(item.label, compactRole(item.role)))}</span>
         <span class="agent-row-state">${escapeHtml(text(item.status, "idle"))}</span>
-      </div>`).join("") : '<div class="tree-empty">No roster entries.</div>';
-      return `<article class="department-card"><div class="department-header"><div class="department-heading"><div class="department-name">${escapeHtml(text(department.label, department.id))}</div><div class="department-id mono">${escapeHtml(department.id)}</div></div><div class="department-stats"><div class="department-stat"><strong>${number(engaged)}</strong><span>active</span></div><div class="department-stat"><strong>${number(failures)}</strong><span>flagged</span></div></div></div><div class="department-leads"><span>CHIEF <b>${escapeHtml(chief)}</b></span><span>ADVERSARY <b>${escapeHtml(adversary)}</b></span></div><div class="agent-list">${rows}</div></article>`;
+      </div>`;
+      const rows = visibleItems.length ? visibleItems.map(agentRow).join("") : '<div class="agent-list-empty">No active or flagged roles.</div>';
+      const idle = idleItems.length ? `<details class="agent-idle-details"><summary>${number(idleItems.length)} idle capabilities</summary><div class="agent-idle-list">${idleItems.map(agentRow).join("")}</div></details>` : "";
+      return `<article class="department-card"><div class="department-header"><div class="department-heading"><div class="department-name">${escapeHtml(text(department.label, department.id))}</div><div class="department-id mono">${escapeHtml(department.id)}</div></div><div class="department-stats"><div class="department-stat"><strong>${number(engaged)}</strong><span>active</span></div><div class="department-stat"><strong>${number(failures)}</strong><span>flagged</span></div><div class="department-stat"><strong>${number(items.length)}</strong><span>eligible</span></div></div></div><div class="department-leads"><span>CHIEF <b>${escapeHtml(chief)}</b></span><span>ADVERSARY <b>${escapeHtml(adversary)}</b></span></div><div class="agent-list">${rows}${idle}</div></article>`;
     }).join("");
   }
 
@@ -432,8 +523,9 @@
     const items = snapshot.specialists || [];
     const work = snapshot.recent_work || [];
     if (!work.length) {
-      $("#specialist-body").innerHTML = '<tr><td colspan="5" class="empty-cell">No roster or assignment records found.</td></tr>';
-      $("#specialist-caption").textContent = `${number(items.length)} roles · no recent assignment work`;
+      const active = items.filter((item) => item.engaged).length;
+      $("#specialist-body").innerHTML = '<tr><td colspan="5" class="empty-cell">No logical assignment artifact recorded yet. Actual provider work is shown in Model calls above.</td></tr>';
+      $("#specialist-caption").textContent = `${number(items.length)} roles · ${number(active)} active · live model work shown above`;
       return;
     }
     const active = items.filter((item) => item.engaged).length;
@@ -453,7 +545,22 @@
   }
 
   function renderActivity(snapshot) {
-    const items = (snapshot.logs || snapshot.activity || []).slice(0, 60);
+    const allItems = snapshot.logs || snapshot.activity || [];
+    const meaningful = [];
+    let composerCheckpointShown = false;
+    allItems.forEach((item) => {
+      const title = String(item.title || "").toLowerCase();
+      const detail = String(item.detail || "");
+      if (title === "progress / checkpointed" || (title === "artifact / published" && detail.includes("artifact:command/progress/"))) return;
+      if (title === "task / proposed") return;
+      if ((title === "budget / reserved" || title === "budget / settled") && (!detail || detail === "No detail recorded.")) return;
+      if (title === "artifact / published" && detail.includes("artifact:command/composer/checkpoints/")) {
+        if (composerCheckpointShown) return;
+        composerCheckpointShown = true;
+      }
+      meaningful.push(item);
+    });
+    const items = meaningful.slice(0, 24);
     if (!items.length) {
       $("#activity-list").innerHTML = '<div class="loading-block">No durable activity recorded yet.</div>';
       return;
@@ -473,25 +580,21 @@
   function renderResources(snapshot) {
     const resources = snapshot.resources || {};
     const usage = resources.usage || snapshot.live?.usage || {};
-    const pools = resources.pools || [];
     const databases = snapshot.integrity?.databases || [];
     const execution = snapshot.execution || {};
     const roleAssignments = execution.role_assignments || {};
     const provider = execution.provider || {};
     const gates = databases.length ? databases.map((item) => `<div class="gate-row"><span class="status-dot status-dot--${item.status === "ok" ? "pass" : "warn"}"></span><span>${escapeHtml(item.root_key)} ledger · ${escapeHtml(item.status)}</span></div>`).join("") : '<div class="gate-row"><span class="status-dot status-dot--warn"></span><span>No ledger verification available</span></div>';
-    const currentPool = provider.source_root ? pools.filter((pool) => pool.root_key === provider.source_root) : pools;
-    const poolBlock = currentPool.slice(0, 1).map((pool) => `<div class="resource-card"><div class="resource-card-heading"><span>CURRENT RESOURCE POOL</span><strong>${escapeHtml(text(pool.root_key))}</strong></div><div class="resource-rows">${resourceRows(usageEntries(pool.usage))}</div></div>`).join("");
     const totalCapacity = provider.durable_window_capacity ?? provider.configured_capacity;
     const workerCapacity = provider.worker_capacity ?? provider.configured_worker_concurrency;
     const dispatchRows = [
-      ["role assignments", `${number(roleAssignments.running)} running · ${number(roleAssignments.queued)} queued`],
       ["stage role limit", roleAssignments.limit === null || roleAssignments.limit === undefined ? "not recorded" : number(roleAssignments.limit)],
       ["provider calls", `${number(provider.running_tasks)} running · ${number(provider.awaiting_review_tasks)} awaiting review`],
       ["worker capacity", workerCapacity === null || workerCapacity === undefined ? "not recorded" : number(workerCapacity)],
       ["total call cap", totalCapacity === null || totalCapacity === undefined ? "not recorded" : number(totalCapacity)],
       ["capacity guard", provider.within_capacity === false ? "OVER CAPACITY" : "within capacity"],
     ];
-    $("#resource-stack").innerHTML = `<div class="resource-card"><div class="resource-card-heading"><span>MISSION USAGE</span><strong>${usageEntries(usage).length ? "live" : "not recorded"}</strong></div><div class="resource-rows">${resourceRows(usageEntries(usage))}</div></div><div class="resource-card"><div class="resource-card-heading"><span>DISPATCH SEMANTICS</span><strong>${escapeHtml(text(provider.capacity_source, "not recorded"))}</strong></div><div class="resource-rows">${resourceRows(dispatchRows)}</div></div>${poolBlock}<div class="resource-card"><div class="resource-card-heading"><span>INTEGRITY GATES</span><strong>read-only</strong></div><div class="resource-rows">${gates}</div></div>`;
+    $("#resource-stack").innerHTML = `<div class="resource-card"><div class="resource-card-heading"><span>MISSION USAGE</span><strong>${usageEntries(usage).length ? "live" : "not recorded"}</strong></div><div class="resource-rows">${resourceRows(usageEntries(usage))}</div></div><div class="resource-card"><div class="resource-card-heading"><span>DISPATCH SEMANTICS</span><strong>${escapeHtml(text(provider.capacity_source, "not recorded"))}</strong></div><div class="resource-rows">${resourceRows(dispatchRows)}${provider.source_root ? `<div class="resource-row"><span class="resource-key">allocation root</span><span class="resource-value">${escapeHtml(provider.source_root)}</span></div>` : ""}</div></div><div class="resource-card"><div class="resource-card-heading"><span>INTEGRITY GATES</span><strong>read-only</strong></div><div class="resource-rows">${gates}</div></div>`;
   }
 
   function renderStructure(snapshot) {
@@ -511,9 +614,12 @@
     }
     setGridColumns("#structure-grid", "--structure-columns", displayRoots.length, layoutPreference("structure"));
     $("#structure-grid").innerHTML = displayRoots.map((root) => {
-      const entries = directories.filter((item) => item.root_key === root.root_key).slice(0, 180);
+      const rootDirectories = directories.filter((item) => item.root_key === root.root_key);
+      const entries = rootDirectories.filter((item) => Number(item.depth) <= 1).slice(0, 36);
+      const hidden = Math.max(0, rootDirectories.length - entries.length);
       const tree = entries.length ? entries.map((item) => `<div class="tree-row" style="--depth:${Math.min(Math.max(Number(item.depth) || 0, 0), 8)}"><span class="tree-marker">/</span><span>${escapeHtml(item.path)}</span></div>`).join("") : `<div class="tree-empty">${root.covered_by ? `covered by ${escapeHtml(root.covered_by)} root scan` : "no directories discovered"}</div>`;
-      return `<article class="structure-card"><div class="structure-card-header"><div><div class="structure-root">${escapeHtml(root.root_key)}</div><div class="structure-path mono">${escapeHtml(root.path)}</div></div><div class="structure-count">${number(root.files)} files<br>${number(root.directories)} dirs</div></div><div class="tree-list">${tree}</div></article>`;
+      const more = hidden ? `<div class="tree-empty">${number(hidden)} deeper directories indexed · use Inventory to inspect files</div>` : "";
+      return `<article class="structure-card"><div class="structure-card-header"><div><div class="structure-root">${escapeHtml(root.root_key)}</div><div class="structure-path mono">${escapeHtml(root.path)}</div></div><div class="structure-count">${number(root.files)} files<br>${number(root.directories)} dirs</div></div><div class="tree-list">${tree}${more}</div></article>`;
     }).join("");
   }
 
@@ -521,7 +627,13 @@
     const checkpoints = (snapshot.checkpoints || []).map((item) => ({ ...item, kind: "checkpoint", displayKind: "checkpoint" }));
     const artifacts = (snapshot.artifacts || []).map((item) => ({ ...item, kind: "artifact", displayKind: item.artifact_type || "artifact", path: item.artifact_ref || item.logical_id, name: item.logical_id || item.artifact_ref, owner: item.owner || item.author }));
     const files = (snapshot.files || []).map((item) => ({ ...item, kind: "file", displayKind: item.kind || "file" }));
-    return [...checkpoints, ...artifacts, ...files].sort((a, b) => String(b.updated_at || b.created_at || "").localeCompare(String(a.updated_at || a.created_at || "")));
+    const seen = new Set();
+    return [...checkpoints, ...artifacts, ...files].filter((item) => {
+      const identity = item.artifact_ref ? `artifact:${item.artifact_ref}` : `${item.kind}:${item.ref || item.path || item.name}`;
+      if (seen.has(identity)) return false;
+      seen.add(identity);
+      return true;
+    }).sort((a, b) => String(b.updated_at || b.created_at || "").localeCompare(String(a.updated_at || a.created_at || "")));
   }
 
   function renderInventory(snapshot) {
@@ -563,13 +675,14 @@
     renderHeader(snapshot);
     renderResearch(snapshot);
     renderMetrics(snapshot);
-    renderPipeline(snapshot);
+    renderModelCalls(snapshot);
     renderDepartments(snapshot);
     renderSpecialists(snapshot);
     renderActivity(snapshot);
     renderResources(snapshot);
     renderStructure(snapshot);
     renderInventory(snapshot);
+    scheduleProjectNavSync();
     $$("[data-agent-role]").forEach((element) => {
       const inspect = () => openAgentInspector(element.dataset.agentRole, element.dataset.agentTask || null);
       element.addEventListener("click", inspect);
@@ -921,6 +1034,7 @@
     });
     $$("#project-nav .nav-link").forEach((link) => link.addEventListener("click", () => {
       $$("#project-nav .nav-link").forEach((item) => item.classList.toggle("is-active", item === link));
+      window.setTimeout(scheduleProjectNavSync, 80);
     }));
     window.addEventListener("popstate", () => {
       const project = new URLSearchParams(window.location.search).get("project");
@@ -939,7 +1053,9 @@
       $$("#project-nav .nav-link").forEach((link) => {
         link.classList.toggle("is-active", link.getAttribute("href") === `#${activeHash}`);
       });
+      scheduleProjectNavSync();
     });
+    window.addEventListener("scroll", scheduleProjectNavSync, { passive: true });
   }
 
   bindControls();
@@ -953,6 +1069,7 @@
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => {
       if (state.snapshot && state.view === "project") render(state.snapshot);
+      scheduleProjectNavSync();
     }, 120);
   });
 })();

@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+repository_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$repository_dir"
+
+workflow=local-private/autolab/workflow.json
+running_pid=$(ps -axo pid=,command= | awk -v workflow="$workflow" '
+  /[s]cisaurus\.cli run-composer/ && index($0, workflow) {
+    print $1
+    exit
+  }
+')
+
+if [ -n "$running_pid" ]; then
+  echo "Composer already running (PID $running_pid); no duplicate started."
+  exit 0
+fi
+
+exec local-private/autolab/resume.sh "$@"

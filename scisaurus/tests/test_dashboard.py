@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 import tempfile
 import threading
@@ -76,6 +77,92 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(any(item["ref"] == "project::output/progress.json"
                             for item in snapshot["checkpoints"]))
         self.assertEqual((root / "README.md").read_text(encoding="utf-8"), "# Dashboard fixture\n")
+
+    def test_snapshot_projects_real_model_calls_from_call_artifacts(self):
+        temporary, root = self.make_project()
+        self.addCleanup(temporary.cleanup)
+        objects = root / "objects" / "sha256"
+        objects.mkdir(parents=True)
+
+        def artifact(logical_id, body, task_id=None):
+            encoded = json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            body_hash = hashlib.sha256(encoded).hexdigest()
+            (objects / body_hash).write_bytes(encoded)
+            return {
+                "root_key": "project", "logical_id": logical_id, "version": 1,
+                "artifact_ref": f"artifact:{logical_id}@1", "artifact_type": "execution",
+                "body_hash": body_hash, "file_ref": f"project::objects/sha256/{body_hash}",
+                "task_id": task_id, "created_at": "2026-09-16T00:00:02+00:00",
+            }
+
+        running_id = "model-running"
+        review_id = "model-review"
+        completed_id = "model-completed"
+        running_context = artifact(
+            f"command/contexts/{running_id}",
+            {"role": "research.literature-mapper", "client": {
+                "model": "fallback-model", "base_url": "http://127.0.0.1:11434/v1",
+                "role_models": {"research.literature-mapper": {
+                    "model": "qwen3.8-27b",
+                    "base_url": "https://desktop-br7ukeg.taila57d41.ts.net/v1",
+                }},
+            }},
+        )
+        completed_context = artifact(
+            f"command/contexts/{completed_id}",
+            {"role": "review.methods", "client": {
+                "model": "fallback-model", "base_url": "http://127.0.0.1:11434/v1",
+            }},
+        )
+        review_context = artifact(
+            f"command/contexts/{review_id}",
+            {"role": "research.fact-verifier", "client": {
+                "model": "review-model", "base_url": "http://127.0.0.1:11434/v1",
+            }},
+        )
+        completed_execution = artifact(
+            f"command/executions/{completed_id}",
+            {"model": "glm-5.3-flash:cloud", "elapsed_seconds": 2.5,
+             "finish_reason": "stop", "usage": {
+                 "model_calls": 1, "input_tokens": 100, "output_tokens": 25,
+             }},
+        )
+        db = {
+            "tasks": [
+                {"root_key": "project", "task_id": running_id, "state": "running",
+                 "updated_at": "2026-09-16T00:00:03+00:00", "payload": {"operation": "model"}},
+                {"root_key": "project", "task_id": review_id, "state": "awaiting_review",
+                 "updated_at": "2026-09-16T00:00:02+00:00", "payload": {"operation": "model"}},
+                {"root_key": "project", "task_id": completed_id, "state": "completed",
+                 "updated_at": "2026-09-16T00:00:02+00:00", "payload": {"operation": "model"}},
+            ],
+            "attempts": [
+                {"root_key": "project", "task_id": running_id, "attempt_id": "a-running",
+                 "state": "started", "lease_owner": "research.literature-mapper",
+                 "created_at": "2026-09-16T00:00:03+00:00", "finished_at": None, "usage": {}},
+                {"root_key": "project", "task_id": review_id, "attempt_id": "a-review",
+                 "state": "started", "lease_owner": "research.fact-verifier",
+                 "created_at": "2026-09-16T00:00:02+00:00", "finished_at": None, "usage": {}},
+                {"root_key": "project", "task_id": completed_id, "attempt_id": "a-completed",
+                 "state": "succeeded", "lease_owner": "review.methods",
+                 "created_at": "2026-09-16T00:00:01+00:00",
+                 "finished_at": "2026-09-16T00:00:02+00:00", "usage": {}},
+            ],
+            "artifacts": [running_context, review_context, completed_context, completed_execution],
+        }
+
+        calls = DashboardSnapshot(root)._model_calls(db)
+
+        self.assertEqual(calls["active"], 1)
+        self.assertEqual(calls["review_pending"], 1)
+        self.assertEqual([item["task_id"] for item in calls["items"]], [running_id])
+        self.assertEqual([item["task_id"] for item in calls["review_items"]], [review_id])
+        self.assertEqual([item["task_id"] for item in calls["recent_items"]], [completed_id])
+        self.assertEqual(calls["items"][0]["model"], "qwen3.8-27b")
+        self.assertEqual(calls["items"][0]["provider"], "Tailnet")
+        self.assertEqual(calls["recent_items"][0]["model"], "glm-5.3-flash:cloud")
+        self.assertEqual(calls["recent_items"][0]["response_status"], "response recorded")
+        self.assertTrue(calls["recent_items"][0]["response_ref"].startswith("project::objects/sha256/"))
 
     def test_workspace_overview_is_lightweight_and_project_scoped(self):
         temporary, root = self.make_project()
