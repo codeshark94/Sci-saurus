@@ -505,6 +505,43 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual([(row["task_count"], row["pending_review_count"]) for row in production[:3]], [(2, 0), (2, 1), (1, 3)])
         self.assertTrue(all(row["worker_slots"] == 2 and row["reserved_review_seconds"] > 0 for row in production))
 
+    def test_multi_provider_mapping_uses_a_bounded_rolling_dispatch_window(self):
+        config = survey_config(self.endpoint)
+        config["model"]["base_url"] = "http://127.0.0.1:1/v1"
+        config["limits"]["provider_pools"] = {
+            "ollama": {"max_concurrent": 3, "base_urls": ["http://127.0.0.1:1/v1"]},
+            "qwen": {"max_concurrent": 1, "base_urls": ["https://qwen.invalid/v1"]},
+        }
+        runner = self.runtime(config)
+        self.addCleanup(runner.control.close)
+        runner._initialize()
+        runner._complete = lambda task_id: None
+        batches = []
+
+        def fake_call(specs, *, max_parallel=None):
+            batches.append((len(specs), max_parallel))
+            return {
+                spec["task_id"]: {
+                    "ok": True,
+                    "result": {
+                        "text": json.dumps({"accepted": True}), "model": "fixture",
+                        "usage": {"model_calls": 1, "input_tokens": 1, "output_tokens": 1},
+                        "elapsed_seconds": 0.01, "finish_reason": "stop",
+                    },
+                    "record_ref": "artifact:command/executions/" + spec["task_id"],
+                }
+                for spec in specs
+            }
+
+        jobs = [{"name": f"job-{index}", "actor": "research.literature-mapper",
+                 "assignment": {"phase": "map", "job": index},
+                 "validator": lambda value: None}
+                for index in range(5)]
+        with patch.object(runner, "_call_batch", side_effect=fake_call):
+            result = runner._models_checked(jobs, stage="production", task_kind="production")
+        self.assertEqual(set(result), {f"job-{index}" for index in range(5)})
+        self.assertEqual(batches, [(4, 2), (1, 2)])
+
     def test_exhausted_work_repair_keeps_other_valid_work_artifacts(self):
         config = survey_config(self.endpoint, "map-reject")
         config["limits"]["max_rounds"] = 2

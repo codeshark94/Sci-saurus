@@ -517,11 +517,16 @@ class SurveyRunner(ExecutionRuntime):
                     if (retained := self._retained_validation_feedback(job["name"], job["assignment"])) is not None}
         repair_mode = self.config["limits"].get("repair_mode", "bounded")
         rounds = itertools.count() if repair_mode == "until_deadline" else range(self.config["limits"]["max_rounds"])
+        # A multi-provider run uses a small rolling dispatch buffer.  The
+        # execution runtime already backfills a returned slot immediately;
+        # keeping the buffer bounded avoids unbounded prompt retention while
+        # preventing a slow provider from imposing a full-wave barrier.
+        dispatch_window = self.worker_slots * 2 if len(self.provider_pools) > 1 else self.worker_slots
         for _ in rounds:
             self._ensure_active()
             rejected = []
-            for offset in range(0, len(pending), self.worker_slots):
-                wave = pending[offset:offset + self.worker_slots]
+            for offset in range(0, len(pending), dispatch_window):
+                wave = pending[offset:offset + dispatch_window]
                 self._tick(stage, count=len(wave), pending_review_count=len(results) if stage in {"production", "revision"} else 0)
                 specs = []
                 for job in wave:

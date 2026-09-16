@@ -1138,12 +1138,27 @@ class DashboardSnapshot:
             endpoint = self._model_endpoint(base_url)
             provider_pool = context.get("provider_pool")
             route_id = context.get("route_id")
+            cache_prompt_value = role_config.get("cache_prompt", client.get("cache_prompt"))
+            cache_prompt_requested = cache_prompt_value is True
 
             state = _display_status(task.get("state"))
             usage = execution.get("usage") if isinstance(execution.get("usage"), dict) else None
             if usage is None and isinstance(attempt.get("usage"), dict):
                 usage = attempt["usage"].get("actual") or attempt["usage"].get("reserved")
             usage = usage if isinstance(usage, dict) else {}
+            cache_read_tokens = usage.get("cache_read_tokens")
+            cache_write_tokens = usage.get("cache_write_tokens")
+            if type(cache_read_tokens) is not int or cache_read_tokens < 0:
+                cache_read_tokens = None
+            if type(cache_write_tokens) is not int or cache_write_tokens < 0:
+                cache_write_tokens = None
+            cache_status = (
+                "hit" if cache_read_tokens is not None and cache_read_tokens > 0
+                else "primed" if cache_write_tokens is not None and cache_write_tokens > 0
+                else "miss" if cache_read_tokens is not None
+                else "enabled · unreported" if cache_prompt_requested
+                else "not requested"
+            )
             response_status = {
                 "queued": "queued",
                 "running": "awaiting response",
@@ -1181,6 +1196,12 @@ class DashboardSnapshot:
                 "endpoint": endpoint["host"],
                 "provider_pool": provider_pool if isinstance(provider_pool, str) else None,
                 "route_id": route_id if isinstance(route_id, str) else None,
+                "cache": {
+                    "requested": cache_prompt_requested,
+                    "status": cache_status,
+                    "read_tokens": cache_read_tokens,
+                    "write_tokens": cache_write_tokens,
+                },
                 "response_status": response_status,
                 "response_ref": execution_artifact.get("file_ref") if execution_artifact else None,
                 "artifact_ref": execution_artifact.get("artifact_ref") if execution_artifact else None,
@@ -1189,7 +1210,8 @@ class DashboardSnapshot:
                 "updated_at": _iso_timestamp(task.get("updated_at")),
                 "elapsed_seconds": elapsed_seconds,
                 "usage": {key: value for key, value in usage.items()
-                          if key in {"model_calls", "input_tokens", "output_tokens"}
+                          if key in {"model_calls", "input_tokens", "output_tokens",
+                                     "cache_read_tokens", "cache_write_tokens"}
                           and type(value) is int and value >= 0},
             })
 

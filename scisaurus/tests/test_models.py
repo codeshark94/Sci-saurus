@@ -125,6 +125,28 @@ class TestModelClient(unittest.TestCase):
         self.assertEqual(result.json_object(), {'revised_text': 'Association observed.'})
         self.assertEqual(result.usage, {'model_calls': 1, 'input_tokens': 14, 'output_tokens': 28})
 
+    def test_prompt_cache_hint_and_usage_are_preserved(self):
+        self.response = {
+            'model': 'qwen3.8-27b',
+            'choices': [{'message': {'content': '{"ok":true}'}, 'finish_reason': 'stop'}],
+            'usage': {
+                'prompt_tokens': 100,
+                'completion_tokens': 28,
+                'prompt_tokens_details': {'cached_tokens': 80},
+                'created_cache_tokens': 20,
+            },
+        }
+        result = self.client('openai_compatible', cache_prompt=True).complete(
+            system='Stable instruction.', prompt='Different assignment.')
+        self.assertTrue(self.request['cache_prompt'])
+        self.assertEqual(result.usage, {
+            'model_calls': 1,
+            'input_tokens': 100,
+            'output_tokens': 28,
+            'cache_read_tokens': 80,
+            'cache_write_tokens': 20,
+        })
+
     def test_sampling_controls_are_sent_to_compatible_provider(self):
         self.response = {'choices': [{'message': {'content': '{"ok":true}'}, 'finish_reason': 'stop'}]}
         self.client(
@@ -240,6 +262,12 @@ class TestModelClient(unittest.TestCase):
                 ('frequency_penalty', -2.1)):
             with self.subTest(field=field, value=value), self.assertRaises(ValidationError):
                 self.client('openai_compatible', **{field: value})
+        self.assertFalse(hasattr(self, 'request'))
+
+    def test_invalid_prompt_cache_hint_fails_before_network(self):
+        for value in ("true", 1, [], {}):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                self.client('openai_compatible', cache_prompt=value)
         self.assertFalse(hasattr(self, 'request'))
 
     def test_explicit_reasoning_none_is_transmitted(self):

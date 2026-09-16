@@ -102,6 +102,7 @@ class DashboardTests(unittest.TestCase):
             f"command/contexts/{running_id}",
             {"role": "research.literature-mapper", "provider_pool": "qwen", "route_id": "qwen-tailnet", "client": {
                 "model": "fallback-model", "base_url": "http://127.0.0.1:11434/v1",
+                "cache_prompt": True,
                 "role_models": {"research.literature-mapper": {
                     "model": "qwen3.8-27b",
                     "base_url": "https://desktop-br7ukeg.taila57d41.ts.net/v1",
@@ -112,6 +113,7 @@ class DashboardTests(unittest.TestCase):
             f"command/contexts/{completed_id}",
             {"role": "review.methods", "client": {
                 "model": "fallback-model", "base_url": "http://127.0.0.1:11434/v1",
+                "cache_prompt": True,
             }},
         )
         review_context = artifact(
@@ -125,6 +127,7 @@ class DashboardTests(unittest.TestCase):
             {"model": "glm-5.3-flash:cloud", "elapsed_seconds": 2.5,
              "finish_reason": "stop", "usage": {
                  "model_calls": 1, "input_tokens": 100, "output_tokens": 25,
+                 "cache_read_tokens": 64,
              }},
         )
         db = {
@@ -162,8 +165,13 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(calls["items"][0]["provider"], "Tailnet")
         self.assertEqual(calls["items"][0]["provider_pool"], "qwen")
         self.assertEqual(calls["items"][0]["route_id"], "qwen-tailnet")
+        self.assertEqual(calls["items"][0]["cache"]["status"], "enabled · unreported")
         self.assertEqual(calls["recent_items"][0]["model"], "glm-5.3-flash:cloud")
         self.assertEqual(calls["recent_items"][0]["response_status"], "response recorded")
+        self.assertEqual(calls["recent_items"][0]["cache"], {
+            "requested": True, "status": "hit", "read_tokens": 64, "write_tokens": None,
+        })
+        self.assertEqual(calls["recent_items"][0]["usage"]["cache_read_tokens"], 64)
         self.assertTrue(calls["recent_items"][0]["response_ref"].startswith("project::objects/sha256/"))
 
     def test_workspace_overview_is_lightweight_and_project_scoped(self):

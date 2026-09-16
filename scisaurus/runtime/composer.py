@@ -4213,6 +4213,18 @@ class ComposerRunner:
                            else "candidate_needs_review" if candidate_stage else "completed")
             self._checkpoint("complete_proposed", force=True)
             return self._finish()
+        except KeyboardInterrupt as exc:
+            # A process-level stop is a resumable pause, not a failed
+            # workflow.  Persist it here so the dashboard and the next
+            # resume observe the same durable state.
+            self.status = "paused"
+            self.blockers.append({
+                "stage_id": "workflow",
+                "reason": f"{type(exc).__name__}: {exc}",
+                "stop_reason": "process_interrupted",
+            })
+            self._checkpoint("paused_process_interruption", force=True)
+            return self._finish()
         except Exception as exc:
             self.status = "blocked"
             self.blockers.append({"reason": f"{type(exc).__name__}: {exc}"})
@@ -4252,6 +4264,11 @@ class ComposerRunner:
                         and item.get("reason") == "provider_cooldown"
                         for item in self.blockers):
                     stop_reason = "provider_cooldown"
+                if stop_reason is None and self.status == "paused" and any(
+                        isinstance(item, dict)
+                        and item.get("stop_reason") == "process_interrupted"
+                        for item in self.blockers):
+                    stop_reason = "process_interrupted"
                 interim = self.interim_report(
                     stop_reason=stop_reason or self.status)
             except Exception as exc:

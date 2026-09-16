@@ -416,6 +416,12 @@
         : call.finished_at ? relativeDate(call.finished_at) : "finish time not recorded";
       const endpoint = call.endpoint ? ` · ${escapeHtml(call.endpoint)}` : "";
       const pool = call.provider_pool ? ` · ${escapeHtml(call.provider_pool)}` : "";
+      const cache = call.cache || {};
+      const cacheLabel = cache.status === "hit" && Number.isFinite(Number(cache.read_tokens))
+        ? `hit · ${number(cache.read_tokens)} read`
+        : cache.status === "primed" && Number.isFinite(Number(cache.write_tokens))
+          ? `primed · ${number(cache.write_tokens)} written`
+        : text(cache.status, "not recorded");
       return `<article class="model-call-card${history ? " model-call-card--history" : ""} model-call-card--${statusClass(stateValue)}">
         <div class="model-call-top">
           <div class="model-call-heading">
@@ -429,7 +435,7 @@
           <span><small>STAGE</small><b>${escapeHtml(call.stage_id ? stageName(snapshot, call.stage_id) : "not recorded")}</b></span>
           <span><small>TASK</small><code title="${escapeHtml(text(call.task_id))}">${escapeHtml(shortTaskId(call.task_id))}</code></span>
           <span><small>RESPONSE</small><b class="response-state response-state--${statusClass(call.response_status)}">${escapeHtml(text(call.response_status, "not recorded"))}</b></span>
-          <span><small>USAGE</small><b>${escapeHtml(modelCallUsage(call))}</b></span>
+          <span><small>USAGE / CACHE</small><b>${escapeHtml(modelCallUsage(call))} · ${escapeHtml(cacheLabel)}</b></span>
         </div>
         <div class="model-call-footer"><span>${escapeHtml(timing)}</span><span>${escapeHtml(relativeDate(call.updated_at || call.started_at))}</span></div>
         <div class="model-call-action">${responseRef

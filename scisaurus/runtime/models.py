@@ -26,6 +26,7 @@ MODEL_CONFIG_FIELDS = frozenset({
     "base_url", "model", "protocol", "timeout_seconds", "max_output_tokens",
     "auth_env", "max_response_bytes", "reasoning_effort", "output_format",
     "max_image_bytes", "max_request_bytes", "max_retries", "retry_backoff_seconds",
+    "cache_prompt",
 }) | SAMPLING_FIELDS
 ROLE_ROUTE_FIELDS = frozenset({"id", "pool"}) | MODEL_CONFIG_FIELDS
 # OpenAI-compatible providers commonly expose ``seed`` as a signed int64.
@@ -139,6 +140,8 @@ def _validate_role_models(role_models):
         if "auth_env" in selected and selected["auth_env"] is not None and (
                 not isinstance(selected["auth_env"], str) or not selected["auth_env"]):
             raise ValidationError(f"model.role_models.{role_name}.auth_env is invalid")
+        if "cache_prompt" in selected and type(selected["cache_prompt"]) is not bool:
+            raise ValidationError(f"model.role_models.{role_name}.cache_prompt must be boolean")
         if "reasoning_effort" in selected and selected["reasoning_effort"] not in {
                 None, "none", "low", "medium", "high", "xhigh"}:
             raise ValidationError(f"model.role_models.{role_name}.reasoning_effort is invalid")
@@ -281,6 +284,32 @@ class ModelResult:
         return value
 
 
+def _cache_usage(response):
+    """Normalize prompt-cache counters from compatible provider responses."""
+    if not isinstance(response, dict):
+        return {}
+    provider_usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+    details = provider_usage.get("prompt_tokens_details")
+    if not isinstance(details, dict):
+        details = response.get("prompt_tokens_details")
+    containers = [provider_usage, details, response]
+    fields = {
+        "cache_read_tokens": ("cached_tokens", "cache_read_input_tokens", "prompt_cache_hit_tokens"),
+        "cache_write_tokens": ("created_cache_tokens", "cache_creation_input_tokens",
+                                "cache_write_input_tokens", "prompt_cache_write_tokens"),
+    }
+    normalized = {}
+    for target, names in fields.items():
+        for container in containers:
+            if not isinstance(container, dict):
+                continue
+            value = next((container[name] for name in names if name in container), None)
+            if type(value) is int and value >= 0:
+                normalized[target] = value
+                break
+    return normalized
+
+
 class ModelClient:
     def __init__(self, *, base_url: str, model: str, protocol: str,
                  timeout_seconds: float, max_output_tokens: int,
@@ -290,7 +319,8 @@ class ModelClient:
                  max_retries: int = 2, retry_backoff_seconds: float = 1.0,
                  temperature: float | None = None, top_p: float | None = None,
                  seed: int | None = None, presence_penalty: float | None = None,
-                 frequency_penalty: float | None = None):
+                 frequency_penalty: float | None = None,
+                 cache_prompt: bool | None = None):
         if not isinstance(base_url, str):
             raise ValidationError("model base_url must be a URL string")
         parsed = urllib.parse.urlsplit(base_url)
@@ -325,6 +355,8 @@ class ModelClient:
             raise ValidationError("reasoning_effort must be none, low, medium, high, or xhigh when configured")
         if output_format is not None and output_format != "json_object":
             raise ValidationError("output_format must be json_object when configured")
+        if cache_prompt is not None and type(cache_prompt) is not bool:
+            raise ValidationError("cache_prompt must be boolean when configured")
         sampling = {
             key: value for key, value in {
                 "temperature": temperature, "top_p": top_p, "seed": seed,
@@ -342,6 +374,7 @@ class ModelClient:
         self.reasoning_effort, self.output_format = reasoning_effort, output_format
         self.max_image_bytes, self.max_request_bytes = max_image_bytes, max_request_bytes
         self.max_retries, self.retry_backoff_seconds = max_retries, float(retry_backoff_seconds)
+        self.cache_prompt = cache_prompt
         self.temperature = temperature
         self.top_p = top_p
         self.seed = seed
@@ -416,6 +449,11 @@ class ModelClient:
                 body["reasoning_effort"] = self.reasoning_effort
             if self.output_format is not None:
                 body["response_format"] = {"type": self.output_format}
+        if self.cache_prompt is not None:
+            # Ollama/llama.cpp-compatible servers use this hint to reuse the
+            # longest matching token prefix across requests. Other compatible
+            # gateways may ignore it; the request remains semantically valid.
+            body["cache_prompt"] = self.cache_prompt
         headers = {"Content-Type": "application/json"}
         if self.auth_env:
             key = os.environ.get(self.auth_env)
@@ -568,6 +606,7 @@ class ModelClient:
                     usage = {k: data["usage"][source] for k, source in
                              (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens"))
                              if source in data.get("usage", {})}
+                usage.update(_cache_usage(data))
                 if not isinstance(text, str) or not text.strip():
                     raise ValueError("empty text")
                 if any(type(value) is not int or value < 0 for value in usage.values()):

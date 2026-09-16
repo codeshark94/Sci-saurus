@@ -25,6 +25,7 @@ Copy `config/paragraph-run.example.json` to a local configuration file. The exam
 | `model.auth_env` | Environment-variable name, or `null`; never a plaintext key |
 | `model.reasoning_effort` | Optional `none`, `low`, `medium`, `high`, or `xhigh` for compatible servers that support it |
 | `model.output_format` | Optional `json_object` for compatible servers that support structured output |
+| `model.cache_prompt` | Optional boolean provider hint for compatible servers that reuse the longest matching prompt prefix; omitted unless explicitly enabled |
 | `model.temperature`, `model.top_p` | Optional provider sampling controls; Composer role defaults apply when omitted |
 | `model.seed` | Optional non-negative replay seed; an autonomous Composer mission supplies and persists its exploration seed |
 | `model.presence_penalty`, `model.frequency_penalty` | Optional provider repetition controls in the range `-2` to `2` |
@@ -34,7 +35,7 @@ Copy `config/paragraph-run.example.json` to a local configuration file. The exam
 | `required_literals` | Baseline values or phrases that must remain present |
 | `limits` | Finite rounds, request/deadline/checkpoint times, output/capture/IPC sizes |
 
-For [Ollama's native API](https://docs.ollama.com/api/chat), the base URL excludes `/api/chat`. For a [vLLM-compatible server](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html), provide its API base including `/v1`; the adapter appends `/chat/completions`. The protocol name does not select or authorize a different provider. No alternate endpoint is used on failure. Explicit reasoning/output-format settings are rejected for the native Ollama adapter; unset settings are omitted. Reported completion tokens already include provider reasoning tokens and are counted once.
+For [Ollama's native API](https://docs.ollama.com/api/chat), the base URL excludes `/api/chat`. For a [vLLM-compatible server](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html), provide its API base including `/v1`; the adapter appends `/chat/completions`. The protocol name does not select or authorize a different provider. No alternate endpoint is used on failure. Explicit reasoning/output-format settings are rejected for the native Ollama adapter; unset settings are omitted. `cache_prompt` is deliberately opt-in because it is provider-specific; when enabled, the request hint is sent unchanged and reported cache-read/write counters are retained in the execution artifact. vLLM's automatic prefix cache must also be enabled on the server (for example, `--enable-prefix-caching`), and `--enable-prompt-tokens-details` is required for hit/write counters; a successful request with zero counters is not treated as a cache hit. Reported completion tokens already include provider reasoning tokens and are counted once.
 
 ```bash
 python3 -m scisaurus.cli run-paragraph /tmp/research-paragraph --config /path/to/run.json

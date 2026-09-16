@@ -267,6 +267,25 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(blocker["retry_after_seconds"], 0.03)
             self.assertEqual(result["interim_report"]["stop_reason"], "provider_cooldown")
 
+    def test_process_interrupt_persists_a_resumable_pause(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+
+            def interrupted(stage, **kwargs):
+                raise KeyboardInterrupt("run cancellation requested")
+
+            runner._run_stage = interrupted
+            result = runner.run()
+            self.assertEqual(result["status"], "paused")
+            self.assertEqual(result["interim_report"]["stop_reason"], "process_interrupted")
+            self.assertTrue(any(item.get("stop_reason") == "process_interrupted"
+                                for item in result["blockers"]))
+            progress = json.loads((root / "composer" / "output" / "progress.json").read_text())
+            self.assertEqual(progress["status"], "paused")
+            self.assertEqual(progress["phase"], "paused_process_interruption")
+
     def test_quota_exhaustion_does_not_recreate_a_stage_budget(self):
         class FastClock:
             def __init__(self):
