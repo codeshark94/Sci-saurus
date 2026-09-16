@@ -77,6 +77,23 @@ class DashboardTests(unittest.TestCase):
                             for item in snapshot["checkpoints"]))
         self.assertEqual((root / "README.md").read_text(encoding="utf-8"), "# Dashboard fixture\n")
 
+    def test_workspace_overview_is_lightweight_and_project_scoped(self):
+        temporary, root = self.make_project()
+        self.addCleanup(temporary.cleanup)
+
+        overview = DashboardService(root).workspace()
+
+        self.assertEqual(overview["schema_version"], "dashboard-workspace-1")
+        self.assertEqual(overview["workspace"]["name"], "Sci-saurus")
+        self.assertEqual(overview["summary"]["total_projects"], 1)
+        self.assertEqual(overview["summary"]["stale_projects"], 1)
+        self.assertEqual(overview["projects"][0]["current_stage"], "survey")
+        self.assertEqual(overview["projects"][0]["completed_stages"], 1)
+        self.assertEqual(overview["projects"][0]["total_stages"], 2)
+        self.assertEqual(overview["active_runs"], [])
+        self.assertEqual(overview["recent_projects"][0]["ref"], ".")
+        self.assertNotIn("artifacts", overview)
+
     def test_http_snapshot_file_preview_and_path_boundary(self):
         temporary, root = self.make_project()
         self.addCleanup(temporary.cleanup)
@@ -95,6 +112,11 @@ class DashboardTests(unittest.TestCase):
             snapshot = json.loads(response.read())
         self.assertEqual(snapshot["schema_version"], "dashboard-snapshot-1")
         self.assertEqual(snapshot["project"]["name"], root.name)
+
+        with urlopen(f"{base_url}/api/workspace", timeout=2) as response:
+            workspace = json.loads(response.read())
+        self.assertEqual(workspace["schema_version"], "dashboard-workspace-1")
+        self.assertEqual(workspace["projects"][0]["ref"], ".")
 
         with urlopen(f"{base_url}/api/file?ref={quote('project::README.md')}", timeout=2) as response:
             preview = json.loads(response.read())

@@ -1,7 +1,17 @@
 (() => {
   "use strict";
 
-  const state = { snapshot: null, projects: [], projectRef: null, filter: "all", query: "", inventoryPage: 0 };
+  const initialProject = new URLSearchParams(window.location.search).get("project");
+  const state = {
+    view: initialProject === null ? "workspace" : "project",
+    snapshot: null,
+    workspace: null,
+    projects: [],
+    projectRef: initialProject === null ? null : (initialProject || "."),
+    filter: "all",
+    query: "",
+    inventoryPage: 0,
+  };
   const INVENTORY_PAGE_SIZE = 24;
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -25,7 +35,8 @@
   }
 
   function projectQuery() {
-    return state.projectRef ? `&project=${encodeURIComponent(state.projectRef)}` : "";
+    return state.view === "project" && state.projectRef
+      ? `&project=${encodeURIComponent(state.projectRef)}` : "";
   }
 
   function bytes(value) {
@@ -88,12 +99,146 @@
       .slice(0, 7);
   }
 
+  function projectStage(project) {
+    const stage = (project?.stages || []).find((item) => item.current) ||
+      (project?.stages || []).find((item) => item.status === "running");
+    return stage?.label || (project?.current_stage ? text(project.current_stage).replaceAll("_", " ") : "not started");
+  }
+
+  function projectPhase(project) {
+    const phase = project?.phase;
+    if (!phase) return "no phase recorded";
+    return String(phase).replaceAll("_", " ").replaceAll(":", " · ");
+  }
+
+  function projectName(ref) {
+    const item = state.projects.find((project) => project.ref === ref) ||
+      (state.workspace?.projects || []).find((project) => project.ref === ref);
+    return item?.name || (ref === "." ? "autolab" : ref || "project");
+  }
+
+  function selectedProject() {
+    return state.projects.find((project) => project.ref === state.projectRef) ||
+      (state.workspace?.projects || []).find((project) => project.ref === state.projectRef) || null;
+  }
+
+  function renderCurrentProject() {
+    const project = selectedProject();
+    $("#current-project-name").textContent = projectName(state.projectRef);
+    $("#current-project-meta").textContent = project
+      ? `${text(project.status, "unknown")} · ${projectStage(project)}`
+      : "loading project state";
+  }
+
+  function setView(view, projectRef = null) {
+    state.view = view;
+    state.projectRef = view === "project" ? (projectRef || ".") : null;
+    const workspace = view === "workspace";
+    $("#workspace-view").hidden = !workspace;
+    $("#project-view").hidden = workspace;
+    $("#project-nav").hidden = workspace;
+    $("#workspace-link").classList.toggle("is-active", workspace);
+    if (workspace) {
+      $("#breadcrumb-context").textContent = "WORKSPACE";
+      $("#breadcrumb-name").textContent = "Sci-saurus";
+    } else {
+      $("#breadcrumb-context").textContent = "PROJECT";
+      $("#breadcrumb-name").textContent = projectName(state.projectRef);
+    }
+    $("#project-divider").hidden = workspace;
+    const activeHash = window.location.hash.replace(/^#/, "") || "research";
+    $$("#project-nav .nav-link").forEach((link) => {
+      link.classList.toggle("is-active", view === "project" && link.getAttribute("href") === `#${activeHash}`);
+    });
+    renderCurrentProject();
+    renderSidebar(state.workspace?.projects || state.projects);
+  }
+
+  function navigateWorkspace() {
+    const url = new URL(window.location.href);
+    url.searchParams.delete("project");
+    url.hash = "workspace";
+    window.history.pushState({}, "", `${url.pathname}${url.search}${url.hash}`);
+    setView("workspace");
+    window.scrollTo(0, 0);
+    fetchWorkspace();
+  }
+
+  function navigateProject(projectRef) {
+    const ref = projectRef || ".";
+    const url = new URL(window.location.href);
+    url.searchParams.set("project", ref);
+    url.hash = "research";
+    window.history.pushState({}, "", `${url.pathname}${url.search}${url.hash}`);
+    state.snapshot = null;
+    setView("project", ref);
+    window.scrollTo(0, 0);
+    fetchSnapshot();
+    fetchProjects();
+  }
+
+  function renderSidebar(projects) {
+    const list = $("#sidebar-project-list");
+    if (!list) return;
+    const items = Array.isArray(projects) ? projects : [];
+    const selectedRef = state.view === "project" ? state.projectRef : null;
+    list.innerHTML = items.length ? items.map((project) => `<button class="sidebar-project${project.ref === selectedRef ? " is-selected" : ""}" type="button" data-sidebar-project-ref="${escapeHtml(project.ref)}">
+      <span class="sidebar-project-main"><span class="sidebar-project-name">${escapeHtml(text(project.name, project.ref))}</span><span class="sidebar-project-meta">${escapeHtml(text(project.workflow_id, project.ref === "." ? "current mission" : project.ref))}</span></span>
+      <span class="sidebar-project-state">${statusPill(project.status)}</span>
+    </button>`).join("") : '<div class="sidebar-empty">No projects</div>';
+    $$("[data-sidebar-project-ref]").forEach((button) => button.addEventListener("click", () => navigateProject(button.dataset.sidebarProjectRef)));
+  }
+
+  function renderWorkspace(data) {
+    state.workspace = data;
+    const workspace = data.workspace || {};
+    const summary = data.summary || {};
+    const projects = Array.isArray(data.projects) ? data.projects : [];
+    state.projects = projects;
+    renderCurrentProject();
+    $("#workspace-path").textContent = text(workspace.path);
+    $("#workspace-managed-root").textContent = text(workspace.managed_root);
+    $("#workspace-scope").textContent = `${number(summary.total_projects)} project${summary.total_projects === 1 ? "" : "s"} · ${number(summary.running_projects)} active`;
+    $("#workspace-project-count").textContent = number(summary.total_projects);
+    $("#workspace-running-count").textContent = number(summary.running_projects);
+    $("#workspace-running-note").textContent = `${number(summary.processes)} Composer process${summary.processes === 1 ? "" : "es"}`;
+    $("#workspace-draft-count").textContent = number(summary.draft_projects);
+    $("#workspace-stage-count").textContent = number(summary.active_stages);
+    $("#workspace-project-caption").textContent = `${number(summary.total_projects)} managed · ${number(summary.stale_projects)} stale · ${number(summary.failed_projects + summary.blocked_projects)} need attention`;
+    const attention = Number(summary.stale_projects || 0) + Number(summary.failed_projects || 0) + Number(summary.blocked_projects || 0);
+    const health = $("#workspace-health");
+    health.className = `state-pill state-pill--${attention ? "pending" : "ok"}`;
+    health.textContent = attention ? `${attention} NEED ATTENTION` : "CONNECTED";
+    $("#workspace-updated").textContent = `Updated ${relativeDate(data.generated_at)}`;
+    renderSidebar(projects);
+
+    $("#workspace-project-list").innerHTML = projects.length ? projects.map((project) => `<button class="workspace-project-row" type="button" data-workspace-project-ref="${escapeHtml(project.ref)}">
+      <span class="workspace-project-main"><span class="workspace-project-name">${escapeHtml(text(project.name, project.ref))}</span><span class="workspace-project-id mono">${escapeHtml(text(project.workflow_id, project.ref))}</span><span class="workspace-project-objective">${escapeHtml(text(project.objective, "No objective recorded."))}</span></span>
+      <span class="workspace-project-stage"><span class="workspace-row-label">PHASE</span><strong>${escapeHtml(projectStage(project))}</strong><small>${escapeHtml(projectPhase(project))}</small></span>
+      <span class="workspace-project-progress"><span class="workspace-row-label">PIPELINE</span><strong>${number(project.completed_stages)} / ${number(project.total_stages)}</strong><span class="workspace-progress-bar"><i style="width:${Math.round((Number(project.progress_ratio) || 0) * 100)}%"></i></span><small>${relativeDate(project.last_updated)}</small></span>
+      <span class="workspace-project-state">${statusPill(project.status)}${project.pid ? `<small>PID ${escapeHtml(project.pid)}</small>` : `<small>${escapeHtml(text(project.source, "not initialized"))}</small>`}</span>
+    </button>`).join("") : '<div class="loading-block">No managed projects found.</div>';
+    $("#workspace-run-list").innerHTML = data.active_runs?.length ? data.active_runs.map((project) => `<button class="workspace-run-card" type="button" data-workspace-project-ref="${escapeHtml(project.ref)}">
+      <span class="workspace-run-heading"><span class="workspace-project-name">${escapeHtml(text(project.name, project.ref))}</span>${statusPill(project.status)}</span>
+      <span class="workspace-run-phase"><strong>${escapeHtml(projectStage(project))}</strong><span>${escapeHtml(projectPhase(project))}</span></span>
+      <span class="workspace-run-meta"><span>PID ${escapeHtml(project.pid || "not detected")}</span><span>${escapeHtml(duration(project.elapsed_seconds))} elapsed</span><span>${project.remaining_seconds === null || project.remaining_seconds === undefined ? "No deadline" : `${escapeHtml(duration(project.remaining_seconds))} left`}</span><span>${escapeHtml(text(project.source))}</span></span>
+    </button>`).join("") : '<div class="workspace-empty">No active Composer runs. Draft projects remain available in the project list.</div>';
+    const recent = Array.isArray(data.recent_projects) ? data.recent_projects : [];
+    $("#workspace-recent-list").innerHTML = recent.length ? recent.map((project) => `<button class="workspace-recent-row" type="button" data-workspace-project-ref="${escapeHtml(project.ref)}">
+      <span class="workspace-recent-main"><strong>${escapeHtml(text(project.name, project.ref))}</strong><span>${escapeHtml(text(project.workflow_id, project.ref))}</span></span>
+      <span>${escapeHtml(projectStage(project))}</span><span>${statusPill(project.status)}</span><span>${escapeHtml(relativeDate(project.last_updated))}</span>
+    </button>`).join("") : '<div class="workspace-empty">No checkpoint or workflow updates recorded.</div>';
+    $$('[data-workspace-project-ref]').forEach((button) => button.addEventListener("click", () => navigateProject(button.dataset.workspaceProjectRef)));
+  }
+
   function renderHeader(snapshot) {
     const project = snapshot.project || {};
     const live = snapshot.live || {};
     const status = live.status || "unknown";
     $("#project-name").textContent = text(project.name, "Sci-saurus");
+    $("#breadcrumb-context").textContent = "PROJECT";
     $("#breadcrumb-name").textContent = text(project.name, "project");
+    renderCurrentProject();
     $("#objective").textContent = text(project.objective, "No objective recorded in the workflow.");
     $("#project-path").textContent = text(project.path);
     $("#hero-status").outerHTML = `<span class="state-pill state-pill--${statusClass(status)}" id="hero-status">${escapeHtml(status.replaceAll("_", " "))}</span>`;
@@ -279,7 +424,7 @@
         <span class="agent-row-name">${escapeHtml(text(item.label, compactRole(item.role)))}</span>
         <span class="agent-row-state">${escapeHtml(text(item.status, "idle"))}</span>
       </div>`).join("") : '<div class="tree-empty">No roster entries.</div>';
-      return `<article class="department-card"><div class="department-header"><div><div class="department-name">${escapeHtml(text(department.label, department.id))}</div><div class="department-id mono">${escapeHtml(department.id)}</div></div><div class="department-stats"><strong>${number(engaged)}</strong> active<br><span>${number(failures)} flagged</span></div></div><div class="department-leads"><span>CHIEF <b>${escapeHtml(chief)}</b></span><span>ADVERSARY <b>${escapeHtml(adversary)}</b></span></div><div class="agent-list">${rows}</div></article>`;
+      return `<article class="department-card"><div class="department-header"><div class="department-heading"><div class="department-name">${escapeHtml(text(department.label, department.id))}</div><div class="department-id mono">${escapeHtml(department.id)}</div></div><div class="department-stats"><div class="department-stat"><strong>${number(engaged)}</strong><span>active</span></div><div class="department-stat"><strong>${number(failures)}</strong><span>flagged</span></div></div></div><div class="department-leads"><span>CHIEF <b>${escapeHtml(chief)}</b></span><span>ADVERSARY <b>${escapeHtml(adversary)}</b></span></div><div class="agent-list">${rows}</div></article>`;
     }).join("");
   }
 
@@ -447,6 +592,7 @@
 
   function renderProjects(data) {
     state.projects = Array.isArray(data?.projects) ? data.projects : [];
+    renderCurrentProject();
     const selectedRef = state.projectRef || ".";
     const selected = state.projects.find((item) => item.ref === selectedRef);
     $("#project-manager-status").textContent = `${number(state.projects.length)} project${state.projects.length === 1 ? "" : "s"} · ${text(selected?.name, "none")} selected`;
@@ -455,9 +601,8 @@
       <span class="project-item-status">${statusPill(project.status)}${project.pid ? `<small>PID ${escapeHtml(project.pid)}</small>` : ""}</span>
     </button>`).join("") : '<div class="loading-block">No managed Composer projects found.</div>';
     $$(".project-item").forEach((button) => button.addEventListener("click", () => {
-      state.projectRef = button.dataset.projectRef === "." ? null : button.dataset.projectRef;
       closeProjectDialog();
-      fetchSnapshot();
+      navigateProject(button.dataset.projectRef);
     }));
     const draft = selected?.status === "draft";
     $("#start-current").disabled = !draft;
@@ -511,18 +656,19 @@
         slug: formData.get("slug"), objective: formData.get("objective"),
         hard_seconds: Number(formData.get("hard_seconds")), start_now: startNow,
       });
-      state.projectRef = result.project;
       form.reset();
       closeProjectDialog();
       showToast(startNow && result.start?.pid ? `Project created and started · PID ${result.start.pid}` : `Project created · ${result.project}`);
       await fetchProjects();
-      await fetchSnapshot();
+      await fetchWorkspace();
+      navigateProject(result.project);
     } catch (error) {
       showToast(error.message);
     }
   }
 
   async function fetchSnapshot() {
+    if (state.view !== "project") return fetchWorkspace();
     try {
       const response = await fetch(`/api/snapshot?ts=${Date.now()}${projectQuery()}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`snapshot request failed (${response.status})`);
@@ -534,6 +680,28 @@
       if (state.snapshot) showToast(error.message);
       else $("#objective").textContent = `Unable to read the project snapshot: ${error.message}`;
     }
+  }
+
+  async function fetchWorkspace() {
+    try {
+      const response = await fetch(`/api/workspace?ts=${Date.now()}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`workspace request failed (${response.status})`);
+      const data = await response.json();
+      renderWorkspace(data);
+      $("#connection-status").textContent = "Connected";
+      $("#connection-dot").classList.remove("is-error");
+      if (state.view === "workspace") setView("workspace");
+    } catch (error) {
+      $("#connection-status").textContent = "Unavailable";
+      $("#connection-dot").classList.add("is-error");
+      $("#workspace-updated").textContent = "Waiting for the local server";
+      if (state.workspace) showToast(error.message);
+      else $("#workspace-project-list").innerHTML = `<div class="loading-block">${escapeHtml(error.message)}</div>`;
+    }
+  }
+
+  async function refreshCurrent() {
+    await Promise.all([fetchWorkspace(), state.view === "project" ? fetchSnapshot() : Promise.resolve()]);
   }
 
   async function openInspector(ref) {
@@ -702,12 +870,21 @@
   }
 
   function bindControls() {
-    $("#refresh-button").addEventListener("click", fetchSnapshot);
-    $("#projects-button").addEventListener("click", () => {
+    $("#refresh-button").addEventListener("click", refreshCurrent);
+    $("#workspace-link").addEventListener("click", (event) => {
+      event.preventDefault();
+      navigateWorkspace();
+    });
+    const openProjectManager = (focusCreate = false) => {
       const dialog = $("#project-dialog");
       if (typeof dialog.showModal === "function") dialog.showModal();
       else dialog.setAttribute("open", "");
       fetchProjects();
+      if (focusCreate) window.requestAnimationFrame(() => $("#new-project-slug").focus());
+    };
+    $("#new-project-button").addEventListener("click", () => openProjectManager(true));
+    $("#projects-button").addEventListener("click", () => {
+      openProjectManager();
     });
     $("#project-dialog-close").addEventListener("click", closeProjectDialog);
     $("#project-dialog").addEventListener("click", (event) => {
@@ -742,20 +919,40 @@
     $("#inspector").addEventListener("click", (event) => {
       if (event.target === $("#inspector")) $("#inspector").close();
     });
-    $$(".nav-link").forEach((link) => link.addEventListener("click", () => {
-      $$(".nav-link").forEach((item) => item.classList.toggle("is-active", item === link));
+    $$("#project-nav .nav-link").forEach((link) => link.addEventListener("click", () => {
+      $$("#project-nav .nav-link").forEach((item) => item.classList.toggle("is-active", item === link));
     }));
+    window.addEventListener("popstate", () => {
+      const project = new URLSearchParams(window.location.search).get("project");
+      if (project === null) {
+        setView("workspace");
+        fetchWorkspace();
+      } else {
+        setView("project", project || ".");
+        fetchSnapshot();
+        fetchProjects();
+      }
+    });
+    window.addEventListener("hashchange", () => {
+      if (state.view !== "project") return;
+      const activeHash = window.location.hash.replace(/^#/, "") || "research";
+      $$("#project-nav .nav-link").forEach((link) => {
+        link.classList.toggle("is-active", link.getAttribute("href") === `#${activeHash}`);
+      });
+    });
   }
 
   bindControls();
+  setView(state.view, state.projectRef);
   fetchProjects();
-  fetchSnapshot();
-  window.setInterval(fetchSnapshot, 5000);
+  fetchWorkspace();
+  if (state.view === "project") fetchSnapshot();
+  window.setInterval(refreshCurrent, 5000);
   let resizeTimer;
   window.addEventListener("resize", () => {
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => {
-      if (state.snapshot) render(state.snapshot);
+      if (state.snapshot && state.view === "project") render(state.snapshot);
     }, 120);
   });
 })();

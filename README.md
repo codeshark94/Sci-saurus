@@ -129,7 +129,7 @@ authorized model endpoint and set `live_dispatch_allowed` to `true`:
 | Literature survey | `scripts/prepare-survey-config.py` | `python3 -m scisaurus.cli run-survey PROJECT --config CONFIG.json` |
 | Scientific experiment | `scripts/setup-experiment-runtime.sh` + `scripts/prepare-experiment-config.py` | `python3 -m scisaurus.cli run-experiment PROJECT --config CONFIG.json` |
 | Composer mission | workflow JSON | `python3 -m scisaurus.cli run-composer --workflow WORKFLOW.json` |
-| Local status console | `./dashboard [PROJECT]` | `./dashboard` |
+| Local workspace console | `./dashboard [WORKSPACE]` | `./dashboard` |
 
 The templates are intentionally inert until the operator supplies the
 authorized connection and dispatch permission. See the detailed runtime guide
@@ -156,7 +156,7 @@ before using live providers.
 | [Project organization](docs/15-project-organization.md) | Rosters, contracts, custom organizations, and Operations Cell |
 | [Agent / department / stage flow](docs/16-agent-department-flow.md) | Routing, assignments, handoffs, and scoped continuation |
 | [Composer runtime](docs/110-composer-runtime.md) | End-to-end stage admission, review, reallocation, and resume |
-| [Local dashboard](docs/120-local-dashboard.md) | Local console for research progress, bounded project creation, and Composer start/resume; snapshots and inspectors remain read-only |
+| [Local dashboard](docs/120-local-dashboard.md) | Workspace overview, project drill-down, research progress, bounded project creation, and Composer start/resume |
 | [Literature survey](docs/75-literature-survey-score.md) | Search, source spans, citation maps, and gap assessment |
 | [Experiment runtime](docs/90-experiment-runtime.md) | Frozen studies, replay, recalculation, and result packages |
 | [Completion runtime](docs/80-completion-runtime.md) | Paper release candidates, evaluation, and delivery boundaries |

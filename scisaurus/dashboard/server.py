@@ -44,6 +44,7 @@ MAX_LOG_BYTES = 600_000
 MAX_RECENT_WORK = 32
 MAX_ACTION_BYTES = 64_000
 MAX_PROJECTS = 64
+MAX_WORKSPACE_RECENT_PROJECTS = 12
 MIN_PROJECT_HARD_SECONDS = 3_600
 MAX_PROJECT_HARD_SECONDS = 604_800
 
@@ -1457,37 +1458,152 @@ class DashboardService:
     def snapshot(self, project_ref=None):
         return DashboardSnapshot(self._resolve_project(project_ref)).payload()
 
-    def projects(self):
+    @staticmethod
+    def _project_stage_summary(workflow, progress):
+        specs = [item for item in workflow.get("stages", [])
+                 if isinstance(item, dict) and isinstance(item.get("id"), str)]
+        stage_records = progress.get("stages") if isinstance(progress, dict) else {}
+        if not isinstance(stage_records, dict):
+            stage_records = {}
+        order = {stage_id: index for index, stage_id in enumerate(STAGE_ORDER)}
+        summaries = []
+        for spec in sorted(specs, key=lambda item: (order.get(item["id"], len(order)), item["id"])):
+            stage_id = spec["id"]
+            raw = stage_records.get(stage_id)
+            raw = raw if isinstance(raw, dict) else {}
+            status = _display_status(raw.get("status"))
+            if status == "unknown" and (raw.get("active_agents") or raw.get("attempt_id") or raw.get("attempt_number")):
+                status = "running"
+            summaries.append({
+                "id": stage_id,
+                "label": STAGE_LABELS.get(stage_id, stage_id.replace("_", " ").title()),
+                "status": status,
+                "current": status == "running",
+                "attempts": len(raw.get("attempts")) if isinstance(raw.get("attempts"), list) else _safe_int(raw.get("attempt_count"), 0),
+                "attempt_number": raw.get("attempt_number"),
+            })
+        return summaries
+
+    def _project_record(self, candidate):
+        workflow_path, workflow = self._workflow(candidate)
+        ref = "." if candidate == self.project_dir else candidate.relative_to(self.project_dir).as_posix()
+        project_id = workflow.get("project_id")
+        project_root = Path(project_id).expanduser().resolve() if isinstance(project_id, str) else None
+        progress_path = project_root / "output" / "progress.json" if project_root else None
+        state_path = project_root / "state" / "control.sqlite" if project_root else None
+        progress = _read_json(progress_path) if progress_path and progress_path.is_file() else {}
+        progress = progress if isinstance(progress, dict) else {}
+        running_processes = self._composer_processes(workflow_path)
+        progress_status = _display_status(progress.get("status"))
+        status = "running" if running_processes else ("draft" if not progress else progress_status)
+        if status == "running" and not running_processes:
+            status = "stale"
+
+        stages = self._project_stage_summary(workflow, progress)
+        phase = progress.get("phase")
+        current_stage = None
+        if isinstance(phase, str) and phase:
+            phase_stage = phase.split(":", 1)[0]
+            if any(item["id"] == phase_stage for item in stages):
+                current_stage = phase_stage
+        if current_stage is None:
+            current_stage = next((item["id"] for item in stages if item["current"]), None)
+        completed = sum(item["status"] == "completed" for item in stages)
+
+        updated_path = progress_path if progress_path and progress_path.is_file() else workflow_path
+        try:
+            updated_at = datetime.fromtimestamp(updated_path.stat().st_mtime, timezone.utc).isoformat()
+        except OSError:
+            updated_at = None
+        deadline_at = progress.get("deadline_at_epoch")
+        remaining = _safe_float(progress.get("remaining_seconds"))
+        if remaining is None and isinstance(deadline_at, (int, float)):
+            remaining = max(0, deadline_at - datetime.now(timezone.utc).timestamp())
+        blockers = progress.get("blockers")
+        blocker_count = len(blockers) if isinstance(blockers, list) else (1 if blockers else 0)
+        source = "live process" if running_processes else ("checkpoint" if progress else "workflow")
+        return {
+            "ref": ref,
+            "name": candidate.name,
+            "path": str(candidate),
+            "workflow_path": str(workflow_path),
+            "workflow_id": workflow.get("id"),
+            "objective": _short(workflow.get("objective"), 300),
+            "status": status,
+            "pid": running_processes[0]["pid"] if running_processes else None,
+            "initialized": bool(state_path and state_path.is_file()),
+            "source": source,
+            "last_updated": updated_at,
+            "current_stage": current_stage,
+            "phase": phase,
+            "completed_stages": completed,
+            "total_stages": len(stages),
+            "progress_ratio": completed / len(stages) if stages else 0,
+            "elapsed_seconds": _safe_float(progress.get("elapsed_seconds"), 0),
+            "remaining_seconds": remaining,
+            "deadline_at_epoch": deadline_at,
+            "run_id": progress.get("run_id"),
+            "blocker_count": blocker_count,
+            "stages": stages,
+        }
+
+    def _project_candidates(self):
         candidates = [self.project_dir]
         missions = self.project_dir / "missions"
         if missions.is_dir():
             candidates.extend(child for child in sorted(missions.iterdir())
                               if child.is_dir() and not child.name.startswith("."))
+        return candidates
+
+    def projects(self):
+        candidates = self._project_candidates()
         projects = []
         for candidate in candidates[:MAX_PROJECTS]:
             try:
-                workflow_path, workflow = self._workflow(candidate)
+                projects.append(self._project_record(candidate))
             except (OSError, ValueError):
                 continue
-            ref = "." if candidate == self.project_dir else candidate.relative_to(self.project_dir).as_posix()
-            project_id = workflow.get("project_id")
-            project_root = Path(project_id).expanduser().resolve() if isinstance(project_id, str) else None
-            progress_path = project_root / "output" / "progress.json" if project_root else None
-            state_path = project_root / "state" / "control.sqlite" if project_root else None
-            progress = _read_json(progress_path) if progress_path and progress_path.is_file() else {}
-            running_processes = self._composer_processes(workflow_path)
-            progress_status = _display_status(progress.get("status")) if isinstance(progress, dict) else "unknown"
-            status = "running" if running_processes else ("draft" if not progress else progress_status)
-            if status == "running" and not running_processes:
-                status = "stale"
-            projects.append({
-                "ref": ref, "name": candidate.name, "path": str(candidate),
-                "workflow_path": str(workflow_path), "workflow_id": workflow.get("id"),
-                "status": status, "pid": running_processes[0]["pid"] if running_processes else None,
-                "initialized": bool(state_path and state_path.is_file()),
-            })
         return {"workspace": str(self.project_dir), "current": ".", "projects": projects,
                 "bounded": len(candidates) > MAX_PROJECTS}
+
+    def workspace(self):
+        listing = self.projects()
+        projects = listing["projects"]
+        status_counts = {status: sum(item.get("status") == status for item in projects)
+                         for status in ("running", "stale", "draft", "completed", "failed", "blocked", "cancelled")}
+        active_runs = [item for item in projects if item.get("status") == "running"]
+        active_stages = sum(1 for item in active_runs if item.get("current_stage"))
+        repository = Path(__file__).resolve().parents[2]
+        recent_projects = sorted(
+            (item for item in projects if item.get("last_updated")),
+            key=lambda item: item["last_updated"], reverse=True,
+        )[:MAX_WORKSPACE_RECENT_PROJECTS]
+        return {
+            "schema_version": f"dashboard-workspace-{APP_VERSION}",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "workspace": {
+                "name": repository.name,
+                "path": str(repository),
+                "managed_root": str(self.project_dir),
+                "current_project": listing.get("current"),
+            },
+            "summary": {
+                "total_projects": len(projects),
+                "running_projects": status_counts["running"],
+                "stale_projects": status_counts["stale"],
+                "draft_projects": status_counts["draft"],
+                "completed_projects": status_counts["completed"],
+                "failed_projects": status_counts["failed"],
+                "blocked_projects": status_counts["blocked"],
+                "active_stages": active_stages,
+                "processes": sum(1 for item in projects if item.get("pid")),
+            },
+            "projects": projects,
+            "active_runs": active_runs,
+            "recent_projects": recent_projects,
+            "bounded": listing.get("bounded", False),
+            "controls": {"local_actions": ["create_project", "start_composer"]},
+        }
 
     @staticmethod
     def _composer_processes(workflow_path):
@@ -1672,6 +1788,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/snapshot":
                 project_ref = query.get("project", [None])[0]
                 return self._json_response(self.server.service.snapshot(project_ref))
+            if parsed.path == "/api/workspace":
+                return self._json_response(self.server.service.workspace())
             if parsed.path == "/api/projects":
                 return self._json_response(self.server.service.projects())
             if parsed.path == "/api/file":

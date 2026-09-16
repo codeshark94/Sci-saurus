@@ -1,7 +1,7 @@
 # Local dashboard
 
 Sci-saurus includes a small localhost web console for understanding and
-managing bounded Composer projects. It reads the durable workflow checkpoints,
+managing the whole local research workspace and its bounded Composer projects. It reads the durable workflow checkpoints,
 content-addressed artifact store, SQLite control ledger, and project files.
 Snapshot and file inspection stay read-only; the Projects dialog exposes only
 validated project creation and Composer start/resume actions.
@@ -27,8 +27,9 @@ To inspect another project, pass its directory explicitly:
 ./dashboard PROJECT_DIR
 ```
 
-The command prints a localhost URL and opens it in the default browser. It
-chooses a free local port by default. Use `--no-open` when the URL should only
+The command prints a localhost URL and opens it in the default browser. The
+root page is the Sci-saurus workspace overview; selecting a project opens its
+project detail surface. It chooses a free local port by default. Use `--no-open` when the URL should only
 be printed, `--port` to select a fixed port explicitly, or `--host` to select
 another bind address.
 
@@ -36,14 +37,18 @@ another bind address.
 python3 -m scisaurus.cli dashboard PROJECT_DIR --no-open --port 8765
 ```
 
-The command is project-scoped rather than mission-scoped. It works for a
-simple initialized project, a Composer project, a stage directory, or a custom
-project that only has files and checkpoints. When a workflow defines stage
-project directories, the console discovers those roots and groups their
-checkpoints, tasks, artifacts, and files in one view.
+The dashboard workspace is rooted at the directory passed to the command. It
+lists that root as the current project and direct child projects under
+`<workspace>/missions`. A selected project can be a simple initialized
+project, a Composer project, a stage directory, or a custom project that only
+has files and checkpoints. When a workflow defines stage project directories,
+the project detail view discovers those roots and groups their checkpoints,
+tasks, artifacts, and files in one view.
 
 ## What is visible
 
+- workspace-level project index, active runs, drafts, stale projects, and
+  recently updated missions
 - current mission status, phase, elapsed time, deadline, blockers, and process
 - pipeline stage status, attempts, active roles, and verifier assignment
 - department roster and assignment ledger; selecting a role opens its task,
@@ -56,6 +61,12 @@ checkpoints, tasks, artifacts, and files in one view.
 The browser polls the snapshot every five seconds. The project checkpoint and
 event ledger remain the source of truth; a dashboard snapshot is only a
 time-bounded read model.
+
+The sidebar follows the same hierarchy: `Workspace` is the global entry point,
+the `Projects` list is always visible, and project-only navigation appears
+after a project is selected. The global workspace response is intentionally
+lightweight; expensive artifact, task, agent, and evidence inspection is
+loaded only for the selected project.
 
 ## Research-first view
 
