@@ -66,6 +66,23 @@ class TestSurveyConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "worker_concurrency"):
             validate_survey_config(value)
 
+    def test_provider_pools_register_every_explicit_role_route(self):
+        value = survey_config()
+        route_url = value["model"]["base_url"]
+        value["model"]["role_routes"] = {
+            "research.literature-mapper": [{
+                "id": "local-route", "pool": "ollama", "protocol": "openai_compatible",
+                "base_url": route_url, "model": "route-model", "auth_env": None,
+            }]
+        }
+        value["limits"]["provider_pools"] = {
+            "ollama": {"max_concurrent": 3, "base_urls": [route_url]},
+        }
+        self.assertEqual(validate_survey_config(value)["limits"]["provider_pools"]["ollama"]["max_concurrent"], 3)
+        value["model"]["role_routes"]["research.literature-mapper"][0]["pool"] = "missing"
+        with self.assertRaisesRegex(ValidationError, "unknown provider pool"):
+            validate_survey_config(value)
+
     def test_unknown_and_missing_survey_fields_are_rejected(self):
         for field in ("survey", "proposed_gap", "search", "full_text_sources"):
             with self.subTest(field=field):

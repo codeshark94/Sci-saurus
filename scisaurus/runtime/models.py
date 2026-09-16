@@ -27,6 +27,7 @@ MODEL_CONFIG_FIELDS = frozenset({
     "auth_env", "max_response_bytes", "reasoning_effort", "output_format",
     "max_image_bytes", "max_request_bytes", "max_retries", "retry_backoff_seconds",
 }) | SAMPLING_FIELDS
+ROLE_ROUTE_FIELDS = frozenset({"id", "pool"}) | MODEL_CONFIG_FIELDS
 # OpenAI-compatible providers commonly expose ``seed`` as a signed int64.
 # Keep internally derived seeds inside that wire-level contract so a valid
 # exploration hash cannot become a provider-side 400.
@@ -146,6 +147,39 @@ def _validate_role_models(role_models):
     return role_models
 
 
+def _validate_role_routes(role_routes):
+    """Validate explicit provider alternatives for one logical model role."""
+    if not isinstance(role_routes, dict):
+        raise ValidationError("model.role_routes must be an object")
+    for role_name, routes in role_routes.items():
+        if not isinstance(role_name, str) or not role_name.strip():
+            raise ValidationError("model.role_routes keys must be nonempty strings")
+        if not isinstance(routes, list) or not routes:
+            raise ValidationError(f"model.role_routes.{role_name} must be a nonempty list")
+        route_ids = set()
+        for route in routes:
+            if not isinstance(route, dict):
+                raise ValidationError(f"model.role_routes.{role_name} entries must be objects")
+            unknown = set(route) - ROLE_ROUTE_FIELDS
+            if unknown:
+                raise ValidationError(
+                    f"model.role_routes.{role_name} contains unsupported fields: "
+                    + ", ".join(sorted(unknown)))
+            for field in ("id", "pool", "base_url", "model"):
+                if (not isinstance(route.get(field), str) or not route[field].strip()
+                        or route[field] == "runtime_required"):
+                    raise ValidationError(
+                        f"model.role_routes.{role_name}.{field} requires an explicit value")
+            if route["id"] in route_ids:
+                raise ValidationError(f"model.role_routes.{role_name} route IDs must be unique")
+            route_ids.add(route["id"])
+            _validate_role_models({role_name: {
+                key: value for key, value in route.items()
+                if key not in {"id", "pool"}
+            }})
+    return role_routes
+
+
 def resolve_model_config(model, *, role=None, overrides=None):
     """Resolve a model config plus a role's provider and sampling profiles.
 
@@ -161,6 +195,8 @@ def resolve_model_config(model, *, role=None, overrides=None):
     base = dict(model)
     role_models = base.pop("role_models", {})
     _validate_role_models(role_models)
+    role_routes = base.pop("role_routes", {})
+    _validate_role_routes(role_routes)
     profiles = base.pop("role_profiles", {})
     if not isinstance(profiles, dict):
         raise ValidationError("model.role_profiles must be an object")

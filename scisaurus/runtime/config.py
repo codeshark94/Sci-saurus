@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.models import resolve_model_config, ModelClient
@@ -11,6 +12,43 @@ from scisaurus.runtime.models import resolve_model_config, ModelClient
 def _text(value, field):
     if not isinstance(value, str) or not value.strip() or value == "runtime_required":
         raise ValidationError(f"{field} requires an explicit nonempty value")
+    return value
+
+
+def _normalize_provider_url(value):
+    return value.rstrip("/") if isinstance(value, str) else value
+
+
+def validate_provider_pools(value):
+    """Validate transient endpoint pools used by the parent dispatcher."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValidationError("limits.provider_pools must be an object")
+    for pool_name, pool in value.items():
+        _text(pool_name, "limits.provider_pools key")
+        if not isinstance(pool, dict) or set(pool) != {"max_concurrent", "base_urls"}:
+            raise ValidationError(
+                f"limits.provider_pools.{pool_name} requires max_concurrent and base_urls")
+        if type(pool["max_concurrent"]) is not int or pool["max_concurrent"] <= 0:
+            raise ValidationError(
+                f"limits.provider_pools.{pool_name}.max_concurrent must be a positive integer")
+        urls = pool["base_urls"]
+        if not isinstance(urls, list) or not urls:
+            raise ValidationError(
+                f"limits.provider_pools.{pool_name}.base_urls must be a nonempty list")
+        normalized = []
+        for url in urls:
+            _text(url, f"limits.provider_pools.{pool_name}.base_urls")
+            parsed = urlsplit(url)
+            if (parsed.scheme not in {"http", "https"} or not parsed.netloc
+                    or parsed.username or parsed.password or parsed.query or parsed.fragment):
+                raise ValidationError(
+                    f"limits.provider_pools.{pool_name}.base_urls contains an invalid URL")
+            normalized.append(_normalize_provider_url(url))
+        if len(set(normalized)) != len(normalized):
+            raise ValidationError(
+                f"limits.provider_pools.{pool_name}.base_urls must not repeat URLs")
     return value
 
 
@@ -66,6 +104,19 @@ def validate_common(value, extra_fields, *, retrieval=True):
     limits = value.get("limits", {})
     if not isinstance(limits, dict):
         raise ValidationError("limits must be an object")
+    provider_pools = validate_provider_pools(limits.get("provider_pools"))
+    role_routes = value["model"].get("role_routes", {})
+    for role_name, routes in role_routes.items():
+        for route in routes:
+            pool_name = route["pool"]
+            pool = provider_pools.get(pool_name)
+            if pool is None:
+                raise ValidationError(
+                    f"model.role_routes.{role_name} references an unknown provider pool: {pool_name}")
+            if _normalize_provider_url(route["base_url"]) not in {
+                    _normalize_provider_url(url) for url in pool["base_urls"]}:
+                raise ValidationError(
+                    f"model.role_routes.{role_name}.{route['id']} base_url is not registered in provider pool {pool_name}")
     integer_limits = ["max_rounds", "max_result_bytes", "concurrent_calls"]
     if retrieval:
         integer_limits += ["search_results", "max_capture_chars", "max_source_bytes"]

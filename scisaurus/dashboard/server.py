@@ -1011,6 +1011,11 @@ class DashboardSnapshot:
                 "ledger_active_task_ids": [item.get("task_id") for item in provider_running + provider_queued][:12],
                 "within_capacity": (type(total_capacity) is not int
                                      or len(provider_running) + len(provider_queued) <= total_capacity),
+                "pool_limits": {
+                    name: {"max_concurrent": pool["max_concurrent"]}
+                    for name, pool in (config_limits.get("provider_pools") or {}).items()
+                    if isinstance(pool, dict) and type(pool.get("max_concurrent")) is int
+                },
                 "source_root": (pool or {}).get("root_key"),
                 "capacity_source": "durable allocation window" if durable_capacity is not None else "stage config",
                 "window_state": (window or {}).get("state"),
@@ -1131,6 +1136,8 @@ class DashboardSnapshot:
             if not base_url and isinstance(client.get("base_url"), str):
                 base_url = client["base_url"]
             endpoint = self._model_endpoint(base_url)
+            provider_pool = context.get("provider_pool")
+            route_id = context.get("route_id")
 
             state = _display_status(task.get("state"))
             usage = execution.get("usage") if isinstance(execution.get("usage"), dict) else None
@@ -1172,6 +1179,8 @@ class DashboardSnapshot:
                 "model": model or "model not recorded",
                 "provider": endpoint["provider"],
                 "endpoint": endpoint["host"],
+                "provider_pool": provider_pool if isinstance(provider_pool, str) else None,
+                "route_id": route_id if isinstance(route_id, str) else None,
                 "response_status": response_status,
                 "response_ref": execution_artifact.get("file_ref") if execution_artifact else None,
                 "artifact_ref": execution_artifact.get("artifact_ref") if execution_artifact else None,
@@ -1517,6 +1526,17 @@ class DashboardSnapshot:
         specialists = self._specialists(stages, db, organization_raw)
         execution = self._execution_view(stages, db, organization_raw)
         model_calls = self._model_calls(db)
+        pool_limits = execution.get("provider", {}).get("pool_limits", {})
+        execution.setdefault("provider", {})["pools"] = {
+            name: {
+                "max_concurrent": details["max_concurrent"],
+                "running": sum(1 for item in model_calls.get("live_items", [])
+                                if item.get("provider_pool") == name),
+                "within_capacity": sum(1 for item in model_calls.get("live_items", [])
+                                        if item.get("provider_pool") == name) <= details["max_concurrent"],
+            }
+            for name, details in pool_limits.items()
+        }
         recent_work = self._recent_work(db, organization_raw)
         organization = self._organization_view(organization_raw)
         return {

@@ -415,10 +415,11 @@
         ? `${duration(call.elapsed_seconds)} elapsed`
         : call.finished_at ? relativeDate(call.finished_at) : "finish time not recorded";
       const endpoint = call.endpoint ? ` · ${escapeHtml(call.endpoint)}` : "";
+      const pool = call.provider_pool ? ` · ${escapeHtml(call.provider_pool)}` : "";
       return `<article class="model-call-card${history ? " model-call-card--history" : ""} model-call-card--${statusClass(stateValue)}">
         <div class="model-call-top">
           <div class="model-call-heading">
-            <div class="model-call-provider">${escapeHtml(text(call.provider, "ROUTE"))}${endpoint}</div>
+            <div class="model-call-provider">${escapeHtml(text(call.provider, "ROUTE"))}${endpoint}${pool}</div>
             <div class="model-call-model">${escapeHtml(text(call.model, "model not recorded"))}</div>
           </div>
           ${statusPill(stateValue)}
@@ -594,7 +595,10 @@
       ["total call cap", totalCapacity === null || totalCapacity === undefined ? "not recorded" : number(totalCapacity)],
       ["capacity guard", provider.within_capacity === false ? "OVER CAPACITY" : "within capacity"],
     ];
-    $("#resource-stack").innerHTML = `<div class="resource-card"><div class="resource-card-heading"><span>MISSION USAGE</span><strong>${usageEntries(usage).length ? "live" : "not recorded"}</strong></div><div class="resource-rows">${resourceRows(usageEntries(usage))}</div></div><div class="resource-card"><div class="resource-card-heading"><span>DISPATCH SEMANTICS</span><strong>${escapeHtml(text(provider.capacity_source, "not recorded"))}</strong></div><div class="resource-rows">${resourceRows(dispatchRows)}${provider.source_root ? `<div class="resource-row"><span class="resource-key">allocation root</span><span class="resource-value">${escapeHtml(provider.source_root)}</span></div>` : ""}</div></div><div class="resource-card"><div class="resource-card-heading"><span>INTEGRITY GATES</span><strong>read-only</strong></div><div class="resource-rows">${gates}</div></div>`;
+    const poolRows = Object.entries(provider.pools || {}).map(([name, item]) => [
+      `${name} pool`, `${number(item.running)} / ${number(item.max_concurrent)} running${item.within_capacity === false ? " · OVER" : ""}`,
+    ]);
+    $("#resource-stack").innerHTML = `<div class="resource-card"><div class="resource-card-heading"><span>MISSION USAGE</span><strong>${usageEntries(usage).length ? "live" : "not recorded"}</strong></div><div class="resource-rows">${resourceRows(usageEntries(usage))}</div></div><div class="resource-card"><div class="resource-card-heading"><span>DISPATCH SEMANTICS</span><strong>${escapeHtml(text(provider.capacity_source, "not recorded"))}</strong></div><div class="resource-rows">${resourceRows(dispatchRows)}${poolRows.length ? resourceRows(poolRows) : ""}${provider.source_root ? `<div class="resource-row"><span class="resource-key">allocation root</span><span class="resource-value">${escapeHtml(provider.source_root)}</span></div>` : ""}</div></div><div class="resource-card"><div class="resource-card-heading"><span>INTEGRITY GATES</span><strong>read-only</strong></div><div class="resource-rows">${gates}</div></div>`;
   }
 
   function renderStructure(snapshot) {

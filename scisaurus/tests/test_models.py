@@ -181,6 +181,35 @@ class TestModelClient(unittest.TestCase):
         self.assertEqual(resolved['temperature'], 0.2)
         self.assertNotIn('role_models', resolved)
 
+    def test_role_route_metadata_is_validated_and_not_forwarded_to_provider(self):
+        base = {
+            'base_url': self.url, 'protocol': 'openai_compatible', 'model': 'strong-model',
+            'timeout_seconds': 2, 'max_output_tokens': 64,
+            'role_routes': {
+                'research.literature-mapper': [
+                    {'id': 'ollama-route', 'pool': 'ollama', 'base_url': self.url,
+                     'protocol': 'openai_compatible', 'model': 'ollama-model', 'auth_env': None},
+                    {'id': 'qwen-route', 'pool': 'qwen', 'base_url': self.url,
+                     'protocol': 'openai_compatible', 'model': 'qwen-model', 'auth_env': None},
+                ],
+            },
+        }
+        resolved = resolve_model_config(base, role='research.literature-mapper')
+        self.assertEqual(resolved['model'], 'strong-model')
+        self.assertNotIn('role_routes', resolved)
+
+    def test_invalid_role_route_is_rejected_before_network(self):
+        base = {
+            'base_url': self.url, 'protocol': 'openai_compatible', 'model': 'strong-model',
+            'timeout_seconds': 2, 'max_output_tokens': 64,
+            'role_routes': {'research.cataloger': [
+                {'id': 'broken', 'pool': 'qwen', 'base_url': self.url,
+                 'protocol': 'openai_compatible', 'model': 'runtime_required'},
+            ]},
+        }
+        with self.assertRaisesRegex(ValidationError, 'requires an explicit value'):
+            resolve_model_config(base)
+
     def test_invalid_role_model_config_fails_before_network(self):
         base = {
             'base_url': self.url, 'protocol': 'openai_compatible', 'model': 'strong-model',

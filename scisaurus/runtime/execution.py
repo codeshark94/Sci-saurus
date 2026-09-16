@@ -40,6 +40,15 @@ SYSTEM = (
 )
 
 
+_NO_PROVIDER_CAPACITY = object()
+
+
+def _is_process_cancellation(error):
+    return isinstance(error, KeyboardInterrupt) and str(error) in {
+        "", "termination requested", "run cancellation requested",
+    }
+
+
 
 class _ResultFile:
     """Atomic JSON publication keeps partial worker writes out of the poll loop."""
@@ -153,6 +162,9 @@ class ExecutionRuntime:
         self.verified_changes, self.information_changes, self.blockers = [], [], []
         self.active_task = None
         self.active_tasks = []
+        self.provider_pools = dict(config["limits"].get("provider_pools") or {})
+        self.provider_active = {name: 0 for name in self.provider_pools}
+        self.provider_route_cursors = {}
         self.cancelled = False
         self.cancellation_reason = None
         self.sources = []
@@ -241,6 +253,8 @@ class ExecutionRuntime:
             parallel = min(parallel, max_parallel)
         pending = self._validate_batch(specs)
         active, outcomes = {}, {}
+        propagate_cancellation = False
+        cancellation_error = None
         try:
             while pending or active:
                 if self.cancelled:
@@ -250,13 +264,23 @@ class ExecutionRuntime:
                 while pending and len(active) < parallel:
                     window = self.budget.get_window("run-window")
                     available = window["capacity"]["concurrent_calls"] - window["reserved"].get("concurrent_calls", 0)
-                    index = next((i for i, spec in enumerate(pending)
-                                  if self._reservation(spec) is not None or available >= 1), None)
+                    index = None
+                    selected_route = None
+                    for i, candidate in enumerate(pending):
+                        if self._reservation(candidate) is None and available < 1:
+                            continue
+                        route = self._provider_route(candidate)
+                        if route is _NO_PROVIDER_CAPACITY:
+                            continue
+                        index, selected_route = i, route
+                        break
                     if index is None:
                         break
-                    spec = pending.pop(index)
+                    spec = self._apply_provider_route(pending.pop(index), selected_route)
                     entry = {"spec": spec, "context": None, "process": None,
-                             "channel": None, "dispatched": False, "attempt_id": None}
+                             "channel": None, "dispatched": False, "attempt_id": None,
+                             "provider_reserved": False}
+                    self._reserve_provider(entry)
                     active[spec["task_id"]] = entry
                     self._set_active(active)
                     self._dispatch(entry)
@@ -271,9 +295,12 @@ class ExecutionRuntime:
                     if message is not None:
                         self._stop_worker(entry["process"])
                         entry["process"] = None
-                        outcomes[task_id] = self._record_outcome(entry, message)
-                        del active[task_id]
-                        self._set_active(active)
+                        try:
+                            outcomes[task_id] = self._record_outcome(entry, message)
+                        finally:
+                            self._release_provider(entry)
+                            del active[task_id]
+                            self._set_active(active)
                 if active:
                     self._checkpoint("executing")
                     nearest = min(entry["deadline"] for entry in active.values())
@@ -283,6 +310,9 @@ class ExecutionRuntime:
             if isinstance(exc, KeyboardInterrupt):
                 self.cancelled = True
                 self.cancellation_reason = str(exc)
+                propagate_cancellation = _is_process_cancellation(exc)
+                if propagate_cancellation:
+                    cancellation_error = exc
             for task_id, entry in list(active.items()):
                 message = self._poll(entry) if entry["dispatched"] else None
                 self._stop_worker(entry["process"])
@@ -290,14 +320,20 @@ class ExecutionRuntime:
                 if message is None:
                     message = {"ok": False, "error": reason,
                                "outcome_known": not entry["dispatched"]}
-                outcomes[task_id] = self._record_outcome(entry, message)
-                del active[task_id]
+                try:
+                    outcomes[task_id] = self._record_outcome(entry, message)
+                finally:
+                    self._release_provider(entry)
+                    del active[task_id]
             for spec in pending:
                 outcomes[spec["task_id"]] = self._undispatched(spec, reason)
         finally:
             for entry in active.values():
                 self._stop_worker(entry["process"])
+                self._release_provider(entry)
             self._set_active({})
+        if propagate_cancellation:
+            raise cancellation_error
         return outcomes
 
     def _validate_batch(self, specs):
@@ -342,6 +378,91 @@ class ExecutionRuntime:
     def _set_active(self, active):
         self.active_tasks = list(active)
         self.active_task = self.active_tasks[0] if len(self.active_tasks) == 1 else None
+
+    @staticmethod
+    def _provider_url(value):
+        return value.rstrip("/") if isinstance(value, str) else value
+
+    def _provider_route(self, spec):
+        """Select one route whose transient provider pool has capacity."""
+        if spec["kind"] != "model" or not self.provider_pools:
+            return None
+        params = spec["params"]
+        client = params.get("client")
+        if not isinstance(client, dict):
+            raise ValidationError("model operation requires a client object")
+        role = params.get("role") or spec["actor"]
+        routes_by_role = client.get("role_routes", {})
+        routes = routes_by_role.get(role, []) if isinstance(routes_by_role, dict) else []
+        if routes:
+            cursor = self.provider_route_cursors.get(role, 0) % len(routes)
+            for offset in range(len(routes)):
+                index = (cursor + offset) % len(routes)
+                route = routes[index]
+                pool_name = route["pool"]
+                pool = self.provider_pools.get(pool_name)
+                if pool is None:
+                    raise ValidationError(
+                        f"model route {route['id']} references an unknown provider pool: {pool_name}")
+                if self.provider_active[pool_name] >= pool["max_concurrent"]:
+                    continue
+                self.provider_route_cursors[role] = (index + 1) % len(routes)
+                return route
+            return _NO_PROVIDER_CAPACITY
+
+        effective = resolve_model_config(client, role=role)
+        base_url = self._provider_url(effective.get("base_url"))
+        matches = [name for name, pool in self.provider_pools.items()
+                   if base_url in {self._provider_url(url) for url in pool["base_urls"]}]
+        if len(matches) > 1:
+            raise ValidationError(f"model base_url matches multiple provider pools: {matches}")
+        if not matches:
+            return None
+        pool_name = matches[0]
+        if self.provider_active[pool_name] >= self.provider_pools[pool_name]["max_concurrent"]:
+            return _NO_PROVIDER_CAPACITY
+        return {"id": f"default:{pool_name}", "pool": pool_name, "_effective": effective}
+
+    def _apply_provider_route(self, spec, route):
+        if route is None:
+            return spec
+        params = dict(spec["params"])
+        role = params.get("role") or spec["actor"]
+        client = params.get("client")
+        if not isinstance(client, dict):
+            raise ValidationError("model operation requires a client object")
+        effective = route.get("_effective") if isinstance(route, dict) else None
+        if not isinstance(effective, dict):
+            effective = resolve_model_config(client, role=role)
+        else:
+            effective = dict(effective)
+        for key, value in route.items():
+            if key not in {"id", "pool", "_effective"}:
+                effective[key] = value
+        params["client"] = effective
+        params["role"] = role
+        params["route_id"] = route["id"]
+        params["provider_pool"] = route["pool"]
+        return {**spec, "params": params}
+
+    def _reserve_provider(self, entry):
+        pool_name = entry["spec"]["params"].get("provider_pool")
+        if pool_name is None:
+            return
+        if pool_name not in self.provider_pools:
+            raise ValidationError(f"unknown provider pool: {pool_name}")
+        if self.provider_active[pool_name] >= self.provider_pools[pool_name]["max_concurrent"]:
+            raise ValidationError(f"provider pool is full: {pool_name}")
+        self.provider_active[pool_name] += 1
+        entry["provider_reserved"] = True
+
+    def _release_provider(self, entry):
+        if not entry.get("provider_reserved"):
+            return
+        pool_name = entry["spec"]["params"].get("provider_pool")
+        if pool_name in self.provider_active:
+            self.provider_active[pool_name] = max(0, self.provider_active[pool_name] - 1)
+        entry["provider_reserved"] = False
 
     def _before_dispatch(self, spec):
         """Recheck dynamic prerequisites immediately before process creation."""

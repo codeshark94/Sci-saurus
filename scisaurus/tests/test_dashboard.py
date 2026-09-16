@@ -100,7 +100,7 @@ class DashboardTests(unittest.TestCase):
         completed_id = "model-completed"
         running_context = artifact(
             f"command/contexts/{running_id}",
-            {"role": "research.literature-mapper", "client": {
+            {"role": "research.literature-mapper", "provider_pool": "qwen", "route_id": "qwen-tailnet", "client": {
                 "model": "fallback-model", "base_url": "http://127.0.0.1:11434/v1",
                 "role_models": {"research.literature-mapper": {
                     "model": "qwen3.8-27b",
@@ -160,6 +160,8 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual([item["task_id"] for item in calls["recent_items"]], [completed_id])
         self.assertEqual(calls["items"][0]["model"], "qwen3.8-27b")
         self.assertEqual(calls["items"][0]["provider"], "Tailnet")
+        self.assertEqual(calls["items"][0]["provider_pool"], "qwen")
+        self.assertEqual(calls["items"][0]["route_id"], "qwen-tailnet")
         self.assertEqual(calls["recent_items"][0]["model"], "glm-5.3-flash:cloud")
         self.assertEqual(calls["recent_items"][0]["response_status"], "response recorded")
         self.assertTrue(calls["recent_items"][0]["response_ref"].startswith("project::objects/sha256/"))

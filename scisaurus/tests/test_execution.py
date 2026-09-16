@@ -32,7 +32,10 @@ def execution_worker(kind, params, channel):
     usage = {"model_calls": 1, "input_tokens": 10, "output_tokens": 5}
     if assignment.get("missing_usage"):
         usage = {"model_calls": 1}
-    result = {"text": json.dumps({"started": started, "ended": time.monotonic(), "pid": os.getpid()}),
+    result = {"text": json.dumps({"started": started, "ended": time.monotonic(), "pid": os.getpid(),
+                                   "provider_pool": params.get("provider_pool"),
+                                   "route_id": params.get("route_id"),
+                                   "model": params.get("client", {}).get("model")}),
               "model": "simulated", "usage": usage, "elapsed_seconds": time.monotonic() - started,
               "finish_reason": "stop"}
     if assignment.get("malformed"):
@@ -174,6 +177,50 @@ class TestExecutionRuntime(unittest.TestCase):
         self.assertEqual(runtime.budget.get_window("run-window")["cumulative_usage"], {"model_calls": 1})
         self.assertEqual(runtime.budget.get_window("run-window")["reserved"], {"concurrent_calls": 1})
 
+    def test_provider_routes_mix_endpoints_without_exceeding_pool_caps(self):
+        value = config()
+        value["model"].update(
+            base_url="http://127.0.0.1:1/v1", protocol="openai_compatible", model="base-model")
+        value["model"]["role_routes"] = {
+            "strategy.worker": [
+                {"id": "ollama-route", "pool": "ollama", "base_url": "http://127.0.0.1:1/v1",
+                 "protocol": "openai_compatible", "model": "ollama-model", "auth_env": None},
+                {"id": "qwen-route", "pool": "qwen", "base_url": "https://qwen.invalid/v1",
+                 "protocol": "openai_compatible", "model": "qwen-model", "auth_env": None},
+            ]
+        }
+        value["limits"]["provider_pools"] = {
+            "ollama": {"max_concurrent": 3, "base_urls": ["http://127.0.0.1:1/v1"]},
+            "qwen": {"max_concurrent": 1, "base_urls": ["https://qwen.invalid/v1"]},
+        }
+        runtime = ExecutionRuntime(self.root / "provider-pool-project", validate_config(value),
+                                   worker_target=execution_worker)
+        self.runtimes.append(runtime)
+        specs = []
+        for i in range(6):
+            spec = self.spec(f"route-{i}", delay=0.35, timeout=8)
+            spec["params"]["client"] = value["model"]
+            specs.append(spec)
+        outcomes = runtime._call_batch(specs, max_parallel=3)
+        self.assertTrue(all(outcome["ok"] for outcome in outcomes.values()))
+        records = [json.loads(outcome["result"]["text"]) for outcome in outcomes.values()]
+        self.assertEqual(runtime.provider_active, {"ollama": 0, "qwen": 0})
+        self.assertEqual({record["provider_pool"] for record in records}, {"ollama", "qwen"})
+        self.assertEqual({record["route_id"] for record in records}, {"ollama-route", "qwen-route"})
+        def provider_peak(pool_name):
+            events = []
+            for record in records:
+                if record["provider_pool"] == pool_name:
+                    events.extend(((record["started"], 1), (record["ended"], -1)))
+            running = peak = 0
+            for _timestamp, delta in sorted(events):
+                running += delta
+                peak = max(peak, running)
+            return peak
+        self.assertLessEqual(provider_peak("ollama"), 3)
+        self.assertLessEqual(provider_peak("qwen"), 1)
+        self.assertEqual(runtime.control._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 6)
+
     @unittest.skipUnless(os.name == "posix", "process-group cleanup uses POSIX process sessions")
     def test_interrupt_keeps_unknown_cost_releases_undispatched_review_and_stops_descendants(self):
         paths = [self.root / f"pid-{i}.json" for i in range(2)]
@@ -202,6 +249,24 @@ class TestExecutionRuntime(unittest.TestCase):
         self.assertTrue(later["later"]["outcome_known"])
         self.assertFalse(later["later"]["ok"])
         self.assertEqual(runtime.control._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 2)
+
+    @unittest.skipUnless(os.name == "posix", "process-group cleanup uses POSIX process sessions")
+    def test_process_termination_cancellation_propagates_after_reconciliation(self):
+        callback_count = 0
+
+        def terminate_when_running(update):
+            nonlocal callback_count
+            callback_count += 1
+            if callback_count > 1 and update["active_tasks"]:
+                raise KeyboardInterrupt("termination requested")
+
+        runtime = self.runtime(capacity=3, on_progress=terminate_when_running)
+        with self.assertRaisesRegex(KeyboardInterrupt, "termination requested"):
+            runtime._call_batch([self.spec("terminated", delay=30)], max_parallel=1)
+        self.assertEqual(runtime.active_tasks, [])
+        self.assertTrue(runtime.cancelled)
+        self.assertEqual(runtime.tasks.get_attempt("terminated-attempt")["state"], "result_unknown")
+        self.assertEqual(runtime.budget.get_window("run-window")["reserved"], {"concurrent_calls": 1})
 
     @unittest.skipUnless(os.name == "posix", "process-group cleanup uses POSIX process sessions")
     def test_deadline_stops_owned_workers_and_blocks_pending_work(self):
