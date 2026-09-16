@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+
+repository_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$repository_dir"
+
+python_bin=python3
+if [ -x .venv/bin/python ]; then
+  python_bin=.venv/bin/python
+fi
+
+if [ "$#" -gt 0 ] && [ "${1#--}" = "$1" ]; then
+  project_dir=$1
+  shift
+elif [ -d local-private/autolab ]; then
+  project_dir=local-private/autolab
+else
+  project_dir=.
+fi
+
+exec "$python_bin" -m scisaurus.cli dashboard "$project_dir" "$@"

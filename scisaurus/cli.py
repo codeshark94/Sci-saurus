@@ -1,4 +1,4 @@
-"""Minimal CLI for the P1 core slice: init / publish / show / status / verify."""
+"""Command-line entry points for Sci-saurus projects and the local console."""
 
 from __future__ import annotations
 
@@ -11,6 +11,12 @@ from scisaurus.core.events import ControlStore
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.messages import MessageBus
 from scisaurus.core.tasks import TaskManager
+
+
+def _default_dashboard_project_dir():
+    current = Path.cwd()
+    autolab = current / "local-private" / "autolab"
+    return str(autolab if autolab.is_dir() else current)
 
 
 def main(argv=None) -> int:
@@ -34,6 +40,12 @@ def main(argv=None) -> int:
 
     p_status = sub.add_parser("status", help="project status summary")
     p_status.add_argument("project_dir")
+
+    p_dashboard = sub.add_parser("dashboard", help="serve a read-only dashboard for any project")
+    p_dashboard.add_argument("project_dir", nargs="?", default=None)
+    p_dashboard.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost)")
+    p_dashboard.add_argument("--port", type=int, default=0, help="bind port (default: choose a free local port)")
+    p_dashboard.add_argument("--no-open", action="store_true", help="print the URL without opening a browser")
 
     p_verify = sub.add_parser("verify", help="verify the event hash chain")
     p_verify.add_argument("project_dir")
@@ -157,6 +169,16 @@ def main(argv=None) -> int:
     p_interim.add_argument("project_dir")
 
     args = parser.parse_args(argv)
+    if args.cmd == "dashboard":
+        from scisaurus.dashboard import run_dashboard
+        try:
+            project_dir = args.project_dir or _default_dashboard_project_dir()
+            run_dashboard(project_dir, host=args.host, port=args.port,
+                          open_browser=not args.no_open)
+        except (OSError, ValueError) as exc:
+            print(f"dashboard rejected: {exc}", file=sys.stderr)
+            return 2
+        return 0
     if args.cmd == "run-composer":
         from scisaurus.core.errors import ValidationError
         from scisaurus.runtime.composer import ComposerRunner
