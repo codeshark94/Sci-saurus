@@ -14,10 +14,14 @@ from scisaurus.runtime.topic_discovery import (
     TopicBudget,
     TopicDiscoveryRunner,
     topic_maturity_admitted,
+    topic_portfolio_profile,
+    topic_refinement_dimensions,
     topic_signature,
     validate_topic_package,
     validate_topic_maturity_review,
     validate_topic_novelty,
+    validate_topic_portfolio,
+    validate_topic_refinement,
     validate_topic_stage_config,
     validate_frontier_seed_plan,
     validate_source_challenge,
@@ -26,12 +30,18 @@ from scisaurus.runtime.topic_discovery import (
 
 def package(objective):
     candidates = []
+    research_forms = ("theory_simulation", "observational_reanalysis", "methodological_benchmark")
+    evidence_modes = ("synthetic_simulation", "published_observations", "public_dataset")
+    comparison_types = ("mechanism_ablation", "cross_method", "model_selection")
     for index in range(3):
         candidates.append({
             "id": f"direction_{index}",
             "title": f"Direction {index}",
             "domain": "computational science",
             "research_question": f"Does mechanism {index} change the measured outcome under a controlled comparison?",
+            "research_form": research_forms[index],
+            "evidence_mode": evidence_modes[index],
+            "comparison_type": comparison_types[index],
             "scope": "Public data and a reproducible local experiment.",
             "search_queries": [f"mechanism {index} comparison", "controlled computational experiment", "reproducible public data"],
             "why_promising": "The sampled recent records suggest a testable comparison without establishing novelty.",
@@ -162,6 +172,33 @@ class FakeModel:
                            elapsed_seconds=0.01, finish_reason="stop")
 
 
+class PortfolioRepairModel(FakeModel):
+    """Return one structurally collapsed package, then a valid repair."""
+
+    topic_calls = 0
+    prompts = []
+
+    def complete(self, *, system, prompt, images=None):
+        payload = json.loads(prompt)
+        type(self).prompts.append(payload)
+        result = super().complete(system=system, prompt=prompt, images=images)
+        if payload.get("assignment") in {"free_topic_discovery", "repair_invalid_topic_discovery"}:
+            type(self).topic_calls += 1
+            if type(self).topic_calls == 1:
+                value = json.loads(result.text)
+                for candidate in value["candidates"]:
+                    candidate.update({
+                        "research_form": "theory_simulation",
+                        "evidence_mode": "synthetic_simulation",
+                        "comparison_type": "mechanism_ablation",
+                    })
+                result = ModelResult(
+                    text=json.dumps(value), model="fake",
+                    usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                    elapsed_seconds=0.01, finish_reason="stop")
+        return result
+
+
 class MaturityModel:
     """Return a thin first proposal, then a substantively refined proposal."""
 
@@ -235,7 +272,19 @@ class SourceChallengeRefinementModel(FakeModel):
             return ModelResult(text=json.dumps(review), model="fake",
                                usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
                                elapsed_seconds=0.01, finish_reason="stop")
-        return super().complete(system=system, prompt=prompt, images=images)
+        result = super().complete(system=system, prompt=prompt, images=images)
+        if payload.get("assignment") == "refine_topic_discovery":
+            value = json.loads(result.text)
+            value["candidates"][1].update({
+                "research_form": "scaling_boundary",
+                "evidence_mode": "cross_source_synthesis",
+                "comparison_type": "causal_contrast",
+            })
+            result = ModelResult(
+                text=json.dumps(value), model="fake",
+                usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                elapsed_seconds=0.01, finish_reason="stop")
+        return result
 
 
 class TopicDiscoveryTests(unittest.TestCase):
@@ -276,6 +325,132 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertTrue(topic_maturity_admitted(review))
         review["scores"]["mechanism_depth"] = 1
         self.assertFalse(topic_maturity_admitted(review))
+
+    def test_topic_portfolio_profile_tracks_research_shape(self):
+        value = package("Choose a feasible research direction")
+        profile = topic_portfolio_profile(value["candidates"])
+        self.assertEqual(profile["candidate_count"], 3)
+        self.assertEqual(profile["distinct"], {
+            "research_form": 3, "evidence_mode": 3, "comparison_type": 3,
+        })
+        signature = topic_signature(value["candidates"][0])
+        self.assertEqual(signature["structure"]["research_form"], "theory_simulation")
+        self.assertTrue(signature["structure_fingerprint"])
+
+    def test_topic_portfolio_gate_rejects_structural_collapse(self):
+        value = package("Choose a feasible research direction")
+        for candidate in value["candidates"]:
+            candidate.update({
+                "research_form": "theory_simulation",
+                "evidence_mode": "synthetic_simulation",
+                "comparison_type": "mechanism_ablation",
+            })
+        with self.assertRaisesRegex(ValidationError, "distinct research_form"):
+            validate_topic_package(
+                value, objective=value["objective"], candidate_count=3,
+                enforce_portfolio_diversity=True)
+
+    def test_topic_portfolio_gate_rejects_repeated_archetype(self):
+        value = package("Choose a feasible research direction")
+        value["candidates"][1].update({
+            "research_form": value["candidates"][0]["research_form"],
+            "evidence_mode": value["candidates"][0]["evidence_mode"],
+            "comparison_type": value["candidates"][0]["comparison_type"],
+        })
+        with self.assertRaisesRegex(ValidationError, "same research archetype"):
+            validate_topic_portfolio(
+                value["candidates"], minimum_research_forms=1,
+                minimum_evidence_modes=1, minimum_comparison_types=1)
+
+    def test_topic_history_rejects_same_research_archetype_with_new_prose(self):
+        value = package("Choose a feasible research direction")
+        prior = value["candidates"][0]
+        candidate = {
+            **value["candidates"][1],
+            "id": "new_direction",
+            "title": "A different title",
+            "domain": "a different domain",
+            "research_question": "Which unrelated wording tests a new phenomenon?",
+            "research_form": prior["research_form"],
+            "evidence_mode": prior["evidence_mode"],
+            "comparison_type": prior["comparison_type"],
+        }
+        with self.assertRaisesRegex(ValidationError, "too similar"):
+            validate_topic_novelty(candidate, {"entries": [{
+                "topic_id": "old_direction", "signature": topic_signature(prior),
+            }]})
+
+    def test_maturity_refinement_requires_structural_pivot_when_enabled(self):
+        review = {
+            "decision": "refine", "selected_id": "direction_1",
+            "scores": {dimension: 1 for dimension in (
+                "question_specificity", "mechanism_depth", "comparison_design",
+                "contribution_potential", "falsifiability")},
+            "rationale": "The direction remains too close to the prior form.",
+            "required_changes": ["Change the study shape and mechanism."],
+            "changed_dimensions": ["mechanism"],
+        }
+        with self.assertRaisesRegex(ValidationError, "at least two"):
+            validate_topic_maturity_review(
+                review, candidate_ids={"direction_1"}, require_structural_pivot=True)
+        review["changed_dimensions"] = ["mechanism", "research_form"]
+        self.assertEqual(
+            validate_topic_maturity_review(
+                review, candidate_ids={"direction_1"}, require_structural_pivot=True),
+            review)
+
+    def test_topic_refinement_gate_compares_actual_parent_and_child(self):
+        value = package("Choose a feasible research direction")
+        parent = value["candidates"][0]
+        child = {**parent, "research_question": "A genuinely changed question."}
+        self.assertEqual(topic_refinement_dimensions(parent, child), ["research_question"])
+        with self.assertRaisesRegex(ValidationError, "at least two"):
+            validate_topic_refinement(parent, child, require_structural_pivot=True)
+        child.update({
+            "research_form": "scaling_boundary",
+            "evidence_mode": "cross_source_synthesis",
+        })
+        changed = validate_topic_refinement(parent, child, require_structural_pivot=True)
+        self.assertEqual(changed, ["research_question", "research_form", "evidence_mode"])
+
+    def test_topic_prompt_exposes_portfolio_contract_and_attempt_history(self):
+        from scisaurus.runtime.topic_discovery import topic_prompt
+        payload = json.loads(topic_prompt(
+            "Choose a feasible research direction", 6,
+            candidate_history=[{"status": "rejected", "candidate_signatures": []}]))
+        self.assertEqual(payload["portfolio_requirements"]["minimum_distinct_research_forms"], 4)
+        self.assertIn("research_form", payload["output_contract"]["candidate"])
+        self.assertEqual(payload["previous_candidate_directions"][0]["status"], "rejected")
+
+    def test_runner_persists_candidate_attempt_trace_and_admission(self):
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", FakeModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+            }).run("Choose a feasible research direction", candidate_count=3,
+                   bibliography=False, max_attempts=1)
+        self.assertEqual(result["candidate_attempt_trace"][0]["status"], "admitted")
+        self.assertEqual(len(result["candidate_attempt_trace"][0]["candidate_signatures"]), 3)
+        self.assertEqual(result["candidate_attempt_trace"][0]["portfolio_profile"]["distinct"]["research_form"], 3)
+
+    def test_runner_passes_rejected_candidate_history_to_repair(self):
+        PortfolioRepairModel.topic_calls = 0
+        PortfolioRepairModel.prompts = []
+        with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", FakeOpenAlex), \
+                patch("scisaurus.runtime.topic_discovery.ModelClient", PortfolioRepairModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+            }).run("Choose a feasible research direction", candidate_count=3,
+                   max_attempts=2)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(PortfolioRepairModel.topic_calls, 2)
+        self.assertEqual([item["status"] for item in result["candidate_attempt_trace"]],
+                         ["rejected", "admitted"])
+        repair_prompts = [item for item in PortfolioRepairModel.prompts
+                          if item.get("assignment") == "repair_invalid_topic_discovery"]
+        self.assertEqual(len(repair_prompts), 1)
+        self.assertEqual(repair_prompts[0]["previous_candidate_directions"][0]["status"], "rejected")
 
     def test_runner_refines_topic_after_maturity_review(self):
         objective = "Choose a feasible research direction"
@@ -361,6 +536,14 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(len(snapshot["events"]), 3)
         self.assertTrue(all(event["status"] == "error" for event in snapshot["events"]))
         self.assertTrue(all(event["request_attempts"] == 2 for event in snapshot["events"]))
+        self.assertEqual(
+            [item["status"] for item in caught.exception.candidate_attempt_trace],
+            ["result_unknown", "result_unknown", "result_unknown"],
+        )
+        self.assertTrue(all(
+            item["outcome_known"] is False
+            for item in caught.exception.candidate_attempt_trace
+        ))
 
     def test_validation_after_external_response_is_kept_in_diagnostics(self):
         budget = TopicBudget({"max_model_calls": 2}, {})

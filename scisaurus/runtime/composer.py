@@ -1158,6 +1158,7 @@ class ComposerRunner:
                 continue
             entries.append({key: entry.get(key) for key in (
                 "topic_id", "title", "domain", "research_question", "experiment_capability_id",
+                "research_form", "evidence_mode", "comparison_type",
                 "parent_topic_id", "refinement_cycle", "changed_dimensions")})
         return {
             "schema_version": "topic-history-1",
@@ -1172,13 +1173,17 @@ class ComposerRunner:
         if not isinstance(topic, dict) or not isinstance(topic.get("id"), str):
             return
         from scisaurus.runtime.topic_discovery import topic_signature
+        signature = topic_signature(topic)
         entry = {
             "topic_id": topic["id"],
             "title": topic.get("title"),
             "domain": topic.get("domain"),
             "research_question": topic.get("research_question"),
             "experiment_capability_id": topic.get("experiment_capability_id"),
-            "signature": topic_signature(topic),
+            "research_form": topic.get("research_form"),
+            "evidence_mode": topic.get("evidence_mode"),
+            "comparison_type": topic.get("comparison_type"),
+            "signature": signature,
             "run_id": self.run_id,
             "recorded_at": now_iso(),
         }
@@ -1397,7 +1402,10 @@ class ComposerRunner:
             "parent_topic_id": parent.get("id"),
             "parent_topic": deepcopy(parent),
             "reason": "The literature and admission review did not support the current question as a sufficient journal study.",
-            "changed_dimensions": list(("mechanism", "data_regime", "comparison", "measurement", "theory")),
+            "changed_dimensions": list((
+                "mechanism", "data_regime", "comparison", "measurement", "theory",
+                "research_form", "evidence_mode", "comparison_type",
+            )),
             "survey_feedback": feedback,
         }
 
