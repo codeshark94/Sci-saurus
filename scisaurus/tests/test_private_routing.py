@@ -9,9 +9,15 @@ PRIVATE_ROOT = Path(__file__).resolve().parents[2] / "local-private"
 if str(PRIVATE_ROOT) not in sys.path:
     sys.path.insert(0, str(PRIVATE_ROOT))
 
-from role_routing import routed_model_config  # noqa: E402
+PRIVATE_ROUTING_MODULE = PRIVATE_ROOT / "role_routing.py"
+if PRIVATE_ROUTING_MODULE.is_file():
+    from role_routing import routed_model_config  # noqa: E402
+else:
+    routed_model_config = None
 
 
+@unittest.skipUnless(PRIVATE_ROUTING_MODULE.is_file(),
+                     "owner-local role_routing.py is not part of the public checkout")
 class TestPrivateRouting(unittest.TestCase):
     def env(self, **overrides):
         values = {

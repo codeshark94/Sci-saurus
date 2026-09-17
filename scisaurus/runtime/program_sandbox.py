@@ -49,6 +49,56 @@ def sandbox_status():
     return {"sandbox_exec": SANDBOX_EXEC, "mode": "sandbox-exec" if SANDBOX_EXEC else "rlimits-only"}
 
 
+def _macho_dependency_paths(executable):
+    """Return existing absolute Mach-O libraries needed to start *executable*.
+
+    macOS Python distributions do not all place their framework library next
+    to the virtual environment.  Inspecting the pinned executable keeps the
+    Seatbelt read allowlist narrow while supporting Homebrew, hosted-toolcache,
+    and framework-based Python installations alike.
+    """
+    otool = shutil.which("otool")
+    if not otool:
+        return set()
+    pending = [Path(executable)]
+    seen = set()
+    dependencies = set()
+    while pending:
+        current = pending.pop()
+        try:
+            current = current.resolve()
+        except OSError:
+            continue
+        if current in seen or not current.is_file():
+            continue
+        seen.add(current)
+        try:
+            completed = subprocess.run(
+                [otool, "-L", str(current)], capture_output=True, text=True,
+                check=False,
+            )
+        except (OSError, ValueError):
+            continue
+        if completed.returncode != 0:
+            continue
+        for line in completed.stdout.splitlines()[1:]:
+            raw_path = line.strip().split(" (", 1)[0]
+            if not raw_path.startswith("/"):
+                continue
+            dependency = Path(raw_path)
+            if not dependency.is_file():
+                continue
+            dependencies.add(dependency)
+            try:
+                resolved = dependency.resolve()
+            except OSError:
+                resolved = dependency
+            dependencies.add(resolved)
+            if resolved not in seen:
+                pending.append(resolved)
+    return dependencies
+
+
 def _sandbox_read_paths(command, workspace):
     """Return the minimal immutable runtime roots needed to start Python."""
     executable = Path(command[0]).resolve()
@@ -62,6 +112,7 @@ def _sandbox_read_paths(command, workspace):
     if configured.parent.name == "bin" and configured.parent.parent.name in {".venv", "venv"}:
         roots.add(configured.parent.parent.resolve())
     files = {configured.resolve(), executable}
+    files.update(_macho_dependency_paths(executable))
     for argument in command[1:]:
         candidate = Path(argument)
         if candidate.is_absolute() and candidate.exists():

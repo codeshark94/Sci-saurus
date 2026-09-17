@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -14,7 +15,9 @@ from scisaurus.runtime.capability_registry import (
 )
 from scisaurus.runtime.program_admission import SCHEMA_VERSION, validate_program_candidate
 from scisaurus.runtime.program_gates import admit_program_candidate
-from scisaurus.runtime.program_sandbox import run_sandboxed, sandbox_status
+from scisaurus.runtime.program_sandbox import (
+    _macho_dependency_paths, run_sandboxed, sandbox_profile, sandbox_status,
+)
 from scisaurus.runtime.programs import LocalProgramClient
 from scisaurus.tests.test_program_admission import EXECUTOR, INTENT, VALIDATOR
 
@@ -61,6 +64,18 @@ def output_document():
 
 
 class SandboxTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin" and shutil.which("otool"),
+                         "Mach-O dependency inspection is only available on macOS")
+    def test_profile_includes_actual_runtime_dependencies(self):
+        with tempfile.TemporaryDirectory() as path:
+            workspace = Path(path)
+            executable = Path(sys.executable).resolve()
+            dependencies = _macho_dependency_paths(executable)
+            self.assertTrue(dependencies)
+            profile = sandbox_profile(workspace, [sys.executable, "-c", "print('ok')"])
+            for dependency in dependencies:
+                self.assertIn(f'(literal "{dependency}")', profile)
+
     def test_deny_by_default_profile_blocks_network_and_outside_writes(self):
         self.assertEqual(sandbox_status()["mode"], "sandbox-exec")
         with tempfile.TemporaryDirectory() as path:
