@@ -37,6 +37,10 @@ from scisaurus.runtime.departments import (
     DEFAULT_STAGE_ROUTES,
     stage_role,
 )
+from scisaurus.runtime.specialists import (
+    SpecialistDispatcher,
+    build_verifier_prompt,
+)
 
 
 SCHEMA_VERSION = "composer-workflow-1"
@@ -602,7 +606,8 @@ class ComposerRunner:
                 blockers.append({key: item[key] for key in (
                     "stage_id", "reason", "provider_error", "retry_after_seconds",
                     "retry_after_epoch", "rate_limit", "attempts", "usage",
-                    "diagnostics") if key in item})
+                    "diagnostics", "candidate_attempt_trace", "maturity_review_history",
+                    "rejected_topic_history") if key in item})
             else:
                 blockers.append({"reason": str(item)[:240]})
         report = {
@@ -756,17 +761,53 @@ class ComposerRunner:
                     requests.append(item)
                     seen.add(request_id)
             if context.get("status") == "review_rejected" and not has_candidates:
-                request_id = f"{stage_id}-editorial-reconsideration"
-                requests.append({
-                    "id": request_id,
-                    "kind": "manuscript_revision",
-                    "owner": "editorial.composer",
-                    "objective": "Reopen the manuscript with a fresh reviewer-facing composition attempt.",
-                    "why": "The bounded editorial cycle ended with material findings still unresolved.",
-                    "success_condition": "The same reviewer panel accepts the revised incumbent and the editor-in-chief records acceptance.",
-                    "evidence_needed": "The prior draft, review findings, and every surgical repair remain available in the manuscript project.",
-                    "source_stage_id": stage_id,
-                })
+                # A specialist verifier hold belongs to the stage that was
+                # reviewed.  In particular, a rejected topic must return to
+                # topic discovery with the verifier's repair scope; treating
+                # every rejection as a manuscript revision can leave the
+                # rejected topic marked complete and admit its survey.
+                if context.get("kind") == "topic_discovery":
+                    verifier = context.get("specialist_verifier", {})
+                    response = (verifier.get("response", {})
+                                if isinstance(verifier, dict) else {})
+                    repair_scope = (response.get("repair_scope", [])
+                                    if isinstance(response, dict) else [])
+                    if not isinstance(repair_scope, list):
+                        repair_scope = []
+                    repair_scope = [str(item).strip() for item in repair_scope
+                                    if isinstance(item, str) and item.strip()]
+                    if not repair_scope:
+                        repair_scope = [
+                            "Resolve every blocking finding from the independent topic verifier and resubmit a source-grounded question."
+                        ]
+                    item = {
+                        "id": f"{stage_id}-topic-refinement",
+                        "kind": "topic_refinement",
+                        "owner": "research.intelligence",
+                        "objective": "Repair the rejected topic using the independent verifier findings, then generate and review a materially improved research question before admitting literature survey.",
+                        "why": "The topic's independent adversarial review found unresolved scientific or evidence-grounding blockers.",
+                        "success_condition": "A fresh topic package addresses the verifier repair scope, survives independent specialist review, and only then admits survey.",
+                        "evidence_needed": "; ".join(repair_scope),
+                        "source_stage_id": stage_id,
+                    }
+                    if self._research_request_signature(item) not in self._attempted_request_signatures:
+                        requests.append(item)
+                elif context.get("kind") == "paper":
+                    # A paper rejection is the one case where a generic
+                    # editorial reconsideration is the correct fallback.
+                    request_id = f"{stage_id}-editorial-reconsideration"
+                    item = {
+                        "id": request_id,
+                        "kind": "manuscript_revision",
+                        "owner": "editorial.composer",
+                        "objective": "Reopen the manuscript with a fresh reviewer-facing composition attempt.",
+                        "why": "The bounded editorial cycle ended with material findings still unresolved.",
+                        "success_condition": "The same reviewer panel accepts the revised incumbent and the editor-in-chief records acceptance.",
+                        "evidence_needed": "The prior draft, review findings, and every surgical repair remain available in the manuscript project.",
+                        "source_stage_id": stage_id,
+                    }
+                    if self._research_request_signature(item) not in self._attempted_request_signatures:
+                        requests.append(item)
         return requests
 
     @staticmethod
@@ -985,6 +1026,26 @@ class ComposerRunner:
             except (OSError, ValueError, TypeError):
                 experiment_contract = None
         foundry_enabled = bool(self.workflow.get("capability_foundry_config_path"))
+        foundry_runtime_packages = []
+        if foundry_enabled:
+            try:
+                foundry_config = json.loads(
+                    Path(self.workflow["capability_foundry_config_path"]).read_text())
+                foundry_runtime_packages = [
+                    {"name": item["name"], "version": item["version"]}
+                    for item in foundry_config.get("runtime_packages", [])
+                    if isinstance(item, dict)
+                    and isinstance(item.get("name"), str)
+                    and isinstance(item.get("version"), str)
+                ]
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                raise ValidationError(
+                    "capability foundry runtime package inventory is unreadable") from exc
+            # These packages are installed in the isolated foundry runtime,
+            # which is the execution boundary for the generated program. The
+            # host interpreter may intentionally not have the same packages.
+            for item in foundry_runtime_packages:
+                packages[item["name"]] = True
         return {
             "operating_system": platform.system(),
             "platform": platform.machine(),
@@ -1004,6 +1065,8 @@ class ComposerRunner:
             "capability_foundry": ({
                 "enabled": True,
                 "execution_boundary": "deterministic seeded Python with no network or subprocess access",
+                "runtime_packages": foundry_runtime_packages,
+                "allowed_evidence_modes": ["analytical_derivation", "synthetic_simulation"],
                 "admission_gates": [
                     "static scan", "sandbox execution", "deterministic replay",
                     "test-vector digest", "independent recalculation", "adversarial review",
@@ -1167,6 +1230,84 @@ class ComposerRunner:
             "capability_counts": deepcopy(self.topic_history.get("capability_counts", {})),
         }
 
+    def _append_topic_history_entries(self, entries):
+        """Append topic outcomes to the project-family memory atomically."""
+        entries = [deepcopy(item) for item in (entries or [])
+                   if isinstance(item, dict)
+                   and isinstance(item.get("topic_id"), str)
+                   and item["topic_id"].strip()]
+        if not entries:
+            return
+        path = self.topic_history_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = Path(str(path) + ".lock")
+        lock = lock_path.open("a+")
+        flock = None
+        try:
+            try:
+                import fcntl
+                flock = fcntl
+                flock.flock(lock.fileno(), flock.LOCK_EX)
+            except ImportError as exc:
+                raise ValidationError(
+                    "topic history requires an interprocess file lock") from exc
+            if path.is_file():
+                try:
+                    document = json.loads(path.read_text())
+                except (OSError, ValueError) as exc:
+                    raise ValidationError(f"topic history is unreadable: {path}") from exc
+                self._validate_topic_history_document(document)
+            else:
+                document = {"schema_version": "topic-history-1", "scopes": {}}
+            scope = document["scopes"].setdefault(self.topic_history_scope, {"entries": []})
+            stored_entries = scope.setdefault("entries", [])
+            comparison_entries = (
+                [item for stored_scope in document["scopes"].values()
+                 for item in stored_scope.get("entries", [])]
+                if self.workflow.get("topic_history_path") else list(stored_entries)
+            )
+            new_entries = []
+            for entry in entries:
+                fingerprint = ((entry.get("signature") or {}).get("fingerprint")
+                               if isinstance(entry.get("signature"), dict) else None)
+                duplicate = any(
+                    isinstance(item, dict)
+                    and (
+                        fingerprint
+                        and ((item.get("signature") or {}).get("fingerprint") == fingerprint)
+                        or not fingerprint
+                        and item.get("topic_id") == entry.get("topic_id")
+                        and item.get("research_question") == entry.get("research_question")
+                    )
+                    for item in comparison_entries
+                )
+                if duplicate:
+                    continue
+                stored_entries.append(entry)
+                comparison_entries.append(entry)
+                new_entries.append(entry)
+            scope["entries"] = stored_entries
+            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            temporary.write_bytes(canonical_bytes(document))
+            os.replace(temporary, path)
+            self.topic_history = self._load_topic_history()
+            if self.control is not None:
+                for entry in new_entries:
+                    self._publish(
+                        f"command/composer/topic-history/{entry['topic_id']}",
+                        "note",
+                        {"schema_version": "topic-history-entry-1",
+                         "scope_key": self.topic_history_scope, "entry": entry},
+                        "command.composer",
+                    )
+        finally:
+            if flock is not None:
+                try:
+                    flock.flock(lock.fileno(), flock.LOCK_UN)
+                except OSError:
+                    pass
+            lock.close()
+
     def _record_topic_history(self, context):
         """Append an accepted topic selection to the project-family memory."""
         topic = context.get("topic") if isinstance(context, dict) else None
@@ -1193,63 +1334,32 @@ class ComposerRunner:
             entry["refinement_cycle"] = evolution.get("cycle")
             entry["refinement_reason"] = evolution.get("reason")
             entry["changed_dimensions"] = list(evolution.get("changed_dimensions", []))
-        path = self.topic_history_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = Path(str(path) + ".lock")
-        lock = lock_path.open("a+")
-        flock = None
-        try:
-            try:
-                import fcntl
-                flock = fcntl
-                flock.flock(lock.fileno(), flock.LOCK_EX)
-            except ImportError as exc:
-                raise ValidationError(
-                    "topic history requires an interprocess file lock") from exc
-            if path.is_file():
-                try:
-                    document = json.loads(path.read_text())
-                except (OSError, ValueError) as exc:
-                    raise ValidationError(f"topic history is unreadable: {path}") from exc
-                self._validate_topic_history_document(document)
-            else:
-                document = {"schema_version": "topic-history-1", "scopes": {}}
-            scope = document["scopes"].setdefault(self.topic_history_scope, {"entries": []})
-            entries = scope.setdefault("entries", [])
-            fingerprint = entry["signature"]["fingerprint"]
-            new_entry = False
-            comparison_entries = (
-                [item for stored_scope in document["scopes"].values()
-                 for item in stored_scope.get("entries", [])]
-                if self.workflow.get("topic_history_path") else entries
-            )
-            if not any(
-                    isinstance(item, dict)
-                    and (item.get("run_id") == self.run_id
-                         or ((item.get("signature") or {}).get("fingerprint") == fingerprint))
-                    for item in comparison_entries):
-                entries.append(entry)
-                new_entry = True
-            scope["entries"] = entries
-            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-            temporary.write_bytes(canonical_bytes(document))
-            os.replace(temporary, path)
-            self.topic_history = self._load_topic_history()
-            if new_entry and self.control is not None:
-                self._publish(
-                    f"command/composer/topic-history/{topic['id']}",
-                    "note",
-                    {"schema_version": "topic-history-entry-1",
-                     "scope_key": self.topic_history_scope, "entry": entry},
-                    "command.composer",
-                )
-        finally:
-            if flock is not None:
-                try:
-                    flock.flock(lock.fileno(), flock.LOCK_UN)
-                except OSError:
-                    pass
-            lock.close()
+        self._append_topic_history_entries([entry])
+
+    def _record_topic_rejection_history(self, rejected_entries):
+        """Persist bounded topic directions rejected before survey admission."""
+        from scisaurus.runtime.topic_discovery import topic_signature
+
+        entries = []
+        for rejected in rejected_entries or []:
+            if not isinstance(rejected, dict):
+                continue
+            topic_id = rejected.get("topic_id")
+            if not isinstance(topic_id, str) or not topic_id.strip():
+                continue
+            entry = deepcopy(rejected)
+            topic = {
+                key: entry.get(key) for key in (
+                    "id", "title", "domain", "research_question", "research_form",
+                    "evidence_mode", "comparison_type")
+            }
+            topic["id"] = topic_id
+            entry.setdefault("signature", topic_signature(topic))
+            entry["history_status"] = "rejected"
+            entry["run_id"] = self.run_id
+            entry["recorded_at"] = now_iso()
+            entries.append(entry)
+        self._append_topic_history_entries(entries)
 
     def _requests_for_stage(self, stage_id):
         return [deepcopy(item) for item in self.active_research_requests
@@ -1396,6 +1506,39 @@ class ComposerRunner:
                 "id", "kind", "objective", "why", "success_condition", "evidence_needed")}
                          for item in requests],
         }
+        specialist_feedback = []
+        prior_reports = parent_context.get("specialist_reports") if isinstance(parent_context, dict) else None
+        if isinstance(prior_reports, list):
+            for report in prior_reports[:16]:
+                if not isinstance(report, dict):
+                    continue
+                response = report.get("response") if isinstance(report.get("response"), dict) else {}
+                specialist_feedback.append({
+                    "assigned_role": report.get("assigned_role"),
+                    "role_id": report.get("role_id"),
+                    "decision": response.get("decision", report.get("decision")),
+                    "summary": str(response.get("summary", report.get("summary", "")))[:2000],
+                    "findings": [str(item)[:1200] for item in (response.get("findings", []) or [])[:8]],
+                    "evidence_gaps": [str(item)[:1200] for item in (response.get("evidence_gaps", []) or [])[:8]],
+                    "requested_actions": [str(item)[:1200] for item in (response.get("requested_actions", []) or [])[:8]],
+                })
+        verifier = parent_context.get("specialist_verifier") if isinstance(parent_context, dict) else None
+        verifier_response = verifier.get("response") if isinstance(verifier, dict) else None
+        if not isinstance(verifier_response, dict):
+            verifier_response = {}
+        verifier_repair = [str(item)[:1600] for item in (
+            verifier_response.get("repair_scope") or verifier_response.get("critical_findings") or []
+        )[:12] if str(item).strip()]
+        refinement_feedback = None
+        if verifier_repair or verifier_response.get("decision") == "hold":
+            refinement_feedback = {
+                "review_type": "specialist_verifier",
+                "decision": verifier_response.get("decision"),
+                "rationale": str(verifier_response.get("rationale", ""))[:4000],
+                "required_changes": verifier_repair,
+                "critical_findings": [str(item)[:1600] for item in (
+                    verifier_response.get("critical_findings", []) or [])[:12]],
+            }
         return {
             "mode": "refinement",
             "cycle": self.continuation_cycles,
@@ -1407,6 +1550,8 @@ class ComposerRunner:
                 "research_form", "evidence_mode", "comparison_type",
             )),
             "survey_feedback": feedback,
+            "specialist_feedback": specialist_feedback,
+            "refinement_feedback": refinement_feedback,
         }
 
     def _gate_free_topic_survey(self, result, *, stage=None):
@@ -1508,6 +1653,39 @@ class ComposerRunner:
             if assignment is not None:
                 return {"dept": assignment["department"], "agent": assignment["agent"]}
         return deepcopy(COMMAND_ADDRESSES.get(role, COMMAND_ADDRESSES["arbiter"]))
+
+    @staticmethod
+    def _topic_program(topic_context):
+        """Return the validated program attached to a topic context, if any."""
+        if not isinstance(topic_context, dict):
+            return None
+        program = topic_context.get("research_program")
+        if not isinstance(program, dict):
+            return None
+        from scisaurus.runtime.research_program import validate_research_program
+        validate_research_program(program)
+        return program
+
+    @classmethod
+    def _topic_program_projection(cls, topic_context, *, max_alternatives=8):
+        program = cls._topic_program(topic_context)
+        if program is None:
+            return None
+        from scisaurus.runtime.research_program import project_research_program
+        return project_research_program(program, max_alternatives=max_alternatives)
+
+    def _attach_topic_program(self, packet):
+        """Attach the full, validated program to a scientific packet in memory."""
+        if not isinstance(packet, dict):
+            return packet
+        topic_context = next((value for value in self.context.values()
+                              if isinstance(value, dict)
+                              and value.get("kind") == "topic_discovery"
+                              and isinstance(value.get("topic"), dict)), None)
+        program = self._topic_program(topic_context)
+        if program is not None:
+            packet["research_program"] = deepcopy(program)
+        return packet
 
     @staticmethod
     def _prior_stage_project(stage_id, context):
@@ -1655,10 +1833,17 @@ class ComposerRunner:
                 f"Investigate the selected question with a bounded scholarly survey: "
                 f"{topic['research_question']}")
         if isinstance(config.get("supplied_context"), str):
+            program_projection = self._topic_program_projection(topic_context, max_alternatives=8)
+            program_context = (
+                "\nResearch program (provisional; conditional outcomes are decision rules, not results):\n"
+                + json.dumps(program_projection, ensure_ascii=False, sort_keys=True)
+                if program_projection is not None else ""
+            )
             config["supplied_context"] = (
                 "A catalog-backed free-topic intake selected this direction. "
                 "Rebuild the literature map around the current question and preserve only evidence "
-                "that is relevant to the selected study.\n" + topic["research_question"])
+                "that is relevant to the selected study.\n" + topic["research_question"]
+                + program_context)
         return config
 
     @staticmethod
@@ -1820,6 +2005,9 @@ class ComposerRunner:
                     "no network access or undeclared data",
                 ],
             }
+            program_projection = self._topic_program_projection(result, max_alternatives=8)
+            if program_projection is not None:
+                brief["research_program"] = program_projection
             required_intent = {"domain": domain, "research_question": question}
             if force_regenerate:
                 revision = continuation_revision
@@ -1954,6 +2142,12 @@ class ComposerRunner:
             f"{context}\nSelected executable capability: {capability_id}.\n"
             f"Selected research question: {selected.get('research_question', '')}"
         )
+        program_projection = self._topic_program_projection(topic_context, max_alternatives=8)
+        if program_projection is not None:
+            config["supplied_context"] += (
+                "\nResearch program (provisional; use the selected branch's kill condition and conditional outcomes):\n"
+                + json.dumps(program_projection, ensure_ascii=False, sort_keys=True)
+            )
         return config
 
     @staticmethod
@@ -2173,6 +2367,10 @@ class ComposerRunner:
             packet["research_argument"] = deepcopy(argument)
             if isinstance(argument_package.get("review"), dict):
                 packet["research_argument_review"] = deepcopy(argument_package["review"])
+            if isinstance(argument_package.get("argument_defense"), dict):
+                packet["argument_defense"] = deepcopy(argument_package["argument_defense"])
+
+        self._attach_topic_program(packet)
 
         question = results.get("question") or packet.get("study_question")
         if not isinstance(question, str) or not question.strip():
@@ -2668,6 +2866,10 @@ class ComposerRunner:
             temporary = output / f"progress-live-{uuid.uuid4().hex}.tmp"
             temporary.write_bytes(canonical_bytes(state))
             temporary.replace(output / "progress.json")
+            # Keep the heartbeat fields and specialist cards in the in-memory
+            # base as well. The next specialist event must build on the latest
+            # live state instead of restoring the last stage-boundary snapshot.
+            self._progress_snapshot = deepcopy(state)
         self.on_progress({"phase": phase, "elapsed_seconds": round(state["elapsed_seconds"], 2),
                           "remaining_seconds": round(state["remaining_seconds"], 2),
                           "stages": deepcopy(state.get("stages", {})),
@@ -2719,9 +2921,38 @@ class ComposerRunner:
             return False
         if not isinstance(terminal, dict):
             return True
-        return cls._ready_stage_ids(checkpoint) > cls._ready_stage_ids(terminal)
+        checkpoint_ready = cls._ready_stage_ids(checkpoint)
+        terminal_ready = cls._ready_stage_ids(terminal)
+        if checkpoint_ready > terminal_ready:
+            return True
+        if checkpoint_ready != terminal_ready:
+            return False
 
-    def _latest_inflight_checkpoint(self):
+        # A retrying stage can make durable progress without changing the set
+        # of ready dependencies.  Compare its attempt frontier as well, or a
+        # stale terminal report can hide the only checkpoint that tells resume
+        # which isolated attempt directory is safe to create next.
+        def attempt_counts(state):
+            stages = state.get("stages", {})
+            if not isinstance(stages, dict):
+                return {}
+            counts = {}
+            for stage_id, record in stages.items():
+                if not isinstance(record, dict):
+                    continue
+                value = record.get("attempt_count", record.get("attempt_number", 0))
+                if type(value) is int and value >= 0:
+                    counts[stage_id] = value
+            return counts
+
+        checkpoint_counts = attempt_counts(checkpoint)
+        terminal_counts = attempt_counts(terminal)
+        return any(
+            checkpoint_counts.get(stage_id, 0) > terminal_counts.get(stage_id, 0)
+            for stage_id in checkpoint_counts
+        )
+
+    def _latest_inflight_checkpoint(self, terminal=None):
         """Read the newest durable running checkpoint when output was finalized stale."""
         rows = self.control._conn.execute(
             "SELECT manifest_json FROM artifacts "
@@ -2739,6 +2970,8 @@ class ComposerRunner:
             if (isinstance(checkpoint, dict)
                     and checkpoint.get("workflow_id") == self.workflow["id"]
                     and checkpoint.get("status") == "running"):
+                if terminal is not None and not self._checkpoint_advances_terminal_state(checkpoint, terminal):
+                    continue
                 return checkpoint
         return None
 
@@ -2801,10 +3034,11 @@ class ComposerRunner:
         elif self._checkpoint_advances_terminal_state(checkpoint, head_body):
             live_checkpoint = checkpoint
         else:
-            candidate = self._latest_inflight_checkpoint()
-            live_checkpoint = (candidate
-                               if self._checkpoint_advances_terminal_state(candidate, head_body)
-                               else None)
+            # The newest running checkpoint may belong to a failed resume and
+            # may have fewer attempts than an older checkpoint from the
+            # interrupted process.  Scan until an actually advancing one is
+            # found instead of returning the first stale candidate.
+            live_checkpoint = self._latest_inflight_checkpoint(head_body)
         if isinstance(live_checkpoint, dict):
             timing_state = live_checkpoint
             self.stage_records = live_checkpoint.get("stages", self.stage_records)
@@ -2899,6 +3133,11 @@ class ComposerRunner:
                 context["interpretation"] = payload
             if stage["kind"] == "argument":
                 context["argument_package_path"] = str(output_path.resolve())
+            if (stage["kind"] == "topic_discovery" and "research_program" not in context
+                    and isinstance(context.get("candidates"), list)
+                    and isinstance(context.get("selected_id"), str)):
+                from scisaurus.runtime.research_program import build_research_program
+                context["research_program"] = build_research_program(context)
             self.context[stage_id] = context
 
     def _reconcile_interrupted_attempt(self, attempt_id):
@@ -3149,7 +3388,345 @@ class ComposerRunner:
             })
         return fields
 
-    def _run_stage(self, stage, *, attempt_number=1):
+    @staticmethod
+    def _specialist_model_config(stage, descriptor):
+        """Load the model config used by a stage, when one is declared."""
+        if not isinstance(descriptor, dict):
+            return None
+        model = descriptor.get("model")
+        if isinstance(model, dict):
+            return deepcopy(model) if model.get("base_url") and model.get("model") else None
+        model_path = descriptor.get("model_config_path")
+        if not isinstance(model_path, str) or not model_path:
+            return None
+        path = Path(model_path)
+        if not path.is_file():
+            return None
+        try:
+            model = json.loads(path.read_text())
+        except (OSError, ValueError, TypeError):
+            return None
+        return deepcopy(model) if isinstance(model, dict) and model.get("base_url") and model.get("model") else None
+
+    @staticmethod
+    def _specialist_provider_pools(descriptor):
+        limits = descriptor.get("limits") if isinstance(descriptor, dict) else None
+        pools = limits.get("provider_pools") if isinstance(limits, dict) else None
+        return deepcopy(pools) if isinstance(pools, dict) else None
+
+    def _specialist_file_ref(self, artifact):
+        """Return the dashboard-safe object path for a Composer artifact."""
+        body_hash = artifact.get("body_hash") if isinstance(artifact, dict) else None
+        if not isinstance(body_hash, str) or len(body_hash) != 64:
+            return None
+        return f"composer::objects/sha256/{body_hash}"
+
+    def _specialist_stage_result_projection(self, stage, stage_result):
+        """Expose named scientific inputs from a completed stage result.
+
+        Topic discovery is the graph frontier: it has no upstream context from
+        which its seed plan, candidate portfolio, or source records could be
+        projected.  Its specialists therefore review the generated result,
+        while later stages retain the normal pre-execution planning packet.
+        The aliases below keep role contracts stable without forwarding the
+        whole result into any one prompt.
+        """
+        if not isinstance(stage_result, dict):
+            return {}
+        projected = deepcopy(stage_result)
+        if stage.get("kind") != "topic_discovery":
+            return projected
+
+        frontier_plan = stage_result.get("frontier_seed_plan")
+        seeds = (frontier_plan.get("seeds", [])
+                 if isinstance(frontier_plan, dict) else [])
+        recent_papers = stage_result.get("recent_papers")
+        if not isinstance(recent_papers, list):
+            recent_papers = []
+        candidate_prior_work = stage_result.get("candidate_prior_work")
+        if not isinstance(candidate_prior_work, list):
+            candidate_prior_work = []
+        topic = stage_result.get("topic")
+        if not isinstance(topic, dict):
+            topic = {}
+        selected_seed_id = topic.get("frontier_seed_id")
+        selected_domain = topic.get("domain")
+        selected_seed_records = [
+            deepcopy(item) for item in (candidate_prior_work or recent_papers)
+            if isinstance(item, dict)
+            and (
+                selected_seed_id is None
+                or item.get("frontier_seed_id") == selected_seed_id
+                or (
+                    item.get("frontier_seed_id") == "selected_direction"
+                    and selected_domain
+                    and item.get("frontier_domain") == selected_domain
+                )
+            )
+        ]
+
+        projected.update({
+            "candidate_topics": deepcopy(stage_result.get("candidates", [])),
+            "frontier_seeds": deepcopy(seeds),
+            "scholarly_records": deepcopy(recent_papers),
+            # The broad sample is useful for frontier scouting but is not
+            # evidence for the selected direction. Keep both scopes named so
+            # role projections and the verifier cannot mistake inspiration
+            # records from other seeds for selected-topic support.
+            "frontier_inspiration_records": deepcopy(recent_papers),
+            "selected_seed_id": selected_seed_id,
+            "selected_seed_records": selected_seed_records,
+            "topic_history": self._topic_history_context(),
+            "known_gaps": deepcopy(stage_result.get("proposed_gap", "")),
+            "source_classes": sorted({
+                item.get("source_class") for item in recent_papers
+                if isinstance(item, dict) and isinstance(item.get("source_class"), str)
+            }),
+            "search_results": deepcopy(candidate_prior_work or selected_seed_records or recent_papers),
+            "prior_work": deepcopy(candidate_prior_work or selected_seed_records or recent_papers),
+            "experiment_feasibility": deepcopy(stage_result.get("feasibility_check", {})),
+            "research_question": stage_result.get("question") or topic.get("research_question"),
+            "search_terms": deepcopy(stage_result.get("search_queries", topic.get("search_queries", []))),
+            "candidate_methods": deepcopy(topic.get("resource_plan", "")),
+            "capability_inventory": deepcopy(stage_result.get("feasibility_check", {})),
+        })
+        return projected
+
+    def _specialist_stage_packet(self, stage, descriptor, *, stage_result=None):
+        """Build a bounded, non-secret packet for specialist input projection."""
+        packet = {
+            "objective": self.workflow["objective"],
+            "stage_id": stage["id"],
+            "stage_kind": stage["kind"],
+            "dependencies": deepcopy(self.context),
+            "stage_result": self._specialist_stage_result_projection(
+                stage, stage_result or {}),
+            "configured_stage": {
+                key: deepcopy(value) for key, value in (descriptor or {}).items()
+                if key not in {"model", "model_config_path", "bibliography"}
+            },
+        }
+        if stage["kind"] == "topic_discovery":
+            model = self._specialist_model_config(stage, descriptor)
+            if model is not None:
+                packet["runtime_context"] = self._runtime_context(model)
+        return packet
+
+    def _specialist_progress(self, stage_id, event):
+        """Publish a thread-safe live projection without touching SQLite."""
+        if not isinstance(event, dict):
+            return
+        role = event.get("role")
+        if not isinstance(role, str):
+            return
+        live = {key: deepcopy(event.get(key)) for key in (
+            "event", "role", "role_id", "task_id", "stage_id", "model_role", "route_id",
+            "provider_pool", "model", "base_url", "cache_prompt", "execution_mode", "status",
+            "decision", "elapsed_seconds", "error", "attempts", "usage", "artifact_ref",
+            "response_ref",
+        ) if key in event}
+        live["observed_at"] = now_iso()
+        now = self.clock()
+        remaining_snapshot = self.deadline - now
+        if isinstance(self.deadline_epoch, (int, float)) and math.isfinite(self.deadline_epoch):
+            remaining_snapshot = min(remaining_snapshot, self.deadline_epoch - time.time())
+        with self._progress_lock:
+            state = deepcopy(self._progress_snapshot)
+            state.update({
+                "phase": f"{stage_id}:specialists",
+                "elapsed_seconds": max(0.0, now - self.started),
+                "remaining_seconds": max(0.0, remaining_snapshot),
+                "started_at_epoch": self.started_epoch,
+                "deadline_at_epoch": self.deadline_epoch,
+            })
+            stage_record = state.setdefault("stages", {}).setdefault(stage_id, {})
+            previous = stage_record.setdefault("specialist_live", {}).get(role, {})
+            if isinstance(previous, dict) and event.get("event") == "completed":
+                live = {**previous, **live}
+                live.setdefault("started_at", previous.get("observed_at"))
+            if event.get("event") == "dispatched":
+                live["started_at"] = live["observed_at"]
+            live["updated_at"] = live["observed_at"]
+            stage_record["specialist_live"][role] = live
+            self._progress_snapshot = deepcopy(state)
+            output = self.root / "output"
+            output.mkdir(parents=True, exist_ok=True)
+            temporary = output / f"progress-specialist-{uuid.uuid4().hex}.tmp"
+            temporary.write_bytes(canonical_bytes(state))
+            temporary.replace(output / "progress.json")
+
+    def _run_specialist_pool(self, stage, stage_assignment, descriptor, *, stage_result=None):
+        """Run the admitted specialist assignments in a bounded provider pool."""
+        model = self._specialist_model_config(stage, descriptor)
+        if model is None or not isinstance(stage_assignment, dict):
+            return {"reports": [], "by_role": {}, "usage": {}, "model_enabled": False}
+        assignments = [item for item in stage_assignment.get("assignments", [])
+                       if isinstance(item, dict) and item.get("assignment_phase") == "specialist"]
+        if not assignments:
+            return {"reports": [], "by_role": {}, "usage": {}, "model_enabled": False}
+        limits = descriptor.get("limits") if isinstance(descriptor, dict) else {}
+        max_parallel = limits.get("concurrent_calls") if isinstance(limits, dict) else None
+        if type(max_parallel) is not int or max_parallel < 1:
+            max_parallel = min(4, len(assignments))
+        deadline = time.monotonic() + min(float(stage["deadline_seconds"]), self._remaining())
+        packet = self._specialist_stage_packet(
+            stage, descriptor, stage_result=stage_result)
+        dispatcher = SpecialistDispatcher(
+            model, provider_pools=self._specialist_provider_pools(descriptor),
+            max_parallel=min(max_parallel, len(assignments)), deadline=deadline,
+            on_progress=lambda event: self._specialist_progress(stage["id"], event),
+        )
+        reports = dispatcher.dispatch(assignments, packet)
+        by_role = {}
+        for report in reports:
+            role_id = report.get("role_id")
+            if isinstance(role_id, str):
+                by_role[role_id] = report
+        return {
+            "reports": reports,
+            "by_role": by_role,
+            "packet": packet,
+            "usage": self._specialist_usage(reports),
+            "model_enabled": True,
+        }
+
+    @staticmethod
+    def _specialist_usage(reports):
+        totals = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
+        by_role = {}
+        for report in reports if isinstance(reports, list) else []:
+            if not isinstance(report, dict):
+                continue
+            role_id = report.get("role_id") or report.get("assigned_role")
+            usage = report.get("usage") if isinstance(report.get("usage"), dict) else {}
+            if isinstance(role_id, str):
+                by_role[role_id] = deepcopy(usage)
+            for key in totals:
+                value = usage.get(key, 0)
+                if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                    totals[key] += value
+        totals["by_role"] = by_role
+        return totals
+
+    def _publish_specialist_reports(self, stage, stage_assignment, bundle):
+        """Persist each specialist's independent response in its own namespace."""
+        if not bundle.get("model_enabled"):
+            return bundle
+        packet = bundle.get("packet") if isinstance(bundle.get("packet"), dict) else {}
+        packet_digest = hashlib.sha256(canonical_bytes(packet)).hexdigest()
+        updated = {}
+        rows = [item for item in stage_assignment.get("assignments", [])
+                if isinstance(item, dict) and item.get("assignment_phase") == "specialist"]
+        reports = bundle.get("by_role", {})
+        for row in rows:
+            report = deepcopy(reports.get(row.get("role_id")))
+            if not isinstance(report, dict):
+                report = {
+                    "status": "failed", "execution_mode": "model",
+                    "assigned_role": row.get("assigned_role"), "role_id": row.get("role_id"),
+                    "error": "specialist dispatcher returned no report", "usage": {},
+                }
+            body = {
+                "schema_version": "specialist-execution-1",
+                "project_id": self.workflow["project_id"],
+                "stage_id": stage["id"], "stage_kind": stage["kind"],
+                "attempt_number": stage_assignment.get("attempt_number"),
+                "assigned_role": row.get("assigned_role"), "role_id": row.get("role_id"),
+                "model_role": row.get("model_role"),
+                "assignment_id": row.get("assignment_id"),
+                "task_id": row.get("task_id"),
+                "input_ref": row.get("input_ref"), "input_digest": packet_digest,
+                "report": report,
+                "created_at": now_iso(),
+            }
+            artifact = self._publish(
+                f"{row['assignment_logical_id']}/execution", "report", body,
+                row["assigned_role"],
+            )
+            report["artifact_ref"] = artifact["artifact_ref"]
+            self._specialist_progress(stage["id"], {
+                "event": "completed", "role": row.get("assigned_role"),
+                "role_id": row.get("role_id"), "task_id": row.get("task_id"),
+                "stage_id": stage["id"], "execution_mode": report.get("execution_mode"),
+                "status": report.get("status"), "decision": report.get("decision"),
+                "usage": report.get("usage", {}), "elapsed_seconds": report.get("elapsed_seconds"),
+                "artifact_ref": report.get("artifact_ref"),
+                "response_ref": self._specialist_file_ref(artifact),
+                "error": report.get("error"),
+            })
+            updated[row.get("role_id")] = report
+        bundle["by_role"] = updated
+        bundle["reports"] = list(updated.values())
+        bundle["usage"] = self._specialist_usage(bundle["reports"])
+        return bundle
+
+    def _run_specialist_verifier(self, stage, stage_assignment, descriptor, bundle, chief_result,
+                                 *, stage_result=None):
+        """Run the queued adversary after producer calls and chief output exist."""
+        model = self._specialist_model_config(stage, descriptor)
+        if model is None or not isinstance(stage_assignment, dict):
+            return None
+        verifier = next((item for item in stage_assignment.get("assignments", [])
+                         if isinstance(item, dict) and item.get("assignment_phase") == "verifier"), None)
+        if verifier is None:
+            return None
+        # The verifier must see the same concrete stage result that the
+        # producer specialists reviewed. ``chief_result`` is the stage
+        # outcome/ledger projection and may omit or rewrite scientific fields;
+        # using it as the sole packet source made a valid frontier seed plan
+        # appear empty to the adversary.
+        packet_source = stage_result if isinstance(stage_result, dict) else chief_result
+        packet = self._specialist_stage_packet(stage, descriptor, stage_result=packet_source)
+        packet["chief_result"] = deepcopy(chief_result)
+        packet["specialist_reports"] = deepcopy(bundle.get("reports", []))
+        verifier = deepcopy(verifier)
+        verifier["_prompt"] = build_verifier_prompt(
+            stage, packet, bundle.get("reports", []), chief_result,
+            max_input_tokens=(verifier.get("quota", {}) or {}).get("max_input_tokens"))
+        limits = descriptor.get("limits") if isinstance(descriptor, dict) else {}
+        max_parallel = limits.get("concurrent_calls") if isinstance(limits, dict) else 1
+        if type(max_parallel) is not int or max_parallel < 1:
+            max_parallel = 1
+        deadline = time.monotonic() + min(float(stage["deadline_seconds"]), self._remaining())
+        dispatcher = SpecialistDispatcher(
+            model, provider_pools=self._specialist_provider_pools(descriptor),
+            max_parallel=1, deadline=deadline,
+            on_progress=lambda event: self._specialist_progress(stage["id"], event),
+        )
+        result = dispatcher.dispatch([verifier], packet, verifier=True)
+        report = result[0] if result else {
+            "status": "failed", "error": "verifier dispatcher returned no report", "usage": {},
+        }
+        body = {
+            "schema_version": "specialist-verifier-execution-1",
+            "project_id": self.workflow["project_id"],
+            "stage_id": stage["id"], "stage_kind": stage["kind"],
+            "attempt_number": stage_assignment.get("attempt_number"),
+            "assigned_role": verifier.get("assigned_role"), "role_id": verifier.get("role_id"),
+            "model_role": verifier.get("model_role"),
+            "assignment_id": verifier.get("assignment_id"), "task_id": verifier.get("task_id"),
+            "chief_result": chief_result, "specialist_reports": bundle.get("reports", []),
+            "report": report, "created_at": now_iso(),
+        }
+        artifact = self._publish(
+            f"{verifier['assignment_logical_id']}/execution", "report", body,
+            verifier["assigned_role"],
+        )
+        report["artifact_ref"] = artifact["artifact_ref"]
+        self._specialist_progress(stage["id"], {
+            "event": "completed", "role": verifier.get("assigned_role"),
+            "role_id": verifier.get("role_id"), "task_id": verifier.get("task_id"),
+            "stage_id": stage["id"], "model_role": verifier.get("model_role"),
+            "execution_mode": report.get("execution_mode"), "status": report.get("status"),
+            "decision": (report.get("response") or {}).get("decision") if isinstance(report.get("response"), dict) else None,
+            "usage": report.get("usage", {}), "elapsed_seconds": report.get("elapsed_seconds"),
+            "artifact_ref": report.get("artifact_ref"),
+            "response_ref": self._specialist_file_ref(artifact),
+            "error": report.get("error"),
+        })
+        return report
+
+    def _run_stage(self, stage, *, attempt_number=1, specialist_reports=None):
         """Dispatch one allowlisted specialist runner and return its context."""
         kind = stage["kind"]
         project_dir = Path(stage["project_dir"])
@@ -3177,6 +3754,11 @@ class ComposerRunner:
                     context["results_package"] = prior.get("results_package")
                 if stage["kind"] == "argument":
                     context["argument_package_path"] = context["output_path"]
+                if (stage["kind"] == "topic_discovery" and "research_program" not in context
+                        and isinstance(context.get("candidates"), list)
+                        and isinstance(context.get("selected_id"), str)):
+                    from scisaurus.runtime.research_program import build_research_program
+                    context["research_program"] = build_research_program(context)
                 self._publish(f"command/composer/reuse/{stage['id']}-{len(self.feedback) + 1}",
                               "decision_note", {
                                   "stage_id": stage["id"], "action": "reuse_completed_stage",
@@ -3240,8 +3822,8 @@ class ComposerRunner:
                     or any(item.get("kind") == "paper" for item in self.workflow["stages"])):
                 maturity_rounds = 2
             try:
-                result = runner.run(
-                    self.workflow["objective"],
+                topic_kwargs = dict(
+                    objective=self.workflow["objective"],
                     candidate_count=descriptor["candidate_count"],
                     max_attempts=descriptor["max_attempts"],
                     repair_mode=descriptor.get("repair_mode", "bounded"),
@@ -3251,6 +3833,11 @@ class ComposerRunner:
                     sampling_seed=self._topic_sampling_seed(),
                     maturity_review_rounds=maturity_rounds,
                     refinement_context=self._topic_refinement_context(stage),
+                )
+                if specialist_reports:
+                    topic_kwargs["specialist_reports"] = deepcopy(specialist_reports)
+                result = runner.run(
+                    **topic_kwargs,
                 )
             except ProviderCooldownError:
                 raise
@@ -3262,19 +3849,38 @@ class ComposerRunner:
                         and descriptor.get("repair_mode", "bounded") == "bounded"):
                     snapshot = getattr(exc, "topic_budget", {})
                     snapshot = snapshot if isinstance(snapshot, dict) else {}
-                    raise QuotaExceededError(
+                    quota_error = QuotaExceededError(
                         "topic discovery bounded intake exhausted after "
                         f"{descriptor['max_attempts']} attempts: {exc}",
                         dimension="topic_attempts", limit=descriptor["max_attempts"],
                         observed=descriptor["max_attempts"],
                         usage=snapshot.get("usage", {}),
                         diagnostics=snapshot.get("events", []),
-                    ) from exc
+                    )
+                    # Preserve the bounded runner's scientific trace when the
+                    # Composer wraps its validation error as a quota error.
+                    # Without this handoff, the run kept provider events but
+                    # lost which candidate and review caused each retry.
+                    for attribute in ("candidate_attempt_trace", "maturity_review_history",
+                                      "rejected_topic_history"):
+                        value = getattr(exc, attribute, None)
+                        if isinstance(value, list):
+                            setattr(quota_error, attribute, deepcopy(value))
+                    raise quota_error from exc
                 raise
             output_path = Path(descriptor["output_path"])
             if attempt_number > 1 or stage["id"] in self.reopened_stage_ids:
                 output_path = Path(stage["project_dir"]) / output_path.name
             output_path.parent.mkdir(parents=True, exist_ok=True)
+            if (result.get("schema_version") == "topic-discovery-1"
+                    and isinstance(result.get("candidates"), list)
+                    and isinstance(result.get("selected_id"), str)):
+                from scisaurus.runtime.research_program import build_research_program
+                research_program = build_research_program(result)
+                research_program_path = output_path.parent / "research-program.json"
+                research_program_path.write_bytes(canonical_bytes(research_program))
+                result["research_program"] = research_program
+                result["research_program_path"] = str(research_program_path.resolve())
             output_path.write_bytes(canonical_bytes(result))
         elif kind in {"survey", "experiment"}:
             if kind == "survey":
@@ -3355,6 +3961,7 @@ class ComposerRunner:
                 raise ValidationError(f"interpretation descriptor has unknown fields: {sorted(config)}")
             packet = json.loads(input_path.read_text())
             packet = self._project_continuation_requests(packet, stage)
+            packet = self._attach_topic_program(packet)
             for binding in stage["bindings"]:
                 if binding["target"].startswith("packet."):
                     value = self._source_value(binding["source"])
@@ -3379,6 +3986,7 @@ class ComposerRunner:
             if config:
                 raise ValidationError(f"argument descriptor has unknown fields: {sorted(config)}")
             packet = json.loads(input_path.read_text())
+            packet = self._attach_topic_program(packet)
             for binding in stage["bindings"]:
                 if binding["target"].startswith("packet."):
                     value = self._source_value(binding["source"])
@@ -3432,6 +4040,7 @@ class ComposerRunner:
                         "paper descriptor research_redteam_max_attempts must be an integer from 1 to 8")
             packet = json.loads(Path(config["packet_path"]).read_text())
             packet = self._project_continuation_requests(packet, stage)
+            packet = self._attach_topic_program(packet)
             model = json.loads(Path(config["model_config_path"]).read_text())
             paper_config = json.loads(Path(config["paper_config_path"]).read_text())
             draft = (json.loads(Path(config["draft_path"]).read_text())
@@ -3932,6 +4541,8 @@ class ComposerRunner:
                         self._checkpoint(f"{stage_id}:admitted", force=True)
                         stop_live_progress = self._start_live_progress(attempt_stage)
                         stage_assignment = None
+                        specialist_bundle = {"reports": [], "by_role": {}, "usage": {}, "model_enabled": False}
+                        specialist_verifier = None
                         try:
                             stage_assignment = self.departments.begin_stage(
                                 stage_id, stage["kind"], attempt_number=attempt_number,
@@ -3958,13 +4569,81 @@ class ComposerRunner:
                                 "assignment_ids": deepcopy(stage_assignment["assignment_ids"]),
                             })
                             self._checkpoint(f"{stage_id}:specialists_admitted", force=True)
-                            context = (self._run_stage(attempt_stage)
-                                       if attempt_number == 1
-                                       else self._run_stage(attempt_stage, attempt_number=attempt_number))
+                            try:
+                                descriptor = json.loads(Path(attempt_stage["config_path"]).read_text())
+                            except (OSError, ValueError, TypeError):
+                                descriptor = {}
+                            # Topic discovery is the graph frontier and has no
+                            # upstream scientific packet. Running its
+                            # specialists first would therefore hand them an
+                            # empty candidate/seed/source projection. Generate
+                            # the bounded topic package first, then dispatch
+                            # the same admitted roles as an independent review
+                            # of that concrete result. Downstream stages keep
+                            # the normal plan-before-run ordering because they
+                            # do have an upstream packet to inspect.
+                            if stage["kind"] == "topic_discovery":
+                                prior_topic_reports = None
+                                if stage_id in self.reopened_stage_ids:
+                                    prior_topic_context = self.context.get(stage_id, {})
+                                    if isinstance(prior_topic_context, dict):
+                                        prior_topic_reports = prior_topic_context.get(
+                                            "specialist_reports")
+                                if attempt_number == 1:
+                                    context = self._run_stage(
+                                        attempt_stage, specialist_reports=prior_topic_reports)
+                                else:
+                                    context = self._run_stage(
+                                        attempt_stage, attempt_number=attempt_number,
+                                        specialist_reports=prior_topic_reports)
+                                specialist_bundle = self._run_specialist_pool(
+                                    attempt_stage, stage_assignment, descriptor,
+                                    stage_result=context)
+                            else:
+                                specialist_bundle = self._run_specialist_pool(
+                                    attempt_stage, stage_assignment, descriptor)
+                            specialist_bundle = self._publish_specialist_reports(
+                                attempt_stage, stage_assignment, specialist_bundle)
+                            specialist_reports = specialist_bundle.get("reports", [])
+                            if stage["kind"] != "topic_discovery":
+                                if attempt_number == 1:
+                                    context = (self._run_stage(
+                                        attempt_stage, specialist_reports=specialist_reports)
+                                        if specialist_reports else self._run_stage(attempt_stage))
+                                else:
+                                    context = (self._run_stage(
+                                        attempt_stage, attempt_number=attempt_number,
+                                        specialist_reports=specialist_reports)
+                                        if specialist_reports else self._run_stage(
+                                            attempt_stage, attempt_number=attempt_number))
                             outcome = context.get("status")
                             if outcome not in {"completed", "accepted", "candidate_needs_review",
                                                "research_expansion_required", "review_rejected"}:
                                 raise ValidationError(f"stage {stage_id} did not complete: {outcome}")
+                            context["specialist_reports"] = deepcopy(specialist_reports)
+                            context["specialist_usage"] = deepcopy(specialist_bundle.get("usage", {}))
+                            merged_usage = deepcopy(context.get("usage", {}))
+                            if not isinstance(merged_usage, dict):
+                                merged_usage = {}
+                            for key in ("model_calls", "input_tokens", "output_tokens"):
+                                value = specialist_bundle.get("usage", {}).get(key, 0)
+                                if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                                    merged_usage[key] = merged_usage.get(key, 0) + value
+                            merged_usage["by_role"] = deepcopy(
+                                specialist_bundle.get("usage", {}).get("by_role", {}))
+                            context["usage"] = merged_usage
+                            specialist_verifier = self._run_specialist_verifier(
+                                attempt_stage, stage_assignment, descriptor,
+                                specialist_bundle, context, stage_result=context)
+                            if specialist_verifier is not None:
+                                context["specialist_verifier"] = deepcopy(specialist_verifier)
+                                verdict = (specialist_verifier.get("response", {})
+                                           if isinstance(specialist_verifier, dict) else {})
+                                if (specialist_verifier.get("status") != "succeeded"
+                                        or not isinstance(verdict, dict)
+                                        or verdict.get("decision") != "accept"):
+                                    outcome = "review_rejected"
+                                    context["status"] = outcome
                             if stage["kind"] == "topic_discovery":
                                 # Record the direction at admission time, even
                                 # when a later survey or experiment hold stops
@@ -3979,7 +4658,9 @@ class ComposerRunner:
                             assignment_result = self.departments.finish_stage(
                                 stage_id, stage["kind"], attempt_number=attempt_number,
                                 outcome=outcome, output_ref=context.get("output_path"),
-                                usage=context.get("usage", {}), actor="command.composer")
+                                usage=context.get("usage", {}), actor="command.composer",
+                                specialist_results=specialist_bundle.get("by_role", {}),
+                                verifier_result=specialist_verifier)
                             self.department_activity.append({
                                 "cycle": self.continuation_cycles,
                                 "action": "complete_specialist_pool",
@@ -4042,7 +4723,9 @@ class ComposerRunner:
                                         stage_id, stage["kind"], attempt_number=attempt_number,
                                         outcome="blocked", output_ref=None,
                                         usage=failure_usage, error=exc,
-                                        actor="command.composer")
+                                        actor="command.composer",
+                                        specialist_results=specialist_bundle.get("by_role", {}),
+                                        verifier_result=specialist_verifier)
                                     self.department_activity.append({
                                         "cycle": self.continuation_cycles,
                                         "action": "fail_specialist_pool",
@@ -4178,10 +4861,23 @@ class ComposerRunner:
                     }
                     blocker = {"stage_id": stage_id, "reason": str(error),
                                "attempts": len(attempt_history)}
+                    if stage["kind"] == "topic_discovery":
+                        rejected_history = getattr(error, "rejected_topic_history", None)
+                        if isinstance(rejected_history, list) and rejected_history:
+                            try:
+                                self._record_topic_rejection_history(rejected_history)
+                            except Exception as history_error:
+                                blocker["topic_history_error"] = (
+                                    f"{type(history_error).__name__}: {history_error}")
                     if isinstance(getattr(error, "usage", None), dict) and error.usage:
                         blocker["usage"] = deepcopy(error.usage)
                     if isinstance(getattr(error, "diagnostics", None), list) and error.diagnostics:
                         blocker["diagnostics"] = deepcopy(error.diagnostics)
+                    for attribute in ("candidate_attempt_trace", "maturity_review_history",
+                                      "rejected_topic_history"):
+                        value = getattr(error, attribute, None)
+                        if isinstance(value, list) and value:
+                            blocker[attribute] = deepcopy(value)
                     self.blockers.append(blocker)
                     self._record_blocker_feedback(stage, error)
                     self.status = "blocked"

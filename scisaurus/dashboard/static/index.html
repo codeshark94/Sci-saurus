@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>Sci-saurus · Research Console</title>
   <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/styles.css?v=12">
+    <link rel="stylesheet" href="/assets/styles.css?v=15">
 </head>
 <body>
   <div class="app-shell">
@@ -171,6 +171,23 @@
           </div>
           <div class="research-progress-grid" id="research-progress">
             <div class="loading-block">Loading research progress…</div>
+          </div>
+          <div class="research-logic-heading">
+            <div class="research-label">DECISION SURFACE</div>
+            <div class="section-caption" id="research-logic-caption">provisional branches and claim controls</div>
+          </div>
+          <div class="research-logic-grid">
+            <article class="research-card research-logic-card" id="research-program-panel">
+              <div class="research-card-heading"><span>BRANCH PORTFOLIO</span><strong id="research-program-status">not recorded</strong></div>
+              <div id="research-program-summary" class="research-logic-summary"></div>
+              <div id="research-branch-list" class="research-branch-list"></div>
+            </article>
+            <article class="research-card research-logic-card" id="argument-defense-panel">
+              <div class="research-card-heading"><span>ARGUMENT DEFENSE</span><strong id="argument-defense-status">not recorded</strong></div>
+              <div id="argument-defense-summary" class="research-logic-summary"></div>
+              <div id="argument-claim-list" class="research-claim-list"></div>
+              <div id="argument-weak-list" class="research-weak-list"></div>
+            </article>
           </div>
         </section>
 
@@ -363,6 +380,6 @@
     <div class="inspector-footer"><span>Only validated Composer workflows under this workspace can be created or started.</span></div>
   </dialog>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script src="/assets/app.js?v=11" defer></script>
+  <script src="/assets/app.js?v=13" defer></script>
 </body>
 </html>

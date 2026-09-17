@@ -471,7 +471,9 @@ def agent_roster(charters):
             "reviewer_role_id": None,
             "reviewer_agent": None,
             "activation": "on_demand",
-            "quota": {"max_calls": 1, "max_input_tokens": 16000,
+            # Reserve one bounded repair/fallback call for malformed model
+            # output; a verifier still has only one accepted verdict.
+            "quota": {"max_calls": 2, "max_input_tokens": 16000,
                       "max_output_tokens": 6000, "max_seconds": 900},
             "internal_role_aliases": [],
             "stage_kinds": list(charter["stage_kinds"]),
@@ -853,7 +855,9 @@ class DepartmentRuntime:
                 "input_projection": ["objective", "stage_packet", "assignment_results", "producer_claims"],
                 "independent_review": True, "reviewer_role_id": None,
                 "reviewer_agent": None,
-                "quota": {"max_calls": 1, "max_input_tokens": 16000,
+                # Reserve one bounded repair/fallback call for malformed model
+                # output; a verifier still has only one accepted verdict.
+                "quota": {"max_calls": 2, "max_input_tokens": 16000,
                           "max_output_tokens": 6000, "max_seconds": 900},
                 "activation": "on_demand", "internal_role_aliases": [],
             }
@@ -1570,7 +1574,9 @@ class DepartmentRuntime:
             "system_contract": "Independently challenge the chief synthesis and specialist result.",
             "input_projection": ["stage_packet", "assignment_results", "chief_synthesis"],
             "input_ref": input_projection_ref,
-            "quota": {"max_calls": 1, "max_input_tokens": 16000,
+            # Reserve one bounded repair/fallback call for malformed model
+            # output; a verifier still has only one accepted verdict.
+            "quota": {"max_calls": 2, "max_input_tokens": 16000,
                       "max_output_tokens": 6000, "max_seconds": min(900, float(deadline_seconds))},
             "reserved_seconds": min(900.0, float(deadline_seconds)),
             "deadline_seconds": float(deadline_seconds), "deadline_at_epoch": deadline_at_epoch,
@@ -1638,7 +1644,8 @@ class DepartmentRuntime:
         }
 
     def finish_stage(self, stage_id, stage_kind, *, attempt_number=1, outcome,
-                     output_ref=None, usage=None, error=None, actor="command.composer"):
+                     output_ref=None, usage=None, error=None, actor="command.composer",
+                     specialist_results=None, verifier_result=None):
         """Close specialist assignments, then publish chief synthesis and an independent verdict."""
         route = self.stage_route(stage_kind)
         rows = self._assignment_task_rows(stage_id=stage_id, attempt_number=attempt_number)
@@ -1656,6 +1663,7 @@ class DepartmentRuntime:
         unknown = outcome == "result_unknown"
         stage_usage = deepcopy(usage) if isinstance(usage, dict) else {}
         by_role_usage = stage_usage.get("by_role") if isinstance(stage_usage.get("by_role"), dict) else {}
+        result_by_role = specialist_results if isinstance(specialist_results, dict) else {}
         assignment_results = []
         for item in rows:
             if item.get("assignment_phase") == "verifier":
@@ -1663,13 +1671,23 @@ class DepartmentRuntime:
             task_id = item["task_id"]
             task_state = item["task_state"]
             attempt_id = item.get("attempt_id")
-            assignment_outcome = "result_unknown" if unknown else "succeeded" if known_success else "failed"
+            specialist = result_by_role.get(item.get("role_id"))
+            reported = specialist.get("status") if isinstance(specialist, dict) else None
+            if unknown:
+                assignment_outcome = "result_unknown"
+            elif reported in {"succeeded", "failed", "result_unknown"}:
+                # The stage result and the child execution result are separate
+                # scopes. A chief/stage failure must not rewrite a specialist
+                # that already returned a known result as failed.
+                assignment_outcome = reported
+            else:
+                assignment_outcome = "succeeded" if known_success else "failed"
             if attempt_id and item.get("attempt_state") == "started":
                 if assignment_outcome == "result_unknown":
                     self.tasks.reconcile_unknown(attempt_id, actor)
                 else:
                     self.tasks.finish_attempt(attempt_id, assignment_outcome,
-                                              usage=by_role_usage.get(item.get("role_id"), {}))
+                                              usage=(specialist or {}).get("usage", by_role_usage.get(item.get("role_id"), {})))
             if assignment_outcome == "result_unknown":
                 task_state = self.tasks.get(task_id)["state"]
             elif assignment_outcome == "succeeded":
@@ -1678,8 +1696,8 @@ class DepartmentRuntime:
                                                        reason="stage result returned")["state"]
             elif task_state == "running":
                 task_state = self.tasks.transition(task_id, "failed", actor,
-                                                   reason=str(error or outcome))["state"]
-            role_usage = deepcopy(by_role_usage.get(item.get("role_id"), {}))
+                                                   reason=str((specialist or {}).get("error") or error or outcome))["state"]
+            role_usage = deepcopy((specialist or {}).get("usage", by_role_usage.get(item.get("role_id"), {})))
             result_body = {
                 "schema_version": "department-assignment-1", "project_id": self.project_id,
                 **{key: deepcopy(item[key]) for key in item if key not in {"task_state", "attempt_state", "attempt_usage"}},
@@ -1688,6 +1706,7 @@ class DepartmentRuntime:
                 "usage": role_usage,
                 "usage_scope": "role" if item.get("role_id") in by_role_usage else "stage_unattributed",
                 "stage_usage": deepcopy(stage_usage), "error": str(error) if error else None,
+                "execution_artifact_ref": (specialist or {}).get("artifact_ref"),
                 "verifier_agent": route["verifier_agent"], "updated_at": now_iso(),
             }
             logical = item["assignment_logical_id"]
@@ -1698,7 +1717,8 @@ class DepartmentRuntime:
                                        "role_id": item["role_id"], "agent": item["assigned_role"],
                                        "task_state": task_state, "outcome": assignment_outcome,
                                        "artifact_ref": artifact["artifact_ref"],
-                                       "usage": role_usage})
+                                       "usage": role_usage,
+                                       "execution_artifact_ref": (specialist or {}).get("artifact_ref")})
 
         chief_agent = route["owner_address"]["dept"] + "." + route["owner_address"]["agent"]
         synthesis_logical = (
@@ -1713,6 +1733,9 @@ class DepartmentRuntime:
             "assignment_refs": [item["artifact_ref"] for item in assignment_results],
             "output_ref": str(output_ref) if output_ref else None, "outcome": outcome,
             "usage": deepcopy(stage_usage), "error": str(error) if error else None,
+            "specialist_outcomes": {
+                item["role_id"]: item["outcome"] for item in assignment_results
+            },
             "verifier_agent": route["verifier_agent"],
             "independence_check": chief_agent != route["verifier_agent"],
             "created_at": now_iso(),
@@ -1729,9 +1752,21 @@ class DepartmentRuntime:
         verifier_payload = deepcopy(verifier)
         verifier_payload["attempt_id"] = verifier_attempt_id
         verifier_payload["chief_synthesis_ref"] = synthesis_artifact["artifact_ref"]
-        verifier_outcome = "result_unknown" if unknown else "accepted" if known_success and outcome in {
-            "completed", "accepted", "candidate_needs_review"} else "hold" if known_success else "failed"
-        verifier_execution = "succeeded" if verifier_outcome != "result_unknown" else "result_unknown"
+        if isinstance(verifier_result, dict):
+            verifier_status = verifier_result.get("status")
+            verifier_response = verifier_result.get("response")
+            if verifier_status == "result_unknown":
+                verifier_outcome, verifier_execution = "result_unknown", "result_unknown"
+            elif verifier_status != "succeeded":
+                verifier_outcome, verifier_execution = "failed", "failed"
+            else:
+                decision = verifier_response.get("decision") if isinstance(verifier_response, dict) else None
+                verifier_outcome = "accepted" if known_success and decision == "accept" else "hold" if known_success else "failed"
+                verifier_execution = "succeeded"
+        else:
+            verifier_outcome = "result_unknown" if unknown else "accepted" if known_success and outcome in {
+                "completed", "accepted", "candidate_needs_review"} else "hold" if known_success else "failed"
+            verifier_execution = "succeeded" if verifier_outcome != "result_unknown" else "result_unknown"
         if verifier_task["state"] == "queued":
             self.tasks.start_attempt(
                 verifier_task_id, verifier_attempt_id, owner=route["verifier_agent"],
@@ -1748,14 +1783,19 @@ class DepartmentRuntime:
             if verifier_execution == "result_unknown":
                 self.tasks.reconcile_unknown(verifier_attempt_id, actor)
             else:
-                self.tasks.finish_attempt(verifier_attempt_id, "succeeded", usage={})
+                self.tasks.finish_attempt(verifier_attempt_id, verifier_execution,
+                                          usage=(verifier_result or {}).get("usage", {}))
         verifier_task = self.tasks.get(verifier_task_id)
         if verifier_outcome == "result_unknown":
             verifier_state = verifier_task["state"]
         else:
             if verifier_task["state"] == "running":
-                verifier_task = self.tasks.transition(verifier_task_id, "awaiting_review", actor,
-                                                      reason="independent verdict returned")
+                if verifier_execution == "failed":
+                    verifier_task = self.tasks.transition(verifier_task_id, "failed", actor,
+                                                          reason="independent verifier call failed")
+                else:
+                    verifier_task = self.tasks.transition(verifier_task_id, "awaiting_review", actor,
+                                                          reason="independent verdict returned")
             if verifier_task["state"] == "awaiting_review":
                 verifier_task = self.tasks.transition(verifier_task_id, "completed", route["verifier_agent"],
                                                       reason=f"verdict:{verifier_outcome}")
@@ -1772,6 +1812,8 @@ class DepartmentRuntime:
             "verdict": verifier_outcome, "task_state": verifier_state,
             "attempt_state": verifier_execution, "output_ref": str(output_ref) if output_ref else None,
             "error": str(error) if error else None,
+            "verifier_execution_artifact_ref": (verifier_result or {}).get("artifact_ref"),
+            "verifier_report": deepcopy(verifier_result.get("response")) if isinstance(verifier_result, dict) else None,
             "independence_check": (
                 chief_agent != route["verifier_agent"]
                 and route["verifier_agent"] != route["owner_address"]["agent"]

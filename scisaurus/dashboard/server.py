@@ -45,6 +45,10 @@ MAX_RECENT_WORK = 32
 MAX_MODEL_CALLS = 8
 MAX_MODEL_HISTORY_CALLS = 8
 MAX_MODEL_CONTEXT_BYTES = 512_000
+MAX_RESEARCH_BRANCHES = 8
+MAX_RESEARCH_CLAIMS = 24
+MAX_RESEARCH_WEAK_POINTS = 12
+MAX_RESEARCH_EVIDENCE_REFS = 16
 MAX_ACTION_BYTES = 64_000
 MAX_PROJECTS = 64
 MAX_WORKSPACE_RECENT_PROJECTS = 12
@@ -408,6 +412,7 @@ class DashboardSnapshot:
             "attempt_number": raw.get("attempt_number"),
             "assignment_plan_ref": raw.get("assignment_plan_ref"),
             "assignment_task_ids": raw.get("assignment_task_ids", []),
+            "specialist_live": raw.get("specialist_live", {}),
             "error": _short(raw.get("error"), 280),
             "source_root": source_root,
             "project_dir": spec.get("project_dir") or str(stage_root or ""),
@@ -1072,13 +1077,15 @@ class DashboardSnapshot:
         host_label = host if port is None else f"{host}:{port}"
         return {"provider": provider, "host": host_label}
 
-    def _model_calls(self, db):
+    def _model_calls(self, db, live_value=None):
         """Project real provider model calls into bounded, inspectable cards.
 
         Assignment tasks represent logical work scopes; these records are
         different.  Only tasks explicitly dispatched with operation=model are
         included, and their model/route comes from the immutable call context
-        or the recorded execution result.
+        or the recorded execution result.  Composer specialists do not create
+        a second provider task in the control ledger, so their live projection
+        is joined from the atomic progress checkpoint below.
         """
         tasks = [item for item in db.get("tasks") or []
                  if isinstance(item, dict)
@@ -1148,12 +1155,21 @@ class DashboardSnapshot:
             usage = usage if isinstance(usage, dict) else {}
             cache_read_tokens = usage.get("cache_read_tokens")
             cache_write_tokens = usage.get("cache_write_tokens")
+            input_tokens = usage.get("input_tokens")
             if type(cache_read_tokens) is not int or cache_read_tokens < 0:
                 cache_read_tokens = None
             if type(cache_write_tokens) is not int or cache_write_tokens < 0:
                 cache_write_tokens = None
+            if type(input_tokens) is not int or input_tokens <= 0:
+                input_tokens = None
+            cache_read_ratio = (
+                cache_read_tokens / input_tokens
+                if cache_read_tokens is not None and input_tokens is not None else None
+            )
             cache_status = (
-                "hit" if cache_read_tokens is not None and cache_read_tokens > 0
+                "hit" if (cache_read_tokens is not None and cache_read_tokens > 0
+                          and input_tokens is not None and cache_read_tokens >= input_tokens)
+                else "partial" if cache_read_tokens is not None and cache_read_tokens > 0
                 else "primed" if cache_write_tokens is not None and cache_write_tokens > 0
                 else "miss" if cache_read_tokens is not None
                 else "enabled · unreported" if cache_prompt_requested
@@ -1201,6 +1217,7 @@ class DashboardSnapshot:
                     "status": cache_status,
                     "read_tokens": cache_read_tokens,
                     "write_tokens": cache_write_tokens,
+                    "read_ratio": cache_read_ratio,
                 },
                 "response_status": response_status,
                 "response_ref": execution_artifact.get("file_ref") if execution_artifact else None,
@@ -1214,6 +1231,100 @@ class DashboardSnapshot:
                                      "cache_read_tokens", "cache_write_tokens"}
                           and type(value) is int and value >= 0},
             })
+
+        # Specialist assignments are logical ledger scopes around a short
+        # provider call.  Read their redacted progress projection so the
+        # console reflects the actual in-flight pool instead of showing only
+        # the parent stage task.  Completed entries remain bounded history;
+        # deterministic/service assignments are intentionally excluded.
+        existing_task_ids = {item.get("task_id") for item in calls}
+        live_value = live_value if isinstance(live_value, dict) else {}
+        for stage_id, stage_record in (live_value.get("stages") or {}).items():
+            if not isinstance(stage_id, str) or not isinstance(stage_record, dict):
+                continue
+            live_records = stage_record.get("specialist_live")
+            if not isinstance(live_records, dict):
+                continue
+            for role, event in live_records.items():
+                if not isinstance(event, dict) or event.get("execution_mode", "model") != "model":
+                    continue
+                task_id = event.get("task_id")
+                if not isinstance(task_id, str) or task_id in existing_task_ids:
+                    continue
+                event_name = event.get("event")
+                report_status = str(event.get("status") or "").lower()
+                if event_name == "dispatched":
+                    state = "running"
+                    response_status = "awaiting response"
+                elif event_name == "completed":
+                    state = _display_status(report_status or "completed")
+                    response_status = (
+                        "response recorded" if state == "completed"
+                        else "result unknown" if state == "result_unknown"
+                        else "failed"
+                    )
+                else:
+                    state = _display_status(report_status or "queued")
+                    response_status = "awaiting response" if state in MODEL_LIVE_STATES else "not recorded"
+                usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+                input_tokens = usage.get("input_tokens")
+                cache_read_tokens = usage.get("cache_read_tokens")
+                cache_write_tokens = usage.get("cache_write_tokens")
+                if type(input_tokens) is not int or input_tokens <= 0:
+                    input_tokens = None
+                if type(cache_read_tokens) is not int or cache_read_tokens < 0:
+                    cache_read_tokens = None
+                if type(cache_write_tokens) is not int or cache_write_tokens < 0:
+                    cache_write_tokens = None
+                cache_ratio = (
+                    cache_read_tokens / input_tokens
+                    if cache_read_tokens is not None and input_tokens is not None else None
+                )
+                cache_requested = event.get("cache_prompt") is True
+                cache_status = (
+                    "hit" if cache_read_tokens is not None and input_tokens is not None
+                    and cache_read_tokens >= input_tokens
+                    else "partial" if cache_read_tokens is not None and cache_read_tokens > 0
+                    else "primed" if cache_write_tokens is not None and cache_write_tokens > 0
+                    else "enabled · unreported" if cache_requested else "not requested"
+                )
+                observed_at = _iso_timestamp(event.get("observed_at"))
+                started_at = _iso_timestamp(event.get("started_at")) or observed_at
+                updated_at = _iso_timestamp(event.get("updated_at")) or observed_at
+                base_url = event.get("base_url") if isinstance(event.get("base_url"), str) else None
+                endpoint = self._model_endpoint(base_url)
+                calls.append({
+                    "root_key": "composer",
+                    "task_id": task_id,
+                    "attempt_id": None,
+                    "state": state,
+                    "role": event.get("role") if isinstance(event.get("role"), str) else role,
+                    "stage_id": event.get("stage_id") if isinstance(event.get("stage_id"), str) else stage_id,
+                    "model": event.get("model") if isinstance(event.get("model"), str) else "model not recorded",
+                    "provider": endpoint["provider"],
+                    "endpoint": endpoint["host"],
+                    "provider_pool": event.get("provider_pool") if isinstance(event.get("provider_pool"), str) else None,
+                    "route_id": event.get("route_id") if isinstance(event.get("route_id"), str) else None,
+                    "cache": {
+                        "requested": cache_requested,
+                        "status": cache_status,
+                        "read_tokens": cache_read_tokens,
+                        "write_tokens": cache_write_tokens,
+                        "read_ratio": cache_ratio,
+                    },
+                    "response_status": response_status,
+                    "response_ref": event.get("response_ref") if isinstance(event.get("response_ref"), str) else None,
+                    "artifact_ref": event.get("artifact_ref") if isinstance(event.get("artifact_ref"), str) else None,
+                    "started_at": started_at,
+                    "finished_at": updated_at if state not in MODEL_LIVE_STATES else None,
+                    "updated_at": updated_at,
+                    "elapsed_seconds": _safe_float(event.get("elapsed_seconds")),
+                    "usage": {key: value for key, value in usage.items()
+                              if key in {"model_calls", "input_tokens", "output_tokens",
+                                         "cache_read_tokens", "cache_write_tokens"}
+                              and type(value) is int and value >= 0},
+                })
+                existing_task_ids.add(task_id)
 
         def timestamp(value):
             if not isinstance(value, str) or not value:
@@ -1249,6 +1360,150 @@ class DashboardSnapshot:
             "history_total": len(history),
             "history_displayed": min(len(history), MAX_MODEL_HISTORY_CALLS * 2),
             "history_truncated": len(history) > MAX_MODEL_HISTORY_CALLS * 2,
+        }
+
+    def _scoped_json_file(self, raw_path):
+        """Read a small JSON file only when it remains inside a project root."""
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return None
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.root / candidate
+        try:
+            resolved = candidate.resolve()
+            allowed = any(
+                resolved == root.resolve() or resolved.is_relative_to(root.resolve())
+                for root in self.roots.values()
+            )
+            if not allowed or not resolved.is_file() or resolved.stat().st_size > MAX_MODEL_CONTEXT_BYTES:
+                return None
+            value = _read_json(resolved)
+        except (OSError, ValueError, RuntimeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _research_program_view(program):
+        """Expose the decision surface without leaking prompt-sized payloads."""
+        if not isinstance(program, dict):
+            return None
+
+        def outcome_view(outcome):
+            if not isinstance(outcome, dict):
+                return None
+            return {
+                "id": outcome.get("id"),
+                "condition": _short(outcome.get("condition"), 520),
+                "contribution": _short(outcome.get("contribution"), 420),
+                "required_evidence": [
+                    _short(item, 220) for item in (outcome.get("required_evidence") or [])[:8]
+                    if isinstance(item, str)
+                ],
+            }
+
+        def branch_view(branch):
+            if not isinstance(branch, dict):
+                return None
+            return {
+                "id": branch.get("id"),
+                "title": _short(branch.get("title"), 240),
+                "question": _short(branch.get("question"), 620),
+                "hypothesis": _short(branch.get("hypothesis"), 620),
+                "mechanism": _short(branch.get("mechanism"), 620),
+                "plan": _short(branch.get("plan"), 620),
+                "research_form": _short(branch.get("research_form"), 180),
+                "evidence_mode": _short(branch.get("evidence_mode"), 180),
+                "comparison_type": _short(branch.get("comparison_type"), 180),
+                "paper_if": [
+                    item for item in (outcome_view(value) for value in (branch.get("paper_if") or [])[:3])
+                    if item is not None
+                ],
+                "kill_if": _short(branch.get("kill_if"), 620),
+                "evidence_obligations": [
+                    _short(item, 260) for item in (branch.get("evidence_obligations") or [])[:8]
+                    if isinstance(item, str)
+                ],
+                "source_refs": [
+                    _short(item, 180) for item in (branch.get("source_refs") or [])[:16]
+                    if isinstance(item, str)
+                ],
+                "status": _display_status(branch.get("status")),
+            }
+
+        raw_branches = [item for item in (program.get("branches") or []) if isinstance(item, dict)]
+        branches = [item for item in (branch_view(value) for value in raw_branches[:MAX_RESEARCH_BRANCHES])
+                    if item is not None]
+        selected_id = program.get("selected_id")
+        selected = next((item for item in branches if item.get("id") == selected_id), None)
+        return {
+            "schema_version": program.get("schema_version"),
+            "theme": _short(program.get("theme"), 240),
+            "objective": _short(program.get("objective"), 620),
+            "selection_mode": _short(program.get("selection_mode"), 80),
+            "selected_id": selected_id,
+            "selected_branch": selected,
+            "selection_rationale": _short(program.get("selection_rationale"), 620),
+            "selection_criteria": [
+                _short(item, 320) for item in (program.get("selection_criteria") or [])[:8]
+                if isinstance(item, str)
+            ],
+            "branches": branches,
+            "branch_count": len(raw_branches),
+            "retained_count": sum(item.get("status") == "retained" for item in branches),
+        }
+
+    @staticmethod
+    def _argument_defense_view(defense):
+        """Expose claim posture and repair signals as a compact review surface."""
+        if not isinstance(defense, dict):
+            return None
+
+        claims = []
+        for claim in (defense.get("claim_postures") or [])[:MAX_RESEARCH_CLAIMS]:
+            if not isinstance(claim, dict):
+                continue
+            claims.append({
+                "id": claim.get("id"),
+                "claim": _short(claim.get("claim"), 520),
+                "posture": _short(claim.get("posture"), 80),
+                "evidence_ids": [
+                    _short(item, 180) for item in (claim.get("evidence_ids") or [])[:MAX_RESEARCH_EVIDENCE_REFS]
+                    if isinstance(item, str)
+                ],
+                "defense": _short(claim.get("defense"), 520),
+                "caveat": _short(claim.get("caveat"), 520),
+                "allowed_sections": [
+                    _short(item, 80) for item in (claim.get("allowed_sections") or [])[:8]
+                    if isinstance(item, str)
+                ],
+            })
+
+        weak_points = []
+        for item in (defense.get("weak_points") or [])[:MAX_RESEARCH_WEAK_POINTS]:
+            if not isinstance(item, dict):
+                continue
+            weak_points.append({
+                "id": item.get("id"),
+                "weak_point": _short(item.get("weak_point"), 420),
+                "defense_strategy": _short(item.get("defense_strategy"), 120),
+                "argument": _short(item.get("argument"), 520),
+                "remaining_uncertainty": _short(item.get("remaining_uncertainty"), 520),
+                "reviewer_test": _short(item.get("reviewer_test"), 520),
+            })
+
+        policy = defense.get("policy") if isinstance(defense.get("policy"), dict) else {}
+        return {
+            "schema_version": defense.get("schema_version"),
+            "research_question": _short(defense.get("research_question"), 900),
+            "claim_postures": claims,
+            "weak_points": weak_points,
+            "claim_count": len(defense.get("claim_postures") or []),
+            "weak_point_count": len(defense.get("weak_points") or []),
+            "policy": {
+                key: _short(policy.get(key), 420) for key in (
+                    "results_rule", "discussion_rule", "limitation_rule", "missing_evidence_action"
+                ) if policy.get(key) not in (None, "")
+            },
         }
 
     def _research_view(self, live_value, stages):
@@ -1320,6 +1575,47 @@ class DashboardSnapshot:
         source_challenge = topic_context.get("source_challenge") if isinstance(topic_context.get("source_challenge"), dict) else {}
         feasibility = topic_context.get("feasibility_check") if isinstance(topic_context.get("feasibility_check"), dict) else {}
         survey_stage = stage_map.get("survey") or {}
+
+        # New runs carry these objects in their stage context.  The path
+        # fallback keeps the view useful for checkpoints written before the
+        # full packet was embedded in Composer state.
+        context_values = [value for value in context.values() if isinstance(value, dict)]
+        program = topic_context.get("research_program") if isinstance(topic_context, dict) else None
+        defense = None
+        for item in context_values:
+            if not isinstance(program, dict) and isinstance(item.get("research_program"), dict):
+                program = item["research_program"]
+            if isinstance(item.get("argument_defense"), dict):
+                defense = item["argument_defense"]
+            package = item.get("argument_package")
+            if isinstance(package, dict) and isinstance(package.get("argument_defense"), dict):
+                defense = package["argument_defense"]
+
+        program_paths = []
+        defense_paths = []
+        for item in context_values:
+            if isinstance(item.get("research_program_path"), str):
+                program_paths.append(item["research_program_path"])
+            for key in ("research_argument_defense_path", "argument_defense_path"):
+                if isinstance(item.get(key), str):
+                    defense_paths.append(item[key])
+        if not isinstance(program, dict):
+            for raw_path in program_paths:
+                loaded = self._scoped_json_file(raw_path)
+                if not isinstance(loaded, dict):
+                    continue
+                program = loaded.get("research_program") if isinstance(loaded.get("research_program"), dict) else loaded
+                if isinstance(program, dict):
+                    break
+        if not isinstance(defense, dict):
+            for raw_path in defense_paths:
+                loaded = self._scoped_json_file(raw_path)
+                if not isinstance(loaded, dict):
+                    continue
+                defense = loaded.get("argument_defense") if isinstance(loaded.get("argument_defense"), dict) else loaded
+                if isinstance(defense, dict):
+                    break
+
         return {
             "topic": {
                 "title": value("title", "name"),
@@ -1365,6 +1661,8 @@ class DashboardSnapshot:
                 "resource_plan": value("resource_plan"),
                 "scope": value("scope"),
             },
+            "research_program": self._research_program_view(program),
+            "argument_defense": self._argument_defense_view(defense),
             "stage_progress": stage_progress,
         }
 
@@ -1547,7 +1845,22 @@ class DashboardSnapshot:
         organization_raw = live_value.get("organization") if isinstance(live_value.get("organization"), dict) else None
         specialists = self._specialists(stages, db, organization_raw)
         execution = self._execution_view(stages, db, organization_raw)
-        model_calls = self._model_calls(db)
+        model_calls = self._model_calls(db, live_value)
+        live_provider_calls = model_calls.get("live_items", [])
+        execution.setdefault("provider", {})["live_model_calls"] = len(live_provider_calls)
+        execution["provider"]["running_tasks"] = sum(
+            item.get("state") in {"running", "started"} for item in live_provider_calls
+        )
+        execution["provider"]["queued_tasks"] = sum(
+            item.get("state") == "queued" for item in live_provider_calls
+        )
+        total_provider_capacity = execution["provider"].get("durable_window_capacity")
+        if type(total_provider_capacity) is not int:
+            total_provider_capacity = execution["provider"].get("configured_capacity")
+        execution["provider"]["within_capacity"] = (
+            type(total_provider_capacity) is not int
+            or len(live_provider_calls) <= total_provider_capacity
+        )
         pool_limits = execution.get("provider", {}).get("pool_limits", {})
         execution.setdefault("provider", {})["pools"] = {
             name: {

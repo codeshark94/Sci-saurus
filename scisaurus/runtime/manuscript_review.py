@@ -129,6 +129,9 @@ def _compact_evidence(evidence):
         compact["references"] = deepcopy(evidence["references"])
     if "scholarly_depth" in evidence:
         compact["scholarly_depth"] = deepcopy(evidence["scholarly_depth"])
+    for key in ("research_program", "argument_defense"):
+        if key in evidence:
+            compact[key] = deepcopy(evidence[key])
     return compact
 
 
@@ -664,7 +667,9 @@ SYSTEM = (
     "report observations, Discussion interprets them, figures are used as arguments, and facts or caveats are not "
     "repeated without purpose. A journal_editor review must also apply the supplied scholarly-depth profile and "
     "flag a candidate whose bibliography, full-text basis, citation coverage, or visual evidence is too thin for "
-    "the selected publication tier."
+    "the selected publication tier. When argument_defense is supplied, check that observations, inferences, "
+    "provisional mechanisms, and future tests remain in their permitted sections and that a weak point is not "
+    "being hidden by confident prose."
 )
 
 

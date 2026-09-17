@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import sqlite3
 import threading
 import time
 import urllib.parse
@@ -24,11 +25,24 @@ SAMPLING_FIELDS = frozenset({
 OLLAMA_SAMPLING_FIELDS = frozenset({"temperature", "top_p", "seed"})
 MODEL_CONFIG_FIELDS = frozenset({
     "base_url", "model", "protocol", "timeout_seconds", "max_output_tokens",
+    "context_window_tokens", "max_input_tokens",
     "auth_env", "max_response_bytes", "reasoning_effort", "output_format",
     "max_image_bytes", "max_request_bytes", "max_retries", "retry_backoff_seconds",
-    "cache_prompt",
+    "cache_prompt", "model_call_budget_path", "model_call_budget_key",
+    "model_call_budget_limit",
 }) | SAMPLING_FIELDS
 ROLE_ROUTE_FIELDS = frozenset({"id", "pool"}) | MODEL_CONFIG_FIELDS
+MODEL_CALL_BUDGET_FIELDS = frozenset({
+    "model_call_budget_path", "model_call_budget_key", "model_call_budget_limit",
+})
+# This is deliberately a conservative, tokenizer-independent preflight.  The
+# runtime does not install a tokenizer for every configured provider, so it
+# reserves three UTF-8 bytes per input token plus a small chat-template margin.
+# The provider's reported ``prompt_tokens`` remains the authoritative observed
+# usage after a request completes.
+CONTEXT_ESTIMATOR_BYTES_PER_TOKEN = 3
+CONTEXT_ESTIMATOR_OVERHEAD_TOKENS = 128
+IMAGE_CONTEXT_TOKEN_RESERVE = 4096
 # OpenAI-compatible providers commonly expose ``seed`` as a signed int64.
 # Keep internally derived seeds inside that wire-level contract so a valid
 # exploration hash cannot become a provider-side 400.
@@ -93,6 +107,148 @@ def _validate_sampling_options(options, *, name="sampling options"):
     return options
 
 
+def _validate_model_call_budget(config, *, name="model call budget"):
+    """Validate an optional durable cap for one model-family call ledger."""
+    present = {
+        key for key in MODEL_CALL_BUDGET_FIELDS
+        if key in config and config[key] is not None
+    }
+    if not present:
+        return config
+    if present != MODEL_CALL_BUDGET_FIELDS:
+        raise ValidationError(
+            f"{name} requires model_call_budget_path, model_call_budget_key, "
+            "and model_call_budget_limit together")
+    path = config["model_call_budget_path"]
+    if (not isinstance(path, str) or not path.strip()
+            or not Path(path).is_absolute()):
+        raise ValidationError(f"{name} path must be an absolute file path")
+    key = config["model_call_budget_key"]
+    if not isinstance(key, str) or not key.strip():
+        raise ValidationError(f"{name} key must be a nonempty string")
+    limit = config["model_call_budget_limit"]
+    if type(limit) is not int or limit <= 0:
+        raise ValidationError(f"{name} limit must be a positive integer")
+    return config
+
+
+def _budget_config(config):
+    """Return the configured budget fields, or ``None`` when uncapped."""
+    present = {
+        key for key in MODEL_CALL_BUDGET_FIELDS
+        if key in config and config[key] is not None
+    }
+    if not present:
+        return None
+    _validate_model_call_budget(config)
+    return {
+        "path": config["model_call_budget_path"],
+        "key": config["model_call_budget_key"],
+        "limit": config["model_call_budget_limit"],
+    }
+
+
+def model_call_budget_available(config):
+    """Check a durable model-call cap without reserving a call.
+
+    A missing ledger means no call has been reserved yet.  The atomic reserve
+    operation remains authoritative when concurrent workers race at the cap.
+    """
+    budget = _budget_config(config)
+    if budget is None:
+        return True
+    path = Path(budget["path"])
+    if not path.exists():
+        return True
+    connection = None
+    try:
+        connection = sqlite3.connect(str(path), timeout=5.0)
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            ("model_call_budgets",),
+        ).fetchone()
+        if table is None:
+            return True
+        row = connection.execute(
+            "SELECT max_calls, used_calls FROM model_call_budgets WHERE budget_key=?",
+            (budget["key"],),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise ValidationError(f"{path} model-call budget ledger is unreadable") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    if row is None:
+        return True
+    if row[0] != budget["limit"]:
+        raise ValidationError(
+            f"{path} model-call budget limit conflicts with configured limit")
+    return row[1] < row[0]
+
+
+def _reserve_model_call_budget(config):
+    """Atomically spend one model-call budget before provider I/O."""
+    budget = _budget_config(config)
+    if budget is None:
+        return
+    path = Path(budget["path"])
+    connection = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(str(path), timeout=30.0)
+        connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS model_call_budgets ("
+            "budget_key TEXT PRIMARY KEY, max_calls INTEGER NOT NULL, "
+            "used_calls INTEGER NOT NULL)"
+        )
+        # Serialize the read/insert-or-update decision.  Without an
+        # immediate transaction, two workers can both observe a remaining
+        # slot and race at the cap.
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT max_calls, used_calls FROM model_call_budgets WHERE budget_key=?",
+            (budget["key"],),
+        ).fetchone()
+        if row is None:
+            connection.execute(
+                "INSERT INTO model_call_budgets(budget_key, max_calls, used_calls) "
+                "VALUES (?, ?, 1)",
+                (budget["key"], budget["limit"]),
+            )
+            connection.commit()
+            return
+        if row[0] != budget["limit"]:
+            raise ModelCallError(
+                "model call budget limit conflicts with the existing ledger",
+                outcome_known=True,
+            )
+        updated = connection.execute(
+            "UPDATE model_call_budgets SET used_calls=used_calls+1 "
+            "WHERE budget_key=? AND used_calls < max_calls",
+            (budget["key"],),
+        )
+        if updated.rowcount != 1:
+            connection.rollback()
+            raise ModelCallError(
+                f"model call budget exhausted: {budget['key']}",
+                outcome_known=True,
+            )
+        connection.commit()
+    except ModelCallError:
+        if connection is not None:
+            connection.rollback()
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        raise ModelCallError(
+            f"model call budget ledger unavailable: {path}",
+            outcome_known=True,
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def _validate_role_models(role_models):
     """Validate partial provider configurations used by named runtime roles."""
     if not isinstance(role_models, dict):
@@ -131,8 +287,9 @@ def _validate_role_models(role_models):
                     or (field == "timeout_seconds" and selected[field] == 0)):
                 raise ValidationError(f"model.role_models.{role_name}.{field} is invalid")
         for field in ("max_output_tokens", "max_response_bytes", "max_image_bytes",
-                      "max_request_bytes"):
-            if field in selected and (type(selected[field]) is not int or selected[field] <= 0):
+                      "max_request_bytes", "context_window_tokens", "max_input_tokens"):
+            if field in selected and selected[field] is not None and (
+                    type(selected[field]) is not int or selected[field] <= 0):
                 raise ValidationError(f"model.role_models.{role_name}.{field} is invalid")
         if "max_retries" in selected and (
                 type(selected["max_retries"]) is not int or not 0 <= selected["max_retries"] <= 8):
@@ -142,12 +299,28 @@ def _validate_role_models(role_models):
             raise ValidationError(f"model.role_models.{role_name}.auth_env is invalid")
         if "cache_prompt" in selected and type(selected["cache_prompt"]) is not bool:
             raise ValidationError(f"model.role_models.{role_name}.cache_prompt must be boolean")
+        _validate_model_call_budget(
+            selected, name=f"model.role_models.{role_name} call budget")
         if "reasoning_effort" in selected and selected["reasoning_effort"] not in {
                 None, "none", "low", "medium", "high", "xhigh"}:
             raise ValidationError(f"model.role_models.{role_name}.reasoning_effort is invalid")
         if "output_format" in selected and selected["output_format"] not in {None, "json_object"}:
             raise ValidationError(f"model.role_models.{role_name}.output_format is invalid")
     return role_models
+
+
+def _validate_role_model_fallbacks(fallbacks):
+    """Validate model alternatives used when a named model cap is exhausted."""
+    if not isinstance(fallbacks, dict):
+        raise ValidationError("model.role_model_fallbacks must be an object")
+    for role_name, alternatives in fallbacks.items():
+        if not isinstance(role_name, str) or not role_name.strip():
+            raise ValidationError("model.role_model_fallbacks keys must be nonempty strings")
+        if not isinstance(alternatives, list) or not alternatives:
+            raise ValidationError(
+                f"model.role_model_fallbacks.{role_name} must be a nonempty list")
+        _validate_role_models({role_name: alternative for alternative in alternatives})
+    return fallbacks
 
 
 def _validate_role_routes(role_routes):
@@ -183,6 +356,72 @@ def _validate_role_routes(role_routes):
     return role_routes
 
 
+def _validate_context_policy(config, *, name="model"):
+    """Validate route/model context metadata after inheritance is resolved."""
+    if not isinstance(config, dict):
+        raise ValidationError(f"{name} configuration must be an object")
+    window = config.get("context_window_tokens")
+    input_limit = config.get("max_input_tokens")
+    output_limit = config.get("max_output_tokens")
+    if window is not None and (type(window) is not int or window <= 0):
+        raise ValidationError(f"{name}.context_window_tokens must be a positive integer when configured")
+    if input_limit is not None and (type(input_limit) is not int or input_limit <= 0):
+        raise ValidationError(f"{name}.max_input_tokens must be a positive integer when configured")
+    if window is not None:
+        if type(output_limit) is not int or output_limit <= 0:
+            raise ValidationError(f"{name}.max_output_tokens must be a positive integer")
+        if window <= output_limit:
+            raise ValidationError(
+                f"{name}.context_window_tokens must leave room for max_output_tokens")
+        if input_limit is not None and input_limit + output_limit > window:
+            raise ValidationError(
+                f"{name}.max_input_tokens plus max_output_tokens exceeds context_window_tokens")
+    return {"context_window_tokens": window, "max_input_tokens": input_limit,
+            "max_output_tokens": output_limit}
+
+
+def estimate_input_tokens(system, prompt, *, image_count=0):
+    """Return a conservative preflight estimate without provider tokenizers."""
+    if not isinstance(system, str) or not isinstance(prompt, str):
+        raise ValidationError("model system and prompt content must be strings")
+    if type(image_count) is not int or image_count < 0:
+        raise ValidationError("model image count must be a non-negative integer")
+    text_bytes = len(system.encode("utf-8")) + len(prompt.encode("utf-8"))
+    return (
+        math.ceil(text_bytes / CONTEXT_ESTIMATOR_BYTES_PER_TOKEN)
+        + CONTEXT_ESTIMATOR_OVERHEAD_TOKENS
+        + image_count * IMAGE_CONTEXT_TOKEN_RESERVE
+    )
+
+
+def model_context_error(config, *, system, prompt, image_count=0):
+    """Return a dispatch-blocking context error, or ``None`` when it fits.
+
+    ``context_window_tokens`` is the provider's total input-plus-output window.
+    ``max_input_tokens`` is an optional stricter input admission ceiling.  Both
+    are metadata for admission control; they are not sent as unsupported
+    provider request fields such as Ollama's ``num_ctx``.
+    """
+    policy = _validate_context_policy(config)
+    window = policy["context_window_tokens"]
+    input_limit = policy["max_input_tokens"]
+    if window is None and input_limit is None:
+        return None
+    estimated = estimate_input_tokens(system, prompt, image_count=image_count)
+    allowed = input_limit if input_limit is not None else float("inf")
+    if window is not None:
+        allowed = min(allowed, window - policy["max_output_tokens"])
+    if estimated <= allowed:
+        return None
+    model_name = config.get("model", "configured model")
+    limit_text = f"{int(allowed)} input tokens"
+    window_text = f"; context window {window} with max output {policy['max_output_tokens']}"
+    return (
+        f"model context budget exceeded for {model_name}: conservative input estimate "
+        f"{estimated} tokens exceeds {limit_text}{window_text}"
+    )
+
+
 def resolve_model_config(model, *, role=None, overrides=None):
     """Resolve a model config plus a role's provider and sampling profiles.
 
@@ -198,6 +437,8 @@ def resolve_model_config(model, *, role=None, overrides=None):
     base = dict(model)
     role_models = base.pop("role_models", {})
     _validate_role_models(role_models)
+    role_model_fallbacks = base.pop("role_model_fallbacks", {})
+    _validate_role_model_fallbacks(role_model_fallbacks)
     role_routes = base.pop("role_routes", {})
     _validate_role_routes(role_routes)
     profiles = base.pop("role_profiles", {})
@@ -212,6 +453,13 @@ def resolve_model_config(model, *, role=None, overrides=None):
     if overrides is not None:
         _validate_sampling_options(overrides, name="sampling overrides")
     selected_model = role_models.get(role) if role is not None else None
+    if selected_model is not None and not model_call_budget_available(selected_model):
+        alternatives = role_model_fallbacks.get(role, [])
+        selected_model = next(
+            (alternative for alternative in alternatives
+             if model_call_budget_available(alternative)),
+            selected_model,
+        )
     selected_sampling = {}
     if selected_model is not None:
         selected_model = dict(selected_model)
@@ -265,20 +513,29 @@ class ModelResult:
 
     def json_object(self):
         text = self.text.strip()
-        try:
-            value = json.loads(text)
-        except (ValueError, TypeError) as exc:
-            # Some structured-output Ollama aliases append a reasoning wrapper
-            # terminator even when the provider returns a valid JSON object.
-            # Accept only the exact suffix after that explicit terminator; any
-            # other prose, markdown, or trailing bytes remains invalid.
-            if "</think>" not in text:
-                raise ValidationError("model output is not a complete JSON object") from exc
-            suffix = text.rsplit("</think>", 1)[1].strip()
+        candidates = [text]
+        # Some structured-output providers append a reasoning wrapper
+        # terminator, while others emit a JSON object in an otherwise empty
+        # Markdown JSON fence.  Accept only those two exact, bounded forms;
+        # arbitrary prose and mixed markdown remain invalid.
+        if "</think>" in text:
+            candidates.append(text.rsplit("</think>", 1)[1].strip())
+        for candidate in tuple(candidates):
+            lines = candidate.splitlines()
+            if (len(lines) >= 3 and lines[0].strip().casefold() in {"```json", "```jsonc"}
+                    and lines[-1].strip() == "```"
+                    and all(not line.strip().startswith("```") for line in lines[1:-1])):
+                candidates.append("\n".join(lines[1:-1]).strip())
+        value = None
+        parse_error = None
+        for candidate in candidates:
             try:
-                value = json.loads(suffix)
-            except (ValueError, TypeError) as suffix_exc:
-                raise ValidationError("model output is not a complete JSON object") from suffix_exc
+                value = json.loads(candidate)
+                break
+            except (ValueError, TypeError) as exc:
+                parse_error = exc
+        if parse_error is not None and value is None:
+            raise ValidationError("model output is not a complete JSON object") from parse_error
         if not isinstance(value, dict):
             raise ValidationError("model output must be a JSON object")
         return value
@@ -313,6 +570,8 @@ def _cache_usage(response):
 class ModelClient:
     def __init__(self, *, base_url: str, model: str, protocol: str,
                  timeout_seconds: float, max_output_tokens: int,
+                 context_window_tokens: int | None = None,
+                 max_input_tokens: int | None = None,
                  auth_env: str | None = None, max_response_bytes: int = 2_000_000,
                  reasoning_effort: str | None = None, output_format: str | None = None,
                  max_image_bytes: int = 7_000_000, max_request_bytes: int = 10_000_000,
@@ -320,7 +579,10 @@ class ModelClient:
                  temperature: float | None = None, top_p: float | None = None,
                  seed: int | None = None, presence_penalty: float | None = None,
                  frequency_penalty: float | None = None,
-                 cache_prompt: bool | None = None):
+                 cache_prompt: bool | None = None,
+                 model_call_budget_path: str | None = None,
+                 model_call_budget_key: str | None = None,
+                 model_call_budget_limit: int | None = None):
         if not isinstance(base_url, str):
             raise ValidationError("model base_url must be a URL string")
         parsed = urllib.parse.urlsplit(base_url)
@@ -334,6 +596,12 @@ class ModelClient:
             raise ValidationError("an explicit model name is required")
         if type(max_output_tokens) is not int or max_output_tokens <= 0:
             raise ValidationError("max_output_tokens must be a positive integer")
+        _validate_context_policy({
+            "model": model,
+            "max_output_tokens": max_output_tokens,
+            "context_window_tokens": context_window_tokens,
+            "max_input_tokens": max_input_tokens,
+        })
         if type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValidationError("model timeout must be finite and positive")
         if type(max_response_bytes) is not int or max_response_bytes <= 0:
@@ -357,6 +625,11 @@ class ModelClient:
             raise ValidationError("output_format must be json_object when configured")
         if cache_prompt is not None and type(cache_prompt) is not bool:
             raise ValidationError("cache_prompt must be boolean when configured")
+        _validate_model_call_budget({
+            "model_call_budget_path": model_call_budget_path,
+            "model_call_budget_key": model_call_budget_key,
+            "model_call_budget_limit": model_call_budget_limit,
+        }, name="model call budget")
         sampling = {
             key: value for key, value in {
                 "temperature": temperature, "top_p": top_p, "seed": seed,
@@ -370,6 +643,8 @@ class ModelClient:
             raise ValidationError("configured model authentication environment variable is absent")
         self.base_url, self.model, self.protocol = base_url.rstrip("/"), model, protocol
         self.timeout_seconds, self.max_output_tokens = timeout_seconds, max_output_tokens
+        self.context_window_tokens, self.max_input_tokens = (
+            context_window_tokens, max_input_tokens)
         self.max_response_bytes, self.auth_env = max_response_bytes, auth_env
         self.reasoning_effort, self.output_format = reasoning_effort, output_format
         self.max_image_bytes, self.max_request_bytes = max_image_bytes, max_request_bytes
@@ -380,6 +655,9 @@ class ModelClient:
         self.seed = seed
         self.presence_penalty = presence_penalty
         self.frequency_penalty = frequency_penalty
+        self.model_call_budget_path = model_call_budget_path
+        self.model_call_budget_key = model_call_budget_key
+        self.model_call_budget_limit = model_call_budget_limit
 
     @staticmethod
     def _read_image(image):
@@ -414,6 +692,13 @@ class ModelClient:
             raise ValidationError("model images must be a list containing at most 16 items")
         if images and self.protocol != "openai_compatible":
             raise ValidationError("multimodal image input requires the openai_compatible protocol")
+        context_error = model_context_error(
+            {"model": self.model, "max_output_tokens": self.max_output_tokens,
+             "context_window_tokens": self.context_window_tokens,
+             "max_input_tokens": self.max_input_tokens},
+            system=system, prompt=prompt, image_count=len(images))
+        if context_error:
+            raise ValidationError(context_error)
         parts, total = [{"type": "text", "text": prompt}], 0
         for descriptor in images:
             raw, media_type = self._read_image(descriptor)
@@ -486,6 +771,11 @@ class ModelClient:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise failure("model request deadline exceeded") from None
+            _reserve_model_call_budget({
+                "model_call_budget_path": self.model_call_budget_path,
+                "model_call_budget_key": self.model_call_budget_key,
+                "model_call_budget_limit": self.model_call_budget_limit,
+            })
             attempts_made += 1
             connection = connection_type(parsed_base.hostname, parsed_base.port,
                                          timeout=max(0.1, remaining))

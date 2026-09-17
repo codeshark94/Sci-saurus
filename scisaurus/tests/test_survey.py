@@ -16,8 +16,9 @@ from scisaurus.core.errors import ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.surveys import SurveyGate
-from scisaurus.runtime.execution import _invoke_worker
+from scisaurus.runtime.execution import SYSTEM, _invoke_worker
 from scisaurus.runtime.literature import ProviderCooldownError
+from scisaurus.runtime.models import estimate_input_tokens
 from scisaurus.runtime.survey import (SurveyRunner, apply_scoped_map_repair,
                                       normalize_map_relationships,
                                       overlay_post_checkpoint_relationships)
@@ -278,6 +279,49 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(SurveyRunner._balanced_query_limit(10, 1, 2), 2)
         self.assertEqual(SurveyRunner._balanced_query_limit(0, 3, 50), 1)
 
+    def test_map_projection_keeps_large_corpus_inside_declared_context(self):
+        runner = self.runtime()
+        runner.config["model"].update({
+            "context_window_tokens": 65536,
+            "max_input_tokens": 56000,
+            "max_output_tokens": 8192,
+        })
+        runner.bounds["context_chars"] = 30000
+        runner.bounds["max_text_chars"] = 400000
+        runner.works = {}
+        runner.source_docs = {}
+        runner.aliases = {}
+        runner.analysis_records = {}
+        runner.analyzed_basis = {}
+        runner.relationships = {}
+        runner.identity_records = {}
+        for index in range(80):
+            wid = f"W{index:03d}"
+            runner.works[wid] = {
+                "id": wid, "title": f"Study {wid}", "year": 2020,
+                "doi": None, "publication_metadata_status": "provider_reported",
+                "referenced_works": [],
+            }
+            if index == 0:
+                runner.source_docs[f"source-{wid}-full"] = {
+                    "work_id": wid, "representation": "full_text",
+                    "text": "Owner evidence. " * 2200,
+                }
+            else:
+                runner.source_docs[f"source-{wid}-abstract"] = {
+                    "work_id": wid, "representation": "abstract",
+                    "text": f"Comparison evidence for {wid}. " * 300,
+                }
+        assignment = runner._map_job("W000", ["artifact:work-W000@1"])["assignment"]
+        estimate = estimate_input_tokens(SYSTEM, json.dumps(assignment, ensure_ascii=False))
+        self.assertLessEqual(estimate, 56000)
+        owner = next(source for source in assignment["sources"] if source["work_id"] == "W000")
+        comparisons = [source for source in assignment["sources"] if source["work_id"] != "W000"]
+        self.assertEqual(len(owner["text"]), 30000)
+        self.assertEqual(len(comparisons), 79)
+        self.assertLessEqual(sum(len(source["text"]) for source in comparisons), 60000)
+        runner.control.close()
+
     def runtime(self, config=None, *, on_progress=None, resume_policy=None):
         runner = SurveyRunner(self.root / "run", config or survey_config(self.endpoint),
                               on_progress=on_progress, resume_policy=resume_policy)
@@ -403,6 +447,11 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual({prompt["requested_work_ids"][0] for prompt in maps[:4]}, {"W101", "W102", "W201", "W301"})
         self.assertTrue(all(len(prompt["requested_work_ids"]) == 1 for prompt in maps))
         self.assertEqual(maps[4]["requested_work_ids"], ["W401"])
+        serialized_maps = [json.dumps(prompt, ensure_ascii=False, separators=(",", ":")) for prompt in maps[:4]]
+        stable_prefix = serialized_maps[0].split('"requested_work_ids"', 1)[0]
+        self.assertTrue(all(serialized.startswith(stable_prefix) for serialized in serialized_maps))
+        self.assertLess(serialized_maps[0].index('"works"'), serialized_maps[0].index('"requested_work_ids"'))
+        self.assertLess(serialized_maps[0].index('"instructions"'), serialized_maps[0].index('"requested_work_ids"'))
         for wid in ("W101", "W102", "W201", "W301"):
             self.assertEqual(store.head("kb/work-analyses/" + wid)["version"], 1)
         exported = json.loads((runner.dir / "output/literature-map.json").read_text())

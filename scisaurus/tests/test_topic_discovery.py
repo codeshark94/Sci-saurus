@@ -1,6 +1,7 @@
 import json
 import hashlib
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +10,8 @@ from scisaurus.core.errors import QuotaExceededError, ValidationError
 from scisaurus.runtime.literature import ProviderCooldownError
 from scisaurus.runtime.models import ModelCallError, ModelResult
 from scisaurus.runtime.topic_discovery import (
+    MAX_BOUNDED_TOPIC_ATTEMPTS,
+    PORTFOLIO_DIMENSIONS,
     SCHEMA_VERSION,
     STAGE_CONFIG_SCHEMA_VERSION,
     TopicBudget,
@@ -25,6 +28,20 @@ from scisaurus.runtime.topic_discovery import (
     validate_topic_stage_config,
     validate_frontier_seed_plan,
     validate_source_challenge,
+    topic_prompt,
+    _anchor_frontier_seed_queries,
+    _anchor_topic_candidate_queries,
+    _merge_candidate_source_records,
+    _materialize_foundry_capability_requirements,
+    _materialize_foundry_feasibility,
+    _materialize_seed_bindings,
+    _materialize_seed_domains,
+    _materialize_topic_objective,
+    _portfolio_shape_plan,
+    _repair_foundry_selection,
+    _repair_topic_novelty_selection,
+    _repair_topic_refinement_selection,
+    _source_challenge_requires_frontier_seed_pivot,
 )
 
 
@@ -172,6 +189,64 @@ class FakeModel:
                            elapsed_seconds=0.01, finish_reason="stop")
 
 
+class MissingResearchQuestionModel(FakeModel):
+    """Omit one required field, then return only its targeted patch."""
+
+    assignments = []
+
+    def complete(self, *, system, prompt, images=None):
+        payload = json.loads(prompt)
+        type(self).assignments.append(payload.get("assignment"))
+        if payload.get("assignment") == "repair_missing_topic_fields":
+            patches = [{
+                "id": item["id"],
+                "fields": {
+                    "research_question": (
+                        f"Does {item['candidate_fields'].get('mechanism', 'the mechanism')} change "
+                        f"{item['candidate_fields'].get('measurement', 'the measured outcome')} under the declared "
+                        f"{item['candidate_fields'].get('comparison_type', 'controlled')} comparison?"
+                    ),
+                },
+            } for item in payload["candidate_context"]]
+            return ModelResult(
+                text=json.dumps({"candidate_patches": patches}), model="fake",
+                usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                elapsed_seconds=0.01, finish_reason="stop")
+        result = super().complete(system=system, prompt=prompt, images=images)
+        value = json.loads(result.text)
+        value["candidates"][0].pop("research_question")
+        return ModelResult(
+            text=json.dumps(value), model="fake",
+            usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+            elapsed_seconds=0.01, finish_reason="stop")
+
+
+class MissingTitleModel(FakeModel):
+    """Omit a candidate title, then return only the targeted title patch."""
+
+    assignments = []
+
+    def complete(self, *, system, prompt, images=None):
+        payload = json.loads(prompt)
+        type(self).assignments.append(payload.get("assignment"))
+        if payload.get("assignment") == "repair_missing_topic_fields":
+            patches = [{
+                "id": item["id"],
+                "fields": {"title": f"Working title for {item['candidate_fields']['domain']}"},
+            } for item in payload["candidate_context"]]
+            return ModelResult(
+                text=json.dumps({"candidate_patches": patches}), model="fake",
+                usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                elapsed_seconds=0.01, finish_reason="stop")
+        result = super().complete(system=system, prompt=prompt, images=images)
+        value = json.loads(result.text)
+        value["candidates"][0].pop("title")
+        return ModelResult(
+            text=json.dumps(value), model="fake",
+            usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+            elapsed_seconds=0.01, finish_reason="stop")
+
+
 class PortfolioRepairModel(FakeModel):
     """Return one structurally collapsed package, then a valid repair."""
 
@@ -232,6 +307,20 @@ class MaturityModel:
             return ModelResult(text=json.dumps(review), model="fake",
                                usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
                                elapsed_seconds=0.01, finish_reason="stop")
+        if payload.get("assignment") == "repair_selected_topic_candidate":
+            candidate = dict(payload["parent_candidate"])
+            candidate.update(payload["required_shape"])
+            candidate["research_question"] = (
+                "Does mechanism 1 change the measured outcome across clean and contaminated regimes, "
+                "and which regime separates the competing explanations?"
+            )
+            candidate["scope"] = (
+                "Public data and a reproducible local experiment spanning clean and contaminated regimes."
+            )
+            return ModelResult(
+                text=json.dumps({"candidate": candidate}), model="fake",
+                usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                elapsed_seconds=0.01, finish_reason="stop")
         objective = payload["principal_objective"]
         value = package(objective)
         if payload.get("assignment") == "refine_topic_discovery":
@@ -246,15 +335,49 @@ class MaturityModel:
                            elapsed_seconds=0.01, finish_reason="stop")
 
 
+class MaturityMalformedRepairModel(MaturityModel):
+    """Return an incomplete review once, then a complete bounded repair."""
+
+    review_calls = 0
+    assignments = []
+
+    def complete(self, *, system, prompt, images=None):
+        payload = json.loads(prompt)
+        type(self).assignments.append(payload.get("assignment"))
+        if payload.get("assignment") in {
+                "topic_maturity_review", "repair_topic_maturity_review"}:
+            type(self).review_calls += 1
+            if type(self).review_calls == 1:
+                return ModelResult(text='{"decision":', model="fake",
+                                   usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                                   elapsed_seconds=0.01, finish_reason="stop")
+            review = {
+                "decision": "admit", "selected_id": payload["selected_id_to_copy_exactly"],
+                "scores": {
+                    "question_specificity": 4, "mechanism_depth": 3,
+                    "comparison_design": 4, "contribution_potential": 3,
+                    "falsifiability": 4,
+                },
+                "rationale": "The bounded direction has a concrete mechanism and disconfirmation route.",
+                "required_changes": [], "changed_dimensions": [],
+            }
+            return ModelResult(text=json.dumps(review), model="fake",
+                               usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                               elapsed_seconds=0.01, finish_reason="stop")
+        return super().complete(system=system, prompt=prompt, images=images)
+
+
 class SourceChallengeRefinementModel(FakeModel):
     """Reject the first source challenge, then admit its bounded repair."""
 
     calls = []
+    payloads = []
     challenge_count = 0
 
     def complete(self, *, system, prompt, images=None):
         payload = json.loads(prompt)
         self.calls.append(payload.get("assignment"))
+        self.payloads.append(payload)
         if payload.get("assignment") == "topic_source_and_template_challenge":
             type(self).challenge_count += 1
             admitted = type(self).challenge_count > 1
@@ -272,6 +395,29 @@ class SourceChallengeRefinementModel(FakeModel):
             return ModelResult(text=json.dumps(review), model="fake",
                                usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
                                elapsed_seconds=0.01, finish_reason="stop")
+        if payload.get("assignment") == "repair_selected_topic_candidate":
+            candidate = dict(payload["parent_candidate"])
+            candidate.update(payload["required_shape"])
+            target_seed = next(
+                seed for seed in payload["frontier_seeds"]
+                if seed["id"] == payload["target_frontier_seed_id"])
+            candidate.update({
+                "domain": target_seed["domain"],
+                "frontier_seed_id": target_seed["id"],
+                "prior_work_ids": [payload["target_seed_records"][0]["work_id"]],
+                "title": f"{target_seed['domain']} changed boundary",
+                "research_question": (
+                    f"Does {target_seed['mechanism']} alter the bounded observable "
+                    f"under a changed comparison for {target_seed['unit_of_analysis']}?"
+                ),
+                "mechanism": target_seed["mechanism"],
+                "comparison": "Compare the supplied mechanism against its stated boundary.",
+                "measurement": target_seed["unit_of_analysis"],
+            })
+            return ModelResult(
+                text=json.dumps({"candidate": candidate}), model="fake",
+                usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                elapsed_seconds=0.01, finish_reason="stop")
         result = super().complete(system=system, prompt=prompt, images=images)
         if payload.get("assignment") == "refine_topic_discovery":
             value = json.loads(result.text)
@@ -280,6 +426,108 @@ class SourceChallengeRefinementModel(FakeModel):
                 "evidence_mode": "cross_source_synthesis",
                 "comparison_type": "causal_contrast",
             })
+            result = ModelResult(
+                text=json.dumps(value), model="fake",
+                usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                elapsed_seconds=0.01, finish_reason="stop")
+        return result
+
+
+class SourceChallengeInvalidIdRepairModel(FakeModel):
+    """Repair a challenger response that cites an ID outside its evidence packet."""
+
+    assignments = []
+    challenge_count = 0
+
+    def complete(self, *, system, prompt, images=None):
+        payload = json.loads(prompt)
+        type(self).assignments.append(payload.get("assignment"))
+        if payload.get("assignment") in {
+                "topic_source_and_template_challenge", "repair_topic_source_challenge"}:
+            type(self).challenge_count += 1
+            allowed = payload["allowed_work_ids"]
+            work_ids = ["W-not-supplied"] if type(self).challenge_count == 1 else [allowed[0]]
+            review = {
+                "schema_version": "topic-source-challenge-1",
+                "decision": "admit_to_survey", "selected_id": payload["selected_topic"]["id"],
+                "source_relevance": 4, "template_independence": 4, "prior_work_risk": "low",
+                "closest_work_ids": work_ids,
+                "rationale": "The supplied record supports a distinct bounded comparison.",
+                "required_changes": [],
+            }
+            return ModelResult(text=json.dumps(review), model="fake",
+                               usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                               elapsed_seconds=0.01, finish_reason="stop")
+        return super().complete(system=system, prompt=prompt, images=images)
+
+
+class RefinementValidationRepairModel(FakeModel):
+    """Repair a refinement using the rejected package and validation error."""
+
+    challenge_calls = 0
+    refinement_calls = 0
+    payloads = []
+
+    def complete(self, *, system, prompt, images=None):
+        payload = json.loads(prompt)
+        type(self).payloads.append(payload)
+        if payload.get("assignment") == "topic_source_and_template_challenge":
+            type(self).challenge_calls += 1
+            admitted = type(self).challenge_calls > 1
+            review = {
+                "schema_version": "topic-source-challenge-1",
+                "decision": "admit_to_survey" if admitted else "refine",
+                "selected_id": payload["selected_topic"]["id"],
+                "source_relevance": 4,
+                "template_independence": 4 if admitted else 2,
+                "prior_work_risk": "low" if admitted else "high",
+                "closest_work_ids": [payload["targeted_scholarly_records"][0]["work_id"]],
+                "rationale": "The first direction needs a substantive pivot; the repaired direction is distinct.",
+                "required_changes": [] if admitted else [
+                    "Change the research form and comparison boundary."
+                ],
+            }
+            return ModelResult(text=json.dumps(review), model="fake",
+                               usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                               elapsed_seconds=0.01, finish_reason="stop")
+        if payload.get("assignment") == "repair_selected_topic_candidate":
+            type(self).refinement_calls += 1
+            candidate = dict(payload["parent_candidate"])
+            candidate["research_question"] = (
+                "Does the changed mechanism alter the observed transition under a bounded comparison?"
+            )
+            if type(self).refinement_calls > 1:
+                candidate.update(payload["required_shape"])
+                target_seed = next(
+                    seed for seed in payload["frontier_seeds"]
+                    if seed["id"] == payload["target_frontier_seed_id"])
+                candidate.update({
+                    "domain": target_seed["domain"],
+                    "frontier_seed_id": target_seed["id"],
+                    "prior_work_ids": [payload["target_seed_records"][0]["work_id"]],
+                    "scope": "A bounded transition comparison across supplied records.",
+                    "mechanism": target_seed["mechanism"],
+                    "measurement": target_seed["unit_of_analysis"],
+                })
+            return ModelResult(
+                text=json.dumps({"candidate": candidate}), model="fake",
+                usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                elapsed_seconds=0.01, finish_reason="stop")
+        result = super().complete(system=system, prompt=prompt, images=images)
+        if payload.get("assignment") == "refine_topic_discovery":
+            type(self).refinement_calls += 1
+            value = json.loads(result.text)
+            candidate = value["candidates"][1]
+            candidate["research_question"] = (
+                "Does the changed mechanism alter the observed transition under a bounded comparison?"
+            )
+            if type(self).refinement_calls > 1:
+                candidate.update({
+                    "research_form": "scaling_boundary",
+                    "evidence_mode": "cross_source_synthesis",
+                    "comparison_type": "causal_contrast",
+                    "scope": "A bounded transition comparison across the supplied scholarly records.",
+                })
             result = ModelResult(
                 text=json.dumps(value), model="fake",
                 usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
@@ -301,6 +549,8 @@ class TopicDiscoveryTests(unittest.TestCase):
                 "max_attempts": 2,
                 "budgets": {"max_model_calls": 4, "max_openalex_requests": 5},
             }
+            self.assertEqual(validate_topic_stage_config(config), config)
+            config["max_attempts"] = MAX_BOUNDED_TOPIC_ATTEMPTS
             self.assertEqual(validate_topic_stage_config(config), config)
             value = package("Choose a feasible research direction")
             self.assertEqual(validate_topic_package(value, objective=value["objective"], candidate_count=3), value)
@@ -413,6 +663,129 @@ class TopicDiscoveryTests(unittest.TestCase):
         changed = validate_topic_refinement(parent, child, require_structural_pivot=True)
         self.assertEqual(changed, ["research_question", "research_form", "evidence_mode"])
 
+    def test_refinement_shape_plan_moves_the_parent_slot(self):
+        initial = _portfolio_shape_plan(4, seed=123456)
+        parent_index = 1
+        parent_shape = initial[parent_index]
+        payload = json.loads(topic_prompt(
+            "Choose a feasible research direction", 4,
+            refinement_context={
+                "parent_topic": {"id": "direction_1", **parent_shape},
+                "parent_candidate_index": parent_index,
+                "refinement_feedback": {"required_changes": ["Change the comparison boundary."]},
+            },
+            portfolio_seed=123456,
+        ))
+        repaired = payload["portfolio_shape_plan"]
+        self.assertNotEqual(
+            tuple(repaired[parent_index][field] for field in PORTFOLIO_DIMENSIONS),
+            tuple(parent_shape[field] for field in PORTFOLIO_DIMENSIONS),
+        )
+        self.assertEqual(
+            len({item["research_form"] for item in repaired}), 4)
+        self.assertEqual(
+            len({item["evidence_mode"] for item in repaired}), 3)
+        self.assertEqual(
+            len({item["comparison_type"] for item in repaired}), 3)
+
+    def test_foundry_shape_plan_and_selection_repair_keep_one_executable_member(self):
+        context = {
+            "capability_foundry": {
+                "enabled": True,
+                "allowed_evidence_modes": ["analytical_derivation", "synthetic_simulation"],
+            },
+            "executables": {"python3": True},
+            "python_packages": {},
+            "configured_stage_kinds": ["experiment"],
+        }
+        payload = json.loads(topic_prompt(
+            "Choose a feasible research direction", 4,
+            runtime_context=context, portfolio_seed=9876,
+        ))
+        self.assertTrue(any(
+            item["evidence_mode"] in context["capability_foundry"]["allowed_evidence_modes"]
+            for item in payload["portfolio_shape_plan"]))
+        value = package("Choose a feasible research direction")
+        value["candidates"][0]["evidence_mode"] = "synthetic_simulation"
+        value["candidates"][0].pop("capability_requirements")
+        value["candidates"][1]["evidence_mode"] = "published_observations"
+        value["selected_id"] = "direction_1"
+        repair = _repair_foundry_selection(value, context)
+        self.assertEqual(repair["from_selected_id"], "direction_1")
+        self.assertEqual(repair["to_selected_id"], "direction_0")
+        self.assertEqual(value["selected_id"], "direction_0")
+        self.assertEqual(
+            value["candidates"][0]["capability_requirements"],
+            {"executables": ["python3"], "python_packages": [], "stage_kinds": ["experiment"]},
+        )
+
+    def test_refinement_selection_repair_uses_actual_candidate_shapes(self):
+        value = package("Choose a feasible research direction")
+        parent = value["candidates"][1]
+        value["selected_id"] = parent["id"]
+        repair = _repair_topic_refinement_selection(value, parent)
+        self.assertIsNotNone(repair)
+        self.assertNotEqual(value["selected_id"], parent["id"])
+        replacement = next(
+            candidate for candidate in value["candidates"]
+            if candidate["id"] == value["selected_id"])
+        self.assertNotEqual(
+            tuple(replacement[field] for field in PORTFOLIO_DIMENSIONS),
+            tuple(parent[field] for field in PORTFOLIO_DIMENSIONS),
+        )
+        self.assertGreaterEqual(len(repair["changed_dimensions"]), 2)
+
+    def test_refinement_selection_repair_skips_rejected_seeds_when_pivot_is_required(self):
+        value = package("Choose a feasible research direction")
+        for index, candidate in enumerate(value["candidates"]):
+            candidate["frontier_seed_id"] = f"frontier_{index}"
+        parent = value["candidates"][1]
+        value["selected_id"] = parent["id"]
+        repair = _repair_topic_refinement_selection(
+            value, parent, require_frontier_seed_pivot=True,
+            rejected_frontier_seed_ids=["frontier_0", "frontier_1"])
+        self.assertIsNotNone(repair)
+        replacement = next(
+            candidate for candidate in value["candidates"]
+            if candidate["id"] == value["selected_id"])
+        self.assertEqual(replacement["frontier_seed_id"], "frontier_2")
+        self.assertNotIn(replacement["frontier_seed_id"], {"frontier_0", "frontier_1"})
+
+    def test_weak_high_risk_source_refinement_requires_a_new_frontier_seed(self):
+        value = package("Choose a feasible research direction")
+        parent = value["candidates"][1]
+        parent["frontier_seed_id"] = "frontier_1"
+        child = {
+            **parent,
+            "research_question": "A genuinely changed question.",
+            "research_form": "scaling_boundary",
+            "evidence_mode": "cross_source_synthesis",
+            "frontier_seed_id": "frontier_1",
+        }
+        with self.assertRaisesRegex(ValidationError, "different frontier seed"):
+            validate_topic_refinement(
+                parent, child, require_structural_pivot=True,
+                require_frontier_seed_pivot=True)
+        child["frontier_seed_id"] = "frontier_2"
+        changed = validate_topic_refinement(
+            parent, child, require_structural_pivot=True,
+            require_frontier_seed_pivot=True)
+        self.assertIn("frontier_seed_id", changed)
+
+    def test_only_weak_or_template_near_high_risk_source_forces_seed_pivot(self):
+        self.assertFalse(_source_challenge_requires_frontier_seed_pivot({
+            "prior_work_risk": "high", "source_relevance": 4,
+            "template_independence": 2,
+        }))
+        self.assertTrue(_source_challenge_requires_frontier_seed_pivot({
+            "prior_work_risk": "high", "source_relevance": 4,
+            "template_independence": 1,
+        }))
+        self.assertTrue(_source_challenge_requires_frontier_seed_pivot({
+            "prior_work_risk": "high", "source_relevance": 2,
+            "template_independence": 4,
+        }))
+
     def test_topic_prompt_exposes_portfolio_contract_and_attempt_history(self):
         from scisaurus.runtime.topic_discovery import topic_prompt
         payload = json.loads(topic_prompt(
@@ -421,6 +794,70 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(payload["portfolio_requirements"]["minimum_distinct_research_forms"], 4)
         self.assertIn("research_form", payload["output_contract"]["candidate"])
         self.assertEqual(payload["previous_candidate_directions"][0]["status"], "rejected")
+
+    def test_topic_prompt_exposes_source_seed_pivot_requirement(self):
+        from scisaurus.runtime.topic_discovery import topic_prompt
+        payload = json.loads(topic_prompt(
+            "Choose a feasible research direction", 3,
+            frontier_seeds=frontier_plan(3)["seeds"],
+            recent_papers=[{
+                "work_id": "W1", "frontier_seed_id": "frontier_0",
+                "title": "Marine ecology transition", "abstract": "A bounded study.",
+            }],
+            refinement_context={
+                "parent_topic": {"frontier_seed_id": "frontier_0"},
+                "require_frontier_seed_pivot": True,
+            }))
+        self.assertTrue(payload["refinement_shape"]["frontier_seed_pivot_required"])
+        self.assertTrue(any("different frontier_seed_id" in item for item in payload["constraints"]))
+
+    def test_topic_objective_is_restored_from_the_declared_mission(self):
+        value = {"objective": "model paraphrase"}
+        self.assertIs(_materialize_topic_objective(value, "declared mission"), value)
+        self.assertEqual(value["objective"], "declared mission")
+
+    def test_missing_domain_is_derived_only_from_the_declared_frontier_seed(self):
+        value = {"candidates": [
+            {"id": "direction_1", "frontier_seed_id": "frontier_1"},
+            {"id": "direction_2", "frontier_seed_id": "missing", "domain": "explicit"},
+        ]}
+        repairs = _materialize_seed_domains(value, [{
+            "id": "frontier_1", "domain": "marine ecology",
+        }])
+        self.assertEqual(value["candidates"][0]["domain"], "marine ecology")
+        self.assertEqual(value["candidates"][1]["domain"], "explicit")
+        self.assertEqual(repairs[0]["source"], "frontier_seed_id")
+
+    def test_missing_grounding_is_repaired_only_from_an_exact_seed_and_matching_record(self):
+        value = {"candidates": [{
+            "id": "direction_1",
+            "domain": "marine ecology",
+            "title": "Diel oxygen transition",
+            "research_question": "Does oxygen control a plankton transition?",
+            "scope": "Estuarine plankton under diel oxygen forcing.",
+        }]}
+        repairs = _materialize_seed_bindings(
+            value,
+            [{
+                "id": "frontier_1", "domain": "marine ecology",
+                "phenomenon": "oxygen transition", "mechanism": "diel forcing",
+                "unit_of_analysis": "plankton community",
+            }],
+            [{
+                "work_id": "W1", "frontier_seed_id": "frontier_1",
+                "title": "Oxygen transitions in estuarine plankton",
+                "abstract": "Diel oxygen forcing changes plankton community turnover.",
+            }],
+        )
+        self.assertEqual(value["candidates"][0]["frontier_seed_id"], "frontier_1")
+        self.assertEqual(value["candidates"][0]["prior_work_ids"], ["W1"])
+        self.assertEqual(
+            {(item["field"], item["source"]) for item in repairs},
+            {
+                ("frontier_seed_id", "exact_frontier_domain"),
+                ("prior_work_ids", "seed_record_token_overlap"),
+            },
+        )
 
     def test_runner_persists_candidate_attempt_trace_and_admission(self):
         with patch("scisaurus.runtime.topic_discovery.ModelClient", FakeModel):
@@ -450,6 +887,7 @@ class TopicDiscoveryTests(unittest.TestCase):
         repair_prompts = [item for item in PortfolioRepairModel.prompts
                           if item.get("assignment") == "repair_invalid_topic_discovery"]
         self.assertEqual(len(repair_prompts), 1)
+        self.assertIn("portfolio_repair", repair_prompts[0])
         self.assertEqual(repair_prompts[0]["previous_candidate_directions"][0]["status"], "rejected")
 
     def test_runner_refines_topic_after_maturity_review(self):
@@ -472,8 +910,24 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["maturity_score"], 18)
         self.assertIn("across clean and contaminated regimes", result["question"])
 
+    def test_runner_repairs_incomplete_maturity_review_without_discarding_package(self):
+        MaturityMalformedRepairModel.review_calls = 0
+        MaturityMalformedRepairModel.assignments = []
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", MaturityMalformedRepairModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+            }).run("Choose a feasible research direction", candidate_count=3,
+                   bibliography=False, maturity_review_rounds=1, max_attempts=1)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(MaturityMalformedRepairModel.review_calls, 2)
+        self.assertEqual(MaturityMalformedRepairModel.assignments[-2:], [
+            "topic_maturity_review", "repair_topic_maturity_review",
+        ])
+
     def test_runner_carries_source_challenge_feedback_into_repair(self):
         SourceChallengeRefinementModel.calls = []
+        SourceChallengeRefinementModel.payloads = []
         SourceChallengeRefinementModel.challenge_count = 0
         with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", FakeOpenAlex), \
                 patch("scisaurus.runtime.topic_discovery.ModelClient", SourceChallengeRefinementModel):
@@ -484,8 +938,66 @@ class TopicDiscoveryTests(unittest.TestCase):
                    max_attempts=2, maturity_review_rounds=0)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(SourceChallengeRefinementModel.challenge_count, 2)
-        self.assertEqual(SourceChallengeRefinementModel.calls.count("refine_topic_discovery"), 1)
+        self.assertEqual(
+            SourceChallengeRefinementModel.calls.count("repair_selected_topic_candidate"), 1)
+        refinement = next(item for item in SourceChallengeRefinementModel.payloads
+                          if item.get("assignment") == "repair_selected_topic_candidate")
+        self.assertEqual(
+            refinement["targeted_feedback"]["required_changes"],
+            ["Change the mechanism and comparison boundary."],
+        )
+        self.assertNotEqual(
+            refinement["target_frontier_seed_id"],
+            refinement["parent_candidate"]["frontier_seed_id"],
+        )
+        challenge_payload = next(item for item in SourceChallengeRefinementModel.payloads
+                                if item.get("assignment") == "topic_source_and_template_challenge")
+        self.assertEqual(
+            challenge_payload["allowed_work_ids"],
+            [record["work_id"] for record in challenge_payload["targeted_scholarly_records"]],
+        )
+        self.assertTrue(set(refinement["output_contract"]["candidate"]).issuperset({
+            "research_question", "mechanism", "measurement", "frontier_seed_id",
+        }))
         self.assertEqual(result["source_challenge"]["decision"], "admit_to_survey")
+
+    def test_runner_repairs_refinement_against_the_rejected_package(self):
+        RefinementValidationRepairModel.challenge_calls = 0
+        RefinementValidationRepairModel.refinement_calls = 0
+        RefinementValidationRepairModel.payloads = []
+        with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", FakeOpenAlex), \
+                patch("scisaurus.runtime.topic_discovery.ModelClient", RefinementValidationRepairModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+        }).run("Choose a feasible research direction", candidate_count=3,
+                   max_attempts=3, maturity_review_rounds=0)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["selected_id"], result["topic"]["id"])
+        self.assertEqual(result["selected_id"], "direction_0")
+        self.assertEqual(RefinementValidationRepairModel.refinement_calls, 1)
+        repair = [
+            item for item in RefinementValidationRepairModel.payloads
+            if item.get("assignment") == "refine_topic_discovery"
+            and "previous_response" in item
+        ]
+        self.assertEqual(repair, [])
+
+    def test_source_challenge_repairs_out_of_packet_work_id(self):
+        SourceChallengeInvalidIdRepairModel.assignments = []
+        SourceChallengeInvalidIdRepairModel.challenge_count = 0
+        with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", FakeOpenAlex), \
+                patch("scisaurus.runtime.topic_discovery.ModelClient", SourceChallengeInvalidIdRepairModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+            }).run("Choose a feasible research direction", candidate_count=3,
+                   max_attempts=1, maturity_review_rounds=0)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(SourceChallengeInvalidIdRepairModel.challenge_count, 2)
+        self.assertEqual(SourceChallengeInvalidIdRepairModel.assignments[-2:], [
+            "topic_source_and_template_challenge", "repair_topic_source_challenge",
+        ])
 
     def test_samples_recent_records_with_unicode_objective_and_reproducible_shuffle(self):
         FakeOpenAlex.queries = []
@@ -558,6 +1070,27 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(events[-1]["kind"], "validation")
         self.assertIn("source challenge", events[-1]["error"])
 
+    def test_topic_budget_preflights_input_before_provider_dispatch(self):
+        budget = TopicBudget({"max_model_calls": 2, "max_input_tokens": 1}, {})
+        with self.assertRaisesRegex(QuotaExceededError, "input_tokens"):
+            budget.before_model_call(
+                "topic_discovery", "fake", system="Return JSON.", prompt="A bounded request.")
+        snapshot = budget.snapshot()
+        self.assertEqual(snapshot["usage"]["model_calls"], 0)
+        self.assertEqual(snapshot["usage"]["input_tokens"], 0)
+        self.assertEqual(len(snapshot["events"]), 1)
+        self.assertEqual(snapshot["events"][0]["kind"], "quota")
+        self.assertEqual(snapshot["events"][0]["status"], "blocked")
+        self.assertEqual(snapshot["events"][0]["dimension"], "input_tokens")
+
+    def test_topic_budget_records_conservative_input_estimate_on_dispatch(self):
+        budget = TopicBudget({"max_model_calls": 1, "max_input_tokens": 1000}, {})
+        budget.before_model_call(
+            "topic_discovery", "fake", system="Return JSON.", prompt="A bounded request.")
+        event = budget.snapshot()["events"][0]
+        self.assertEqual(event["kind"], "model")
+        self.assertGreater(event["estimated_input_tokens"], 0)
+
     def test_topic_sampling_rejects_single_token_provider_false_positives(self):
         class MixedRelevanceOpenAlex:
             def __init__(self, **config):
@@ -604,6 +1137,51 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertGreaterEqual(
             len({item["frontier_seed_id"] for item in result["candidates"]}), 3)
         self.assertTrue(all(item["prior_work_ids"] for item in result["candidates"]))
+
+    def test_runner_repairs_only_a_missing_research_question(self):
+        objective = "Choose a feasible research direction"
+        MissingResearchQuestionModel.assignments = []
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", MissingResearchQuestionModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+            }).run(objective, candidate_count=3, bibliography=False, max_attempts=1)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(
+            MissingResearchQuestionModel.assignments,
+            ["free_topic_discovery", "repair_missing_topic_fields"],
+        )
+        self.assertTrue(all(candidate["research_question"] for candidate in result["candidates"]))
+        repairs = result["candidate_attempt_trace"][0]["derived_field_repairs"]
+        self.assertEqual(repairs[0]["field"], "research_question")
+        self.assertEqual(repairs[0]["source"], "targeted_model_field_repair")
+
+    def test_runner_repairs_only_a_missing_title(self):
+        objective = "Choose a feasible research direction"
+        MissingTitleModel.assignments = []
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", MissingTitleModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+            }).run(objective, candidate_count=3, bibliography=False, max_attempts=1)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(
+            MissingTitleModel.assignments,
+            ["free_topic_discovery", "repair_missing_topic_fields"],
+        )
+        self.assertTrue(all(candidate["title"] for candidate in result["candidates"]))
+        repairs = result["candidate_attempt_trace"][0]["derived_field_repairs"]
+        self.assertEqual(repairs[0]["field"], "title")
+        self.assertEqual(repairs[0]["source"], "targeted_model_field_repair")
+
+    def test_topic_client_clamps_provider_timeout_to_stage_deadline(self):
+        runner = TopicDiscoveryRunner({
+            "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+            "timeout_seconds": 120, "max_output_tokens": 4096,
+        })
+        client = runner._client("topic_discovery", deadline=time.monotonic() + 5)
+        self.assertGreater(client.timeout_seconds, 0)
+        self.assertLessEqual(client.timeout_seconds, 5)
 
     def test_grounded_portfolio_rejects_invented_sources_and_seed_collapse(self):
         value = package("Choose a feasible research direction")
@@ -689,6 +1267,99 @@ class TopicDiscoveryTests(unittest.TestCase):
             from scisaurus.runtime.topic_discovery import validate_topic_feasibility
             validate_topic_feasibility(value, {"executables": {}, "python_packages": {}, "configured_stage_kinds": []})
 
+    def test_foundry_selected_baseline_is_materialized_when_model_omits_it(self):
+        value = package("Choose a feasible research direction")
+        value["candidates"][1].pop("capability_requirements")
+        context = {
+            "capability_foundry": {"enabled": True},
+            "executables": {"python3": True},
+            "python_packages": {"numpy": True},
+            "configured_stage_kinds": ["topic_discovery", "experiment", "paper"],
+        }
+        _materialize_foundry_capability_requirements(value, context)
+        self.assertEqual(
+            value["candidates"][1]["capability_requirements"],
+            {"executables": ["python3"], "python_packages": [], "stage_kinds": ["experiment"]},
+        )
+        from scisaurus.runtime.topic_discovery import validate_topic_feasibility
+        self.assertEqual(validate_topic_feasibility(value, context)["status"], "feasible")
+
+    def test_foundry_feasibility_note_is_materialized_without_inventing_evidence(self):
+        value = package("Choose a feasible research direction")
+        value["candidates"][0].pop("feasibility")
+        context = {
+            "capability_foundry": {"enabled": True},
+            "executables": {}, "python_packages": {}, "configured_stage_kinds": [],
+        }
+        repairs = _materialize_foundry_feasibility(value, context)
+        self.assertEqual(repairs[0]["field"], "feasibility")
+        self.assertIn("bounded experiment baseline", value["candidates"][0]["feasibility"])
+
+    def test_foundry_topic_rejects_external_evidence_mode(self):
+        value = package("Choose a feasible research direction")
+        context = {
+            "capability_foundry": {
+                "enabled": True,
+                "allowed_evidence_modes": ["analytical_derivation", "synthetic_simulation"],
+            },
+            "executables": {}, "python_packages": {},
+            "configured_stage_kinds": [],
+        }
+        with self.assertRaisesRegex(ValidationError, "analytical or synthetic"):
+            from scisaurus.runtime.topic_discovery import validate_topic_feasibility
+            validate_topic_feasibility(value, context)
+        value["candidates"][1]["evidence_mode"] = "synthetic_simulation"
+        self.assertEqual(validate_topic_feasibility(value, context)["status"], "feasible")
+
+    def test_frontier_query_anchor_repair_preserves_model_terms(self):
+        value = frontier_plan(4)
+        original = "unrelated spectroscopy transition"
+        value["seeds"][0]["search_queries"][0] = original
+        repaired = _anchor_frontier_seed_queries(value)
+        self.assertTrue(repaired["seeds"][0]["search_queries"][0].startswith(original))
+        validate_frontier_seed_plan(repaired, seed_count=4)
+
+    def test_topic_query_anchor_repair_preserves_model_terms(self):
+        value = package("Choose a feasible research direction")
+        original = "unrelated spectroscopy transition"
+        value["candidates"][0]["domain"] = "marine ecology"
+        value["candidates"][0]["title"] = "Diel oxygen boundary in estuarine plankton"
+        value["candidates"][0]["research_question"] = (
+            "Does oxygen depletion change plankton turnover across salinity gradients?")
+        value["candidates"][0]["search_queries"] = [
+            original, "oxygen plankton salinity", "estuarine oxygen turnover",
+        ]
+        self.assertEqual(_anchor_topic_candidate_queries(value), 1)
+        self.assertTrue(value["candidates"][0]["search_queries"][0].startswith(original))
+        validate_topic_package(value, objective=value["objective"], candidate_count=3)
+
+    def test_topic_query_anchor_repair_uses_the_matching_seed_for_sparse_queries(self):
+        value = {"candidates": [{
+            "id": "direction_1", "frontier_seed_id": "frontier_1",
+            "domain": "x", "title": "x", "research_question": "x",
+            "scope": "x", "mechanism": "x", "measurement": "x",
+            "search_queries": ["x"],
+        }]}
+        repairs = _anchor_topic_candidate_queries(
+            value, frontier_seeds=[{
+                "id": "frontier_1", "domain": "remote physics",
+                "phenomenon": "phase transition", "mechanism": "coupled transport",
+                "unit_of_analysis": "mode amplitude",
+            }])
+        self.assertEqual(repairs, 1)
+        query = value["candidates"][0]["search_queries"][0]
+        self.assertGreaterEqual(len(set(query.split())), 2)
+        self.assertTrue({"remote", "physics", "phase", "transition"}.intersection(query.split()))
+
+    def test_source_challenge_receives_cited_records_before_fresh_hits(self):
+        selected = {"prior_work_ids": ["W2", "W-missing"]}
+        cited = [{"work_id": "W1", "title": "Other"},
+                 {"work_id": "W2", "title": "Cited record"}]
+        targeted = [{"work_id": "W3", "title": "Fresh hit"},
+                    {"work_id": "W2", "title": "Duplicate fresh hit"}]
+        records = _merge_candidate_source_records(selected, cited, targeted, maximum=3)
+        self.assertEqual([item["work_id"] for item in records], ["W2", "W3"])
+
     def test_catalog_bound_candidates_must_name_an_available_experiment(self):
         value = package("Choose a feasible research direction")
         for candidate in value["candidates"]:
@@ -771,6 +1442,33 @@ class TopicDiscoveryTests(unittest.TestCase):
         selected["id"] = "new_direction"
         with self.assertRaisesRegex(ValidationError, "too similar|repeats"):
             validate_topic_novelty(selected, {"entries": [prior]})
+
+    def test_repeated_selection_switches_to_an_unseen_portfolio_member(self):
+        value = package("Choose a feasible research direction")
+        prior = {
+            "topic_id": "old_direction",
+            "title": value["candidates"][0]["title"],
+            "domain": value["candidates"][0]["domain"],
+            "research_question": value["candidates"][0]["research_question"],
+            "signature": topic_signature(value["candidates"][0]),
+        }
+        value["candidates"][1].update({
+            "title": "Dispersal-driven recovery after disturbance",
+            "domain": "landscape ecology",
+            "research_question": "How does habitat dispersal alter recovery time after a disturbance pulse?",
+        })
+        value["selected_id"] = value["candidates"][0]["id"]
+        repair = _repair_topic_novelty_selection(value, {"entries": [prior]})
+        self.assertEqual(repair["from_selected_id"], "direction_0")
+        self.assertEqual(value["selected_id"], "direction_1")
+
+    def test_excluded_selection_switches_to_an_unseen_portfolio_member(self):
+        value = package("Choose a feasible research direction")
+        value["selected_id"] = value["candidates"][0]["id"]
+        repair = _repair_topic_novelty_selection(
+            value, {"entries": []}, excluded_topic_ids={"direction_0"})
+        self.assertEqual(repair["from_selected_id"], "direction_0")
+        self.assertEqual(value["selected_id"], "direction_1")
 
     def test_topic_history_keeps_different_questions_in_same_portfolio(self):
         value = package("Choose a feasible research direction")

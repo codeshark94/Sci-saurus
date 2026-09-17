@@ -225,7 +225,9 @@ def validate_redteam_package(value):
     return value
 
 
-def research_redteam_packet(*, results, interpretation, argument, paper_evidence=(), paper_claims=(), references=()):
+def research_redteam_packet(*, results, interpretation, argument, research_program=None,
+                            argument_defense=None,
+                            paper_evidence=(), paper_claims=(), references=()):
     """Project only scientific inputs into the pre-composition review packet."""
     if not isinstance(results, dict) or not isinstance(argument, dict):
         raise ValidationError("red-team packet requires results and argument objects")
@@ -243,7 +245,7 @@ def research_redteam_packet(*, results, interpretation, argument, paper_evidence
         {key: deepcopy(item[key]) for key in ("key", "title", "year", "source_ref") if key in item}
         for item in references if isinstance(item, dict)
     ]
-    return {
+    packet = {
         "research_question": results.get("question"),
         "results_package": compact_results,
         "scientific_interpretation": deepcopy(interpretation),
@@ -252,6 +254,11 @@ def research_redteam_packet(*, results, interpretation, argument, paper_evidence
         "paper_claims": deepcopy(list(paper_claims)),
         "references": compact_references,
     }
+    if argument_defense is not None:
+        packet["argument_defense"] = deepcopy(argument_defense)
+    if research_program is not None:
+        packet["research_program"] = deepcopy(research_program)
+    return packet
 
 
 def redteam_prompt(packet, reviewer):
@@ -265,6 +272,8 @@ def redteam_prompt(packet, reviewer):
             "Check whether the supplied results actually contain the controls and analyses needed to discriminate the explanations.",
             "Demand robust parameter or condition coverage, uncertainty, sensitivity, convergence, and independent recalculation when relevant.",
             "Preserve negative, null, mixed, and failed predictions instead of selecting only favorable results.",
+            "Inspect argument_defense: accept a defense only when it labels the posture, binds available evidence, and keeps interpretive claims out of Results.",
+            "If the ledger identifies an unresolved mechanism or missing result, test whether it becomes a scoped research request rather than a prose-only defense.",
             "If a gap needs new evidence, emit a research request with a falsifiable success condition.",
             "Do not emit a prose repair as a substitute for a missing result.",
         ],

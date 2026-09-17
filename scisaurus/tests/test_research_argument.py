@@ -151,6 +151,8 @@ class ResearchArgumentTests(unittest.TestCase):
                                              "max_output_tokens": 100}).run(packet)
         self.assertEqual(result["status"], "accepted")
         self.assertEqual(result["model_calls"], 2)
+        self.assertEqual(result["argument_defense"]["schema_version"], "argument-defense-1")
+        self.assertEqual(len(result["argument_defense_sha256"]), 64)
         self.assertEqual(len(FakeClient.assignments), 2)
 
 

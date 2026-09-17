@@ -53,11 +53,16 @@ variable name is stored in descriptors.
 ## Runtime policy
 
 - `model.role_models` provides explicit per-role provider/model overrides.
-  Unlisted roles use DeepSeek; independent reviews, methods judgments, and
-  adversarial checks use GLM.
-- Bounded scholarly/web scouting, cataloging, and citation mapping use the
-  owner-private Qwen route. Simple section and manuscript drafts use
-  `gemma4:31b-cloud`.
+  Qwen and Gemma are assigned to the largest bulk workload: scholarly/web
+  scouting, cataloging, citation mapping, source review, prose, and surface
+  editing. DeepSeek v4.1 Flash and GLM 5.3 Flash are assigned to intermediate
+  planning, methods, interpretation, and ordinary review work.
+- Impact-only `kimi-k3:cloud` and full `glm-5.3:cloud` are opt-in escalation
+  lanes for topic maturity, experiment arbitration, journal editing, and final
+  arbitration. They share the durable budget key `kimi-k3+glm-5.3`, whose hard
+  ceiling is 20 total provider call attempts across the whole configured
+  mission. When that budget is exhausted, the declared fallback is DeepSeek;
+  no undeclared paid-model failover is allowed.
 - Qwen authentication is scoped to Qwen routes only; Gemma routes explicitly
   suppress inherited credentials.
 - Ollama runs reserve one independent verifier slot: the active configuration
@@ -67,7 +72,8 @@ variable name is stored in descriptors.
   json_object`. The client rejects empty or non-JSON replies instead of
   fabricating a fallback.
 - The client keeps its own timeout, byte, retry, and attempt accounting. A
-  stage budget remains authoritative even when the provider retries.
+  stage budget remains authoritative even when the provider retries. Premium
+  call reservations are atomic and count each retry attempt before network I/O.
 - Images are sent only as bounded Base64 `data:` parts. The configured image
   and request byte limits apply before dispatch.
 

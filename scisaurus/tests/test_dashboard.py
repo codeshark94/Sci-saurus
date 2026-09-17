@@ -8,6 +8,10 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from scisaurus.dashboard.server import DashboardServer, DashboardService, DashboardSnapshot
+from scisaurus.runtime.argument_defense import build_argument_defense
+from scisaurus.runtime.research_program import build_research_program
+from scisaurus.tests.test_argument_defense import argument
+from scisaurus.tests.test_research_program import topic_package
 
 
 class DashboardTests(unittest.TestCase):
@@ -77,6 +81,29 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(any(item["ref"] == "project::output/progress.json"
                             for item in snapshot["checkpoints"]))
         self.assertEqual((root / "README.md").read_text(encoding="utf-8"), "# Dashboard fixture\n")
+
+    def test_snapshot_exposes_research_program_and_argument_defense(self):
+        temporary, root = self.make_project()
+        self.addCleanup(temporary.cleanup)
+        program = build_research_program(topic_package())
+        defense = build_argument_defense(
+            argument(), {"evidence_ids": ["e1", "e2", "e3"]}, research_program=program)
+        live = json.loads((root / "output" / "progress.json").read_text(encoding="utf-8"))
+        live["context"] = {
+            "topic": {"research_program": program},
+            "argument": {"argument_package": {"argument_defense": defense}},
+        }
+        (root / "output" / "progress.json").write_text(
+            json.dumps(live), encoding="utf-8")
+
+        snapshot = DashboardSnapshot(root).payload()
+        research = snapshot["research"]
+        self.assertEqual(research["research_program"]["schema_version"], "research-program-1")
+        self.assertEqual(research["research_program"]["selected_id"], "branch_1")
+        self.assertEqual(len(research["research_program"]["branches"]), 3)
+        self.assertEqual(research["argument_defense"]["schema_version"], "argument-defense-1")
+        self.assertEqual(research["argument_defense"]["claim_count"], 4)
+        self.assertTrue(research["argument_defense"]["weak_points"])
 
     def test_snapshot_projects_real_model_calls_from_call_artifacts(self):
         temporary, root = self.make_project()
@@ -169,10 +196,35 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(calls["recent_items"][0]["model"], "glm-5.3-flash:cloud")
         self.assertEqual(calls["recent_items"][0]["response_status"], "response recorded")
         self.assertEqual(calls["recent_items"][0]["cache"], {
-            "requested": True, "status": "hit", "read_tokens": 64, "write_tokens": None,
+            "requested": True, "status": "partial", "read_tokens": 64, "write_tokens": None,
+            "read_ratio": 0.64,
         })
         self.assertEqual(calls["recent_items"][0]["usage"]["cache_read_tokens"], 64)
         self.assertTrue(calls["recent_items"][0]["response_ref"].startswith("project::objects/sha256/"))
+
+    def test_snapshot_projects_live_composer_specialist_calls(self):
+        temporary, root = self.make_project()
+        self.addCleanup(temporary.cleanup)
+        snapshot = DashboardSnapshot(root)
+        live = {
+            "stages": {"survey": {"specialist_live": {
+                "research.cataloger": {
+                    "event": "dispatched", "execution_mode": "model",
+                    "task_id": "specialist-survey-cataloger", "stage_id": "survey",
+                    "model": "qwen3.8-27b", "base_url": "https://desktop-br7ukeg.taila57d41.ts.net/v1",
+                    "provider_pool": "qwen", "route_id": "qwen-bulk",
+                    "cache_prompt": True, "observed_at": "2026-09-16T00:00:03+00:00",
+                },
+            }}}
+        }
+        calls = snapshot._model_calls({"tasks": [], "attempts": [], "artifacts": []}, live)
+
+        self.assertEqual(calls["active"], 1)
+        self.assertEqual(calls["total"], 1)
+        self.assertEqual(calls["live_items"][0]["role"], "research.cataloger")
+        self.assertEqual(calls["live_items"][0]["provider"], "Tailnet")
+        self.assertEqual(calls["live_items"][0]["response_status"], "awaiting response")
+        self.assertEqual(calls["live_items"][0]["cache"]["status"], "enabled · unreported")
 
     def test_workspace_overview_is_lightweight_and_project_scoped(self):
         temporary, root = self.make_project()

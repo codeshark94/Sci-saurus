@@ -33,6 +33,14 @@ The same runtime can also produce bounded reports, guides, JSON artifacts, and
 Python source units. A scientific result is never inferred from a model response
 or a successful process exit alone.
 
+For free-topic missions, topic discovery is materialized as a provisional
+research program: all candidate branches are retained with supportive,
+null/boundary, and ambiguous outcome rules plus a declared kill condition. The
+argument stage then writes an evidence-bound defense ledger that separates
+observations, inferences, provisional explanations, limitations, and future
+tests. Missing evidence remains a research request; it cannot be repaired by
+confident prose.
+
 Licensed under the [MIT License](LICENSE).
 
 ## How the organization works
@@ -95,6 +103,7 @@ and [Agent, Department, and Stage Flow](docs/16-agent-department-flow.md).
 | **Literature survey** | OpenAlex discovery, source capture, identity reconciliation, exact source spans, citation maps, counter-search, and gap assessment |
 | **Scientific experiments** | Frozen methods and seeds, deterministic replay, independent recalculation, raw observations, figures, and result-package review |
 | **Paper pipeline** | Frozen storyline, claim/evidence index, bibliography, figures, LaTeX, rendered PDF, and release manifest |
+| **Research program and defense ledger** | Candidate branches with conditional paper outcomes, retained alternatives, posture-separated argumentation, and reviewer-visible weak points |
 | **Resume and time policy** | Checkpoints, deadline-aware replanning, unknown-call reconciliation, retained failures, and scoped repair |
 | **Tool acquisition** | Allowlisted programs, APIs, and MCP services with readiness probes and drift-aware bindings |
 

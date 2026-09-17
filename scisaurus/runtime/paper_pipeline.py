@@ -51,6 +51,10 @@ from scisaurus.runtime.research_argument import (
     validate_argument_review,
     validate_research_argument,
 )
+from scisaurus.runtime.argument_defense import (
+    build_argument_defense,
+    validate_argument_defense,
+)
 from scisaurus.runtime.research_redteam import (
     ResearchRedTeamRunner,
     research_redteam_packet,
@@ -787,6 +791,7 @@ class PaperPipelineRunner:
                                          if initial_argument_package is not None else None)
         self.research_argument = None
         self.argument_review = None
+        self.argument_defense = None
         self.argument_usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
         self.research_redteam = None
         self.research_redteam_usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
@@ -961,6 +966,8 @@ class PaperPipelineRunner:
                 results=results,
                 interpretation=self.packet.get("scientific_interpretation"),
                 argument=argument,
+                research_program=self.packet.get("research_program"),
+                argument_defense=self.packet.get("argument_defense"),
                 paper_evidence=paper_config.get("evidence", []),
                 paper_claims=paper_config.get("claims", []),
                 references=paper_config.get("references", []),
@@ -1015,6 +1022,8 @@ class PaperPipelineRunner:
                     "argument_status": argument_review["decision"],
                     "research_argument_path": str(self.output / "research-argument.json"),
                     "research_argument_review_path": str(self.output / "research-argument-review.json"),
+                    "research_argument_defense_path": str(self.output / "research-argument-defense.json"),
+                    "research_argument_defense_sha256": hashlib.sha256(canonical_bytes(self.argument_defense)).hexdigest(),
                     "research_argument_sha256": hashlib.sha256(canonical_bytes(argument)).hexdigest(),
                     "manuscript_project_dir": None,
                     "release_dir": None,
@@ -1079,6 +1088,8 @@ class PaperPipelineRunner:
             "argument_status": argument_review["decision"],
             "research_argument_path": str(self.output / "research-argument.json"),
             "research_argument_review_path": str(self.output / "research-argument-review.json"),
+            "research_argument_defense_path": str(self.output / "research-argument-defense.json"),
+            "research_argument_defense_sha256": hashlib.sha256(canonical_bytes(self.argument_defense)).hexdigest(),
             "research_argument_sha256": hashlib.sha256(canonical_bytes(argument)).hexdigest(),
             "manuscript_project_dir": None,
             "release_dir": None,
@@ -1150,6 +1161,8 @@ class PaperPipelineRunner:
             "argument_status": argument_review["decision"],
             "research_argument_path": str(self.output / "research-argument.json"),
             "research_argument_review_path": str(self.output / "research-argument-review.json"),
+            "research_argument_defense_path": str(self.output / "research-argument-defense.json"),
+            "research_argument_defense_sha256": hashlib.sha256(canonical_bytes(self.argument_defense)).hexdigest(),
             "research_argument_sha256": hashlib.sha256(canonical_bytes(argument)).hexdigest(),
             "manuscript_project_dir": str(project_dir),
             "release_dir": None,
@@ -1241,6 +1254,8 @@ class PaperPipelineRunner:
             "argument_status": argument_review["decision"],
             "research_argument_path": str(self.output / "research-argument.json"),
             "research_argument_review_path": str(self.output / "research-argument-review.json"),
+            "research_argument_defense_path": str(self.output / "research-argument-defense.json"),
+            "research_argument_defense_sha256": hashlib.sha256(canonical_bytes(self.argument_defense)).hexdigest(),
             "research_argument_sha256": hashlib.sha256(canonical_bytes(argument)).hexdigest(),
             "manuscript_project_dir": str(project_dir),
             "release_dir": None,
@@ -1274,16 +1289,18 @@ class PaperPipelineRunner:
         package = self.initial_argument_package
         candidate = self.supplied_argument
         review = deepcopy(self.supplied_argument_review) if candidate is not None else None
+        supplied_defense = None
         usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
         if package is not None:
             if not isinstance(package, dict) or set(package) - {
                     "schema_version", "argument", "review", "argument_sha256", "review_sha256",
-                    "model_calls", "usage", "status"} or "argument" not in package:
+                    "argument_defense", "argument_defense_sha256", "model_calls", "usage", "status"} or "argument" not in package:
                 raise ValidationError("initial argument package has an invalid shape")
             if package.get("schema_version") != PACKAGE_SCHEMA_VERSION or package.get("status") != "accepted":
                 raise ValidationError("initial argument package is not an accepted research-argument package")
             candidate = deepcopy(package["argument"])
             review = deepcopy(package.get("review"))
+            supplied_defense = deepcopy(package.get("argument_defense"))
             usage = deepcopy(package.get("usage") or usage)
             if package.get("argument_sha256") not in {None, hashlib.sha256(canonical_bytes(candidate)).hexdigest()}:
                 raise ValidationError("initial argument package has a mismatched argument hash")
@@ -1310,10 +1327,13 @@ class PaperPipelineRunner:
                 min_tables=self.min_argument_tables,
                 min_experiments=self.min_argument_experiments)
             if review is None:
+                review_packet = deepcopy(evidence_packet)
+                review_packet["argument_defense"] = build_argument_defense(
+                    candidate, evidence_packet, research_program=evidence_packet.get("research_program"))
                 reviewer = ArgumentAdjudicator(
                     self.model_config,
                     deadline_seconds=min(self.argument_deadline_seconds, self._remaining()))
-                review, review_usage = reviewer.run(candidate, evidence_packet)
+                review, review_usage = reviewer.run(candidate, review_packet)
                 usage = {key: usage.get(key, 0) + review_usage.get(key, 0) for key in usage}
             else:
                 validate_argument_review(review, argument=candidate)
@@ -1329,16 +1349,31 @@ class PaperPipelineRunner:
         validate_argument_review(review, argument=candidate)
         if review["decision"] != "accept":
             raise ValidationError("research argument adjudication requires revision")
+        expected_defense = build_argument_defense(
+            candidate, evidence_packet, research_program=evidence_packet.get("research_program"))
+        if supplied_defense is not None:
+            validate_argument_defense(supplied_defense, evidence_ids=evidence_ids)
+            supplied_hash = package.get("argument_defense_sha256") if isinstance(package, dict) else None
+            if supplied_hash is not None and supplied_hash != hashlib.sha256(canonical_bytes(supplied_defense)).hexdigest():
+                raise ValidationError("initial argument package has a mismatched argument defense hash")
+            if canonical_bytes(supplied_defense) != canonical_bytes(expected_defense):
+                raise ValidationError("initial argument package has a mismatched argument defense")
+        argument_defense = expected_defense
         self.research_argument, self.argument_review = candidate, review
+        self.argument_defense = argument_defense
         self.argument_usage = {key: usage.get(key, 0) for key in self.argument_usage}
         self.packet["research_argument"] = deepcopy(candidate)
         self.packet["research_argument_review"] = deepcopy(review)
+        self.packet["argument_defense"] = deepcopy(argument_defense)
         (self.output / "research-argument.json").write_bytes(canonical_bytes(candidate))
         (self.output / "research-argument-review.json").write_bytes(canonical_bytes(review))
+        (self.output / "research-argument-defense.json").write_bytes(canonical_bytes(argument_defense))
         (self.output / "research-argument-package.json").write_bytes(canonical_bytes({
             "schema_version": "research-argument-package-1",
             "argument": candidate,
             "review": review,
+            "argument_defense": argument_defense,
+            "argument_defense_sha256": hashlib.sha256(canonical_bytes(argument_defense)).hexdigest(),
             "argument_sha256": hashlib.sha256(canonical_bytes(candidate)).hexdigest(),
             "review_sha256": hashlib.sha256(canonical_bytes(review)).hexdigest(),
             "usage": self.argument_usage,
@@ -1367,10 +1402,14 @@ class PaperPipelineRunner:
             "Do not emit markdown fences, workflow terminology, hashes, or commentary. "
             "Do not invent citations, measurements, analyses, or authors. The research_argument is the "
             "adjudicated scientific spine: preserve its question, observed patterns, competing explanations, "
-            "primary thesis, scope boundary, and figure/table jobs. Results reports observations; Discussion "
+            "primary thesis, scope boundary, and figure/table jobs. Use argument_defense as a posture ledger: "
+            "observed claims may appear in Results, while supported or bounded inferences, provisional explanations, "
+            "and future tests belong in Discussion, Limitations, or Future Work. Results reports observations; Discussion "
             "explains mechanisms and labels unresolved alternatives. Follow any writer_contract in the packet: "
             "when scientific_follow_up is present, address each requested evidence or analysis in the new draft "
             "and make any remaining uncertainty explicit without copying assignment metadata into the manuscript. "
+            "Never use confident wording to cover a missing result; the defense ledger's missing_evidence_action "
+            "requires a scoped research request or an explicit future test. "
             "use its section titles and stable unit IDs, copy its required scientific sentences exactly into the "
             "named units, include every pinned citation marker, and satisfy its depth and figure requirements. "
             "The manuscript surface must contain scientific meaning rather than pipeline state or provenance jargon."
@@ -1953,6 +1992,8 @@ class PaperPipelineRunner:
                                              "paper_evidence": self.paper_config.get("evidence", []),
                                              "paper_claims": self.paper_config.get("claims", []),
                                              "references": self.paper_config.get("references", []),
+                                             "research_program": self.packet.get("research_program"),
+                                             "argument_defense": self.packet.get("argument_defense"),
                                              "scholarly_depth": {
                                                  "profile_id": (profile_for_paper(self.paper_config)
                                                                  if self.paper_config.get("schema_version") == "paper-release-score-3"
@@ -2146,6 +2187,8 @@ class PaperPipelineRunner:
                       "argument_status": argument_review["decision"],
                       "research_argument_path": str(self.output / "research-argument.json"),
                       "research_argument_review_path": str(self.output / "research-argument-review.json"),
+                      "research_argument_defense_path": str(self.output / "research-argument-defense.json"),
+                      "research_argument_defense_sha256": hashlib.sha256(canonical_bytes(self.argument_defense)).hexdigest(),
                       "research_argument_sha256": hashlib.sha256(canonical_bytes(argument)).hexdigest(),
                       "manuscript_project_dir": str(project_dir), "release_dir": str(release_dir),
                       "editor_decision_path": str(self.output / "editor-decision.json"),

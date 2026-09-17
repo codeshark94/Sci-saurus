@@ -320,6 +320,12 @@
     $("#experiment-status").textContent = experimentStatus.replaceAll("_", " ");
     $("#experiment-design").innerHTML = designRows.length ? designRows.map(([label, value]) => `<div class="research-row"><div class="research-row-label">${escapeHtml(label)}</div><div class="research-row-value">${escapeHtml(text(value))}</div></div>`).join("") : '<div class="tree-empty">No executable design recorded yet.</div>';
 
+    $("#research-logic-caption").textContent = research.research_program || research.argument_defense
+      ? "provisional routing · evidence posture · reviewer tests"
+      : "awaiting topic and argument artifacts";
+    renderResearchProgram(research.research_program);
+    renderArgumentDefense(research.argument_defense);
+
     const survey = research.survey || {};
     const coverage = survey.coverage || {};
     const priorSurvey = survey.last_result_status && survey.last_result_status !== survey.current_status
@@ -355,6 +361,123 @@
         <div class="research-progress-footer"><span>${statusPill(displayStatus)}</span><span>${stage.current ? "current gate" : escapeHtml(text(stage.gate, "acceptance gate"))}</span></div>
       </article>`;
     }).join("");
+  }
+
+  function renderResearchProgram(program) {
+    const status = $("#research-program-status");
+    const summary = $("#research-program-summary");
+    const list = $("#research-branch-list");
+    if (!program) {
+      status.textContent = "not recorded";
+      summary.innerHTML = '<div class="research-empty-state">No provisional research program is attached to this checkpoint.</div>';
+      list.innerHTML = "";
+      return;
+    }
+    const branches = Array.isArray(program.branches) ? program.branches : [];
+    const visibleBranches = branches.slice(0, 8);
+    const branchTotal = Number.isFinite(Number(program.branch_count)) ? Number(program.branch_count) : branches.length;
+    const selected = program.selected_branch || branches.find((item) => item.id === program.selected_id);
+    const outcomes = Array.isArray(selected?.paper_if) ? selected.paper_if : [];
+    status.textContent = number(program.branch_count ?? branches.length) + " branches · " + text(program.selection_mode, "provisional");
+    summary.innerHTML = selected
+      ? '<div class="research-logic-kicker">SELECTED ROUTE · ' + escapeHtml(text(selected.id)) + '</div>' +
+        '<strong class="research-logic-title">' + escapeHtml(text(selected.title, "Selected branch")) + '</strong>' +
+        '<p class="research-logic-question">' + escapeHtml(text(selected.question)) + '</p>' +
+        '<div class="research-outcome-grid">' + outcomes.map((outcome) =>
+          '<div class="research-outcome">' +
+            '<span class="outcome-chip outcome-chip--' + statusClass(outcome.id) + '">' +
+              escapeHtml(String(outcome.id || "outcome").replaceAll("_", " ")) +
+            '</span>' +
+            '<p>' + escapeHtml(text(outcome.condition)) + '</p>' +
+          '</div>'
+        ).join("") + '</div>' +
+        '<div class="research-kill"><span>KILL CONDITION</span><p>' +
+          escapeHtml(text(selected.kill_if)) + '</p></div>'
+      : '<div class="research-empty-state">Program has no selected branch.</div>';
+    list.innerHTML = branches.length
+      ? '<div class="research-branch-heading"><span>RETAINED / SELECTED BRANCHES</span><span>' +
+        number(program.retained_count ?? 0) + ' retained</span></div>' +
+        visibleBranches.map((branch) => {
+          const selectedClass = branch.id === program.selected_id ? " research-branch--selected" : "";
+          return '<div class="research-branch' + selectedClass + '">' +
+            '<div class="research-branch-top"><span class="research-branch-id">' +
+              escapeHtml(text(branch.id)) + '</span>' + statusPill(branch.status) + '</div>' +
+            '<strong>' + escapeHtml(text(branch.title, "Untitled branch")) + '</strong>' +
+            '<p>' + escapeHtml(text(branch.question)) + '</p>' +
+            '<div class="research-branch-meta"><span>' + escapeHtml(text(branch.research_form)) +
+              '</span><span>' + escapeHtml(text(branch.comparison_type)) + '</span></div>' +
+          '</div>';
+        }).join("") + '</div>' +
+        (branchTotal > visibleBranches.length
+          ? '<div class="research-more">Showing ' + number(visibleBranches.length) + ' of ' + number(branchTotal) + ' branches · additional records remain in the artifact inspector.</div>'
+          : "")
+      : '<div class="research-empty-state">No branches recorded.</div>';
+  }
+
+  function renderArgumentDefense(defense) {
+    const status = $("#argument-defense-status");
+    const summary = $("#argument-defense-summary");
+    const claimsList = $("#argument-claim-list");
+    const weakList = $("#argument-weak-list");
+    if (!defense) {
+      status.textContent = "not recorded";
+      summary.innerHTML = '<div class="research-empty-state">No claim posture ledger is attached yet. It is created with the argument stage.</div>';
+      claimsList.innerHTML = "";
+      weakList.innerHTML = "";
+      return;
+    }
+    const claims = Array.isArray(defense.claim_postures) ? defense.claim_postures : [];
+    const weakPoints = Array.isArray(defense.weak_points) ? defense.weak_points : [];
+    const visibleClaims = claims.slice(0, 8);
+    const visibleWeakPoints = weakPoints.slice(0, 6);
+    const claimTotal = Number.isFinite(Number(defense.claim_count)) ? Number(defense.claim_count) : claims.length;
+    const weakPointTotal = Number.isFinite(Number(defense.weak_point_count)) ? Number(defense.weak_point_count) : weakPoints.length;
+    const postureCounts = claims.reduce((counts, item) => {
+      const key = item.posture || "unknown";
+      counts[key] = (counts[key] || 0) + 1;
+      return counts;
+    }, {});
+    status.textContent = number(defense.claim_count ?? claims.length) + " claims · " +
+      number(defense.weak_point_count ?? weakPoints.length) + " weak points";
+    summary.innerHTML = '<div class="defense-counts">' +
+      Object.entries(postureCounts).map(([key, value]) =>
+        '<span><b>' + number(value) + '</b>' + escapeHtml(key.replaceAll("_", " ")) + '</span>'
+      ).join("") + '</div>' +
+      '<p class="research-logic-note">Results accepts observed claims only. Interpretive claims stay bounded to Discussion, Limitations, or Future Work.</p>';
+    claimsList.innerHTML = claims.length
+      ? '<div class="research-branch-heading"><span>CLAIM POSTURES</span><span>evidence-bound</span></div>' +
+        visibleClaims.map((claim) =>
+          '<div class="research-claim">' +
+            '<div class="research-claim-top"><span class="outcome-chip outcome-chip--' +
+              statusClass(claim.posture) + '">' + escapeHtml(String(claim.posture || "unknown").replaceAll("_", " ")) +
+              '</span><span class="research-claim-id">' + escapeHtml(text(claim.id)) + '</span></div>' +
+            '<strong>' + escapeHtml(text(claim.claim, "Claim not recorded")) + '</strong>' +
+            '<div class="research-claim-meta"><span>evidence: ' +
+              escapeHtml((claim.evidence_ids || []).join(", ") || "none") + '</span><span>allowed: ' +
+              escapeHtml((claim.allowed_sections || []).join(", ") || "none") + '</span></div>' +
+            '<p>' + escapeHtml(text(claim.caveat, "Caveat not recorded")) + '</p>' +
+          '</div>'
+        ).join("") +
+        (claimTotal > visibleClaims.length
+          ? '<div class="research-more">Showing ' + number(visibleClaims.length) + ' of ' + number(claimTotal) + ' claims · additional records remain in the artifact inspector.</div>'
+          : "")
+      : '<div class="research-empty-state">No claims recorded.</div>';
+    weakList.innerHTML = weakPoints.length
+      ? '<div class="research-branch-heading"><span>OPEN WEAK POINTS</span><span>reviewer tests</span></div>' +
+        visibleWeakPoints.map((item) =>
+          '<div class="research-weak-point">' +
+            '<div class="research-claim-top"><span class="outcome-chip outcome-chip--' +
+              statusClass(item.defense_strategy) + '">' +
+              escapeHtml(String(item.defense_strategy || "review").replaceAll("_", " ")) +
+              '</span><span class="research-claim-id">' + escapeHtml(text(item.id)) + '</span></div>' +
+            '<strong>' + escapeHtml(text(item.weak_point, "Weak point not recorded")) + '</strong>' +
+            '<p>' + escapeHtml(text(item.reviewer_test, "Reviewer test not recorded")) + '</p>' +
+          '</div>'
+        ).join("") +
+        (weakPointTotal > visibleWeakPoints.length
+          ? '<div class="research-more">Showing ' + number(visibleWeakPoints.length) + ' of ' + number(weakPointTotal) + ' weak points · additional records remain in the artifact inspector.</div>'
+          : "")
+      : '<div class="research-empty-state research-empty-state--clear">No open weak points recorded.</div>';
   }
 
   function renderMetrics(snapshot) {
@@ -417,8 +540,10 @@
       const endpoint = call.endpoint ? ` · ${escapeHtml(call.endpoint)}` : "";
       const pool = call.provider_pool ? ` · ${escapeHtml(call.provider_pool)}` : "";
       const cache = call.cache || {};
-      const cacheLabel = cache.status === "hit" && Number.isFinite(Number(cache.read_tokens))
-        ? `hit · ${number(cache.read_tokens)} read`
+      const readRatio = Number(cache.read_ratio);
+      const readPercent = Number.isFinite(readRatio) ? ` · ${(readRatio * 100).toFixed(1)}%` : "";
+      const cacheLabel = ["hit", "partial"].includes(cache.status) && Number.isFinite(Number(cache.read_tokens))
+        ? `${text(cache.status, "cache")} · ${number(cache.read_tokens)} read${readPercent}`
         : cache.status === "primed" && Number.isFinite(Number(cache.write_tokens))
           ? `primed · ${number(cache.write_tokens)} written`
         : text(cache.status, "not recorded");

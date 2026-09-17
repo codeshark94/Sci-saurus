@@ -4,6 +4,7 @@ import base64
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import time
@@ -11,7 +12,10 @@ import unittest
 from unittest.mock import patch
 
 from scisaurus.core.errors import ValidationError
-from scisaurus.runtime.models import ModelClient, ModelCallError, resolve_model_config
+from scisaurus.runtime.models import (
+    ModelClient, ModelCallError, estimate_input_tokens, model_context_error,
+    resolve_model_config,
+)
 
 
 class TestModelClient(unittest.TestCase):
@@ -203,6 +207,47 @@ class TestModelClient(unittest.TestCase):
         self.assertEqual(resolved['temperature'], 0.2)
         self.assertNotIn('role_models', resolved)
 
+    def test_context_policy_resolves_per_role_and_is_not_sent_to_provider(self):
+        base = {
+            'base_url': self.url, 'protocol': 'openai_compatible', 'model': 'strong-model',
+            'timeout_seconds': 2, 'max_output_tokens': 64,
+            'context_window_tokens': 8192, 'max_input_tokens': 4000,
+            'role_models': {
+                'short-context-role': {
+                    'model': 'small-model', 'context_window_tokens': 4096,
+                    'max_input_tokens': 3000,
+                },
+            },
+        }
+        resolved = resolve_model_config(base, role='short-context-role')
+        self.assertEqual(resolved['model'], 'small-model')
+        self.assertEqual(resolved['context_window_tokens'], 4096)
+        self.assertEqual(resolved['max_input_tokens'], 3000)
+        self.response = {'choices': [{'message': {'content': '{"ok":true}'}, 'finish_reason': 'stop'}]}
+        self.client('openai_compatible', context_window_tokens=8192,
+                    max_input_tokens=4000).complete(system='Return JSON.', prompt='Inspect.')
+        self.assertNotIn('context_window_tokens', self.request)
+        self.assertNotIn('max_input_tokens', self.request)
+
+    def test_context_budget_is_conservative_and_blocks_before_network(self):
+        self.assertGreater(estimate_input_tokens('x', 'y' * 3000), 1000)
+        client = self.client('openai_compatible', context_window_tokens=8192,
+                             max_input_tokens=1000)
+        with self.assertRaisesRegex(ValidationError, 'context budget exceeded'):
+            client.complete(system='x', prompt='y' * 3000)
+        self.assertFalse(hasattr(self, 'request'))
+        self.assertIsNone(model_context_error(
+            {'model': 'fits', 'max_output_tokens': 64,
+             'context_window_tokens': 4096, 'max_input_tokens': 3000},
+            system='x', prompt='short'))
+
+    def test_context_policy_must_leave_output_room(self):
+        with self.assertRaisesRegex(ValidationError, 'leave room'):
+            self.client('openai_compatible', context_window_tokens=4096)
+        with self.assertRaisesRegex(ValidationError, 'exceeds context_window_tokens'):
+            self.client('openai_compatible', context_window_tokens=8192,
+                        max_input_tokens=5000)
+
     def test_role_route_metadata_is_validated_and_not_forwarded_to_provider(self):
         base = {
             'base_url': self.url, 'protocol': 'openai_compatible', 'model': 'strong-model',
@@ -335,8 +380,13 @@ class TestModelClient(unittest.TestCase):
                 self.client('ollama', **options)
         self.assertFalse(hasattr(self, 'request'))
 
-    def test_json_output_mode_does_not_repair_non_json_model_text(self):
+    def test_json_output_mode_accepts_an_exact_json_markdown_fence(self):
         self.response = {'choices': [{'message': {'content': '```json\n{"ok":true}\n```'}, 'finish_reason': 'stop'}]}
+        result = self.client('openai_compatible', output_format='json_object').complete(system='Return JSON.', prompt='Inspect.')
+        self.assertEqual(result.json_object(), {'ok': True})
+
+    def test_json_output_mode_still_rejects_prose_around_json(self):
+        self.response = {'choices': [{'message': {'content': 'Here is the JSON:\n```json\n{"ok":true}\n```'}, 'finish_reason': 'stop'}]}
         result = self.client('openai_compatible', output_format='json_object').complete(system='Return JSON.', prompt='Inspect.')
         with self.assertRaises(ValidationError):
             result.json_object()
@@ -389,6 +439,63 @@ class TestModelClient(unittest.TestCase):
         result = self.client(max_retries=1, retry_backoff_seconds=0).complete(system='x', prompt='x')
         self.assertEqual(self.calls, 2)
         self.assertEqual(result.json_object(), {'value': 4})
+
+    def test_shared_model_call_budget_counts_retries_and_blocks_before_network(self):
+        self.status = [429, 200]
+        self.response = {'choices': [{'message': {'content': '{"value": 4}'}, 'finish_reason': 'stop'}]}
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = str((Path(directory) / 'model-budgets.sqlite').resolve())
+            client = self.client(
+                'openai_compatible', max_retries=1, retry_backoff_seconds=0,
+                model_call_budget_path=ledger,
+                model_call_budget_key='kimi-k3+glm-5.3',
+                model_call_budget_limit=2,
+            )
+            result = client.complete(system='x', prompt='x')
+            self.assertEqual(result.request_attempts, 2)
+            self.assertEqual(self.calls, 2)
+            connection = sqlite3.connect(ledger)
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        'SELECT max_calls, used_calls FROM model_call_budgets WHERE budget_key=?',
+                        ('kimi-k3+glm-5.3',),
+                    ).fetchone(),
+                    (2, 2),
+                )
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(ModelCallError, 'budget exhausted'):
+                client.complete(system='x', prompt='x')
+            self.assertEqual(self.calls, 2)
+
+    def test_exhausted_named_model_resolves_to_unbudgeted_fallback(self):
+        self.response = {'choices': [{'message': {'content': '{"ok":true}'}, 'finish_reason': 'stop'}]}
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = str((Path(directory) / 'model-budgets.sqlite').resolve())
+            client = self.client(
+                'openai_compatible', max_retries=0,
+                model_call_budget_path=ledger,
+                model_call_budget_key='kimi-k3+glm-5.3',
+                model_call_budget_limit=1,
+            )
+            client.complete(system='x', prompt='x')
+            resolved = resolve_model_config({
+                'base_url': self.url + '/v1', 'protocol': 'openai_compatible',
+                'model': 'base-model', 'timeout_seconds': 2, 'max_output_tokens': 64,
+                'role_models': {
+                    'impact-review': {
+                        'model': 'kimi-k3:cloud',
+                        'model_call_budget_path': ledger,
+                        'model_call_budget_key': 'kimi-k3+glm-5.3',
+                        'model_call_budget_limit': 1,
+                    },
+                },
+                'role_model_fallbacks': {
+                    'impact-review': [{'model': 'deepseek-v4.1-flash:cloud'}],
+                },
+            }, role='impact-review')
+            self.assertEqual(resolved['model'], 'deepseek-v4.1-flash:cloud')
 
     def test_incomplete_or_oversized_response_is_not_success(self):
         self.response['done']=False

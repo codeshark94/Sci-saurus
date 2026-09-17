@@ -1200,6 +1200,78 @@ class SurveyRunner(ExecutionRuntime):
                  "window": {"start": 0, "end": min(len(value["text"]), self.bounds["context_chars"])}}
                 for ref, value in self.source_docs.items()]
 
+    @staticmethod
+    def _project_source_window(source, limit):
+        """Return a source window with its evidence boundary moved to the projection."""
+        projected = deepcopy(source)
+        text = source.get("text", "") if isinstance(source, dict) else ""
+        limit = max(0, int(limit))
+        projected["text"] = text[:limit]
+        projected["window"] = {"start": 0, "end": len(projected["text"])}
+        return projected
+
+    def _map_sources(self, wid, *, old_relationships=None, review_feedback=None):
+        """Build a bounded source projection for one literature-map assignment.
+
+        A map worker owns one work, while comparison abstracts are only needed
+        to justify an optional outgoing relationship. Sending every captured
+        abstract at the full survey context limit makes the same assignment
+        exceed a 64k provider window as the corpus grows. Keep the assigned
+        work's source budget intact, then divide a separate comparison budget
+        across stable, relevant excerpts. The displayed windows are persisted
+        in the assignment and remain the evidence boundary for validation.
+        """
+        all_sources = self._source_context()
+        owner_sources = [source for source in all_sources if source["work_id"] == wid]
+        comparison_sources = [source for source in all_sources
+                              if source["work_id"] != wid and source["representation"] == "abstract"]
+
+        target_ids = set()
+        for relation in old_relationships or []:
+            if isinstance(relation, dict) and isinstance(relation.get("target"), str):
+                target_ids.add(self.aliases.get(relation["target"], relation["target"]))
+        if isinstance(review_feedback, dict):
+            for target in review_feedback.get("relationship_targets", []):
+                if isinstance(target, str):
+                    target_ids.add(self.aliases.get(target, target))
+        referenced_ids = {
+            self.aliases.get(reference, reference)
+            for reference in self.works.get(wid, {}).get("referenced_works", [])
+            if isinstance(reference, str)
+        }
+        order = {source["source_ref"]: index for index, source in enumerate(comparison_sources)}
+        comparison_sources.sort(key=lambda source: (
+            0 if source["work_id"] in target_ids else
+            1 if source["work_id"] in referenced_ids else 2,
+            order[source["source_ref"]],
+        ))
+
+        context_chars = self.bounds["context_chars"]
+        owner_budget = context_chars
+        projected_owner = []
+        for source in sorted(owner_sources, key=lambda item: (
+                0 if item["representation"] == "full_text" else
+                1 if item["representation"] == "unverified_text" else 2)):
+            if owner_budget <= 0:
+                break
+            projected = self._project_source_window(source, owner_budget)
+            if projected["text"]:
+                projected_owner.append(projected)
+                owner_budget -= len(projected["text"])
+
+        # This budget is independent of the number of captured works. Dividing
+        # it across the comparison set keeps map prompts bounded while still
+        # exposing every candidate work to the model for optional linking.
+        comparison_budget = min(self.bounds["max_text_chars"], context_chars * 2)
+        comparison_limit = (comparison_budget // len(comparison_sources)
+                            if comparison_sources else 0)
+        projected_comparisons = [
+            self._project_source_window(source, comparison_limit)
+            for source in comparison_sources
+            if comparison_limit > 0 and source["text"][:comparison_limit]
+        ]
+        return [*projected_owner, *projected_comparisons]
+
     def _assessment_source_context(self):
         """Bound source windows for the final gap decision.
 
@@ -1367,12 +1439,11 @@ class SurveyRunner(ExecutionRuntime):
         }, "research.literature-mapper", subjects=[self.register_ref])
 
     def _map_job(self, wid, basis, *, review_feedback=None):
-        sources = [source for source in self._source_context()
-                   if source["work_id"] == wid or source["representation"] == "abstract"]
-        own_sources = [source for source in sources if source["work_id"] == wid]
-        visible_sources = {source["source_ref"]: source for source in sources}
         previous = json.loads(self.store.read_body(self.analysis_records[wid]["body_hash"])) if wid in self.analysis_records else None
         old_relationships = [relation for relation in self.relationships.values() if relation["source"] == wid]
+        sources = self._map_sources(wid, old_relationships=old_relationships,
+                                    review_feedback=review_feedback)
+        own_sources = [source for source in sources if source["work_id"] == wid]
         entry_editable = (self.analyzed_basis.get(wid) != basis or contains_legacy(previous)
                           or contains_legacy(old_relationships))
         if review_feedback is not None:
@@ -1383,7 +1454,7 @@ class SurveyRunner(ExecutionRuntime):
             "works": [{**{key: work[key] for key in ("id", "title", "year", "doi", "publication_metadata_status")},
                        "identity_ref": self.identity_records[work["id"]]["artifact_ref"] if work["id"] in self.identity_records else None,
                        "identity_status": self._body(self.identity_records[work["id"]])["status"] if work["id"] in self.identity_records else "not_checked"}
-                      for work in self.works.values()],
+                      for work in sorted(self.works.values(), key=lambda item: item["id"])],
             "previous_entries": [previous] if previous is not None else [], "entry_editable": entry_editable,
             "previous_affected_relationships": old_relationships,
             "semantic_feedback": review_feedback,
@@ -1409,6 +1480,17 @@ class SurveyRunner(ExecutionRuntime):
                 "When no captured source belongs to the assigned work, set inclusion to uncertain and make reason a narrow availability note: state that the catalog record is relevant by metadata but no abstract or verified full text was available, so substantive content could not be assessed. Do not put other work IDs, quotations, chronology, evolution, extension, comparison, or superiority in that reason. "
                 "Keep each statement text concise (at most 240 characters), return at most one outgoing relationship, and omit any relationship that is not directly supported by both displayed works. Return only the requested JSON object."
         }
+        # ModelClient sends this assignment JSON verbatim. Keep the stable
+        # corpus and contract before per-work state so provider prefix caches
+        # can reuse the large common token sequence across map jobs. The
+        # requested work, prior entry, feedback, and source window are
+        # intentionally placed after that stable prefix because they vary by
+        # assignment or repair attempt.
+        assignment = {key: assignment[key] for key in (
+            "assignment", "phase", "question", "works", "relationship_semantics", "instructions",
+            "requested_work_ids", "previous_entries", "entry_editable",
+            "previous_affected_relationships", "semantic_feedback", "sources",
+        )}
         if review_feedback is not None:
             editable_fields = list(review_feedback["entry_fields"])
             editable_targets = list(review_feedback["relationship_targets"])

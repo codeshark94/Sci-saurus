@@ -328,6 +328,9 @@ def argument_evidence_packet(packet):
         "asset_ids": [asset.get("id") for asset in result.get("assets", [])
                       if isinstance(asset, dict) and isinstance(asset.get("id"), str)],
     }
+    if isinstance(packet.get("research_program"), dict):
+        from scisaurus.runtime.research_program import project_research_program
+        context["research_program"] = project_research_program(packet["research_program"])
     # Raw replicate matrices are inputs to the experiment stage, not a reason
     # to let the argument model silently perform a new analysis.
     if isinstance(result, dict):
@@ -346,7 +349,9 @@ SYSTEM = (
     "why it is the most defensible interpretation. Every major pattern needs a figure or table with a concrete "
     "reader-facing job. Keep possible mechanisms explicitly provisional and never invent measurements, sources, "
     "or citations. Use public scientific language; do not expose hashes, artifact IDs, acceptance states, "
-    "validator vocabulary, or internal enums. Return exactly the requested JSON object and no markdown."
+    "validator vocabulary, or internal enums. A weak point may be handled only by a clearly labelled scope boundary, "
+    "alternative explanation, mechanistic interpretation, or future test; rhetoric must never substitute for missing "
+    "evidence. Return exactly the requested JSON object and no markdown."
 )
 
 
@@ -363,6 +368,8 @@ def argument_prompt(evidence_packet, *, min_figures=2, min_tables=1, min_experim
             "Design at least the requested number of controlled, discriminating experiments.",
             "Plan figures and tables as parts of the argument: each must answer a reader question and cover every observed pattern.",
             "State a primary bounded thesis and the scope boundary that prevents overclaiming.",
+            "Use any supplied research program as a provisional branch plan: preserve its supportive, null/boundary, and ambiguous outcomes, and do not treat the selected branch as confirmed.",
+            "Separate direct observations from supported or bounded inferences, provisional explanations, and future tests. A missing result remains a research request or limitation.",
         ],
         "final_consistency_check": (
             "After drafting, enumerate the exact observed_patterns IDs and set the union of every hypothesis's "
@@ -458,10 +465,11 @@ def _normalise_argument_candidate(value, *, available_asset_ids=None, available_
     return candidate, changes
 
 
-def review_prompt(argument, evidence_packet):
+def review_prompt(argument, evidence_packet, argument_defense=None):
     return json.dumps({
         "assignment": "Independently challenge the proposed research argument before manuscript composition.",
         "argument": argument,
+        "argument_defense": argument_defense,
         "evidence_packet": evidence_packet,
         "questions": [
             "Is the research question genuinely unresolved and narrower than the supplied procedure?",
@@ -470,6 +478,7 @@ def review_prompt(argument, evidence_packet):
             "Does each hypothesis explain a named pattern, and does each experiment test named hypotheses with meaningful controls?",
             "Does every observed pattern have a figure or table whose purpose and readout advance the argument?",
             "Could a human researcher explain the paper's contribution from this map without seeing pipeline metadata?",
+            "Does the defense ledger distinguish evidence from interpretation, and is any rhetorical defense being used to cover a missing result?",
         ],
         "output_contract": {
             "schema_version": REVIEW_SCHEMA_VERSION,
@@ -506,7 +515,8 @@ class ArgumentAdjudicator:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.2:
                     raise ValidationError("research argument review deadline exceeded")
-            prompt = review_prompt(argument, evidence_packet)
+            prompt = review_prompt(argument, evidence_packet,
+                                   evidence_packet.get("argument_defense"))
             if previous is not None:
                 prompt = json.dumps({"assignment": "Repair invalid argument review JSON.",
                                      "candidate_response": previous[:24000],
@@ -607,10 +617,16 @@ class ResearchArgumentRunner:
             if not generated:
                 raise last_error or ValidationError("research argument was not accepted")
 
+            from scisaurus.runtime.argument_defense import build_argument_defense
+            defense_packet = deepcopy(evidence_packet)
+            defense_packet["evidence_ids"] = list(evidence_ids)
+            argument_defense = build_argument_defense(argument, defense_packet,
+                                                       research_program=defense_packet.get("research_program"))
+            defense_packet["argument_defense"] = argument_defense
             review_deadline = None if deadline is None else max(0.2, deadline - time.monotonic())
             review, review_usage = ArgumentAdjudicator(self.model_config,
                                                        deadline_seconds=review_deadline).run(
-                                                           argument, evidence_packet)
+                                                           argument, defense_packet)
             for key in usage:
                 usage[key] += review_usage.get(key, 0)
             if review["decision"] == "accept":
@@ -628,6 +644,8 @@ class ResearchArgumentRunner:
             "review": review,
             "argument_sha256": hashlib.sha256(canonical_bytes(argument)).hexdigest(),
             "review_sha256": hashlib.sha256(canonical_bytes(review)).hexdigest(),
+            "argument_defense": argument_defense,
+            "argument_defense_sha256": hashlib.sha256(canonical_bytes(argument_defense)).hexdigest(),
             "model_calls": usage["model_calls"],
             "usage": usage,
             "status": "accepted",

@@ -134,6 +134,23 @@ class DepartmentRuntimeTests(unittest.TestCase):
         self.assertEqual(verdict["verifier_agent"], "research.adversarial-reviewer")
         self.assertEqual(self.runtime.snapshot()["active_assignments"], [])
 
+    def test_stage_failure_preserves_known_specialist_outcomes(self):
+        self.runtime.begin_stage(
+            "survey", "survey", attempt_number=3,
+            deadline_seconds=30, active_role_ids=["search-strategist", "source-acquirer"],
+        )
+        result = self.runtime.finish_stage(
+            "survey", "survey", attempt_number=3, outcome="blocked",
+            output_ref=None, error=ValidationError("chief stage output was blocked"),
+            specialist_results={
+                "search-strategist": {"status": "succeeded", "usage": {}},
+                "source-acquirer": {"status": "result_unknown", "usage": {}},
+            },
+        )
+        outcomes = {item["role_id"]: item["outcome"] for item in result["assignments"]}
+        self.assertEqual(outcomes["search-strategist"], "succeeded")
+        self.assertEqual(outcomes["source-acquirer"], "result_unknown")
+
     def test_stage_pool_quota_and_deadline_are_enforced(self):
         route = self.runtime.stage_route("survey")
         route["max_active_agents"] = 1

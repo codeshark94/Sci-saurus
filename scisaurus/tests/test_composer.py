@@ -12,6 +12,7 @@ from scisaurus.runtime.composer import ComposerRunner, read_interim_report, vali
 from scisaurus.runtime.departments import default_organization
 from scisaurus.runtime.literature import ProviderCooldownError
 from scisaurus.core.errors import QuotaExceededError, ValidationError
+from scisaurus.tests.test_research_program import topic_package
 
 
 class ComposerWorkflowTests(unittest.TestCase):
@@ -120,6 +121,57 @@ class ComposerWorkflowTests(unittest.TestCase):
                     "SELECT COUNT(*) FROM tasks WHERE payload_json LIKE '%assignment_id%'").fetchone()[0]
             self.assertGreaterEqual(assignment_tasks, 2)
 
+    def test_topic_specialists_review_generated_evidence_not_an_empty_frontier(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_config = root / "topic.json"
+            topic_config.write_text("{}")
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"] = [{
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": str(topic_config.resolve()),
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            }]
+            workflow["completion"]["required_stage_ids"] = ["topic"]
+            runner = ComposerRunner(workflow)
+            specialist_packets = []
+
+            def fake_stage(stage, **_kwargs):
+                output = root / "topic-result.json"
+                output.write_text(json.dumps({"status": "completed"}))
+                return {
+                    "status": "completed", "output_path": str(output),
+                    "project_dir": stage["project_dir"], "stage_id": stage["id"],
+                    "topic": {"id": "direction-1", "research_question": "Does A change B?"},
+                    "candidates": [{"id": "direction-1", "research_question": "Does A change B?"}],
+                    "frontier_seed_plan": {"seeds": [{"id": "frontier-1", "domain": "A"}]},
+                    "recent_papers": [{"work_id": "W1", "title": "A study"}],
+                    "candidate_prior_work": [{"work_id": "W1", "title": "A study"}],
+                    "feasibility_check": {"status": "feasible"},
+                }
+
+            def fake_pool(stage, assignment, descriptor, *, stage_result=None):
+                specialist_packets.append(stage_result)
+                return {"reports": [], "by_role": {}, "usage": {}, "model_enabled": False}
+
+            runner._run_stage = fake_stage
+            runner._run_specialist_pool = fake_pool
+            result = runner.run()
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(len(specialist_packets), 1)
+            packet = runner._specialist_stage_result_projection(
+                workflow["stages"][0], specialist_packets[0])
+            self.assertEqual(packet["candidate_topics"][0]["id"], "direction-1")
+            self.assertEqual(packet["frontier_seeds"][0]["id"], "frontier-1")
+            self.assertEqual(packet["scholarly_records"][0]["work_id"], "W1")
+            self.assertEqual(packet["prior_work"][0]["work_id"], "W1")
+            runner.close()
+
     def test_candidate_release_is_forwarded_for_principal_review(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -159,6 +211,50 @@ class ComposerWorkflowTests(unittest.TestCase):
             result = runner.run()
             self.assertEqual(result["status"], "research_expansion_required")
             self.assertEqual(result["organization"]["backlog_counts"]["research"]["awaiting_review"], 1)
+
+    def test_topic_verifier_hold_reopens_topic_before_admitting_survey(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_config = root / "topic.json"
+            topic_config.write_text("{}")
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": str(topic_config.resolve()),
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            runner = ComposerRunner(workflow)
+            runner.context["topic"] = {
+                "kind": "topic_discovery", "status": "review_rejected",
+                "specialist_verifier": {
+                    "response": {
+                        "decision": "hold",
+                        "repair_scope": ["cite the decisive parameter source"],
+                    },
+                },
+            }
+            runner.stage_records["topic"] = {
+                "kind": "topic_discovery", "status": "review_rejected",
+            }
+
+            requests = runner._continuation_requests()
+            self.assertEqual([item["kind"] for item in requests], ["topic_refinement"])
+            self.assertEqual(requests[0]["evidence_needed"], "cite the decisive parameter source")
+            self.assertNotIn("manuscript_revision", {item["kind"] for item in requests})
+
+            completed = {"topic"}
+            by_id = {stage["id"]: stage for stage in workflow["stages"]}
+            self.assertTrue(runner._begin_continuation(completed, by_id))
+            self.assertNotIn("topic", completed)
+            self.assertNotIn("survey", completed)
+            self.assertEqual(runner.reopened_stage_ids,
+                             {"topic", "survey", "experiment"})
+            runner.close()
 
     def test_invalid_continuation_request_is_rejected_without_blocking_composer(self):
         with tempfile.TemporaryDirectory() as path:
@@ -510,6 +606,15 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(runtime_context["experiment_catalog"], [])
             self.assertEqual(len(runtime_context["fallback_experiment_catalog"]), 1)
             self.assertTrue(runtime_context["capability_foundry"]["enabled"])
+            self.assertTrue(runtime_context["python_packages"]["numpy"])
+            self.assertEqual(
+                runtime_context["capability_foundry"]["runtime_packages"],
+                [{"name": "numpy", "version": "2.5.2"}],
+            )
+            self.assertEqual(
+                runtime_context["capability_foundry"]["allowed_evidence_modes"],
+                ["analytical_derivation", "synthetic_simulation"],
+            )
             result = {
                 "status": "completed",
                 "topic": {"id": "frontier", "title": "Patch recovery", "domain": "marine ecology",
@@ -603,6 +708,37 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(resumed._effective_topic_exclusions()["capability_ids"], ["cap_a"])
             self.assertIn("direction_a", resumed._effective_topic_exclusions()["topic_ids"])
             resumed.close()
+
+    def test_rejected_topic_history_persists_across_fresh_missions(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            history_path = root / "shared" / "topic-history.json"
+            first_root = root / "first"
+            second_root = root / "second"
+            first_root.mkdir(); second_root.mkdir()
+            first_workflow = self._workflow(first_root)
+            first_workflow["topic_history_path"] = str(history_path.resolve())
+            first = ComposerRunner(first_workflow)
+            first._record_topic_rejection_history([{
+                "topic_id": "rejected_direction",
+                "title": "Rejected direction",
+                "domain": "ecology",
+                "research_question": "Does dispersal change recovery after disturbance?",
+                "rejection_type": "maturity",
+            }])
+            first.close()
+
+            second_workflow = self._workflow(second_root)
+            second_workflow["topic_history_path"] = str(history_path.resolve())
+            second = ComposerRunner(second_workflow)
+            self.assertEqual(
+                [item["topic_id"] for item in second.topic_history["entries"]],
+                ["rejected_direction"],
+            )
+            self.assertEqual(second.topic_history["entries"][0]["history_status"], "rejected")
+            self.assertIn(
+                "rejected_direction", second._effective_topic_exclusions()["topic_ids"])
+            second.close()
 
     def test_explicit_topic_history_survives_objective_wording_changes(self):
         with tempfile.TemporaryDirectory() as path:
@@ -1233,6 +1369,41 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual((root / "composer" / "output" / "progress.json").read_bytes(), before)
             runner.close()
 
+    def test_resume_selects_an_older_checkpoint_with_ahead_attempt_frontier(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            terminal = {
+                "status": "paused",
+                "stages": {
+                    "survey": {"status": "retrying", "attempt_count": 51},
+                    "experiment": {"status": "pending", "attempt_count": 0},
+                },
+            }
+
+            def checkpoint(attempt_count):
+                runner._publish(
+                    f"command/composer/checkpoints/regression-{attempt_count}",
+                    "progress_checkpoint",
+                    {"workflow_id": workflow["id"], "status": "running", "stages": {
+                        "survey": {"status": "retrying", "attempt_count": attempt_count},
+                        "experiment": {"status": "pending", "attempt_count": 0},
+                    }},
+                    "command.composer",
+                )
+
+            # The stale checkpoint is newer, so a first-row-only lookup would
+            # incorrectly discard the older checkpoint at the true frontier.
+            checkpoint(53)
+            checkpoint(51)
+            selected = runner._latest_inflight_checkpoint(terminal)
+            self.assertIsNotNone(selected)
+            self.assertEqual(selected["stages"]["survey"]["attempt_count"], 53)
+            self.assertTrue(ComposerRunner._checkpoint_advances_terminal_state(
+                selected, terminal))
+            runner.close()
+
     def test_routes_journal_editor_to_editor_in_chief(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -1550,6 +1721,51 @@ class ComposerWorkflowTests(unittest.TestCase):
                     "status": "completed", "topic": {"research_question": "new"}}
                 result = runner._run_stage(workflow["stages"][0])
             self.assertEqual(result["topic"]["research_question"], "new")
+            runner.close()
+
+    def test_topic_stage_materializes_research_program_artifact(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_config = root / "topic.json"
+            topic_config.write_text(json.dumps({"schema_version": "topic-discovery-config-1"}))
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery", "config_path": str(topic_config.resolve()),
+                "project_dir": str(topic_dir.resolve()), "depends_on": [], "estimate_seconds": 1,
+                "bindings": [], "deadline_seconds": 10, "reuse_completed": False,
+                "reuse_output_path": None,
+            })
+            runner = ComposerRunner(workflow)
+            runner._remaining = lambda: 10.0
+            output_path = root / "topic-output.json"
+            model_path = root / "model.json"
+            model_path.write_text("{}")
+            result = {**topic_package(), "status": "completed",
+                      "topic": next(item for item in topic_package()["candidates"]
+                                     if item["id"] == "branch_1")}
+            with patch("scisaurus.runtime.topic_discovery.validate_topic_stage_config") as validate, \
+                    patch("scisaurus.runtime.topic_discovery.TopicDiscoveryRunner") as topic_runner:
+                validate.return_value = {
+                    "model_config_path": str(model_path.resolve()),
+                    "output_path": str(output_path.resolve()),
+                    "candidate_count": 3, "max_attempts": 1,
+                    "schema_version": "topic-discovery-config-1",
+                }
+                topic_runner.return_value.run.return_value = result
+                context = runner._run_stage(workflow["stages"][0])
+            program_path = Path(context["research_program_path"])
+            self.assertTrue(program_path.is_file())
+            program = json.loads(program_path.read_text())
+            self.assertEqual(program["schema_version"], "research-program-1")
+            self.assertEqual(program["selected_id"], "branch_1")
+            self.assertEqual(len(program["branches"]), 3)
+            self.assertEqual(json.loads(output_path.read_text())["research_program"], program)
+            runner.context["topic"] = {**context, "kind": "topic_discovery"}
+            packet = {}
+            runner._attach_topic_program(packet)
+            self.assertEqual(packet["research_program"], program)
             runner.close()
 
     def test_journal_consumer_attaches_default_experiment_quality_contract(self):

@@ -22,7 +22,10 @@ from scisaurus.core.schema import TASK_KINDS, canonical_bytes
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.tasks import TaskManager
 from scisaurus.review.issues import IssueManager
-from scisaurus.runtime.models import ModelCallError, ModelClient, ModelResult, resolve_model_config
+from scisaurus.runtime.models import (
+    ModelCallError, ModelClient, ModelResult, model_call_budget_available,
+    model_context_error, resolve_model_config,
+)
 from scisaurus.runtime.resume import ResumeController, source_manifest
 
 SYSTEM = (
@@ -41,6 +44,12 @@ SYSTEM = (
 
 
 _NO_PROVIDER_CAPACITY = object()
+
+
+class _ProviderContextBlock:
+    """A task cannot fit any currently usable route's declared context budget."""
+    def __init__(self, reason):
+        self.reason = reason
 
 
 def _is_process_cancellation(error):
@@ -266,17 +275,30 @@ class ExecutionRuntime:
                     available = window["capacity"]["concurrent_calls"] - window["reserved"].get("concurrent_calls", 0)
                     index = None
                     selected_route = None
+                    context_block = None
                     for i, candidate in enumerate(pending):
                         if self._reservation(candidate) is None and available < 1:
                             continue
                         route = self._provider_route(candidate)
                         if route is _NO_PROVIDER_CAPACITY:
                             continue
+                        if isinstance(route, _ProviderContextBlock):
+                            index, context_block = i, route
+                            break
                         index, selected_route = i, route
                         break
                     if index is None:
                         break
-                    spec = self._apply_provider_route(pending.pop(index), selected_route)
+                    raw_spec = pending.pop(index)
+                    if context_block is not None:
+                        outcomes[raw_spec["task_id"]] = self._undispatched(
+                            raw_spec, context_block.reason)
+                        continue
+                    spec = self._apply_provider_route(raw_spec, selected_route)
+                    context_error = self._model_context_error(spec)
+                    if context_error:
+                        outcomes[spec["task_id"]] = self._undispatched(spec, context_error)
+                        continue
                     entry = {"spec": spec, "context": None, "process": None,
                              "channel": None, "dispatched": False, "attempt_id": None,
                              "provider_reserved": False}
@@ -383,8 +405,50 @@ class ExecutionRuntime:
     def _provider_url(value):
         return value.rstrip("/") if isinstance(value, str) else value
 
+    def _base_model_config(self, spec):
+        """Resolve a task client, filling fixture-style partial clients from the run config."""
+        params = spec["params"]
+        client = params.get("client")
+        if not isinstance(client, dict):
+            raise ValidationError("model operation requires a client object")
+        role = params.get("role") or spec["actor"]
+        selected = dict(client)
+        # Generic execution tests and a few adapters pass only per-call
+        # overrides. Real model tasks pass the complete run model config.
+        if "base_url" not in selected or "model" not in selected:
+            inherited = dict(self.config.get("model") or {})
+            inherited.update(selected)
+            selected = inherited
+        return resolve_model_config(selected, role=role)
+
+    def _route_model_config(self, spec, route):
+        effective = self._base_model_config(spec)
+        if isinstance(route, dict) and isinstance(route.get("_effective"), dict):
+            effective = dict(route["_effective"])
+        if isinstance(route, dict):
+            for key, value in route.items():
+                if key not in {"id", "pool", "_effective"}:
+                    effective[key] = value
+        return effective
+
+    def _model_context_error(self, spec, effective=None):
+        if spec["kind"] != "model":
+            return None
+        params = spec["params"]
+        if effective is None:
+            effective = self._base_model_config(spec)
+        prompt = params.get("prompt")
+        if not isinstance(prompt, str):
+            # ModelClient retains the existing task-level validation for a
+            # malformed prompt; context preflight is only meaningful for text.
+            return None
+        images = params.get("images")
+        image_count = len(images) if isinstance(images, list) else 0
+        return model_context_error(effective, system=SYSTEM, prompt=prompt,
+                                   image_count=image_count)
+
     def _provider_route(self, spec):
-        """Select one route whose transient provider pool has capacity."""
+        """Select one route with pool capacity and a fitting context budget."""
         if spec["kind"] != "model" or not self.provider_pools:
             return None
         params = spec["params"]
@@ -396,6 +460,9 @@ class ExecutionRuntime:
         routes = routes_by_role.get(role, []) if isinstance(routes_by_role, dict) else []
         if routes:
             cursor = self.provider_route_cursors.get(role, 0) % len(routes)
+            capacity_blocked = False
+            budget_blocked = False
+            context_errors = []
             for offset in range(len(routes)):
                 index = (cursor + offset) % len(routes)
                 route = routes[index]
@@ -405,12 +472,31 @@ class ExecutionRuntime:
                     raise ValidationError(
                         f"model route {route['id']} references an unknown provider pool: {pool_name}")
                 if self.provider_active[pool_name] >= pool["max_concurrent"]:
+                    capacity_blocked = True
+                    continue
+                effective = self._route_model_config(spec, route)
+                if not model_call_budget_available(effective):
+                    budget_blocked = True
+                    continue
+                context_error = self._model_context_error(spec, effective)
+                if context_error:
+                    context_errors.append(f"{route['id']}: {context_error}")
                     continue
                 self.provider_route_cursors[role] = (index + 1) % len(routes)
-                return route
+                return {**route, "_effective": effective}
+            # A full route may become usable later, so do not convert a
+            # temporary pool-capacity wait into a permanent task failure.
+            if capacity_blocked:
+                return _NO_PROVIDER_CAPACITY
+            if context_errors:
+                return _ProviderContextBlock(
+                    "no configured provider route fits the model context budget: "
+                    + "; ".join(context_errors))
+            if budget_blocked:
+                return _ProviderContextBlock("configured model call budget is exhausted")
             return _NO_PROVIDER_CAPACITY
 
-        effective = resolve_model_config(client, role=role)
+        effective = self._base_model_config(spec)
         base_url = self._provider_url(effective.get("base_url"))
         matches = [name for name, pool in self.provider_pools.items()
                    if base_url in {self._provider_url(url) for url in pool["base_urls"]}]
@@ -421,6 +507,9 @@ class ExecutionRuntime:
         pool_name = matches[0]
         if self.provider_active[pool_name] >= self.provider_pools[pool_name]["max_concurrent"]:
             return _NO_PROVIDER_CAPACITY
+        context_error = self._model_context_error(spec, effective)
+        if context_error:
+            return _ProviderContextBlock(context_error)
         return {"id": f"default:{pool_name}", "pool": pool_name, "_effective": effective}
 
     def _apply_provider_route(self, spec, route):
@@ -431,14 +520,11 @@ class ExecutionRuntime:
         client = params.get("client")
         if not isinstance(client, dict):
             raise ValidationError("model operation requires a client object")
-        effective = route.get("_effective") if isinstance(route, dict) else None
-        if not isinstance(effective, dict):
-            effective = resolve_model_config(client, role=role)
-        else:
-            effective = dict(effective)
-        for key, value in route.items():
-            if key not in {"id", "pool", "_effective"}:
-                effective[key] = value
+        effective = self._route_model_config(spec, route) if route is not None else None
+        if effective is None:
+            # Keep the original client payload for callers that use a partial
+            # fixture client; the worker will apply the same inherited config.
+            return spec
         params["client"] = effective
         params["role"] = role
         params["route_id"] = route["id"]

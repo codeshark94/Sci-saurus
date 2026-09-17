@@ -221,6 +221,62 @@ class TestExecutionRuntime(unittest.TestCase):
         self.assertLessEqual(provider_peak("qwen"), 1)
         self.assertEqual(runtime.control._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 6)
 
+    def test_provider_route_skips_a_too_small_model_context(self):
+        value = config()
+        value["model"].update(
+            base_url="http://127.0.0.1:1/v1", protocol="openai_compatible", model="base-model")
+        value["model"]["role_routes"] = {
+            "strategy.worker": [
+                {"id": "small-route", "pool": "ollama", "base_url": "http://127.0.0.1:1/v1",
+                 "protocol": "openai_compatible", "model": "small-model", "auth_env": None,
+                 "context_window_tokens": 3000, "max_input_tokens": 300},
+                {"id": "large-route", "pool": "qwen", "base_url": "https://qwen.invalid/v1",
+                 "protocol": "openai_compatible", "model": "large-model", "auth_env": None,
+                 "context_window_tokens": 9000, "max_input_tokens": 6000},
+            ]
+        }
+        value["limits"]["provider_pools"] = {
+            "ollama": {"max_concurrent": 3, "base_urls": ["http://127.0.0.1:1/v1"]},
+            "qwen": {"max_concurrent": 1, "base_urls": ["https://qwen.invalid/v1"]},
+        }
+        runtime = ExecutionRuntime(self.root / "context-route-project", validate_config(value),
+                                   worker_target=execution_worker)
+        self.runtimes.append(runtime)
+        spec = self.spec("context-route", payload="x" * 2000)
+        spec["params"]["client"] = value["model"]
+        outcomes = runtime._call_batch([spec], max_parallel=1)
+        self.assertTrue(outcomes["context-route"]["ok"])
+        record = json.loads(outcomes["context-route"]["result"]["text"])
+        self.assertEqual(record["route_id"], "large-route")
+        self.assertEqual(record["model"], "large-model")
+
+    def test_context_overflow_is_scoped_to_task_without_worker_attempt(self):
+        value = config()
+        value["model"].update(
+            base_url="http://127.0.0.1:1/v1", protocol="openai_compatible", model="base-model")
+        value["model"]["role_routes"] = {
+            "strategy.worker": [{
+                "id": "small-route", "pool": "ollama", "base_url": "http://127.0.0.1:1/v1",
+                "protocol": "openai_compatible", "model": "small-model", "auth_env": None,
+                "context_window_tokens": 3000, "max_input_tokens": 300,
+            }]
+        }
+        value["limits"]["provider_pools"] = {
+            "ollama": {"max_concurrent": 3, "base_urls": ["http://127.0.0.1:1/v1"]},
+        }
+        runtime = ExecutionRuntime(self.root / "context-block-project", validate_config(value),
+                                   worker_target=execution_worker)
+        self.runtimes.append(runtime)
+        spec = self.spec("context-block", payload="x" * 2000)
+        spec["params"]["client"] = value["model"]
+        outcomes = runtime._call_batch([spec], max_parallel=1)
+        self.assertFalse(outcomes["context-block"]["ok"])
+        self.assertTrue(outcomes["context-block"]["outcome_known"])
+        self.assertIn("context budget", outcomes["context-block"]["error"])
+        self.assertEqual(runtime.tasks.get("context-block")["state"], "blocked")
+        self.assertEqual(runtime.control._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 0)
+        self.assertEqual(runtime.provider_active, {"ollama": 0})
+
     @unittest.skipUnless(os.name == "posix", "process-group cleanup uses POSIX process sessions")
     def test_interrupt_keeps_unknown_cost_releases_undispatched_review_and_stops_descendants(self):
         paths = [self.root / f"pid-{i}.json" for i in range(2)]
