@@ -18,6 +18,7 @@ from scisaurus.runtime.topic_discovery import (
     TopicBudget,
     TopicDiscoveryRunner,
     topic_maturity_admitted,
+    topic_maturity_survey_eligible,
     topic_portfolio_profile,
     topic_refinement_dimensions,
     topic_signature,
@@ -385,6 +386,40 @@ class MaturityMalformedRepairModel(MaturityModel):
         return super().complete(system=system, prompt=prompt, images=images)
 
 
+class SurveyEligibleMaturityModel(MaturityModel):
+    """Keep a candidate below the journal floor but above the survey floor."""
+
+    def complete(self, *, system, prompt, images=None):
+        payload = json.loads(prompt)
+        if payload.get("assignment") == "topic_maturity_review":
+            type(self).calls.append(payload.get("assignment"))
+            review = {
+                "decision": "refine",
+                "selected_id": payload["selected_id_to_copy_exactly"],
+                "scores": {
+                    "question_specificity": 3,
+                    "mechanism_depth": 2,
+                    "comparison_design": 2,
+                    "contribution_potential": 2,
+                    "falsifiability": 3,
+                },
+                "rationale": (
+                    "The direction is concrete enough to investigate, but literature must sharpen "
+                    "the mechanism and contribution before experiment admission."
+                ),
+                "required_changes": [
+                    "Ground the mechanism in prior work.",
+                    "Identify the strongest competing explanation.",
+                ],
+                "changed_dimensions": ["mechanism", "research_form"],
+            }
+            return ModelResult(
+                text=json.dumps(review), model="fake",
+                usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                elapsed_seconds=0.01, finish_reason="stop")
+        return super().complete(system=system, prompt=prompt, images=images)
+
+
 class SourceChallengeRefinementModel(FakeModel):
     """Reject the first source challenge, then admit its bounded repair."""
 
@@ -593,6 +628,28 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertTrue(topic_maturity_admitted(review))
         review["scores"]["mechanism_depth"] = 1
         self.assertFalse(topic_maturity_admitted(review))
+
+    def test_maturity_survey_floor_requires_substance_in_every_dimension(self):
+        review = {
+            "decision": "refine",
+            "selected_id": "direction_1",
+            "scores": {dimension: 2 for dimension in (
+                "question_specificity", "mechanism_depth", "comparison_design",
+                "contribution_potential", "falsifiability")},
+            "rationale": "The question merits evidence gathering but is not experiment-ready.",
+            "required_changes": ["Ground the mechanism."],
+            "changed_dimensions": ["mechanism"],
+        }
+        self.assertTrue(topic_maturity_survey_eligible(review))
+        review["scores"]["mechanism_depth"] = 1
+        self.assertFalse(topic_maturity_survey_eligible(review))
+        contradictory_admit = {
+            **review,
+            "decision": "admit",
+            "scores": {dimension: 2 for dimension in review["scores"]},
+            "required_changes": [],
+        }
+        self.assertFalse(topic_maturity_survey_eligible(contradictory_admit))
 
     def test_generated_direction_slot_id_does_not_block_a_different_question(self):
         prior = {
@@ -1017,6 +1074,24 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["maturity_review_history"][0]["review"]["decision"], "refine")
         self.assertEqual(result["maturity_score"], 18)
         self.assertIn("across clean and contaminated regimes", result["question"])
+
+    def test_runner_preserves_survey_eligible_candidate_as_provisional(self):
+        SurveyEligibleMaturityModel.calls = []
+        SurveyEligibleMaturityModel.review_count = 0
+        with patch("scisaurus.runtime.topic_discovery.ModelClient",
+                   SurveyEligibleMaturityModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+            }).run("Choose a feasible research direction", candidate_count=3,
+                   bibliography=False, maturity_review_rounds=1, max_attempts=2)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["admission_state"], "provisional_for_survey")
+        self.assertEqual(result["next_evidence_action"], "literature_survey")
+        self.assertEqual(len(result["maturity_open_requirements"]), 2)
+        self.assertEqual(
+            result["candidate_attempt_trace"][-1]["status"],
+            "provisional_for_survey")
 
     def test_runner_repairs_incomplete_maturity_review_without_discarding_package(self):
         MaturityMalformedRepairModel.review_calls = 0

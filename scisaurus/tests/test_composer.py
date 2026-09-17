@@ -52,6 +52,90 @@ class ComposerWorkflowTests(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 validate_workflow(workflow)
 
+    def test_topic_to_experiment_requires_an_intervening_survey(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            workflow["stages"][2]["depends_on"] = ["topic"]
+            with self.assertRaisesRegex(ValidationError, "requires a survey between"):
+                validate_workflow(workflow)
+
+    def test_independent_experiment_does_not_inherit_unrelated_topic_context(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "unrelated-topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "unrelated_topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            runner = ComposerRunner(workflow)
+            runner.context["unrelated_topic"] = {
+                "kind": "topic_discovery",
+                "admission_state": "provisional_for_survey",
+                "topic": {
+                    "id": "unrelated", "title": "Unrelated",
+                    "research_question": "This must not bind to the experiment.",
+                },
+            }
+            experiment_stage = next(
+                item for item in workflow["stages"] if item["id"] == "experiment")
+            config = {"sentinel": "unchanged"}
+            self.assertIs(
+                runner._apply_topic_to_experiment_config(experiment_stage, config), config)
+            self.assertEqual(config, {"sentinel": "unchanged"})
+            runner.close()
+
+    def test_agenda_policy_is_strictly_validated(self):
+        with tempfile.TemporaryDirectory() as path:
+            workflow = self._workflow(Path(path))
+            workflow["agenda_policy"] = {"mode": "adaptive"}
+            self.assertEqual(
+                validate_workflow(workflow)["agenda_policy"],
+                {"mode": "adaptive"})
+            workflow["agenda_policy"] = {"mode": "random"}
+            with self.assertRaisesRegex(ValidationError, "agenda_policy"):
+                validate_workflow(workflow)
+
+    def test_omitted_agenda_policy_preserves_legacy_declaration_order(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            paper_dir = root / "paper"
+            paper_dir.mkdir()
+            paper = {
+                "id": "paper", "kind": "paper",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(paper_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            }
+            survey = workflow["stages"][0]
+            workflow["stages"] = [paper, survey]
+            workflow["completion"]["required_stage_ids"] = ["paper", "survey"]
+            runner = ComposerRunner(workflow)
+            try:
+                ordered = runner._agenda_order(
+                    workflow["stages"], completed=set(),
+                    by_id={item["id"]: item for item in workflow["stages"]})
+                self.assertEqual(runner._agenda_policy(), {"mode": "ordered"})
+                self.assertEqual([item["id"] for item in ordered], ["paper", "survey"])
+            finally:
+                runner.close()
+
     def test_custom_organization_must_cover_stage_owners(self):
         with tempfile.TemporaryDirectory() as path:
             workflow = self._workflow(Path(path))
@@ -137,6 +221,166 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(result["organization"]["backlog_counts"]["research"]["completed"], 1)
             self.assertEqual(result["organization"]["backlog_counts"]["methods"]["completed"], 1)
 
+    def test_adaptive_agenda_treats_stage_order_as_dependencies_not_itinerary(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            paper_dir = root / "paper"
+            paper_dir.mkdir()
+            paper = {
+                "id": "paper", "kind": "paper",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(paper_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            }
+            survey = workflow["stages"][0]
+            workflow["stages"] = [paper, survey]
+            workflow["completion"]["required_stage_ids"] = ["paper", "survey"]
+            workflow["agenda_policy"] = {"mode": "adaptive"}
+            workflow["exploration_seed"] = 7
+            runner = ComposerRunner(workflow)
+            calls = []
+
+            def fake_stage(stage, **_kwargs):
+                calls.append(stage["id"])
+                output = root / f"{stage['id']}-adaptive.json"
+                output.write_text(json.dumps({"stage": stage["id"]}))
+                return {
+                    "status": "completed", "output_path": str(output),
+                    "project_dir": stage["project_dir"], "stage_id": stage["id"],
+                }
+
+            runner._run_stage = fake_stage
+            result = runner.run()
+            self.assertEqual(calls, ["survey", "paper"])
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["agenda_policy"], {"mode": "adaptive"})
+            first = result["agenda_decisions"][0]
+            self.assertEqual(first["selected_stage_id"], "survey")
+            self.assertEqual(
+                [item["stage_id"] for item in first["candidate_stages"]],
+                ["survey", "paper"])
+            self.assertEqual(result["research_state"]["phase"], "release_candidate")
+
+    def test_adaptive_retry_yields_to_other_ready_work_before_replanning(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            paper_dir = root / "paper"
+            paper_dir.mkdir()
+            paper = {
+                "id": "paper", "kind": "paper",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(paper_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            }
+            survey = workflow["stages"][0]
+            workflow["stages"] = [paper, survey]
+            workflow["completion"]["required_stage_ids"] = ["paper", "survey"]
+            workflow["agenda_policy"] = {"mode": "adaptive"}
+            workflow["retry_policy"] = {"mode": "until_deadline", "backoff_seconds": 0}
+            runner = ComposerRunner(workflow)
+            calls = []
+
+            def flaky_stage(stage, **_kwargs):
+                calls.append(stage["id"])
+                if stage["id"] == "survey" and calls.count("survey") == 1:
+                    raise RuntimeError("survey provider failed once")
+                output = root / f"{stage['id']}-{len(calls)}.json"
+                output.write_text(json.dumps({"stage": stage["id"]}))
+                return {
+                    "status": "completed", "output_path": str(output),
+                    "project_dir": stage["project_dir"], "stage_id": stage["id"],
+                }
+
+            runner._run_stage = flaky_stage
+            result = runner.run()
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(calls, ["survey", "paper", "survey"])
+            self.assertEqual(
+                [item["selected_stage_id"] for item in result["agenda_decisions"][:3]],
+                ["survey", "paper", "survey"],
+            )
+            self.assertTrue(any(
+                item.get("action") == "yield_retry_to_agenda"
+                for item in result["department_activity"]))
+            self.assertEqual(result["retry_schedule"], {})
+
+    def test_resume_restores_agenda_frontier_and_decision_history(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            workflow["agenda_policy"] = {"mode": "adaptive"}
+            workflow["exploration_seed"] = 19
+            runner = ComposerRunner(workflow)
+            by_id = {stage["id"]: stage for stage in workflow["stages"]}
+            ordered = runner._agenda_order(
+                [workflow["stages"][0]], completed=set(), by_id=by_id)
+            self.assertEqual(ordered[0]["id"], "survey")
+            runner._checkpoint("agenda:test:selected", force=True)
+            decision_ref = runner.agenda_decisions[0]["artifact_ref"]
+            runner.close()
+
+            resumed = ComposerRunner(workflow, resume=True)
+            try:
+                self.assertEqual(len(resumed.agenda_decisions), 1)
+                self.assertEqual(
+                    resumed.agenda_decisions[0]["artifact_ref"], decision_ref)
+                state = resumed._research_state()
+                self.assertEqual(state["frontier_stage_ids"], ["survey"])
+                self.assertEqual(
+                    state["last_agenda_decision"]["selected_stage_id"], "survey")
+            finally:
+                resumed.close()
+
+    def test_resume_preserves_persisted_adaptive_policy_for_legacy_workflow(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            self.assertNotIn("agenda_policy", workflow)
+            runner = ComposerRunner(workflow)
+            runner._restored_agenda_policy = {"mode": "adaptive"}
+            runner._checkpoint("agenda:migrated", force=True)
+            runner.close()
+
+            resumed = ComposerRunner(workflow, resume=True)
+            try:
+                self.assertEqual(resumed._agenda_policy(), {"mode": "adaptive"})
+            finally:
+                resumed.close()
+
+    def test_newer_agenda_checkpoint_supersedes_stale_terminal_report(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            workflow["agenda_policy"] = {"mode": "adaptive"}
+            runner = ComposerRunner(workflow)
+            by_id = {stage["id"]: stage for stage in workflow["stages"]}
+            runner._agenda_order([workflow["stages"][0]], completed=set(), by_id=by_id)
+            runner._checkpoint("agenda:test:selected", force=True)
+            checkpoint_revision = runner.state_revision
+            runner._publish("command/composer/run", "report", {
+                "schema_version": "composer-run-1",
+                "workflow_id": workflow["id"],
+                "run_id": runner.run_id,
+                "status": "paused",
+                "state_revision": checkpoint_revision - 1,
+                "stages": {}, "context": {}, "feedback": [], "blockers": [],
+                "usage": {}, "agenda_decisions": [],
+            }, "command.composer")
+            runner.close()
+
+            resumed = ComposerRunner(workflow, resume=True)
+            try:
+                self.assertEqual(resumed.state_revision, checkpoint_revision)
+                self.assertEqual(len(resumed.agenda_decisions), 1)
+                self.assertEqual(
+                    resumed.agenda_decisions[0]["selected_stage_id"], "survey")
+            finally:
+                resumed.close()
+
     def test_fake_stage_end_to_end_records_specialist_activation_and_verdict(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -217,6 +461,77 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(packet["frontier_seeds"][0]["id"], "frontier-1")
             self.assertEqual(packet["scholarly_records"][0]["work_id"], "W1")
             self.assertEqual(packet["prior_work"][0]["work_id"], "W1")
+            runner.close()
+
+    def test_provisional_topic_verifier_hold_becomes_survey_requirements(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            runner = ComposerRunner(workflow)
+            calls = []
+
+            def fake_stage(stage, **_kwargs):
+                calls.append(stage["id"])
+                output = root / f"{stage['id']}-provisional.json"
+                output.write_text(json.dumps({"stage": stage["id"]}))
+                result = {
+                    "status": "completed", "output_path": str(output),
+                    "project_dir": stage["project_dir"], "stage_id": stage["id"],
+                }
+                if stage["id"] == "topic":
+                    result.update({
+                        "admission_state": "provisional_for_survey",
+                        "next_evidence_action": "literature_survey",
+                        "maturity_open_requirements": ["Ground the comparator."],
+                        "topic": {
+                            "id": "direction-1", "title": "A provisional direction",
+                            "research_question": "Does A distinguish B from C?",
+                        },
+                    })
+                return result
+
+            def verifier(stage, *_args, **_kwargs):
+                response = ({
+                    "decision": "hold",
+                    "rationale": "The reference dataset must be located.",
+                    "critical_findings": ["The reference dataset is not pinned."],
+                    "repair_scope": ["Locate and verify the reference dataset in the survey."],
+                } if stage["id"] == "topic" else {
+                    "decision": "accept", "rationale": "The bounded result is supported.",
+                    "critical_findings": [], "repair_scope": [],
+                })
+                return {"status": "succeeded", "response": response, "usage": {}}
+
+            runner._run_stage = fake_stage
+            runner._run_specialist_pool = lambda *_args, **_kwargs: {
+                "reports": [], "by_role": {}, "usage": {}, "model_enabled": False,
+            }
+            runner._publish_specialist_reports = lambda _stage, _assignment, bundle: bundle
+            runner._run_specialist_verifier = verifier
+            result = runner.run()
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(calls, ["topic", "survey", "experiment"])
+            topic = result["context"]["topic"]
+            self.assertIn(
+                "Locate and verify the reference dataset in the survey.",
+                topic["maturity_open_requirements"],
+            )
+            self.assertEqual(
+                topic["provisional_adversarial_challenge"]["control_disposition"],
+                "carried_to_literature_survey",
+            )
+            self.assertEqual(result["stages"]["topic"]["verifier_outcome"], "hold")
             runner.close()
 
     def test_candidate_release_is_forwarded_for_principal_review(self):
@@ -1264,6 +1579,41 @@ class ComposerWorkflowTests(unittest.TestCase):
                                                   "experiment": workflow["stages"][2]}))
             runner.close()
 
+    def test_eligible_survey_carries_provisional_topic_requirements_forward(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            runner = ComposerRunner(workflow)
+            runner.context["topic"] = {
+                "kind": "topic_discovery",
+                "admission_state": "provisional_for_survey",
+                "maturity_open_requirements": ["Ground the mechanism."],
+                "topic": {
+                    "id": "direction_a", "title": "A direction",
+                    "domain": "science",
+                    "research_question": "Does mechanism A change the measured outcome?",
+                },
+            }
+            gated = runner._gate_free_topic_survey({
+                "status": "completed", "gap_state": "eligible_for_experiment",
+                "survey_ref": "survey-ref", "assessment_ref": "assessment-ref",
+            }, stage=workflow["stages"][1])
+            self.assertEqual(
+                gated["topic_admission"], "provisional_supported_for_experiment")
+            self.assertEqual(
+                gated["carried_maturity_requirements"], ["Ground the mechanism."])
+            runner.close()
+
     def test_repeated_continuation_hold_pivots_until_the_deadline(self):
         """A repeated survey hold keeps changing strategy until the hard wall."""
         class FastClock:
@@ -1354,17 +1704,66 @@ class ComposerWorkflowTests(unittest.TestCase):
                 },
             }))
             workflow["experiment_catalog"] = [{"id": "cap_b", "config_path": str(catalog.resolve())}]
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            unrelated_dir = root / "unrelated-topic"
+            unrelated_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "unrelated_topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(unrelated_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            next(item for item in workflow["stages"]
+                 if item["id"] == "survey")["depends_on"] = ["topic"]
             runner = ComposerRunner(workflow)
             template = json.loads(Path("config/experiment-capabilities/free_quadrature_peak.json").read_text())
             config = {"experiment": template["experiment"], "supplied_context": "base"}
-            runner.context["topic"] = {"kind": "topic_discovery", "topic": {
-                "experiment_capability_id": "cap_b",
-                "research_question": "Does the robust estimator reduce tail error under contamination?",
-            }}
-            selected = runner._apply_topic_to_experiment_config(workflow["stages"][1], config)
+            runner.context["unrelated_topic"] = {
+                "kind": "topic_discovery",
+                "admission_state": "mature",
+                "topic": {
+                    "experiment_capability_id": "cap_b",
+                    "research_question": "This unrelated branch must never be bound.",
+                },
+            }
+            runner.context["topic"] = {
+                "kind": "topic_discovery",
+                "admission_state": "provisional_for_survey",
+                "maturity_open_requirements": ["Separate the competing mechanism."],
+                "topic": {
+                    "experiment_capability_id": "cap_b",
+                    "research_question": "Does the robust estimator reduce tail error under contamination?",
+                },
+            }
+            experiment_stage = next(
+                item for item in workflow["stages"] if item["id"] == "experiment")
+            with self.assertRaisesRegex(ValidationError, "provisional topic cannot enter"):
+                runner._apply_topic_to_experiment_config(experiment_stage, config)
+            runner.context["survey"] = {
+                "kind": "survey",
+                "status": "completed",
+                "gap_state": "eligible_for_experiment",
+                "topic_admission": "provisional_supported_for_experiment",
+                "carried_maturity_requirements": ["Separate the competing mechanism."],
+            }
+            selected = runner._apply_topic_to_experiment_config(experiment_stage, config)
             self.assertEqual(selected["experiment"]["id"], "capability_b_study")
             self.assertEqual(selected["experiment"]["research_question"],
                              "Does the robust estimator reduce tail error under contamination?")
+            self.assertIn(
+                "Separate the competing mechanism.", selected["supplied_context"])
+            self.assertIn(
+                "literature gap decision does not by itself resolve them",
+                selected["supplied_context"])
             runner.close()
 
     def test_design_driven_capability_injects_the_proposed_design(self):

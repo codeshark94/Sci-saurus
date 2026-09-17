@@ -25,11 +25,31 @@ departments investigate, construct, challenge, verify, revise, and choose the
 next scoped recovery action without asking a person to invent a pivot. The
 Archivist preserves the trail.
 
-The flagship path is:
+The paper mission has hard evidence dependencies, but it is not a one-way
+assembly line. The Composer keeps a live research frontier and can reopen the
+smallest affected scope:
 
 ```text
-brief + results → literature → experiment → interpretation → argument → paper/PDF
+candidate portfolio → literature probe ↔ topic refinement
+                              ↓
+                    experiment ↔ added evidence
+                              ↓
+             interpretation ↔ discriminating test
+                              ↓
+                  argument ↔ claim repair
+                              ↓
+                    paper ↔ adversarial review
 ```
+
+When several dependency-ready activities exist, an adaptive agenda favors
+evidence-producing work, active work orders, and actions that unlock useful
+downstream work. Seeded exploration breaks close ties. Every choice and
+alternative is checkpointed; final release authority remains with the Principal.
+A failed adaptive attempt yields back to the global agenda with a persisted
+not-before boundary, so another ready evidence action can run during backoff.
+Hard dependencies may correctly leave a single initial frontier; the flow
+becomes non-linear through retained candidate branches and evidence-triggered
+reopenings rather than by bypassing those dependencies.
 
 The same runtime can also produce bounded reports, guides, JSON artifacts, and
 Python source units. A scientific result is never inferred from a model response
@@ -107,6 +127,7 @@ and [Agent, Department, and Stage Flow](docs/16-agent-department-flow.md).
 | **Paper pipeline** | Frozen storyline, claim/evidence index, bibliography, figures, LaTeX, rendered PDF, and release manifest |
 | **Research program and defense ledger** | Candidate branches with conditional paper outcomes, retained alternatives, posture-separated argumentation, and reviewer-visible weak points |
 | **Resume and time policy** | Checkpoints, deadline-aware replanning, unknown-call reconciliation, retained failures, and scoped repair |
+| **Adaptive research agenda** | Dependency-ready work ranked by information value, active work orders, downstream unlocks, and reproducible seeded exploration |
 | **Tool acquisition** | Allowlisted programs, APIs, and MCP services with readiness probes and drift-aware bindings |
 
 “Implemented” means the bounded runtime contract is present and regression

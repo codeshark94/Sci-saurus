@@ -203,6 +203,12 @@ MATURITY_REVIEW_FIELDS = {
 }
 MATURITY_MIN_TOTAL = 15
 MATURITY_MIN_DIMENSION = 2
+# A topic does not need to be a finished paper thesis before the literature
+# team is allowed to investigate it.  This lower floor admits only candidates
+# with substance in every review dimension, while preserving the stricter
+# journal-oriented threshold above for a mature intake decision.
+MATURITY_SURVEY_MIN_TOTAL = 10
+MATURITY_SURVEY_MIN_DIMENSION = 2
 
 _TOPIC_STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "can", "does", "do", "for", "from",
@@ -2068,6 +2074,31 @@ def topic_maturity_admitted(review, *, minimum_total=MATURITY_MIN_TOTAL,
         score >= minimum_dimension for score in scores.values())
 
 
+def topic_maturity_survey_eligible(
+        review, *, minimum_total=MATURITY_SURVEY_MIN_TOTAL,
+        minimum_dimension=MATURITY_SURVEY_MIN_DIMENSION):
+    """Return whether a thin but substantive candidate merits evidence probes.
+
+    The maturity reviewer may correctly request refinement because a mechanism
+    or contribution is not yet developed enough for a journal experiment.  If
+    every dimension still clears a modest deterministic floor, discarding the
+    candidate and generating another portfolio loses useful work.  Such a
+    candidate may enter the literature survey provisionally; it is not treated
+    as novel, experiment-ready, or publication-ready until downstream evidence
+    resolves the open requirements.
+    """
+    validate_topic_maturity_review(review)
+    if type(minimum_total) is not int or not 0 <= minimum_total <= 20:
+        raise ValidationError("topic survey maturity minimum_total must be between 0 and 20")
+    if type(minimum_dimension) is not int or not 0 <= minimum_dimension <= 4:
+        raise ValidationError("topic survey maturity minimum_dimension must be between 0 and 4")
+    scores = review["scores"]
+    return (review["decision"] == "refine"
+            and bool(review["required_changes"])
+            and sum(scores.values()) >= minimum_total
+            and all(score >= minimum_dimension for score in scores.values()))
+
+
 FRONTIER_SYSTEM = (
     "You are a scientific horizon scanner. Generate independent, science-first search seeds before any "
     "experiment capability is shown. Deliberately span remote domains and combine a concrete phenomenon, "
@@ -3562,6 +3593,61 @@ class TopicDiscoveryRunner:
                 {"candidate_index": index, "experiment_capability_id": capability_id}
                 for index, capability_id in enumerate(coverage_plan)
             ]
+
+        def finalize_topic(package, selected, feasibility, *, generation_seed,
+                           portfolio_profile, candidate_prior_work,
+                           candidate_sampling_trace, source_challenge,
+                           review=None, admission_state="mature",
+                           evolution_dimensions=None):
+            """Assemble one admitted topic without duplicating gate semantics."""
+            output = {
+                **package,
+                "status": "completed",
+                "topic": selected,
+                "question": selected["research_question"],
+                "search_queries": selected["search_queries"],
+                "proposed_gap": selected["why_promising"],
+                "feasibility_check": feasibility,
+                "recent_papers": recent_papers,
+                "frontier_seed_plan": frontier_seed_plan,
+                "candidate_prior_work": candidate_prior_work,
+                "candidate_sampling_trace": candidate_sampling_trace,
+                "source_challenge": source_challenge,
+                "sampling_seed": sampling_seed,
+                "generation_seed": generation_seed,
+                "sampling_trace": sampling_trace,
+                "portfolio_profile": deepcopy(portfolio_profile),
+                "candidate_attempt_trace": deepcopy(candidate_attempt_trace),
+                "rejected_topic_history": deepcopy(rejected_topic_history),
+                "usage": usage,
+                "budget": budget.snapshot(),
+            }
+            if review is not None:
+                output.update({
+                    "maturity_reviews": deepcopy(maturity_reviews),
+                    "maturity_review_history": deepcopy(maturity_review_history),
+                    "maturity_score": sum(review["scores"].values()),
+                })
+            if admission_state == "provisional_for_survey":
+                output.update({
+                    "admission_state": admission_state,
+                    "maturity_open_requirements": deepcopy(
+                        review.get("required_changes", []) if isinstance(review, dict) else []),
+                    "next_evidence_action": "literature_survey",
+                })
+            if refinement_context:
+                output["topic_evolution"] = {
+                    "mode": "refinement",
+                    "cycle": refinement_context.get("cycle"),
+                    "parent_topic_id": refinement_context.get("parent_topic_id"),
+                    "changed_dimensions": sorted(set(
+                        list(evolution_dimensions or [])
+                        + list(refinement_changed_dimensions or [])
+                    )) or refinement_context.get("changed_dimensions", []),
+                    "reason": refinement_context.get("reason"),
+                }
+            return output
+
         for attempt in attempts:
             generation_seed = (sampling_seed + attempt) % MAX_PROVIDER_SEED if sampling_seed is not None else None
             # Preserve temperature for the first portfolio proposal so the
@@ -4170,46 +4256,44 @@ class TopicDiscoveryRunner:
                     evolution_dimensions = sorted({dimension
                                                    for item in maturity_reviews
                                                    for dimension in item.get("changed_dimensions", [])})
-                    output = {
-                        **package,
-                        "status": "completed",
-                        "topic": selected,
-                        "question": selected["research_question"],
-                        "search_queries": selected["search_queries"],
-                        "proposed_gap": selected["why_promising"],
-                        "feasibility_check": feasibility,
-                        "recent_papers": recent_papers,
-                        "frontier_seed_plan": frontier_seed_plan,
-                        "candidate_prior_work": candidate_prior_work,
-                        "candidate_sampling_trace": candidate_sampling_trace,
-                        "source_challenge": source_challenge,
-                        "sampling_seed": sampling_seed,
-                        "generation_seed": generation_seed,
-                        "sampling_trace": sampling_trace,
-                        "maturity_reviews": deepcopy(maturity_reviews),
-                        "maturity_review_history": deepcopy(maturity_review_history),
-                        "maturity_score": sum(review["scores"].values()),
-                        "portfolio_profile": deepcopy(portfolio_profile),
-                        "candidate_attempt_trace": deepcopy(candidate_attempt_trace),
-                        "rejected_topic_history": deepcopy(rejected_topic_history),
-                        "usage": usage,
-                        "budget": budget.snapshot(),
-                    }
-                    if refinement_context:
-                        output["topic_evolution"] = {
-                            "mode": "refinement",
-                            "cycle": refinement_context.get("cycle"),
-                            "parent_topic_id": refinement_context.get("parent_topic_id"),
-                            "changed_dimensions": sorted(set(
-                                evolution_dimensions + refinement_changed_dimensions
-                            )) or refinement_context.get("changed_dimensions", []),
-                            "reason": refinement_context.get("reason"),
-                        }
-                    return output
+                    return finalize_topic(
+                        package, selected, feasibility,
+                        generation_seed=generation_seed,
+                        portfolio_profile=portfolio_profile,
+                        candidate_prior_work=candidate_prior_work,
+                        candidate_sampling_trace=candidate_sampling_trace,
+                        source_challenge=source_challenge,
+                        review=review,
+                        evolution_dimensions=evolution_dimensions,
+                    )
                 if refinement_round >= maturity_review_rounds:
                     last_error = ValidationError(
                         "topic maturity review requires substantive refinement: "
                         + review["rationale"])
+                    # A candidate that has substance in every dimension is a
+                    # valid object for evidence gathering even when it is not
+                    # yet a journal-ready thesis.  Preserve it as a provisional
+                    # branch and let the literature gate decide whether to
+                    # strengthen, pivot, or kill it.  Candidates below this
+                    # floor are still rejected and never reach an experiment.
+                    if topic_maturity_survey_eligible(review):
+                        attempt_record["status"] = "provisional_for_survey"
+                        attempt_record["error"] = str(last_error)[:2048]
+                        evolution_dimensions = sorted({
+                            dimension for item in maturity_reviews
+                            for dimension in item.get("changed_dimensions", [])
+                        })
+                        return finalize_topic(
+                            package, selected, feasibility,
+                            generation_seed=generation_seed,
+                            portfolio_profile=portfolio_profile,
+                            candidate_prior_work=candidate_prior_work,
+                            candidate_sampling_trace=candidate_sampling_trace,
+                            source_challenge=source_challenge,
+                            review=review,
+                            admission_state="provisional_for_survey",
+                            evolution_dimensions=evolution_dimensions,
+                        )
                     attempt_record["status"] = "maturity_rejected"
                     attempt_record["error"] = str(last_error)[:2048]
                     attempt_record["rejection_type"] = "maturity"
@@ -4252,38 +4336,15 @@ class TopicDiscoveryRunner:
                 previous = None
                 continue
             attempt_record["status"] = "admitted"
-            output = {
-                **package,
-                "status": "completed",
-                "topic": selected,
-                "question": selected["research_question"],
-                "search_queries": selected["search_queries"],
-                "proposed_gap": selected["why_promising"],
-                "feasibility_check": feasibility,
-                "recent_papers": recent_papers,
-                "frontier_seed_plan": frontier_seed_plan,
-                "candidate_prior_work": candidate_prior_work,
-                "candidate_sampling_trace": candidate_sampling_trace,
-                "source_challenge": source_challenge,
-                "sampling_seed": sampling_seed,
-                "generation_seed": generation_seed,
-                "sampling_trace": sampling_trace,
-                "portfolio_profile": deepcopy(portfolio_profile),
-                "candidate_attempt_trace": deepcopy(candidate_attempt_trace),
-                "rejected_topic_history": deepcopy(rejected_topic_history),
-                "usage": usage,
-                "budget": budget.snapshot(),
-            }
-            if refinement_context:
-                output["topic_evolution"] = {
-                    "mode": "refinement",
-                    "cycle": refinement_context.get("cycle"),
-                    "parent_topic_id": refinement_context.get("parent_topic_id"),
-                    "changed_dimensions": refinement_changed_dimensions or refinement_context.get(
-                        "changed_dimensions", []),
-                    "reason": refinement_context.get("reason"),
-                }
-            return output
+            return finalize_topic(
+                package, selected, feasibility,
+                generation_seed=generation_seed,
+                portfolio_profile=portfolio_profile,
+                candidate_prior_work=candidate_prior_work,
+                candidate_sampling_trace=candidate_sampling_trace,
+                source_challenge=source_challenge,
+                evolution_dimensions=refinement_changed_dimensions,
+            )
         error = last_error or ValidationError("topic discovery did not produce a valid package")
         snapshot = budget.snapshot()
         # Some direction-level gates reject a selected topic before the

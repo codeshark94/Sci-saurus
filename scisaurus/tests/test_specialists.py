@@ -184,6 +184,37 @@ class SpecialistDispatcherTests(unittest.TestCase):
         self.assertNotIn("[truncated]", prompt)
         self.assertIn("f" * 900, prompt)
 
+    def test_topic_verifier_judges_provisional_result_against_survey_admission(self):
+        chief_result = {
+            "status": "completed",
+            "admission_state": "provisional_for_survey",
+            "next_evidence_action": "literature_survey",
+            "maturity_open_requirements": [
+                "Verify whether the comparison is unresolved in prior work.",
+            ],
+            "topic": {
+                "id": "candidate-1",
+                "title": "A searchable provisional question",
+                "research_question": "Does condition A separate mechanisms B and C?",
+                "search_queries": ["condition A mechanism B mechanism C"],
+            },
+        }
+        prompt = build_verifier_prompt(
+            {"id": "topic", "kind": "topic_discovery"},
+            {"objective": "Find a testable research direction."}, [], chief_result,
+            max_input_tokens=16000)
+        parsed = json.loads(prompt)
+        projected = parsed["chief_result"]
+        self.assertEqual(projected["admission_state"], "provisional_for_survey")
+        self.assertEqual(projected["next_evidence_action"], "literature_survey")
+        self.assertEqual(
+            projected["maturity_open_requirements"],
+            ["Verify whether the comparison is unresolved in prior work."],
+        )
+        contract = parsed["verifier_contract"]
+        self.assertIn("literature survey", contract["acceptance_target"])
+        self.assertIn("not by themselves grounds to hold", contract["provisional_rule"])
+
     def test_provider_pool_capacity_is_real_and_reports_are_role_scoped(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), _SpecialistHandler)
         server.lock = threading.Lock()

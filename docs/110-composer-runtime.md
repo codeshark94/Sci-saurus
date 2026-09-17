@@ -11,13 +11,34 @@ Principal Intent + Score
           ↓
 Executive Command / Composer
           ↓
-Topic intake → Research → Methods → Interpretation → Argument → Composition
-          ↑        ↓                  ↓            ↓
-     evidence   checks            hypotheses   reviews/PDF
-          └────────────── feedback and reallocation ─────┘
+candidate portfolio → literature probe ↔ topic refinement
+                              ↓
+                    experiment ↔ added evidence
+                              ↓
+             interpretation ↔ discriminating test
+                              ↓
+                  argument ↔ claim repair
+                              ↓
+                    paper ↔ adversarial review
 ```
 
-The Composer owns procedure and portfolio control: stage order, dependency
+The stage declaration is a graph of hard artifact dependencies, not a preferred
+itinerary. With `agenda_policy.mode=adaptive`, the Composer ranks every
+dependency-ready activity by information value, active work-order urgency,
+downstream unlocks, retry cost, and a small reproducible seeded exploration
+term. The selected action, credible alternatives, scores, and reason are
+persisted as `composer-agenda-decision-1`; checkpoints expose the current
+frontier under `research_state`. `mode=ordered` remains available for exact
+declaration-order fixtures. Workflows that predate the field retain ordered
+semantics; the autonomous-lab builder writes `adaptive` explicitly.
+In adaptive mode, one failed provider or stage attempt is one agenda turn. Its
+backoff is persisted as a not-before boundary and the stage yields, allowing
+other ready evidence work to proceed before Composer re-scores the frontier.
+The first frontier can still contain only one stage when hard evidence
+dependencies require it; adaptive control does not let an experiment outrun
+its literature gate.
+
+The Composer owns procedure and portfolio control: agenda selection, dependency
 binding, time admission, resource accounting, pause/resume state, deadline-
 governed continuation, and the release proposal. It does not author accepted evidence, convert an unresolved
 judgment into a fact, or grant itself final publication authority. Research,
@@ -106,15 +127,27 @@ selected question also declares structured executable, Python-package, and
 stage-kind requirements; Composer rejects the selection when any required
 capability is absent. The question and search strings can be bound into the
 survey; metadata is never treated as evidence or a novelty claim. Before
-admission, the selected direction is independently scored for specificity,
+evidence work begins, the selected direction is independently scored for specificity,
 explanatory depth, comparison design, contribution potential, and
-falsifiability. A low-scoring direction is regenerated with a substantive
-change instead of being polished as a paper. The accepted topic artifact keeps
+falsifiability. A direction that clears the full maturity floor is admitted. A
+direction that has substance in every dimension but still lacks journal-level
+mechanism or contribution depth is retained as `provisional_for_survey`; its
+required changes travel with it, and it cannot reach an experiment unless the
+survey establishes `eligible_for_experiment`. A direction below the exploratory
+floor is regenerated with a substantive change. The topic artifact keeps
 the accepted review chain and a separate history of rejected or refined
 directions, so a later selection cannot inherit a misleading aggregate score. A topic stage
 with `reuse_completed: true` is an explicit replay of the pinned output and does
 not perform new topic generation; set it to `false` for a fresh exploration. If the
 scholarly provider fails, topic admission fails rather than fabricating a topic.
+The independent adversary judges that result against its declared next evidence
+action. For `provisional_for_survey`, unresolved maturity findings remain visible
+as survey and downstream repair requirements; they are not mistaken for a claim
+that the topic is already publication-ready. A model-level hold at this boundary
+is preserved as an adversarial challenge and added to the survey brief instead
+of forcing another topic-generation loop. Deterministic schema, source,
+feasibility, or minimum-substance failures still block admission, and the later
+survey gate still controls experiment entry.
 
 An exploratory workflow may declare an `experiment_catalog` containing two to
 sixteen pinned capability descriptors. Each candidate then names one exact
@@ -129,7 +162,11 @@ search families and adds a compact exact-concept query when the topic exposes a
 distinctive phrase, so one high-recall query cannot starve independent search
 families.
 
-The first selection is provisional. When the literature assessment is
+The first selection is provisional whenever its intake review has unresolved
+requirements. An `eligible_for_experiment` survey supports moving into a
+bounded experiment, but the open maturity requirements remain attached to the
+experiment design and interpretation; a literature gap does not resolve them
+by itself. When the literature assessment is
 `insufficient_evidence`, Composer first gives the survey a scoped expansion
 pass. If the expanded evidence still cannot support the question, or if the
 assessment is `refuted_by_prior_work`, Composer holds the experiment, creates a

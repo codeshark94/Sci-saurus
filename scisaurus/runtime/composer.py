@@ -66,6 +66,18 @@ DEFAULT_RETRY_POLICY = {"mode": "until_deadline", "max_attempts": None, "backoff
 # workflow may opt into a finite cycle budget explicitly; the manuscript's
 # independent three-round peer review remains a separate contract.
 DEFAULT_CONTINUATION_POLICY = {"mode": "until_deadline", "max_cycles": None}
+# Workflows created before agenda selection existed retain declaration-order
+# semantics. New autonomous-lab workflows opt into adaptive selection
+# explicitly, so replaying an immutable legacy graph never changes its meaning.
+DEFAULT_AGENDA_POLICY = {"mode": "ordered"}
+
+
+class ComposerHardDeadlineExceeded(ValidationError):
+    """The immutable mission wall was reached during control-plane work."""
+
+
+class ComposerLateStageResult(ValidationError):
+    """A stage returned an artifact only after the immutable mission wall."""
 
 
 def _text(value, name):
@@ -187,13 +199,14 @@ def _validate_topic_preferences(value):
 def validate_workflow(value):
     """Validate the immutable composer workflow contract."""
     fields = {"schema_version", "id", "revision", "project_id", "objective", "stages", "time_policy", "completion"}
-    allowed_fields = fields | {"retry_policy", "continuation_policy", "organization", "exploration_seed",
+    allowed_fields = fields | {"retry_policy", "continuation_policy", "agenda_policy",
+                               "organization", "exploration_seed",
                                "topic_reuse_allowed", "experiment_catalog", "topic_exclusions",
                                "topic_history_path", "capability_foundry_config_path",
                                "topic_preferences", "runtime_env_files"}
     if not isinstance(value, dict) or set(value) - allowed_fields or not fields.issubset(value):
         raise ValidationError(
-            f"composer workflow requires {sorted(fields)} and permits ['capability_foundry_config_path', 'continuation_policy', 'exploration_seed', 'experiment_catalog', 'organization', 'retry_policy', 'runtime_env_files', 'topic_exclusions', 'topic_history_path', 'topic_preferences', 'topic_reuse_allowed']")
+            f"composer workflow requires {sorted(fields)} and permits ['agenda_policy', 'capability_foundry_config_path', 'continuation_policy', 'exploration_seed', 'experiment_catalog', 'organization', 'retry_policy', 'runtime_env_files', 'topic_exclusions', 'topic_history_path', 'topic_preferences', 'topic_reuse_allowed']")
     if value["schema_version"] != SCHEMA_VERSION:
         raise ValidationError(f"composer workflow schema must be {SCHEMA_VERSION}")
     _identifier(value["id"], "workflow id")
@@ -208,6 +221,13 @@ def validate_workflow(value):
         raise ValidationError("workflow topic_reuse_allowed must be Boolean when configured")
     if "topic_preferences" in value:
         _validate_topic_preferences(value["topic_preferences"])
+    agenda_policy = value.get("agenda_policy")
+    if agenda_policy is not None:
+        if (not isinstance(agenda_policy, dict)
+                or set(agenda_policy) != {"mode"}
+                or agenda_policy.get("mode") not in {"adaptive", "ordered"}):
+            raise ValidationError(
+                "workflow agenda_policy requires exactly mode=adaptive or mode=ordered")
     if "topic_history_path" in value:
         history_path = value["topic_history_path"]
         if not isinstance(history_path, str) or not history_path.strip():
@@ -329,6 +349,44 @@ def validate_workflow(value):
         visited.add(stage_id)
     for stage_id in stage_ids:
         visit(stage_id)
+
+    ancestor_cache = {}
+
+    def ancestors(stage_id):
+        if stage_id not in ancestor_cache:
+            found = set()
+            pending = list(by_id[stage_id]["depends_on"])
+            while pending:
+                current = pending.pop()
+                if current in found:
+                    continue
+                found.add(current)
+                pending.extend(by_id[current]["depends_on"])
+            ancestor_cache[stage_id] = found
+        return ancestor_cache[stage_id]
+
+    # A topic admitted only for evidence gathering must never flow directly
+    # into execution. Any experiment downstream of topic discovery therefore
+    # needs a survey ancestor that is itself downstream of that topic. Runtime
+    # admission additionally checks the survey's actual gap verdict.
+    for stage in stages:
+        if stage["kind"] != "experiment":
+            continue
+        experiment_ancestors = ancestors(stage["id"])
+        topic_ancestors = {
+            stage_id for stage_id in experiment_ancestors
+            if by_id[stage_id]["kind"] == "topic_discovery"
+        }
+        for topic_id in topic_ancestors:
+            has_literature_gate = any(
+                by_id[stage_id]["kind"] == "survey"
+                and topic_id in ancestors(stage_id)
+                for stage_id in experiment_ancestors
+            )
+            if not has_literature_gate:
+                raise ValidationError(
+                    f"experiment stage {stage['id']} requires a survey between "
+                    f"topic stage {topic_id} and experiment admission")
     policy = value["time_policy"]
     policy_fields = {"first_result_seconds", "target_seconds", "hard_seconds", "checkpoint_seconds"}
     if not isinstance(policy, dict) or set(policy) != policy_fields:
@@ -508,6 +566,10 @@ class ComposerRunner:
         self.department_activity = []
         self.deadline_extensions = []
         self.deadline_decisions = []
+        self.agenda_decisions = []
+        self.retry_schedule = {}
+        self.state_revision = 0
+        self._restored_agenda_policy = None
         # A hold can echo the same work order in every returned stage packet.
         # Suppress that exact request for the current Composer invocation after
         # its owning stage has been attempted.  The set is intentionally
@@ -524,6 +586,10 @@ class ComposerRunner:
             "exploration_seed": self.exploration_seed,
             "retry_policy": self._retry_policy(),
             "continuation_policy": self._continuation_policy(),
+            "agenda_policy": self._agenda_policy(),
+            "agenda_decisions": [],
+            "retry_schedule": {},
+            "state_revision": self.state_revision,
             "continuation_cycles": 0, "reopened_stage_ids": [],
             "continuation_pending_stage_ids": [], "active_research_requests": [],
             "department_activity": [], "stages": {}, "context": {}, "feedback": [],
@@ -541,6 +607,7 @@ class ComposerRunner:
                 "schema_version": "composer-run-input-1", "workflow_ref": self._workflow_record["artifact_ref"],
                 "run_id": self.run_id, "resume": False,
                 "exploration_seed": self.exploration_seed,
+                "agenda_policy": self._agenda_policy(),
             }, "command.composer")
         else:
             head = self.store.head("command/composer/workflow")
@@ -711,7 +778,7 @@ class ComposerRunner:
         if isinstance(self.deadline_epoch, (int, float)) and math.isfinite(self.deadline_epoch):
             remaining = min(remaining, self.deadline_epoch - time.time())
         if remaining <= 0:
-            raise ValidationError("composer hard deadline exceeded")
+            raise ComposerHardDeadlineExceeded("composer hard deadline exceeded")
         return remaining
 
     def _deadline_dispatch_floor(self):
@@ -932,6 +999,21 @@ class ComposerRunner:
         if "mode" not in configured and "max_cycles" in configured:
             policy["mode"] = "bounded"
         return policy
+
+    def _agenda_policy(self):
+        """Return how Composer chooses among dependency-ready research work.
+
+        A workflow declaration remains a DAG of hard artifact dependencies.
+        It is not interpreted as a preferred linear itinerary in adaptive
+        mode. Workflows without an agenda declaration retain legacy ordered
+        semantics; newly generated autonomous missions opt into adaptive mode.
+        """
+        configured = self.workflow.get("agenda_policy")
+        if configured is not None:
+            return {**DEFAULT_AGENDA_POLICY, **configured}
+        if isinstance(self._restored_agenda_policy, dict):
+            return deepcopy(self._restored_agenda_policy)
+        return deepcopy(DEFAULT_AGENDA_POLICY)
 
     def _autonomous_recovery_request(self, stage_id, context):
         """Synthesize a new scoped move when a scientific hold gives no order.
@@ -2013,6 +2095,57 @@ class ComposerRunner:
             "refinement_feedback": refinement_feedback,
         }
 
+    @staticmethod
+    def _carry_provisional_verifier_challenge(context, verifier_result):
+        """Route a survey-stage challenge forward without declaring it solved.
+
+        A provisional topic has already passed deterministic schema, source,
+        feasibility, and minimum-substance checks. The next action exists to
+        investigate unresolved novelty, provenance, comparator, threshold,
+        and mechanism questions. An adversary's hold on those questions is
+        therefore evidence for the survey brief, not a reason to demand the
+        survey's result before the survey can start. Experiment admission
+        remains independently blocked by the later literature verdict.
+        """
+        if (not isinstance(context, dict)
+                or context.get("admission_state") != "provisional_for_survey"
+                or not isinstance(verifier_result, dict)):
+            return False
+        response = verifier_result.get("response")
+        if not isinstance(response, dict) or response.get("decision") != "hold":
+            return False
+        existing = [str(item).strip() for item in context.get(
+            "maturity_open_requirements", []) if str(item).strip()]
+        requested = response.get("repair_scope")
+        if not isinstance(requested, list) or not requested:
+            requested = response.get("critical_findings", [])
+        merged = []
+        seen = set()
+        for item in [*existing, *(requested if isinstance(requested, list) else [])]:
+            text = str(item).strip()
+            key = text.casefold()
+            if not text or key in seen:
+                continue
+            seen.add(key)
+            merged.append(text[:1600])
+            if len(merged) >= 16:
+                break
+        context["maturity_open_requirements"] = merged
+        response["control_disposition"] = "carried_to_literature_survey"
+        verifier_result["response"] = response
+        verifier_result["gate_disposition"] = "carried_to_literature_survey"
+        context["provisional_adversarial_challenge"] = {
+            "decision": "hold",
+            "control_disposition": "carried_to_literature_survey",
+            "rationale": str(response.get("rationale", ""))[:4000],
+            "critical_findings": [str(item)[:1600] for item in (
+                response.get("critical_findings", []) or [])[:12]],
+            "repair_scope": [str(item)[:1600] for item in (
+                response.get("repair_scope", []) or [])[:12]],
+        }
+        context["specialist_verifier"] = deepcopy(verifier_result)
+        return True
+
     def _gate_free_topic_survey(self, result, *, stage=None):
         """Hold a free-topic mission until its question survives literature review.
 
@@ -2021,12 +2154,21 @@ class ComposerRunner:
         redesign request instead of allowing the Composer to pass a thin
         question directly to the executable experiment.
         """
-        if self._topic_stage_for_survey(stage) is None or not isinstance(result, dict):
+        topic_stage = self._topic_stage_for_survey(stage)
+        if topic_stage is None or not isinstance(result, dict):
             return result
         if result.get("status") not in {"completed", "accepted"}:
             return result
         state = result.get("gap_state")
         if state == "eligible_for_experiment":
+            topic_context = self.context.get(topic_stage["id"], {})
+            if (isinstance(topic_context, dict)
+                    and topic_context.get("admission_state") == "provisional_for_survey"):
+                supported = deepcopy(result)
+                supported["topic_admission"] = "provisional_supported_for_experiment"
+                supported["carried_maturity_requirements"] = deepcopy(
+                    topic_context.get("maturity_open_requirements", []))
+                return supported
             return result
         if state not in {"refuted_by_prior_work", "insufficient_evidence"}:
             return result
@@ -2048,7 +2190,7 @@ class ComposerRunner:
             # continued run can distinguish that first pass from a repeated
             # failure without relying on an in-memory counter.
             prior_survey = self._survey_context_for_topic(
-                self._topic_stage_for_survey(stage))
+                topic_stage)
             expanded_before = (
                 isinstance(prior_survey, dict)
                 and prior_survey.get("gap_state") == "insufficient_evidence"
@@ -2506,12 +2648,72 @@ class ComposerRunner:
         In both cases, the current run supplies the accepted literature gate
         and project-local paths; model output never becomes a command directly.
         """
-        topic_context = next((value for value in self.context.values()
-                              if isinstance(value, dict)
-                              and value.get("kind") == "topic_discovery"
-                              and isinstance(value.get("topic"), dict)), None)
-        if topic_context is None:
+        by_id = {item["id"]: item for item in self.workflow["stages"]}
+        pending = list(stage.get("depends_on", []))
+        ancestor_ids = set()
+        while pending:
+            current = pending.pop()
+            if current in ancestor_ids or current not in by_id:
+                continue
+            ancestor_ids.add(current)
+            pending.extend(by_id[current].get("depends_on", []))
+        ancestor_topic_ids = [
+            item["id"] for item in self.workflow["stages"]
+            if item["id"] in ancestor_ids and item["kind"] == "topic_discovery"
+        ]
+        if len(ancestor_topic_ids) > 1:
+            raise ValidationError(
+                f"experiment stage {stage['id']} has multiple topic ancestors; "
+                "each research branch requires its own experiment stage")
+        if ancestor_topic_ids:
+            topic_stage_id = ancestor_topic_ids[0]
+            value = self.context.get(topic_stage_id)
+            topic_match = (
+                (topic_stage_id, value)
+                if isinstance(value, dict)
+                and value.get("kind") == "topic_discovery"
+                and isinstance(value.get("topic"), dict)
+                else None
+            )
+            if topic_match is None:
+                raise ValidationError(
+                    f"experiment stage {stage['id']} is missing its topic ancestor context")
+        else:
+            # Compatibility for workflows that predate an explicit topic
+            # stage but inject a single topic packet into a standalone
+            # experiment helper. A mixed DAG that contains topic stages but
+            # has none in this experiment's ancestor closure is an independent
+            # branch and must not inherit a global topic packet.
+            if any(item["kind"] == "topic_discovery" for item in self.workflow["stages"]):
+                return config
+            topic_match = next((
+                (stage_id, value) for stage_id, value in self.context.items()
+                if isinstance(value, dict)
+                and value.get("kind") == "topic_discovery"
+                and isinstance(value.get("topic"), dict)
+            ), None)
+        if topic_match is None:
             return config
+        topic_stage_id, topic_context = topic_match
+        if topic_context.get("admission_state") == "provisional_for_survey":
+            eligible_surveys = []
+            for ancestor_id in ancestor_ids:
+                ancestor = by_id[ancestor_id]
+                if ancestor.get("kind") != "survey":
+                    continue
+                survey_topic = self._topic_stage_for_survey(ancestor)
+                if not isinstance(survey_topic, dict) or survey_topic.get("id") != topic_stage_id:
+                    continue
+                survey_context = self.context.get(ancestor_id)
+                if (isinstance(survey_context, dict)
+                        and survey_context.get("gap_state") == "eligible_for_experiment"
+                        and survey_context.get("topic_admission")
+                        == "provisional_supported_for_experiment"):
+                    eligible_surveys.append(ancestor_id)
+            if not eligible_surveys:
+                raise ValidationError(
+                    "provisional topic cannot enter an experiment until its dependent "
+                    "survey records eligible_for_experiment with carried maturity requirements")
         selected = topic_context["topic"]
         generated = topic_context.get("generated_capability")
         continuation_requests = self._requests_for_stage(stage["id"])
@@ -2601,6 +2803,15 @@ class ComposerRunner:
             f"{context}\nSelected executable capability: {capability_id}.\n"
             f"Selected research question: {selected.get('research_question', '')}"
         )
+        maturity_requirements = topic_context.get("maturity_open_requirements", [])
+        if (topic_context.get("admission_state") == "provisional_for_survey"
+                and isinstance(maturity_requirements, list) and maturity_requirements):
+            config["supplied_context"] += (
+                "\nThe topic entered evidence gathering provisionally. The experiment design, "
+                "analysis, and interpretation must address these still-open intake requirements; "
+                "the literature gap decision does not by itself resolve them:\n- "
+                + "\n- ".join(str(item) for item in maturity_requirements[:8])
+            )
         program_projection = self._topic_program_projection(topic_context, max_alternatives=8)
         if program_projection is not None:
             config["supplied_context"] += (
@@ -3217,33 +3428,65 @@ class ComposerRunner:
             "decision_note", feedback, "command.composer")
         self._route_feedback(feedback, note)
 
-    def _wait_before_retry(self, stage, *, attempt_number, retry_index, error, downstream_seconds):
-        """Pace a retry without sleeping past the hard deadline."""
+    def _retry_delay_seconds(self, error, retry_index):
+        """Return the bounded backoff for one failed attempt."""
         policy = self._retry_policy()
         base_delay = float(policy["backoff_seconds"])
         if policy.get("mode", "bounded") == "until_deadline":
-            # A zero-delay provider failure must not become a hot loop.  This
-            # floor is a pacing guard, not a retry limit; the deadline remains
-            # the only count-independent stop condition.
             base_delay = max(0.25, base_delay)
         delay = min(60.0, base_delay * (2 ** min(max(0, retry_index - 1), 6)))
         provider_delay = getattr(error, "retry_after_seconds", None)
         if (type(provider_delay) in (int, float) and math.isfinite(provider_delay)
                 and provider_delay > 0):
-            # A parsed provider reset boundary is stronger than the generic
-            # retry curve. Preserve it instead of waking every minute and
-            # spending another request merely to rediscover the same quota.
             delay = max(delay, float(provider_delay))
+        return delay
+
+    def _retry_fits(self, stage, *, delay, downstream_seconds):
+        policy = self._retry_policy()
         remaining = self._remaining()
         if policy.get("mode", "bounded") == "until_deadline":
-            # In autonomous mode a failed stage may still be retried in the
-            # residual window.  Keep only the control-plane margin here; the
-            # specialist receives the actual remaining deadline and decides
-            # whether its own contract can finish.
             required_window = self._deadline_dispatch_floor()
         else:
             required_window = min(float(stage["estimate_seconds"]), downstream_seconds)
-        if remaining <= delay + max(0.2, required_window):
+        return remaining > delay + max(0.2, required_window)
+
+    def _schedule_adaptive_retry(self, stage, *, attempt_number, error,
+                                 downstream_seconds):
+        """Defer a failed stage and return control to the global agenda.
+
+        The retry remains deadline-bounded, but it no longer monopolizes the
+        stage loop. Other dependency-ready work can run during its backoff and
+        the Composer re-evaluates the complete frontier before the next call.
+        """
+        retry_index = max(1, attempt_number)
+        delay = self._retry_delay_seconds(error, retry_index)
+        if not self._retry_fits(stage, delay=delay, downstream_seconds=downstream_seconds):
+            return False
+        next_attempt = attempt_number + 1
+        self._record_retry_feedback(
+            stage, attempt_number=next_attempt, retry_index=retry_index,
+            error=error, delay_seconds=delay)
+        self.retry_schedule[stage["id"]] = {
+            "not_before_epoch": time.time() + delay,
+            "delay_seconds": delay,
+            "failed_attempt_number": attempt_number,
+            "next_attempt_number": next_attempt,
+            "error": f"{type(error).__name__}: {error}",
+        }
+        self.department_activity.append({
+            "cycle": self.continuation_cycles,
+            "action": "yield_retry_to_agenda",
+            "stage_id": stage["id"],
+            "failed_attempt_number": attempt_number,
+            "next_attempt_number": next_attempt,
+            "not_before_epoch": self.retry_schedule[stage["id"]]["not_before_epoch"],
+        })
+        return True
+
+    def _wait_before_retry(self, stage, *, attempt_number, retry_index, error, downstream_seconds):
+        """Pace a retry without sleeping past the hard deadline."""
+        delay = self._retry_delay_seconds(error, retry_index)
+        if not self._retry_fits(stage, delay=delay, downstream_seconds=downstream_seconds):
             return False
         self._record_retry_feedback(stage, attempt_number=attempt_number, retry_index=retry_index,
                                     error=error,
@@ -3257,6 +3500,187 @@ class ComposerRunner:
             self._checkpoint(f"{stage['id']}:retry_wait")
             time.sleep(min(5.0, left))
 
+    def _research_state(self):
+        """Project the current research frontier for checkpoints and dashboards."""
+        completed = {
+            stage_id for stage_id, record in self.stage_records.items()
+            if isinstance(record, dict) and record.get("status") in STAGE_READY_STATUSES
+        }
+        if self.continuation_pending_stage_ids:
+            completed.difference_update(self.continuation_pending_stage_ids)
+        ready = [
+            stage["id"] for stage in self.workflow["stages"]
+            if stage["id"] not in completed
+            and set(stage["depends_on"]).issubset(completed)
+        ]
+        active = [
+            stage_id for stage_id, record in self.stage_records.items()
+            if isinstance(record, dict)
+            and record.get("status") in {"running", "retrying", "paused"}
+        ]
+        topic_context = next((
+            value for value in self.context.values()
+            if isinstance(value, dict) and value.get("kind") == "topic_discovery"
+            and isinstance(value.get("topic"), dict)
+        ), None)
+        topic = topic_context.get("topic", {}) if topic_context else {}
+        program = topic_context.get("research_program", {}) if topic_context else {}
+        if self.active_research_requests or self.reopened_stage_ids:
+            phase = "repair_and_revalidation"
+        elif any(self.stage_records.get(stage["id"], {}).get("status") in STAGE_READY_STATUSES
+                 for stage in self.workflow["stages"] if stage["kind"] == "paper"):
+            phase = "release_candidate"
+        elif ready:
+            kinds = {stage["id"]: stage["kind"] for stage in self.workflow["stages"]}
+            phase = {
+                "topic_discovery": "topic_exploration",
+                "survey": "evidence_mapping",
+                "experiment": "empirical_probe",
+                "interpretation": "mechanism_interpretation",
+                "argument": "claim_construction",
+                "paper": "manuscript_and_review",
+            }.get(kinds.get(ready[0]), "research")
+        else:
+            phase = "waiting_for_frontier"
+        return {
+            "mode": self._agenda_policy()["mode"],
+            "phase": phase,
+            "frontier_stage_ids": ready,
+            "active_stage_ids": active,
+            "completed_stage_ids": sorted(completed),
+            "reopened_stage_ids": sorted(self.reopened_stage_ids),
+            "active_work_order_ids": [
+                item.get("id") for item in self.active_research_requests
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            ],
+            "deferred_retry_stage_ids": sorted(self.retry_schedule),
+            "topic": ({
+                "id": topic.get("id"),
+                "title": topic.get("title"),
+                "research_question": topic.get("research_question"),
+                "admission_state": topic_context.get("admission_state"),
+            } if topic else None),
+            "retained_branch_count": (
+                len(program.get("branches", []))
+                if isinstance(program, dict) and isinstance(program.get("branches"), list)
+                else 0
+            ),
+            "last_agenda_decision": (
+                deepcopy(self.agenda_decisions[-1]) if self.agenda_decisions else None),
+        }
+
+    def _agenda_order(self, ready_stages, *, completed, by_id):
+        """Rank dependency-ready stages by current expected information value."""
+        ready_stages = list(ready_stages)
+        if not ready_stages:
+            return []
+        policy = self._agenda_policy()
+        if policy["mode"] == "ordered":
+            ordered = ready_stages
+            candidates = [{
+                "stage_id": stage["id"], "kind": stage["kind"],
+                "score": float(len(ready_stages) - index),
+                "factors": ["workflow_declaration_order"],
+            } for index, stage in enumerate(ready_stages)]
+        else:
+            from scisaurus.runtime.departments import REQUEST_STAGE_KINDS
+
+            information_value = {
+                "topic_discovery": 5.0,
+                "survey": 6.0,
+                "experiment": 6.0,
+                "interpretation": 4.0,
+                "argument": 2.5,
+                "paper": 1.0,
+            }
+            request_kinds = {
+                REQUEST_STAGE_KINDS.get(item.get("kind"))
+                for item in self.active_research_requests if isinstance(item, dict)
+            }
+            decision_index = len(self.agenda_decisions) + 1
+            candidates = []
+            for declaration_index, stage in enumerate(ready_stages):
+                stage_id = stage["id"]
+                score = information_value.get(stage["kind"], 0.0)
+                factors = [f"information_value={score:.2f}"]
+                if stage["kind"] in request_kinds:
+                    score += 8.0
+                    factors.append("active_work_order=+8.00")
+                if stage_id in self.reopened_stage_ids:
+                    score += 4.0
+                    factors.append("reopened_scope=+4.00")
+                if stage_id in self.workflow["completion"]["required_stage_ids"]:
+                    score += 0.5
+                    factors.append("required_output=+0.50")
+                unlocks = sum(
+                    1 for candidate in by_id.values()
+                    if stage_id in candidate["depends_on"]
+                    and candidate["id"] not in completed
+                )
+                if unlocks:
+                    score += min(1.5, unlocks * 0.4)
+                    factors.append(f"unlocks={unlocks}")
+                attempts = self.stage_records.get(stage_id, {}).get("attempt_count", 0)
+                if type(attempts) is int and attempts > 0:
+                    penalty = min(0.75, attempts * 0.05)
+                    score -= penalty
+                    factors.append(f"retry_cost=-{penalty:.2f}")
+                # Seeded jitter changes only close decisions.  It provides
+                # controlled exploration without allowing a writing stage to
+                # outrank a ready evidence-producing stage by chance alone.
+                material = (
+                    f"{self.exploration_seed}:agenda:{self.continuation_cycles}:"
+                    f"{decision_index}:{stage_id}"
+                ).encode("utf-8")
+                jitter = int(hashlib.sha256(material).hexdigest()[:8], 16) / 0xFFFFFFFF * 0.45
+                score += jitter
+                factors.append(f"seeded_exploration=+{jitter:.2f}")
+                candidates.append({
+                    "stage_id": stage_id,
+                    "kind": stage["kind"],
+                    "score": round(score, 6),
+                    "factors": factors,
+                    "declaration_index": declaration_index,
+                })
+            ranked = sorted(
+                candidates,
+                key=lambda item: (-item["score"], item["declaration_index"], item["stage_id"]),
+            )
+            rank = {item["stage_id"]: index for index, item in enumerate(ranked)}
+            ordered = sorted(ready_stages, key=lambda stage: rank[stage["id"]])
+            candidates = ranked
+        decision = {
+            "schema_version": "composer-agenda-decision-1",
+            "decision_id": f"agenda-{len(self.agenda_decisions) + 1}",
+            "created_at": now_iso(),
+            "cycle": self.continuation_cycles,
+            "mode": policy["mode"],
+            "completed_stage_ids": sorted(completed),
+            "candidate_stages": [{key: deepcopy(item[key]) for key in (
+                "stage_id", "kind", "score", "factors")}
+                for item in candidates],
+            "selected_stage_id": ordered[0]["id"],
+            "reason": (
+                "selected the dependency-ready work with the highest expected information value, "
+                "scoped work-order urgency, and downstream unlock value"
+                if policy["mode"] == "adaptive"
+                else "selected the first dependency-ready stage in workflow declaration order"
+            ),
+        }
+        artifact = self._publish(
+            f"command/composer/agenda/{len(self.agenda_decisions) + 1}",
+            "decision_note", decision, "command.composer")
+        decision["artifact_ref"] = artifact["artifact_ref"]
+        self.agenda_decisions.append(decision)
+        self.department_activity.append({
+            "cycle": self.continuation_cycles,
+            "action": "select_agenda_stage",
+            "selected_stage_id": decision["selected_stage_id"],
+            "candidate_stage_ids": [item["stage_id"] for item in decision["candidate_stages"]],
+            "agenda_decision_ref": artifact["artifact_ref"],
+        })
+        return ordered
+
     def _checkpoint(self, phase, *, force=False):
         now = self.clock()
         if not force and now < self.next_checkpoint:
@@ -3267,6 +3691,7 @@ class ComposerRunner:
         remaining_snapshot = self.deadline - now
         if isinstance(self.deadline_epoch, (int, float)) and math.isfinite(self.deadline_epoch):
             remaining_snapshot = min(remaining_snapshot, self.deadline_epoch - time.time())
+        self.state_revision += 1
         state = {
             "schema_version": "composer-checkpoint-1", "workflow_id": self.workflow["id"],
             "run_id": self.run_id,
@@ -3276,6 +3701,11 @@ class ComposerRunner:
             "started_at_epoch": self.started_epoch, "deadline_at_epoch": self.deadline_epoch,
             "retry_policy": self._retry_policy(),
             "continuation_policy": self._continuation_policy(),
+            "agenda_policy": self._agenda_policy(),
+            "agenda_decisions": deepcopy(self.agenda_decisions),
+            "retry_schedule": deepcopy(self.retry_schedule),
+            "state_revision": self.state_revision,
+            "research_state": self._research_state(),
             "exploration_seed": self.exploration_seed,
             "continuation_cycles": self.continuation_cycles,
             "reopened_stage_ids": sorted(self.reopened_stage_ids),
@@ -3394,6 +3824,14 @@ class ComposerRunner:
             return False
         if not isinstance(terminal, dict):
             return True
+        checkpoint_revision = checkpoint.get("state_revision", 0)
+        terminal_revision = terminal.get("state_revision", 0)
+        if (type(checkpoint_revision) is int and checkpoint_revision >= 0
+                and type(terminal_revision) is int and terminal_revision >= 0):
+            if checkpoint_revision > terminal_revision:
+                return True
+            if checkpoint_revision < terminal_revision:
+                return False
         checkpoint_ready = cls._ready_stage_ids(checkpoint)
         terminal_ready = cls._ready_stage_ids(terminal)
         if checkpoint_ready > terminal_ready:
@@ -3420,10 +3858,16 @@ class ComposerRunner:
 
         checkpoint_counts = attempt_counts(checkpoint)
         terminal_counts = attempt_counts(terminal)
-        return any(
+        if any(
             checkpoint_counts.get(stage_id, 0) > terminal_counts.get(stage_id, 0)
             for stage_id in checkpoint_counts
-        )
+        ):
+            return True
+        checkpoint_agenda = checkpoint.get("agenda_decisions", [])
+        terminal_agenda = terminal.get("agenda_decisions", [])
+        return (isinstance(checkpoint_agenda, list)
+                and isinstance(terminal_agenda, list)
+                and len(checkpoint_agenda) > len(terminal_agenda))
 
     def _latest_inflight_checkpoint(self, terminal=None):
         """Read the newest durable running checkpoint when output was finalized stale."""
@@ -3461,6 +3905,11 @@ class ComposerRunner:
             if (isinstance(input_body, dict) and type(input_body.get("exploration_seed")) is int
                     and input_body["exploration_seed"] >= 0):
                 self.exploration_seed = input_body["exploration_seed"]
+            input_agenda = input_body.get("agenda_policy") if isinstance(input_body, dict) else None
+            if ("agenda_policy" not in self.workflow
+                    and isinstance(input_agenda, dict)
+                    and input_agenda.get("mode") in {"adaptive", "ordered"}):
+                self._restored_agenda_policy = {"mode": input_agenda["mode"]}
         head = self.store.head("command/composer/run")
         head_status = None
         head_body = None
@@ -3475,6 +3924,18 @@ class ComposerRunner:
             self.blockers = body.get("blockers", [])
             self.usage = body.get("usage", self.usage)
             self.deadline_decisions = body.get("deadline_decisions", [])
+            self.agenda_decisions = body.get("agenda_decisions", [])
+            self.retry_schedule = body.get("retry_schedule", {})
+            if not isinstance(self.retry_schedule, dict):
+                self.retry_schedule = {}
+            revision = body.get("state_revision", 0)
+            if type(revision) is int and revision >= 0:
+                self.state_revision = revision
+            restored_agenda = body.get("agenda_policy")
+            if ("agenda_policy" not in self.workflow
+                    and isinstance(restored_agenda, dict)
+                    and restored_agenda.get("mode") in {"adaptive", "ordered"}):
+                self._restored_agenda_policy = {"mode": restored_agenda["mode"]}
             self.continuation_cycles = body.get("continuation_cycles", 0)
             self.reopened_stage_ids = set(body.get("reopened_stage_ids", []))
             self.continuation_pending_stage_ids = set(body.get("continuation_pending_stage_ids", []))
@@ -3521,6 +3982,19 @@ class ComposerRunner:
             self.blockers = live_checkpoint.get("blockers", self.blockers)
             self.usage = live_checkpoint.get("usage", self.usage)
             self.deadline_decisions = live_checkpoint.get("deadline_decisions", self.deadline_decisions)
+            self.agenda_decisions = live_checkpoint.get(
+                "agenda_decisions", self.agenda_decisions)
+            retry_schedule = live_checkpoint.get("retry_schedule", self.retry_schedule)
+            if isinstance(retry_schedule, dict):
+                self.retry_schedule = retry_schedule
+            revision = live_checkpoint.get("state_revision", self.state_revision)
+            if type(revision) is int and revision >= 0:
+                self.state_revision = revision
+            restored_agenda = live_checkpoint.get("agenda_policy")
+            if ("agenda_policy" not in self.workflow
+                    and isinstance(restored_agenda, dict)
+                    and restored_agenda.get("mode") in {"adaptive", "ordered"}):
+                self._restored_agenda_policy = {"mode": restored_agenda["mode"]}
             self.continuation_cycles = live_checkpoint.get("continuation_cycles", self.continuation_cycles)
             self.reopened_stage_ids = set(live_checkpoint.get("reopened_stage_ids", self.reopened_stage_ids))
             self.continuation_pending_stage_ids = set(live_checkpoint.get(
@@ -4929,12 +5403,40 @@ class ComposerRunner:
                     break
                 self._remaining()
                 progress = False
-                for stage in self.workflow["stages"]:
+                dependency_ready_stages = [
+                    stage for stage in self.workflow["stages"]
+                    if stage["id"] not in completed
+                    and set(stage["depends_on"]).issubset(completed)
+                ]
+                ready_stages = []
+                deferred_stages = []
+                now_epoch = time.time()
+                for stage in dependency_ready_stages:
+                    schedule = self.retry_schedule.get(stage["id"])
+                    not_before = (schedule.get("not_before_epoch")
+                                  if isinstance(schedule, dict) else None)
+                    if (type(not_before) in (int, float) and math.isfinite(not_before)
+                            and not_before > now_epoch):
+                        deferred_stages.append(stage)
+                        continue
+                    self.retry_schedule.pop(stage["id"], None)
+                    ready_stages.append(stage)
+                if not ready_stages and deferred_stages:
+                    next_epoch = min(
+                        self.retry_schedule[stage["id"]]["not_before_epoch"]
+                        for stage in deferred_stages)
+                    self._remaining()
+                    self._checkpoint("agenda:retry_deferred")
+                    time.sleep(min(5.0, max(0.0, next_epoch - time.time())))
+                    continue
+                ordered_ready_stages = self._agenda_order(
+                    ready_stages, completed=completed, by_id=by_id)
+                if ordered_ready_stages:
+                    self._checkpoint(
+                        f"agenda:{self.agenda_decisions[-1]['decision_id']}:selected",
+                        force=True)
+                for stage in ordered_ready_stages:
                     stage_id = stage["id"]
-                    if stage_id in completed:
-                        continue
-                    if not set(stage["depends_on"]).issubset(completed):
-                        continue
                     # The estimate is a planning reservation, not a promise.
                     # Bounded jobs reserve the complete downstream closure;
                     # an autonomous deadline-governed job may use a residual
@@ -5011,11 +5513,13 @@ class ComposerRunner:
                     last_error = None
                     stage_succeeded = False
                     context = None
-                    retry_indices = (
+                    adaptive_turn = self._agenda_policy()["mode"] == "adaptive"
+                    adaptive_retry_scheduled = False
+                    retry_indices = (range(1) if adaptive_turn else (
                         itertools.count()
                         if retry_policy.get("mode", "bounded") == "until_deadline"
                         else range(retry_policy["max_attempts"])
-                    )
+                    ))
                     for retry_index in retry_indices:
                         attempt_number = len(attempt_history) + 1
                         if retry_index:
@@ -5027,6 +5531,8 @@ class ComposerRunner:
                                     last_error = ValidationError(
                                         "retry budget no longer fits the Composer hard deadline")
                                     break
+                            except ComposerHardDeadlineExceeded:
+                                raise
                             except Exception as exc:
                                 last_error = exc
                                 break
@@ -5051,6 +5557,11 @@ class ComposerRunner:
                         }
                         self._checkpoint(f"{stage_id}:admitted", force=True)
                         stop_live_progress = self._start_live_progress(attempt_stage)
+                        # This belongs to the current attempt only.  A prior
+                        # attempt may have produced a candidate before failing
+                        # review; retaining it here would misclassify a later
+                        # control-plane deadline as a late returned result.
+                        context = None
                         stage_assignment = None
                         specialist_bundle = {"reports": [], "by_role": {}, "usage": {}, "model_enabled": False}
                         specialist_verifier = None
@@ -5127,6 +5638,9 @@ class ComposerRunner:
                                         specialist_reports=specialist_reports)
                                         if specialist_reports else self._run_stage(
                                             attempt_stage, attempt_number=attempt_number))
+                            if self._deadline_exhausted():
+                                raise ComposerLateStageResult(
+                                    "stage result exceeded the Composer hard deadline")
                             outcome = context.get("status")
                             if outcome not in {"completed", "accepted", "candidate_needs_review",
                                                "research_expansion_required", "review_rejected"}:
@@ -5153,8 +5667,15 @@ class ComposerRunner:
                                 if (specialist_verifier.get("status") != "succeeded"
                                         or not isinstance(verdict, dict)
                                         or verdict.get("decision") != "accept"):
-                                    outcome = "review_rejected"
-                                    context["status"] = outcome
+                                    carried = (
+                                        specialist_verifier.get("status") == "succeeded"
+                                        and stage["kind"] == "topic_discovery"
+                                        and self._carry_provisional_verifier_challenge(
+                                            context, specialist_verifier)
+                                    )
+                                    if not carried:
+                                        outcome = "review_rejected"
+                                        context["status"] = outcome
                             if stage["kind"] == "topic_discovery":
                                 # Record the direction at admission time, even
                                 # when a later survey or experiment hold stops
@@ -5378,9 +5899,21 @@ class ComposerRunner:
                             # policy. The retry wait below honors its exact
                             # reset boundary; bounded workflows retain the
                             # explicit pause contract.
-                            retry_open = (not quota_exhausted and (
+                            retry_open = (not quota_exhausted
+                                          and not isinstance(
+                                              exc, (ComposerLateStageResult,
+                                                    ComposerHardDeadlineExceeded))
+                                          and (
                                 retry_policy.get("mode", "bounded") == "until_deadline"
-                                or retry_index + 1 < retry_policy.get("max_attempts", 0)))
+                                or len(attempt_history) < retry_policy.get("max_attempts", 0)))
+                            if (adaptive_turn and retry_open
+                                    and (not provider_paused
+                                         or retry_policy.get("mode", "bounded")
+                                         == "until_deadline")):
+                                retry_open = self._schedule_adaptive_retry(
+                                    stage, attempt_number=attempt_number, error=last_error,
+                                    downstream_seconds=downstream)
+                                adaptive_retry_scheduled = retry_open
                             assignment_fields = {
                                 key: deepcopy(self.stage_records.get(stage_id, {}).get(key))
                                 for key in (
@@ -5450,6 +5983,16 @@ class ComposerRunner:
                                     self._checkpoint(f"{stage_id}:provider_cooldown", force=True)
                                     return self._finish()
                             self._checkpoint(f"{stage_id}:retrying" if retry_open else f"{stage_id}:failed", force=True)
+                            if isinstance(exc, ComposerLateStageResult):
+                                raise
+                            if isinstance(exc, ComposerHardDeadlineExceeded):
+                                if isinstance(context, dict):
+                                    raise ComposerLateStageResult(
+                                        "stage result exceeded the Composer hard deadline"
+                                    ) from exc
+                                raise
+                            if adaptive_retry_scheduled:
+                                break
                             if quota_exhausted:
                                 # Provider/mission quota exhaustion is a hard
                                 # stop. A local scientific intake exhaustion
@@ -5458,6 +6001,13 @@ class ComposerRunner:
                                 break
                         finally:
                             stop_live_progress()
+                    if adaptive_retry_scheduled:
+                        # One failed call is one adaptive agenda turn. The
+                        # scheduler can now choose another ready action, or
+                        # wait for this retry's not-before boundary and
+                        # reassess the frontier before dispatching it again.
+                        progress = True
+                        break
                     if stage_succeeded:
                         completed.add(stage_id)
                         self._record_feedback(stage, context)
@@ -5546,6 +6096,23 @@ class ComposerRunner:
                            else "candidate_needs_review" if candidate_stage else "completed")
             self._checkpoint("complete_proposed", force=True)
             return self._finish()
+        except ComposerHardDeadlineExceeded as exc:
+            # Reaching the wall after useful research is a resumable mission
+            # pause, not a scientific blocker.  A workflow that was already
+            # expired before doing any work remains blocked because there is
+            # no execution state to resume without an explicit extension.
+            had_research_activity = bool(
+                self.stage_records or self.context or self.agenda_decisions)
+            self.status = "paused" if had_research_activity else "blocked"
+            self.blockers.append({
+                "stage_id": "workflow",
+                "reason": str(exc),
+                "stop_reason": "hard_deadline",
+            })
+            self._checkpoint(
+                "paused_deadline" if had_research_activity else "blocked_deadline",
+                force=True)
+            return self._finish()
         except KeyboardInterrupt as exc:
             # A process-level stop is a resumable pause, not a failed
             # workflow.  Persist it here so the dashboard and the next
@@ -5615,6 +6182,11 @@ class ComposerRunner:
             "organization": deepcopy(self.organization_snapshot),
             "retry_policy": self._retry_policy(),
             "continuation_policy": self._continuation_policy(),
+            "agenda_policy": self._agenda_policy(),
+            "agenda_decisions": deepcopy(self.agenda_decisions),
+            "retry_schedule": deepcopy(self.retry_schedule),
+            "state_revision": self.state_revision,
+            "research_state": self._research_state(),
             "continuation_cycles": self.continuation_cycles,
             "reopened_stage_ids": sorted(self.reopened_stage_ids),
             "continuation_pending_stage_ids": sorted(self.continuation_pending_stage_ids),

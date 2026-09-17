@@ -57,9 +57,10 @@ accepted evidence. Operations can make an authorized capability usable, but it
 cannot set the research question or accept a scientific claim. A producing
 agent cannot supply its own independent adversarial verdict.
 
-## 3. Default stage route
+## 3. Default adaptive route
 
-The normal research-paper route is:
+The normal research-paper mission has hard artifact dependencies and reversible
+scientific decisions. It is not a department-by-department queue:
 
 ```text
 Principal intent / Score
@@ -68,20 +69,41 @@ Principal intent / Score
 executive-command.progress-controller
         |
         v
-research.intelligence -- topic_discovery --> research.intelligence -- survey -->
-        |                                                                      |
-        +----------------------------- accepted evidence ---------------------+
-                                                                               v
-methods.validation -- experiment --> strategy.interpretation -- interpretation -->
-                                                                               v
-strategy.argument -- argument --> editorial.composer -- paper/review -->
-                                                                               v
-                                              executive-command.intent-keeper
+candidate portfolio --> survey probe <------> topic refinement
+                            |
+                            v
+      methods experiment <------> evidence or control work order
+                            |
+                            v
+ strategy interpretation <------> discriminating experiment
+                            |
+                            v
+       evidence argument <------> literature / analysis repair
+                            |
+                            v
+          paper + review <------> scoped scientific continuation
+                            |
+                            v
+             executive-command.intent-keeper
 ```
 
 The arrows are dependency admissions, not unconditional transfers. A stage
 can advance only when its declared dependencies are current and its own
-acceptance contract passes. For every stage, the runtime records:
+acceptance contract passes. When more than one stage is ready, the Composer's
+adaptive agenda records all candidates and selects by information value,
+active work orders, downstream unlocks, and seeded exploration. For every
+provisional result, the independent verifier evaluates admission to the named
+next evidence action rather than final-paper maturity, while every unresolved
+finding remains attached to the research state. At topic intake, a provisional
+hold is carried into the literature brief rather than discarded or falsely
+marked resolved; experiment admission remains closed until the survey verdict.
+
+An adaptive failure does not own the worker until the deadline. Composer
+persists its retry boundary, yields to any other ready work, and re-scores the
+frontier before the next isolated attempt. A one-item frontier is still valid
+when a hard artifact dependency leaves no scientifically safe alternative.
+
+For every stage, the runtime records:
 
 | Field | Purpose |
 |---|---|

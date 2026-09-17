@@ -188,13 +188,16 @@ _VERIFIER_SCALAR_KEYS = (
     "selection_rationale", "proposed_gap", "gap", "summary", "conclusion", "coverage",
     "coverage_assessment", "evidence_assessment", "novelty", "limitations", "decision",
     "research_form", "evidence_mode", "comparison_type", "output_path", "phase",
+    "admission_state", "next_evidence_action", "topic_admission", "gap_state",
 )
 _VERIFIER_COLLECTION_KEYS = (
     "claims", "findings", "evidence_gaps", "requested_actions", "limitations", "references",
     "citations", "source_records", "source_identity", "source_candidates", "evidence_records",
     "search_results", "known_gaps", "gaps", "alternative_hypotheses", "hypotheses",
     "results", "derived_results", "raw_results", "figures", "tables", "candidates",
-    "candidate_prior_work", "selected_seed_records", "recent_papers", "maturity_reviews", "maturity_review_history",
+    "candidate_prior_work", "selected_seed_records", "recent_papers", "maturity_reviews",
+    "maturity_review_history", "maturity_open_requirements",
+    "carried_maturity_requirements",
 )
 _VERIFIER_RECORD_KEYS = (
     "id", "work_id", "source_id", "selected_id", "title", "label", "name", "year",
@@ -393,6 +396,38 @@ def _verifier_chief_result(result, *, detail="full"):
 
 
 def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, detail):
+    contract = {
+        "decision": "accept or hold",
+        "rationale": "why the chief result is or is not supported",
+        "critical_findings": ["material issue or an empty list"],
+        "repair_scope": ["specific bounded repair, or an empty list"],
+    }
+    if (stage.get("kind") == "topic_discovery"
+            and isinstance(chief_result, dict)
+            and chief_result.get("admission_state") == "provisional_for_survey"):
+        contract.update({
+            "acceptance_target": (
+                "bounded admission to literature survey, not final journal maturity or "
+                "experiment admission"
+            ),
+            "provisional_rule": (
+                "Accept when the question is structurally valid, searchable, source-grounded, "
+                "and feasible enough for literature testing. Unresolved novelty, mechanism, "
+                "threshold, comparison, provenance, or design requirements must remain explicit "
+                "in repair_scope but are not by themselves grounds to hold this provisional "
+                "literature step. Hold only when the packet is not safe or meaningful to survey."
+            ),
+        })
+    elif (isinstance(chief_result, dict)
+          and chief_result.get("topic_admission") == "provisional_supported_for_experiment"):
+        contract.update({
+            "acceptance_target": "bounded experiment admission with explicit carried requirements",
+            "provisional_rule": (
+                "Do not treat carried requirements as resolved. Accept only if the literature "
+                "result supports an experiment and the open requirements remain visible for "
+                "design, analysis, and interpretation."
+            ),
+        })
     return {
         "stage": {
             "id": stage.get("id"),
@@ -403,12 +438,7 @@ def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, det
         "specialist_reports": [
             _verifier_report(report, detail=detail) for report in specialist_reports
         ],
-        "verifier_contract": {
-            "decision": "accept or hold",
-            "rationale": "why the chief result is or is not supported",
-            "critical_findings": ["material issue or an empty list"],
-            "repair_scope": ["specific bounded repair, or an empty list"],
-        },
+        "verifier_contract": contract,
     }
 
 
