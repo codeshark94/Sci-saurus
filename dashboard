@@ -12,8 +12,8 @@ fi
 if [ "$#" -gt 0 ] && [ "${1#--}" = "$1" ]; then
   project_dir=$1
   shift
-elif [ -d local-private/autolab ]; then
-  project_dir=local-private/autolab
+elif [ -d local-private ]; then
+  project_dir=local-private
 else
   project_dir=.
 fi

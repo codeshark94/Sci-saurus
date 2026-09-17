@@ -8,8 +8,8 @@ validated project creation and Composer start/resume actions.
 
 ## Start it
 
-From the repository root, the short command opens the local Composer project
-when `local-private/autolab` exists:
+From the repository root, the short command opens the local research workspace
+when `local-private` exists:
 
 ```bash
 ./dashboard
@@ -21,8 +21,9 @@ The default Composer mission has the same short root-level entry point:
 ./run
 ```
 
-It resumes `local-private/autolab` and exits without starting a duplicate when
-the matching Composer process is already running.
+It discovers the newest direct Composer project under `local-private/` and
+resumes it. If one is already running, it exits without starting a duplicate.
+Set `SCISAURUS_COMPOSER_WORKFLOW` when a specific workflow must be selected.
 
 The equivalent module command also auto-selects that project:
 
@@ -47,8 +48,8 @@ python3 -m scisaurus.cli dashboard PROJECT_DIR --no-open --port 8765
 ```
 
 The dashboard workspace is rooted at the directory passed to the command. It
-lists that root as the current project and direct child projects under
-`<workspace>/missions`. A selected project can be a simple initialized
+lists direct child directories that contain a validated workflow marker. A
+selected project can be a simple initialized
 project, a Composer project, a stage directory, or a custom project that only
 has files and checkpoints. When a workflow defines stage project directories,
 the project detail view discovers those roots and groups their checkpoints,

@@ -84,6 +84,12 @@ The minimal stage descriptor is shown in
 replace its two absolute paths before workflow validation. The optional
 `maturity_review_rounds` field gives the intake an independent scientific-depth
 screen; journal-oriented topic→survey missions default to two rounds when it is omitted.
+Topic-level `budgets` and `continuation_budgets` are opt-in envelopes for small,
+deterministic jobs. The autonomous mission template omits them: Composer then
+continues isolated topic pivots until the mission deadline, an actual provider
+or API limit, or a worker/resource fence. They must not be confused with
+provider/account limits, the premium-model ledger, or the per-call output
+contract.
 
 For a free-topic mission, `topic_discovery` runs before the survey. It queries
 OpenAlex with objective-derived and broad recent-literature searches, filters to
@@ -185,14 +191,17 @@ the organization cannot silently acknowledge a handoff that is missing from
 the audit trail.
 
 Blockers do not trigger a whole-project restart. The Composer records a scoped
-reconciliation request, keeps incumbent artifacts, and leaves the blocked task
-visible until an Arbiter decision or a deadline-governed continuation reopens
-that scope. Usage from each completed stage is accumulated in the command
-ledger, and the next admission sees the remaining deadline and the transitive
-downstream reservation. This gives the workflow a human division of
-responsibility: the department produces, independent checks challenge, the
-Arbiter handles contested validity, and the Progress Controller decides
-whether another action can still buy verified progress.
+reconciliation request, keeps incumbent artifacts, and autonomously reopens
+the smallest affected closure when the blocker is scientific. A hold is a
+result of the current attempt, not a request for a person to choose the next
+question: when a runner emits no usable work order, or repeats one already
+attempted in the current invocation, the Composer synthesizes a cycle-specific
+typed recovery order and changes the strategy (for example, a new mechanism,
+boundary, observable, search family, control, or claim-evidence path). Usage
+from each completed stage is accumulated in the command ledger, and the next
+admission sees the remaining deadline and the transitive downstream
+reservation. The Arbiter remains an independent dispute and verification
+surface; it is not a manual gate for ordinary scientific recovery.
 
 Paper production uses the same desk inside the paper stage. The review runner
 emits one compact event for each scientific, methods, adversarial, human-
@@ -321,7 +330,10 @@ When a paper or specialist returns a structured research request, the Composer
 continues automatically instead of only sending a notification. By default it
 admits cycles until the hard wall, maps each request to the smallest owning
 stage closure, and dispatches that closure in a cycle-specific project
-namespace. A small deterministic workflow can opt into
+namespace. If a scientific hold has no valid request, or its request is already
+spent, the controller creates an `auto-<stage>-recovery-<cycle>` work order
+with a different strategy and records the reason that drove it. A small
+deterministic workflow can opt into
 `continuation_policy.mode: bounded` with `max_cycles` from zero through eight.
 Survey continuations expand search, full-text, and API capacity together and
 carry forward open-access routes; experiment continuations append the work
@@ -329,11 +341,12 @@ order to the methods context; paper continuations synchronize the reference
 set to the newly accepted survey. Downstream interpretation, argument, and
 review consumers rerun. Earlier attempts, manifests, references, and review
 decisions remain intact. The hard wall remains the termination condition for
-retry and continuation work. If a hold returns the identical work order after
-its owning stage has already been attempted in the current invocation, the
-Composer fences that request and returns the hold instead of reopening a hot
-loop; an explicit resume starts a fresh attempt and may retry the unresolved
-request.
+retry and continuation work. A provider/API quota, worker-capacity limit, or
+mission deadline is a resource fence rather than a scientific hold. In the
+deadline-governed autonomous mode, a provider reset with a concrete retry
+boundary is recorded and retried automatically in a fresh isolated attempt;
+only an unavailable route, exhausted hard wall, or explicitly bounded job
+pauses. These fences do not silently become human research decisions.
 
 Interpretation and composition stages receive the same scoped requests in a
 fresh evidence packet as `scientific_follow_up`: each objective, rationale,

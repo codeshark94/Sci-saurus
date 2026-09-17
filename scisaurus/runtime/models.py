@@ -846,6 +846,12 @@ class ModelClient:
                     chunks.append(chunk)
                     total += len(chunk)
                 raw = b"".join(chunks)
+                # A peer can close a partial body at the same instant as the
+                # absolute timer.  Do not let the resulting truncated JSON
+                # masquerade as a provider-format error; the deadline is the
+                # authoritative outcome for this transaction.
+                if expired.is_set() or time.monotonic() >= deadline:
+                    raise failure("model request deadline exceeded") from None
             except _ProviderHTTPError as exc:
                 code = exc.code
                 retry_after = exc.retry_after

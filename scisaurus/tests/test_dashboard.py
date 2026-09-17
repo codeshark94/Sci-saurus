@@ -281,12 +281,81 @@ class DashboardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             DashboardService(root).file_payload("project::../outside.txt")
 
+    def test_workspace_root_discovers_direct_projects_and_uses_default_template(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+
+        def write_project(name):
+            project = root / name
+            (project / "composer").mkdir(parents=True)
+            (project / "projects" / "survey").mkdir(parents=True)
+            (project / "stage.json").write_text("{}\n", encoding="utf-8")
+            workflow = {
+                "schema_version": "composer-workflow-1",
+                "id": f"workflow-{name}",
+                "revision": 1,
+                "project_id": str((project / "composer").resolve()),
+                "objective": f"Objective for {name}",
+                "stages": [{
+                    "id": "survey", "kind": "survey",
+                    "config_path": str((project / "stage.json").resolve()),
+                    "project_dir": str((project / "projects" / "survey").resolve()),
+                    "depends_on": [], "estimate_seconds": 1, "bindings": [],
+                    "deadline_seconds": 10, "reuse_completed": False,
+                    "reuse_output_path": None,
+                }],
+                "time_policy": {"first_result_seconds": 1, "target_seconds": 10,
+                                 "hard_seconds": 30, "checkpoint_seconds": 1},
+                "completion": {"required_stage_ids": ["survey"],
+                                "release_requires_human": True},
+            }
+            (project / "workflow.json").write_text(
+                json.dumps(workflow), encoding="utf-8")
+
+        write_project("autolab")
+        write_project("autolab-rerun-current")
+        service = DashboardService(root)
+        refs = {item["ref"] for item in service.projects()["projects"]}
+        self.assertEqual(refs, {"autolab", "autolab-rerun-current"})
+        self.assertNotIn("stage.json", refs)
+
+        created = service.create_project({
+            "template": ".", "slug": "fixture-run",
+            "objective": "Create a project from the workspace template.",
+            "hard_seconds": 3600,
+        })
+        self.assertEqual(created["project"], "missions/fixture-run")
+        self.assertTrue((root / "missions" / "fixture-run" / "workflow.json").is_file())
+
     def test_project_manager_creates_isolated_validated_workflow(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
-        template_path = Path(__file__).resolve().parents[2] / "local-private" / "autolab" / "workflow.json"
-        (root / "workflow.json").write_text(template_path.read_text(encoding="utf-8"), encoding="utf-8")
+        stage_config = root / "stage.json"
+        stage_dir = root / "stage"
+        stage_config.write_text("{}\n", encoding="utf-8")
+        stage_dir.mkdir()
+        template = {
+            "schema_version": "composer-workflow-1",
+            "id": "dashboard-template",
+            "revision": 1,
+            "project_id": str((root / "composer").resolve()),
+            "objective": "A dashboard fixture template.",
+            "stages": [{
+                "id": "survey", "kind": "survey",
+                "config_path": str(stage_config.resolve()),
+                "project_dir": str(stage_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            }],
+            "time_policy": {"first_result_seconds": 1, "target_seconds": 10,
+                             "hard_seconds": 30, "checkpoint_seconds": 1},
+            "completion": {"required_stage_ids": ["survey"],
+                            "release_requires_human": True},
+        }
+        (root / "workflow.json").write_text(
+            json.dumps(template), encoding="utf-8")
 
         service = DashboardService(root)
         result = service.create_project({

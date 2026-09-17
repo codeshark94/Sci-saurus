@@ -60,6 +60,24 @@ class ComposerWorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "stage-owning departments"):
                 validate_workflow(workflow)
 
+    def test_computational_topic_preferences_are_validated_and_projected(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            workflow["topic_preferences"] = {
+                "mode": "computational_native",
+                "must_have": ["a quantitative estimand"],
+                "avoid": ["a generic benchmark"],
+            }
+            validate_workflow(workflow)
+            runner = ComposerRunner(workflow)
+            context = runner._runtime_context({"protocol": "openai", "model": "test"})
+            self.assertEqual(
+                context["topic_preferences"], workflow["topic_preferences"])
+            workflow["topic_preferences"]["mode"] = "unsupported"
+            with self.assertRaisesRegex(ValidationError, "mode must be general"):
+                validate_workflow(workflow)
+
     def test_runs_stages_and_routes_feedback(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -256,10 +274,43 @@ class ComposerWorkflowTests(unittest.TestCase):
                              {"topic", "survey", "experiment"})
             runner.close()
 
+    def test_scientific_hold_without_request_gets_a_cycle_specific_recovery_strategy(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            runner.context["experiment"] = {
+                "kind": "experiment", "status": "research_expansion_required",
+                "research_expansion_requests": [],
+                "specialist_verifier": {
+                    "response": {
+                        "decision": "hold",
+                        "critical_findings": ["The current control cannot separate the explanations."],
+                    },
+                },
+            }
+
+            first = runner._continuation_requests()
+            self.assertEqual(len(first), 1)
+            self.assertEqual(first[0]["kind"], "additional_experiment")
+            self.assertEqual(first[0]["owner"], "methods.validation")
+            self.assertIn("discriminating", first[0]["objective"])
+            runner._attempted_request_signatures.add(
+                runner._research_request_signature(first[0]))
+
+            runner.continuation_cycles = 1
+            second = runner._continuation_requests()
+            self.assertEqual(len(second), 1)
+            self.assertNotEqual(first[0]["id"], second[0]["id"])
+            self.assertNotEqual(first[0]["objective"], second[0]["objective"])
+            self.assertIn("boundary", second[0]["objective"])
+            runner.close()
+
     def test_invalid_continuation_request_is_rejected_without_blocking_composer(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
             workflow = self._workflow(root)
+            workflow["continuation_policy"] = {"mode": "bounded", "max_cycles": 1}
             runner = ComposerRunner(workflow)
 
             def held_or_completed(stage, **kwargs):
@@ -363,6 +414,47 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(blocker["retry_after_seconds"], 0.03)
             self.assertEqual(result["interim_report"]["stop_reason"], "provider_cooldown")
 
+    def test_autonomous_provider_cooldown_waits_and_retries_before_deadline(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            workflow["retry_policy"] = {
+                "mode": "until_deadline", "backoff_seconds": 0,
+            }
+            runner = ComposerRunner(workflow)
+            calls = []
+
+            def cooldown_then_complete(stage, **kwargs):
+                calls.append(stage["id"])
+                if calls.count("survey") == 1:
+                    raise ProviderCooldownError(
+                        "provider reset pending", retry_after_seconds=0.03,
+                        rate_limit={"kind": "daily_budget"},
+                    )
+                output = root / f"{stage['id']}-result.json"
+                output.write_text(json.dumps({"stage": stage["id"]}))
+                return {"status": "completed", "output_path": str(output),
+                        "project_dir": stage["project_dir"], "stage_id": stage["id"]}
+
+            runner._run_stage = cooldown_then_complete
+            result = runner.run()
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(calls, ["survey", "survey", "experiment"])
+            self.assertEqual(result["stages"]["survey"]["attempt_count"], 2)
+            self.assertTrue(any(
+                item.get("action") == "provider_cooldown_auto_retry"
+                for item in result["department_activity"]
+            ))
+            self.assertTrue(any(
+                item.get("action") == "retry_stage"
+                and item.get("delay_seconds", 0) >= 0.03
+                for item in result["feedback"]
+            ))
+            self.assertFalse(any(
+                item.get("reason") == "provider_cooldown"
+                for item in result["blockers"]
+            ))
+
     def test_process_interrupt_persists_a_resumable_pause(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -427,6 +519,136 @@ class ComposerWorkflowTests(unittest.TestCase):
                 "output_tokens": 7, "openalex_requests": 2,
             })
             self.assertEqual(result["stages"]["topic"]["attempts"][0]["usage"]["model_calls"], 1)
+
+    def test_scientific_topic_intake_failure_pivots_until_deadline(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_config = root / "topic.json"
+            topic_config.write_text("{}")
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"] = [{
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": str(topic_config.resolve()),
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            }]
+            workflow["completion"]["required_stage_ids"] = ["topic"]
+            workflow["retry_policy"] = {"mode": "until_deadline", "backoff_seconds": 0}
+            runner = ComposerRunner(workflow)
+            calls = []
+
+            def pivot_then_complete(stage, **kwargs):
+                calls.append(stage["project_dir"])
+                if len(calls) == 1:
+                    error = QuotaExceededError(
+                        "topic discovery bounded intake exhausted",
+                        dimension="topic_attempts", limit=6, observed=6,
+                        usage={"model_calls": 4, "input_tokens": 40,
+                               "output_tokens": 20, "openalex_requests": 3},
+                        diagnostics=[],
+                    )
+                    error.retryable_topic_intake = True
+                    error.topic_retry_reason = "scientific_candidate_rejected"
+                    error.rejected_topic_history = [{
+                        "topic_id": "rejected-direction",
+                        "title": "A weak direction",
+                        "domain": "test",
+                        "research_question": "Does A change B?",
+                    }]
+                    raise error
+                output = root / "topic-result.json"
+                output.write_text(json.dumps({"status": "completed"}))
+                return {"status": "completed", "output_path": str(output),
+                        "project_dir": stage["project_dir"], "stage_id": stage["id"]}
+
+            runner._run_stage = pivot_then_complete
+            runner._run_specialist_pool = lambda *args, **kwargs: {
+                "reports": [], "by_role": {}, "usage": {}, "model_enabled": False,
+            }
+            runner._publish_specialist_reports = lambda stage, assignment, bundle: bundle
+            runner._run_specialist_verifier = lambda *args, **kwargs: None
+            result = runner.run()
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(calls[1].endswith("attempts/attempt-2"))
+            self.assertTrue(any(
+                item.get("action") == "pivot_topic_direction"
+                for item in result["department_activity"]
+            ))
+            self.assertTrue(any(
+                item.get("retry_reason") == "scientific_candidate_rejected"
+                for item in result["feedback"] if item.get("action") == "retry_stage"
+            ))
+
+    def test_topic_budget_is_cumulative_across_isolated_attempts(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            runner.stage_records["topic"] = {"attempts": [{
+                "state": "failed",
+                "usage": {"model_calls": 3, "input_tokens": 100,
+                           "output_tokens": 25, "openalex_requests": 2},
+            }]}
+            remaining = runner._topic_budgets_for_attempt("topic", {
+                "max_model_calls": 8,
+                "max_openalex_requests": 5,
+                "max_input_tokens": 200,
+                "max_output_tokens": 40,
+            })
+            self.assertEqual(remaining, {
+                "max_model_calls": 5,
+                "max_openalex_requests": 3,
+                "max_input_tokens": 100,
+                "max_output_tokens": 15,
+            })
+            runner.close()
+
+    def test_topic_continuation_has_a_separate_cumulative_budget(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            runner.stage_records["topic"] = {"attempts": [
+                {"state": "failed", "cycle": 0,
+                 "usage": {"model_calls": 8, "input_tokens": 100,
+                            "output_tokens": 25, "openalex_requests": 2}},
+                {"state": "succeeded", "cycle": 1,
+                 "topic_usage": {"model_calls": 3, "input_tokens": 40,
+                                  "output_tokens": 10, "openalex_requests": 1},
+                 # Specialist usage belongs to the stage ledger but not the
+                 # topic runner's continuation envelope.
+                 "usage": {"model_calls": 7, "input_tokens": 500,
+                            "output_tokens": 50, "openalex_requests": 1}},
+            ]}
+            initial = runner._topic_budgets_for_attempt(
+                "topic", {"max_model_calls": 10}, scope="intake")
+            continuation = runner._topic_budgets_for_attempt(
+                "topic", {"max_model_calls": 6}, scope="continuation")
+            self.assertEqual(initial["max_model_calls"], 2)
+            self.assertEqual(continuation["max_model_calls"], 3)
+            runner.close()
+
+    def test_topic_budget_admission_snapshot_is_not_charged_twice(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            error = QuotaExceededError(
+                "topic discovery mission quota exhausted",
+                dimension="model_calls", limit=8, observed=8,
+                usage={}, diagnostics=[{"kind": "composer_topic_budget"}],
+            )
+            error.usage_is_snapshot = True
+            self.assertEqual(
+                runner._record_failed_stage_usage(error),
+                {"model_calls": 0, "input_tokens": 0,
+                 "output_tokens": 0, "openalex_requests": 0})
+            runner.close()
 
     def test_until_deadline_retry_mode_does_not_stop_at_attempt_counter(self):
         with tempfile.TemporaryDirectory() as path:
@@ -698,16 +920,36 @@ class ComposerWorkflowTests(unittest.TestCase):
             ]
             workflow["topic_history_path"] = str(history_path.resolve())
             runner = ComposerRunner(workflow)
-            topic = {"id": "direction_a", "title": "Direction A", "domain": "science",
+            topic = {"id": "chosen_topic_a", "title": "Direction A", "domain": "science",
                      "research_question": "Does mechanism A change the measured outcome?"}
             runner._record_topic_history({"topic": {**topic, "experiment_capability_id": "cap_a"}})
             runner.close()
 
             resumed = ComposerRunner(workflow, resume=True)
-            self.assertEqual(resumed.topic_history["entries"][0]["topic_id"], "direction_a")
+            self.assertEqual(resumed.topic_history["entries"][0]["topic_id"], "chosen_topic_a")
             self.assertEqual(resumed._effective_topic_exclusions()["capability_ids"], ["cap_a"])
-            self.assertIn("direction_a", resumed._effective_topic_exclusions()["topic_ids"])
+            self.assertIn("chosen_topic_a", resumed._effective_topic_exclusions()["topic_ids"])
             resumed.close()
+
+    def test_generated_slot_history_id_does_not_become_exact_exclusion(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            history_path = root / "shared" / "topic-history.json"
+            workflow["topic_history_path"] = str(history_path.resolve())
+            workflow["topic_exclusions"] = {
+                "capability_ids": [], "topic_ids": ["explicit_topic_id"]}
+            runner = ComposerRunner(workflow)
+            runner._record_topic_history({"topic": {
+                "id": "direction_qft_topology_scaling",
+                "title": "A generated slot label",
+                "domain": "quantum science",
+                "research_question": "Does a changed observable distinguish two mechanisms?",
+            }})
+            exclusions = runner._effective_topic_exclusions()
+            self.assertNotIn("direction_qft_topology_scaling", exclusions["topic_ids"])
+            self.assertIn("explicit_topic_id", exclusions["topic_ids"])
+            runner.close()
 
     def test_rejected_topic_history_persists_across_fresh_missions(self):
         with tempfile.TemporaryDirectory() as path:
@@ -800,6 +1042,10 @@ class ComposerWorkflowTests(unittest.TestCase):
             runner = ComposerRunner(workflow)
             self.assertEqual(runner.exploration_seed, 123456)
             self.assertEqual(runner._topic_sampling_seed(), runner._topic_sampling_seed())
+            self.assertNotEqual(
+                runner._topic_sampling_seed(attempt_number=1),
+                runner._topic_sampling_seed(attempt_number=2),
+            )
             runner._checkpoint("seed-persisted", force=True)
             progress = json.loads((Path(workflow["project_id"]) / "output" / "progress.json").read_text())
             self.assertEqual(progress["status"], "running")
@@ -908,8 +1154,8 @@ class ComposerWorkflowTests(unittest.TestCase):
                                                   "experiment": workflow["stages"][2]}))
             runner.close()
 
-    def test_identical_continuation_request_cannot_hot_loop_until_deadline(self):
-        """A repeated survey hold must stop after its new work order is attempted."""
+    def test_repeated_continuation_hold_pivots_until_the_deadline(self):
+        """A repeated survey hold keeps changing strategy until the hard wall."""
         class FastClock:
             def __init__(self):
                 self.value = 0.0
@@ -960,10 +1206,18 @@ class ComposerWorkflowTests(unittest.TestCase):
 
             runner._run_stage = staged
             result = runner.run()
-            self.assertEqual(result["status"], "research_expansion_required")
-            self.assertEqual(result["continuation_cycles"], 2)
-            self.assertEqual(calls, ["topic", "survey", "survey", "topic", "survey"])
-            self.assertFalse(result["blockers"])
+            self.assertEqual(result["status"], "paused")
+            self.assertGreaterEqual(result["continuation_cycles"], 2)
+            self.assertGreaterEqual(len(calls), 5)
+            self.assertEqual(calls[:5], ["topic", "survey", "survey", "topic", "survey"])
+            self.assertTrue(any(item.get("action") == "continue_research"
+                                for item in result["feedback"]))
+            self.assertTrue(any(
+                request.get("id", "").startswith("auto-")
+                for item in result["feedback"]
+                if item.get("action") == "continue_research"
+                for request in item.get("research_requests", [])
+                if isinstance(request, dict)))
             runner.close()
 
     def test_free_topic_selection_switches_between_pinned_experiment_capabilities(self):

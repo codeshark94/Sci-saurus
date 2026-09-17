@@ -736,11 +736,14 @@ class TopicBudget:
 def validate_topic_stage_config(value):
     """Validate the descriptor consumed by the Composer topic stage."""
     fields = {"schema_version", "model_config_path", "output_path", "candidate_count", "max_attempts"}
-    allowed = fields | {"repair_mode", "maturity_review_rounds", "bibliography", "budgets"}
+    allowed = fields | {
+        "repair_mode", "maturity_review_rounds", "bibliography", "budgets",
+        "continuation_budgets",
+    }
     if (not isinstance(value, dict) or set(value) - allowed
             or not fields.issubset(value)):
         raise ValidationError(
-            f"topic discovery config requires {sorted(fields)} and permits repair_mode, bibliography, budgets")
+            f"topic discovery config requires {sorted(fields)} and permits repair_mode, bibliography, budgets, continuation_budgets")
     if value["schema_version"] != STAGE_CONFIG_SCHEMA_VERSION:
         raise ValidationError("topic discovery config schema version is unsupported")
     model_path = Path(value["model_config_path"])
@@ -764,6 +767,8 @@ def validate_topic_stage_config(value):
         raise ValidationError("topic discovery maturity_review_rounds must be between 0 and 4")
     if "budgets" in value:
         _validate_topic_budgets(value["budgets"])
+    if "continuation_budgets" in value:
+        _validate_topic_budgets(value["continuation_budgets"])
     bibliography = value.get("bibliography")
     if bibliography is not None:
         if not isinstance(bibliography, dict) or set(bibliography) - TOPIC_BIBLIOGRAPHY_FIELDS:
@@ -1400,6 +1405,25 @@ def topic_signature(candidate):
     }
 
 
+def _is_generated_slot_topic_id(value):
+    """Return whether a model used a reusable portfolio slot ID.
+
+    Models often turn a portfolio slot into a subject-shaped identifier such
+    as ``direction_qft_topology_scaling``.  That is still an unstable label,
+    not a durable scientific identity: a substantive repair may retain it
+    while changing the question. Cross-mission novelty therefore relies on
+    the question, domain, and structural fingerprint for these generated
+    labels rather than treating the model's naming choice as an exclusion
+    key.
+    """
+    if not isinstance(value, str):
+        return False
+    normalized = value.casefold()
+    return normalized == "direction" or normalized.startswith((
+        "direction_", "direction-", "dir_", "dir-", "topic_", "topic-",
+    ))
+
+
 def _candidate_attempt_record(package, *, attempt, status="parsed", error=None,
                               outcome_known=None):
     """Keep bounded signatures for every candidate package an attempt saw."""
@@ -1588,7 +1612,8 @@ def validate_topic_novelty(candidate, topic_history, *, threshold=0.78):
         raise ValidationError("topic novelty threshold must be finite and in (0, 1]")
     current_id = candidate.get("id") if isinstance(candidate, dict) else None
     for prior in _topic_history_entries(topic_history):
-        if current_id and current_id == prior.get("topic_id"):
+        if (current_id and current_id == prior.get("topic_id")
+                and not _is_generated_slot_topic_id(current_id)):
             raise ValidationError("selected topic repeats a previously attempted direction")
         score = _topic_repeat_score(candidate, prior)
         if score >= threshold:
@@ -1660,6 +1685,31 @@ def _repair_topic_novelty_selection(package, topic_history, *, excluded_topic_id
         "candidate_index": index,
         "reason": str(selection_error),
     }
+
+
+def _grounding_eligible_frontier_seeds(frontier_seeds, recent_papers, candidate_count):
+    """Limit candidate generation to seeds with inspectable source support.
+
+    Frontier discovery may legitimately produce a direction whose OpenAlex
+    search returns no works. That seed remains in the audit plan, but it cannot
+    support a grounded candidate in the same intake. When enough grounded
+    groups exist for the portfolio gate, hide unsupported seeds from the
+    generation prompt so the model cannot select an impossible citation
+    binding and burn every repair attempt on it.
+    """
+    seeds = [item for item in (frontier_seeds or []) if isinstance(item, dict)]
+    work_seed_ids = {
+        item.get("frontier_seed_id") for item in (recent_papers or [])
+        if isinstance(item, dict)
+        and isinstance(item.get("frontier_seed_id"), str)
+        and isinstance(item.get("work_id"), str)
+        and item.get("work_id")
+    }
+    grounded = [item for item in seeds if item.get("id") in work_seed_ids]
+    minimum_groups = min(3, candidate_count) if type(candidate_count) is int else 3
+    return grounded if len(grounded) >= minimum_groups else seeds
+
+
 def _repair_foundry_selection(package, runtime_context):
     """Select an already-proposed candidate that fits a closed foundry boundary.
 
@@ -2076,6 +2126,241 @@ def _portfolio_shape_plan(candidate_count, seed=None, *, avoid_shape_by_index=No
     return plan
 
 
+def _topic_prompt_clip(value, limit):
+    """Clip reader-facing prompt prose without changing structured meaning."""
+    if not isinstance(value, str):
+        return value
+    value = value.strip()
+    return value if len(value) <= limit else value[:max(0, limit - 1)].rstrip() + "…"
+
+
+def _topic_prompt_paper_projection(value):
+    """Keep source identity and a small evidence window for topic generation."""
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: _topic_prompt_clip(value.get(key), limit)
+        for key, limit in (
+            ("work_id", 80), ("title", 260), ("abstract", 900),
+            ("authors", 240), ("doi", 160), ("frontier_domain", 180),
+            ("frontier_seed_id", 100), ("matched_query", 260),
+            ("year", 12), ("source_url", 500),
+        ) if value.get(key) is not None
+    }
+
+
+def _topic_prompt_seed_projection(value):
+    """Bound frontier seed prose while preserving its grounding identity."""
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: _topic_prompt_clip(value.get(key), limit)
+        for key, limit in (
+            ("id", 100), ("domain", 180), ("phenomenon", 700),
+            ("mechanism", 700), ("unit_of_analysis", 500),
+        ) if value.get(key) is not None
+    } | {
+        "search_queries": [
+            _topic_prompt_clip(item, 260)
+            for item in value.get("search_queries", [])[:8]
+            if isinstance(item, str)
+        ]
+    }
+
+
+def _topic_prompt_candidate_projection(value):
+    """Project one prior candidate attempt without replaying token-heavy traces."""
+    if not isinstance(value, dict):
+        return value
+    selected = value.get("selected_topic")
+    selected_projection = None
+    if isinstance(selected, dict):
+        selected_projection = {
+            key: _topic_prompt_clip(selected.get(key), limit)
+            for key, limit in (
+                ("id", 100), ("title", 260), ("domain", 180),
+                ("research_question", 900), ("research_form", 80),
+                ("evidence_mode", 80), ("comparison_type", 80),
+                ("frontier_seed_id", 100),
+            ) if selected.get(key) is not None
+        }
+    result = {
+        key: value.get(key) for key in ("attempt", "status", "selected_id", "outcome_known")
+        if key in value
+    }
+    if selected_projection is not None:
+        result["selected_topic"] = selected_projection
+    if value.get("error") is not None:
+        result["error"] = _topic_prompt_clip(value.get("error"), 900)
+    for label in ("source_challenge", "maturity_review"):
+        review = value.get(label)
+        if not isinstance(review, dict):
+            continue
+        result[label] = {
+            key: (_topic_prompt_clip(review.get(key), 1200)
+                  if isinstance(review.get(key), str)
+                  else [str(item)[:400] for item in review.get(key, [])[:6]]
+                  if isinstance(review.get(key), list)
+                  else review.get(key))
+            for key in ("decision", "prior_work_risk", "direct_comparison_match",
+                        "rationale", "required_changes", "evidence_gaps")
+            if key in review
+        }
+    if isinstance(value.get("portfolio_profile"), dict):
+        profile = value["portfolio_profile"]
+        result["portfolio_profile"] = {
+            key: profile.get(key) for key in ("candidate_count", "counts", "distinct")
+            if key in profile
+        }
+    return result
+
+
+def _topic_prompt_rejection_projection(value):
+    """Keep rejection causes while dropping duplicate signatures and token lists."""
+    if not isinstance(value, dict):
+        return value
+    result = {
+        key: _topic_prompt_clip(value.get(key), limit)
+        for key, limit in (
+            ("topic_id", 100), ("title", 260), ("domain", 180),
+            ("research_question", 900), ("research_form", 80),
+            ("evidence_mode", 80), ("comparison_type", 80),
+            ("rejection_type", 80), ("rejection_reason", 900),
+        ) if value.get(key) is not None
+    }
+    if isinstance(value.get("required_changes"), list):
+        result["required_changes"] = [str(item)[:400] for item in value["required_changes"][:6]]
+    return result
+
+
+def _topic_prompt_specialist_projection(value):
+    """Pass findings to a refinement without echoing raw provider responses."""
+    if not isinstance(value, dict):
+        return value
+    result = {
+        key: _topic_prompt_clip(value.get(key), 1400)
+        for key in ("assigned_role", "role_id", "decision", "summary")
+        if value.get(key) is not None
+    }
+    for key in ("findings", "evidence_gaps", "requested_actions"):
+        items = value.get(key)
+        if isinstance(items, list):
+            result[key] = [str(item)[:500] for item in items[:4]]
+    return result
+
+
+def _topic_prompt_refinement_projection(value):
+    """Bound a continuation handoff while retaining every repair obligation."""
+    if not isinstance(value, dict):
+        return value
+    result = {
+        key: value.get(key) for key in (
+            "mode", "cycle", "parent_topic_id", "parent_candidate_index",
+            "changed_dimensions", "require_frontier_seed_pivot",
+            "rejected_frontier_seed_ids",
+        )
+        if key in value
+    }
+    parent = value.get("parent_topic")
+    if isinstance(parent, dict):
+        result["parent_topic"] = {
+            key: _topic_prompt_clip(parent.get(key), limit)
+            for key, limit in (
+                ("id", 100), ("title", 260), ("domain", 180),
+                ("research_question", 900), ("research_form", 80),
+                ("evidence_mode", 80), ("comparison_type", 80),
+                ("frontier_seed_id", 100), ("prior_work_ids", 300),
+                ("mechanism", 700), ("data_regime", 700),
+                ("comparison", 700), ("measurement", 700),
+                ("theory_target", 700), ("scope", 700),
+                ("resource_plan", 700), ("disconfirmation_test", 700),
+            ) if parent.get(key) is not None
+        }
+    feedback = value.get("refinement_feedback")
+    if isinstance(feedback, dict):
+        result["refinement_feedback"] = {
+            key: (_topic_prompt_clip(feedback.get(key), 2200)
+                  if isinstance(feedback.get(key), str)
+                  else [str(item)[:900] for item in feedback.get(key, [])[:8]]
+                  if isinstance(feedback.get(key), list)
+                  else feedback.get(key))
+            for key in ("review_type", "decision", "rationale", "required_changes",
+                        "critical_findings", "changed_dimensions",
+                        "require_frontier_seed_pivot", "rejected_frontier_seed_ids")
+            if key in feedback
+        }
+    survey = value.get("survey_feedback")
+    if isinstance(survey, dict):
+        survey_result = {
+            key: (_topic_prompt_clip(survey.get(key), 1600)
+                  if isinstance(survey.get(key), str) else survey.get(key))
+            for key in ("gap_state", "nomination", "assessment_ref")
+            if key in survey
+        }
+        evidence = survey.get("evidence")
+        if isinstance(evidence, dict):
+            survey_result["evidence"] = {
+                str(key): _topic_prompt_clip(item, 6000)
+                for key, item in list(evidence.items())[:2]
+                if isinstance(item, str)
+            }
+        result["survey_feedback"] = survey_result
+    if isinstance(value.get("specialist_feedback"), list):
+        result["specialist_feedback"] = [
+            _topic_prompt_specialist_projection(item)
+            for item in value["specialist_feedback"][:2]
+            if isinstance(item, dict)
+        ]
+    if value.get("reason") is not None:
+        result["reason"] = _topic_prompt_clip(value.get("reason"), 1200)
+    return result
+
+
+def _topic_prompt_runtime_projection(value):
+    """Keep executable constraints and remove environment-sized bookkeeping."""
+    if not isinstance(value, dict):
+        return value
+    result = deepcopy(value)
+    project_files = result.get("project_files")
+    if isinstance(project_files, list):
+        projected_files = []
+        for item in project_files[:40]:
+            if isinstance(item, str):
+                projected_files.append(_topic_prompt_clip(item, 500))
+            elif isinstance(item, dict):
+                projected_files.append({
+                    key: (_topic_prompt_clip(item.get(key), 500)
+                          if isinstance(item.get(key), str) else item.get(key))
+                    for key in ("path", "kind", "label", "size", "sha256")
+                    if item.get(key) is not None
+                })
+        result["project_files"] = projected_files
+    history = result.get("topic_history")
+    if isinstance(history, dict) and isinstance(history.get("entries"), list):
+        result["topic_history"] = {
+            **{key: history.get(key) for key in ("schema_version", "scope_key", "capability_counts")
+               if key in history},
+            "entries": [
+                _topic_prompt_rejection_projection(item)
+                for item in history["entries"][-8:]
+                if isinstance(item, dict)
+            ],
+        }
+    reports = result.get("independent_specialist_reports")
+    if isinstance(reports, list):
+        result["independent_specialist_reports"] = [
+            _topic_prompt_specialist_projection(item)
+            for item in reports[:2] if isinstance(item, dict)
+        ]
+    catalog = result.get("experiment_catalog")
+    if isinstance(catalog, list):
+        for item in catalog:
+            if isinstance(item, dict) and isinstance(item.get("design_template"), dict):
+                encoded = json.dumps(item["design_template"], ensure_ascii=False, sort_keys=True)
+                item["design_template"] = encoded[:5000]
+    return result
+
+
 def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_seeds=None,
                  runtime_context=None, refinement_context=None, candidate_history=None,
                  rejected_candidate_directions=None, portfolio_seed=None):
@@ -2089,15 +2374,29 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
             return project_internal_language(value)
         return value
 
-    runtime_context = reader_projection(runtime_context or {})
+    runtime_context = _topic_prompt_runtime_projection(reader_projection(runtime_context or {}))
     # Frozen fallback templates are retained for the independent challenge,
     # but a foundry-backed candidate generator must never see them as idea
     # seeds before it has defined the scientific question.
     runtime_context.pop("fallback_experiment_catalog", None)
-    recent_papers = reader_projection(recent_papers or [])
-    frontier_seeds = reader_projection(frontier_seeds or [])
-    candidate_history = reader_projection(candidate_history or [])
-    rejected_candidate_directions = reader_projection(rejected_candidate_directions or [])
+    recent_papers = [
+        _topic_prompt_paper_projection(reader_projection(item))
+        for item in (recent_papers or [])[:TOPIC_SAMPLE_LIMIT] if isinstance(item, dict)
+    ]
+    frontier_seeds = [
+        _topic_prompt_seed_projection(reader_projection(item))
+        for item in (frontier_seeds or []) if isinstance(item, dict)
+    ]
+    candidate_history = [
+        _topic_prompt_candidate_projection(reader_projection(item))
+        for item in (candidate_history or [])[-4:] if isinstance(item, dict)
+    ]
+    rejected_candidate_directions = [
+        _topic_prompt_rejection_projection(reader_projection(item))
+        for item in (rejected_candidate_directions or [])[-6:] if isinstance(item, dict)
+    ]
+    refinement_context = _topic_prompt_refinement_projection(
+        reader_projection(refinement_context)) if refinement_context else None
     evidence_by_seed = {}
     for paper in recent_papers:
         if not isinstance(paper, dict):
@@ -2247,6 +2546,26 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
                 "include experiment_design only for a candidate using a design-driven capability; omit that key "
                 "for every other capability",
             ])
+    topic_preferences = runtime_context.get("topic_preferences") or {}
+    if isinstance(topic_preferences, dict):
+        mode = topic_preferences.get("mode")
+        must_have = [item for item in topic_preferences.get("must_have", [])
+                     if isinstance(item, str) and item.strip()]
+        avoid = [item for item in topic_preferences.get("avoid", [])
+                 if isinstance(item, str) and item.strip()]
+        if mode == "computational_native":
+            constraints.extend([
+                "prefer a computational-native scientific question: computation must be the primary instrument for testing a substantive mechanism, boundary, scaling relation, or theory discrepancy, not merely a software or workflow demonstration",
+                "the selected candidate must satisfy every item in topic_preferences.must_have; alternatives may vary their epistemic shape, but the selected direction must remain executable inside the declared deterministic Python boundary",
+            ])
+        if must_have:
+            constraints.append(
+                "the selected candidate must satisfy these declared topic preferences: "
+                + "; ".join(must_have))
+        if avoid:
+            constraints.append(
+                "avoid these topic patterns unless the supplied evidence makes them necessary: "
+                + "; ".join(avoid))
     foundry = runtime_context.get("capability_foundry")
     if isinstance(foundry, dict) and foundry.get("enabled") is True:
         allowed_evidence_modes = foundry.get("allowed_evidence_modes") or []
@@ -2328,8 +2647,8 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         } if refinement_context else {},
         "portfolio_requirements": portfolio_requirements,
         "portfolio_shape_plan": portfolio_shape_plan,
-        "previous_candidate_directions": candidate_history[-24:],
-        "rejected_candidate_directions": rejected_candidate_directions[-12:],
+        "previous_candidate_directions": candidate_history,
+        "rejected_candidate_directions": rejected_candidate_directions,
         "output_contract": {
             "schema_version": SCHEMA_VERSION,
             "objective": "copy principal_objective exactly",
@@ -2484,12 +2803,27 @@ def _topic_candidate_refinement_prompt(objective, parent_candidate, *,
             return project_internal_language(value)
         return value
 
-    runtime_projection = reader_projection(runtime_context or {})
+    runtime_projection = _topic_prompt_runtime_projection(
+        reader_projection(runtime_context or {}))
     runtime_projection.pop("fallback_experiment_catalog", None)
     seeds_projection = reader_projection(frontier_seeds or [])
-    records_projection = reader_projection(recent_papers or [])
+    records_projection = [
+        _topic_prompt_paper_projection(reader_projection(item))
+        for item in (recent_papers or []) if isinstance(item, dict)
+    ]
     parent_projection = reader_projection(parent_candidate)
-    feedback_projection = reader_projection(refinement_feedback or {})
+    feedback_source = reader_projection(refinement_feedback or {})
+    feedback_projection = {
+        key: (_topic_prompt_clip(feedback_source.get(key), 2200)
+              if isinstance(feedback_source.get(key), str)
+              else [str(item)[:900] for item in feedback_source.get(key, [])[:8]]
+              if isinstance(feedback_source.get(key), list)
+              else feedback_source.get(key))
+        for key in ("review_type", "decision", "rationale", "required_changes",
+                    "critical_findings", "changed_dimensions",
+                    "require_frontier_seed_pivot", "rejected_frontier_seed_ids")
+        if key in feedback_source
+    }
     catalog = runtime_projection.get("experiment_catalog") or []
     candidate_contract = {
         "id": "copy candidate_id_to_copy_exactly",
@@ -3082,6 +3416,11 @@ class TopicDiscoveryRunner:
             recent_papers, sampling_seed, sampling_trace = self._recent_paper_sample(
                 objective, bibliography=bibliography, deadline=deadline, sampling_seed=sampling_seed,
                 frontier_seed_plan=frontier_seed_plan, budget=budget)
+        candidate_frontier_seeds = _grounding_eligible_frontier_seeds(
+            (frontier_seed_plan or {}).get("seeds", []),
+            recent_papers,
+            candidate_count,
+        )
         previous = None
         last_error = None
         refinement_feedback = None
@@ -3149,7 +3488,7 @@ class TopicDiscoveryRunner:
                           if generation_seed is not None else None),
                 )
                 target_seed = _refinement_target_seed(
-                    (frontier_seed_plan or {}).get("seeds", []),
+                    candidate_frontier_seeds,
                     recent_papers,
                     refinement_parent.get("frontier_seed_id"),
                     refinement_feedback,
@@ -3171,7 +3510,7 @@ class TopicDiscoveryRunner:
                             base_package=refinement_base_package,
                             target_shape=target_shape,
                             target_seed=target_seed,
-                            frontier_seeds=(frontier_seed_plan or {}).get("seeds", []),
+                            frontier_seeds=candidate_frontier_seeds,
                             recent_papers=recent_papers,
                             runtime_context=prompt_runtime_context,
                             refinement_feedback=refinement_feedback,
@@ -3195,7 +3534,7 @@ class TopicDiscoveryRunner:
                 refinement_payload = json.loads(topic_prompt(
                     objective, candidate_count,
                     recent_papers=recent_papers,
-                    frontier_seeds=(frontier_seed_plan or {}).get("seeds", []),
+                    frontier_seeds=candidate_frontier_seeds,
                     runtime_context=prompt_runtime_context,
                     refinement_context={
                         **(refinement_context or {}),
@@ -3247,7 +3586,7 @@ class TopicDiscoveryRunner:
             elif not single_candidate_refinement:
                 prompt = topic_prompt(objective, candidate_count,
                     recent_papers=recent_papers,
-                    frontier_seeds=(frontier_seed_plan or {}).get("seeds", []),
+                    frontier_seeds=candidate_frontier_seeds,
                     runtime_context=prompt_runtime_context,
                     refinement_context=refinement_context,
                     candidate_history=candidate_attempt_trace[-24:],
@@ -3259,7 +3598,7 @@ class TopicDiscoveryRunner:
                 repair_payload = json.loads(topic_prompt(
                     objective, candidate_count,
                     recent_papers=recent_papers,
-                    frontier_seeds=(frontier_seed_plan or {}).get("seeds", []),
+                    frontier_seeds=candidate_frontier_seeds,
                     runtime_context=prompt_runtime_context,
                     refinement_context=refinement_context,
                     candidate_history=candidate_attempt_trace[-24:],
@@ -3832,10 +4171,51 @@ class TopicDiscoveryRunner:
             return output
         error = last_error or ValidationError("topic discovery did not produce a valid package")
         snapshot = budget.snapshot()
+        # Some package gates reject a selected direction for similarity or
+        # structural validity before the maturity reviewer can emit its
+        # normal rejection object. Preserve every concrete selected direction
+        # that is not already in the rejection list so the next Composer pivot
+        # has durable exclusion targets instead of only an opaque error string.
+        rejected_ids = {
+            item.get("topic_id") for item in rejected_topic_history
+            if isinstance(item, dict) and isinstance(item.get("topic_id"), str)
+        }
+        for trace in reversed(candidate_attempt_trace):
+            selected = trace.get("selected_topic") if isinstance(trace, dict) else None
+            if (not isinstance(selected, dict)
+                    or not isinstance(selected.get("id"), str)
+                    or selected["id"] in rejected_ids):
+                continue
+            rejected_topic_history.append({
+                "topic_id": selected["id"],
+                "title": selected.get("title"),
+                "domain": selected.get("domain"),
+                "research_question": selected.get("research_question"),
+                "research_form": selected.get("research_form"),
+                "evidence_mode": selected.get("evidence_mode"),
+                "comparison_type": selected.get("comparison_type"),
+                "rejection_type": "intake_validation",
+                "rejection_reason": str(error)[:2048],
+            })
+            rejected_ids.add(selected["id"])
+            if len(rejected_topic_history) >= 24:
+                break
         setattr(error, "topic_budget", snapshot)
         setattr(error, "candidate_attempt_trace", deepcopy(candidate_attempt_trace))
         setattr(error, "maturity_review_history", deepcopy(maturity_review_history))
         setattr(error, "rejected_topic_history", deepcopy(rejected_topic_history))
+        # A bounded intake can exhaust its local proposal/repair passes while
+        # still having a scientifically actionable next move.  The Composer
+        # uses this durable trace to distinguish a candidate-quality failure
+        # (pivot and continue) from an environmental or provider failure
+        # (pause/block). Empty traces deliberately remain non-recoverable:
+        # missing credentials and failures before a candidate was examined
+        # must not become autonomous retry loops.
+        setattr(
+            error,
+            "topic_intake_recoverable",
+            bool(candidate_attempt_trace or maturity_review_history or rejected_topic_history),
+        )
         raise error
 
     @staticmethod

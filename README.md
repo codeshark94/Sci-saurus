@@ -4,7 +4,7 @@
 
 ### A bounded, auditable research organization for turning compute into verified progress.
 
-Human-led · evidence-first · resumable · provider-aware
+Autonomous within mission bounds · evidence-first · resumable · provider-aware
 
 [![CI](https://github.com/codeshark94/Sci-saurus/actions/workflows/tests.yml/badge.svg)](https://github.com/codeshark94/Sci-saurus/actions/workflows/tests.yml)
 ![Python 3.14](https://img.shields.io/badge/python-3.14-3776AB?logo=python&logoColor=white)
@@ -19,9 +19,11 @@ Human-led · evidence-first · resumable · provider-aware
 ## At a glance
 
 Sci-saurus coordinates a project-scoped organization of on-demand specialists.
-The human Principal sets the objective, authority, trade-offs, and release
-boundary. The Composer plans and supervises work; departments investigate,
-construct, challenge, verify, and revise; the Archivist preserves the trail.
+The Principal sets the objective, authority, trade-offs, and release boundary.
+Once a mission is admitted, the Composer plans and supervises work;
+departments investigate, construct, challenge, verify, revise, and choose the
+next scoped recovery action without asking a person to invent a pivot. The
+Archivist preserves the trail.
 
 The flagship path is:
 
@@ -147,7 +149,9 @@ before using live providers.
 ## Guardrails that matter
 
 - **Human authority is explicit.** The Principal owns mission scope and final release.
-- **Budgets are real.** Model calls, API requests, tokens, worker slots, and wall-clock time are reserved and recorded.
+- **Scientific recovery is autonomous.** A hold, rejected direction, or missing typed repair order produces a cycle-specific work order, changes the strategy, and reopens only the affected closure. Human input is not the normal next step.
+- **Only real fences stop autonomous progress.** The autonomous mission does not impose an aggregate local topic-call quota; provider/account limits, API policy, worker capacity, and the mission deadline are reserved and recorded. Explicit topic budgets remain available for intentionally deterministic jobs.
+- **Resource fences are not scientific decisions.** A resettable provider/API cooldown is waited out and retried automatically in autonomous mode; exhausted quotas, worker capacity, and the mission deadline remain hard resource boundaries recorded in the checkpoint, never scientific conclusions.
 - **Failure is not success.** A timeout, provider block, malformed response, or rejected review remains visible and scoped.
 - **Evidence is claim-level.** Literature claims require exact source references and stable spans; metadata is not scientific evidence.
 - **Experiments are bounded.** A deterministic replay proves reproducibility of the pinned execution, not mathematical truth or real-world novelty.

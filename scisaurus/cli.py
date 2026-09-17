@@ -15,6 +15,9 @@ from scisaurus.core.tasks import TaskManager
 
 def _default_dashboard_project_dir():
     current = Path.cwd()
+    workspace = current / "local-private"
+    if workspace.is_dir():
+        return str(workspace)
     autolab = current / "local-private" / "autolab"
     return str(autolab if autolab.is_dir() else current)
 

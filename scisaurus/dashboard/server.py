@@ -2111,12 +2111,36 @@ class DashboardService:
         }
 
     def _project_candidates(self):
-        candidates = [self.project_dir]
-        missions = self.project_dir / "missions"
-        if missions.is_dir():
-            candidates.extend(child for child in sorted(missions.iterdir())
-                              if child.is_dir() and not child.name.startswith("."))
-        return candidates
+        def has_workflow(candidate):
+            return any((candidate / relative).is_file()
+                       for relative in (Path("workflow.json"),
+                                        Path("composer") / "workflow.json"))
+
+        # A directory with a workflow is a project-detail root.  A directory
+        # without one is a workspace root, so discover only direct children
+        # that actually contain Composer projects; config/data folders must
+        # never become phantom projects in the UI.
+        if has_workflow(self.project_dir):
+            candidates = [self.project_dir]
+            containers = [self.project_dir / "missions"]
+        else:
+            candidates = []
+            containers = [self.project_dir, self.project_dir / "missions"]
+        for container in containers:
+            if not container.is_dir():
+                continue
+            for child in sorted(container.iterdir(), key=lambda path: path.name):
+                if (child.is_dir() and not child.name.startswith(".")
+                        and child != self.project_dir and has_workflow(child)):
+                    candidates.append(child)
+        deduplicated = []
+        seen = set()
+        for candidate in candidates:
+            identity = str(candidate.resolve())
+            if identity not in seen:
+                seen.add(identity)
+                deduplicated.append(candidate)
+        return deduplicated
 
     def projects(self):
         candidates = self._project_candidates()
@@ -2126,6 +2150,13 @@ class DashboardService:
                 projects.append(self._project_record(candidate))
             except (OSError, ValueError):
                 continue
+        # Put live work and the most recently updated checkpoint first.  This
+        # keeps a workspace dashboard oriented around the current mission
+        # without deleting or hiding historical projects.
+        projects.sort(key=lambda item: (
+            item.get("status") == "running",
+            item.get("last_updated") or "",
+        ), reverse=True)
         return {"workspace": str(self.project_dir), "current": ".", "projects": projects,
                 "bounded": len(candidates) > MAX_PROJECTS}
 
@@ -2242,6 +2273,20 @@ class DashboardService:
             raise ValueError("project objective must be 1 to 8000 characters")
         template_ref = payload.get("template", ".")
         template_dir = self._resolve_project(template_ref)
+        # In workspace mode, the root is a container rather than a project.
+        # Keep the global New project action usable by selecting the stable
+        # autolab template when present, otherwise the first discovered
+        # Composer project.  A caller can still provide an explicit project
+        # reference through the project manager.
+        if template_ref in (None, "", ".") and not any(
+                (self.project_dir / relative).is_file()
+                for relative in (Path("workflow.json"),
+                                 Path("composer") / "workflow.json")):
+            candidates = self._project_candidates()
+            template_dir = next(
+                (candidate for candidate in candidates if candidate.name == "autolab"),
+                candidates[0] if candidates else template_dir,
+            )
         template_path, template = self._workflow(template_dir)
         if not isinstance(template.get("stages"), list):
             raise ValueError("template workflow has no stage list")

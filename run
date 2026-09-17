@@ -4,17 +4,69 @@ set -eu
 repository_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$repository_dir"
 
-workflow=local-private/autolab/workflow.json
-running_pid=$(ps -axo pid=,command= | awk -v workflow="$workflow" '
-  /[s]cisaurus\.cli run-composer/ && index($0, workflow) {
-    print $1
-    exit
-  }
-')
+python_bin=python3
+if [ -x .venv/bin/python ]; then
+  python_bin=.venv/bin/python
+fi
+
+workflow=${SCISAURUS_COMPOSER_WORKFLOW:-}
+if [ -z "$workflow" ] && [ -n "${SCISAURUS_COMPOSER_PROJECT:-}" ]; then
+  workflow=$SCISAURUS_COMPOSER_PROJECT/workflow.json
+fi
+
+if [ -z "$workflow" ]; then
+  newest_workflow=
+  running_workflow=
+  running_pid=
+  for candidate in local-private/*/workflow.json; do
+    [ -f "$candidate" ] || continue
+    if [ -z "$newest_workflow" ] || [ "$candidate" -nt "$newest_workflow" ]; then
+      newest_workflow=$candidate
+    fi
+    candidate_pid=$(ps -axo pid=,command= | awk -v candidate="$candidate" '
+      /[s]cisaurus\.cli run-composer/ && index($0, candidate) {
+        print $1
+        exit
+      }
+    ')
+    if [ -n "$candidate_pid" ]; then
+      running_workflow=$candidate
+      running_pid=$candidate_pid
+    fi
+  done
+  workflow=${running_workflow:-$newest_workflow}
+fi
+
+if [ -z "$workflow" ] || [ ! -f "$workflow" ]; then
+  echo "No Composer workflow found under local-private/. Set SCISAURUS_COMPOSER_WORKFLOW to choose one." >&2
+  exit 1
+fi
+
+if [ -z "${running_pid:-}" ]; then
+  running_pid=$(ps -axo pid=,command= | awk -v workflow="$workflow" '
+    /[s]cisaurus\.cli run-composer/ && index($0, workflow) {
+      print $1
+      exit
+    }
+  ')
+fi
 
 if [ -n "$running_pid" ]; then
-  echo "Composer already running (PID $running_pid); no duplicate started."
+  echo "Composer already running for $workflow (PID $running_pid); no duplicate started."
   exit 0
 fi
 
-exec local-private/autolab/resume.sh "$@"
+export PATH=/opt/homebrew/bin:$PATH
+set -a
+if [ -f local-private/ollama-cloud.env ]; then
+  . local-private/ollama-cloud.env
+fi
+if [ -n "${SCISAURUS_QWEN_ENV_FILE:-}" ] && [ -f "$SCISAURUS_QWEN_ENV_FILE" ]; then
+  . "$SCISAURUS_QWEN_ENV_FILE"
+fi
+if [ -f local-private/openalex.env ]; then
+  . local-private/openalex.env
+fi
+set +a
+
+exec "$python_bin" -m scisaurus.cli run-composer --workflow "$workflow" --resume "$@"

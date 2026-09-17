@@ -8,9 +8,10 @@ from unittest.mock import patch
 
 from scisaurus.core.errors import QuotaExceededError, ValidationError
 from scisaurus.runtime.literature import ProviderCooldownError
-from scisaurus.runtime.models import ModelCallError, ModelResult
+from scisaurus.runtime.models import ModelCallError, ModelResult, estimate_input_tokens
 from scisaurus.runtime.topic_discovery import (
     MAX_BOUNDED_TOPIC_ATTEMPTS,
+    SYSTEM,
     PORTFOLIO_DIMENSIONS,
     SCHEMA_VERSION,
     STAGE_CONFIG_SCHEMA_VERSION,
@@ -31,6 +32,7 @@ from scisaurus.runtime.topic_discovery import (
     topic_prompt,
     _anchor_frontier_seed_queries,
     _anchor_topic_candidate_queries,
+    _grounding_eligible_frontier_seeds,
     _merge_candidate_source_records,
     _materialize_foundry_capability_requirements,
     _materialize_foundry_feasibility,
@@ -576,6 +578,48 @@ class TopicDiscoveryTests(unittest.TestCase):
         review["scores"]["mechanism_depth"] = 1
         self.assertFalse(topic_maturity_admitted(review))
 
+    def test_generated_direction_slot_id_does_not_block_a_different_question(self):
+        prior = {
+            "topic_id": "direction_2",
+            "title": "Charging protection in Majorana islands",
+            "domain": "topological superconductivity",
+            "research_question": "Where does charging energy protect a zero-bias peak?",
+            "research_form": "scaling_boundary",
+            "evidence_mode": "analytical_derivation",
+            "comparison_type": "cross_method",
+        }
+        candidate = {
+            "id": "direction_2",
+            "title": "Chemotactic colony branching threshold",
+            "domain": "microbial ecology",
+            "research_question": "Does membrane-potential coupling change branching in chemotactic bacterial colonies?",
+            "research_form": "observational_reanalysis",
+            "evidence_mode": "published_observations",
+            "comparison_type": "causal_contrast",
+        }
+        self.assertTrue(validate_topic_novelty(candidate, {"entries": [prior]}))
+
+    def test_subject_shaped_generated_id_is_not_a_scientific_identity(self):
+        prior = {
+            "topic_id": "direction_qft_topology_scaling",
+            "title": "Topological susceptibility scaling",
+            "domain": "quantum field theory",
+            "research_question": "Does susceptibility follow a universal temperature scaling form?",
+            "research_form": "theory_simulation",
+            "evidence_mode": "published_observations",
+            "comparison_type": "replication",
+        }
+        candidate = {
+            "id": "direction_qft_topology_scaling",
+            "title": "Finite-size estimator bias near deconfinement",
+            "domain": "quantum field theory",
+            "research_question": "Does an instanton-size cutoff alter estimator bias across lattice extent?",
+            "research_form": "methodological_benchmark",
+            "evidence_mode": "synthetic_simulation",
+            "comparison_type": "mechanism_ablation",
+        }
+        self.assertTrue(validate_topic_novelty(candidate, {"entries": [prior]}))
+
     def test_topic_portfolio_profile_tracks_research_shape(self):
         value = package("Choose a feasible research direction")
         profile = topic_portfolio_profile(value["candidates"])
@@ -794,6 +838,32 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(payload["portfolio_requirements"]["minimum_distinct_research_forms"], 4)
         self.assertIn("research_form", payload["output_contract"]["candidate"])
         self.assertEqual(payload["previous_candidate_directions"][0]["status"], "rejected")
+
+    def test_topic_prompt_applies_computational_native_preferences(self):
+        payload = json.loads(topic_prompt(
+            "Choose a feasible research direction", 4,
+            runtime_context={
+                "topic_preferences": {
+                    "mode": "computational_native",
+                    "must_have": ["a quantitative estimand", "a known-limit check"],
+                    "avoid": ["a generic benchmark"],
+                },
+            }))
+        self.assertEqual(
+            payload["runtime_context"]["topic_preferences"]["mode"],
+            "computational_native")
+        self.assertTrue(any("computational-native" in item for item in payload["constraints"]))
+        self.assertTrue(any("known-limit check" in item for item in payload["constraints"]))
+        self.assertTrue(any("generic benchmark" in item for item in payload["constraints"]))
+
+    def test_candidate_prompt_excludes_frontier_seeds_without_source_records(self):
+        seeds = frontier_plan(4)["seeds"]
+        papers = [{"work_id": "W1", "frontier_seed_id": "frontier_0"},
+                  {"work_id": "W2", "frontier_seed_id": "frontier_1"},
+                  {"work_id": "W3", "frontier_seed_id": "frontier_2"}]
+        eligible = _grounding_eligible_frontier_seeds(seeds, papers, 4)
+        self.assertEqual([item["id"] for item in eligible],
+                         ["frontier_0", "frontier_1", "frontier_2"])
 
     def test_topic_prompt_exposes_source_seed_pivot_requirement(self):
         from scisaurus.runtime.topic_discovery import topic_prompt
@@ -1090,6 +1160,59 @@ class TopicDiscoveryTests(unittest.TestCase):
         event = budget.snapshot()["events"][0]
         self.assertEqual(event["kind"], "model")
         self.assertGreater(event["estimated_input_tokens"], 0)
+
+    def test_topic_refinement_prompt_stays_inside_qwen_context_after_compaction(self):
+        large = "evidence span " * 5000
+        papers = [{
+            "work_id": f"W{index}", "title": f"Paper {index}",
+            "abstract": large, "authors": large, "doi": f"10.1000/{index}",
+            "frontier_seed_id": "seed-1", "frontier_domain": "soft matter",
+            "matched_query": large, "source_url": "https://example.invalid/work",
+            "year": 2025,
+        } for index in range(24)]
+        candidate = {
+            "id": "direction_1", "title": large, "domain": "soft matter",
+            "research_question": large, "research_form": "theory_simulation",
+            "evidence_mode": "synthetic_simulation", "comparison_type": "cross_method",
+        }
+        history = [{
+            "attempt": index, "status": "rejected", "selected_id": "direction_1",
+            "selected_topic": candidate, "error": large,
+            "candidate_signatures": [{"question_tokens": list(range(2000)), "title_tokens": list(range(2000))}],
+            "source_challenge": {"rationale": large, "required_changes": [large] * 12},
+        } for index in range(24)]
+        runtime = {
+            "topic_history": {"schema_version": "topic-history-1", "entries": history},
+            "project_files": [large] * 80,
+            "independent_specialist_reports": [{
+                "assigned_role": "research.adversary", "role_id": "adversary",
+                "decision": "hold", "summary": large,
+                "findings": [large] * 10, "evidence_gaps": [large] * 10,
+                "requested_actions": [large] * 10,
+            } for _ in range(12)],
+            "experiment_catalog": [{"id": "cap-1", "design_template": {"detail": large}}],
+        }
+        refinement = {
+            "mode": "refinement", "cycle": 3, "parent_topic_id": "direction_1",
+            "parent_candidate_index": 1, "changed_dimensions": ["mechanism"],
+            "require_frontier_seed_pivot": True, "rejected_frontier_seed_ids": ["seed-1"],
+            "parent_topic": {**candidate, "mechanism": large, "resource_plan": large},
+            "refinement_feedback": {
+                "review_type": "specialist_verifier", "decision": "hold",
+                "rationale": large, "required_changes": [large] * 12,
+                "critical_findings": [large] * 12,
+            },
+            "survey_feedback": {"gap_state": "insufficient_evidence", "evidence": {"gap": large}},
+            "specialist_feedback": runtime["independent_specialist_reports"],
+        }
+        prompt = topic_prompt(
+            "Find a computationally executable scientific question", 4,
+            recent_papers=papers, frontier_seeds=frontier_plan(),
+            runtime_context=runtime, refinement_context=refinement,
+            candidate_history=history, rejected_candidate_directions=history,
+            portfolio_seed=7,
+        )
+        self.assertLess(estimate_input_tokens(SYSTEM, prompt), 56000)
 
     def test_topic_sampling_rejects_single_token_provider_false_positives(self):
         class MixedRelevanceOpenAlex:

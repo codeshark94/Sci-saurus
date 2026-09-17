@@ -85,12 +85,36 @@ def _positive_number(value, name):
         raise ValidationError(f"{name} must be finite and positive")
 
 
+def _validate_topic_preferences(value):
+    """Validate optional scientific topic-selection preferences.
+
+    Preferences narrow the search objective without replacing the evidence,
+    maturity, or feasibility gates applied to the selected topic.
+    """
+    allowed = {"mode", "must_have", "avoid"}
+    if (not isinstance(value, dict) or "mode" not in value
+            or set(value) - allowed):
+        raise ValidationError(
+            "workflow topic_preferences requires mode and permits must_have and avoid")
+    if value["mode"] not in {"general", "computational_native"}:
+        raise ValidationError(
+            "workflow topic_preferences.mode must be general or computational_native")
+    for field in ("must_have", "avoid"):
+        items = value.get(field, [])
+        if (not isinstance(items, list) or len(items) > 12
+                or any(not isinstance(item, str) or not item.strip() or len(item) > 240
+                       for item in items)):
+            raise ValidationError(
+                f"workflow topic_preferences.{field} must be a list of at most twelve nonempty strings of 240 characters or fewer")
+
+
 def validate_workflow(value):
     """Validate the immutable composer workflow contract."""
     fields = {"schema_version", "id", "revision", "project_id", "objective", "stages", "time_policy", "completion"}
     allowed_fields = fields | {"retry_policy", "continuation_policy", "organization", "exploration_seed",
                                "topic_reuse_allowed", "experiment_catalog", "topic_exclusions",
-                               "topic_history_path", "capability_foundry_config_path"}
+                               "topic_history_path", "capability_foundry_config_path",
+                               "topic_preferences"}
     if not isinstance(value, dict) or set(value) - allowed_fields or not fields.issubset(value):
         raise ValidationError(
             f"composer workflow requires {sorted(fields)} and permits ['continuation_policy', 'exploration_seed', 'organization', 'retry_policy', 'topic_reuse_allowed', 'experiment_catalog', 'topic_exclusions', 'topic_history_path']")
@@ -106,6 +130,8 @@ def validate_workflow(value):
         raise ValidationError("workflow exploration_seed must be a non-negative integer when configured")
     if "topic_reuse_allowed" in value and type(value["topic_reuse_allowed"]) is not bool:
         raise ValidationError("workflow topic_reuse_allowed must be Boolean when configured")
+    if "topic_preferences" in value:
+        _validate_topic_preferences(value["topic_preferences"])
     if "topic_history_path" in value:
         history_path = value["topic_history_path"]
         if not isinstance(history_path, str) or not history_path.strip():
@@ -450,6 +476,12 @@ class ComposerRunner:
 
     def _record_failed_stage_usage(self, error):
         """Merge bounded work consumed by a failed stage into run accounting."""
+        # A Composer-level budget admission failure reports the observed
+        # ledger snapshot in its diagnostics.  That snapshot is not work
+        # performed by this failed attempt and must not be charged a second
+        # time as if it were a fresh provider call.
+        if bool(getattr(error, "usage_is_snapshot", False)):
+            return {key: 0 for key in self.usage}
         usage = getattr(error, "usage", None)
         if not isinstance(usage, dict) or not usage:
             snapshot = getattr(error, "topic_budget", None)
@@ -463,6 +495,131 @@ class ComposerRunner:
                 self.usage[key] += value
                 actual[key] = value
         return actual
+
+    @staticmethod
+    def _topic_attempt_usage(attempt):
+        """Return the topic runner usage for one attempt, excluding reviewers.
+
+        A successful Composer attempt stores both the core topic intake and
+        the independently admitted specialist pool in ``usage``.  The topic
+        descriptor's intake quota governs the runner itself, so prefer its
+        explicit budget snapshot and fall back to the durable output for
+        checkpoints written before that field existed.
+        """
+        if not isinstance(attempt, dict):
+            return {}
+        direct = attempt.get("topic_usage")
+        if isinstance(direct, dict):
+            return direct
+        project_dir = attempt.get("project_dir")
+        if isinstance(project_dir, str):
+            output = Path(project_dir) / "topic-discovery.json"
+            if output.is_file():
+                try:
+                    body = json.loads(output.read_text())
+                except (OSError, TypeError, ValueError):
+                    body = None
+                if isinstance(body, dict) and isinstance(body.get("budget"), dict):
+                    usage = body["budget"].get("usage")
+                    if isinstance(usage, dict):
+                        return usage
+        usage = attempt.get("usage")
+        return usage if isinstance(usage, dict) else {}
+
+    @classmethod
+    def _sum_topic_attempt_usage(cls, attempts, *, scope="all"):
+        """Sum observed topic work across isolated attempts.
+
+        Topic discovery receives a fresh local ``TopicBudget`` for each
+        scientific pivot, but the Composer mission owns the aggregate ceiling.
+        Missing usage is treated as zero here; an interrupted provider call is
+        already represented as ``unknown`` and is reconciled separately by the
+        stage/task lease machinery.
+        """
+        totals = {
+            "model_calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "openalex_requests": 0,
+        }
+        if not isinstance(attempts, list):
+            return totals
+        for attempt in attempts:
+            if not isinstance(attempt, dict):
+                continue
+            cycle = attempt.get("cycle", 0)
+            if scope == "intake" and cycle not in (None, 0):
+                continue
+            if scope == "continuation" and not (isinstance(cycle, int) and cycle > 0):
+                continue
+            usage = cls._topic_attempt_usage(attempt)
+            for key in totals:
+                value = usage.get(key, 0)
+                if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                    totals[key] += value
+        return totals
+
+    def _topic_budgets_for_attempt(self, stage_id, configured_budgets, *, scope="intake"):
+        """Return the remaining mission budget for one fresh topic intake.
+
+        The topic runner's bounded repair budget is intentionally local so a
+        rejected direction can be abandoned cleanly. The Composer carries a
+        separate workflow-level ceiling for initial intake and deliberate
+        continuation work, preventing a deadline-governed policy from
+        multiplying provider work while preserving a real repair path after a
+        reviewer hold.
+        """
+        if not isinstance(configured_budgets, dict) or not configured_budgets:
+            return configured_budgets
+        record = self.stage_records.get(stage_id, {})
+        observed = self._sum_topic_attempt_usage(record.get("attempts", []), scope=scope)
+        usage_by_budget = {
+            "max_model_calls": "model_calls",
+            "max_openalex_requests": "openalex_requests",
+            "max_input_tokens": "input_tokens",
+            "max_output_tokens": "output_tokens",
+        }
+        remaining = deepcopy(configured_budgets)
+        for budget_key, usage_key in usage_by_budget.items():
+            if budget_key not in configured_budgets:
+                continue
+            limit = configured_budgets[budget_key]
+            used = observed[usage_key]
+            available = limit - used
+            if available < 1:
+                diagnostics = [{
+                    "kind": "composer_topic_budget",
+                    "stage_id": stage_id,
+                    "dimension": usage_key,
+                    "limit": limit,
+                    "observed": used,
+                    "scope": "mission",
+                }]
+                quota_error = QuotaExceededError(
+                    "topic discovery mission quota exhausted: "
+                    f"{usage_key}={used}, limit={limit}",
+                    dimension=usage_key,
+                    limit=limit,
+                    observed=used,
+                    # ``observed`` is a diagnostic snapshot, not consumption
+                    # caused by the attempted admission itself.
+                    usage={},
+                    diagnostics=diagnostics,
+                )
+                quota_error.usage_is_snapshot = True
+                quota_error.topic_budget_scope = scope
+                raise quota_error
+            remaining[budget_key] = int(available)
+        return remaining
+
+    @staticmethod
+    def _is_topic_intake_retry(error, stage):
+        """Return whether a failed topic intake has a scientific pivot path."""
+        return (
+            stage.get("kind") == "topic_discovery"
+            and isinstance(error, QuotaExceededError)
+            and bool(getattr(error, "retryable_topic_intake", False))
+        )
 
     def _remaining(self):
         remaining = self.deadline - self.clock()
@@ -691,6 +848,163 @@ class ComposerRunner:
             policy["mode"] = "bounded"
         return policy
 
+    def _autonomous_recovery_request(self, stage_id, context):
+        """Synthesize a new scoped move when a scientific hold gives no order.
+
+        A stage-level ``hold`` is a result of the current attempt, not an
+        instruction for a person to decide what happens next.  Reviewers and
+        legacy runners do not always emit a typed research request, so the
+        control plane derives one from the stage kind and the recorded
+        blocker.  The cycle-specific strategy changes the work itself and
+        gives the next attempt a reason to diverge instead of replaying the
+        same prompt.  Environmental failures are deliberately excluded: they
+        are handled by the provider cooldown, quota, and deadline fences.
+        """
+        if not isinstance(context, dict):
+            return None
+        stage_record = self.stage_records.get(stage_id, {})
+        stage_kind = context.get("kind") or stage_record.get("kind")
+        if stage_kind not in {"topic_discovery", "survey", "experiment",
+                              "interpretation", "argument", "paper"}:
+            return None
+        if context.get("status") not in STAGE_HOLD_STATUSES:
+            return None
+
+        cycle = self.continuation_cycles + 1
+        strategies = {
+            "topic_discovery": (
+                "abandon the rejected framing or frontier seed when necessary and pivot to an orthogonal mechanism, boundary, or observable",
+                "change the evidence mode and comparison while preserving only the supported scientific core",
+                "reframe the question around a discriminating prediction and a declared analytic or computational limit",
+                "search a neighboring phenomenon with a different measurement and an explicit falsification test",
+            ),
+            "survey": (
+                "expand exact terminology and citation chaining from primary studies",
+                "search contradictory findings and neighboring terminology, then capture full-text evidence",
+                "trace methods and results spans from the most relevant papers instead of adding abstract-only records",
+                "run a boundary-focused counter-search across an adjacent field and reconcile identities before admission",
+            ),
+            "experiment": (
+                "run a discriminating control or null-model comparison",
+                "sweep the declared boundary and test whether the effect survives the relevant regimes",
+                "perform an analytic-limit and sensitivity check with an independent recalculation",
+                "change the measurement or baseline so the competing explanations make different predictions",
+            ),
+            "interpretation": (
+                "construct the strongest alternative mechanism and identify its discriminating observable",
+                "separate observation from mechanism across the declared parameter regimes",
+                "recalculate the interpretation at the analytic limit and state the boundary of inference",
+                "relink every material claim to evidence and downgrade any explanation the data cannot distinguish",
+            ),
+            "argument": (
+                "rebuild the claim-evidence graph around the strongest supported result",
+                "reorder the narrative around the decisive comparison and expose the main limitation",
+                "remove unsupported causal steps and add the missing mechanism-to-observation bridge",
+                "write a competing explanation and show exactly which evidence favors or fails to favor it",
+            ),
+            "paper": (
+                "recompose the manuscript around the accepted evidence and the unresolved reviewer findings",
+                "repair the weakest claim-evidence links and make all scope boundaries explicit",
+                "rebuild the results and discussion transitions so observations are not presented as mechanisms",
+                "perform a publication-level rejection pass, then revise every retained blocking finding",
+            ),
+        }
+        strategy = strategies[stage_kind][(cycle - 1) % len(strategies[stage_kind])]
+
+        evidence = []
+        verifier = context.get("specialist_verifier")
+        response = verifier.get("response") if isinstance(verifier, dict) else None
+        if not isinstance(response, dict):
+            response = {}
+        for key in ("repair_scope", "critical_findings", "required_changes"):
+            value = response.get(key)
+            if isinstance(value, list):
+                evidence.extend(str(item).strip() for item in value if str(item).strip())
+        for key in ("rationale", "error", "gap_state", "topic_admission", "review_status"):
+            value = response.get(key) if key in response else context.get(key)
+            if isinstance(value, str) and value.strip():
+                evidence.append(value.strip())
+        evidence_text = "; ".join(dict.fromkeys(evidence))
+        if not evidence_text:
+            evidence_text = "the current stage returned a scientific hold without a typed repair request"
+        evidence_text = evidence_text[:1800]
+
+        base = re.sub(r"[^a-z0-9_.-]+", "-", str(stage_id).casefold()).strip("-")
+        base = base[:24] or "stage"
+        request_id = f"auto-{base}-recovery-{cycle}"
+        if stage_kind == "topic_discovery":
+            return {
+                "id": request_id,
+                "kind": "topic_refinement",
+                "owner": "research.intelligence",
+                "objective": (
+                    f"Generate and independently review a materially different research question: {strategy}."
+                ),
+                "why": (
+                    "The topic stage produced a scientific hold without a complete typed repair order. "
+                    f"Recovery cycle {cycle} must change the research direction, not its wording."
+                ),
+                "success_condition": (
+                    "A source-grounded topic package addresses the recorded blocker, survives maturity and adversarial review, and is admitted before survey."
+                ),
+                "evidence_needed": evidence_text,
+                "source_stage_id": stage_id,
+            }
+        if stage_kind == "survey":
+            return {
+                "id": request_id,
+                "kind": "literature_expansion",
+                "owner": "research.intelligence",
+                "objective": (
+                    f"Re-run the literature stage with a changed retrieval strategy: {strategy}. "
+                    "Update the gap assessment from identity-reconciled primary and full-text evidence."
+                ),
+                "why": f"The survey hold was not accompanied by an executable repair order. Recorded blocker: {evidence_text}",
+                "success_condition": (
+                    "The refreshed survey either establishes an experiment-worthy gap or emits evidence for a substantive topic redesign."
+                ),
+                "evidence_needed": "Primary-study records, citation-chain results, full-text spans, contradiction checks, and a refreshed gap assessment.",
+                "source_stage_id": stage_id,
+            }
+        if stage_kind == "experiment":
+            return {
+                "id": request_id,
+                "kind": "additional_experiment",
+                "owner": "methods.validation",
+                "objective": (
+                    f"Run a fresh discriminating analysis or experiment: {strategy}. Preserve raw observations and independently recalculate the primary estimand."
+                ),
+                "why": f"The methods stage returned a scientific hold without a complete typed repair order. Recorded blocker: {evidence_text}",
+                "success_condition": "The new declared control, boundary, or sensitivity result separates the retained explanations or records why it cannot.",
+                "evidence_needed": "Versioned raw output, prespecified control or baseline, primary estimand, independent recalculation, and limitations.",
+                "source_stage_id": stage_id,
+            }
+        if stage_kind in {"interpretation", "argument"}:
+            return {
+                "id": request_id,
+                "kind": "interpretation_expansion",
+                "owner": "strategy.interpretation",
+                "objective": (
+                    f"Rebuild the scientific interpretation and downstream argument: {strategy}. Keep unsupported mechanisms provisional."
+                ),
+                "why": f"The strategy stage returned a scientific hold without a complete typed repair order. Recorded blocker: {evidence_text}",
+                "success_condition": "Every material claim is linked to an observation or source, alternatives are separated, and the independent reviewer accepts the revised argument.",
+                "evidence_needed": "Claim-evidence graph, competing explanations, boundary conditions, recalculated results, and explicit uncertainty language.",
+                "source_stage_id": stage_id,
+            }
+        return {
+            "id": request_id,
+            "kind": "manuscript_revision",
+            "owner": "editorial.composer",
+            "objective": (
+                f"Recompose and re-review the manuscript after the scientific hold: {strategy}. Preserve accepted results and repair the evidence chain."
+            ),
+            "why": f"The paper stage returned a hold without a complete typed repair order. Recorded blocker: {evidence_text}",
+            "success_condition": "The independent reviewer and editor accept the revised manuscript with no unresolved blocking finding or research request.",
+            "evidence_needed": "Current manuscript, reviewer findings, accepted evidence map, revision ledger, and a fresh rendered PDF check.",
+            "source_stage_id": stage_id,
+        }
+
     def _continuation_requests(self):
         """Collect validated research requests that can reopen a scoped stage.
 
@@ -705,14 +1019,11 @@ class ComposerRunner:
         for stage_id, context in self.context.items():
             if not isinstance(context, dict):
                 continue
-            has_candidates = False
             containers = []
             for label in ("research_expansion_requests", "research_requests"):
                 if label not in context or context[label] is None:
                     continue
                 value = context[label]
-                has_candidates = has_candidates or (
-                    bool(value) if isinstance(value, list) else True)
                 containers.append((label, value))
             for label, candidates in containers:
                 if not isinstance(candidates, list):
@@ -760,54 +1071,24 @@ class ComposerRunner:
                         continue
                     requests.append(item)
                     seen.add(request_id)
-            if context.get("status") == "review_rejected" and not has_candidates:
-                # A specialist verifier hold belongs to the stage that was
-                # reviewed.  In particular, a rejected topic must return to
-                # topic discovery with the verifier's repair scope; treating
-                # every rejection as a manuscript revision can leave the
-                # rejected topic marked complete and admit its survey.
-                if context.get("kind") == "topic_discovery":
-                    verifier = context.get("specialist_verifier", {})
-                    response = (verifier.get("response", {})
-                                if isinstance(verifier, dict) else {})
-                    repair_scope = (response.get("repair_scope", [])
-                                    if isinstance(response, dict) else [])
-                    if not isinstance(repair_scope, list):
-                        repair_scope = []
-                    repair_scope = [str(item).strip() for item in repair_scope
-                                    if isinstance(item, str) and item.strip()]
-                    if not repair_scope:
-                        repair_scope = [
-                            "Resolve every blocking finding from the independent topic verifier and resubmit a source-grounded question."
-                        ]
-                    item = {
-                        "id": f"{stage_id}-topic-refinement",
-                        "kind": "topic_refinement",
-                        "owner": "research.intelligence",
-                        "objective": "Repair the rejected topic using the independent verifier findings, then generate and review a materially improved research question before admitting literature survey.",
-                        "why": "The topic's independent adversarial review found unresolved scientific or evidence-grounding blockers.",
-                        "success_condition": "A fresh topic package addresses the verifier repair scope, survives independent specialist review, and only then admits survey.",
-                        "evidence_needed": "; ".join(repair_scope),
-                        "source_stage_id": stage_id,
-                    }
-                    if self._research_request_signature(item) not in self._attempted_request_signatures:
+            if context.get("status") in STAGE_HOLD_STATUSES:
+                # A hold with a valid request is routed as emitted.  If the
+                # request was malformed, empty, or already attempted, create
+                # a cycle-specific strategy so the lab still has a concrete
+                # next move instead of escalating an ordinary scientific
+                # judgment to a person.
+                stage_requests = [
+                    item for item in requests
+                    if isinstance(item, dict) and item.get("source_stage_id") == stage_id
+                ]
+                if not stage_requests:
+                    item = self._autonomous_recovery_request(stage_id, context)
+                    if (isinstance(item, dict)
+                            and item.get("id") not in seen
+                            and self._research_request_signature(item)
+                            not in self._attempted_request_signatures):
                         requests.append(item)
-                elif context.get("kind") == "paper":
-                    # A paper rejection is the one case where a generic
-                    # editorial reconsideration is the correct fallback.
-                    request_id = f"{stage_id}-editorial-reconsideration"
-                    item = {
-                        "id": request_id,
-                        "kind": "manuscript_revision",
-                        "owner": "editorial.composer",
-                        "objective": "Reopen the manuscript with a fresh reviewer-facing composition attempt.",
-                        "why": "The bounded editorial cycle ended with material findings still unresolved.",
-                        "success_condition": "The same reviewer panel accepts the revised incumbent and the editor-in-chief records acceptance.",
-                        "evidence_needed": "The prior draft, review findings, and every surgical repair remain available in the manuscript project.",
-                        "source_stage_id": stage_id,
-                    }
-                    if self._research_request_signature(item) not in self._attempted_request_signatures:
-                        requests.append(item)
+                        seen.add(item["id"])
         return requests
 
     @staticmethod
@@ -1074,13 +1355,23 @@ class ComposerRunner:
             } if foundry_enabled else {"enabled": False}),
             "topic_exclusions": self._effective_topic_exclusions(),
             "topic_history": self._topic_history_context(),
+            "topic_preferences": deepcopy(self.workflow.get("topic_preferences") or {}),
             "project_files": project_files,
             "project_scoped_execution": True,
         }
 
-    def _topic_sampling_seed(self):
-        """Derive a stable per-cycle seed from the mission exploration seed."""
-        material = f"{self.exploration_seed}:topic:{self.continuation_cycles}".encode("utf-8")
+    def _topic_sampling_seed(self, *, attempt_number=0):
+        """Derive a stable but attempt-diverse topic sampling seed.
+
+        Resume keeps the mission seed, while each isolated topic intake gets
+        its own deterministic branch. Without the attempt component, a
+        provider that honors the seed can replay the same rejected direction
+        indefinitely even after the Composer has persisted its reason.
+        """
+        material = (
+            f"{self.exploration_seed}:topic:{self.continuation_cycles}:"
+            f"attempt:{attempt_number}"
+        ).encode("utf-8")
         # The digest is intentionally wide for entropy, then reduced to the
         # signed-int64 range accepted by the configured model endpoint.
         from scisaurus.runtime.models import MAX_PROVIDER_SEED
@@ -1187,9 +1478,16 @@ class ComposerRunner:
         capability_ids = list(configured.get("capability_ids", [])) if isinstance(configured, dict) else []
         topic_ids = list(configured.get("topic_ids", [])) if isinstance(configured, dict) else []
         entries = self.topic_history.get("entries", [])
+        # A model-generated portfolio slot is not a durable scientific
+        # identity.  Keep it in the bounded history projection for semantic
+        # repeat checks, but do not turn its subject-shaped label into an
+        # exact-match exclusion.  Explicit workflow exclusions remain exact.
+        from scisaurus.runtime.topic_discovery import _is_generated_slot_topic_id
         for entry in entries:
             topic_id = entry.get("topic_id") if isinstance(entry, dict) else None
-            if isinstance(topic_id, str) and topic_id and topic_id not in topic_ids:
+            if (isinstance(topic_id, str) and topic_id
+                    and not _is_generated_slot_topic_id(topic_id)
+                    and topic_id not in topic_ids):
                 topic_ids.append(topic_id)
         catalog_ids = [
             item.get("id") for item in self.workflow.get("experiment_catalog", [])
@@ -2718,6 +3016,7 @@ class ComposerRunner:
         """Record a retry decision before dispatching the next isolated attempt."""
         policy = self._retry_policy()
         event_id = f"composer-retry-{stage['id']}-{attempt_number}"
+        topic_pivot = bool(getattr(error, "retryable_topic_intake", False))
         feedback = {
             "event_id": event_id,
             "stage_id": stage["id"],
@@ -2732,7 +3031,13 @@ class ComposerRunner:
             "max_attempts": policy.get("max_attempts") if policy.get("mode", "bounded") == "bounded" else None,
             "delay_seconds": delay_seconds,
             "error": f"{type(error).__name__}: {error}",
-            "next_condition": "dispatch a fresh isolated stage attempt within the Composer hard deadline",
+            "retry_reason": (getattr(error, "topic_retry_reason", None)
+                             if topic_pivot else "transient_stage_failure"),
+            "next_condition": (
+                "abandon the rejected direction and sample a fresh topic portfolio within the remaining mission budget"
+                if topic_pivot else
+                "dispatch a fresh isolated stage attempt within the Composer hard deadline"
+            ),
             "stage_deadline_seconds": stage["deadline_seconds"],
             "dependencies": list(stage["depends_on"]),
             "message_id": event_id,
@@ -3822,6 +4127,16 @@ class ComposerRunner:
                     or any(item.get("kind") == "paper" for item in self.workflow["stages"])):
                 maturity_rounds = 2
             try:
+                continuation_scope = bool(
+                    stage["id"] in self.reopened_stage_ids and self.continuation_cycles)
+                configured_topic_budgets = (
+                    descriptor.get("continuation_budgets")
+                    if continuation_scope and descriptor.get("continuation_budgets")
+                    else descriptor.get("budgets")
+                )
+                topic_budgets = self._topic_budgets_for_attempt(
+                    stage["id"], configured_topic_budgets,
+                    scope="continuation" if continuation_scope else "intake")
                 topic_kwargs = dict(
                     objective=self.workflow["objective"],
                     candidate_count=descriptor["candidate_count"],
@@ -3829,8 +4144,8 @@ class ComposerRunner:
                     repair_mode=descriptor.get("repair_mode", "bounded"),
                     runtime_context=self._runtime_context(model),
                     bibliography=descriptor.get("bibliography"),
-                    budgets=descriptor.get("budgets"),
-                    sampling_seed=self._topic_sampling_seed(),
+                    budgets=topic_budgets,
+                    sampling_seed=self._topic_sampling_seed(attempt_number=attempt_number),
                     maturity_review_rounds=maturity_rounds,
                     refinement_context=self._topic_refinement_context(stage),
                 )
@@ -3842,9 +4157,12 @@ class ComposerRunner:
             except ProviderCooldownError:
                 raise
             except ValidationError as exc:
-                # A bounded topic descriptor owns its repair budget.  Do not
-                # let the outer Composer retry loop recreate a fresh budget
-                # indefinitely after that bounded intake has failed.
+                # The bounded descriptor owns one isolated intake. A
+                # scientifically rejected direction is still recoverable at
+                # the Composer level, where the next attempt receives a fresh
+                # sampling boundary and the remaining mission budget. Only
+                # the topic runner's explicit evidence trace can authorize
+                # that pivot; authentication/provider failures remain hard.
                 if (descriptor.get("budgets")
                         and descriptor.get("repair_mode", "bounded") == "bounded"):
                     snapshot = getattr(exc, "topic_budget", {})
@@ -3857,6 +4175,11 @@ class ComposerRunner:
                         usage=snapshot.get("usage", {}),
                         diagnostics=snapshot.get("events", []),
                     )
+                    recoverable = bool(getattr(exc, "topic_intake_recoverable", False))
+                    setattr(quota_error, "retryable_topic_intake", recoverable)
+                    setattr(quota_error, "topic_retry_reason",
+                            "scientific_candidate_rejected" if recoverable else "intake_failure")
+                    setattr(quota_error, "topic_budget", snapshot)
                     # Preserve the bounded runner's scientific trace when the
                     # Composer wraps its validation error as a quota error.
                     # Without this handoff, the run kept provider events but
@@ -4493,6 +4816,7 @@ class ComposerRunner:
                             attempt_history.append({
                                 "attempt_number": prior_record.get("attempt_number", len(attempt_history) + 1),
                                 "attempt_id": prior_record["attempt_id"],
+                                "cycle": self.continuation_cycles,
                                 "state": "unknown",
                                 "project_dir": prior_record.get("project_dir", stage["project_dir"]),
                                 "error": "Composer resumed after an incomplete stage attempt; outcome was not observed.",
@@ -4690,11 +5014,19 @@ class ComposerRunner:
                                         stage_kind=stage["kind"], outcome=outcome),
                                 })
                             self.continuation_pending_stage_ids.discard(stage_id)
+                            topic_usage = {}
+                            if isinstance(context.get("budget"), dict):
+                                topic_usage = context["budget"].get("usage", {})
+                            if not isinstance(topic_usage, dict):
+                                topic_usage = {}
                             attempt_history.append({
                                 "attempt_number": attempt_number,
                                 "attempt_id": attempt_id,
+                                "cycle": self.continuation_cycles,
                                 "state": "succeeded",
                                 "project_dir": attempt_stage["project_dir"],
+                                "usage": deepcopy(context.get("usage", {})),
+                                "topic_usage": deepcopy(topic_usage),
                                 "elapsed_seconds": self.clock() - attempt_started,
                             })
                             self.stage_records[stage_id] = {
@@ -4716,7 +5048,64 @@ class ComposerRunner:
                             last_error = exc
                             failure_usage = self._record_failed_stage_usage(exc)
                             provider_paused = isinstance(exc, ProviderCooldownError)
-                            quota_exhausted = isinstance(exc, QuotaExceededError)
+                            topic_intake_retry = self._is_topic_intake_retry(exc, stage)
+                            quota_exhausted = (
+                                isinstance(exc, QuotaExceededError)
+                                and not topic_intake_retry
+                            )
+                            if topic_intake_retry:
+                                rejected = getattr(exc, "rejected_topic_history", [])
+                                if not rejected:
+                                    for trace in reversed(
+                                            getattr(exc, "candidate_attempt_trace", [])):
+                                        selected = (
+                                            trace.get("selected_topic")
+                                            if isinstance(trace, dict) else None
+                                        )
+                                        if (not isinstance(selected, dict)
+                                                or not isinstance(selected.get("id"), str)):
+                                            continue
+                                        rejected = [{
+                                            "topic_id": selected["id"],
+                                            "title": selected.get("title"),
+                                            "domain": selected.get("domain"),
+                                            "research_question": selected.get("research_question"),
+                                            "research_form": selected.get("research_form"),
+                                            "evidence_mode": selected.get("evidence_mode"),
+                                            "comparison_type": selected.get("comparison_type"),
+                                            "rejection_type": "intake_validation",
+                                            "rejection_reason": str(exc)[:2048],
+                                        }]
+                                        break
+                                try:
+                                    self._record_topic_rejection_history(rejected)
+                                    self.department_activity.append({
+                                        "cycle": self.continuation_cycles,
+                                        "action": "pivot_topic_direction",
+                                        "stage_id": stage_id,
+                                        "attempt_number": attempt_number,
+                                        "rejected_topic_ids": [
+                                            item.get("topic_id") for item in rejected
+                                            if isinstance(item, dict)
+                                            and isinstance(item.get("topic_id"), str)
+                                        ],
+                                        "reason": getattr(
+                                            exc, "topic_retry_reason",
+                                            "scientific_candidate_rejected",
+                                        ),
+                                    })
+                                except Exception as history_error:
+                                    # A pivot without durable rejection memory
+                                    # could immediately rediscover the same
+                                    # weak direction. Preserve the failure and
+                                    # stop rather than weakening the exclusion
+                                    # contract silently.
+                                    topic_intake_retry = False
+                                    quota_exhausted = isinstance(exc, QuotaExceededError)
+                                    last_error = ValidationError(
+                                        "topic pivot history could not be persisted: "
+                                        f"{type(history_error).__name__}: {history_error}"
+                                    )
                             if stage_assignment is not None:
                                 try:
                                     assignment_result = self.departments.finish_stage(
@@ -4752,16 +5141,39 @@ class ComposerRunner:
                                     "command.composer", reason=str(exc))
                             except Exception:
                                 pass
-                            attempt_history.append({
+                            failed_attempt = {
                                 "attempt_number": attempt_number,
                                 "attempt_id": attempt_id,
+                                "cycle": self.continuation_cycles,
                                 "state": "failed",
                                 "project_dir": attempt_stage["project_dir"],
                                 "error": f"{type(exc).__name__}: {exc}",
                                 "usage": deepcopy(failure_usage),
+                                "retry_reason": (
+                                    getattr(exc, "topic_retry_reason", None)
+                                    if topic_intake_retry else None
+                                ),
                                 "elapsed_seconds": self.clock() - attempt_started,
-                            })
-                            retry_open = (not provider_paused and not quota_exhausted and (
+                            }
+                            if stage["kind"] == "topic_discovery":
+                                failed_attempt["topic_usage"] = deepcopy(failure_usage)
+                                for attribute in (
+                                        "candidate_attempt_trace",
+                                        "maturity_review_history",
+                                        "rejected_topic_history"):
+                                    value = getattr(exc, attribute, None)
+                                    if isinstance(value, list) and value:
+                                        # Keep the retry ledger useful to the
+                                        # dashboard without copying an
+                                        # unbounded provider response.
+                                        failed_attempt[attribute] = deepcopy(value[-24:])
+                            attempt_history.append(failed_attempt)
+                            # A known provider reset is a transient resource
+                            # condition in the autonomous deadline-governed
+                            # policy. The retry wait below honors its exact
+                            # reset boundary; bounded workflows retain the
+                            # explicit pause contract.
+                            retry_open = (not quota_exhausted and (
                                 retry_policy.get("mode", "bounded") == "until_deadline"
                                 or retry_index + 1 < retry_policy.get("max_attempts", 0)))
                             assignment_fields = {
@@ -4808,16 +5220,36 @@ class ComposerRunner:
                                     cooldown_blocker["usage"] = deepcopy(cooldown_usage)
                                 if isinstance(cooldown_diagnostics, list) and cooldown_diagnostics:
                                     cooldown_blocker["diagnostics"] = deepcopy(cooldown_diagnostics)
-                                self.blockers.append(cooldown_blocker)
-                                self.status = "paused"
-                                self._checkpoint(f"{stage_id}:provider_cooldown", force=True)
-                                return self._finish()
+                                if (retry_open
+                                        and retry_policy.get("mode", "bounded") == "until_deadline"):
+                                    # Keep the cooldown in the durable activity
+                                    # ledger without misclassifying it as a
+                                    # terminal blocker. The next retry waits
+                                    # until the provider reset boundary and
+                                    # then starts a fresh isolated attempt.
+                                    self.department_activity.append({
+                                        "cycle": self.continuation_cycles,
+                                        "action": "provider_cooldown_auto_retry",
+                                        "stage_id": stage_id,
+                                        "attempt_number": attempt_number,
+                                        "retry_after_seconds": retry_after,
+                                        "retry_after_epoch": cooldown_blocker["retry_after_epoch"],
+                                        "rate_limit": deepcopy(exc.rate_limit),
+                                        "next_condition": "wait for provider reset, then dispatch a fresh isolated attempt",
+                                    })
+                                    self._checkpoint(
+                                        f"{stage_id}:provider_cooldown_retrying", force=True)
+                                else:
+                                    self.blockers.append(cooldown_blocker)
+                                    self.status = "paused"
+                                    self._checkpoint(f"{stage_id}:provider_cooldown", force=True)
+                                    return self._finish()
                             self._checkpoint(f"{stage_id}:retrying" if retry_open else f"{stage_id}:failed", force=True)
                             if quota_exhausted:
-                                # The stage has consumed its declared work
-                                # budget.  In particular, do not let an
-                                # until-deadline Composer policy recreate a
-                                # fresh stage budget on the next retry.
+                                # Provider/mission quota exhaustion is a hard
+                                # stop. A local scientific intake exhaustion
+                                # deliberately does not enter this branch: it
+                                # authorizes a fresh direction instead.
                                 break
                         finally:
                             stop_live_progress()
