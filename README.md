@@ -69,20 +69,68 @@ Licensed under the [MIT License](LICENSE).
 
 ```mermaid
 flowchart LR
-    P[Principal<br/>objective + authority] --> C[Composer<br/>plan + allocate + supervise]
+    P[Principal<br/>objective + authority] --> C[Composer / Command<br/>plan · allocate · supervise]
     C --> R[Research<br/>questions + evidence]
-    R --> M[Methods<br/>experiment + controls]
-    M --> I[Strategy<br/>interpretation + argument]
-    I --> E[Editorial<br/>manuscript + release candidate]
-    O[Operations<br/>APIs + tools + environment] -. supports .-> R
+    C --> M[Methods<br/>experiments + controls]
+    C --> S[Strategy<br/>interpretation + argument]
+    C --> E[Editorial<br/>manuscript + release proposal]
+    O[Operations<br/>APIs · tools · environment] -. supports .-> R
     O -. supports .-> M
     O -. supports .-> E
-    V[Independent checks<br/>review + replay + verification] --> C
-    R --> V
-    M --> V
-    I --> V
-    E --> V
+    V[Independent checks<br/>review · replay · verification] -. verdicts and holds .-> C
+
+    classDef control fill:#e8edf5,stroke:#52657a,color:#17212b
+    classDef department fill:#f5f6f8,stroke:#68727d,color:#17212b
+    classDef support fill:#fafafa,stroke:#9aa3ad,color:#17212b
+    class C control
+    class R,M,S,E department
+    class P,O,V support
 ```
+
+The accountability map above is not an execution itinerary. Runtime selection
+is shown separately:
+
+```mermaid
+flowchart TB
+    C[Composer / Command] --> F{Adaptive agenda<br/>score the ready frontier}
+    F --> A[Admit one safe scoped action<br/>after dependency · quota · deadline checks]
+
+    subgraph G[Default paper mission]
+        direction TB
+        T[Topic<br/>explore · compare · refine]
+        S[Survey<br/>search · acquire · verify]
+        M[Experiment<br/>freeze · run · replay]
+        I[Interpretation<br/>explain · test alternatives]
+        R[Argument<br/>link claims to evidence]
+        P[Paper<br/>compose · review · propose release]
+        T -->|provisional direction| S
+        S -->|eligible evidence| M
+        M --> I --> R --> P
+    end
+
+    A -->|fresh free-topic mission| T
+    S -.-> Q
+    M -.-> Q
+    I -.-> Q
+    R -.-> Q
+    P -.-> Q
+    Q[Scoped repair work order<br/>gap · control · test · claim finding] -.-> F
+
+    classDef control fill:#e8edf5,stroke:#52657a,color:#17212b
+    classDef stage fill:#f5f6f8,stroke:#68727d,color:#17212b
+    classDef feedback fill:#f5f6f8,stroke:#68727d,color:#17212b
+    class C,F,A control
+    class T,S,M,I,R,P stage
+    class Q feedback
+    style G fill:#fbfcfd,stroke:#d0d5dd,color:#17212b
+```
+
+Solid arrows are scientific dependencies. Dotted arrows return a finding to
+the Composer for scoped repair and re-planning; they are not direct bypasses.
+For a fresh free-topic mission the first admission is Topic, while later
+admissions can target any currently dependency-ready stage. A run may revisit
+an earlier stage or pursue a parallel-ready repair without pretending that a
+later stage is already accepted.
 
 | Boundary | Responsibility |
 |---|---|
