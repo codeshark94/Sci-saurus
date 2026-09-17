@@ -1645,8 +1645,10 @@ class DepartmentRuntime:
 
     def finish_stage(self, stage_id, stage_kind, *, attempt_number=1, outcome,
                      output_ref=None, usage=None, error=None, actor="command.composer",
-                     specialist_results=None, verifier_result=None):
+                     specialist_results=None, verifier_result=None, failure_scope=None):
         """Close specialist assignments, then publish chief synthesis and an independent verdict."""
+        if failure_scope not in {None, "stage"}:
+            raise ValidationError(f"unsupported department failure scope: {failure_scope}")
         route = self.stage_route(stage_kind)
         rows = self._assignment_task_rows(stage_id=stage_id, attempt_number=attempt_number)
         if not rows:
@@ -1680,16 +1682,35 @@ class DepartmentRuntime:
                 # scopes. A chief/stage failure must not rewrite a specialist
                 # that already returned a known result as failed.
                 assignment_outcome = reported
+            elif failure_scope == "stage":
+                # The stage can fail before the admitted pool is dispatched
+                # (for example, a topic package can fail schema validation).
+                # These assignments reserved slots but produced no specialist
+                # result; marking them failed would falsely attribute the
+                # stage-level error to every role.
+                assignment_outcome = "not_evaluated"
             else:
                 assignment_outcome = "succeeded" if known_success else "failed"
+            execution_state = assignment_outcome
             if attempt_id and item.get("attempt_state") == "started":
                 if assignment_outcome == "result_unknown":
                     self.tasks.reconcile_unknown(attempt_id, actor)
+                elif assignment_outcome == "not_evaluated":
+                    # begin_stage reserves a task attempt before the stage
+                    # runner starts. Cancel that reservation explicitly when
+                    # no external specialist call was dispatched.
+                    self.tasks.finish_attempt(attempt_id, "cancelled", usage={})
+                    execution_state = "cancelled"
                 else:
                     self.tasks.finish_attempt(attempt_id, assignment_outcome,
                                               usage=(specialist or {}).get("usage", by_role_usage.get(item.get("role_id"), {})))
             if assignment_outcome == "result_unknown":
                 task_state = self.tasks.get(task_id)["state"]
+            elif assignment_outcome == "not_evaluated":
+                if task_state in {"queued", "running"}:
+                    task_state = self.tasks.transition(
+                        task_id, "blocked", actor,
+                        reason="stage failed before specialist evaluation")["state"]
             elif assignment_outcome == "succeeded":
                 if task_state == "running":
                     task_state = self.tasks.transition(task_id, "awaiting_review", actor,
@@ -1698,14 +1719,21 @@ class DepartmentRuntime:
                 task_state = self.tasks.transition(task_id, "failed", actor,
                                                    reason=str((specialist or {}).get("error") or error or outcome))["state"]
             role_usage = deepcopy((specialist or {}).get("usage", by_role_usage.get(item.get("role_id"), {})))
+            assignment_error = None
+            if assignment_outcome in {"failed", "result_unknown"}:
+                assignment_error = (specialist or {}).get("error") or (
+                    str(error) if error else None)
             result_body = {
                 "schema_version": "department-assignment-1", "project_id": self.project_id,
                 **{key: deepcopy(item[key]) for key in item if key not in {"task_state", "attempt_state", "attempt_usage"}},
                 "task_state": task_state, "attempt_state": assignment_outcome,
                 "outcome": assignment_outcome, "output_ref": str(output_ref) if output_ref else None,
+                "execution_state": execution_state,
+                "failure_scope": failure_scope,
                 "usage": role_usage,
                 "usage_scope": "role" if item.get("role_id") in by_role_usage else "stage_unattributed",
-                "stage_usage": deepcopy(stage_usage), "error": str(error) if error else None,
+                "stage_usage": deepcopy(stage_usage), "error": assignment_error,
+                "stage_error": str(error) if failure_scope == "stage" and error else None,
                 "execution_artifact_ref": (specialist or {}).get("artifact_ref"),
                 "verifier_agent": route["verifier_agent"], "updated_at": now_iso(),
             }
@@ -1763,11 +1791,21 @@ class DepartmentRuntime:
                 decision = verifier_response.get("decision") if isinstance(verifier_response, dict) else None
                 verifier_outcome = "accepted" if known_success and decision == "accept" else "hold" if known_success else "failed"
                 verifier_execution = "succeeded"
+        elif failure_scope == "stage" and not known_success:
+            # A verifier cannot independently assess a chief synthesis that
+            # was never produced. Keep the ledger explicit without fabricating
+            # a failed adversarial call.
+            verifier_outcome, verifier_execution = "not_evaluated", "not_started"
         else:
             verifier_outcome = "result_unknown" if unknown else "accepted" if known_success and outcome in {
                 "completed", "accepted", "candidate_needs_review"} else "hold" if known_success else "failed"
             verifier_execution = "succeeded" if verifier_outcome != "result_unknown" else "result_unknown"
-        if verifier_task["state"] == "queued":
+        if verifier_outcome == "not_evaluated":
+            if verifier_task["state"] in {"queued", "running"}:
+                verifier_task = self.tasks.transition(
+                    verifier_task_id, "blocked", actor,
+                    reason="stage failed before verifier dispatch")
+        elif verifier_task["state"] == "queued":
             self.tasks.start_attempt(
                 verifier_task_id, verifier_attempt_id, owner=route["verifier_agent"],
                 lease_ttl_seconds=max(1.0, min(float(verifier["deadline_seconds"]),
@@ -1811,6 +1849,7 @@ class DepartmentRuntime:
             "assignment_refs": [item["artifact_ref"] for item in assignment_results],
             "verdict": verifier_outcome, "task_state": verifier_state,
             "attempt_state": verifier_execution, "output_ref": str(output_ref) if output_ref else None,
+            "failure_scope": failure_scope,
             "error": str(error) if error else None,
             "verifier_execution_artifact_ref": (verifier_result or {}).get("artifact_ref"),
             "verifier_report": deepcopy(verifier_result.get("response")) if isinstance(verifier_result, dict) else None,
@@ -1851,6 +1890,7 @@ class DepartmentRuntime:
             "assignments": assignment_results, "chief_synthesis_ref": synthesis_artifact["artifact_ref"],
             "verifier_artifact_ref": verdict_artifact["artifact_ref"],
             "verifier_outcome": verifier_outcome, "verifier_task_state": verifier_state,
+            "failure_scope": failure_scope,
         }
 
     def snapshot(self):

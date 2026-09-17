@@ -74,6 +74,82 @@ def _text(value, name):
     return value
 
 
+def load_runtime_environment_files(configured):
+    """Load owner-local env files into this process without persisting secrets."""
+    configured = list(configured or [])
+    if not configured:
+        return
+    loaded = {}
+    visited = set()
+
+    def parse(path):
+        values = {}
+        try:
+            lines = path.read_text().splitlines()
+        except (OSError, UnicodeError) as exc:
+            raise ValidationError(f"runtime environment file is unreadable: {path}") from exc
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            values[key] = value
+        return values
+
+    def resolve_reference(path, reference):
+        candidate = Path(reference)
+        if candidate.is_absolute():
+            candidates = [candidate]
+        else:
+            repo_root = Path(__file__).resolve().parents[2]
+            candidates = [
+                path.parent / candidate,
+                path.parent.parent / candidate,
+                Path.cwd() / candidate,
+                repo_root / candidate,
+            ]
+        for item in candidates:
+            try:
+                resolved = item.resolve()
+            except OSError:
+                continue
+            if resolved.is_file():
+                return resolved
+        raise ValidationError(
+            f"runtime environment reference is unavailable: {reference}")
+
+    def visit(path):
+        path = path.resolve()
+        if path in visited:
+            return
+        visited.add(path)
+        values = parse(path)
+        loaded.update(values)
+        nested = values.get("SCISAURUS_QWEN_ENV_FILE")
+        if nested:
+            visit(resolve_reference(path, nested))
+
+    for configured_path in configured:
+        path = Path(configured_path)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.is_file():
+            raise ValidationError(f"runtime environment file is unavailable: {path}")
+        visit(path)
+    for key, value in loaded.items():
+        os.environ.setdefault(key, value)
+
+
 def _identifier(value, name):
     if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
         raise ValidationError(f"{name} must be a bounded lowercase identifier")
@@ -114,10 +190,10 @@ def validate_workflow(value):
     allowed_fields = fields | {"retry_policy", "continuation_policy", "organization", "exploration_seed",
                                "topic_reuse_allowed", "experiment_catalog", "topic_exclusions",
                                "topic_history_path", "capability_foundry_config_path",
-                               "topic_preferences"}
+                               "topic_preferences", "runtime_env_files"}
     if not isinstance(value, dict) or set(value) - allowed_fields or not fields.issubset(value):
         raise ValidationError(
-            f"composer workflow requires {sorted(fields)} and permits ['continuation_policy', 'exploration_seed', 'organization', 'retry_policy', 'topic_reuse_allowed', 'experiment_catalog', 'topic_exclusions', 'topic_history_path']")
+            f"composer workflow requires {sorted(fields)} and permits ['capability_foundry_config_path', 'continuation_policy', 'exploration_seed', 'experiment_catalog', 'organization', 'retry_policy', 'runtime_env_files', 'topic_exclusions', 'topic_history_path', 'topic_preferences', 'topic_reuse_allowed']")
     if value["schema_version"] != SCHEMA_VERSION:
         raise ValidationError(f"composer workflow schema must be {SCHEMA_VERSION}")
     _identifier(value["id"], "workflow id")
@@ -140,6 +216,14 @@ def validate_workflow(value):
             raise ValidationError("workflow topic_history_path must be an absolute path")
         if Path(history_path).exists() and not Path(history_path).is_file():
             raise ValidationError("workflow topic_history_path must name a file")
+    if "runtime_env_files" in value:
+        env_files = value["runtime_env_files"]
+        if (not isinstance(env_files, list) or not env_files
+                or len(env_files) > 8
+                or any(not isinstance(item, str) or not Path(item).is_absolute()
+                       or not Path(item).is_file() for item in env_files)):
+            raise ValidationError(
+                "workflow runtime_env_files must contain one to eight existing absolute files")
     if "capability_foundry_config_path" in value:
         foundry_path = value["capability_foundry_config_path"]
         if (not isinstance(foundry_path, str) or not Path(foundry_path).is_absolute()
@@ -349,6 +433,7 @@ class ComposerRunner:
     def __init__(self, workflow, *, resume=False, clock=time.monotonic, on_progress=None,
                  additional_seconds=None):
         self.workflow = deepcopy(validate_workflow(workflow))
+        self._load_runtime_environment()
         if additional_seconds is not None and not resume:
             raise ValidationError("additional_seconds is only valid when resuming a Composer project")
         self.root = Path(self.workflow["project_id"]).resolve()
@@ -357,6 +442,7 @@ class ComposerRunner:
         self.root.mkdir(parents=True, exist_ok=True)
         self.topic_history_path = self._resolve_topic_history_path()
         self.topic_history_scope = self._topic_history_scope_key()
+        self._migrate_legacy_topic_history()
         self.topic_history = self._load_topic_history()
         existing = (self.root / "state" / "control.sqlite").exists()
         if existing and not resume:
@@ -614,10 +700,9 @@ class ComposerRunner:
 
     @staticmethod
     def _is_topic_intake_retry(error, stage):
-        """Return whether a failed topic intake has a scientific pivot path."""
+        """Return whether a topic intake has an autonomous retry path."""
         return (
             stage.get("kind") == "topic_discovery"
-            and isinstance(error, QuotaExceededError)
             and bool(getattr(error, "retryable_topic_intake", False))
         )
 
@@ -1471,6 +1556,82 @@ class ComposerRunner:
                 counts[capability] = counts.get(capability, 0) + 1
         return {"schema_version": "topic-history-1", "scope_key": self.topic_history_scope,
                 "entries": entries, "capability_counts": counts}
+
+    def _load_runtime_environment(self):
+        """Load the workflow's owner-local environment before any model call."""
+        load_runtime_environment_files(self.workflow.get("runtime_env_files", []))
+
+    def _migrate_legacy_topic_history(self):
+        """Remove contract failures from the pre-typed rejection memory.
+
+        Older Composer runs recorded every intake ``ValidationError`` as a
+        rejection.  That mixed provider/contract failures with scientific
+        novelty and maturity decisions, so a malformed response could become
+        a durable exclusion and distort later topic selection.  Semantic
+        entries are retained under their typed rejection kind; non-semantic
+        legacy entries are removed because they are not evidence against a
+        research direction.
+        """
+        path = self.topic_history_path
+        if not path.is_file():
+            return
+        lock_path = Path(str(path) + ".lock")
+        lock = lock_path.open("a+")
+        flock = None
+        temporary = None
+        try:
+            try:
+                import fcntl
+                flock = fcntl
+                flock.flock(lock.fileno(), flock.LOCK_EX)
+            except ImportError as exc:
+                raise ValidationError(
+                    "topic history requires an interprocess file lock") from exc
+            try:
+                document = json.loads(path.read_text())
+            except (OSError, ValueError) as exc:
+                raise ValidationError(f"topic history is unreadable: {path}") from exc
+            self._validate_topic_history_document(document)
+            from scisaurus.runtime.topic_discovery import (
+                _TOPIC_SEMANTIC_REJECTION_TYPES,
+                _topic_validation_rejection_type,
+            )
+            changed = False
+            for scope in document["scopes"].values():
+                migrated_entries = []
+                for entry in scope.get("entries", []):
+                    if entry.get("rejection_type") != "intake_validation":
+                        migrated_entries.append(entry)
+                        continue
+                    rejection_type = _topic_validation_rejection_type(
+                        entry.get("rejection_reason"))
+                    if rejection_type not in _TOPIC_SEMANTIC_REJECTION_TYPES:
+                        changed = True
+                        continue
+                    if rejection_type != entry.get("rejection_type"):
+                        entry = deepcopy(entry)
+                        entry["rejection_type"] = rejection_type
+                        changed = True
+                    migrated_entries.append(entry)
+                scope["entries"] = migrated_entries
+            if not changed:
+                return
+            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            temporary.write_bytes(canonical_bytes(document))
+            os.replace(temporary, path)
+            temporary = None
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if flock is not None:
+                try:
+                    flock.flock(lock.fileno(), flock.LOCK_UN)
+                except OSError:
+                    pass
+            lock.close()
 
     def _effective_topic_exclusions(self):
         """Merge configured exclusions with automatic recent-direction memory."""
@@ -3016,7 +3177,12 @@ class ComposerRunner:
         """Record a retry decision before dispatching the next isolated attempt."""
         policy = self._retry_policy()
         event_id = f"composer-retry-{stage['id']}-{attempt_number}"
-        topic_pivot = bool(getattr(error, "retryable_topic_intake", False))
+        topic_retry_reason = getattr(error, "topic_retry_reason", None)
+        topic_retry = bool(getattr(error, "retryable_topic_intake", False))
+        topic_pivot = (
+            topic_retry_reason == "scientific_candidate_rejected"
+            or bool(getattr(error, "rejected_topic_history", []))
+        )
         feedback = {
             "event_id": event_id,
             "stage_id": stage["id"],
@@ -3031,11 +3197,13 @@ class ComposerRunner:
             "max_attempts": policy.get("max_attempts") if policy.get("mode", "bounded") == "bounded" else None,
             "delay_seconds": delay_seconds,
             "error": f"{type(error).__name__}: {error}",
-            "retry_reason": (getattr(error, "topic_retry_reason", None)
-                             if topic_pivot else "transient_stage_failure"),
+            "retry_reason": (topic_retry_reason if topic_retry
+                              else "transient_stage_failure"),
             "next_condition": (
                 "abandon the rejected direction and sample a fresh topic portfolio within the remaining mission budget"
                 if topic_pivot else
+                "repair the topic intake contract and dispatch a fresh isolated proposal within the remaining mission budget"
+                if topic_retry else
                 "dispatch a fresh isolated stage attempt within the Composer hard deadline"
             ),
             "stage_deadline_seconds": stage["deadline_seconds"],
@@ -3689,6 +3857,7 @@ class ComposerRunner:
                 "chief_synthesis_ref": result.get("chief_synthesis_ref"),
                 "verifier_artifact_ref": result.get("verifier_artifact_ref"),
                 "verifier_outcome": result.get("verifier_outcome"),
+                "specialist_failure_scope": result.get("failure_scope"),
                 "specialist_assignments": deepcopy(result.get("assignments", [])),
             })
         return fields
@@ -4162,7 +4331,19 @@ class ComposerRunner:
                 # the Composer level, where the next attempt receives a fresh
                 # sampling boundary and the remaining mission budget. Only
                 # the topic runner's explicit evidence trace can authorize
-                # that pivot; authentication/provider failures remain hard.
+                # that pivot; authentication/provider failures stay on the
+                # ordinary provider/error policy instead.
+                topic_recoverable = (
+                    stage.get("kind") == "topic_discovery"
+                    and bool(getattr(exc, "topic_intake_recoverable", False))
+                )
+                topic_retry_reason = getattr(exc, "topic_retry_reason", None)
+                if topic_recoverable and not isinstance(topic_retry_reason, str):
+                    topic_retry_reason = (
+                        "scientific_candidate_rejected"
+                        if getattr(exc, "rejected_topic_history", [])
+                        else "intake_contract_failure"
+                    )
                 if (descriptor.get("budgets")
                         and descriptor.get("repair_mode", "bounded") == "bounded"):
                     snapshot = getattr(exc, "topic_budget", {})
@@ -4175,10 +4356,9 @@ class ComposerRunner:
                         usage=snapshot.get("usage", {}),
                         diagnostics=snapshot.get("events", []),
                     )
-                    recoverable = bool(getattr(exc, "topic_intake_recoverable", False))
-                    setattr(quota_error, "retryable_topic_intake", recoverable)
+                    setattr(quota_error, "retryable_topic_intake", topic_recoverable)
                     setattr(quota_error, "topic_retry_reason",
-                            "scientific_candidate_rejected" if recoverable else "intake_failure")
+                            topic_retry_reason if topic_recoverable else "intake_failure")
                     setattr(quota_error, "topic_budget", snapshot)
                     # Preserve the bounded runner's scientific trace when the
                     # Composer wraps its validation error as a quota error.
@@ -4190,6 +4370,13 @@ class ComposerRunner:
                         if isinstance(value, list):
                             setattr(quota_error, attribute, deepcopy(value))
                     raise quota_error from exc
+                if topic_recoverable:
+                    # Autonomous topic contracts without a local attempt quota
+                    # must still reach the Composer's typed retry path. A raw
+                    # ValidationError otherwise looks like an ordinary stage
+                    # failure and loses the runner's rejection class.
+                    setattr(exc, "retryable_topic_intake", True)
+                    setattr(exc, "topic_retry_reason", topic_retry_reason)
                 raise
             output_path = Path(descriptor["output_path"])
             if attempt_number > 1 or stage["id"] in self.reopened_stage_ids:
@@ -5054,10 +5241,19 @@ class ComposerRunner:
                                 and not topic_intake_retry
                             )
                             if topic_intake_retry:
-                                rejected = getattr(exc, "rejected_topic_history", [])
-                                if not rejected:
+                                topic_retry_reason = getattr(
+                                    exc, "topic_retry_reason", "intake_contract_failure")
+                                rejected = list(getattr(exc, "rejected_topic_history", []) or [])
+                                if (topic_retry_reason == "scientific_candidate_rejected"
+                                        and not rejected):
                                     for trace in reversed(
                                             getattr(exc, "candidate_attempt_trace", [])):
+                                        if not isinstance(trace, dict):
+                                            continue
+                                        rejection_type = trace.get("rejection_type")
+                                        if rejection_type not in {
+                                                "novelty", "source_challenge", "maturity"}:
+                                            continue
                                         selected = (
                                             trace.get("selected_topic")
                                             if isinstance(trace, dict) else None
@@ -5073,39 +5269,46 @@ class ComposerRunner:
                                             "research_form": selected.get("research_form"),
                                             "evidence_mode": selected.get("evidence_mode"),
                                             "comparison_type": selected.get("comparison_type"),
-                                            "rejection_type": "intake_validation",
+                                            "rejection_type": rejection_type,
                                             "rejection_reason": str(exc)[:2048],
                                         }]
                                         break
-                                try:
-                                    self._record_topic_rejection_history(rejected)
+                                if rejected:
+                                    try:
+                                        self._record_topic_rejection_history(rejected)
+                                        self.department_activity.append({
+                                            "cycle": self.continuation_cycles,
+                                            "action": "pivot_topic_direction",
+                                            "stage_id": stage_id,
+                                            "attempt_number": attempt_number,
+                                            "rejected_topic_ids": [
+                                                item.get("topic_id") for item in rejected
+                                                if isinstance(item, dict)
+                                                and isinstance(item.get("topic_id"), str)
+                                            ],
+                                            "reason": topic_retry_reason,
+                                        })
+                                    except Exception as history_error:
+                                        # A pivot without durable rejection
+                                        # memory could immediately rediscover
+                                        # the same weak direction. Preserve the
+                                        # failure rather than weakening the
+                                        # exclusion contract silently.
+                                        topic_intake_retry = False
+                                        quota_exhausted = isinstance(exc, QuotaExceededError)
+                                        last_error = ValidationError(
+                                            "topic pivot history could not be persisted: "
+                                            f"{type(history_error).__name__}: {history_error}"
+                                        )
+                                else:
                                     self.department_activity.append({
                                         "cycle": self.continuation_cycles,
-                                        "action": "pivot_topic_direction",
+                                        "action": "retry_topic_intake",
                                         "stage_id": stage_id,
                                         "attempt_number": attempt_number,
-                                        "rejected_topic_ids": [
-                                            item.get("topic_id") for item in rejected
-                                            if isinstance(item, dict)
-                                            and isinstance(item.get("topic_id"), str)
-                                        ],
-                                        "reason": getattr(
-                                            exc, "topic_retry_reason",
-                                            "scientific_candidate_rejected",
-                                        ),
+                                        "rejected_topic_ids": [],
+                                        "reason": topic_retry_reason,
                                     })
-                                except Exception as history_error:
-                                    # A pivot without durable rejection memory
-                                    # could immediately rediscover the same
-                                    # weak direction. Preserve the failure and
-                                    # stop rather than weakening the exclusion
-                                    # contract silently.
-                                    topic_intake_retry = False
-                                    quota_exhausted = isinstance(exc, QuotaExceededError)
-                                    last_error = ValidationError(
-                                        "topic pivot history could not be persisted: "
-                                        f"{type(history_error).__name__}: {history_error}"
-                                    )
                             if stage_assignment is not None:
                                 try:
                                     assignment_result = self.departments.finish_stage(
@@ -5114,12 +5317,14 @@ class ComposerRunner:
                                         usage=failure_usage, error=exc,
                                         actor="command.composer",
                                         specialist_results=specialist_bundle.get("by_role", {}),
-                                        verifier_result=specialist_verifier)
+                                        verifier_result=specialist_verifier,
+                                        failure_scope="stage")
                                     self.department_activity.append({
                                         "cycle": self.continuation_cycles,
-                                        "action": "fail_specialist_pool",
+                                        "action": "record_stage_failure",
                                         "stage_id": stage_id,
                                         "attempt_number": attempt_number,
+                                        "failure_scope": "stage",
                                         "verifier_agent": assignment_result["verifier_agent"],
                                         "verifier_outcome": assignment_result["verifier_outcome"],
                                         "chief_synthesis_ref": assignment_result["chief_synthesis_ref"],

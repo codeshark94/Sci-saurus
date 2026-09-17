@@ -151,6 +151,34 @@ class DepartmentRuntimeTests(unittest.TestCase):
         self.assertEqual(outcomes["search-strategist"], "succeeded")
         self.assertEqual(outcomes["source-acquirer"], "result_unknown")
 
+    def test_stage_failure_does_not_mark_undispatched_specialists_failed(self):
+        plan = self.runtime.begin_stage(
+            "topic", "topic_discovery", attempt_number=4,
+            deadline_seconds=30, active_role_ids=["frontier-scout", "search-strategist"],
+        )
+        result = self.runtime.finish_stage(
+            "topic", "topic_discovery", attempt_number=4, outcome="blocked",
+            output_ref=None, error=ValidationError("topic package contract failed"),
+            failure_scope="stage",
+        )
+        outcomes = {item["role_id"]: item["outcome"] for item in result["assignments"]}
+        self.assertEqual(outcomes, {
+            "frontier-scout": "not_evaluated",
+            "search-strategist": "not_evaluated",
+        })
+        self.assertEqual(result["verifier_outcome"], "not_evaluated")
+        self.assertTrue(all(
+            self.tasks.get(item["task_id"])["state"] == "blocked"
+            for item in result["assignments"]
+        ))
+        attempt_states = {
+            row["state"] for row in self.control._conn.execute(
+                "SELECT state FROM attempts WHERE task_id IN (?, ?)",
+                (plan["task_ids"][0], plan["task_ids"][1]),
+            ).fetchall()
+        }
+        self.assertEqual(attempt_states, {"cancelled"})
+
     def test_stage_pool_quota_and_deadline_are_enforced(self):
         route = self.runtime.stage_route("survey")
         route["max_active_agents"] = 1

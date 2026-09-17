@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -77,6 +78,34 @@ class ComposerWorkflowTests(unittest.TestCase):
             workflow["topic_preferences"]["mode"] = "unsupported"
             with self.assertRaisesRegex(ValidationError, "mode must be general"):
                 validate_workflow(workflow)
+
+    def test_runtime_env_files_load_nested_owner_credentials_before_dispatch(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            nested = root / "qwen.env"
+            nested.write_text("SCISAURUS_TEST_NESTED=loaded\n")
+            env_file = root / "runtime.env"
+            env_file.write_text(
+                f"SCISAURUS_QWEN_ENV_FILE={nested.name}\n"
+                "SCISAURUS_TEST_RUNTIME=loaded\n")
+            workflow["runtime_env_files"] = [str(env_file.resolve())]
+            keys = ("SCISAURUS_QWEN_ENV_FILE", "SCISAURUS_TEST_RUNTIME",
+                    "SCISAURUS_TEST_NESTED")
+            previous = {key: os.environ.get(key) for key in keys}
+            for key in keys:
+                os.environ.pop(key, None)
+            runner = ComposerRunner(workflow)
+            try:
+                self.assertEqual(os.environ.get("SCISAURUS_TEST_RUNTIME"), "loaded")
+                self.assertEqual(os.environ.get("SCISAURUS_TEST_NESTED"), "loaded")
+            finally:
+                runner.close()
+                for key, value in previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
 
     def test_runs_stages_and_routes_feedback(self):
         with tempfile.TemporaryDirectory() as path:
@@ -584,6 +613,50 @@ class ComposerWorkflowTests(unittest.TestCase):
                 for item in result["feedback"] if item.get("action") == "retry_stage"
             ))
 
+    def test_unbudgeted_topic_contract_failure_keeps_typed_retry_metadata(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_config = root / "topic.json"
+            topic_config.write_text("{}")
+            model_path = root / "model.json"
+            model_path.write_text("{}")
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            stage = {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": str(topic_config.resolve()),
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            }
+            runner = ComposerRunner(workflow)
+            error = ValidationError("topic candidate has an invalid shape")
+            error.topic_intake_recoverable = True
+            error.topic_retry_reason = "intake_contract_failure"
+            error.candidate_attempt_trace = [{
+                "status": "rejected", "error": str(error),
+            }]
+            try:
+                with patch("scisaurus.runtime.topic_discovery.validate_topic_stage_config") as validate, \
+                        patch("scisaurus.runtime.topic_discovery.TopicDiscoveryRunner") as topic_runner:
+                    validate.return_value = {
+                        "model_config_path": str(model_path.resolve()),
+                        "output_path": str((root / "topic-output.json").resolve()),
+                        "candidate_count": 3, "max_attempts": 1,
+                        "schema_version": "topic-discovery-config-1",
+                    }
+                    topic_runner.return_value.run.side_effect = error
+                    with self.assertRaises(ValidationError) as raised:
+                        runner._run_stage(stage)
+                self.assertIs(raised.exception, error)
+                self.assertTrue(raised.exception.retryable_topic_intake)
+                self.assertEqual(raised.exception.topic_retry_reason,
+                                 "intake_contract_failure")
+                self.assertTrue(runner._is_topic_intake_retry(raised.exception, stage))
+            finally:
+                runner.close()
+
     def test_topic_budget_is_cumulative_across_isolated_attempts(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -930,6 +1003,43 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(resumed._effective_topic_exclusions()["capability_ids"], ["cap_a"])
             self.assertIn("chosen_topic_a", resumed._effective_topic_exclusions()["topic_ids"])
             resumed.close()
+
+    def test_legacy_topic_history_migration_separates_scientific_rejections(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            history_path = root / "shared" / "topic-history.json"
+            workflow["topic_history_path"] = str(history_path.resolve())
+            history_path.parent.mkdir(parents=True)
+            history_path.write_text(json.dumps({
+                "schema_version": "topic-history-1",
+                "scopes": {"legacy": {"entries": [
+                    {"topic_id": "old-novelty", "rejection_type": "intake_validation",
+                     "rejection_reason": "selected topic is too similar to a previously attempted direction"},
+                    {"topic_id": "old-maturity", "rejection_type": "intake_validation",
+                     "rejection_reason": "topic maturity review requires substantive refinement: the comparison is too thin"},
+                    {"topic_id": "old-contract", "rejection_type": "intake_validation",
+                     "rejection_reason": "topic candidate has an invalid shape (missing=['search_queries'], unexpected=[])"},
+                ]}},
+            }))
+
+            runner = ComposerRunner(workflow)
+            try:
+                document = json.loads(history_path.read_text())
+                entries = [entry for scope in document["scopes"].values()
+                           for entry in scope["entries"]]
+                by_id = {entry["topic_id"]: entry for entry in entries}
+                self.assertEqual(by_id["old-novelty"]["rejection_type"], "novelty")
+                self.assertEqual(by_id["old-maturity"]["rejection_type"], "maturity")
+                self.assertNotIn("old-contract", by_id)
+                self.assertNotIn(
+                    "intake_validation",
+                    {entry.get("rejection_type") for entry in entries})
+                self.assertEqual(
+                    {entry["topic_id"] for entry in runner.topic_history["entries"]},
+                    {"old-novelty", "old-maturity"})
+            finally:
+                runner.close()
 
     def test_generated_slot_history_id_does_not_become_exact_exclusion(self):
         with tempfile.TemporaryDirectory() as path:

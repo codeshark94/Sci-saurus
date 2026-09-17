@@ -166,6 +166,9 @@ def main(argv=None) -> int:
     p_composer.add_argument(
         "--extend-deadline-seconds", type=float,
         help="extend the existing Composer mission wall before resuming (requires --resume)")
+    p_composer.add_argument(
+        "--env-file", action="append", default=[],
+        help="owner-local runtime env file; may be repeated and is loaded before model dispatch")
 
     p_interim = sub.add_parser(
         "composer-interim-report", help="print the latest concise Composer stop/progress report")
@@ -184,9 +187,10 @@ def main(argv=None) -> int:
         return 0
     if args.cmd == "run-composer":
         from scisaurus.core.errors import ValidationError
-        from scisaurus.runtime.composer import ComposerRunner
+        from scisaurus.runtime.composer import ComposerRunner, load_runtime_environment_files
         try:
             workflow = json.loads(Path(args.workflow).read_text())
+            load_runtime_environment_files(args.env_file)
             result = ComposerRunner(workflow, resume=args.resume,
                                     additional_seconds=args.extend_deadline_seconds,
                                     on_progress=lambda state: print(json.dumps(state), flush=True)).run()

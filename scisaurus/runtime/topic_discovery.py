@@ -302,6 +302,105 @@ _MODEL_CANDIDATE_FIELD_ALIASES = {
 }
 
 
+_TOPIC_SEMANTIC_REJECTION_TYPES = frozenset({
+    "novelty", "source_challenge", "maturity",
+})
+
+
+def _topic_validation_rejection_type(error):
+    """Classify only direction-level gates as negative scientific memory.
+
+    A malformed response is an intake-contract failure, not evidence that the
+    proposed direction is scientifically exhausted.  Keeping this distinction
+    here prevents a provider's extra JSON key from poisoning future topic
+    selection while still allowing novelty and scientific review gates to
+    drive an autonomous pivot.
+    """
+    text = str(error or "").casefold()
+    if any(marker in text for marker in (
+            "selected topic repeats a previously attempted direction",
+            "selected topic is too similar to a previously attempted direction",
+            "selected topic is excluded by the exploration history",
+            "selected experiment capability is excluded by the exploration history",
+            "too similar to a fallback experiment template",
+    )):
+        return "novelty"
+    if "topic source challenge requires substantive refinement" in text:
+        return "source_challenge"
+    if "topic maturity review requires substantive refinement" in text:
+        return "maturity"
+    return None
+
+
+def _topic_rejection_entry(candidate, *, rejection_type, reason):
+    """Build one bounded, signature-bearing local rejection record."""
+    if (not isinstance(candidate, dict)
+            or not isinstance(candidate.get("id"), str)
+            or not candidate["id"].strip()):
+        return None
+    entry = {
+        "topic_id": candidate["id"],
+        "title": candidate.get("title"),
+        "domain": candidate.get("domain"),
+        "research_question": candidate.get("research_question"),
+        "research_form": candidate.get("research_form"),
+        "evidence_mode": candidate.get("evidence_mode"),
+        "comparison_type": candidate.get("comparison_type"),
+        "signature": topic_signature(candidate),
+        "rejection_type": rejection_type,
+        "rejection_reason": str(reason)[:2048],
+    }
+    return entry
+
+
+def _remember_topic_rejection(history, candidate, *, rejection_type, reason):
+    """Add a direction to this intake's negative memory without duplicates."""
+    entry = _topic_rejection_entry(
+        candidate, rejection_type=rejection_type, reason=reason)
+    if entry is None:
+        return False
+    fingerprint = ((entry.get("signature") or {}).get("fingerprint")
+                   if isinstance(entry.get("signature"), dict) else None)
+    for prior in history:
+        if not isinstance(prior, dict):
+            continue
+        prior_fingerprint = ((prior.get("signature") or {}).get("fingerprint")
+                             if isinstance(prior.get("signature"), dict) else None)
+        if fingerprint and prior_fingerprint == fingerprint:
+            return False
+        if (not fingerprint and not prior_fingerprint
+                and prior.get("topic_id") == entry["topic_id"]
+                and prior.get("research_question") == entry.get("research_question")):
+            return False
+    history.append(entry)
+    return True
+
+
+def _topic_retry_reason(error, candidate_attempt_trace, rejected_topic_history):
+    """Return the Composer retry class, or ``None`` for provider failures."""
+    text = str(error or "").casefold()
+    if ("model call failed" in text
+            or ("provider" in text and "failed" in text)):
+        return None
+    direct_type = _topic_validation_rejection_type(error)
+    if direct_type in _TOPIC_SEMANTIC_REJECTION_TYPES:
+        return "scientific_candidate_rejected"
+    for trace in reversed(candidate_attempt_trace or []):
+        if not isinstance(trace, dict):
+            continue
+        trace_type = trace.get("rejection_type")
+        if trace_type in _TOPIC_SEMANTIC_REJECTION_TYPES:
+            return "scientific_candidate_rejected"
+        if trace.get("status") in {
+                "rejected", "incomplete", "maturity_review_error",
+                "source_challenge_error", "refinement_rejected",
+        }:
+            return "intake_contract_failure"
+    if rejected_topic_history:
+        return "scientific_candidate_rejected"
+    return None
+
+
 def _repair_known_candidate_field_aliases(package):
     """Canonicalize only explicit, lossless aliases from model JSON."""
     if not isinstance(package, dict) or not isinstance(package.get("candidates"), list):
@@ -2444,6 +2543,7 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "keep every narrative field concise (at most 45 words), keep each search query under 12 words, and fit the complete JSON package within 5000 output tokens",
         "include every required top-level key and every required candidate key; never stop after a partial candidate list",
         "emit every required field described by the candidate contract; research_question is mandatory",
+        "use only literal candidate keys listed in output_contract.candidate; do not invent aliases such as mechanism_boundary or disconfirmation_test_note_optional; express a boundary in data_regime or theory_target",
         "return only the JSON object with no preface, commentary, markdown, or trailing explanation",
         "candidate prose is reader-facing: do not use the words frozen, validator, accepted artifact, model calls, release candidate, or SHA-256; say prespecified or independent recalculation where scientifically appropriate",
     ]
@@ -2661,6 +2761,7 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "output_constraints": [
             "Return exactly one JSON object with exactly the five top-level keys in output_contract.",
             "Each candidate may contain only the fields described by candidate and the explicitly required grounding or design fields.",
+            "The candidate contract is an allowlist: omit every other key, including compound or renamed fields.",
             "Do not echo assignment, constraints, runtime_context, frontier_seeds, or any other metadata.",
         ],
     }, ensure_ascii=False, sort_keys=True)
@@ -2895,6 +2996,7 @@ def _topic_candidate_refinement_prompt(objective, parent_candidate, *,
             "Keep every narrative field under 45 words and every query under 12 words.",
             "Do not claim novelty, a result, or a literature gap; those require later evidence.",
             "Do not include capability_requirements unless it is a complete object copied from the parent.",
+            "Use only literal keys listed in output_contract.candidate; omit aliases such as mechanism_boundary or disconfirmation_test_note_optional and put boundary detail in data_regime or theory_target.",
             "Return only the JSON object with no markdown or explanation.",
         ],
     }, ensure_ascii=False, sort_keys=True)
@@ -3609,7 +3711,10 @@ class TopicDiscoveryRunner:
                 repair_payload["validation_error"] = str(last_error)
                 repair_payload["repair_instruction"] = (
                     "Return a complete package satisfying output_contract. Preserve valid candidates and repair "
-                    "only the reported violations; do not return a wrapper object or a partial candidate list."
+                    "only the reported violations; do not return a wrapper object or a partial candidate list. "
+                    "Treat output_contract.candidate as a strict allowlist: delete unknown candidate keys, "
+                    "and rewrite any useful boundary detail into data_regime or theory_target rather than "
+                    "creating a key such as mechanism_boundary."
                 )
                 if (last_error is not None
                         and str(last_error).startswith("topic candidate portfolio")):
@@ -3837,6 +3942,18 @@ class TopicDiscoveryRunner:
             except ValidationError as exc:
                 budget.record_validation_error(exc)
                 last_error = exc
+                rejection_type = _topic_validation_rejection_type(exc)
+                if rejection_type is not None:
+                    if attempt_record is not None:
+                        attempt_record["rejection_type"] = rejection_type
+                        attempt_record["rejection_reason"] = str(exc)[:2048]
+                    if rejection_type in _TOPIC_SEMANTIC_REJECTION_TYPES and attempt_record is not None:
+                        _remember_topic_rejection(
+                            rejected_topic_history,
+                            attempt_record.get("selected_topic"),
+                            rejection_type=rejection_type,
+                            reason=exc,
+                        )
                 if attempt_record is None:
                     candidate_attempt_trace.append(_candidate_attempt_record(
                         {}, attempt=attempt + 1, status="rejected", error=str(exc),
@@ -3920,6 +4037,8 @@ class TopicDiscoveryRunner:
                     budget.record_validation_error(last_error)
                     attempt_record["status"] = "source_challenge_refine"
                     attempt_record["error"] = str(last_error)[:2048]
+                    attempt_record["rejection_type"] = "source_challenge"
+                    attempt_record["rejection_reason"] = str(last_error)[:2048]
                     # The challenger is an independent gate, but its result
                     # is also the most useful repair specification.  Carry it
                     # into the next bounded generation so the model changes
@@ -4093,20 +4212,16 @@ class TopicDiscoveryRunner:
                         + review["rationale"])
                     attempt_record["status"] = "maturity_rejected"
                     attempt_record["error"] = str(last_error)[:2048]
-                    rejected_topic_history.append({
-                        "topic_id": selected.get("id"),
-                        "title": selected.get("title"),
-                        "domain": selected.get("domain"),
-                        "research_question": selected.get("research_question"),
-                        "research_form": selected.get("research_form"),
-                        "evidence_mode": selected.get("evidence_mode"),
-                        "comparison_type": selected.get("comparison_type"),
-                        "signature": topic_signature(selected),
-                        "rejection_type": "maturity",
-                        "rejection_reason": review.get("rationale"),
-                        "required_changes": deepcopy(review.get("required_changes", [])),
-                        "changed_dimensions": deepcopy(review.get("changed_dimensions", [])),
-                    })
+                    attempt_record["rejection_type"] = "maturity"
+                    attempt_record["rejection_reason"] = str(last_error)[:2048]
+                    if _remember_topic_rejection(
+                            rejected_topic_history, selected,
+                            rejection_type="maturity",
+                            reason=review.get("rationale")):
+                        rejected_topic_history[-1]["required_changes"] = deepcopy(
+                            review.get("required_changes", []))
+                        rejected_topic_history[-1]["changed_dimensions"] = deepcopy(
+                            review.get("changed_dimensions", []))
                     # A portfolio that remains thin after its allowed
                     # refinement passes is abandoned as a whole.  The next
                     # attempt starts a fresh exploration seed rather than
@@ -4171,33 +4286,25 @@ class TopicDiscoveryRunner:
             return output
         error = last_error or ValidationError("topic discovery did not produce a valid package")
         snapshot = budget.snapshot()
-        # Some package gates reject a selected direction for similarity or
-        # structural validity before the maturity reviewer can emit its
-        # normal rejection object. Preserve every concrete selected direction
-        # that is not already in the rejection list so the next Composer pivot
-        # has durable exclusion targets instead of only an opaque error string.
-        rejected_ids = {
-            item.get("topic_id") for item in rejected_topic_history
-            if isinstance(item, dict) and isinstance(item.get("topic_id"), str)
-        }
+        # Some direction-level gates reject a selected topic before the
+        # maturity reviewer can emit its normal rejection object. Preserve
+        # those concrete directions for the next Composer pivot. Contract or
+        # provider failures intentionally do not enter this memory: an extra
+        # JSON key is not a scientific reason to exclude a direction.
         for trace in reversed(candidate_attempt_trace):
+            trace_type = trace.get("rejection_type") if isinstance(trace, dict) else None
+            if trace_type not in _TOPIC_SEMANTIC_REJECTION_TYPES:
+                trace_type = _topic_validation_rejection_type(
+                    trace.get("error") if isinstance(trace, dict) else None)
+            if trace_type not in _TOPIC_SEMANTIC_REJECTION_TYPES:
+                continue
             selected = trace.get("selected_topic") if isinstance(trace, dict) else None
             if (not isinstance(selected, dict)
-                    or not isinstance(selected.get("id"), str)
-                    or selected["id"] in rejected_ids):
+                    or not isinstance(selected.get("id"), str)):
                 continue
-            rejected_topic_history.append({
-                "topic_id": selected["id"],
-                "title": selected.get("title"),
-                "domain": selected.get("domain"),
-                "research_question": selected.get("research_question"),
-                "research_form": selected.get("research_form"),
-                "evidence_mode": selected.get("evidence_mode"),
-                "comparison_type": selected.get("comparison_type"),
-                "rejection_type": "intake_validation",
-                "rejection_reason": str(error)[:2048],
-            })
-            rejected_ids.add(selected["id"])
+            _remember_topic_rejection(
+                rejected_topic_history, selected,
+                rejection_type=trace_type, reason=trace.get("error") or error)
             if len(rejected_topic_history) >= 24:
                 break
         setattr(error, "topic_budget", snapshot)
@@ -4205,17 +4312,14 @@ class TopicDiscoveryRunner:
         setattr(error, "maturity_review_history", deepcopy(maturity_review_history))
         setattr(error, "rejected_topic_history", deepcopy(rejected_topic_history))
         # A bounded intake can exhaust its local proposal/repair passes while
-        # still having a scientifically actionable next move.  The Composer
-        # uses this durable trace to distinguish a candidate-quality failure
-        # (pivot and continue) from an environmental or provider failure
-        # (pause/block). Empty traces deliberately remain non-recoverable:
-        # missing credentials and failures before a candidate was examined
-        # must not become autonomous retry loops.
-        setattr(
-            error,
-            "topic_intake_recoverable",
-            bool(candidate_attempt_trace or maturity_review_history or rejected_topic_history),
-        )
+        # still having a scientifically actionable next move. The Composer
+        # uses the explicit retry class to distinguish a candidate-quality
+        # pivot, an output-contract repair, and an environmental/provider
+        # failure. Provider failures remain on the ordinary stage retry path.
+        retry_reason = _topic_retry_reason(
+            error, candidate_attempt_trace, rejected_topic_history)
+        setattr(error, "topic_retry_reason", retry_reason)
+        setattr(error, "topic_intake_recoverable", retry_reason is not None)
         raise error
 
     @staticmethod

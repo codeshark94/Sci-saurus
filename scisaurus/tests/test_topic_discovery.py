@@ -44,6 +44,7 @@ from scisaurus.runtime.topic_discovery import (
     _repair_topic_novelty_selection,
     _repair_topic_refinement_selection,
     _source_challenge_requires_frontier_seed_pivot,
+    _topic_retry_reason,
 )
 
 
@@ -189,6 +190,21 @@ class FakeModel:
         return ModelResult(text=json.dumps(value), model="fake",
                            usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
                            elapsed_seconds=0.01, finish_reason="stop")
+
+
+class InvalidCandidateShapeModel(FakeModel):
+    """Return a scientifically usable package with one contract-only key."""
+
+    def complete(self, *, system, prompt, images=None):
+        result = super().complete(system=system, prompt=prompt, images=images)
+        value = json.loads(result.text)
+        if isinstance(value.get("candidates"), list):
+            value["candidates"][0]["mechanism_boundary"] = (
+                "This must be represented by a declared boundary field.")
+        return ModelResult(
+            text=json.dumps(value), model="fake",
+            usage=result.usage, elapsed_seconds=result.elapsed_seconds,
+            finish_reason=result.finish_reason)
 
 
 class MissingResearchQuestionModel(FakeModel):
@@ -939,6 +955,28 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["candidate_attempt_trace"][0]["status"], "admitted")
         self.assertEqual(len(result["candidate_attempt_trace"][0]["candidate_signatures"]), 3)
         self.assertEqual(result["candidate_attempt_trace"][0]["portfolio_profile"]["distinct"]["research_form"], 3)
+
+    def test_schema_failure_is_retryable_but_does_not_poison_rejection_history(self):
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", InvalidCandidateShapeModel):
+            with self.assertRaises(ValidationError) as raised:
+                TopicDiscoveryRunner({
+                    "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                    "timeout_seconds": 1, "max_output_tokens": 4096,
+                }).run("Choose a feasible research direction", candidate_count=3,
+                       bibliography=False, max_attempts=1)
+        error = raised.exception
+        self.assertTrue(error.topic_intake_recoverable)
+        self.assertEqual(error.topic_retry_reason, "intake_contract_failure")
+        self.assertEqual(error.rejected_topic_history, [])
+        self.assertIn("mechanism_boundary", error.candidate_attempt_trace[0]["error"])
+        self.assertEqual(
+            _topic_retry_reason(
+                ValidationError("topic candidate has an invalid shape"),
+                [{"status": "rejected"}],
+                [{"topic_id": "earlier-scientific-rejection"}],
+            ),
+            "intake_contract_failure",
+        )
 
     def test_runner_passes_rejected_candidate_history_to_repair(self):
         PortfolioRepairModel.topic_calls = 0
