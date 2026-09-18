@@ -703,6 +703,7 @@ class SpecialistDispatcher:
         self.condition = threading.Condition()
         self.active = {}
         self.route_cursors = {}
+        self.provider_cooldowns = {}
         self.provider_pools = deepcopy(provider_pools or {})
         self._ensure_provider_pools()
 
@@ -764,13 +765,23 @@ class SpecialistDispatcher:
             if self.deadline is not None and time.monotonic() >= self.deadline:
                 raise ModelCallError("specialist stage deadline exceeded before dispatch", outcome_known=True)
             capacity_wait = False
-            budget_available = False
+            cooldown_wait = False
+            next_cooldown = None
             with self.condition:
                 for offset in range(len(routes)):
                     index = (cursor + offset) % len(routes)
                     route_id, declared_pool, route = routes[index]
                     effective = self._effective_route(route, role)
                     pool = self._pool_for(route, effective) or "unpooled"
+                    cooldown_until = self.provider_cooldowns.get(pool, 0.0)
+                    now = time.monotonic()
+                    if cooldown_until > now:
+                        cooldown_wait = True
+                        next_cooldown = cooldown_until if next_cooldown is None else min(
+                            next_cooldown, cooldown_until)
+                        continue
+                    if cooldown_until:
+                        self.provider_cooldowns.pop(pool, None)
                     entry = self.provider_pools.get(pool)
                     if entry is None:
                         entry = {"max_concurrent": self.max_parallel, "base_urls": []}
@@ -788,7 +799,7 @@ class SpecialistDispatcher:
                         "pool_key": pool,
                         "config": effective,
                     }
-                if not capacity_wait:
+                if not capacity_wait and not cooldown_wait:
                     raise ModelCallError(
                         f"all configured specialist routes are unavailable for {role}",
                         outcome_known=True,
@@ -797,7 +808,33 @@ class SpecialistDispatcher:
                 if remaining <= 0:
                     raise ModelCallError("specialist stage deadline exceeded while waiting for provider capacity",
                                          outcome_known=True)
-                self.condition.wait(timeout=min(0.25, remaining))
+                wait_for = min(0.25, remaining)
+                if next_cooldown is not None:
+                    wait_for = min(wait_for, max(0.01, next_cooldown - time.monotonic()))
+                self.condition.wait(timeout=wait_for)
+
+    def _mark_provider_cooldown(self, pool, error):
+        """Quarantine a provider after a known route-level failure."""
+        if not isinstance(pool, str) or not pool:
+            return
+        delay = getattr(error, "retry_after_seconds", None)
+        if type(delay) in (int, float) and math.isfinite(delay) and delay > 0:
+            until = time.monotonic() + float(delay)
+        elif self.deadline is not None:
+            until = self.deadline
+        else:
+            # A dispatcher without a hard deadline still needs a finite
+            # quarantine; callers can submit a later bounded assignment.
+            until = time.monotonic() + 60.0
+        self.provider_cooldowns[pool] = max(until, self.provider_cooldowns.get(pool, 0.0))
+
+    @staticmethod
+    def _provider_route_failure(error):
+        return getattr(error, "status_code", None) in {408, 425, 429, 500, 502, 503, 504}
+
+    def _provider_retry_limit(self, role):
+        pools = {pool for _route_id, pool, _route in self._routes(role) if pool}
+        return max(0, len(pools) - 1) if pools else max(0, len(self._routes(role)) - 1)
 
     def _release_route(self, route):
         pool = route.get("pool_key", route.get("pool"))
@@ -838,17 +875,20 @@ class SpecialistDispatcher:
         max_input_tokens = quota.get("max_input_tokens") if isinstance(
             quota.get("max_input_tokens"), int) else 12000
         # A verifier's second attempt is an explicit bounded repair/fallback,
-        # not an unbounded provider retry.  The assignment manifest reserves
-        # two logical call slots for this case; ordinary specialists retain
-        # their one-call contract.
+        # not an unbounded provider retry.  Provider failures are a separate
+        # technical concern: a 429/5xx from one route must not consume the
+        # scientific assignment when another configured pool is healthy.
         retry_limit = 1 if verifier and type(quota.get("max_calls")) is int \
             and quota["max_calls"] >= 2 else 0
+        provider_retry_limit = self._provider_retry_limit(model_role)
+        validation_retries = 0
+        provider_retries = 0
         accumulated_usage = {}
         retry_history = []
         previous_text = None
+        last_validation_error = None
         report = None
-        route = None
-        for call_index in range(retry_limit + 1):
+        while report is None:
             route = None
             response_received = False
             try:
@@ -871,8 +911,8 @@ class SpecialistDispatcher:
                             outcome_known=True)
                     config["timeout_seconds"] = min(
                         float(config.get("timeout_seconds", remaining)), remaining)
-                current_prompt = prompt if call_index == 0 else _verifier_repair_prompt(
-                    prompt, retry_history[-1]["error"], previous_text,
+                current_prompt = prompt if validation_retries == 0 else _verifier_repair_prompt(
+                    prompt, last_validation_error, previous_text,
                     max_input_tokens=max_input_tokens)
                 self.on_progress({"event": "dispatched", "role": assigned_role,
                                   "role_id": assignment.get("role_id"),
@@ -882,7 +922,10 @@ class SpecialistDispatcher:
                                   "provider_pool": route["pool"], "model": config.get("model"),
                                   "base_url": config.get("base_url"),
                                   "cache_prompt": config.get("cache_prompt"),
-                                  "execution_mode": "model", "dispatch_attempt": call_index + 1})
+                                  "execution_mode": "model",
+                                  "dispatch_attempt": validation_retries + provider_retries + 1,
+                                  "provider_retry_count": provider_retries,
+                                  "validation_retry_count": validation_retries})
                 result = ModelClient(**config).complete(system=system, prompt=current_prompt)
                 response_received = True
                 for key, value in result.usage.items():
@@ -904,11 +947,37 @@ class SpecialistDispatcher:
                     "request_attempts": sum(
                         item.get("request_attempts", 0) for item in retry_history
                     ) + result.request_attempts,
-                    "validation_retries": call_index,
+                    "validation_retries": validation_retries,
+                    "provider_retries": provider_retries,
                     "retry_history": deepcopy(retry_history),
                 }
-                break
+                continue
             except ModelCallError as exc:
+                if (self._provider_route_failure(exc)
+                        and provider_retries < provider_retry_limit):
+                    provider_retries += 1
+                    self._mark_provider_cooldown(route.get("pool_key") if route else None, exc)
+                    retry_history.append({
+                        "kind": "provider_route",
+                        "attempt": validation_retries + provider_retries,
+                        "route_id": route["route_id"] if route else None,
+                        "provider_pool": route["pool"] if route else None,
+                        "status_code": exc.status_code,
+                        "retry_after_seconds": exc.retry_after_seconds,
+                        "error": str(exc)[:1000],
+                        "request_attempts": exc.attempts,
+                    })
+                    self.on_progress({"event": "provider_route_failed",
+                                      "role": assigned_role,
+                                      "role_id": assignment.get("role_id"),
+                                      "model_role": model_role,
+                                      "route_id": route["route_id"] if route else None,
+                                      "provider_pool": route["pool"] if route else None,
+                                      "status_code": exc.status_code,
+                                      "retry_after_seconds": exc.retry_after_seconds,
+                                      "error": str(exc),
+                                      "provider_retry_count": provider_retries})
+                    continue
                 report = {
                     "status": "result_unknown" if not exc.outcome_known else "failed",
                     "execution_mode": "model", "assigned_role": assigned_role,
@@ -919,14 +988,20 @@ class SpecialistDispatcher:
                     "elapsed_seconds": exc.elapsed_seconds if exc.elapsed_seconds is not None
                     else time.monotonic() - started,
                     "usage": deepcopy(accumulated_usage),
-                    "validation_retries": call_index,
+                    "validation_retries": validation_retries,
+                    "provider_retries": provider_retries,
+                    "status_code": exc.status_code,
+                    "retry_after_seconds": exc.retry_after_seconds,
                     "retry_history": deepcopy(retry_history),
                 }
-                break
+                continue
             except ValidationError as exc:
-                if response_received and call_index < retry_limit:
+                if response_received and validation_retries < retry_limit:
+                    validation_retries += 1
+                    last_validation_error = str(exc)
                     retry_history.append({
-                        "attempt": call_index + 1, "route_id": route["route_id"],
+                        "kind": "validation",
+                        "attempt": validation_retries, "route_id": route["route_id"],
                         "provider_pool": route["pool"], "error": str(exc)[:1000],
                         "request_attempts": result.request_attempts,
                     })
@@ -934,7 +1009,9 @@ class SpecialistDispatcher:
                                       "role_id": assignment.get("role_id"),
                                       "model_role": model_role, "route_id": route["route_id"],
                                       "provider_pool": route["pool"],
-                                      "error": str(exc), "dispatch_attempt": call_index + 1})
+                                      "error": str(exc),
+                                      "dispatch_attempt": validation_retries + provider_retries + 1,
+                                      "validation_retry_count": validation_retries})
                     continue
                 report = {
                     "status": "failed", "execution_mode": "model",
@@ -945,10 +1022,11 @@ class SpecialistDispatcher:
                     "error": f"{type(exc).__name__}: {exc}",
                     "elapsed_seconds": time.monotonic() - started,
                     "usage": deepcopy(accumulated_usage),
-                    "validation_retries": call_index,
+                    "validation_retries": validation_retries,
+                    "provider_retries": provider_retries,
                     "retry_history": deepcopy(retry_history),
                 }
-                break
+                continue
             except (OSError, ValueError, TypeError) as exc:
                 report = {
                     "status": "failed", "execution_mode": "model",
@@ -959,10 +1037,11 @@ class SpecialistDispatcher:
                     "error": f"{type(exc).__name__}: {exc}",
                     "elapsed_seconds": time.monotonic() - started,
                     "usage": deepcopy(accumulated_usage),
-                    "validation_retries": call_index,
+                    "validation_retries": validation_retries,
+                    "provider_retries": provider_retries,
                     "retry_history": deepcopy(retry_history),
                 }
-                break
+                continue
             finally:
                 if route is not None:
                     self._release_route(route)
@@ -974,7 +1053,8 @@ class SpecialistDispatcher:
                 "error": "specialist dispatch ended without a report",
                 "elapsed_seconds": time.monotonic() - started,
                 "usage": deepcopy(accumulated_usage),
-                "validation_retries": len(retry_history),
+                "validation_retries": validation_retries,
+                "provider_retries": provider_retries,
                 "retry_history": deepcopy(retry_history),
             }
         self.on_progress({"event": "completed", "role": assigned_role, **report})

@@ -43,6 +43,27 @@ def execution_worker(kind, params, channel):
     channel.put({"ok": True, "result": result})
 
 
+def provider_retry_worker(kind, params, channel):
+    if params.get("provider_pool") == "ollama":
+        channel.put({"ok": False, "error": "provider quota exhausted",
+                     "outcome_known": True, "status_code": 429})
+        return
+    started = time.monotonic()
+    time.sleep(0.15)
+    result = {"text": json.dumps({
+        "provider_pool": params.get("provider_pool"),
+        "route_id": params.get("route_id"),
+    }), "model": params.get("client", {}).get("model", "simulated"),
+               "usage": {"model_calls": 1, "input_tokens": 10, "output_tokens": 5},
+               "elapsed_seconds": time.monotonic() - started, "finish_reason": "stop"}
+    channel.put({"ok": True, "result": result})
+
+
+def provider_exhaustion_worker(kind, params, channel):
+    channel.put({"ok": False, "error": "all configured providers exhausted",
+                 "outcome_known": True, "status_code": 429})
+
+
 class TestExecutionRuntime(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="scisaurus-execution-test-")
@@ -220,6 +241,76 @@ class TestExecutionRuntime(unittest.TestCase):
         self.assertLessEqual(provider_peak("ollama"), 3)
         self.assertLessEqual(provider_peak("qwen"), 1)
         self.assertEqual(runtime.control._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 6)
+
+    def test_provider_429_requeues_same_logical_task_on_healthy_route(self):
+        value = config()
+        value["model"].update(
+            base_url="http://127.0.0.1:1/v1", protocol="openai_compatible", model="base-model")
+        value["model"]["role_routes"] = {
+            "strategy.worker": [
+                {"id": "qwen-route", "pool": "qwen", "base_url": "http://127.0.0.1:1/v1",
+                 "protocol": "openai_compatible", "model": "qwen-model", "auth_env": None},
+                {"id": "gemma-route", "pool": "ollama", "base_url": "http://127.0.0.1:2/v1",
+                 "protocol": "openai_compatible", "model": "gemma-model", "auth_env": None},
+            ]
+        }
+        value["limits"]["provider_pools"] = {
+            "qwen": {"max_concurrent": 1, "base_urls": ["http://127.0.0.1:1/v1"]},
+            "ollama": {"max_concurrent": 1, "base_urls": ["http://127.0.0.1:2/v1"]},
+        }
+        runtime = ExecutionRuntime(
+            self.root / "provider-retry-project", validate_config(value),
+            worker_target=provider_retry_worker)
+        self.runtimes.append(runtime)
+        specs = []
+        for index in range(2):
+            spec = self.spec(f"provider-retry-{index}", delay=0.1)
+            spec["params"]["client"] = value["model"]
+            specs.append(spec)
+        outcomes = runtime._call_batch(specs, max_parallel=2)
+        self.assertTrue(all(outcome["ok"] for outcome in outcomes.values()))
+        self.assertEqual({json.loads(item["result"]["text"])["provider_pool"]
+                          for item in outcomes.values()}, {"qwen"})
+        self.assertEqual(runtime.tasks.get("provider-retry-0")["state"], "awaiting_review")
+        self.assertEqual(runtime.tasks.get("provider-retry-1")["state"], "awaiting_review")
+        technical = runtime.control._conn.execute(
+            "SELECT state FROM tasks WHERE task_id LIKE '%-provider-retry-1'"
+        ).fetchall()
+        self.assertEqual([row[0] for row in technical], ["completed"])
+        retry_failures = runtime.control._conn.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE logical_id LIKE 'command/failures/provider-retry-%'"
+        ).fetchone()[0]
+        self.assertEqual(retry_failures, 1)
+        self.assertEqual(runtime.provider_active, {"qwen": 0, "ollama": 0})
+
+    def test_provider_route_exhaustion_returns_failure_for_original_logical_task(self):
+        value = config()
+        value["model"].update(
+            base_url="http://127.0.0.1:1/v1", protocol="openai_compatible", model="base-model")
+        value["model"]["role_routes"] = {
+            "strategy.worker": [
+                {"id": "qwen-route", "pool": "qwen", "base_url": "http://127.0.0.1:1/v1",
+                 "protocol": "openai_compatible", "model": "qwen-model", "auth_env": None},
+                {"id": "gemma-route", "pool": "ollama", "base_url": "http://127.0.0.1:2/v1",
+                 "protocol": "openai_compatible", "model": "gemma-model", "auth_env": None},
+            ]
+        }
+        value["limits"]["provider_pools"] = {
+            "qwen": {"max_concurrent": 1, "base_urls": ["http://127.0.0.1:1/v1"]},
+            "ollama": {"max_concurrent": 1, "base_urls": ["http://127.0.0.1:2/v1"]},
+        }
+        runtime = ExecutionRuntime(
+            self.root / "provider-exhaustion-project", validate_config(value),
+            worker_target=provider_exhaustion_worker)
+        self.runtimes.append(runtime)
+        spec = self.spec("provider-exhausted", delay=0.01)
+        spec["params"]["client"] = value["model"]
+        outcomes = runtime._call_batch([spec], max_parallel=1)
+        self.assertEqual(set(outcomes), {"provider-exhausted"})
+        self.assertFalse(outcomes["provider-exhausted"]["ok"])
+        self.assertEqual(outcomes["provider-exhausted"]["status_code"], 429)
+        self.assertEqual(runtime.tasks.get("provider-exhausted")["state"], "failed")
+        self.assertEqual(runtime.provider_active, {"qwen": 0, "ollama": 0})
 
     def test_provider_route_skips_a_too_small_model_context(self):
         value = config()

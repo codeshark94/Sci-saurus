@@ -68,6 +68,44 @@ class _VerifierRetryHandler(BaseHTTPRequestHandler):
         return
 
 
+class _ProviderFallbackHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        request = json.loads(self.rfile.read(length))
+        server = self.server
+        model = request.get("model")
+        with server.lock:
+            server.models.append(model)
+        if model == "gemma":
+            body = b'{"error":"quota exhausted"}'
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        # Keep the first Qwen reservation occupied while the second logical
+        # assignment is forced onto Gemma.  The retry must then wait for the
+        # single Qwen slot and return to it after Gemma's 429.
+        time.sleep(0.15)
+        body = json.dumps({
+            "model": model,
+            "choices": [{"message": {"content": json.dumps({
+                "decision": "pass", "summary": "checked", "findings": [],
+                "evidence_gaps": [], "requested_actions": [],
+            })}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args):
+        return
+
+
 class SpecialistDispatcherTests(unittest.TestCase):
     def test_specialist_prompt_uses_declared_projection_and_fits_role_quota(self):
         assignment = {
@@ -316,6 +354,61 @@ class SpecialistDispatcherTests(unittest.TestCase):
             self.assertEqual(result["request_attempts"], 2)
             self.assertEqual(server.requests, 2)
             self.assertTrue(any(event.get("event") == "retrying" for event in events))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_provider_429_reroutes_same_assignment_to_healthy_qwen(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _ProviderFallbackHandler)
+        server.lock = threading.Lock()
+        server.models = []
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        events = []
+        try:
+            base = f"http://127.0.0.1:{server.server_port}/v1"
+            route = lambda route_id, pool, model: {
+                "id": route_id, "pool": pool, "protocol": "openai_compatible",
+                "base_url": base, "model": model,
+            }
+            model = {
+                "protocol": "openai_compatible", "base_url": base,
+                "model": "fallback", "timeout_seconds": 5.0,
+                "max_output_tokens": 100, "context_window_tokens": 4096,
+                "max_input_tokens": 2048, "role_routes": {
+                    "research.search-planner": [
+                        route("qwen-route", "qwen", "qwen"),
+                        route("gemma-route", "ollama", "gemma"),
+                    ],
+                },
+            }
+            assignments = [{
+                "assigned_role": f"research.search-planner-{index}",
+                "role_id": f"search-planner-{index}",
+                "model_role": "research.search-planner",
+                "execution_kind": "model", "stage_id": "survey",
+                "stage_kind": "survey", "quota": {
+                    "max_calls": 1, "max_input_tokens": 1000,
+                    "max_output_tokens": 100, "max_seconds": 5,
+                },
+                "_prompt": json.dumps({"stage": "survey", "assignment": index}),
+            } for index in range(2)]
+            results = SpecialistDispatcher(
+                model, provider_pools={
+                    "qwen": {"max_concurrent": 1, "base_urls": [base]},
+                    "ollama": {"max_concurrent": 1, "base_urls": [base]},
+                }, max_parallel=2, deadline=time.monotonic() + 5,
+                on_progress=events.append,
+            ).dispatch(assignments, {"objective": "test"})
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(item["status"] == "succeeded" for item in results))
+            self.assertEqual({item["provider_pool"] for item in results}, {"qwen"})
+            self.assertEqual(sum(item["provider_retries"] for item in results), 1)
+            self.assertEqual(server.models.count("gemma"), 1)
+            self.assertEqual(server.models.count("qwen"), 2)
+            self.assertTrue(any(event.get("event") == "provider_route_failed"
+                                and event.get("status_code") == 429 for event in events))
         finally:
             server.shutdown()
             server.server_close()

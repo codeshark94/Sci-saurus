@@ -290,9 +290,25 @@ class DashboardSnapshot:
             for stage_id, record in progress_stages.items():
                 if not isinstance(stage_id, str) or not isinstance(record, dict):
                     continue
-                if record.get("status") != "running":
+                if record.get("status") not in {"running", "retrying"}:
                     continue
                 project_dir = record.get("project_dir")
+                if not isinstance(project_dir, str) or not project_dir:
+                    # Composer retries historically lived below attempts/ and
+                    # the live stage record did not repeat the active path.
+                    # The attempt ledger is still authoritative; expose its
+                    # newest durable workspace so the dashboard reads the
+                    # current survey artifacts instead of only the empty
+                    # workflow root.
+                    attempts = record.get("attempts")
+                    if isinstance(attempts, list):
+                        for attempt in reversed(attempts):
+                            if not isinstance(attempt, dict):
+                                continue
+                            candidate_dir = attempt.get("project_dir")
+                            if isinstance(candidate_dir, str) and candidate_dir:
+                                project_dir = candidate_dir
+                                break
                 if not isinstance(project_dir, str) or not project_dir:
                     continue
                 candidate = Path(project_dir).expanduser()
@@ -425,7 +441,9 @@ class DashboardSnapshot:
             "specialist_live": raw.get("specialist_live", {}),
             "error": _short(raw.get("error"), 280),
             "source_root": source_root,
-            "project_dir": spec.get("project_dir") or str(stage_root or ""),
+            "project_dir": (str(self.roots.get(f"stage:{stage_id}:active"))
+                            if self.roots.get(f"stage:{stage_id}:active") is not None
+                            else spec.get("project_dir") or str(stage_root or "")),
         }
 
     def _db_connection(self, path):

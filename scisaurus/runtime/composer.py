@@ -3479,11 +3479,40 @@ class ComposerRunner:
 
     @staticmethod
     def _attempt_stage(stage, attempt_number):
-        """Isolate a retried stage while keeping every prior attempt inspectable."""
+        """Choose a retry workspace without discarding resumable stage state.
+
+        SurveyRunner owns a durable work register and source checkpoint.  A
+        provider failure should therefore reopen that same survey namespace;
+        putting every retry in a new directory turns a recoverable role failure
+        into a full literature restart.  Older runs created isolated survey
+        attempts, so select the newest such directory when the base namespace
+        has not yet been migrated.  Other stage kinds retain isolated retries.
+        """
         candidate = deepcopy(stage)
+        base = Path(stage["project_dir"]).resolve()
+        if stage.get("kind") == "survey":
+            durable_project = base
+            if not (base / "state" / "control.sqlite").is_file():
+                prior_attempts = []
+                attempts_root = base / "attempts"
+                if attempts_root.is_dir():
+                    for path in attempts_root.iterdir():
+                        if not path.is_dir() or not (path / "state" / "control.sqlite").is_file():
+                            continue
+                        try:
+                            number = int(path.name.removeprefix("attempt-"))
+                        except ValueError:
+                            continue
+                        if path.name == f"attempt-{number}":
+                            prior_attempts.append((number, path))
+                if prior_attempts:
+                    durable_project = max(prior_attempts, key=lambda item: item[0])[1]
+            candidate["project_dir"] = str(durable_project)
+            candidate["reuse_completed"] = False
+            candidate["reuse_output_path"] = None
+            return candidate
         if attempt_number <= 1:
             return candidate
-        base = Path(stage["project_dir"]).resolve()
         candidate["project_dir"] = str(base / "attempts" / f"attempt-{attempt_number}")
         # A failed attempt is never a reusable checkpoint.  Successful stages
         # are skipped by the Composer before this helper is reached.

@@ -82,6 +82,26 @@ class DashboardTests(unittest.TestCase):
                             for item in snapshot["checkpoints"]))
         self.assertEqual((root / "README.md").read_text(encoding="utf-8"), "# Dashboard fixture\n")
 
+    def test_snapshot_discovers_latest_retry_workspace_from_stage_attempt_ledger(self):
+        temporary, root = self.make_project()
+        self.addCleanup(temporary.cleanup)
+        active = root / "survey-attempt-2"
+        active.mkdir()
+        live = json.loads((root / "output" / "progress.json").read_text(encoding="utf-8"))
+        live["stages"]["survey"]["status"] = "retrying"
+        live["stages"]["survey"]["attempts"] = [{
+            "attempt_number": 2, "state": "failed", "project_dir": str(active),
+        }]
+        (root / "output" / "progress.json").write_text(json.dumps(live), encoding="utf-8")
+
+        snapshot = DashboardSnapshot(root).payload()
+
+        self.assertTrue(any(item["key"] == "stage:survey:active"
+                            and item["path"] == str(active.resolve())
+                            for item in snapshot["project"]["roots"]))
+        survey_stage = next(item for item in snapshot["pipeline"]["stages"] if item["id"] == "survey")
+        self.assertEqual(survey_stage["project_dir"], str(active.resolve()))
+
     def test_snapshot_exposes_research_program_and_argument_defense(self):
         temporary, root = self.make_project()
         self.addCleanup(temporary.cleanup)

@@ -114,8 +114,13 @@ def _invoke_worker(kind, params, channel):
             raise ValueError("unknown operation")
         channel.put({"ok": True, "result": result})
     except Exception as exc:
-        channel.put({"ok": False, "error": str(exc), "error_type": type(exc).__name__,
-                     "outcome_known": bool(getattr(exc, "outcome_known", kind != "model"))})
+        payload = {"ok": False, "error": str(exc), "error_type": type(exc).__name__,
+                   "outcome_known": bool(getattr(exc, "outcome_known", kind != "model"))}
+        for key in ("status_code", "retry_after_seconds"):
+            value = getattr(exc, key, None)
+            if value is not None:
+                payload[key] = value
+        channel.put(payload)
 
 
 def _worker_entry(worker_target, kind, params, channel):
@@ -174,6 +179,12 @@ class ExecutionRuntime:
         self.provider_pools = dict(config["limits"].get("provider_pools") or {})
         self.provider_active = {name: 0 for name in self.provider_pools}
         self.provider_route_cursors = {}
+        # A provider-wide response such as HTTP 429 is stronger evidence than
+        # a temporarily full slot.  Keep that health signal for the lifetime
+        # of this bounded dispatch so other logical assignments can use a
+        # healthy alternate route instead of repeatedly hammering the dead
+        # pool.
+        self.provider_cooldowns = {}
         self.cancelled = False
         self.cancellation_reason = None
         self.sources = []
@@ -236,7 +247,11 @@ class ExecutionRuntime:
         }])[task_id]
         self._ensure_active()
         if not outcome["ok"]:
-            raise ModelCallError(outcome["error"], outcome_known=outcome["outcome_known"])
+            raise ModelCallError(
+                outcome["error"], outcome_known=outcome["outcome_known"],
+                status_code=outcome.get("status_code"),
+                retry_after_seconds=outcome.get("retry_after_seconds"),
+            )
         return outcome["result"], outcome["record_ref"]
 
     def _ensure_active(self):
@@ -291,25 +306,34 @@ class ExecutionRuntime:
                         break
                     raw_spec = pending.pop(index)
                     if context_block is not None:
-                        outcomes[raw_spec["task_id"]] = self._undispatched(
-                            raw_spec, context_block.reason)
+                        outcome = self._undispatched(raw_spec, context_block.reason)
+                        logical_task_id = raw_spec.get("_logical_task_id", raw_spec["task_id"])
+                        self._finalize_logical_task(logical_task_id, raw_spec["task_id"], outcome)
+                        outcomes[logical_task_id] = outcome
                         continue
                     spec = self._apply_provider_route(raw_spec, selected_route)
                     context_error = self._model_context_error(spec)
                     if context_error:
-                        outcomes[spec["task_id"]] = self._undispatched(spec, context_error)
+                        outcome = self._undispatched(spec, context_error)
+                        logical_task_id = spec.get("_logical_task_id", spec["task_id"])
+                        self._finalize_logical_task(logical_task_id, spec["task_id"], outcome)
+                        outcomes[logical_task_id] = outcome
                         continue
                     entry = {"spec": spec, "context": None, "process": None,
                              "channel": None, "dispatched": False, "attempt_id": None,
-                             "provider_reserved": False}
+                             "provider_reserved": False,
+                             "logical_task_id": spec.get("_logical_task_id", spec["task_id"])}
                     self._reserve_provider(entry)
                     active[spec["task_id"]] = entry
                     self._set_active(active)
                     self._dispatch(entry)
                 if not active:
                     for spec in pending:
-                        outcomes[spec["task_id"]] = self._undispatched(
+                        outcome = self._undispatched(
                             spec, "dispatch capacity is held by outstanding reservations")
+                        logical_task_id = spec.get("_logical_task_id", spec["task_id"])
+                        self._finalize_logical_task(logical_task_id, spec["task_id"], outcome)
+                        outcomes[logical_task_id] = outcome
                     pending.clear()
                     break
                 for task_id, entry in list(active.items()):
@@ -317,8 +341,20 @@ class ExecutionRuntime:
                     if message is not None:
                         self._stop_worker(entry["process"])
                         entry["process"] = None
+                        retry = self._provider_retry_spec(entry, message)
                         try:
-                            outcomes[task_id] = self._record_outcome(entry, message)
+                            if retry is not None:
+                                # Preserve the logical task as running while
+                                # its technical provider attempt is settled;
+                                # the final route outcome closes it exactly
+                                # once below.
+                                self._record_outcome(entry, message, defer_task_failure=True)
+                                pending.insert(0, retry)
+                                continue
+                            outcome = self._record_outcome(entry, message)
+                            logical_task_id = entry.get("logical_task_id", task_id)
+                            self._finalize_logical_task(logical_task_id, task_id, outcome)
+                            outcomes[logical_task_id] = outcome
                         finally:
                             self._release_provider(entry)
                             del active[task_id]
@@ -343,12 +379,18 @@ class ExecutionRuntime:
                     message = {"ok": False, "error": reason,
                                "outcome_known": not entry["dispatched"]}
                 try:
-                    outcomes[task_id] = self._record_outcome(entry, message)
+                    outcome = self._record_outcome(entry, message)
+                    logical_task_id = entry.get("logical_task_id", task_id)
+                    self._finalize_logical_task(logical_task_id, task_id, outcome)
+                    outcomes[logical_task_id] = outcome
                 finally:
                     self._release_provider(entry)
                     del active[task_id]
             for spec in pending:
-                outcomes[spec["task_id"]] = self._undispatched(spec, reason)
+                outcome = self._undispatched(spec, reason)
+                logical_task_id = spec.get("_logical_task_id", spec["task_id"])
+                self._finalize_logical_task(logical_task_id, spec["task_id"], outcome)
+                outcomes[logical_task_id] = outcome
         finally:
             for entry in active.values():
                 self._stop_worker(entry["process"])
@@ -408,7 +450,7 @@ class ExecutionRuntime:
     def _base_model_config(self, spec):
         """Resolve a task client, filling fixture-style partial clients from the run config."""
         params = spec["params"]
-        client = params.get("client")
+        client = params.get("_routing_client") or params.get("client")
         if not isinstance(client, dict):
             raise ValidationError("model operation requires a client object")
         role = params.get("role") or spec["actor"]
@@ -452,7 +494,7 @@ class ExecutionRuntime:
         if spec["kind"] != "model" or not self.provider_pools:
             return None
         params = spec["params"]
-        client = params.get("client")
+        client = params.get("_routing_client") or params.get("client")
         if not isinstance(client, dict):
             raise ValidationError("model operation requires a client object")
         role = params.get("role") or spec["actor"]
@@ -461,6 +503,7 @@ class ExecutionRuntime:
         if routes:
             cursor = self.provider_route_cursors.get(role, 0) % len(routes)
             capacity_blocked = False
+            cooldown_blocked = False
             budget_blocked = False
             context_errors = []
             for offset in range(len(routes)):
@@ -471,6 +514,12 @@ class ExecutionRuntime:
                 if pool is None:
                     raise ValidationError(
                         f"model route {route['id']} references an unknown provider pool: {pool_name}")
+                cooldown_until = self.provider_cooldowns.get(pool_name, 0.0)
+                if cooldown_until > time.monotonic():
+                    cooldown_blocked = True
+                    continue
+                if cooldown_until:
+                    self.provider_cooldowns.pop(pool_name, None)
                 if self.provider_active[pool_name] >= pool["max_concurrent"]:
                     capacity_blocked = True
                     continue
@@ -486,7 +535,7 @@ class ExecutionRuntime:
                 return {**route, "_effective": effective}
             # A full route may become usable later, so do not convert a
             # temporary pool-capacity wait into a permanent task failure.
-            if capacity_blocked:
+            if capacity_blocked or cooldown_blocked:
                 return _NO_PROVIDER_CAPACITY
             if context_errors:
                 return _ProviderContextBlock(
@@ -505,6 +554,8 @@ class ExecutionRuntime:
         if not matches:
             return None
         pool_name = matches[0]
+        if self.provider_cooldowns.get(pool_name, 0.0) > time.monotonic():
+            return _NO_PROVIDER_CAPACITY
         if self.provider_active[pool_name] >= self.provider_pools[pool_name]["max_concurrent"]:
             return _NO_PROVIDER_CAPACITY
         context_error = self._model_context_error(spec, effective)
@@ -512,12 +563,81 @@ class ExecutionRuntime:
             return _ProviderContextBlock(context_error)
         return {"id": f"default:{pool_name}", "pool": pool_name, "_effective": effective}
 
+    def _mark_provider_cooldown(self, pool_name, message):
+        """Quarantine a provider after a known rate-limit response.
+
+        A missing Retry-After is treated as a run-scoped quota exhaustion.  It
+        is safer to spend the remaining assignment on a live alternate route
+        than to redispatch the same provider once per retry tick.
+        """
+        if not isinstance(pool_name, str) or not pool_name:
+            return
+        delay = message.get("retry_after_seconds")
+        if type(delay) not in (int, float) or delay <= 0:
+            until = self.deadline
+        else:
+            until = min(self.deadline, time.monotonic() + float(delay))
+        self.provider_cooldowns[pool_name] = max(
+            until, self.provider_cooldowns.get(pool_name, 0.0))
+
+    @staticmethod
+    def _provider_route_failure(message):
+        return message.get("status_code") in {408, 425, 429, 500, 502, 503, 504}
+
+    def _provider_retry_spec(self, entry, message):
+        """Create an auditable technical retry for a known provider failure."""
+        spec = entry["spec"]
+        if spec["kind"] != "model" or not self._provider_route_failure(message):
+            return None
+        role = spec["params"].get("role") or spec["actor"]
+        client = spec["params"].get("_routing_client") or spec["params"].get("client")
+        routes = client.get("role_routes", {}).get(role, []) if isinstance(client, dict) else []
+        if not routes:
+            configured = self.config.get("model", {}).get("role_routes", {})
+            routes = configured.get(role, []) if isinstance(configured, dict) else []
+        route_count = len(routes) if isinstance(routes, list) else 0
+        retry_count = int(spec.get("_provider_retry_count", 0) or 0)
+        if route_count < 2 or retry_count >= route_count - 1:
+            return None
+        pool_name = spec["params"].get("provider_pool")
+        if pool_name:
+            self._mark_provider_cooldown(pool_name, message)
+        logical_task_id = spec.get("_logical_task_id", spec["task_id"])
+        retry_count += 1
+        retry = dict(spec)
+        retry["task_id"] = f"{logical_task_id}-provider-retry-{retry_count}"
+        retry["reservation_id"] = f"{spec.get('reservation_id', logical_task_id)}-provider-retry-{retry_count}"
+        retry["_logical_task_id"] = logical_task_id
+        retry["_provider_retry_count"] = retry_count
+        retry["params"] = dict(spec["params"])
+        retry["params"]["provider_retry_of"] = logical_task_id
+        return retry
+
+    def _finalize_logical_task(self, logical_task_id, task_id, outcome):
+        """Close the original logical task after a technical route retry."""
+        if logical_task_id == task_id:
+            return
+        if outcome.get("ok"):
+            # The technical retry has no caller that can perform the normal
+            # post-generation contract check.  Its provider response has
+            # already been recorded, so close only that transport attempt;
+            # leave the logical assignment in awaiting_review for the stage
+            # runner to validate and complete exactly as usual.
+            self.tasks.transition(task_id, "completed", "command.controller",
+                                  reason="provider route retry output recorded")
+            self.tasks.transition(logical_task_id, "awaiting_review", "command.controller",
+                                  reason="provider route retry succeeded")
+        else:
+            state = "failed" if outcome.get("outcome_known") else "blocked"
+            self.tasks.transition(logical_task_id, state, "command.controller",
+                                  reason=outcome.get("error", "provider route retry failed"))
+
     def _apply_provider_route(self, spec, route):
         if route is None:
             return spec
         params = dict(spec["params"])
         role = params.get("role") or spec["actor"]
-        client = params.get("client")
+        client = params.get("_routing_client") or params.get("client")
         if not isinstance(client, dict):
             raise ValidationError("model operation requires a client object")
         effective = self._route_model_config(spec, route) if route is not None else None
@@ -529,6 +649,7 @@ class ExecutionRuntime:
         params["role"] = role
         params["route_id"] = route["id"]
         params["provider_pool"] = route["pool"]
+        params["_routing_client"] = client
         return {**spec, "params": params}
 
     def _reserve_provider(self, entry):
@@ -628,7 +749,7 @@ class ExecutionRuntime:
             process.join()
         process.close()
 
-    def _record_outcome(self, entry, message):
+    def _record_outcome(self, entry, message, *, defer_task_failure=False):
         spec = entry["spec"]
         task_id, actor = spec["task_id"], spec["actor"]
         subjects = [entry["context"]["artifact_ref"]] if entry["context"] else []
@@ -658,20 +779,29 @@ class ExecutionRuntime:
                 return {"ok": True, "result": result, "record_ref": record["artifact_ref"]}
         known = not entry["dispatched"] or bool(message.get("outcome_known"))
         reason = str(message.get("error", "worker failure omitted its error"))
-        self._publish(f"command/failures/{task_id}", "report",
-                      {"error": reason, "outcome_known": known, "dispatch_started": entry["dispatched"]},
+        failure = {"error": reason, "outcome_known": known,
+                   "dispatch_started": entry["dispatched"]}
+        for key in ("status_code", "retry_after_seconds"):
+            if message.get(key) is not None:
+                failure[key] = message[key]
+        self._publish(f"command/failures/{task_id}", "report", failure,
                       actor, subjects=subjects)
         if entry["attempt_id"]:
             if known:
                 usage = {"failed_calls": int(entry["dispatched"])}
                 self.tasks.finish_attempt(entry["attempt_id"], "failed", usage=usage)
-                self.tasks.transition(task_id, "failed", actor, reason=reason)
+                if not defer_task_failure:
+                    self.tasks.transition(task_id, "failed", actor, reason=reason)
                 self.budget.settle(window_id="run-window", reservation_id=spec["reservation_id"], actual=usage)
             else:
                 self.tasks.reconcile_unknown(entry["attempt_id"], "command.controller")
         else:
             self._block_pending(spec, reason)
-        return {"ok": False, "error": reason, "outcome_known": known}
+        result = {"ok": False, "error": reason, "outcome_known": known}
+        for key in ("status_code", "retry_after_seconds"):
+            if message.get(key) is not None:
+                result[key] = message[key]
+        return result
 
     def _block_pending(self, spec, reason):
         task_id = spec["task_id"]

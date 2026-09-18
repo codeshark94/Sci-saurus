@@ -426,6 +426,8 @@ class TestModelClient(unittest.TestCase):
                 system='x', prompt='x')
         self.assertEqual(self.calls, 3)
         self.assertTrue(error.exception.outcome_known)
+        self.assertEqual(error.exception.status_code, 429)
+        self.assertIsNone(error.exception.retry_after_seconds)
         self.assertEqual(error.exception.attempts, 3)
         self.assertIsNotNone(error.exception.elapsed_seconds)
         self.assertNotIn('private', str(error.exception))

@@ -744,7 +744,7 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertTrue(any(item.get("action") == "reject_work_order"
                                 for item in result["department_activity"]))
 
-    def test_retries_failed_stage_in_a_fresh_attempt_directory(self):
+    def test_retries_failed_survey_in_its_durable_project_directory(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
             workflow = self._workflow(root)
@@ -768,8 +768,27 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(len(result["stages"]["survey"]["attempts"]), 2)
             self.assertEqual(result["stages"]["survey"]["attempts"][0]["state"], "failed")
             self.assertEqual(result["stages"]["survey"]["attempts"][1]["state"], "succeeded")
-            self.assertTrue(calls[1].endswith("attempts/attempt-2"))
+            self.assertEqual(calls[1], calls[0])
             self.assertTrue(any(item["action"] == "retry_stage" for item in result["feedback"]))
+
+    def test_survey_retry_migrates_to_latest_legacy_attempt_checkpoint(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            stage = self._workflow(root)["stages"][0]
+            legacy = Path(stage["project_dir"]) / "attempts" / "attempt-7" / "state"
+            legacy.mkdir(parents=True)
+            (legacy / "control.sqlite").write_bytes(b"checkpoint")
+            candidate = ComposerRunner._attempt_stage(stage, 8)
+            self.assertEqual(
+                Path(candidate["project_dir"]),
+                legacy.parent,
+            )
+
+            base_state = Path(stage["project_dir"]) / "state"
+            base_state.mkdir(parents=True)
+            (base_state / "control.sqlite").write_bytes(b"newer-base")
+            candidate = ComposerRunner._attempt_stage(stage, 9)
+            self.assertEqual(Path(candidate["project_dir"]), Path(stage["project_dir"]).resolve())
 
     def test_retry_policy_exhaustion_keeps_failures_and_blocks(self):
         with tempfile.TemporaryDirectory() as path:
@@ -1148,7 +1167,7 @@ class ComposerWorkflowTests(unittest.TestCase):
             result = runner.run()
             self.assertEqual(result["status"], "completed")
             self.assertEqual(len(calls), 5)  # four survey attempts, then experiment
-            self.assertTrue(calls[3].endswith("attempts/attempt-4"))
+            self.assertEqual(calls[3], calls[0])
             self.assertEqual(result["retry_policy"]["mode"], "until_deadline")
             self.assertTrue(all(item.get("retry_mode") == "until_deadline"
                                 for item in result["feedback"] if item["action"] == "retry_stage"))

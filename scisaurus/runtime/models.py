@@ -481,9 +481,16 @@ def resolve_model_config(model, *, role=None, overrides=None):
 
 
 class ModelCallError(RuntimeError):
-    """An invocation failed; unknown outcomes must retain their reservation."""
+    """An invocation failed; unknown outcomes must retain their reservation.
+
+    ``status_code`` and ``retry_after_seconds`` are deliberately kept on the
+    typed error instead of being inferred from the rendered message.  The
+    orchestration layer can then distinguish a provider-wide 429 from a
+    malformed response and reroute the same logical assignment safely.
+    """
     def __init__(self, message, *, outcome_known=False, attempts=0,
-                 elapsed_seconds=None):
+                 elapsed_seconds=None, status_code=None,
+                 retry_after_seconds=None):
         super().__init__(message)
         self.outcome_known = outcome_known
         self.attempts = attempts if type(attempts) is int and attempts >= 0 else 0
@@ -491,6 +498,15 @@ class ModelCallError(RuntimeError):
             float(elapsed_seconds)
             if type(elapsed_seconds) in (int, float) and math.isfinite(elapsed_seconds)
             and elapsed_seconds >= 0 else None
+        )
+        self.status_code = (
+            status_code if type(status_code) is int and 100 <= status_code <= 599 else None
+        )
+        self.retry_after_seconds = (
+            float(retry_after_seconds)
+            if type(retry_after_seconds) in (int, float)
+            and math.isfinite(retry_after_seconds) and retry_after_seconds >= 0
+            else None
         )
 
 
@@ -761,10 +777,13 @@ class ModelClient:
         attempts_made = 0
         parsed = None
 
-        def failure(message, *, outcome_known=False):
+        def failure(message, *, outcome_known=False, status_code=None,
+                    retry_after_seconds=None):
             return ModelCallError(
                 message, outcome_known=outcome_known, attempts=attempts_made,
                 elapsed_seconds=time.monotonic() - started,
+                status_code=status_code,
+                retry_after_seconds=retry_after_seconds,
             )
 
         while True:
@@ -864,14 +883,22 @@ class ModelClient:
                         pass
                     if time.monotonic() + delay >= deadline:
                         raise failure(f"model HTTP request failed with status {code}",
-                                      outcome_known=400 <= code < 500) from None
+                                      outcome_known=400 <= code < 500,
+                                      status_code=code,
+                                      retry_after_seconds=retry_after) from None
                     time.sleep(delay)
                     attempt += 1
                     continue
                 raise failure(f"model HTTP request failed with status {code}",
-                              outcome_known=400 <= code < 500) from None
+                              outcome_known=400 <= code < 500,
+                              status_code=code,
+                              retry_after_seconds=retry_after) from None
             except ModelCallError as exc:
-                raise failure(str(exc), outcome_known=exc.outcome_known) from None
+                raise failure(
+                    str(exc), outcome_known=exc.outcome_known,
+                    status_code=exc.status_code,
+                    retry_after_seconds=exc.retry_after_seconds,
+                ) from None
             except (http.client.HTTPException, TimeoutError, OSError, ValueError, AttributeError) as exc:
                 if expired.is_set() or time.monotonic() >= deadline:
                     raise failure("model request deadline exceeded") from None
