@@ -41,6 +41,11 @@ from scisaurus.runtime.specialists import (
     SpecialistDispatcher,
     build_verifier_prompt,
 )
+from scisaurus.runtime.topic_discovery import (
+    DEFAULT_TOPIC_BUDGETS,
+    DEFAULT_TOPIC_CONTINUATION_BUDGETS,
+    EVIDENCE_MODE_VALUES,
+)
 
 
 SCHEMA_VERSION = "composer-workflow-1"
@@ -680,13 +685,16 @@ class ComposerRunner:
         return usage if isinstance(usage, dict) else {}
 
     @classmethod
-    def _sum_topic_attempt_usage(cls, attempts, *, scope="all"):
-        """Sum observed topic work across isolated attempts.
+    def _sum_topic_attempt_usage(cls, attempts, *, scope="all", cycle=None):
+        """Sum observed topic work for one bounded admission scope.
 
-        Topic discovery receives a fresh local ``TopicBudget`` for each
-        scientific pivot, but the Composer mission owns the aggregate ceiling.
-        Missing usage is treated as zero here; an interrupted provider call is
-        already represented as ``unknown`` and is reconciled separately by the
+        Initial intake retries share one envelope.  Each continuation is a
+        separate, deliberately admitted scientific pivot and gets its own
+        envelope; otherwise a legacy run with many historical pivots could
+        make every newly admitted direction fail before it is evaluated. The
+        immutable workflow deadline and provider/model ledgers still bound the
+        mission as a whole. Missing usage is treated as zero here; an
+        interrupted provider call is reconciled separately by the
         stage/task lease machinery.
         """
         totals = {
@@ -697,13 +705,21 @@ class ComposerRunner:
         }
         if not isinstance(attempts, list):
             return totals
+        selected_cycle = cycle
+        if scope == "continuation" and selected_cycle is None:
+            positive_cycles = [
+                item.get("cycle") for item in attempts
+                if isinstance(item, dict) and isinstance(item.get("cycle"), int)
+                and item.get("cycle") > 0
+            ]
+            selected_cycle = max(positive_cycles) if positive_cycles else None
         for attempt in attempts:
             if not isinstance(attempt, dict):
                 continue
-            cycle = attempt.get("cycle", 0)
-            if scope == "intake" and cycle not in (None, 0):
+            attempt_cycle = attempt.get("cycle", 0)
+            if scope == "intake" and attempt_cycle not in (None, 0):
                 continue
-            if scope == "continuation" and not (isinstance(cycle, int) and cycle > 0):
+            if scope == "continuation" and attempt_cycle != selected_cycle:
                 continue
             usage = cls._topic_attempt_usage(attempt)
             for key in totals:
@@ -713,19 +729,21 @@ class ComposerRunner:
         return totals
 
     def _topic_budgets_for_attempt(self, stage_id, configured_budgets, *, scope="intake"):
-        """Return the remaining mission budget for one fresh topic intake.
+        """Return the remaining scoped budget for one fresh topic intake.
 
         The topic runner's bounded repair budget is intentionally local so a
         rejected direction can be abandoned cleanly. The Composer carries a
-        separate workflow-level ceiling for initial intake and deliberate
-        continuation work, preventing a deadline-governed policy from
-        multiplying provider work while preserving a real repair path after a
-        reviewer hold.
+        separate workflow-level ceiling for initial intake and each deliberate
+        continuation pivot. The immutable deadline and provider/model ledgers
+        remain the mission-wide guardrails while each pivot retains a real
+        bounded repair path after a reviewer hold.
         """
         if not isinstance(configured_budgets, dict) or not configured_budgets:
             return configured_budgets
         record = self.stage_records.get(stage_id, {})
-        observed = self._sum_topic_attempt_usage(record.get("attempts", []), scope=scope)
+        budget_cycle = self.continuation_cycles if scope == "continuation" else None
+        observed = self._sum_topic_attempt_usage(
+            record.get("attempts", []), scope=scope, cycle=budget_cycle)
         usage_by_budget = {
             "max_model_calls": "model_calls",
             "max_openalex_requests": "openalex_requests",
@@ -746,7 +764,10 @@ class ComposerRunner:
                     "dimension": usage_key,
                     "limit": limit,
                     "observed": used,
-                    "scope": "mission",
+                    "scope": (
+                        f"continuation_cycle:{budget_cycle}"
+                        if scope == "continuation" else "intake"
+                    ),
                 }]
                 quota_error = QuotaExceededError(
                     "topic discovery mission quota exhausted: "
@@ -1475,10 +1496,14 @@ class ComposerRunner:
                 experiment_contract = None
         foundry_enabled = bool(self.workflow.get("capability_foundry_config_path"))
         foundry_runtime_packages = []
+        foundry_max_attempts = None
+        foundry_timeout_seconds = None
         if foundry_enabled:
             try:
                 foundry_config = json.loads(
                     Path(self.workflow["capability_foundry_config_path"]).read_text())
+                foundry_max_attempts = foundry_config.get("max_attempts")
+                foundry_timeout_seconds = foundry_config.get("timeout_seconds")
                 foundry_runtime_packages = [
                     {"name": item["name"], "version": item["version"]}
                     for item in foundry_config.get("runtime_packages", [])
@@ -1494,6 +1519,81 @@ class ComposerRunner:
             # host interpreter may intentionally not have the same packages.
             for item in foundry_runtime_packages:
                 packages[item["name"]] = True
+        stage_deadlines_seconds = {
+            stage["id"]: float(stage["deadline_seconds"])
+            for stage in self.workflow["stages"]
+        }
+        experiment_deadlines = [
+            stage["deadline_seconds"] for stage in self.workflow["stages"]
+            if stage["kind"] == "experiment"
+        ]
+        survey_sources = {
+            "metadata": False, "full_text": False, "max_api_requests": None,
+        }
+        for stage in self.workflow["stages"]:
+            if stage["kind"] != "survey":
+                continue
+            try:
+                descriptor = json.loads(Path(stage["config_path"]).read_text())
+                survey = descriptor.get("survey", {}) if isinstance(descriptor, dict) else {}
+                if not isinstance(survey, dict):
+                    survey = {}
+                search = survey.get("search", {}) if isinstance(survey, dict) else {}
+                survey_sources.update({
+                    "metadata": isinstance(survey.get("bibliography"), dict),
+                    "full_text": isinstance(survey.get("full_text"), dict),
+                    "max_api_requests": search.get("max_api_calls")
+                    if type(search.get("max_api_calls")) is int else None,
+                })
+            except (OSError, ValueError, TypeError):
+                # The stage validator remains authoritative for unreadable
+                # descriptors; topic context should not expose a partial path
+                # dump or turn an inventory failure into a scientific claim.
+                pass
+            break
+        if foundry_enabled:
+            feasibility_boundary = {
+                "execution_modes": ["foundry"],
+                "allowed_input_kinds": ["analytical_parameters", "synthetic"],
+                "allowed_data_access": ["closed_world"],
+                "network_access": False,
+                "undeclared_data": False,
+                "max_external_requests": 0,
+                "max_model_calls": 0,
+            }
+        else:
+            feasibility_boundary = {
+                "execution_modes": ["configured_program", "project_runner"],
+                "allowed_input_kinds": ["project_artifact", "synthetic"],
+                "allowed_data_access": ["closed_world", "project_local"],
+                "network_access": False,
+                "undeclared_data": False,
+                # Literature-provider capacity is not experiment capacity. The
+                # current project-runner boundary is closed-world and cannot
+                # smuggle a network/API dependency through the topic plan.
+                "max_external_requests": 0,
+                "max_model_calls": 0,
+            }
+        feasibility_boundary.update({
+            "schema_version": "research-feasibility-1",
+            "allowed_evidence_modes": (
+                ["analytical_derivation", "synthetic_simulation"]
+                if foundry_enabled else list(EVIDENCE_MODE_VALUES)
+            ),
+            "available_executables": sorted(
+                name for name in executable_names if shutil.which(name) is not None
+            ),
+            "available_packages": sorted(
+                name for name, present in packages.items() if present
+            ),
+            "stage_deadlines_seconds": stage_deadlines_seconds,
+            "max_experiment_seconds": min(
+                [*experiment_deadlines, *([foundry_timeout_seconds]
+                 if foundry_enabled and isinstance(foundry_timeout_seconds, (int, float))
+                 else [])]
+            ) if experiment_deadlines or foundry_timeout_seconds is not None else None,
+            "survey_sources": survey_sources,
+        })
         return {
             "operating_system": platform.system(),
             "platform": platform.machine(),
@@ -1514,6 +1614,8 @@ class ComposerRunner:
                 "enabled": True,
                 "execution_boundary": "deterministic seeded Python with no network or subprocess access",
                 "runtime_packages": foundry_runtime_packages,
+                "max_attempts": foundry_max_attempts,
+                "timeout_seconds": foundry_timeout_seconds,
                 "allowed_evidence_modes": ["analytical_derivation", "synthetic_simulation"],
                 "admission_gates": [
                     "static scan", "sandbox execution", "deterministic replay",
@@ -1525,6 +1627,11 @@ class ComposerRunner:
             "topic_preferences": deepcopy(self.workflow.get("topic_preferences") or {}),
             "project_files": project_files,
             "project_scoped_execution": True,
+            # A survey-only/free-topic workflow has no experiment boundary to
+            # validate yet.  Leave its topic package on the legacy contract;
+            # experiment-backed missions receive the strict input/runtime
+            # feasibility gate above.
+            "research_feasibility": feasibility_boundary if experiment_stages else None,
         }
 
     def _topic_sampling_seed(self, *, attempt_number=0):
@@ -4087,6 +4194,75 @@ class ComposerRunner:
                 context["research_program"] = build_research_program(context)
             self.context[stage_id] = context
 
+    def _restored_topic_feasibility_failure(self, by_id):
+        """Recheck a completed topic against the current execution boundary.
+
+        A checkpoint can outlive the code that produced it.  If a newer
+        Composer adds a required feasibility contract, letting an older topic
+        flow directly into survey or experiment would bypass the new gate.
+        Return the affected topic stage and a durable reason so ``run`` can
+        reopen its dependency closure through the ordinary continuation path.
+        """
+        if not any(stage.get("kind") == "experiment"
+                   for stage in self.workflow.get("stages", [])):
+            return None
+        topic_stage = next(
+            (stage for stage in self.workflow.get("stages", [])
+             if stage.get("kind") == "topic_discovery"), None)
+        if not isinstance(topic_stage, dict):
+            return None
+        record = self.stage_records.get(topic_stage.get("id"), {})
+        if not isinstance(record, dict) or record.get("status") not in STAGE_READY_STATUSES:
+            return None
+        topic_context = self.context.get(topic_stage.get("id"))
+        if not isinstance(topic_context, dict):
+            return (topic_stage["id"],
+                    "completed topic output is unavailable for current feasibility revalidation")
+        try:
+            from scisaurus.runtime.topic_discovery import (
+                _materialize_foundry_capability_requirements,
+                validate_topic_feasibility, validate_topic_stage_config,
+            )
+            descriptor = validate_topic_stage_config(
+                json.loads(Path(topic_stage["config_path"]).read_text()))
+            model = json.loads(Path(descriptor["model_config_path"]).read_text())
+            runtime_context = self._runtime_context(model)
+            package = _materialize_foundry_capability_requirements(
+                deepcopy(topic_context), runtime_context)
+            feasibility = validate_topic_feasibility(package, runtime_context)
+            if feasibility.get("status") == "legacy_unchecked":
+                return (topic_stage["id"],
+                        "completed topic output has no current capability admission record")
+        except (KeyError, OSError, StopIteration, TypeError, ValueError, ValidationError) as exc:
+            return topic_stage["id"], str(exc)
+        return None
+
+    def _queue_topic_feasibility_revalidation(self, stage_id, reason):
+        """Attach a typed topic repair order to an incompatible checkpoint."""
+        context = self.context.get(stage_id)
+        if not isinstance(context, dict):
+            context = {"kind": "topic_discovery", "status": "invalidated"}
+        requests = context.get("research_requests")
+        if not isinstance(requests, list):
+            requests = []
+        request_id = "topic-runtime-feasibility-revalidation"
+        if not any(isinstance(item, dict) and item.get("id") == request_id
+                   for item in requests):
+            requests.append({
+                "id": request_id,
+                "kind": "topic_refinement",
+                "owner": "research.intelligence",
+                "objective": "Replan the selected direction against the current executable and data boundary before literature admission.",
+                "why": "The checkpoint predates the machine-readable feasibility admission contract.",
+                "success_condition": "A candidate carries a valid feasibility plan that passes the current runtime boundary and can be admitted to the survey.",
+                "evidence_needed": "Current runtime inventory, experiment boundary, declared inputs, dependency availability, provider work, model work, and compute limit.",
+            })
+        context["research_requests"] = requests
+        context["runtime_feasibility_revalidation"] = {
+            "status": "required", "reason": str(reason)[:2048],
+        }
+        self.context[stage_id] = context
+
     def _reconcile_interrupted_attempt(self, attempt_id):
         """Close an attempt left running before a process interruption.
 
@@ -4777,6 +4953,11 @@ class ComposerRunner:
                     if continuation_scope and descriptor.get("continuation_budgets")
                     else descriptor.get("budgets")
                 )
+                if not configured_topic_budgets:
+                    configured_topic_budgets = (
+                        DEFAULT_TOPIC_CONTINUATION_BUDGETS
+                        if continuation_scope else DEFAULT_TOPIC_BUDGETS
+                    )
                 topic_budgets = self._topic_budgets_for_attempt(
                     stage["id"], configured_topic_budgets,
                     scope="continuation" if continuation_scope else "intake")
@@ -5368,6 +5549,29 @@ class ComposerRunner:
                              "command.composer")
         self._route_feedback(feedback, note)
 
+    def _resolve_terminal_stage_work_orders(self, stage):
+        """Close scoped work orders when their owning stage is terminally blocked.
+
+        A stage failure can happen before its normal success path reaches the
+        work-order resolver. Leaving the request running then makes the
+        dashboard claim that a repair is active after the Composer has already
+        stopped. Holds intentionally bypass this helper and remain running for
+        the next continuation cycle.
+        """
+        if not self.active_research_requests:
+            return []
+        resolved = self.departments.resolve_work_orders(
+            self.active_research_requests, stage_kind=stage["kind"], outcome="blocked")
+        if resolved:
+            self.department_activity.append({
+                "cycle": self.continuation_cycles,
+                "action": "resolve_work_orders",
+                "stage_id": stage["id"],
+                "outcome": "blocked",
+                "work_orders": resolved,
+            })
+        return resolved
+
     def run(self):
         try:
             by_id = {stage["id"]: stage for stage in self.workflow["stages"]}
@@ -5376,15 +5580,31 @@ class ComposerRunner:
             required_ids = set(self.workflow["completion"]["required_stage_ids"])
             if self.continuation_pending_stage_ids:
                 completed.difference_update(self.continuation_pending_stage_ids)
+            migration_reopened = False
+            restored_topic_failure = self._restored_topic_feasibility_failure(by_id)
+            if restored_topic_failure is not None:
+                topic_stage_id, reason = restored_topic_failure
+                self._queue_topic_feasibility_revalidation(topic_stage_id, reason)
+                if not self._begin_continuation(completed, by_id):
+                    self.status = "blocked"
+                    self.blockers.append({
+                        "stage_id": topic_stage_id,
+                        "reason": "completed topic failed current feasibility revalidation and no continuation window is available",
+                        "detail": str(reason)[:2048],
+                    })
+                    self._checkpoint("blocked:topic_feasibility_revalidation", force=True)
+                    return self._finish()
+                migration_reopened = True
+                self._checkpoint("resume:topic_feasibility_revalidation", force=True)
             # A checkpoint may predate the immediate-hold admission rule.  On
             # resume, repair/review holds are reconciled before the scheduler
             # can admit any downstream consumer; this also prevents an
             # interrupted run from silently treating an old proposal as data.
             held = {stage_id for stage_id, row in self.stage_records.items()
                     if row.get("status") in STAGE_HOLD_STATUSES}
-            if held and self._begin_continuation(completed, by_id):
+            if held and not migration_reopened and self._begin_continuation(completed, by_id):
                 self._checkpoint("continuation:resume_admitted", force=True)
-            elif held:
+            elif held and not migration_reopened:
                 hold_status = ("research_expansion_required"
                                if any(self.stage_records[item].get("status") == "research_expansion_required"
                                       for item in held)
@@ -6066,6 +6286,11 @@ class ComposerRunner:
                         if isinstance(value, list) and value:
                             blocker[attribute] = deepcopy(value)
                     self.blockers.append(blocker)
+                    try:
+                        self._resolve_terminal_stage_work_orders(stage)
+                    except (NotFoundError, StateError, ValidationError) as work_order_error:
+                        blocker["work_order_resolution_error"] = (
+                            f"{type(work_order_error).__name__}: {work_order_error}")
                     self._record_blocker_feedback(stage, error)
                     self.status = "blocked"
                     self._checkpoint(f"{stage_id}:blocked", force=True)

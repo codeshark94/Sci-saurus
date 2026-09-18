@@ -171,6 +171,7 @@ and [Agent, Department, and Stage Flow](docs/16-agent-department-flow.md).
 | **Independent review** | Field-level critiques, rebuttals, adjudication, verification closure, and adversarial gates |
 | **Bounded specialist execution** | Role contracts, temporary assignments, per-stage quotas, artifact namespaces, chief synthesis, and independent verdicts |
 | **Literature survey** | OpenAlex discovery, source capture, identity reconciliation, exact source spans, citation maps, counter-search, and gap assessment |
+| **Topic feasibility admission** | Machine-checked execution mode, input provenance/readiness, data boundary, dependencies, network access, API/model estimates, and experiment deadline before a topic enters the survey |
 | **Scientific experiments** | Frozen methods and seeds, deterministic replay, independent recalculation, raw observations, figures, and result-package review |
 | **Paper pipeline** | Frozen storyline, claim/evidence index, bibliography, figures, LaTeX, rendered PDF, and release manifest |
 | **Research program and defense ledger** | Candidate branches with conditional paper outcomes, retained alternatives, posture-separated argumentation, and reviewer-visible weak points |
@@ -219,12 +220,13 @@ before using live providers.
 
 - **Human authority is explicit.** The Principal owns mission scope and final release.
 - **Scientific recovery is autonomous.** A hold, rejected direction, or missing typed repair order produces a cycle-specific work order, changes the strategy, and reopens only the affected closure. Human input is not the normal next step.
-- **Only real fences stop autonomous progress.** The autonomous mission does not impose an aggregate local topic-call quota; provider/account limits, API policy, worker capacity, and the mission deadline are reserved and recorded. Explicit topic budgets remain available for intentionally deterministic jobs.
+- **Only real fences stop autonomous progress.** Topic intake retries share one bounded intake envelope, and every deliberate continuation pivot receives its own bounded envelope. Provider/account limits, API policy, worker capacity, and the mission deadline remain independently reserved and recorded; a historical pivot cannot exhaust the budget of a newly admitted direction.
 - **Resource fences are not scientific decisions.** A resettable provider/API cooldown is waited out and retried automatically in autonomous mode; exhausted quotas, worker capacity, and the mission deadline remain hard resource boundaries recorded in the checkpoint, never scientific conclusions.
 - **Failure is not success.** A timeout, provider block, malformed response, or rejected review remains visible and scoped.
 - **Evidence is claim-level.** Literature claims require exact source references and stable spans; metadata is not scientific evidence.
 - **Experiments are bounded.** A deterministic replay proves reproducibility of the pinned execution, not mathematical truth or real-world novelty.
-- **OpenAlex topic intake fails closed.** Provider cooldown state is persisted; Crossref identity metadata cannot substitute for the citation graph used for topic discovery.
+- **Topic feasibility is explicit.** A prose feasibility note is never enough: experiment-backed topic admission checks the actual execution boundary, every input, dependency availability, network use, provider/model work, compute estimate, and disconfirmation-oriented study shape. The current deterministic project boundary admits only self-contained closed-world inputs, zero experiment-side API/model calls, and the foundry timeout; topic intake has its own bounded intake/continuation envelopes.
+- **OpenAlex topic intake fails closed.** Provider cooldown state is persisted; 429s stop fresh query variants until the recorded provider boundary, while bounded retries honor provider cooldown metadata. Crossref identity metadata cannot substitute for the citation graph used for topic discovery.
 - **Specialists are on demand.** A 34-role roster does not mean 34 model processes are running.
 - **LangGraph is optional, not the control plane.** The native Composer, TaskManager, and ArtifactStore own lifecycle and provenance; adapters can be used per department where useful.
 

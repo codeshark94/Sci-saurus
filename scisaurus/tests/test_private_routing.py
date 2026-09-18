@@ -66,6 +66,51 @@ class TestPrivateRouting(unittest.TestCase):
         }
         self.assertEqual(premium_ids, set())
 
+    def test_evidence_integrators_use_ollama_high_context_without_bulk_spillover(self):
+        config = self.config(self.env())
+        high_roles = {
+            "research.gap-proposer",
+            "methods.novelty-challenger",
+            "methods.novelty-verifier",
+            "methods.survey-reviewer",
+            "review.synthesizer",
+            "review.journal_editor",
+        }
+        for role in high_roles:
+            with self.subTest(role=role):
+                selected = config["role_models"][role]
+                self.assertIn(selected["model"], {
+                    "deepseek-v4.1-flash:cloud", "glm-5.3-flash:cloud"})
+                self.assertEqual(selected["context_window_tokens"], 131072)
+                self.assertEqual(selected["max_input_tokens"], 112000)
+                routes = config["role_routes"][role]
+                self.assertEqual([route["pool"] for route in routes[:2]], ["ollama", "ollama"])
+                self.assertEqual(
+                    {route["model"] for route in routes[:2]},
+                    {"deepseek-v4.1-flash:cloud", "glm-5.3-flash:cloud"})
+                self.assertTrue(all(
+                    route["context_window_tokens"] == 131072
+                    and route["max_input_tokens"] == 112000
+                    for route in routes[:2]))
+                self.assertNotIn("qwen-bulk", {route["id"] for route in routes})
+
+        bulk = config["role_routes"]["research.literature-mapper"]
+        self.assertEqual([route["id"] for route in bulk], [
+            "qwen-bulk", "ollama-gemma-bulk", "ollama-deepseek"])
+        self.assertTrue(all(route["context_window_tokens"] == 65536 for route in bulk))
+
+    def test_high_context_profile_can_be_tuned_independently(self):
+        config = self.config(self.env(
+            SCISAURUS_OLLAMA_HIGH_CONTEXT_WINDOW_TOKENS="98304",
+            SCISAURUS_OLLAMA_HIGH_MAX_INPUT_TOKENS="90000",
+        ))
+        self.assertEqual(
+            config["role_models"]["review.synthesizer"]["context_window_tokens"], 98304)
+        self.assertEqual(
+            config["role_models"]["review.synthesizer"]["max_input_tokens"], 90000)
+        self.assertEqual(
+            config["role_models"]["research.literature-mapper"]["context_window_tokens"], 65536)
+
     def test_kimi_and_full_glm_share_one_twenty_call_budget(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(self.env(

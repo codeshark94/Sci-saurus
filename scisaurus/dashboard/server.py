@@ -44,6 +44,7 @@ MAX_LOG_BYTES = 600_000
 MAX_RECENT_WORK = 32
 MAX_MODEL_CALLS = 8
 MAX_MODEL_HISTORY_CALLS = 8
+MAX_PROVIDER_WORK = 16
 MAX_MODEL_CONTEXT_BYTES = 512_000
 MAX_RESEARCH_BRANCHES = 8
 MAX_RESEARCH_CLAIMS = 24
@@ -76,6 +77,15 @@ CHECKPOINT_NAMES = {"progress.json", "interim_report.json", "checkpoint.json", "
 ACTIVE_STATES = {"proposed", "queued", "running", "awaiting_review", "started"}
 MODEL_LIVE_STATES = {"queued", "running", "started"}
 TERMINAL_STATES = {"completed", "failed", "rejected", "cancelled", "stale"}
+PROVIDER_OPERATION_LABELS = {
+    "crossref": "Crossref identity",
+    "openalex": "OpenAlex literature",
+    "fetch": "Full-text fetch",
+    "mcp_fetch": "Full-text capture",
+    "search": "Literature search",
+    "work": "Work lookup",
+    "citing": "Citation expansion",
+}
 
 
 def _json(value, default=None):
@@ -920,6 +930,128 @@ class DashboardSnapshot:
         specialists.sort(key=lambda item: (not item.get("engaged"), item.get("department") or "", item.get("role") or ""))
         return specialists
 
+    @staticmethod
+    def _provider_operation(task):
+        """Return an actual provider operation, excluding logical assignments."""
+        if not isinstance(task, dict):
+            return None
+        payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+        if payload.get("assignment_id"):
+            return None
+        operation = payload.get("operation")
+        if not isinstance(operation, str) or not operation.strip():
+            return None
+        return operation.strip()
+
+    @staticmethod
+    def _provider_operation_label(operation):
+        if not isinstance(operation, str) or not operation:
+            return "Provider operation"
+        return PROVIDER_OPERATION_LABELS.get(operation, operation.replace("_", " ").title())
+
+    @staticmethod
+    def _provider_stage_id(task):
+        payload = task.get("payload") if isinstance(task, dict) and isinstance(task.get("payload"), dict) else {}
+        stage_id = payload.get("stage_id")
+        if isinstance(stage_id, str) and stage_id:
+            return stage_id
+        root_key = task.get("root_key") if isinstance(task, dict) else None
+        if isinstance(root_key, str) and root_key.startswith("stage:"):
+            parts = root_key.split(":")
+            if len(parts) >= 2 and parts[1]:
+                return parts[1]
+        return None
+
+    def _provider_work(self, db):
+        """Project real non-model provider work into live execution cards.
+
+        A retrieval adapter records its concrete operation (for example
+        ``crossref`` or ``fetch``), not the generic ``retrieval`` label.  The
+        dashboard must retain that distinction while keeping logical role
+        assignments separate from provider attempts.
+        """
+        attempts = {}
+        for item in db.get("attempts") or []:
+            if not isinstance(item, dict) or not item.get("task_id"):
+                continue
+            key = (item.get("root_key"), item.get("task_id"))
+            previous = attempts.get(key)
+            if previous is None or str(item.get("created_at") or "") > str(previous.get("created_at") or ""):
+                attempts[key] = item
+
+        now = datetime.now(timezone.utc)
+        work = []
+        for task in db.get("tasks") or []:
+            operation = self._provider_operation(task)
+            if operation == "model":
+                continue
+            state = _display_status(task.get("state"))
+            if operation is None or state not in ACTIVE_STATES:
+                continue
+            payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+            attempt = attempts.get((task.get("root_key"), task.get("task_id")), {})
+            role = payload.get("role") or payload.get("agent") or attempt.get("lease_owner")
+            provider = payload.get("provider") or payload.get("adapter") or operation
+            focus = payload.get("objective") or payload.get("purpose")
+            if not focus:
+                target = payload.get("work_id") or payload.get("query") or payload.get("capability")
+                focus = f"target: {target}" if target not in (None, "") else "Provider work admitted"
+            started_at = _iso_timestamp(attempt.get("created_at")) or _iso_timestamp(task.get("updated_at"))
+            elapsed_seconds = None
+            if started_at:
+                try:
+                    started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                    elapsed_seconds = max(0, (now - started).total_seconds())
+                except ValueError:
+                    elapsed_seconds = None
+            work.append({
+                "root_key": task.get("root_key"),
+                "task_id": task.get("task_id"),
+                "attempt_id": attempt.get("attempt_id"),
+                "operation": operation,
+                "label": self._provider_operation_label(operation),
+                "provider": _short(provider, 100),
+                "role": role if isinstance(role, str) else None,
+                "stage_id": self._provider_stage_id(task),
+                "kind": task.get("kind"),
+                "state": state,
+                "status": state,
+                "response_status": {
+                    "queued": "queued",
+                    "running": "awaiting response",
+                    "awaiting_review": "response recorded · awaiting review",
+                    "proposed": "admission pending",
+                    "started": "awaiting response",
+                }.get(state, state.replace("_", " ")),
+                "focus": _short(focus, 520),
+                "target": _short(payload.get("work_id") or payload.get("query"), 220),
+                "started_at": started_at,
+                "updated_at": _iso_timestamp(task.get("updated_at")),
+                "elapsed_seconds": elapsed_seconds,
+            })
+
+        def timestamp(value):
+            if not isinstance(value, str) or not value:
+                return 0.0
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return 0.0
+
+        priority = {"running": 0, "started": 1, "queued": 2, "proposed": 3, "awaiting_review": 4}
+        work.sort(key=lambda item: (priority.get(item.get("state"), 5), -timestamp(item.get("updated_at"))))
+        return {
+            "items": work[:MAX_PROVIDER_WORK],
+            "live_items": work[:MAX_PROVIDER_WORK],
+            "total": len(work),
+            "active": len(work),
+            "running": sum(item.get("state") in {"running", "started"} for item in work),
+            "queued": sum(item.get("state") in {"queued", "proposed"} for item in work),
+            "review_pending": sum(item.get("state") == "awaiting_review" for item in work),
+            "displayed": min(len(work), MAX_PROVIDER_WORK),
+            "truncated": len(work) > MAX_PROVIDER_WORK,
+        }
+
     def _execution_view(self, stages, db, organization):
         """Expose role-assignment and provider-capacity counts separately.
 
@@ -945,7 +1077,7 @@ class DashboardSnapshot:
             payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
             if isinstance(payload.get("assignment_id"), str):
                 assignment_tasks.append(task)
-            elif payload.get("operation") in {"model", "retrieval"}:
+            elif self._provider_operation(task) is not None:
                 provider_tasks.append(task)
         active_assignment_tasks = [item for item in assignment_tasks
                                    if item.get("state") in ACTIVE_STATES]
@@ -1845,21 +1977,15 @@ class DashboardSnapshot:
         organization_raw = live_value.get("organization") if isinstance(live_value.get("organization"), dict) else None
         specialists = self._specialists(stages, db, organization_raw)
         execution = self._execution_view(stages, db, organization_raw)
+        provider_work = self._provider_work(db)
         model_calls = self._model_calls(db, live_value)
         live_provider_calls = model_calls.get("live_items", [])
         execution.setdefault("provider", {})["live_model_calls"] = len(live_provider_calls)
-        execution["provider"]["running_tasks"] = sum(
+        execution["provider"]["running_model_tasks"] = sum(
             item.get("state") in {"running", "started"} for item in live_provider_calls
         )
-        execution["provider"]["queued_tasks"] = sum(
+        execution["provider"]["queued_model_tasks"] = sum(
             item.get("state") == "queued" for item in live_provider_calls
-        )
-        total_provider_capacity = execution["provider"].get("durable_window_capacity")
-        if type(total_provider_capacity) is not int:
-            total_provider_capacity = execution["provider"].get("configured_capacity")
-        execution["provider"]["within_capacity"] = (
-            type(total_provider_capacity) is not int
-            or len(live_provider_calls) <= total_provider_capacity
         )
         pool_limits = execution.get("provider", {}).get("pool_limits", {})
         execution.setdefault("provider", {})["pools"] = {
@@ -1872,6 +1998,37 @@ class DashboardSnapshot:
             }
             for name, details in pool_limits.items()
         }
+        active_work = [
+            {**item, "activity_kind": "provider"}
+            for item in provider_work.get("live_items", [])
+        ] + [
+            {**item, "activity_kind": "model"}
+            for item in live_provider_calls
+        ]
+
+        def activity_timestamp(item):
+            value = item.get("updated_at") or item.get("started_at")
+            if not isinstance(value, str) or not value:
+                return 0.0
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return 0.0
+
+        activity_priority = {"running": 0, "started": 0, "queued": 1, "proposed": 2, "awaiting_review": 3}
+        active_work.sort(key=lambda item: (activity_priority.get(item.get("state"), 4), -activity_timestamp(item)))
+        current_activity = None
+        if active_work:
+            item = active_work[0]
+            current_activity = {
+                "kind": item.get("activity_kind"),
+                "label": item.get("label") or item.get("model") or item.get("operation"),
+                "operation": item.get("operation"),
+                "role": item.get("role"),
+                "stage_id": item.get("stage_id"),
+                "task_id": item.get("task_id"),
+                "status": item.get("state"),
+            }
         recent_work = self._recent_work(db, organization_raw)
         organization = self._organization_view(organization_raw)
         return {
@@ -1893,6 +2050,7 @@ class DashboardSnapshot:
                 "stop_reason": live_value.get("stop_reason"),
                 "next_actions": _bounded_notices(live_value.get("next_actions")),
                 "blockers": _bounded_notices(live_value.get("blockers")),
+                "current_activity": current_activity,
                 "usage": usage,
             },
             "pipeline": {
@@ -1905,6 +2063,7 @@ class DashboardSnapshot:
             "specialists_active": sum(item.get("engaged") is True for item in specialists),
             "specialists_roster": len(specialists),
             "execution": execution,
+            "provider_work": provider_work,
             "model_calls": model_calls,
             "recent_work": recent_work["items"],
             "recent_work_meta": {

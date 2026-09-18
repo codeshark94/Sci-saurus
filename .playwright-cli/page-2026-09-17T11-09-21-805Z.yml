@@ -1,0 +1,211 @@
+- generic [active] [ref=f1e1]:
+  - generic [ref=f1e2]:
+    - complementary "Primary navigation" [ref=f1e3]:
+      - generic [ref=f1e4]: SCI-SAURUS / LOCAL CONSOLE
+      - navigation "Workspace navigation" [ref=f1e5]:
+        - link "00 Workspace" [ref=f1e6] [cursor=pointer]:
+          - /url: "#workspace"
+          - generic [ref=f1e7]: "00"
+          - generic [ref=f1e8]: Workspace
+      - generic [ref=f1e9]:
+        - generic [ref=f1e10]: CURRENT PROJECT
+        - generic [ref=f1e11]:
+          - generic [ref=f1e12]: autolab-rerun-20260917-ba
+          - generic [ref=f1e13]: loading project state
+        - navigation "Project navigation" [ref=f1e14]:
+          - link "01 Research brief" [ref=f1e15] [cursor=pointer]:
+            - /url: "#research"
+            - generic [ref=f1e16]: "01"
+            - generic [ref=f1e17]: Research brief
+          - link "02 Live execution" [ref=f1e18] [cursor=pointer]:
+            - /url: "#calls"
+            - generic [ref=f1e19]: "02"
+            - generic [ref=f1e20]: Live execution
+          - link "03 Agents" [ref=f1e21] [cursor=pointer]:
+            - /url: "#specialists"
+            - generic [ref=f1e22]: "03"
+            - generic [ref=f1e23]: Agents
+          - link "04 Run log" [ref=f1e24] [cursor=pointer]:
+            - /url: "#activity"
+            - generic [ref=f1e25]: "04"
+            - generic [ref=f1e26]: Run log
+          - link "05 Resources" [ref=f1e27] [cursor=pointer]:
+            - /url: "#resources"
+            - generic [ref=f1e28]: "05"
+            - generic [ref=f1e29]: Resources
+          - link "06 Structure" [ref=f1e30] [cursor=pointer]:
+            - /url: "#structure"
+            - generic [ref=f1e31]: "06"
+            - generic [ref=f1e32]: Structure
+          - link "07 Inventory" [ref=f1e33] [cursor=pointer]:
+            - /url: "#inventory"
+            - generic [ref=f1e34]: "07"
+            - generic [ref=f1e35]: Inventory
+      - generic [ref=f1e37]: PROJECTS
+      - generic [ref=f1e38]: No projects
+      - generic [ref=f1e41]:
+        - generic [ref=f1e42]: Connecting
+        - generic [ref=f1e45]: LOCALHOST / CONTROLLED
+    - main [ref=f1e46]:
+      - generic [ref=f1e47]:
+        - generic [ref=f1e48]:
+          - generic [ref=f1e49]: PROJECT
+          - generic [ref=f1e50]: /
+          - generic [ref=f1e51]: autolab-rerun-20260917-ba
+        - generic [ref=f1e52]:
+          - generic [ref=f1e53]: LIVE POLL 5s
+          - button "New project" [ref=f1e55] [cursor=pointer]
+          - button "Manage projects" [ref=f1e56] [cursor=pointer]
+          - button "Refresh" [ref=f1e57] [cursor=pointer]
+      - generic [ref=f1e58]:
+        - generic [ref=f1e59]:
+          - generic [ref=f1e60]:
+            - generic [ref=f1e61]:
+              - text: MISSION STATUS
+              - generic [ref=f1e63]: CHECKPOINT
+            - generic [ref=f1e64]:
+              - heading "Loading project" [level=1] [ref=f1e65]
+              - generic [ref=f1e66]: UNKNOWN
+            - paragraph [ref=f1e67]: Waiting for a project checkpoint.
+            - generic [ref=f1e68]: —
+          - generic [ref=f1e69]:
+            - generic [ref=f1e70]:
+              - text: CURRENT PHASE
+              - strong [ref=f1e71]: —
+            - generic [ref=f1e72]:
+              - text: ELAPSED
+              - strong [ref=f1e73]: —
+            - generic [ref=f1e74]:
+              - text: DEADLINE
+              - strong [ref=f1e75]: —
+            - generic [ref=f1e76]:
+              - text: PROCESS
+              - strong [ref=f1e77]: —
+        - generic [ref=f1e78]:
+          - generic [ref=f1e79]:
+            - generic [ref=f1e80]:
+              - generic [ref=f1e81]: RESEARCH BRIEF
+              - heading "Research direction not recorded" [level=2] [ref=f1e82]
+            - generic [ref=f1e83]: topic / evidence / design
+          - generic [ref=f1e84]:
+            - article [ref=f1e85]:
+              - generic [ref=f1e86]: QUESTION
+              - paragraph [ref=f1e87]: Waiting for the accepted research question.
+            - article [ref=f1e89]:
+              - generic [ref=f1e90]:
+                - generic [ref=f1e91]: EXPERIMENTAL DESIGN
+                - strong [ref=f1e92]: not started
+          - generic [ref=f1e94]:
+            - generic [ref=f1e95]: FROM QUESTION TO PAPER
+            - generic [ref=f1e96]: stage gates and deliverables
+          - generic [ref=f1e97]: Loading research progress…
+          - generic [ref=f1e99]:
+            - generic [ref=f1e100]: DECISION SURFACE
+            - generic [ref=f1e101]: provisional branches and claim controls
+          - generic [ref=f1e102]:
+            - article [ref=f1e103]:
+              - generic [ref=f1e104]:
+                - generic [ref=f1e105]: BRANCH PORTFOLIO
+                - strong [ref=f1e106]: not recorded
+            - article [ref=f1e108]:
+              - generic [ref=f1e109]:
+                - generic [ref=f1e110]: ARGUMENT DEFENSE
+                - strong [ref=f1e111]: not recorded
+        - generic "Mission metrics" [ref=f1e113]:
+          - article [ref=f1e114]:
+            - generic [ref=f1e115]: ACTIVE CALLS
+            - generic [ref=f1e116]: —
+            - generic [ref=f1e117]: provider activity
+          - article [ref=f1e118]:
+            - generic [ref=f1e119]: TASKS
+            - generic [ref=f1e120]: —
+            - generic [ref=f1e121]: recorded in ledger
+          - article [ref=f1e122]:
+            - generic [ref=f1e123]: ARTIFACTS
+            - generic [ref=f1e124]: —
+            - generic [ref=f1e125]: content-addressed records
+          - article [ref=f1e126]:
+            - generic [ref=f1e127]: EVENT INTEGRITY
+            - generic [ref=f1e128]: —
+            - generic [ref=f1e129]: read-only verification
+        - generic [ref=f1e130]:
+          - generic [ref=f1e131]:
+            - generic [ref=f1e132]:
+              - generic [ref=f1e133]: LIVE NOW
+              - heading "Live execution" [level=2] [ref=f1e134]
+            - generic [ref=f1e135]: provider operations and model calls
+          - generic [ref=f1e136]:
+            - generic [ref=f1e137]: PROVIDER OPERATIONS
+            - strong [ref=f1e138]: current retrieval and service work
+          - generic [ref=f1e139]: Loading provider work…
+          - generic [ref=f1e141]:
+            - generic [ref=f1e142]: MODEL CALLS
+            - strong [ref=f1e143]: current model work
+          - generic [ref=f1e144]: Loading model calls…
+        - generic [ref=f1e146]:
+          - generic [ref=f1e147]:
+            - generic [ref=f1e148]:
+              - generic [ref=f1e149]: ON-DEMAND ROSTER
+              - heading "Agent roster" [level=2] [ref=f1e150]
+            - generic [ref=f1e151]: roster status
+          - generic [ref=f1e152]: Loading organization…
+          - generic [ref=f1e154]: LIVE WORKBOARD · RECENT ASSIGNMENTS, AGENTS, AND RESPONSES
+          - table [ref=f1e156]:
+            - rowgroup [ref=f1e157]:
+              - row [ref=f1e158]:
+                - columnheader "AGENT / ROLE" [ref=f1e159]
+                - columnheader "WORK / STAGE" [ref=f1e160]
+                - columnheader "TASK" [ref=f1e161]
+                - columnheader "STATE" [ref=f1e162]
+                - columnheader "RESPONSE / REVIEW" [ref=f1e163]
+            - rowgroup [ref=f1e164]:
+              - row [ref=f1e165]:
+                - cell "No active specialist assignments." [ref=f1e166]
+        - generic [ref=f1e167]:
+          - generic [ref=f1e168]:
+            - generic [ref=f1e169]:
+              - generic [ref=f1e170]:
+                - generic [ref=f1e171]: LIVE EVENT STREAM
+                - heading "Run log" [level=2] [ref=f1e172]
+              - generic [ref=f1e173]: events + specialist activity
+            - generic [ref=f1e174]: Loading activity…
+          - generic [ref=f1e176]:
+            - generic [ref=f1e177]:
+              - generic [ref=f1e178]:
+                - generic [ref=f1e179]: CONTROL PLANE
+                - heading "Resources & gates" [level=2] [ref=f1e180]
+              - generic [ref=f1e181]: quota / integrity
+            - generic [ref=f1e182]: Loading resource state…
+        - generic [ref=f1e184]:
+          - generic [ref=f1e185]:
+            - generic [ref=f1e186]:
+              - generic [ref=f1e187]: RESEARCH SURFACE
+              - heading "Project structure" [level=2] [ref=f1e188]
+            - generic [ref=f1e189]: checkpoint and artifact roots
+          - generic [ref=f1e190]: Loading project structure…
+        - generic [ref=f1e192]:
+          - generic [ref=f1e193]:
+            - generic [ref=f1e194]:
+              - generic [ref=f1e195]: PROJECT SURFACE
+              - heading "Artifacts & files" [level=2] [ref=f1e196]
+            - generic [ref=f1e197]: —
+          - generic [ref=f1e198]:
+            - tablist "Inventory filter" [ref=f1e199]:
+              - button "All" [ref=f1e200] [cursor=pointer]
+              - button "Checkpoints" [ref=f1e201] [cursor=pointer]
+              - button "Artifacts" [ref=f1e202] [cursor=pointer]
+              - button "Files" [ref=f1e203] [cursor=pointer]
+            - generic [ref=f1e204]:
+              - generic [aria-hidden] [ref=f1e205]: /
+              - searchbox [ref=f1e206]
+          - generic [ref=f1e207]: Loading project inventory…
+          - generic [ref=f1e209]:
+            - generic [ref=f1e210]: —
+            - generic [ref=f1e211]:
+              - button "Previous" [ref=f1e212] [cursor=pointer]
+              - button "Next" [ref=f1e213] [cursor=pointer]
+        - generic [ref=f1e214]:
+          - generic [ref=f1e215]: SCI-SAURUS LOCAL CONSOLE
+          - generic [ref=f1e216]: Source of truth remains the project checkpoint, artifact store, and event ledger.
+          - generic [ref=f1e217]: Not connected
+  - status

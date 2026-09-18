@@ -156,12 +156,73 @@ class ComposerWorkflowTests(unittest.TestCase):
             }
             validate_workflow(workflow)
             runner = ComposerRunner(workflow)
-            context = runner._runtime_context({"protocol": "openai", "model": "test"})
-            self.assertEqual(
-                context["topic_preferences"], workflow["topic_preferences"])
-            workflow["topic_preferences"]["mode"] = "unsupported"
-            with self.assertRaisesRegex(ValidationError, "mode must be general"):
-                validate_workflow(workflow)
+            try:
+                context = runner._runtime_context({"protocol": "openai", "model": "test"})
+                self.assertEqual(
+                    context["topic_preferences"], workflow["topic_preferences"])
+                self.assertEqual(context["research_feasibility"]["max_model_calls"], 0)
+                self.assertEqual(context["research_feasibility"]["max_external_requests"], 0)
+                self.assertEqual(context["research_feasibility"]["max_experiment_seconds"], 10)
+                workflow["topic_preferences"]["mode"] = "unsupported"
+                with self.assertRaisesRegex(ValidationError, "mode must be general"):
+                    validate_workflow(workflow)
+            finally:
+                runner.close()
+
+    def test_resume_reopens_legacy_topic_before_downstream_admission(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            topic_model = root / "topic-model.json"
+            topic_model.write_text("{}")
+            topic_config = root / "topic.json"
+            topic_config.write_text(json.dumps({
+                "schema_version": "topic-discovery-config-1",
+                "model_config_path": str(topic_model.resolve()),
+                "output_path": str((topic_dir / "output" / "topic.json").resolve()),
+                "candidate_count": 3, "max_attempts": 1,
+            }))
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": str(topic_config.resolve()),
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            validate_workflow(workflow)
+            runner = ComposerRunner(workflow)
+            try:
+                candidate = {
+                    "id": "direction_0",
+                    "capability_requirements": {
+                        "executables": [], "python_packages": [], "stage_kinds": [],
+                    },
+                }
+                runner.stage_records = {"topic": {"status": "completed"}}
+                runner.context = {
+                    "topic": {
+                        "kind": "topic_discovery", "status": "completed",
+                        "selected_id": "direction_0", "candidates": [candidate],
+                        "topic": candidate,
+                    },
+                }
+                failure = runner._restored_topic_feasibility_failure({
+                    stage["id"]: stage for stage in workflow["stages"]})
+                self.assertIsNotNone(failure)
+                self.assertIn("feasibility", failure[1])
+                runner._queue_topic_feasibility_revalidation(*failure)
+                completed = {"topic"}
+                self.assertTrue(runner._begin_continuation(
+                    completed, {stage["id"]: stage for stage in workflow["stages"]}))
+                self.assertEqual(completed, set())
+                self.assertIn("topic", runner.reopened_stage_ids)
+                self.assertEqual(
+                    runner.active_research_requests[0]["kind"], "topic_refinement")
+            finally:
+                runner.close()
 
     def test_runtime_env_files_load_nested_owner_credentials_before_dispatch(self):
         with tempfile.TemporaryDirectory() as path:
@@ -996,11 +1057,12 @@ class ComposerWorkflowTests(unittest.TestCase):
             })
             runner.close()
 
-    def test_topic_continuation_has_a_separate_cumulative_budget(self):
+    def test_topic_continuation_budget_isolated_per_admitted_cycle(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
             workflow = self._workflow(root)
             runner = ComposerRunner(workflow)
+            runner.continuation_cycles = 2
             runner.stage_records["topic"] = {"attempts": [
                 {"state": "failed", "cycle": 0,
                  "usage": {"model_calls": 8, "input_tokens": 100,
@@ -1012,13 +1074,38 @@ class ComposerWorkflowTests(unittest.TestCase):
                  # topic runner's continuation envelope.
                  "usage": {"model_calls": 7, "input_tokens": 500,
                             "output_tokens": 50, "openalex_requests": 1}},
+                {"state": "failed", "cycle": 2,
+                 "topic_usage": {"model_calls": 2, "input_tokens": 20,
+                                  "output_tokens": 5, "openalex_requests": 1}},
             ]}
             initial = runner._topic_budgets_for_attempt(
                 "topic", {"max_model_calls": 10}, scope="intake")
             continuation = runner._topic_budgets_for_attempt(
                 "topic", {"max_model_calls": 6}, scope="continuation")
             self.assertEqual(initial["max_model_calls"], 2)
-            self.assertEqual(continuation["max_model_calls"], 3)
+            self.assertEqual(continuation["max_model_calls"], 4)
+            runner.close()
+
+    def test_terminal_topic_failure_closes_active_revalidation_order(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            request = {
+                "id": "topic-runtime-feasibility-revalidation",
+                "kind": "topic_refinement",
+                "owner": "research.intelligence",
+                "objective": "Replan the selected direction.",
+                "why": "The checkpoint predates the feasibility contract.",
+                "success_condition": "A valid executable plan is admitted.",
+                "evidence_needed": "Runtime inventory and bounded experiment plan.",
+            }
+            runner.active_research_requests = [request]
+            active = runner.departments.activate_work_orders(runner.active_research_requests)
+            self.assertEqual(active[0]["task_state"], "running")
+            runner._resolve_terminal_stage_work_orders({"id": "topic", "kind": "topic_discovery"})
+            task = runner.tasks.get(active[0]["task_id"])
+            self.assertEqual(task["state"], "blocked")
             runner.close()
 
     def test_topic_budget_admission_snapshot_is_not_charged_twice(self):
@@ -1225,6 +1312,10 @@ class ComposerWorkflowTests(unittest.TestCase):
                 runtime_context["capability_foundry"]["allowed_evidence_modes"],
                 ["analytical_derivation", "synthetic_simulation"],
             )
+            self.assertEqual(runtime_context["capability_foundry"]["timeout_seconds"], 30)
+            self.assertEqual(runtime_context["research_feasibility"]["max_model_calls"], 0)
+            self.assertEqual(runtime_context["research_feasibility"]["max_external_requests"], 0)
+            self.assertEqual(runtime_context["research_feasibility"]["max_experiment_seconds"], 10)
             result = {
                 "status": "completed",
                 "topic": {"id": "frontier", "title": "Patch recovery", "domain": "marine ecology",

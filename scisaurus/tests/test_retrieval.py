@@ -20,6 +20,7 @@ from scisaurus.runtime.retrieval import CrossrefClient, MCPFetchClient
 
 class CrossrefFixture(BaseHTTPRequestHandler):
     queries = []
+    rate_limit_once = True
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *_):
@@ -41,6 +42,9 @@ class CrossrefFixture(BaseHTTPRequestHandler):
             return
         elif term == "rate limited":
             status, content = 429, b'{"message":"slow down"}'
+        elif term == "rate limited once" and type(self).rate_limit_once:
+            type(self).rate_limit_once = False
+            status, content = 429, b'{"message":"retry once"}'
         elif term == "malformed":
             content = b"upstream HTML error"
         elif term == "huge":
@@ -107,13 +111,25 @@ class TestCrossrefRetrieval(unittest.TestCase):
         self.assertEqual(CrossrefFixture.queries[-1]["filter"], ["doi:10.1234/example"])
 
     def test_empty_results_are_distinct_from_rate_limits_and_bad_responses(self):
-        client = CrossrefClient(endpoint=self.endpoint)
+        client = CrossrefClient(endpoint=self.endpoint, max_retries=0)
         self.assertEqual(client.search("empty")["outcome"], "empty")
         limited = client.search("rate limited")
         self.assertEqual(limited["outcome"], "rate_limited")
         self.assertEqual(limited["metadata"]["headers"]["retry-after"], "5")
         self.assertEqual(limited["sources"], [])
         self.assertEqual(client.search("malformed")["outcome"], "parse_error")
+
+    def test_transient_rate_limit_retries_inside_one_call_budget(self):
+        CrossrefFixture.rate_limit_once = True
+        with patch("scisaurus.runtime.retrieval.time.sleep") as sleep:
+            result = CrossrefClient(
+                endpoint=self.endpoint, timeout=10, max_retries=2,
+                retry_backoff_seconds=0,
+            ).search("rate limited once")
+        self.assertEqual(result["outcome"], "ok")
+        self.assertEqual(result["metadata"]["attempts"], 2)
+        self.assertEqual(result["metadata"]["retry_wait_seconds"], 5.0)
+        sleep.assert_called_once_with(5.0)
 
     def test_bytes_and_network_wait_are_bounded(self):
         result = CrossrefClient(endpoint=self.endpoint, max_bytes=100).search("huge")

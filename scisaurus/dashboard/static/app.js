@@ -277,7 +277,10 @@
     $("#project-path").textContent = text(project.path);
     $("#hero-status").outerHTML = `<span class="state-pill state-pill--${statusClass(status)}" id="hero-status">${escapeHtml(status.replaceAll("_", " "))}</span>`;
     $("#hero-source").textContent = live.source_ref ? "LIVE CHECKPOINT" : "NO CHECKPOINT";
-    $("#current-phase").textContent = prettyPhase(snapshot, live.phase || live.last_phase);
+    const phaseText = prettyPhase(snapshot, live.phase || live.last_phase);
+    const currentActivity = live.current_activity;
+    $("#current-phase").textContent = currentActivity?.label && !phaseText.includes(currentActivity.label)
+      ? `${phaseText} · ${currentActivity.label}` : phaseText;
     $("#elapsed").textContent = duration(live.elapsed_seconds);
     $("#remaining").textContent = live.remaining_seconds === null || live.remaining_seconds === undefined
       ? "No deadline" : `${duration(live.remaining_seconds)} left`;
@@ -515,6 +518,47 @@
     return task.length > 27 ? `${task.slice(0, 12)}…${task.slice(-12)}` : task;
   }
 
+  function renderProviderWork(snapshot) {
+    const work = snapshot.provider_work || {};
+    const items = Array.isArray(work.live_items)
+      ? work.live_items
+      : (Array.isArray(work.items) ? work.items : []);
+    const running = Number(work.running) || 0;
+    const queued = Number(work.queued) || 0;
+    const reviewPending = Number(work.review_pending) || 0;
+    const suffix = work.truncated ? " · live list capped" : "";
+    $("#provider-work-caption").textContent = `${number(work.active ?? items.length)} active · ${number(running)} running · ${number(queued)} queued${reviewPending ? ` · ${number(reviewPending)} review` : ""}${suffix}`;
+
+    const renderCard = (item) => {
+      const stateValue = item.state || "unknown";
+      const timing = ["running", "queued", "started", "proposed"].includes(stateValue)
+        ? `${duration(item.elapsed_seconds)} elapsed`
+        : text(item.response_status, "state recorded");
+      const target = item.target ? `<span><small>TARGET</small><code>${escapeHtml(item.target)}</code></span>` : "";
+      return `<article class="execution-work-card execution-work-card--${statusClass(stateValue)}">
+        <div class="execution-work-top">
+          <div class="execution-work-heading">
+            <div class="execution-work-provider">${escapeHtml(text(item.provider, item.operation))} · ${escapeHtml(text(item.operation, "operation"))}</div>
+            <div class="execution-work-title">${escapeHtml(text(item.label, "Provider operation"))}</div>
+          </div>
+          ${statusPill(stateValue)}
+        </div>
+        <div class="execution-work-role">${escapeHtml(text(item.role, "role not recorded"))}</div>
+        <div class="execution-work-focus">${escapeHtml(text(item.focus, "Provider work admitted"))}</div>
+        <div class="execution-work-meta">
+          <span><small>STAGE</small><b>${escapeHtml(item.stage_id ? stageName(snapshot, item.stage_id) : "not recorded")}</b></span>
+          <span><small>TASK</small><code title="${escapeHtml(text(item.task_id))}">${escapeHtml(shortTaskId(item.task_id))}</code></span>
+          ${target}
+        </div>
+        <div class="execution-work-footer"><span>${escapeHtml(timing)}</span><span>${escapeHtml(relativeDate(item.updated_at || item.started_at))}</span></div>
+      </article>`;
+    };
+
+    $("#execution-work-grid").innerHTML = items.length
+      ? items.map(renderCard).join("")
+      : '<div class="execution-work-empty"><strong>No retrieval or service operation is active.</strong><span>Model activity is tracked separately below.</span></div>';
+  }
+
   function renderModelCalls(snapshot) {
     const modelCalls = snapshot.model_calls || {};
     const liveCalls = Array.isArray(modelCalls.live_items)
@@ -571,7 +615,7 @@
 
     $("#model-call-grid").innerHTML = liveCalls.length
       ? liveCalls.map((call) => renderCard(call)).join("")
-      : '<div class="model-call-empty"><strong>No provider call is running.</strong><span>Live cards appear here when a queued or running model task is admitted.</span></div>';
+      : '<div class="model-call-empty"><strong>No model call is running.</strong><span>Retrieval and service work is shown in Provider operations above.</span></div>';
 
     const historyCalls = [...reviewCalls, ...recentCalls].slice(0, 16);
     const history = $("#model-call-history");
@@ -810,6 +854,7 @@
     renderHeader(snapshot);
     renderResearch(snapshot);
     renderMetrics(snapshot);
+    renderProviderWork(snapshot);
     renderModelCalls(snapshot);
     renderDepartments(snapshot);
     renderSpecialists(snapshot);

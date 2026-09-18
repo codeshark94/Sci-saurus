@@ -56,7 +56,11 @@ variable name is stored in descriptors.
   Qwen and Gemma are assigned to the largest bulk workload: scholarly/web
   scouting, cataloging, citation mapping, source review, prose, and surface
   editing. DeepSeek v4.1 Flash and GLM 5.3 Flash are assigned to intermediate
-  planning, methods, interpretation, and ordinary review work.
+  planning, methods, interpretation, and ordinary review work. Evidence-
+  integrating roles such as survey synthesis, gap assessment, counter-search
+  and adversarial review use an Ollama-only DeepSeek/GLM Flash route with a
+  separate 128K-token admission profile; they never enter the Qwen/Gemma bulk
+  pool.
 - Impact-only `kimi-k3:cloud` and full `glm-5.3:cloud` are opt-in escalation
   lanes for topic maturity, experiment arbitration, journal editing, and final
   arbitration. They share the durable budget key `kimi-k3+glm-5.3`, whose hard

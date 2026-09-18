@@ -226,6 +226,63 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(calls["live_items"][0]["response_status"], "awaiting response")
         self.assertEqual(calls["live_items"][0]["cache"]["status"], "enabled · unreported")
 
+    def test_snapshot_projects_live_non_model_provider_work(self):
+        temporary, root = self.make_project()
+        self.addCleanup(temporary.cleanup)
+        snapshot = DashboardSnapshot(root)
+        db = {
+            "tasks": [
+                {
+                    "root_key": "stage:survey:active",
+                    "task_id": "crossref-running",
+                    "kind": "retrieval",
+                    "state": "running",
+                    "updated_at": "2026-09-16T00:00:03+00:00",
+                    "payload": {
+                        "operation": "crossref",
+                        "objective": "Reconcile the DOI identity for the selected work.",
+                        "work_id": "W123",
+                    },
+                },
+                {
+                    "root_key": "stage:survey:active",
+                    "task_id": "logical-assignment",
+                    "kind": "production",
+                    "state": "running",
+                    "updated_at": "2026-09-16T00:00:04+00:00",
+                    "payload": {
+                        "operation": "crossref",
+                        "assignment_id": "assignment-1",
+                    },
+                },
+            ],
+            "attempts": [{
+                "root_key": "stage:survey:active",
+                "task_id": "crossref-running",
+                "attempt_id": "attempt-crossref",
+                "state": "started",
+                "lease_owner": "research.identity-checker",
+                "created_at": "2026-09-16T00:00:01+00:00",
+                "finished_at": None,
+                "usage": {"retrieval_calls": 1},
+            }],
+        }
+
+        work = snapshot._provider_work(db)
+
+        self.assertEqual(work["active"], 1)
+        self.assertEqual(work["running"], 1)
+        self.assertEqual(work["live_items"][0]["operation"], "crossref")
+        self.assertEqual(work["live_items"][0]["label"], "Crossref identity")
+        self.assertEqual(work["live_items"][0]["role"], "research.identity-checker")
+        self.assertEqual(work["live_items"][0]["stage_id"], "survey")
+        self.assertEqual(work["live_items"][0]["target"], "W123")
+
+        execution = snapshot._execution_view(
+            [{"id": "survey", "kind": "survey", "status": "running"}], db, {})
+        self.assertEqual(execution["provider"]["running_tasks"], 1)
+        self.assertEqual(execution["provider"]["queued_tasks"], 0)
+
     def test_workspace_overview_is_lightweight_and_project_scoped(self):
         temporary, root = self.make_project()
         self.addCleanup(temporary.cleanup)

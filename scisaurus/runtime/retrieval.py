@@ -19,6 +19,7 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from http.client import HTTPException, IncompleteRead
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
@@ -28,6 +29,7 @@ from urllib.request import Request, urlopen
 ADAPTER_VERSION = "3"
 MCP_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = {MCP_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"}
+CROSSREF_TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 SAFE_PROCESS_ENV = {
     "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT",
     "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "LANG", "LC_ALL",
@@ -77,16 +79,103 @@ def _result(provider: str, transport: str, source_url: str) -> dict:
 
 
 class CrossrefClient:
-    """Public bibliographic search; one explicitly bounded result page per call."""
+    """Public bibliographic search with a bounded, provider-aware retry loop."""
 
     def __init__(
-        self, *, mailto: str | None = None, timeout: float = 30,
-        max_bytes: int = 1_048_576, endpoint: str = "https://api.crossref.org/works",
+        self, *, mailto: str | None = None, mailto_env: str | None = None,
+        timeout: float = 30, max_bytes: int = 1_048_576,
+        endpoint: str = "https://api.crossref.org/works", max_retries: int = 2,
+        retry_backoff_seconds: float = 1.0,
     ):
         _limits(timeout, max_bytes)
-        self.timeout, self.max_bytes, self.endpoint, self.mailto = timeout, max_bytes, _url(endpoint), mailto
+        if type(max_retries) is not int or not 0 <= max_retries <= 8:
+            raise ValueError("max_retries must be an integer between 0 and 8")
+        if (type(retry_backoff_seconds) not in (int, float)
+                or not math.isfinite(retry_backoff_seconds)
+                or retry_backoff_seconds < 0):
+            raise ValueError("retry_backoff_seconds must be finite and non-negative")
+        if mailto is not None and (
+                not isinstance(mailto, str) or not mailto.strip() or len(mailto) > 254):
+            raise ValueError("mailto must be a bounded nonempty contact address")
+        if mailto_env is not None and (
+                not isinstance(mailto_env, str)
+                or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", mailto_env)):
+            raise ValueError("mailto_env must name an environment variable")
+        if mailto is None and mailto_env:
+            configured = os.environ.get(mailto_env)
+            mailto = configured.strip() if isinstance(configured, str) and configured.strip() else None
+        self.timeout, self.max_bytes, self.endpoint = timeout, max_bytes, _url(endpoint)
+        self.mailto, self.mailto_env = mailto, mailto_env
+        self.max_retries = max_retries
+        self.retry_backoff_seconds = float(retry_backoff_seconds)
+
+    @staticmethod
+    def _retry_after_seconds(headers):
+        value = headers.get("retry-after") if hasattr(headers, "get") else None
+        if value is None:
+            return None
+        try:
+            delay = float(str(value).strip())
+        except (TypeError, ValueError):
+            try:
+                target = parsedate_to_datetime(str(value))
+                if target.tzinfo is None:
+                    target = target.replace(tzinfo=timezone.utc)
+                delay = target.timestamp() - time.time()
+            except (TypeError, ValueError, OverflowError, IndexError):
+                return None
+        return delay if math.isfinite(delay) and delay > 0 else None
 
     def search(self, query: str, *, limit: int = 5, cursor: str | None = None) -> dict:
+        """Run one logical lookup inside one total timeout and retry budget.
+
+        Crossref's response headers are part of the operational result. A
+        transient 429/5xx is retried only when the same bounded call still has
+        time left; permanent access and parse failures are returned immediately.
+        """
+        started = time.monotonic()
+        deadline = started + self.timeout
+        last = None
+        retry_wait_seconds = 0.0
+        for attempt in range(self.max_retries + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            last = self._search_once(query, limit=limit, cursor=cursor,
+                                     request_timeout=remaining)
+            metadata = last.setdefault("metadata", {})
+            metadata["attempts"] = attempt + 1
+            status = metadata.get("http_status")
+            if status not in CROSSREF_TRANSIENT_HTTP_STATUSES or attempt >= self.max_retries:
+                metadata["retry_wait_seconds"] = retry_wait_seconds
+                if status in CROSSREF_TRANSIENT_HTTP_STATUSES:
+                    metadata["retry_budget_exhausted"] = True
+                return last
+            headers = metadata.get("headers") or {}
+            delay = max(self.retry_backoff_seconds * (2 ** attempt),
+                        self._retry_after_seconds(headers) or 0.0)
+            if time.monotonic() + delay >= deadline:
+                metadata["retry_wait_seconds"] = retry_wait_seconds
+                metadata["retry_budget_exhausted"] = True
+                return last
+            if delay:
+                time.sleep(delay)
+                retry_wait_seconds += delay
+        if last is not None:
+            last.setdefault("metadata", {}).update(
+                retry_wait_seconds=retry_wait_seconds, retry_budget_exhausted=True)
+            last["outcome"] = "timeout"
+            last["error"] = "Crossref request budget expired before a successful response"
+            return last
+        result = _result("crossref", "http_api", self.endpoint)
+        result.update(outcome="timeout", error="Crossref request budget expired before dispatch")
+        result["metadata"].update({"query": query, "rows": limit, "attempts": 0,
+                                    "retry_wait_seconds": retry_wait_seconds,
+                                    "retry_budget_exhausted": True, "completed_at": _now()})
+        return result
+
+    def _search_once(self, query: str, *, limit: int = 5, cursor: str | None = None,
+                     request_timeout: float | None = None) -> dict:
         if not isinstance(query, str) or not query.strip() or len(query) > 2048:
             raise ValueError("search query must be nonempty and at most 2048 characters")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
@@ -105,7 +194,8 @@ class CrossrefClient:
         result = _result("crossref", "http_api", url)
         result["metadata"].update({"query": query, "rows": limit, "representation": "metadata",
                                    "match_mode": "exact_doi" if exact_doi else "relevance"})
-        deadline = time.monotonic() + self.timeout
+        request_timeout = self.timeout if request_timeout is None else request_timeout
+        deadline = time.monotonic() + request_timeout
         response = None
         body = bytearray()
         try:
@@ -113,7 +203,7 @@ class CrossrefClient:
                 response = urlopen(Request(url, headers={
                     "User-Agent": "Sci-saurus/0.8 (research metadata client)",
                     "Accept": "application/json",
-                }), timeout=self.timeout)
+                }), timeout=request_timeout)
             except HTTPError as exc:
                 response = exc
             with response:

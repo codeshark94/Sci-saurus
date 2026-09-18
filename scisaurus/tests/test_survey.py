@@ -322,6 +322,142 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertLessEqual(sum(len(source["text"]) for source in comparisons), 60000)
         runner.control.close()
 
+    def test_map_projection_compacts_catalog_when_route_limit_is_reached(self):
+        runner = self.runtime()
+        runner.config["model"].update({
+            "context_window_tokens": 65536,
+            "max_input_tokens": 56000,
+            "max_output_tokens": 8192,
+        })
+        runner.bounds["context_chars"] = 30000
+        runner.bounds["max_text_chars"] = 400000
+        runner.works = {}
+        runner.source_docs = {}
+        runner.aliases = {}
+        runner.analysis_records = {}
+        runner.analyzed_basis = {}
+        runner.relationships = {}
+        runner.identity_records = {}
+        for index in range(165):
+            wid = f"W{index:03d}"
+            runner.works[wid] = {
+                "id": wid, "title": f"Study {wid} " + ("verbose catalog metadata " * 24),
+                "year": 2020, "doi": None, "publication_metadata_status": "provider_reported",
+                "referenced_works": [],
+            }
+            if index == 0:
+                runner.source_docs[f"source-{wid}-full"] = {
+                    "work_id": wid, "representation": "full_text",
+                    "text": "Owner evidence. " * 2200,
+                }
+            else:
+                runner.source_docs[f"source-{wid}-abstract"] = {
+                    "work_id": wid, "representation": "abstract",
+                    "text": f"Comparison evidence for {wid}. " * 300,
+                }
+        assignment = runner._map_job("W000", ["artifact:work-W000@1"])["assignment"]
+        estimate = estimate_input_tokens(SYSTEM, json.dumps(assignment, ensure_ascii=False))
+        self.assertLessEqual(estimate, 56000)
+        self.assertLess(len(assignment["works"]), 165)
+        self.assertTrue(any(source["work_id"] == "W000" for source in assignment["sources"]))
+        self.assertLessEqual(
+            estimate_input_tokens(SYSTEM, json.dumps(assignment, ensure_ascii=False)), 56000)
+        runner.control.close()
+
+    def test_gap_assessment_projection_fits_large_source_inventory(self):
+        runner = self.runtime()
+        runner.config["model"].update({
+            "context_window_tokens": 65536,
+            "max_input_tokens": 56000,
+            "max_output_tokens": 8192,
+        })
+        sources = [{
+            "source_ref": f"source-{index}", "work_id": f"W{index:03d}",
+            "representation": "abstract", "identity_verified": False,
+            "text": (f"Abstract evidence {index}. " * 500),
+            "available_chars": 12000, "window": {"start": 0, "end": 12000},
+        } for index in range(165)]
+        sources.append({
+            "source_ref": "source-full", "work_id": "W000",
+            "representation": "full_text", "identity_verified": True,
+            "text": "Full text evidence. " * 10000,
+            "available_chars": 200000, "window": {"start": 0, "end": 200000},
+        })
+        assignment = {
+            "assignment": "assess", "phase": "gap_assessment", "question": "question",
+            "gap": {"id": "gap", "statement": "statement"},
+            "nomination_ref": "nomination", "survey_ref": "survey",
+            "prerequisite_survey_ref": "survey", "map": {"entries": []},
+            "coverage": {
+                "unique_works": 165, "abstracts": 165, "verified_full_texts": 1,
+                "access_and_limit_gaps": [],
+                "searches": [{"request": {"query": "x"}, "new_work_ids": ["W001"]}]
+                             * 100,
+                "expansion": [],
+            },
+            "sources": sources, "verified_full_text_refs": ["source-full"],
+            "required_checks": ["coverage"], "allowed_check_outcomes": ["passed"],
+            "instructions": "return a bounded assessment",
+        }
+        projected = runner._fit_assessment_assignment(assignment)
+        self.assertLessEqual(
+            estimate_input_tokens(SYSTEM, json.dumps(projected, ensure_ascii=False)), 56000)
+        self.assertTrue(projected["sources"])
+        self.assertEqual(projected["verified_full_text_refs"], ["source-full"])
+        runner.control.close()
+
+    def test_role_specific_context_limit_is_not_clamped_by_global_model(self):
+        runner = self.runtime()
+        runner.config["model"].update({
+            "context_window_tokens": 65536,
+            "max_input_tokens": 56000,
+            "max_output_tokens": 8192,
+            "role_models": {
+                "methods.novelty-verifier": {
+                    "context_window_tokens": 131072,
+                    "max_input_tokens": 112000,
+                },
+            },
+            "role_routes": {
+                "methods.novelty-verifier": [{
+                    "id": "ollama-deepseek", "pool": "ollama",
+                    "base_url": "http://127.0.0.1:1",
+                    "model": "deepseek-v4.1-flash:cloud",
+                    "context_window_tokens": 131072,
+                    "max_input_tokens": 112000,
+                }],
+            },
+        })
+        self.assertEqual(runner._map_input_limit("methods.novelty-verifier"), 112000)
+        self.assertEqual(runner._map_input_limit("unconfigured-role"), 56000)
+        runner.control.close()
+
+    def test_catalog_only_map_is_deterministic_and_does_not_call_a_model(self):
+        runner = self.runtime()
+        work = {
+            "work_id": "W999", "title": "Catalog-only study", "year": 2025,
+            "doi": None, "referenced_works": [], "related_works": [],
+            "publication_metadata_status": "provider_reported",
+        }
+        record = runner._publish("kb/works/W999", "reference_card", work,
+                                 "research.cataloger")
+        runner.work_records = {"W999": record}
+        runner.works = {"W999": work}
+        runner.register_ref = record["artifact_ref"]
+        with patch.object(runner, "_map_job", side_effect=AssertionError("model map must not run")):
+            runner._map()
+        entry = json.loads(runner.store.read_body(runner.analysis_records["W999"]["body_hash"]))
+        self.assertEqual(entry["inclusion"], "uncertain")
+        self.assertIsNone(entry["problem"]["text"])
+        execution = runner.store.head("command/executions/survey-map-deterministic-W999")
+        execution_body = json.loads(runner.store.read_body(execution["body_hash"]))
+        self.assertEqual(execution_body["execution_kind"], "deterministic_source_availability")
+        self.assertEqual(execution_body["model_calls"], 0)
+        contexts = list(runner.control._conn.execute(
+            "SELECT artifact_ref FROM artifacts WHERE logical_id LIKE 'command/contexts/%'"))
+        self.assertEqual(contexts, [])
+        runner.control.close()
+
     def runtime(self, config=None, *, on_progress=None, resume_policy=None):
         runner = SurveyRunner(self.root / "run", config or survey_config(self.endpoint),
                               on_progress=on_progress, resume_policy=resume_policy)
@@ -406,7 +542,7 @@ class TestSurveyRunner(unittest.TestCase):
         config["limits"]["max_rounds"] = 2
         result = self.runtime(config).run()
         self.assertEqual(result["status"], "blocked")
-        self.assertIn("exactly the granted entry fields", result["error"])
+        self.assertIn("ungranted entry field", result["error"])
         self.assertIsNone(result["survey_ref"])
         _, store = self.open_store()
         self.assertEqual(store.head("kb/work-analyses/W101")["version"], 1)
@@ -1053,6 +1189,43 @@ class TestSurveyContracts(unittest.TestCase):
         self.assertEqual(repaired["entries"][0]["reason"], "Narrow reason")
         self.assertEqual(repaired["relationships"], [{key: relationship[key]
                          for key in ("source", "target", "kind", "claim")}])
+
+    def test_scoped_map_patch_accepts_assigned_work_wrapper(self):
+        previous = {"work_id": "W101", "inclusion": "included", "reason": "Old reason",
+                    **{field: {"text": None, "evidence": []} for field in MAP_FIELDS}}
+        repaired = apply_scoped_map_repair(
+            "W101", previous, [],
+            {"entry_fields": ["finding"], "relationship_targets": []},
+            {"entry_updates": {"W101": {"finding": {
+                "text": "A bounded finding.", "evidence": []}}}, "relationships": []},
+            reject_ungranted_changes=True)
+        self.assertEqual(repaired["entries"][0]["finding"]["text"], "A bounded finding.")
+        self.assertEqual(repaired["entries"][0]["reason"], "Old reason")
+
+    def test_scoped_map_patch_can_retain_unrepaired_failed_fields_for_recheck(self):
+        previous = {"work_id": "W101", "inclusion": "uncertain", "reason": "Old reason",
+                    **{field: {"text": None, "evidence": []} for field in MAP_FIELDS}}
+        repaired = apply_scoped_map_repair(
+            "W101", previous, [],
+            {"entry_fields": ["inclusion", "reason", "finding"], "relationship_targets": []},
+            {"entry_updates": {"W101": {"reason": "Corrected reason"}}, "relationships": []},
+            reject_ungranted_changes=True)
+        self.assertEqual(repaired["entries"][0]["reason"], "Corrected reason")
+        self.assertEqual(repaired["entries"][0]["inclusion"], "uncertain")
+        self.assertEqual(repaired["entries"][0]["finding"], previous["finding"])
+
+    def test_scoped_map_patch_rejects_multiple_work_wrappers(self):
+        previous = {"work_id": "W101", "inclusion": "included", "reason": "Old reason",
+                    **{field: {"text": None, "evidence": []} for field in MAP_FIELDS}}
+        with self.assertRaisesRegex(ValidationError, "ungranted work"):
+            apply_scoped_map_repair(
+                "W101", previous, [],
+                {"entry_fields": ["finding"], "relationship_targets": []},
+                {"entry_updates": {
+                    "W101": {"finding": {"text": "A", "evidence": []}},
+                    "W102": {"finding": {"text": "B", "evidence": []}}},
+                 "relationships": []},
+                reject_ungranted_changes=True)
 
     def test_scoped_map_patch_ignores_echoed_protected_entry_fields(self):
         previous = {"work_id": "W101", "inclusion": "included", "reason": "Old reason",

@@ -105,12 +105,14 @@ The minimal stage descriptor is shown in
 replace its two absolute paths before workflow validation. The optional
 `maturity_review_rounds` field gives the intake an independent scientific-depth
 screen; journal-oriented topic→survey missions default to two rounds when it is omitted.
-Topic-level `budgets` and `continuation_budgets` are opt-in envelopes for small,
-deterministic jobs. The autonomous mission template omits them: Composer then
-continues isolated topic pivots until the mission deadline, an actual provider
-or API limit, or a worker/resource fence. They must not be confused with
-provider/account limits, the premium-model ledger, or the per-call output
-contract.
+Topic-level `budgets` and `continuation_budgets` are bounded envelopes. Intake
+retries share the first envelope; each deliberately admitted continuation pivot
+gets a fresh continuation envelope, while the immutable mission deadline,
+provider/account limits, premium-model ledger, and worker/resource fences still
+bound the complete run. This scope separation lets a resumed legacy project
+evaluate a new direction without charging that direction against unrelated
+historical pivots. The budgets must not be confused with provider/account
+limits or the per-call output contract.
 
 For a free-topic mission, `topic_discovery` runs before the survey. It queries
 OpenAlex with objective-derived and broad recent-literature searches, filters to
@@ -140,6 +142,20 @@ directions, so a later selection cannot inherit a misleading aggregate score. A 
 with `reuse_completed: true` is an explicit replay of the pinned output and does
 not perform new topic generation; set it to `false` for a fresh exploration. If the
 scholarly provider fails, topic admission fails rather than fabricating a topic.
+
+Experiment-backed missions also require each candidate to carry a
+`feasibility_plan`. This is a machine-readable inventory of the execution mode,
+experiment inputs and their readiness, data-access boundary, required packages
+and executables, network use, estimated external/model calls, and compute time.
+Composer builds the allowed boundary from the actual foundry, stage descriptors,
+survey configuration, and host/runtime inventory; the selected plan is rejected
+when it asks for undeclared data, an unavailable dependency, forbidden network
+access, an over-budget provider call, or more time than the experiment deadline.
+The deterministic foundry specifically requires a self-contained, closed-world
+plan with synthetic or analytical inputs, zero external requests or
+experiment-side model calls, and an estimate within the foundry sandbox
+timeout. A prose
+`feasibility` field remains explanatory only and cannot override this gate.
 The independent adversary judges that result against its declared next evidence
 action. For `provisional_for_survey`, unresolved maturity findings remain visible
 as survey and downstream repair requirements; they are not mistaken for a claim

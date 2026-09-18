@@ -73,6 +73,22 @@ TOPIC_BIBLIOGRAPHY_FIELDS = TOPIC_BIBLIOGRAPHY_CLIENT_FIELDS | {
 TOPIC_BUDGET_FIELDS = {
     "max_model_calls", "max_openalex_requests", "max_input_tokens", "max_output_tokens",
 }
+# Safe defaults for legacy descriptors that predate aggregate intake quotas.
+# New builders write these explicitly; the Composer also applies them when it
+# resumes an older immutable workflow so a migration cannot reopen an unbounded
+# provider/model loop.
+DEFAULT_TOPIC_BUDGETS = {
+    "max_model_calls": 48,
+    "max_openalex_requests": 128,
+    "max_input_tokens": 1_500_000,
+    "max_output_tokens": 400_000,
+}
+DEFAULT_TOPIC_CONTINUATION_BUDGETS = {
+    "max_model_calls": 24,
+    "max_openalex_requests": 64,
+    "max_input_tokens": 750_000,
+    "max_output_tokens": 200_000,
+}
 CANDIDATE_FIELDS = {
     "id", "title", "domain", "research_question", "scope", "search_queries",
     "why_promising", "disconfirmation_test", "feasibility", "resource_plan",
@@ -93,6 +109,38 @@ CATALOG_CANDIDATE_FIELDS = CANDIDATE_FIELDS | {"experiment_capability_id"}
 CATALOG_LEGACY_CANDIDATE_FIELDS = LEGACY_CANDIDATE_FIELDS | {"experiment_capability_id"}
 CAPABILITY_FIELDS = {"executables", "python_packages", "stage_kinds"}
 KNOWN_STAGE_KINDS = {"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"}
+
+# A prose feasibility note is useful to a reader but cannot establish that a
+# proposed study can actually run.  The structured plan below is the small
+# execution inventory used by the deterministic admission gate.  It keeps
+# data access, runtime inputs, provider work, and compute estimates separate so
+# a topic cannot pass merely by naming an installed Python package.
+FEASIBILITY_PLAN_FIELDS = {
+    "execution_mode", "experiment_input", "evidence_inputs", "data_access",
+    "required_packages", "required_executables", "estimated_compute_seconds",
+    "estimated_api_requests", "estimated_model_calls", "network_access",
+}
+FEASIBILITY_EXECUTION_MODES = {
+    "foundry", "configured_program", "project_runner", "external_service",
+}
+FEASIBILITY_INPUT_KINDS = {
+    "synthetic", "analytical_parameters", "project_artifact", "survey_metadata",
+    "survey_full_text", "public_dataset", "new_measurement", "external_service",
+}
+FEASIBILITY_INPUT_STATUSES = {
+    "available", "acquirable_before_experiment", "unavailable",
+}
+FEASIBILITY_DATA_ACCESS = {
+    "closed_world", "project_local", "survey_artifact", "external_provider",
+}
+EVIDENCE_MODE_INPUTS = {
+    "analytical_derivation": {"analytical_parameters", "synthetic"},
+    "synthetic_simulation": {"synthetic"},
+    "published_observations": {"survey_metadata", "survey_full_text"},
+    "public_dataset": {"public_dataset", "survey_metadata"},
+    "cross_source_synthesis": {"survey_metadata", "survey_full_text"},
+    "controlled_measurement": {"new_measurement"},
+}
 
 # These fields describe the epistemic shape of a candidate, not its subject
 # matter.  A diverse frontier seed list is insufficient when every candidate
@@ -260,6 +308,70 @@ def _validate_capability_requirements(value, name="capability_requirements"):
     if set(value["stage_kinds"]) - KNOWN_STAGE_KINDS:
         raise ValidationError(f"{name}.stage_kinds contains an unsupported stage kind")
     return value
+
+
+def validate_feasibility_plan(value, name="feasibility_plan"):
+    """Validate the machine-readable execution and data-access inventory."""
+    if not isinstance(value, dict) or set(value) != FEASIBILITY_PLAN_FIELDS:
+        raise ValidationError(
+            f"{name} requires exactly {sorted(FEASIBILITY_PLAN_FIELDS)}")
+    for key in ("execution_mode", "experiment_input", "data_access"):
+        _text(value[key], f"{name}.{key}", public=False)
+    if value["execution_mode"] not in FEASIBILITY_EXECUTION_MODES:
+        raise ValidationError(f"{name}.execution_mode is unsupported")
+    if value["experiment_input"] not in {"self_contained", "project_artifact", "survey_artifact"}:
+        raise ValidationError(f"{name}.experiment_input is unsupported")
+    if value["data_access"] not in FEASIBILITY_DATA_ACCESS:
+        raise ValidationError(f"{name}.data_access is unsupported")
+    evidence_inputs = value["evidence_inputs"]
+    if not isinstance(evidence_inputs, list) or not 1 <= len(evidence_inputs) <= 8:
+        raise ValidationError(f"{name}.evidence_inputs must contain one to eight items")
+    seen_kinds = set()
+    for item in evidence_inputs:
+        if not isinstance(item, dict) or set(item) != {"kind", "status", "source"}:
+            raise ValidationError(f"{name}.evidence_inputs item has an invalid shape")
+        if item["kind"] not in FEASIBILITY_INPUT_KINDS:
+            raise ValidationError(f"{name}.evidence_inputs contains an unsupported kind")
+        if item["status"] not in FEASIBILITY_INPUT_STATUSES:
+            raise ValidationError(f"{name}.evidence_inputs contains an unsupported status")
+        _text(item["source"], f"{name}.evidence_inputs source", public=False)
+        if len(item["source"]) > 320:
+            raise ValidationError(f"{name}.evidence_inputs source is too long")
+        if item["kind"] in seen_kinds:
+            raise ValidationError(f"{name}.evidence_inputs must not repeat kinds")
+        seen_kinds.add(item["kind"])
+    for key, maximum in (("required_packages", 32), ("required_executables", 16)):
+        _strings(value[key], f"{name}.{key}", minimum=0, maximum=maximum, public=False)
+    for key, minimum, maximum in (
+            ("estimated_compute_seconds", 1, 7 * 24 * 3600),
+            ("estimated_api_requests", 0, 10000),
+            ("estimated_model_calls", 0, 128)):
+        amount = value[key]
+        if type(amount) is not int or not minimum <= amount <= maximum:
+            raise ValidationError(
+                f"{name}.{key} must be an integer between {minimum} and {maximum}")
+    if type(value["network_access"]) is not bool:
+        raise ValidationError(f"{name}.network_access must be a Boolean")
+    observed_kinds = {item["kind"] for item in evidence_inputs}
+    if value["experiment_input"] == "self_contained":
+        if not observed_kinds.issubset({"synthetic", "analytical_parameters"}):
+            raise ValidationError(
+                f"{name}.evidence_inputs for self_contained may use only synthetic or analytical_parameters inputs")
+        if any(item["status"] != "available" for item in evidence_inputs):
+            raise ValidationError(
+                f"{name}.evidence_inputs for self_contained must already be available")
+    elif value["experiment_input"] == "project_artifact":
+        if "project_artifact" not in observed_kinds:
+            raise ValidationError(
+                f"{name}.project_artifact must declare a project_artifact input")
+    elif not observed_kinds.intersection({"survey_metadata", "survey_full_text"}):
+        raise ValidationError(
+            f"{name}.survey_artifact must declare survey_metadata or survey_full_text")
+    if value["data_access"] == "closed_world" and value["network_access"]:
+        raise ValidationError(
+            f"{name}.closed_world cannot require network access")
+    canonical_bytes(value)
+    return deepcopy(value)
 
 
 def _materialize_foundry_capability_requirements(package, runtime_context):
@@ -624,12 +736,13 @@ _TOPIC_REPAIRABLE_TEXT_FIELDS = (
     "title", "domain", "research_question", "scope", "why_promising",
     "disconfirmation_test", "feasibility", "resource_plan",
 )
+_TOPIC_REPAIRABLE_STRUCTURED_FIELDS = ("feasibility_plan",)
 _TOPIC_REPAIR_CONTEXT_FIELDS = (
     "id", "title", "domain", "research_question", "phenomenon", "mechanism",
     "data_regime", "comparison", "measurement", "theory_target", "scope",
     "research_form", "evidence_mode", "comparison_type", "disconfirmation_test_note",
     "feasibility", "resource_plan", "frontier_seed_id", "prior_work_ids",
-    "experiment_capability_id",
+    "experiment_capability_id", "feasibility_plan",
 )
 
 
@@ -660,7 +773,7 @@ def _topic_missing_field_repair_prompt(package, targets):
         "output_contract": {
             "candidate_patches": [{
                 "id": "copy the exact candidate id",
-                "fields": "object containing exactly the listed missing_fields and one concise text value per field",
+                "fields": "object containing exactly the listed missing_fields; text fields are concise strings and feasibility_plan is the exact structured object described by the topic contract",
             }],
         },
         "constraints": [
@@ -1290,7 +1403,7 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
                   CATALOG_CANDIDATE_FIELDS, CATALOG_LEGACY_CANDIDATE_FIELDS)
         candidate_keys = set(candidate) if isinstance(candidate, dict) else set()
         shape_options = [
-            (shape, extra, shape | CANDIDATE_DIMENSION_FIELDS | extra)
+            (shape, extra, shape | CANDIDATE_DIMENSION_FIELDS | {"feasibility_plan"} | extra)
             for shape in shapes
             for extra in ({"experiment_design"}, GROUNDING_FIELDS,
                           GROUNDING_FIELDS | {"experiment_design"}, set())
@@ -1389,6 +1502,8 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
             grounded_domains.add(candidate["domain"].strip().casefold())
         if "capability_requirements" in candidate:
             _validate_capability_requirements(candidate["capability_requirements"])
+        if "feasibility_plan" in candidate:
+            validate_feasibility_plan(candidate["feasibility_plan"])
         if capability_ids:
             selected_capability = candidate.get("experiment_capability_id")
             if not isinstance(selected_capability, str) or selected_capability not in capability_ids:
@@ -1984,6 +2099,7 @@ def validate_topic_feasibility(package, runtime_context):
         if selected.get("experiment_capability_id") in excluded:
             raise ValidationError("selected topic uses a capability excluded by the exploration history")
     foundry = runtime_context.get("capability_foundry")
+    foundry_enabled = isinstance(foundry, dict) and foundry.get("enabled") is True
     if isinstance(foundry, dict) and foundry.get("enabled") is True:
         allowed_evidence_modes = foundry.get("allowed_evidence_modes")
         if isinstance(allowed_evidence_modes, list) and allowed_evidence_modes:
@@ -2009,7 +2125,96 @@ def validate_topic_feasibility(package, runtime_context):
         raise ValidationError(
             "selected topic requires unavailable capabilities: "
             + ", ".join(f"{item['kind']}={item['name']}" for item in unavailable))
-    return {"status": "feasible", "unavailable": [], "requirements": deepcopy(requirements)}
+
+    # A Composer runtime publishes this second contract when it can describe
+    # the actual experiment boundary.  Older callers only supplied the three
+    # legacy inventories above and continue to receive the compatibility
+    # result.  New missions must also account for inputs, data access, network
+    # use, provider work, and compute time before a topic is admitted.
+    feasibility_runtime = runtime_context.get("research_feasibility")
+    if not isinstance(feasibility_runtime, dict):
+        return {"status": "feasible", "unavailable": [],
+                "requirements": deepcopy(requirements)}
+    plan = selected.get("feasibility_plan")
+    if plan is None:
+        raise ValidationError(
+            "current topic discovery output must include feasibility_plan")
+    plan = validate_feasibility_plan(plan)
+    failures = []
+
+    allowed_modes = set(feasibility_runtime.get("execution_modes") or [])
+    if allowed_modes and plan["execution_mode"] not in allowed_modes:
+        failures.append({"check": "execution_mode", "observed": plan["execution_mode"],
+                         "allowed": sorted(allowed_modes)})
+    allowed_inputs = set(feasibility_runtime.get("allowed_input_kinds") or [])
+    observed_inputs = {item["kind"] for item in plan["evidence_inputs"]}
+    unavailable_inputs = sorted(observed_inputs - allowed_inputs) if allowed_inputs else []
+    if unavailable_inputs:
+        failures.append({"check": "evidence_inputs", "unavailable": unavailable_inputs})
+    unavailable_statuses = [item["kind"] for item in plan["evidence_inputs"]
+                            if item["status"] == "unavailable"]
+    if unavailable_statuses:
+        failures.append({"check": "evidence_inputs", "unavailable": unavailable_statuses,
+                         "reason": "input is declared unavailable"})
+    if foundry_enabled:
+        not_ready = [item["kind"] for item in plan["evidence_inputs"]
+                     if item["status"] != "available"]
+        if not_ready:
+            failures.append({"check": "input_readiness", "not_ready": not_ready,
+                             "reason": "the deterministic foundry cannot acquire inputs during execution"})
+    allowed_access = set(feasibility_runtime.get("allowed_data_access") or [])
+    if allowed_access and plan["data_access"] not in allowed_access:
+        failures.append({"check": "data_access", "observed": plan["data_access"],
+                         "allowed": sorted(allowed_access)})
+    if feasibility_runtime.get("network_access") is False and plan["network_access"]:
+        failures.append({"check": "network_access", "reason": "execution boundary forbids network access"})
+    if feasibility_runtime.get("undeclared_data") is False and plan["experiment_input"] == "survey_artifact":
+        failures.append({"check": "experiment_input", "reason": "survey artifacts are not injected into this experiment boundary"})
+
+    available_executables = set(feasibility_runtime.get("available_executables") or [])
+    available_packages = set(feasibility_runtime.get("available_packages") or [])
+    missing_plan_executables = sorted(set(plan["required_executables"]) - available_executables)
+    missing_plan_packages = sorted(set(plan["required_packages"]) - available_packages)
+    if missing_plan_executables:
+        failures.append({"check": "required_executables", "missing": missing_plan_executables})
+    if missing_plan_packages:
+        failures.append({"check": "required_packages", "missing": missing_plan_packages})
+
+    max_compute = feasibility_runtime.get("max_experiment_seconds")
+    if type(max_compute) in (int, float) and plan["estimated_compute_seconds"] > max_compute:
+        failures.append({"check": "compute_budget", "estimated_seconds": plan["estimated_compute_seconds"],
+                         "limit_seconds": max_compute})
+    max_requests = feasibility_runtime.get("max_external_requests")
+    if type(max_requests) is int and plan["estimated_api_requests"] > max_requests:
+        failures.append({"check": "provider_budget", "estimated_requests": plan["estimated_api_requests"],
+                         "limit": max_requests})
+    max_model_calls = feasibility_runtime.get("max_model_calls")
+    if type(max_model_calls) is int and plan["estimated_model_calls"] > max_model_calls:
+        failures.append({"check": "model_budget", "estimated_calls": plan["estimated_model_calls"],
+                         "limit": max_model_calls})
+
+    expected_inputs = EVIDENCE_MODE_INPUTS.get(selected.get("evidence_mode"), set())
+    if expected_inputs and not expected_inputs.intersection(observed_inputs):
+        failures.append({"check": "evidence_mode", "mode": selected.get("evidence_mode"),
+                         "required_input_kinds": sorted(expected_inputs),
+                         "declared_input_kinds": sorted(observed_inputs)})
+    if foundry_enabled and plan["execution_mode"] != "foundry":
+        failures.append({"check": "foundry_boundary", "reason": "foundry-backed missions require foundry execution"})
+    if foundry_enabled and plan["experiment_input"] != "self_contained":
+        failures.append({"check": "foundry_boundary", "reason": "foundry-backed missions require a self-contained experiment input"})
+    if failures:
+        first = failures[0]
+        detail = json.dumps(first, ensure_ascii=False, sort_keys=True)
+        raise ValidationError("selected topic failed feasibility checks: " + detail)
+    return {"status": "feasible", "unavailable": [],
+            "requirements": deepcopy(requirements), "plan": deepcopy(plan),
+            "checks": {
+                "execution_boundary": "passed",
+                "data_access": "passed",
+                "provider_budget": "passed",
+                "compute_budget": "passed",
+                "runtime_dependencies": "passed",
+            }}
 
 
 def validate_topic_maturity_review(value, *, candidate_ids=None,
@@ -2406,6 +2611,9 @@ def _topic_prompt_refinement_projection(value):
                 ("resource_plan", 700), ("disconfirmation_test", 700),
             ) if parent.get(key) is not None
         }
+        if isinstance(parent.get("feasibility_plan"), dict):
+            result["parent_topic"]["feasibility_plan"] = deepcopy(
+                parent["feasibility_plan"])
     feedback = value.get("refinement_feedback")
     if isinstance(feedback, dict):
         result["refinement_feedback"] = {
@@ -2554,6 +2762,18 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "disconfirmation_test": "what result or prior work would make this direction unhelpful",
         "disconfirmation_test_note": "optional detail about how the disconfirmation test separates explanations",
         "feasibility": "why the declared runtime can execute the study within the mission budget",
+        "feasibility_plan": {
+            "execution_mode": "foundry, configured_program, or project_runner",
+            "experiment_input": "self_contained, project_artifact, or survey_artifact",
+            "evidence_inputs": "one to eight {kind,status,source} objects; declare every input used by the experiment",
+            "data_access": "closed_world, project_local, survey_artifact, or external_provider",
+            "required_packages": "exact package names required by the study",
+            "required_executables": "exact executable names required by the study",
+            "estimated_compute_seconds": "integer estimate inside the declared experiment deadline",
+            "estimated_api_requests": "integer count of external requests needed by the study",
+            "estimated_model_calls": "integer count of model calls needed by the study",
+            "network_access": "boolean; false for the deterministic foundry",
+        },
         "resource_plan": "data, programs, tools, and compute the study would use",
     }
     constraints = [
@@ -2570,6 +2790,9 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "do not collapse every candidate onto the first familiar method merely because it is easiest to explain; preserve at least one non-simulation evidence mode when the frontier seeds support it",
         "search queries must be usable as ordinary scholarly search strings",
         "capability_requirements is derived from the declared runtime boundary; do not emit it in candidate objects",
+        "feasibility_plan must be an exact machine-readable inventory, not a second prose claim; declare synthetic or analytical inputs for the deterministic foundry and never hide an external dataset, measurement, or network request",
+        "for a foundry-backed runtime, use execution_mode=foundry, experiment_input=self_contained, data_access=closed_world, network_access=false, and estimated_api_requests=0",
+        "do not call a literature record, public dataset, digitized curve, instrument, or external service an available experiment input unless the runtime_context explicitly permits that input kind",
         "never invent a citation, dataset, result, or prior-work claim",
         "keep every narrative field concise (at most 45 words), keep each search query under 12 words, and fit the complete JSON package within 5000 output tokens",
         "include every required top-level key and every required candidate key; never stop after a partial candidate list",
@@ -2977,6 +3200,18 @@ def _topic_candidate_refinement_prompt(objective, parent_candidate, *,
         "disconfirmation_test": "result or prior evidence that would disconfirm the direction",
         "disconfirmation_test_note": "optional operational detail for the disconfirmation test",
         "feasibility": "why the declared runtime can execute this bounded study",
+        "feasibility_plan": {
+            "execution_mode": "copy the runtime-compatible execution mode",
+            "experiment_input": "declare self_contained, project_artifact, or survey_artifact",
+            "evidence_inputs": "one to eight {kind,status,source} objects; declare every experiment input",
+            "data_access": "declare the actual access boundary",
+            "required_packages": "exact package names required by the study",
+            "required_executables": "exact executable names required by the study",
+            "estimated_compute_seconds": "integer estimate inside the declared experiment deadline",
+            "estimated_api_requests": "integer count of external requests needed by the study",
+            "estimated_model_calls": "integer count of model calls needed by the study",
+            "network_access": "boolean; false for the deterministic foundry",
+        },
         "resource_plan": "data, programs, tools, and compute used",
         "frontier_seed_id": "copy target_frontier_seed_id exactly",
         "prior_work_ids": "one to three work_id values from target_seed_records only",
@@ -3254,8 +3489,9 @@ class TopicDiscoveryRunner:
             config["timeout_seconds"] = min(float(timeout_seconds), remaining)
         return ModelClient(**config)
 
-    def _repair_missing_topic_fields(self, package, *, deadline, budget):
-        """Fill omitted required text fields while keeping all other fields immutable."""
+    def _repair_missing_topic_fields(self, package, *, deadline, budget,
+                                     require_feasibility_plan=False):
+        """Fill omitted contract fields while keeping all other fields immutable."""
         if not isinstance(package, dict) or not isinstance(package.get("candidates"), list):
             return []
         targets = [
@@ -3265,6 +3501,7 @@ class TopicDiscoveryRunner:
                 "candidate": candidate,
                 "missing_fields": [
                     field for field in _TOPIC_REPAIRABLE_TEXT_FIELDS
+                    + (_TOPIC_REPAIRABLE_STRUCTURED_FIELDS if require_feasibility_plan else ())
                     if field not in candidate
                 ],
             }
@@ -3323,7 +3560,10 @@ class TopicDiscoveryRunner:
                     raise ValidationError(
                         "topic field repair returned fields outside the missing-field contract")
                 for field, value in fields.items():
-                    _text(value, f"topic candidate {field}")
+                    if field == "feasibility_plan":
+                        validate_feasibility_plan(value)
+                    else:
+                        _text(value, f"topic candidate {field}")
                 by_id[identifier] = fields
             if set(by_id) != set(target_ids):
                 raise ValidationError(
@@ -3901,7 +4141,9 @@ class TopicDiscoveryRunner:
                     ),
                 )
                 missing_field_repairs = self._repair_missing_topic_fields(
-                    package, deadline=deadline, budget=budget)
+                    package, deadline=deadline, budget=budget,
+                    require_feasibility_plan=isinstance(
+                        (runtime_context or {}).get("research_feasibility"), dict))
                 objective_normalized = (
                     isinstance(package, dict)
                     and isinstance(package.get("objective"), str)
@@ -4639,5 +4881,5 @@ __all__ = [
     "topic_portfolio_profile", "validate_topic_portfolio", "topic_refinement_dimensions",
     "validate_topic_refinement",
     "validate_frontier_seed_plan", "validate_source_challenge", "validate_topic_stage_config",
-    "validate_topic_package", "validate_topic_feasibility", "topic_prompt",
+    "validate_topic_package", "validate_topic_feasibility", "validate_feasibility_plan", "topic_prompt",
 ]

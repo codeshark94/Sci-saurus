@@ -13,10 +13,10 @@ from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.source_spans import bind as bind_source_spans, contains_legacy
 from scisaurus.core.surveys import RELATIONSHIP_SEMANTICS, SurveyGate, work_review_checks
-from scisaurus.runtime.execution import ExecutionRuntime, _invoke_worker
+from scisaurus.runtime.execution import SYSTEM, ExecutionRuntime, _invoke_worker
 from scisaurus.runtime.config import configured_worker_slots
 from scisaurus.runtime.bibliographic_identity import reconcile_result
-from scisaurus.runtime.models import ModelResult
+from scisaurus.runtime.models import ModelResult, estimate_input_tokens
 from scisaurus.runtime.literature import (
     SEARCH_SYNTAX, ProviderCooldownError, provider_cooldown_seconds,
 )
@@ -32,31 +32,49 @@ def normalized(text):
     return " ".join(re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold()))
 
 
+def _normalize_scoped_entry_updates(wid, updates):
+    """Normalize the per-work wrapper used by model repair responses."""
+    if not isinstance(updates, dict) or wid not in updates:
+        return updates
+    if set(updates) != {wid}:
+        raise ValidationError("scoped map repair changed an ungranted work")
+    nested = updates[wid]
+    if not isinstance(nested, dict):
+        return updates
+    return nested
+
+
 def apply_scoped_map_repair(wid, previous, old_relationships, feedback, patch, *,
                             reject_ungranted_changes=False):
     """Compose a narrow repair without asking a worker to reproduce protected state.
 
-    The pure composition helper may discard fields echoed beside a valid patch
-    for compatibility with older callers.  A live provider response must use
-    ``reject_ungranted_changes=True`` so an actual out-of-scope edit is a
-    validation failure rather than a silently accepted response.
+    A repair may update a subset of the fields that failed review; omitted
+    fields remain pinned to the previous entry and are independently reviewed
+    again. A live provider response must use ``reject_ungranted_changes=True``
+    so an actual out-of-scope edit is a validation failure rather than a
+    silently accepted response.
     """
     exact(patch, {"entry_updates", "relationships"}, "scoped map repair")
-    updates = patch["entry_updates"]
+    updates = _normalize_scoped_entry_updates(wid, patch["entry_updates"])
     relations = patch["relationships"]
     granted_fields = set(feedback["entry_fields"])
-    if not isinstance(updates, dict) or not granted_fields.issubset(updates):
-        raise ValidationError("scoped map repair omitted a granted entry field")
-    if reject_ungranted_changes and set(updates) != granted_fields:
-        raise ValidationError("scoped map repair must return exactly the granted entry fields")
+    if not isinstance(updates, dict):
+        raise ValidationError("scoped map repair entry updates must be an object")
+    ungranted_fields = set(updates) - granted_fields
+    if ungranted_fields and reject_ungranted_changes:
+        raise ValidationError("scoped map repair changed an ungranted entry field")
+    if ungranted_fields:
+        updates = {field: updates[field] for field in updates if field in granted_fields}
     # A repair worker sometimes echoes the protected fields from the previous
     # entry along with the requested patch.  The control plane owns those
     # fields, so project the response to the explicit grant before composing
     # it.  No out-of-scope value can affect the accepted entry.
-    updates = {field: updates[field] for field in feedback["entry_fields"]}
+    updates = {field: updates[field] for field in updates if field in granted_fields}
     if not isinstance(relations, list):
         raise ValidationError("scoped map repair relationships must be a list")
     targets = set(feedback["relationship_targets"])
+    if not updates and not targets:
+        raise ValidationError("scoped map repair must change a granted entry field or relationship")
     if any(not isinstance(relation, dict) or relation.get("source") != wid
            or relation.get("target") not in targets for relation in relations):
         raise ValidationError("scoped map repair changed an ungranted relationship")
@@ -1210,6 +1228,183 @@ class SurveyRunner(ExecutionRuntime):
         projected["window"] = {"start": 0, "end": len(projected["text"])}
         return projected
 
+    def _map_input_limit(self, role):
+        """Return the strictest input limit any route for ``role`` permits.
+
+        A map job is serialized before the execution runtime selects a
+        provider lane.  Route selection can therefore reject an otherwise
+        valid assignment when one of the configured fallbacks has a smaller
+        context budget.  Project against the strictest resolved route so
+        capacity rotation cannot turn prompt size into a late dispatch
+        failure.
+        """
+        base = self.config.get("model")
+        if not isinstance(base, dict):
+            return None
+        candidates = []
+
+        def add(overrides):
+            effective = dict(base)
+            if isinstance(overrides, dict):
+                effective.update(overrides)
+            window = effective.get("context_window_tokens")
+            input_limit = effective.get("max_input_tokens")
+            output_limit = effective.get("max_output_tokens")
+            allowed = input_limit
+            if isinstance(window, int) and isinstance(output_limit, int):
+                window_limit = window - output_limit
+                allowed = window_limit if allowed is None else min(allowed, window_limit)
+            if isinstance(allowed, int) and allowed > 0:
+                candidates.append(allowed)
+
+        role_models = base.get("role_models", {})
+        selected = role_models.get(role) if isinstance(role_models, dict) else None
+        fallbacks = base.get("role_model_fallbacks", {})
+        role_fallbacks = fallbacks.get(role, []) if isinstance(fallbacks, dict) else []
+        routes_by_role = base.get("role_routes", {})
+        routes = routes_by_role.get(role, []) if isinstance(routes_by_role, dict) else []
+
+        # An explicit role selection is the admission contract for that role.
+        # The global model is only a candidate when no role-specific model,
+        # fallback, or route exists; otherwise it would silently force every
+        # high-context role back down to the base model's smaller window.
+        if selected is None and not role_fallbacks and not routes:
+            add(None)
+        if selected is not None:
+            add(selected)
+        if isinstance(fallbacks, dict):
+            for fallback in role_fallbacks:
+                add(fallback)
+        for route in routes:
+            if not isinstance(route, dict):
+                continue
+            effective = dict(selected) if isinstance(selected, dict) else {}
+            effective.update({key: value for key, value in route.items()
+                              if key not in {"id", "pool"}})
+            add(effective)
+        return min(candidates) if candidates else None
+
+    @staticmethod
+    def _project_map_catalog(works, *, visible_ids, target_ids, max_items):
+        """Keep catalog metadata for displayed sources and scoped targets."""
+        required_ids = set(visible_ids) | set(target_ids)
+        required = [work for work in works if work.get("id") in required_ids]
+        optional = [work for work in works if work.get("id") not in required_ids]
+        if max_items is None or len(required) >= max_items:
+            return required
+        return [*required, *optional[:max_items - len(required)]]
+
+    def _project_map_sources(self, sources, *, owner_id, owner_chars,
+                             comparison_chars, comparison_count):
+        """Project owner and comparison source windows under two budgets."""
+        owner_sources = [source for source in sources if source.get("work_id") == owner_id]
+        comparison_sources = [source for source in sources if source.get("work_id") != owner_id]
+        projected_owner, remaining = [], max(0, int(owner_chars))
+        for source in owner_sources:
+            if remaining <= 0:
+                break
+            projected = self._project_source_window(source, remaining)
+            if projected["text"]:
+                projected_owner.append(projected)
+                remaining -= len(projected["text"])
+        selected = comparison_sources[:max(0, int(comparison_count))]
+        if selected and comparison_chars > 0:
+            each = max(1, int(comparison_chars) // len(selected))
+            projected_comparisons = [
+                self._project_source_window(source, each)
+                for source in selected if source.get("text", "")[:each]
+            ]
+        else:
+            projected_comparisons = []
+        return [*projected_owner, *projected_comparisons]
+
+    def _fit_map_assignment(self, assignment, *, owner_id):
+        """Fit a map assignment to every possible provider route.
+
+        The normal map projection bounds source text, but the catalog and
+        scoped repair state also grow with a survey.  This second, exact
+        admission pass preserves the owner first, keeps relevant comparison
+        records, and progressively reduces optional context until the same
+        conservative estimator used by the execution runtime fits.  If the
+        immutable contract itself cannot fit, fail closed before a provider
+        request is created.
+        """
+        limit = self._map_input_limit("research.literature-mapper")
+        if limit is None:
+            return assignment
+
+        def fits(candidate):
+            prompt = json.dumps(candidate, ensure_ascii=False)
+            return estimate_input_tokens(SYSTEM, prompt) <= limit
+
+        if fits(assignment):
+            return assignment
+
+        sources = assignment.get("sources", [])
+        works = assignment.get("works", [])
+        target_ids = {
+            relation.get("target") for relation in assignment.get(
+                "previous_affected_relationships", [])
+            if isinstance(relation, dict) and isinstance(relation.get("target"), str)
+        }
+        target_ids.update(
+            target for target in assignment.get("editable_relationship_targets", [])
+            if isinstance(target, str)
+        )
+        source_work_ids = []
+        for source in sources:
+            work_id = source.get("work_id") if isinstance(source, dict) else None
+            if isinstance(work_id, str) and work_id not in source_work_ids:
+                source_work_ids.append(work_id)
+
+        context_chars = int(self.bounds["context_chars"])
+        comparison_budget = min(int(self.bounds["max_text_chars"]), context_chars * 2)
+        profiles = (
+            # The first profile generally only removes unrelated catalog rows.
+            (len(source_work_ids), context_chars, comparison_budget, len(works)),
+            (64, min(context_chars, 24000), min(comparison_budget, 40000), 80),
+            (48, min(context_chars, 18000), min(comparison_budget, 30000), 64),
+            (32, min(context_chars, 12000), min(comparison_budget, 24000), 48),
+            (24, min(context_chars, 8000), min(comparison_budget, 18000), 36),
+            (16, min(context_chars, 5000), min(comparison_budget, 12000), 28),
+            (8, min(context_chars, 3000), min(comparison_budget, 8000), 16),
+            (4, min(context_chars, 2000), min(comparison_budget, 4000), 10),
+            (1, min(context_chars, 1024), 0, 4),
+        )
+        candidate = assignment
+        for comparison_count, owner_chars, comparison_chars, max_items in profiles:
+            projected_sources = self._project_map_sources(
+                sources, owner_id=owner_id, owner_chars=owner_chars,
+                comparison_chars=comparison_chars,
+                comparison_count=comparison_count)
+            visible_ids = {
+                source.get("work_id") for source in projected_sources
+                if isinstance(source, dict) and isinstance(source.get("work_id"), str)
+            }
+            projected_works = self._project_map_catalog(
+                works, visible_ids=visible_ids | {owner_id}, target_ids=target_ids,
+                max_items=max_items)
+            candidate = {**assignment, "works": projected_works,
+                         "sources": projected_sources}
+            if fits(candidate):
+                return candidate
+
+        # Provider metadata should already be bounded by normalization, but a
+        # malformed or unusually verbose catalog must not bypass admission.
+        # Retain only the assigned work's catalog card and a small owner window
+        # in the final fail-closed projection.
+        minimal_works = [work for work in works if work.get("id") == owner_id]
+        if minimal_works:
+            minimal = {**assignment, "works": minimal_works,
+                       "sources": self._project_map_sources(
+                           sources, owner_id=owner_id, owner_chars=1024,
+                           comparison_chars=0, comparison_count=0)}
+            if fits(minimal):
+                return minimal
+        raise ValidationError(
+            "literature-map assignment cannot fit any configured provider context budget: "
+            f"estimated input exceeds {limit} tokens after bounded projection")
+
     def _map_sources(self, wid, *, old_relationships=None, review_feedback=None):
         """Build a bounded source projection for one literature-map assignment.
 
@@ -1312,6 +1507,112 @@ class SurveyRunner(ExecutionRuntime):
         return result
 
     @staticmethod
+    def _compact_assessment_coverage(coverage):
+        """Keep coverage decisions while removing bulky retrieval payloads."""
+        if not isinstance(coverage, dict):
+            return {}
+        compact = {
+            key: deepcopy(coverage.get(key))
+            for key in ("unique_works", "abstracts", "verified_full_texts",
+                        "bibliographic_identities", "pagination_remaining", "saturated", "scope")
+            if key in coverage
+        }
+        compact["searches"] = []
+        for row in coverage.get("searches", [])[-64:]:
+            if not isinstance(row, dict):
+                continue
+            request = row.get("request")
+            request_projection = None
+            if isinstance(request, dict):
+                request_projection = {
+                    key: request.get(key) for key in ("operation", "query", "cursor")
+                    if request.get(key) is not None
+                }
+            new_work_ids = row.get("new_work_ids", [])
+            if not isinstance(new_work_ids, list):
+                new_work_ids = []
+            compact["searches"].append({
+                "request": request_projection,
+                "outcome": row.get("outcome"),
+                "provider": row.get("provider"),
+                "has_more": row.get("has_more"),
+                "new_work_ids": [item for item in new_work_ids[:16]
+                                 if isinstance(item, str)],
+            })
+        compact["expansion"] = []
+        for row in coverage.get("expansion", [])[-32:]:
+            if not isinstance(row, dict):
+                continue
+            compact["expansion"].append({
+                key: deepcopy(row.get(key)) for key in (
+                    "round", "seed_work_ids", "requested_work_ids", "new_work_ids",
+                    "quiet_rounds", "remaining_pages") if key in row
+            })
+        compact["access_and_limit_gaps"] = deepcopy(
+            coverage.get("access_and_limit_gaps", [])[-64:])
+        compact["source_windows"] = [
+            {key: item.get(key) for key in ("source_ref", "available_chars", "window")}
+            for item in coverage.get("source_windows", [])[-256:]
+            if isinstance(item, dict)
+        ]
+        return compact
+
+    @staticmethod
+    def _project_assessment_sources(sources, *, full_text_chars,
+                                    abstract_chars, unverified_chars):
+        """Retain all source identities with bounded displayed text."""
+        projected = []
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            representation = source.get("representation")
+            if representation == "abstract":
+                limit = abstract_chars
+            elif representation == "unverified_text":
+                limit = unverified_chars
+            else:
+                limit = full_text_chars
+            projected.append(SurveyRunner._project_source_window(source, limit))
+        return projected
+
+    def _fit_assessment_assignment(self, assignment):
+        """Fit the aggregate gap decision to the strictest model route."""
+        limit = self._map_input_limit("methods.novelty-verifier")
+        if limit is None:
+            return assignment
+
+        def fits(candidate):
+            prompt = json.dumps(candidate, ensure_ascii=False)
+            return estimate_input_tokens(SYSTEM, prompt) <= limit
+
+        if fits(assignment):
+            return assignment
+        sources = assignment.get("sources", [])
+        coverage = self._compact_assessment_coverage(assignment.get("coverage", {}))
+        profiles = (
+            (100000, 2500, 40000),
+            (60000, 1600, 24000),
+            (30000, 1000, 12000),
+            (16000, 700, 8000),
+            (8000, 450, 4000),
+            (4000, 250, 2000),
+            (2000, 128, 512),
+        )
+        for full_text_chars, abstract_chars, unverified_chars in profiles:
+            candidate = {
+                **assignment,
+                "coverage": coverage,
+                "sources": self._project_assessment_sources(
+                    sources, full_text_chars=full_text_chars,
+                    abstract_chars=abstract_chars, unverified_chars=unverified_chars),
+            }
+            if fits(candidate):
+                return candidate
+        raise ValidationError(
+            "literature gap-assessment assignment cannot fit any configured provider context budget: "
+            f"estimated input exceeds {limit} tokens after bounded source projection")
+
+    @staticmethod
     def _assessment_statement(statement):
         if not isinstance(statement, dict):
             return {"text": None, "evidence": []}
@@ -1407,6 +1708,57 @@ class SurveyRunner(ExecutionRuntime):
             "source_windows": [{"source_ref": item["source_ref"], "available_chars": item["available_chars"], "window": item["window"]}
                                for item in self._source_context()]}
 
+    @staticmethod
+    def _source_less_reason():
+        return (
+            "The catalog record is relevant by metadata, but no abstract or verified full text was available, "
+            "so substantive content could not be assessed."
+        )
+
+    def _materialize_source_less_map(self, wid, basis):
+        """Commit a deterministic abstention without spending a model call.
+
+        A catalog-only work has no textual claim for a model to assess.  The
+        normalizer in ``_map_job`` already reduced this case to the same
+        uncertainty record after a model response, which made large sparse
+        corpora pay for a call whose answer could not legitimately contain
+        substantive content.  Preserve the same evidence contract and an
+        auditable execution report locally instead.
+        """
+        reason = self._source_less_reason()
+        null_statement = {"text": None, "evidence": []}
+        value = {
+            "entries": [{
+                "work_id": wid,
+                "inclusion": "uncertain",
+                "reason": reason,
+                "problem": deepcopy(null_statement),
+                "approach": deepcopy(null_statement),
+                "finding": deepcopy(null_statement),
+                "limitations": deepcopy(null_statement),
+            }],
+            "relationships": [],
+        }
+        validate_map(value, [wid], set(self.works), self.source_docs, require_spans=True)
+        execution = self._record(
+            f"command/executions/survey-map-deterministic-{wid}", "report", {
+                "operation": "literature-map",
+                "outcome": "ok",
+                "execution_kind": "deterministic_source_availability",
+                "work_id": wid,
+                "source_refs": [],
+                "model_calls": 0,
+                "reason": reason,
+            }, "command.controller", subjects=basis)
+        self.analysis_records[wid] = self._record(
+            f"kb/work-analyses/{wid}", "note", value["entries"][0],
+            "research.literature-mapper", subjects=[execution["artifact_ref"], *basis])
+        self.analyzed_basis[wid] = list(basis)
+        self.relationships = {
+            key: relation for key, relation in self.relationships.items()
+            if relation["source"] != wid
+        }
+
     def _map(self):
         requested = []
         basis = {}
@@ -1425,7 +1777,14 @@ class SurveyRunner(ExecutionRuntime):
                     proof["source_ref"] not in self.source_docs for proof in relationship["claim"]["evidence"]))):
                 requested.append(relationship["source"])
         if requested:
-            self._models_checked([self._map_job(wid, basis[wid]) for wid in requested])
+            model_requested = []
+            for wid in requested:
+                if any(source["work_id"] == wid for source in self.source_docs.values()):
+                    model_requested.append(wid)
+                else:
+                    self._materialize_source_less_map(wid, basis[wid])
+            if model_requested:
+                self._models_checked([self._map_job(wid, basis[wid]) for wid in model_requested])
         edges = []
         for wid, work in self.works.items():
             for other in work["referenced_works"]:
@@ -1443,7 +1802,6 @@ class SurveyRunner(ExecutionRuntime):
         old_relationships = [relation for relation in self.relationships.values() if relation["source"] == wid]
         sources = self._map_sources(wid, old_relationships=old_relationships,
                                     review_feedback=review_feedback)
-        own_sources = [source for source in sources if source["work_id"] == wid]
         entry_editable = (self.analyzed_basis.get(wid) != basis or contains_legacy(previous)
                           or contains_legacy(old_relationships))
         if review_feedback is not None:
@@ -1499,8 +1857,8 @@ class SurveyRunner(ExecutionRuntime):
                 "editable_entry_fields": editable_fields,
                 "editable_relationship_targets": editable_targets,
                 "instructions":
-                    "Return exactly {entry_updates:{field:value},relationships:[{source,target,kind,claim}]}. "
-                    "entry_updates must contain exactly the editable_entry_fields and no complete entry. "
+                    "Return exactly {entry_updates:{assigned_work_id:{field:value}},relationships:[{source,target,kind,claim}]}. "
+                    "entry_updates must contain exactly one key, the assigned work ID, whose nested object contains a nonempty subset of editable_entry_fields; omit unchanged fields because the control plane retains and re-reviews them; do not return a complete entry. "
                     "For inclusion use included/excluded/uncertain; reason is a plain string; problem, approach, finding, and limitations use "
                     "Statement={text:string|null,evidence:[{work_id:string,source_ref:string,quote:string}]}. "
                     "relationships contains only replacements for editable_relationship_targets; an omitted editable target deletes its old relationship. "
@@ -1509,8 +1867,12 @@ class SurveyRunner(ExecutionRuntime):
                     "Relationship source must be the assigned work, target must be editable, kind is extends/contradicts/compares/related, "
                     "and its claim needs evidence from both works. Use only displayed source_ref values. "
                     "If no captured source belongs to the assigned work, the only valid repair for inclusion/reason is inclusion=uncertain with a narrow note that catalog metadata is relevant but no abstract or verified full text was available, so substantive content could not be assessed; remove other work IDs, quotations, chronology, evolution, extension, comparison, and superiority from that reason. "
-                    "Correct the failed checks narrowly by grounding, narrowing, setting unknown, or deleting an unsupported relationship."
+                "Correct the failed checks narrowly by grounding, narrowing, setting unknown, or deleting an unsupported relationship."
             })
+
+        assignment = self._fit_map_assignment(assignment, owner_id=wid)
+        sources = assignment["sources"]
+        own_sources = [source for source in sources if source["work_id"] == wid]
 
         # A catalog-only record cannot support substantive prose.  Asking a
         # model to restate that negative evidence repeatedly creates a
@@ -1518,10 +1880,7 @@ class SurveyRunner(ExecutionRuntime):
         # explanation even though the validator must reject it.  Project the
         # deterministic, metadata-only state locally and reserve model calls
         # for assignments that actually contain source text.
-        source_less_reason = (
-            "The catalog record is relevant by metadata, but no abstract or verified full text was available, "
-            "so substantive content could not be assessed."
-        )
+        source_less_reason = self._source_less_reason()
         null_statement = {"text": None, "evidence": []}
 
         def source_less_value(_value):
@@ -1881,33 +2240,16 @@ class SurveyRunner(ExecutionRuntime):
 
     def _assess(self):
         assessment_sources = self._assessment_source_context()
-        assessment_source_lookup = {source["source_ref"]: source for source in assessment_sources}
-        verified_full_text_refs = [source["source_ref"] for source in assessment_sources
-                                   if source["representation"] == "full_text"
-                                   and source.get("identity_verified") is True]
-        displayed_lengths = {source["source_ref"]: len(source["text"])
-                             for source in assessment_sources}
-
-        def validate_gap_assessment(value):
-            validate_assessment(value, assessment_source_lookup, self.works, require_spans=True)
-            # A decisive literature state cannot be adopted while the
-            # accepted survey still records access, identity, or bounded
-            # coverage gaps.  Treat this as a model-contract rejection so the
-            # normal scoped retry asks for an evidence-bounded abstention,
-            # rather than discovering the contradiction after publication.
-            if value["state"] != "insufficient_evidence" and (self.gaps or any(
-                    len(source["text"]) > displayed_lengths.get(ref, 0)
-                    for ref, source in self.source_docs.items()
-                    if source["representation"] == "full_text")):
-                raise ValidationError("decisive gap state requires complete access and source context")
-
-        value, execution = self._model_checked("gap-assessment", "methods.novelty-verifier", {
+        assessment_assignment = {
             "assignment": "Independently determine the status of the nominated gap using the current accepted survey and targeted counter-search.",
             "phase": "gap_assessment", "question": self.score["question"], "gap": self.nomination,
             "nomination_ref": self.nomination_record["artifact_ref"],
             "survey_ref": self.survey_ref, "prerequisite_survey_ref": self.survey_ref,
-            "map": self._assessment_map_context(), "coverage": self._coverage(), "sources": assessment_sources,
-            "verified_full_text_refs": verified_full_text_refs,
+            "map": self._assessment_map_context(), "coverage": self._coverage(),
+            "sources": assessment_sources,
+            "verified_full_text_refs": [source["source_ref"] for source in assessment_sources
+                                        if source["representation"] == "full_text"
+                                        and source.get("identity_verified") is True],
             "required_checks": list(GAP_CHECKS),
             "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
             "instructions": "Return exactly {state:string,rationale:string,comparisons:[{work_id:string,relationship:string,statement:string,evidence:[{work_id:string,source_ref:string,quote:string}]}],checks:[{check_id:string,outcome:string,method:string,result:string}],evidence:[{work_id:string,source_ref:string,quote:string}]}. "
@@ -1925,7 +2267,29 @@ class SurveyRunner(ExecutionRuntime):
                 "if no listed full-text quote directly supports the comparison, set the state to insufficient_evidence and use relationship=uncertain. "
                 "Eligibility requires meaningful, testable distinction, no prior solution or unresolved comparison, and adequate search coverage. "
                 "It authorizes an experiment under the stated scope, never publication-ready novelty. Do not force a positive finding to finish the task."
-        }, validate_gap_assessment,
+        }
+        assessment_assignment = self._fit_assessment_assignment(assessment_assignment)
+        assessment_sources = assessment_assignment["sources"]
+        assessment_source_lookup = {source["source_ref"]: source for source in assessment_sources}
+        verified_full_text_refs = assessment_assignment["verified_full_text_refs"]
+        displayed_lengths = {source["source_ref"]: len(source["text"])
+                             for source in assessment_sources}
+
+        def validate_gap_assessment(value):
+            validate_assessment(value, assessment_source_lookup, self.works, require_spans=True)
+            # A decisive literature state cannot be adopted while the
+            # accepted survey still records access, identity, or bounded
+            # coverage gaps.  Treat this as a model-contract rejection so the
+            # normal scoped retry asks for an evidence-bounded abstention,
+            # rather than discovering the contradiction after publication.
+            if value["state"] != "insufficient_evidence" and (self.gaps or any(
+                    len(source["text"]) > displayed_lengths.get(ref, 0)
+                    for ref, source in self.source_docs.items()
+                    if source["representation"] == "full_text")):
+                raise ValidationError("decisive gap state requires complete access and source context")
+
+        value, execution = self._model_checked("gap-assessment", "methods.novelty-verifier",
+            assessment_assignment, validate_gap_assessment,
             normalizer=lambda value: self._bind_assessment_spans(value, assessment_sources),
             stage="integrated_review", task_kind="verification")
         if value["state"] == "eligible_for_experiment" and (self.gaps or any(

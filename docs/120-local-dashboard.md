@@ -63,6 +63,8 @@ tasks, artifacts, and files in one view.
 - pipeline stage status, attempts, active roles, and verifier assignment
 - department roster and assignment ledger; selecting a role opens its task,
   attempt, assignment record, and linked response file when one is recorded
+- live execution lanes for actual provider operations (`Crossref`, `OpenAlex`,
+  full-text capture, and other service work) separately from model-call cards
 - recent department activity and event-ledger activity
 - model/API usage, allocation windows, and event-chain integrity
 - checkpoint and artifact records plus a paginated, bounded file inventory
@@ -85,6 +87,10 @@ ledger:
 
 - `Research brief` shows the current topic, research question, phenomenon,
   mechanism, comparison, measurement, data regime, and disconfirmation test.
+- `Live execution` shows the concrete operation currently consuming a worker
+  slot. Retrieval and service work is not hidden just because no model call is
+  active; model cards remain a separate lane with their route, role, response,
+  and cache accounting.
 - `Pipeline` shows the six gates from topic admission through rendered paper,
   with each stage's deliverable, status, attempt, and active role slots.
 - `Agents` shows departments and the bounded specialist roster. `Run log`

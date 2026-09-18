@@ -41,10 +41,15 @@ def _limits(client):
 
 def _crossref_client(client, project_path, environment_files):
     _limits(client)
-    if set(client) - {"timeout", "max_bytes", "endpoint", "mailto"}:
+    if set(client) - {"timeout", "max_bytes", "endpoint", "mailto", "mailto_env",
+                      "max_retries", "retry_backoff_seconds"}:
         raise ValidationError("Unsupported Crossref client options")
     client.setdefault("endpoint", "https://api.crossref.org/works")
     _http_url(client["endpoint"])
+    try:
+        retrieval.CrossrefClient(**client)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(str(exc)) from exc
     return client
 
 

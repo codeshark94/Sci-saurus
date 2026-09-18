@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>Sci-saurus · Research Console</title>
   <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/styles.css?v=15">
+    <link rel="stylesheet" href="/assets/styles.css?v=23">
 </head>
 <body>
   <div class="app-shell">
@@ -25,7 +25,7 @@
         </div>
         <nav class="nav-list" aria-label="Project navigation">
           <a class="nav-link" href="#research"><span class="nav-index">01</span><span>Research brief</span></a>
-          <a class="nav-link" href="#calls"><span class="nav-index">02</span><span>Model calls</span></a>
+          <a class="nav-link" href="#calls"><span class="nav-index">02</span><span>Live execution</span></a>
           <a class="nav-link" href="#specialists"><span class="nav-index">03</span><span>Agents</span></a>
           <a class="nav-link" href="#activity"><span class="nav-index">04</span><span>Run log</span></a>
           <a class="nav-link" href="#resources"><span class="nav-index">05</span><span>Resources</span></a>
@@ -218,10 +218,15 @@
           <div class="section-heading">
             <div>
               <div class="eyebrow">LIVE NOW</div>
-              <h2>Model calls</h2>
+              <h2>Live execution</h2>
             </div>
-            <div class="section-caption" id="model-calls-caption">current provider work</div>
+            <div class="section-caption" id="execution-caption">provider operations and model calls</div>
           </div>
+          <div class="execution-subheading"><span>PROVIDER OPERATIONS</span><strong id="provider-work-caption">current retrieval and service work</strong></div>
+          <div class="execution-work-grid" id="execution-work-grid">
+            <div class="loading-block">Loading provider work…</div>
+          </div>
+          <div class="execution-subheading execution-subheading--models"><span>MODEL CALLS</span><strong id="model-calls-caption">current model work</strong></div>
           <div class="model-call-grid" id="model-call-grid">
             <div class="loading-block">Loading model calls…</div>
           </div>
