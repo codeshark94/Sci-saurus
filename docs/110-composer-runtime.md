@@ -380,6 +380,13 @@ admission sees the remaining deadline and the transitive downstream
 reservation. The Arbiter remains an independent dispute and verification
 surface; it is not a manual gate for ordinary scientific recovery.
 
+An assignment that exhausts its own bounded validation contract is handled the
+same way even when the runner can only return `ModelWorkBlocked`: the Composer
+retains the failed attempt, derives a typed recovery order from the blocker,
+and reopens a cycle-specific stage closure. Provider cooldowns, quota errors,
+deadlines, and interrupted calls remain resource states and are not disguised as
+scientific recovery.
+
 Paper production uses the same desk inside the paper stage. The review runner
 emits one compact event for each scientific, methods, adversarial, human-
 scientist, and editorial perspective, followed by a synthesis event. Surgical

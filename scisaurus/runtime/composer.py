@@ -4165,6 +4165,19 @@ class ComposerRunner:
                 and isinstance(terminal_agenda, list)
                 and len(checkpoint_agenda) > len(terminal_agenda))
 
+    @staticmethod
+    def _is_process_interruption_state(state):
+        """Identify a checkpoint or report produced by a process-level stop."""
+        if not isinstance(state, dict):
+            return False
+        if state.get("phase") == "paused_process_interruption":
+            return True
+        if state.get("stop_reason") == "process_interrupted":
+            return True
+        interim = state.get("interim_report")
+        return (isinstance(interim, dict)
+                and interim.get("stop_reason") == "process_interrupted")
+
     def _latest_inflight_checkpoint(self, terminal=None):
         """Read the newest durable running checkpoint when output was finalized stale."""
         rows = self.control._conn.execute(
@@ -4260,8 +4273,17 @@ class ComposerRunner:
                 checkpoint = json.loads(progress_path.read_text())
             except (OSError, ValueError):
                 checkpoint = None
+        interrupted_pause = self._is_process_interruption_state(head_body)
         if head is None or head_status == "running":
             live_checkpoint = checkpoint if isinstance(checkpoint, dict) else self._latest_inflight_checkpoint()
+        elif interrupted_pause and isinstance(checkpoint, dict):
+            # SIGINT/KeyboardInterrupt publishes a paused final report after
+            # the same attempt-boundary checkpoint.  That checkpoint is the
+            # authoritative frontier even when its revision and attempt
+            # count are equal to the final report; requiring a strictly
+            # larger frontier would discard the only record that marks the
+            # in-flight attempt for result-unknown reconciliation.
+            live_checkpoint = checkpoint
         elif self._checkpoint_advances_terminal_state(checkpoint, head_body):
             live_checkpoint = checkpoint
         else:
@@ -4826,6 +4848,146 @@ class ComposerRunner:
         })
         return projected
 
+    def _specialist_experiment_projection(self, stage, descriptor, stage_result=None):
+        """Project an actionable brief before an experiment has observations.
+
+        Methods specialists are admitted before the experiment runner. A
+        continuation therefore cannot rely on ``stage_result`` containing
+        raw observations yet, but it must still receive the question, declared
+        design, feasibility boundary, and prior failure history. Keep this
+        projection bounded instead of forwarding the full dependency graph.
+        """
+        if stage.get("kind") != "experiment":
+            return {}
+
+        by_id = {item["id"]: item for item in self.workflow.get("stages", [])}
+        pending = list(stage.get("depends_on", []))
+        ancestor_ids = set()
+        while pending:
+            current = pending.pop()
+            if current in ancestor_ids or current not in by_id:
+                continue
+            ancestor_ids.add(current)
+            pending.extend(by_id[current].get("depends_on", []))
+        topic_context = next(
+            (self.context.get(item_id) for item_id in ancestor_ids
+             if isinstance(self.context.get(item_id), dict)
+             and self.context[item_id].get("kind") == "topic_discovery"
+             and isinstance(self.context[item_id].get("topic"), dict)),
+            None,
+        )
+        if topic_context is None:
+            topic_context = next(
+                (value for value in self.context.values()
+                 if isinstance(value, dict)
+                 and value.get("kind") == "topic_discovery"
+                 and isinstance(value.get("topic"), dict)),
+                None,
+            )
+        if not isinstance(topic_context, dict):
+            return {}
+
+        selected = topic_context["topic"]
+        program = topic_context.get("research_program")
+        selected_branch = None
+        if isinstance(program, dict) and isinstance(program.get("branches"), list):
+            selected_branch = next(
+                (branch for branch in program["branches"]
+                 if isinstance(branch, dict) and branch.get("id") == selected.get("id")),
+                None,
+            )
+        selected_branch = selected_branch if isinstance(selected_branch, dict) else {}
+        feasibility = topic_context.get("feasibility_check")
+        feasibility = feasibility if isinstance(feasibility, dict) else {}
+        feasibility_plan = feasibility.get("plan")
+        feasibility_plan = feasibility_plan if isinstance(feasibility_plan, dict) else {}
+        configured_experiment = descriptor.get("experiment") if isinstance(descriptor, dict) else None
+        configured_experiment = configured_experiment if isinstance(configured_experiment, dict) else {}
+        result = stage_result if isinstance(stage_result, dict) else {}
+
+        question = topic_context.get("question") or selected.get("research_question")
+        hypothesis = selected_branch.get("hypothesis") or selected.get("disconfirmation_test")
+        method_constraints = {
+            key: deepcopy(selected.get(key))
+            for key in ("scope", "data_regime", "feasibility", "resource_plan",
+                        "capability_requirements", "comparison", "measurement",
+                        "disconfirmation_test")
+            if selected.get(key) is not None
+        }
+        method_constraints["feasibility_plan"] = deepcopy(feasibility_plan)
+        available_assets = {
+            "prior_work_ids": deepcopy(selected.get("prior_work_ids", [])),
+            "evidence_inputs": deepcopy(feasibility_plan.get("evidence_inputs", [])),
+            "required_executables": deepcopy(feasibility_plan.get("required_executables", [])),
+            "required_packages": deepcopy(feasibility_plan.get("required_packages", [])),
+            "network_access": feasibility_plan.get("network_access"),
+        }
+        design = {
+            key: deepcopy(configured_experiment[key])
+            for key in ("study_type", "method", "parameters", "primary_outcomes",
+                        "stopping_rule", "limitations")
+            if key in configured_experiment
+        }
+        topic_design = selected.get("experiment_design")
+        if isinstance(topic_design, dict):
+            design["proposed_design"] = deepcopy(topic_design)
+        analysis_plan = {
+            "research_question": question,
+            "hypothesis": hypothesis,
+            "comparison": selected.get("comparison"),
+            "measurement": selected.get("measurement"),
+            "disconfirmation_test": selected.get("disconfirmation_test"),
+            "primary_outcomes": deepcopy(configured_experiment.get("primary_outcomes", [])),
+            "stopping_rule": deepcopy(configured_experiment.get("stopping_rule")),
+            "state": "pre_execution" if not result else "stage_result_available",
+        }
+        raw_results = result.get("results_package") or result.get("raw_results")
+        derived_results = {
+            key: deepcopy(result[key])
+            for key in ("metrics", "findings", "analysis")
+            if key in result
+        }
+        figures = deepcopy(result.get("assets", [])) if isinstance(result.get("assets"), list) else []
+        blockers = [
+            {key: deepcopy(item.get(key)) for key in ("stage_id", "reason", "diagnostics") if key in item}
+            for item in self.blockers
+            if isinstance(item, dict) and item.get("stage_id") == stage.get("id")
+        ][-4:]
+        try:
+            input_digests = self._stage_input_files(stage, descriptor)
+        except (OSError, TypeError, ValueError):
+            input_digests = {}
+        return {
+            "research_question": question,
+            "hypotheses": hypothesis,
+            "method_constraints": method_constraints,
+            "available_assets": available_assets,
+            "design": design,
+            "analysis_plan": analysis_plan,
+            "claims": {
+                "declared_hypothesis": hypothesis,
+                "disconfirmation_test": selected.get("disconfirmation_test"),
+                "status": "declared_not_observed",
+            },
+            "execution_manifest": {
+                "state": "planned",
+                "capability_id": selected.get("experiment_capability_id"),
+                "execution_mode": feasibility_plan.get("execution_mode"),
+                "required_executables": deepcopy(feasibility_plan.get("required_executables", [])),
+                "required_packages": deepcopy(feasibility_plan.get("required_packages", [])),
+                "network_access": feasibility_plan.get("network_access"),
+            },
+            "input_digests": input_digests,
+            "raw_results": deepcopy(raw_results) if raw_results is not None else None,
+            "analysis_code": {
+                "state": "not_available_before_execution",
+                "reason": "The executable is generated and admitted after the methods brief.",
+            },
+            "derived_results": derived_results,
+            "figures": figures,
+            "failure_history": blockers,
+        }
+
     def _specialist_stage_packet(self, stage, descriptor, *, stage_result=None):
         """Build a bounded, non-secret packet for specialist input projection."""
         packet = {
@@ -4841,6 +5003,8 @@ class ComposerRunner:
                 if key not in {"model", "model_config_path", "bibliography"}
             },
         }
+        packet.update(self._specialist_experiment_projection(
+            stage, descriptor, stage_result=stage_result))
         if stage["kind"] == "topic_discovery":
             model = self._specialist_model_config(stage, descriptor)
             if model is not None:
@@ -5986,6 +6150,44 @@ class ComposerRunner:
             })
         return resolved
 
+    def _admit_scientific_blocker_recovery(self, stage, error, completed, by_id,
+                                           specialist_verifier=None):
+        """Turn a bounded scientific failure into a fresh scoped work order.
+
+        ``ModelWorkBlocked`` means the current assignment exhausted its own
+        validation/repair contract. It is not evidence that the research
+        mission is finished: preserve that attempt, change the scientific
+        work, and reopen only the affected dependency closure. Provider
+        cooldowns, quota failures, deadlines, and process interruptions never
+        enter this path.
+        """
+        if not isinstance(error, ModelWorkBlocked) or stage.get("kind") not in STAGE_KINDS:
+            return False
+        self._remaining()
+        context = self.context.get(stage["id"])
+        context = deepcopy(context) if isinstance(context, dict) else {}
+        context.update({
+            "stage_id": stage["id"],
+            "kind": stage["kind"],
+            "status": "research_expansion_required",
+            "error": str(error)[:4096],
+            "review_status": "scientific_assignment_blocked",
+        })
+        if isinstance(specialist_verifier, dict):
+            context["specialist_verifier"] = deepcopy(specialist_verifier)
+        self.context[stage["id"]] = context
+        if not self._begin_continuation(completed, by_id):
+            return False
+        self.department_activity.append({
+            "cycle": self.continuation_cycles,
+            "action": "auto_recover_scientific_blocker",
+            "stage_id": stage["id"],
+            "error": str(error)[:2048],
+            "reopened_stage_ids": sorted(self.reopened_stage_ids),
+            "next_condition": "complete the cycle-specific work order and re-run every affected admission gate",
+        })
+        return True
+
     def run(self):
         try:
             by_id = {stage["id"]: stage for stage in self.workflow["stages"]}
@@ -6728,12 +6930,26 @@ class ComposerRunner:
                         if isinstance(value, list) and value:
                             blocker[attribute] = deepcopy(value)
                     self.blockers.append(blocker)
+                    self._record_blocker_feedback(stage, error)
+                    recovery_admitted = False
+                    try:
+                        recovery_admitted = self._admit_scientific_blocker_recovery(
+                            stage, error, completed, by_id,
+                            specialist_verifier=specialist_verifier)
+                    except (ComposerHardDeadlineExceeded, ProviderCooldownError,
+                            QuotaExceededError, ValidationError):
+                        recovery_admitted = False
+                    if recovery_admitted:
+                        blocker["recovery"] = "cycle_admitted"
+                        self.stage_records[stage_id]["status"] = "retrying"
+                        self._checkpoint(f"{stage_id}:scientific_recovery_admitted", force=True)
+                        progress = True
+                        break
                     try:
                         self._resolve_terminal_stage_work_orders(stage)
                     except (NotFoundError, StateError, ValidationError) as work_order_error:
                         blocker["work_order_resolution_error"] = (
                             f"{type(work_order_error).__name__}: {work_order_error}")
-                    self._record_blocker_feedback(stage, error)
                     self.status = "blocked"
                     self._checkpoint(f"{stage_id}:blocked", force=True)
                     return self._finish()

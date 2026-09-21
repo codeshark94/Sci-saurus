@@ -12,6 +12,8 @@ from unittest.mock import patch
 from scisaurus.runtime.composer import ComposerRunner, read_interim_report, validate_workflow
 from scisaurus.runtime.departments import default_organization
 from scisaurus.runtime.literature import ProviderCooldownError
+from scisaurus.runtime.model_work import ModelWorkBlocked
+from scisaurus.runtime.specialists import build_specialist_prompt
 from scisaurus.core.errors import QuotaExceededError, ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.schema import canonical_bytes
@@ -719,6 +721,91 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertIn("boundary", second[0]["objective"])
             runner.close()
 
+    def test_blocked_scientific_assignment_admits_a_fresh_recovery_cycle(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            workflow["continuation_policy"] = {"mode": "bounded", "max_cycles": 1}
+            runner = ComposerRunner(workflow)
+            try:
+                runner.context["survey"] = {"kind": "survey", "status": "completed"}
+                runner.stage_records["survey"] = {"kind": "survey", "status": "completed"}
+                runner.stage_records["experiment"] = {"kind": "experiment", "status": "blocked"}
+                by_id = {stage["id"]: stage for stage in workflow["stages"]}
+                completed = {"survey"}
+                admitted = runner._admit_scientific_blocker_recovery(
+                    workflow["stages"][1],
+                    ModelWorkBlocked("independent review rejected the estimator"),
+                    completed, by_id)
+                self.assertTrue(admitted)
+                self.assertEqual(runner.continuation_cycles, 1)
+                self.assertNotIn("experiment", completed)
+                self.assertIn("experiment", runner.reopened_stage_ids)
+                self.assertEqual(runner.context["experiment"]["status"],
+                                 "research_expansion_required")
+                self.assertEqual(len(runner.active_research_requests), 1)
+                self.assertEqual(runner.active_research_requests[0]["kind"],
+                                 "additional_experiment")
+                self.assertTrue(any(item.get("action") == "auto_recover_scientific_blocker"
+                                    for item in runner.department_activity))
+            finally:
+                runner.close()
+
+    def test_experiment_recovery_specialists_receive_a_bounded_scientific_brief(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            try:
+                runner.context["topic"] = {
+                    "kind": "topic_discovery",
+                    "question": "Does the diagnostic survive the finite-size boundary?",
+                    "feasibility_check": {"plan": {
+                        "execution_mode": "foundry",
+                        "required_executables": ["python3"],
+                        "required_packages": ["numpy"],
+                        "network_access": False,
+                        "evidence_inputs": [{"source": "W1"}],
+                    }},
+                    "topic": {
+                        "id": "direction_0",
+                        "research_question": "Does the diagnostic survive the finite-size boundary?",
+                        "hypothesis": "The contrast weakens below a boundary.",
+                        "comparison": "diagnostic A versus diagnostic B",
+                        "measurement": "difference in predictive power",
+                        "disconfirmation_test": "No size-dependent difference.",
+                        "resource_plan": "Deterministic finite-matrix simulation.",
+                    },
+                    "research_program": {"branches": [{
+                        "id": "direction_0",
+                        "hypothesis": "The contrast weakens below a boundary.",
+                    }]},
+                }
+                stage = next(item for item in workflow["stages"] if item["id"] == "experiment")
+                packet = runner._specialist_stage_packet(
+                    stage, {"experiment": {"primary_outcomes": [{"id": "gap"}]}})
+                assignment = {
+                    "assigned_role": "methods.methodologist",
+                    "model_role": "methods.methodologist",
+                    "stage_id": "experiment",
+                    "stage_kind": "experiment",
+                    "role_id": "methodologist",
+                    "system_contract": "Design a falsifiable experiment.",
+                    "input_projection": ["research_question", "hypotheses",
+                                          "method_constraints", "available_assets"],
+                    "quota": {"max_input_tokens": 12000},
+                }
+                prompt = json.loads(build_specialist_prompt(assignment, packet))
+                projected = prompt["projected_input"]
+                self.assertEqual(projected["research_question"],
+                                 "Does the diagnostic survive the finite-size boundary?")
+                self.assertEqual(projected["hypotheses"],
+                                 "The contrast weakens below a boundary.")
+                self.assertEqual(projected["available_assets"]["required_packages"], ["numpy"])
+                self.assertEqual(prompt["shared_stage_context"]["stage_kind"], "experiment")
+            finally:
+                runner.close()
+
     def test_invalid_continuation_request_is_rejected_without_blocking_composer(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -969,6 +1056,33 @@ class ComposerWorkflowTests(unittest.TestCase):
             progress = json.loads((root / "composer" / "output" / "progress.json").read_text())
             self.assertEqual(progress["status"], "paused")
             self.assertEqual(progress["phase"], "paused_process_interruption")
+
+    def test_resume_uses_the_process_interruption_checkpoint_at_equal_frontier(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            runner.stage_records["survey"] = {
+                "kind": "survey", "status": "running", "attempt_count": 1,
+                "attempt_number": 1, "project_dir": workflow["stages"][0]["project_dir"],
+            }
+            runner._checkpoint("survey:running", force=True)
+            runner.status = "paused"
+            runner.blockers.append({
+                "stage_id": "workflow", "reason": "KeyboardInterrupt: ",
+                "stop_reason": "process_interrupted",
+            })
+            runner._checkpoint("paused_process_interruption", force=True)
+            runner._finish()
+
+            resumed = ComposerRunner(workflow, resume=True)
+            try:
+                self.assertEqual(resumed.status, "running")
+                self.assertEqual(resumed._progress_snapshot["phase"],
+                                 "paused_process_interruption")
+                self.assertEqual(resumed.stage_records["survey"]["status"], "running")
+            finally:
+                resumed.close()
 
     def test_quota_exhaustion_does_not_recreate_a_stage_budget(self):
         class FastClock:
