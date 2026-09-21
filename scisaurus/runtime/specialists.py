@@ -22,6 +22,7 @@ from scisaurus.runtime.models import (
     ModelClient,
     estimate_input_tokens,
     model_call_budget_available,
+    model_context_error,
     resolve_model_config,
 )
 
@@ -100,10 +101,22 @@ def _json(value, *, limit=70000):
     return json.dumps({"truncated_context": body[:limit]}, ensure_ascii=False, separators=(",", ":"))
 
 
+def _manuscript_units_projection(value):
+    """Keep section identity and actual prose above generic nesting cutoffs."""
+    if not isinstance(value, dict) or not isinstance(value.get("sections"), list):
+        return value
+    units = [{"section_id": section.get("id"), "section_title": section.get("title"),
+              **{key: unit.get(key) for key in ("id", "kind", "text")}}
+             for section in value["sections"] if isinstance(section, dict)
+             for unit in section.get("units", []) if isinstance(unit, dict)]
+    return {"title": value.get("title"), "unit_count": len(units), "units": units,
+            "projection_scope": "Section-linked manuscript units; omitted text must not be inferred."}
+
+
 def _bounded_value(value, *, depth=0, max_depth=5, max_keys=64, max_items=24,
                    max_text=4000):
     """Project prompt data without allowing one role to inherit a stage dump."""
-    if depth >= max_depth:
+    if depth >= max_depth and isinstance(value, (dict, list)):
         return "[truncated]"
     if isinstance(value, dict):
         output = {}
@@ -144,12 +157,14 @@ def _json_with_budget(value, *, system, max_input_tokens=None):
             or estimate_input_tokens(system, safe_body) <= max_input_tokens):
         return safe_body
     projections = (
-        (5, 64, 24, 4000),
-        (4, 48, 18, 3000),
-        (4, 36, 12, 2200),
-        (3, 28, 10, 1600),
-        (3, 20, 8, 1000),
-        (2, 14, 5, 600),
+        # Keep the scientific record shape while reducing breadth and text.
+        # Lowering depth erased every manuscript unit and evidence leaf.
+        (7, 64, 24, 4000),
+        (7, 48, 18, 3000),
+        (7, 36, 12, 2200),
+        (7, 28, 10, 1600),
+        (7, 20, 8, 1000),
+        (7, 14, 5, 600),
     )
     for max_depth, max_keys, max_items, max_text in projections:
         projected = _bounded_value(
@@ -392,6 +407,27 @@ def _verifier_chief_result(result, *, detail="full"):
                 result[key], max_items=max_items, text_limit=record_limit)
     if isinstance(result.get("usage"), dict):
         output["usage"] = _verifier_scalar_map(result["usage"], limit=12, text_limit=120)
+    product = result.get("review_product")
+    if isinstance(product, dict):
+        plan = product.get("plan", {})
+        draft = product.get("draft", {})
+        output["review_product"] = {
+            "article_type": "critical_review", "title": draft.get("title"),
+            "thesis": _verifier_text(plan.get("thesis"), limit=text_limit),
+            "coverage_limits": _verifier_text(plan.get("coverage_limits"), limit=text_limit),
+            "plan": _bounded_value({key: plan.get(key) for key in ("journal_id", "venues", "benchmarks", "insights", "evidence_matrix")},
+                max_depth=7, max_keys=16, max_items=max_items, max_text=record_limit),
+            "manuscript": _bounded_value(draft, max_depth=6, max_keys=8, max_items=max_items, max_text=text_limit),
+            "source_inventory": [{key: source.get(key) for key in ("id", "kind", "purpose", "url", "text_sha256")}
+                                 for source in product.get("sources", [])],
+            "unit_sources": _bounded_value(product.get("unit_sources", {}), max_depth=3,
+                max_keys=max_items * 4, max_items=max_items, max_text=120),
+            "peer_reviews": _bounded_value(product.get("peer_reviews", []), max_depth=5,
+                max_keys=12, max_items=max_items, max_text=record_limit),
+            "render": {key: deepcopy(product.get("render", {}).get(key))
+                       for key in ("status", "pdf", "pages", "manuscript_sha256", "pdf_sha256")},
+            "projection_scope": "Bounded manuscript and quoted evidence; the full captures remain in the retained review product.",
+        }
     return output
 
 
@@ -554,6 +590,9 @@ def build_specialist_prompt(assignment, stage_packet):
                 projected[field] = matches if len(matches) > 1 else matches[0]
     if assignment.get("role_id") == "topic-maturity-reviewer":
         projected = _compact_topic_maturity_projection(projected)
+    for field in ("draft", "manuscript", "manuscript_source"):
+        if field in projected:
+            projected[field] = _manuscript_units_projection(projected[field])
     envelope = {
         "assignment": {
             "assigned_role": assignment.get("assigned_role"),
@@ -569,7 +608,7 @@ def build_specialist_prompt(assignment, stage_packet):
         # defeated role isolation and routinely exceeded 12k specialist caps.
         "shared_stage_context": {
             key: stage_packet.get(key)
-            for key in ("objective", "stage_id", "stage_kind")
+            for key in ("objective", "stage_id", "stage_kind", "work_orders")
             if key in stage_packet
         },
         "output_contract": {
@@ -604,9 +643,10 @@ def build_verifier_prompt(stage, stage_packet, specialist_reports, chief_result,
     # generic depth-based ``[truncated]`` marker.
     envelope = _verifier_body(
         stage, stage_packet, specialist_reports[:1], chief_result, detail="minimal")
-    envelope["specialist_reports"][0]["response"]["findings"] = []
-    envelope["specialist_reports"][0]["response"]["evidence_gaps"] = []
-    envelope["specialist_reports"][0]["response"]["requested_actions"] = []
+    for report in envelope["specialist_reports"]:
+        report["response"]["findings"] = []
+        report["response"]["evidence_gaps"] = []
+        report["response"]["requested_actions"] = []
     return json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
@@ -691,7 +731,7 @@ class SpecialistDispatcher:
     """Dispatch a finite pool while respecting route and budget capacity."""
 
     def __init__(self, model_config, *, provider_pools=None, max_parallel=4,
-                 deadline=None, on_progress=None):
+                 deadline=None, on_progress=None, provider_cooldowns=None):
         if not isinstance(model_config, dict):
             raise ValidationError("specialist model config must be an object")
         if type(max_parallel) is not int or max_parallel < 1:
@@ -703,7 +743,7 @@ class SpecialistDispatcher:
         self.condition = threading.Condition()
         self.active = {}
         self.route_cursors = {}
-        self.provider_cooldowns = {}
+        self.provider_cooldowns = provider_cooldowns if provider_cooldowns is not None else {}
         self.provider_pools = deepcopy(provider_pools or {})
         self._ensure_provider_pools()
 
@@ -758,7 +798,7 @@ class SpecialistDispatcher:
                    if base_url in {str(url).rstrip("/") for url in entry.get("base_urls", [])}]
         return matches[0] if len(matches) == 1 else None
 
-    def _reserve_route(self, role):
+    def _reserve_route(self, role, *, system, prompt, quota):
         routes = self._routes(role)
         cursor = self.route_cursors.get(role, 0)
         while True:
@@ -767,11 +807,19 @@ class SpecialistDispatcher:
             capacity_wait = False
             cooldown_wait = False
             next_cooldown = None
+            context_errors = []
             with self.condition:
                 for offset in range(len(routes)):
                     index = (cursor + offset) % len(routes)
                     route_id, declared_pool, route = routes[index]
                     effective = self._effective_route(route, role)
+                    for field in ("max_input_tokens", "max_output_tokens"):
+                        if type(quota.get(field)) is int:
+                            effective[field] = min(effective.get(field) or quota[field], quota[field])
+                    context_error = model_context_error(effective, system=system, prompt=prompt)
+                    if context_error:
+                        context_errors.append(context_error)
+                        continue
                     pool = self._pool_for(route, effective) or "unpooled"
                     cooldown_until = self.provider_cooldowns.get(pool, 0.0)
                     now = time.monotonic()
@@ -799,7 +847,13 @@ class SpecialistDispatcher:
                         "pool_key": pool,
                         "config": effective,
                     }
+                if not capacity_wait and cooldown_wait:
+                    raise ModelCallError("configured specialist providers are cooling down",
+                        outcome_known=True, status_code=429,
+                        retry_after_seconds=max(0.1, next_cooldown - time.monotonic()))
                 if not capacity_wait and not cooldown_wait:
+                    if context_errors:
+                        raise ValidationError("no specialist route fits the context budget: " + "; ".join(context_errors))
                     raise ModelCallError(
                         f"all configured specialist routes are unavailable for {role}",
                         outcome_known=True,
@@ -892,7 +946,10 @@ class SpecialistDispatcher:
             route = None
             response_received = False
             try:
-                route = self._reserve_route(model_role)
+                current_prompt = prompt if validation_retries == 0 else _verifier_repair_prompt(
+                    prompt, last_validation_error, previous_text,
+                    max_input_tokens=max_input_tokens)
+                route = self._reserve_route(model_role, system=system, prompt=current_prompt, quota=quota)
                 config = deepcopy(route["config"])
                 if isinstance(quota.get("max_output_tokens"), int):
                     config["max_output_tokens"] = min(
@@ -911,9 +968,6 @@ class SpecialistDispatcher:
                             outcome_known=True)
                     config["timeout_seconds"] = min(
                         float(config.get("timeout_seconds", remaining)), remaining)
-                current_prompt = prompt if validation_retries == 0 else _verifier_repair_prompt(
-                    prompt, last_validation_error, previous_text,
-                    max_input_tokens=max_input_tokens)
                 self.on_progress({"event": "dispatched", "role": assigned_role,
                                   "role_id": assignment.get("role_id"),
                                   "task_id": assignment.get("task_id"),
@@ -953,10 +1007,11 @@ class SpecialistDispatcher:
                 }
                 continue
             except ModelCallError as exc:
+                if self._provider_route_failure(exc):
+                    self._mark_provider_cooldown(route.get("pool_key") if route else None, exc)
                 if (self._provider_route_failure(exc)
                         and provider_retries < provider_retry_limit):
                     provider_retries += 1
-                    self._mark_provider_cooldown(route.get("pool_key") if route else None, exc)
                     retry_history.append({
                         "kind": "provider_route",
                         "attempt": validation_retries + provider_retries,
@@ -1060,7 +1115,7 @@ class SpecialistDispatcher:
         self.on_progress({"event": "completed", "role": assigned_role, **report})
         return report
 
-    def dispatch(self, assignments, stage_packet, *, verifier=False):
+    def dispatch(self, assignments, stage_packet, *, verifier=False, on_result=None):
         if not isinstance(assignments, list):
             raise ValidationError("specialist assignments must be a list")
         if not assignments:
@@ -1076,13 +1131,16 @@ class SpecialistDispatcher:
             }
             for future in as_completed(futures):
                 try:
-                    results.append(future.result())
+                    report = future.result()
                 except Exception as exc:  # keep one broken specialist scoped
                     assignment = futures[future]
-                    results.append({"status": "failed", "execution_mode": "model",
+                    report = {"status": "failed", "execution_mode": "model",
                                     "assigned_role": assignment.get("assigned_role"),
                                     "role_id": assignment.get("role_id"),
-                                    "error": f"{type(exc).__name__}: {exc}", "usage": {}})
+                                    "error": f"{type(exc).__name__}: {exc}", "usage": {}}
+                if on_result is not None:
+                    on_result(report)
+                results.append(report)
         return results
 
 

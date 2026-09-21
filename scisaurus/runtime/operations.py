@@ -172,6 +172,26 @@ class OperationsCell:
                                     profile_ref=manifest["artifact_ref"], profile_sha256=manifest["body_hash"],
                                     probe_ref=None, verification_ref=None, binding=None, schema_identity=None, failure_ref=None)
 
+    def reconcile_interrupted(self, capability_id, *, resume_ref):
+        """Recover stale operational phases only after durable call reconciliation."""
+        if self.store.head(self._logical(capability_id, "state")) is None:
+            return None
+        state = self._state(capability_id)
+        if state["state"] not in {"probing", "awaiting_verification"}:
+            return state
+        manifest, resume = self._body(resume_ref)
+        if (not manifest["artifact_id"].startswith("command/resume-sessions/")
+                or resume.get("schema_version") != "resume-session-1"
+                or state.get("activation_session") == self.session_id):
+            raise StateError("Interrupted operations require an explicit new resume session")
+        with self.control.tx() as conn:
+            if (conn.execute("SELECT 1 FROM attempts WHERE state IN ('started','result_unknown') LIMIT 1").fetchone()
+                    or conn.execute("SELECT 1 FROM reservations WHERE state='reserved' LIMIT 1").fetchone()):
+                raise StateError("Operational recovery requires all prior calls and reservations to be reconciled")
+            return self._transition(state, "degraded", "operations.controller",
+                "Interrupted operational phase reconciled; a fresh independent probe is required",
+                conn=conn, binding=None, probe_ref=None, verification_ref=None, recovery_ref=resume_ref)
+
     def activate(self, capability_id, *, requester, purpose):
         _text(requester, "requester")
         _text(purpose, "purpose")
@@ -250,13 +270,16 @@ class OperationsCell:
                                          attempt_id=execution["attempt_id"])
                 return self._transition(state, "awaiting_verification", operator, "Representative output requires independent operational checks",
                                         conn=conn, probe_ref=manifest["artifact_ref"], verification_ref=None)
-        except Exception as exc:
+        except (Exception, KeyboardInterrupt) as exc:
             with self.control.tx() as conn:
                 failure = self._publish(capability_id, "failures", {"task_id": task_id, "error": f"{type(exc).__name__}: {exc}",
                                         "profile_ref": state["profile_ref"], **execution}, operator, conn=conn,
                                         subjects=[state["profile_ref"], execution.get("execution_ref")])
-                return self._transition(state, "degraded", operator, "Operational probe failed", conn=conn,
-                                        failure_ref=failure["artifact_ref"], binding=None)
+                degraded = self._transition(state, "degraded", operator, "Operational probe failed", conn=conn,
+                                            failure_ref=failure["artifact_ref"], binding=None)
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            return degraded
 
     @staticmethod
     def _inspect(profile, result, params, *, representative=True):

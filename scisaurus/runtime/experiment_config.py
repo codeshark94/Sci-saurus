@@ -49,7 +49,7 @@ def _program(value, name):
             raise ValidationError(f"{name}.environment_files must be existing absolute files")
 
 
-def validate_experiment_config(config):
+def validate_experiment_config(config, *, require_literature_gate=True):
     validate_common(config, {"experiment", "time_policy"}, retrieval=False)
     repair_mode = config.get("limits", {}).get("repair_mode")
     if repair_mode is not None and repair_mode not in {"bounded", "until_deadline"}:
@@ -119,7 +119,7 @@ def validate_experiment_config(config):
 
     gate = experiment["literature_gate"]
     if gate is None:
-        if experiment["study_type"] == "novel_research":
+        if experiment["study_type"] == "novel_research" and require_literature_gate:
             raise ValidationError("novel research requires a current experiment-eligible literature gate assessment")
     else:
         exact(gate, {"project_dir", "survey_ref", "assessment_ref", "required_state"}, "literature gate")

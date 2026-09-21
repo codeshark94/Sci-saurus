@@ -109,7 +109,7 @@ def _sandbox_read_paths(command, workspace):
     }
     # A virtual environment keeps its interpreter and site-packages under one
     # prefix. Never infer a broader user-home root from an arbitrary command.
-    if configured.parent.name == "bin" and configured.parent.parent.name in {".venv", "venv"}:
+    if configured.parent.name == "bin" and (configured.parent.parent / "pyvenv.cfg").is_file():
         roots.add(configured.parent.parent.resolve())
     files = {configured.resolve(), executable}
     files.update(_macho_dependency_paths(executable))
@@ -197,6 +197,7 @@ def run_sandboxed(command, *, workspace, input_bytes=b"", timeout_seconds=300.0,
     process_env["TMPDIR"] = str(workspace)
     if env:
         process_env.update({key: value for key, value in env.items() if key in SAFE_ENV_KEYS})
+    process_env["MPLCONFIGDIR"] = str(workspace / ".matplotlib")
     mode = "sandbox-exec"
     if SANDBOX_EXEC:
         command = [SANDBOX_EXEC, "-p", sandbox_profile(

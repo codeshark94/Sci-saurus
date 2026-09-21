@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import math
 import re
 
 from scisaurus.core.errors import ValidationError
@@ -99,6 +100,56 @@ def canonical_bytes(obj) -> bytes:
         default=str,
     )
     return text.encode("utf-8")
+
+
+def json_object(raw, name="JSON", *, model_envelope=False) -> dict:
+    """Parse one unambiguous object, with optional provider transport wrappers.
+
+    Immutable control records remain plain JSON. Model replies may additionally
+    use a single JSON fence or an explicit reasoning terminator; neither form
+    permits duplicate keys, non-finite values, comments, or trailing prose.
+    """
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+
+    def finite(_):
+        raise ValueError("nonfinite JSON")
+
+    def finite_float(text):
+        value = float(text)
+        if not math.isfinite(value):
+            raise ValueError("nonfinite JSON")
+        return value
+
+    candidates = [raw]
+    if model_envelope and isinstance(raw, str):
+        text = raw.strip()
+        candidates = [text]
+        if "</think>" in text:
+            candidates.append(text.split("</think>", 1)[1].strip())
+        for candidate in tuple(candidates):
+            lines = candidate.splitlines()
+            if (len(lines) >= 3 and lines[0].strip().casefold() in {"```json", "```jsonc"}
+                    and lines[-1].strip() == "```"
+                    and all(not line.strip().startswith("```") for line in lines[1:-1])):
+                candidates.append("\n".join(lines[1:-1]).strip())
+    error = None
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate, object_pairs_hook=unique, parse_constant=finite,
+                               parse_float=finite_float)
+        except (ValueError, TypeError, UnicodeError) as exc:
+            error = exc
+            continue
+        if not isinstance(value, dict):
+            raise ValidationError(f"{name} must contain a JSON object")
+        return value
+    raise ValidationError(f"{name} must contain valid JSON") from error
 
 
 def sha256_hex(data: bytes) -> str:

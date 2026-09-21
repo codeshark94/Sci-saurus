@@ -92,6 +92,7 @@ class ParagraphRunner(ExecutionRuntime):
 
     def _run(self):
         status, error = "blocked", None
+        failure = None
         try:
             self._initialize_document()
             writer_sources = self._retrieve("research.writer", "producer")
@@ -151,6 +152,8 @@ class ParagraphRunner(ExecutionRuntime):
         except (Exception, KeyboardInterrupt) as exc:
             error = f"{type(exc).__name__}: {exc}"
             self.blockers.append({"reason": error})
+            if isinstance(exc, KeyboardInterrupt):
+                status, failure = "paused", {"kind": "process_interrupted"}
             for row in self.control._conn.execute("SELECT task_id FROM tasks WHERE state='awaiting_review'").fetchall():
                 self.tasks.transition(row[0], "blocked", "command.controller", reason=error)
         finally:
@@ -166,6 +169,7 @@ class ParagraphRunner(ExecutionRuntime):
                 self.budget.settle(window_id="run-window", reservation_id=row[0], actual={})
             self._checkpoint(status, force=True)
         result = {"run_id": self.run_id, "status": status, "error": error, "incumbent_ref": self.incumbent,
+                  "failure": failure,
                   "baseline_ref": getattr(self, "baseline", {}).get("artifact_ref"), "candidates": self.candidates,
                   "source_captures": [{k: v for k, v in source.items() if k != "text"} for source in self.sources],
                   "usage": self.budget.get_window("run-window"), "unreported_usage": self.usage_gaps, "blockers": self.blockers,

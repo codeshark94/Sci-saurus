@@ -169,6 +169,40 @@ class TestOperationsCell(unittest.TestCase):
         self.assertEqual(self.control._conn.execute("SELECT COUNT(*) FROM tasks WHERE state='completed'").fetchone()[0], 3)
         self.assertTrue(self.control.verify_chain()[0])
 
+    def test_interrupted_probe_records_degradation_and_propagates_stop(self):
+        self.register()
+        self.cell.activate("papers", requester="research.searcher", purpose="Acquire bibliography")
+        with self.assertRaises(KeyboardInterrupt):
+            self.cell.probe("papers", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt("stop")), operator="operations.operator")
+        self.assertEqual(self.cell.status("papers")["state"], "degraded")
+
+    def test_resume_reconciles_stale_phase_only_after_calls_are_settled(self):
+        self.register()
+        state = self.cell.activate("papers", requester="research.searcher", purpose="Acquire bibliography")
+        self.cell._transition(state, "probing", "operations.operator", "Interrupted legacy probe")
+        tasks = TaskManager(self.control)
+        tasks.create("old-probe", "service", {}, "operations.operator")
+        tasks.admit("old-probe", "command.controller")
+        tasks.start_attempt("old-probe", "old-probe-attempt", owner="operations.operator", lease_ttl_seconds=60)
+        resume = self.store.publish_artifact(logical_id="command/resume-sessions/1", artifact_type="report",
+            author="command.recovery", body=canonical_bytes({"schema_version": "resume-session-1"}), media_type="application/json")
+        with self.assertRaisesRegex(StateError, "new resume session"):
+            self.cell.reconcile_interrupted("papers", resume_ref=resume["artifact_ref"])
+        restored = OperationsCell(self.control, self.store, project_id="one")
+        with self.assertRaisesRegex(StateError, "reconciled"):
+            restored.reconcile_interrupted("papers", resume_ref=resume["artifact_ref"])
+        tasks.reconcile_unknown("old-probe-attempt", "command.recovery")
+        with self.assertRaisesRegex(StateError, "reconciled"):
+            restored.reconcile_interrupted("papers", resume_ref=resume["artifact_ref"])
+        tasks.finish_attempt("old-probe-attempt", "failed", usage={"retrieval_calls": 1})
+        recovered = restored.reconcile_interrupted("papers", resume_ref=resume["artifact_ref"])
+        self.assertEqual(recovered["state"], "degraded")
+        self.assertIsNone(recovered["binding"])
+        self.assertEqual(recovered["recovery_ref"], resume["artifact_ref"])
+        self.cell = restored
+        self.assertEqual(self.ready()["state"], "ready")
+        self.assertTrue(self.control.verify_chain()[0])
+
     def test_same_local_artifact_names_do_not_enable_cross_project_binding(self):
         state = self.ready()
         other_control, other_store, other = self.project("two")

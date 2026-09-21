@@ -36,7 +36,7 @@ def candidate():
         "executor_source": EXECUTOR, "validator_source": VALIDATOR,
         "runtime": {"python": "3.14", "packages": [{"name": "numpy", "version": "2.5.2"}]},
         "test_vector": {"input": {"probe": True}, "expected_output_sha256": "0" * 64},
-        "experiment_intent": INTENT,
+        "experiment_intent": json.loads(json.dumps(INTENT)),
     }
 
 
@@ -64,6 +64,20 @@ def output_document():
 
 
 class SandboxTests(unittest.TestCase):
+    def test_profile_accepts_arbitrary_virtual_environment_names_without_broadening_root(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            environment = root / "experiment-runtime"
+            (environment / "bin").mkdir(parents=True)
+            (environment / "pyvenv.cfg").write_text("include-system-site-packages = false\n")
+            interpreter = environment / "bin" / "python"
+            interpreter.symlink_to(sys.executable)
+            workspace = root / "sandbox"
+            workspace.mkdir()
+            profile = sandbox_profile(workspace, [str(interpreter), "-c", "print('ok')"])
+            self.assertIn(f'(subpath "{environment.resolve()}")', profile)
+            self.assertNotIn(f'(subpath "{root.resolve()}")', profile)
+
     @unittest.skipUnless(sys.platform == "darwin" and shutil.which("otool"),
                          "Mach-O dependency inspection is only available on macOS")
     def test_profile_includes_actual_runtime_dependencies(self):
@@ -93,6 +107,14 @@ class SandboxTests(unittest.TestCase):
                 workspace=workspace, timeout_seconds=30)
             self.assertNotEqual(outside.returncode, 0)
             self.assertFalse(Path("/etc/scisaurus_probe").exists())
+
+    def test_plot_cache_stays_inside_the_sandbox_workspace(self):
+        with tempfile.TemporaryDirectory() as path:
+            workspace = Path(path).resolve()
+            result = run_sandboxed([sys.executable, "-c", "import os; print(os.environ['MPLCONFIGDIR'])"],
+                workspace=workspace, timeout_seconds=30, env={"MPLCONFIGDIR": "/outside/cache"})
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout.decode().strip(), str(workspace / ".matplotlib"))
 
     def test_wall_deadline_is_enforced(self):
         with tempfile.TemporaryDirectory() as path:

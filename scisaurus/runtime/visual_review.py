@@ -475,6 +475,7 @@ class VisualReviewRunner(ExecutionRuntime):
 
     def _run(self):
         status, error, assessment, assessment_record, verification = "blocked", None, None, None, None
+        failure = None
         try:
             self._initialize()
             if not self.time_policy.snapshot()["initial_hard_limit_feasible"]:
@@ -486,6 +487,8 @@ class VisualReviewRunner(ExecutionRuntime):
         except (Exception, KeyboardInterrupt) as exc:
             error = f"{type(exc).__name__}: {exc}"
             self.blockers.append({"reason": error})
+            if isinstance(exc, KeyboardInterrupt):
+                status, failure = "paused", {"kind": "process_interrupted"}
         finally:
             for row in self.control._conn.execute("SELECT task_id FROM tasks WHERE state='awaiting_review'").fetchall():
                 self.tasks.transition(row[0], "blocked", "command.controller",
@@ -493,6 +496,7 @@ class VisualReviewRunner(ExecutionRuntime):
             self._checkpoint(status, force=True)
         result = {
             "run_id": self.run_id, "project_id": self.config["project_id"], "status": status,
+            "failure": failure,
             "error": error, "review_id": self.review["id"], "incumbent_ref": self.incumbent,
             "assessment_ref": self.incumbent,
             "assessment_current": bool(self.incumbent), "decision": assessment.get("decision") if assessment else None,

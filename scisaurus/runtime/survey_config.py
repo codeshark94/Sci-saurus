@@ -83,6 +83,7 @@ def validate_survey_config(value):
             raise ValidationError("environment_files must be an explicit list")
         get_adapter(adapter).validate_arguments(cap["representative"])
     search_fields = set(survey["search"]) if isinstance(survey["search"], dict) else set()
+    search_fields -= {"max_analyzed_works"}
     legacy_limits = SEARCH_LIMITS - {"challenge_reserve"}
     if (survey["revision"] >= 5 and search_fields != SEARCH_LIMITS) or (
             survey["revision"] < 5 and frozenset(search_fields) not in {
@@ -110,8 +111,12 @@ def validate_survey_config(value):
     if survey["search"]["context_chars"] > survey["search"]["max_text_chars"]:
         raise ValidationError("context window cannot exceed the capture limit")
     reserve = survey["search"].get("challenge_reserve", 0)
+    if survey["search"].get("max_analyzed_works", survey["search"]["max_works"]) > survey["search"]["max_works"]:
+        raise ValidationError("deep-analysis work budget cannot exceed the catalog work budget")
     if reserve >= survey["search"]["max_works"]:
         raise ValidationError("challenge reserve must leave at least one discovery work slot")
+    if reserve >= survey["search"].get("max_analyzed_works", survey["search"]["max_works"]):
+        raise ValidationError("deep-analysis budget must leave a discovery slot after the challenge reserve")
     if len(survey["seed_work_ids"]) > survey["search"]["max_works"] - reserve:
         raise ValidationError("seed works exceed the discovery work limit after challenge reserve")
     if not isinstance(survey["full_text_sources"], list):

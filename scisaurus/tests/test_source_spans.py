@@ -2,7 +2,7 @@
 import unittest
 
 from scisaurus.core.errors import ValidationError
-from scisaurus.core.source_spans import bind, locate, validate
+from scisaurus.core.source_spans import bind, expand_evidence, index_evidence, locate, validate
 
 
 class SourceSpanTests(unittest.TestCase):
@@ -80,6 +80,43 @@ class SourceSpanTests(unittest.TestCase):
         proof = {"work_id": "W1", "source_ref": "source", "quote": "hidden", **locate(source, "hidden")}
         with self.assertRaisesRegex(ValidationError, "outside"):
             validate(proof, source, require_span=True, window={"start": 7, "end": 14})
+        with self.assertRaisesRegex(ValidationError, "outside"):
+            bind(proof, {"source": source}, windows={"source": {"start": 7, "end": 14}})
+
+    def test_evidence_catalog_deduplicates_and_replays_exact_source_spans(self):
+        sources = {"source": {"work_id": "W1", "text": "prefix exact quotation suffix"}}
+        proof = {"work_id": "W1", "source_ref": "source", "quote": "exact quotation"}
+        value = {"evidence": [proof], "comparison": {"evidence": [proof]}}
+        projected, catalog = index_evidence(value, sources)
+        self.assertEqual(len(catalog), 1)
+        self.assertEqual(projected["evidence"], projected["comparison"]["evidence"])
+        self.assertEqual(expand_evidence(projected, catalog, sources), bind(value, sources))
+        self.assertEqual(index_evidence(bind(value, sources), sources), (projected, catalog))
+
+    def test_valid_hidden_span_cannot_relocate_to_a_visible_duplicate(self):
+        text = "exact quotation hidden separator exact quotation"
+        source = {"work_id": "W1", "text": text}
+        visible_start = text.rindex("exact quotation")
+        proof = {"work_id": "W1", "source_ref": "source", "quote": "exact quotation",
+                 **locate(source, "exact quotation", window={"start": 0, "end": 15})}
+        with self.assertRaisesRegex(ValidationError, "outside"):
+            bind(proof, {"source": source}, windows={"source": {"start": visible_start, "end": len(text)}})
+
+    def test_evidence_catalog_rejects_forgery_unknown_ids_and_hidden_spans(self):
+        sources = {"source": {"work_id": "W1", "text": "hidden visible"}}
+        proof = {"work_id": "W1", "source_ref": "source", "quote": "hidden"}
+        selected, catalog = index_evidence(proof, sources)
+        for value in ({"evidence_id": "unknown"}, {**selected, "quote": "invented"}):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                expand_evidence(value, catalog, sources)
+        with self.assertRaisesRegex(ValidationError, "does not match"):
+            expand_evidence(selected, [{**catalog[0], "quote": "visible"}], sources)
+        with self.assertRaisesRegex(ValidationError, "duplicated"):
+            expand_evidence(selected, catalog * 2, sources)
+        with self.assertRaisesRegex(ValidationError, "different work"):
+            expand_evidence(selected, catalog, {"source": {**sources["source"], "work_id": "W2"}})
+        with self.assertRaisesRegex(ValidationError, "outside"):
+            expand_evidence(selected, catalog, sources, windows={"source": {"start": 7, "end": 14}})
 
 
 if __name__ == "__main__":

@@ -170,11 +170,35 @@ def main(argv=None) -> int:
         "--env-file", action="append", default=[],
         help="owner-local runtime env file; may be repeated and is loaded before model dispatch")
 
+    p_review_article = sub.add_parser("run-review-article", help="scout, synthesize, render and independently review a critical review article")
+    p_review_article.add_argument("--config", required=True)
+    p_review_article.add_argument("--env-file", action="append", default=[])
+
+    p_prepare_review = sub.add_parser("prepare-review-article", help="prepare a review-only Composer workflow from existing provider settings without model calls")
+    p_prepare_review.add_argument("--from-workflow", required=True)
+    p_prepare_review.add_argument("--output-dir", required=True)
+    p_prepare_review.add_argument("--brief", required=True)
+
     p_interim = sub.add_parser(
         "composer-interim-report", help="print the latest concise Composer stop/progress report")
     p_interim.add_argument("project_dir")
 
     args = parser.parse_args(argv)
+    if args.cmd in {"run-review-article", "prepare-review-article"}:
+        from scisaurus.core.errors import ValidationError
+        from scisaurus.runtime.composer import load_runtime_environment_files
+        from scisaurus.runtime.review_article import ReviewArticleRunner, prepare_review_workflow
+        try:
+            if args.cmd == "prepare-review-article":
+                result = prepare_review_workflow(args.from_workflow, args.output_dir, args.brief)
+            else:
+                load_runtime_environment_files(args.env_file)
+                result = ReviewArticleRunner(json.loads(Path(args.config).read_text())).run()
+        except (OSError, ValueError, ValidationError) as exc:
+            print(f"review article rejected: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result.get("status") in {"prepared", "candidate_needs_review"} else 2
     if args.cmd == "dashboard":
         from scisaurus.dashboard import run_dashboard
         try:

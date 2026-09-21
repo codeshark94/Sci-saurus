@@ -135,6 +135,8 @@ def experiment_program_payload(intent, configured_input):
         experiment = {key: intent[key] for key in PROGRAM_EXPERIMENT_FIELDS}
     except (KeyError, TypeError) as exc:
         raise ValidationError("generated experiment intent cannot form a runtime payload") from exc
+    if intent.get("quality_contract") is not None:
+        experiment["quality_contract"] = intent["quality_contract"]
     return json.loads(canonical_bytes({
         "configured_input": configured_input,
         "experiment": experiment,
@@ -263,7 +265,7 @@ def _verify_entry(root, entry):
         raise ValidationError("registered executor readiness input differs from its admitted test vector")
     if experiment["validation"]["representative"] != {"input": {"readiness_probe": True}}:
         raise ValidationError("registered validator readiness handshake is invalid")
-    validate_experiment_config(_trial_config(deepcopy_json(experiment)))
+    validate_experiment_config(_trial_config(deepcopy_json(experiment)), require_literature_gate=False)
     return descriptor
 
 
@@ -360,7 +362,7 @@ def register_capability(root, candidate, admission, *, runtime_python, repo_root
                 candidate, runtime_python, repo_root, requirements, temporary_dir,
                 configured_input, literature_gate,
             )
-            validate_experiment_config(_trial_config(trial_experiment))
+            validate_experiment_config(_trial_config(trial_experiment), require_literature_gate=False)
             experiment = _experiment(
                 candidate, runtime_python, repo_root, requirements, final_dir,
                 configured_input, literature_gate,

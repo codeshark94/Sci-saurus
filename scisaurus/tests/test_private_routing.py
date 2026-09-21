@@ -66,6 +66,31 @@ class TestPrivateRouting(unittest.TestCase):
         }
         self.assertEqual(premium_ids, set())
 
+    def test_ollama_only_maps_qwen_bulk_and_ignores_remote_credentials(self):
+        values = self.env(
+            SCISAURUS_OLLAMA_ONLY="1",
+            SCISAURUS_OLLAMA_BULK_MODEL="gemma4:31b-cloud",
+            SCISAURUS_QWEN_ENV_FILE="missing/private-qwen.env",
+        )
+        for key in ("SCISAURUS_QWEN_BASE_URL", "SCISAURUS_QWEN_MODEL", "SCISAURUS_QWEN_API_KEY"):
+            values.pop(key, None)
+        config = self.config(values)
+
+        self.assertEqual(
+            config["role_models"]["research.cataloger"]["model"],
+            "gemma4:31b-cloud",
+        )
+        self.assertIsNone(config["role_models"]["research.cataloger"].get("auth_env"))
+        routes = config["role_routes"]["research.literature-mapper"]
+        self.assertEqual([route["pool"] for route in routes], ["ollama", "ollama", "ollama"])
+        self.assertEqual([route["id"] for route in routes], [
+            "ollama-qwen-bulk", "ollama-gemma-bulk", "ollama-deepseek",
+        ])
+        self.assertTrue(all(route["base_url"] == "http://127.0.0.1:11434/v1" for route in routes))
+        self.assertNotIn("qwen", {
+            route["pool"] for route_list in config["role_routes"].values() for route in route_list
+        })
+
     def test_evidence_integrators_use_ollama_high_context_without_bulk_spillover(self):
         config = self.config(self.env())
         high_roles = {

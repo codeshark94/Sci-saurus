@@ -14,10 +14,13 @@ from scisaurus.core.events import ControlStore
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.source_spans import locate
 from scisaurus.core.store import ArtifactStore
-from scisaurus.runtime.paper import PaperReleaseBuilder, _finding_supported, _latex
+from scisaurus.runtime.paper import PaperReleaseBuilder, _finding_supported, _latex, resolve_compile_script
 
 
-COMPILE_SCRIPT = Path("/Users/seungyeop/.codex/plugins/cache/openai-bundled/latex/0.2.6/scripts/compile_latex.py")
+try:
+    COMPILE_SCRIPT = resolve_compile_script()
+except ValidationError:
+    COMPILE_SCRIPT = None
 
 
 class PaperReleaseTests(unittest.TestCase):
@@ -108,7 +111,7 @@ class PaperReleaseTests(unittest.TestCase):
         self.assertIn(r"\textsuperscript{-16}", rendered)
         self.assertIn(r"$\sqrt{a}$", rendered)
 
-    @unittest.skipUnless(os.environ.get("SCISAURUS_RUN_LATEX_INTEGRATION") == "1" and COMPILE_SCRIPT.is_file()
+    @unittest.skipUnless(os.environ.get("SCISAURUS_RUN_LATEX_INTEGRATION") == "1" and COMPILE_SCRIPT is not None
                          and shutil.which("pdfinfo") and shutil.which("pdftoppm"),
                          "set SCISAURUS_RUN_LATEX_INTEGRATION=1 for the real render integration")
     def test_builds_real_pdf_source_claim_index_and_unapproved_release_candidate(self):
@@ -123,6 +126,21 @@ class PaperReleaseTests(unittest.TestCase):
         self.assertTrue((output / "output" / "source" / "references.bib").is_file())
         self.assertTrue(result["visual_check"]["all_pages_rendered"])
         self.assertTrue(result["event_chain"][0])
+
+    @unittest.skipUnless(os.environ.get("SCISAURUS_RUN_LATEX_INTEGRATION") == "1" and COMPILE_SCRIPT is not None
+                         and shutil.which("pdfinfo") and shutil.which("pdftoppm"),
+                         "set SCISAURUS_RUN_LATEX_INTEGRATION=1 for the real preview integration")
+    def test_preview_renders_exact_draft_without_releasing_it(self):
+        output = self.root / "preview"
+        builder = PaperReleaseBuilder(output, self.config())
+        manuscript = builder._manuscript()
+        draft = {"title": manuscript["title"], "sections": manuscript["groups"]}
+        snapshot = builder.render_preview(draft, compile_script=COMPILE_SCRIPT)
+        self.assertEqual(snapshot["status"], "unreviewed")
+        self.assertEqual(snapshot["manuscript_sha256"], hashlib.sha256(canonical_bytes(draft)).hexdigest())
+        self.assertTrue(Path(snapshot["pdf"]).is_file())
+        self.assertTrue(all(Path(page).stat().st_size > 1000 for page in snapshot["pages"]))
+        self.assertFalse((output / "output" / "release.json").exists())
 
     def test_rejects_claim_text_or_evidence_that_is_not_in_its_exact_unit(self):
         value = self.config()
@@ -236,7 +254,8 @@ class PaperReleaseTests(unittest.TestCase):
             tex = builder._tex(manuscript)
             self.assertIn(r"\parbox{0.95\linewidth}", tex)
             self.assertIn("Value is the first threshold crossing: |error| <= tolerance.", tex)
-            self.assertIn(r"\resizebox{\linewidth}{!}{%", tex)
+            self.assertIn(r"\ifdim\wd\scisaurustablebox>\linewidth", tex)
+            self.assertIn(r"\else\usebox{\scisaurustablebox}\fi", tex)
         finally:
             builder.close()
 

@@ -21,6 +21,7 @@ from scisaurus.core.schema import canonical_bytes, sha256_hex
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.surveys import SurveyGate
 from scisaurus.runtime.execution import ExecutionRuntime, _invoke_worker
+from scisaurus.runtime.capability_registry import experiment_program_payload
 from scisaurus.runtime.config import configured_worker_slots
 from scisaurus.runtime.experiment_config import ASSET_MEDIA_TYPES, validate_experiment_config
 from scisaurus.runtime.models import ModelResult
@@ -149,7 +150,10 @@ def validate_deterministic_validation(value, experiment, candidate_sha256):
         _text(check["evidence"], "deterministic validation evidence")
     recalculations = value["metric_recalculations"]
     if not isinstance(recalculations, list) or not recalculations:
-        raise ValidationError("deterministic validation requires metric recalculations")
+        raise ValidationError("deterministic validation requires metric recalculations; "
+            "validator checks=" + json.dumps(value["checks"][:8], ensure_ascii=False)[:2400] +
+            "; each primary_outcomes entry already has its final exact metric ID; "
+            "do not append a condition suffix again")
     metric_ids = set()
     for metric in recalculations:
         exact(metric, {"metric_id", "reported_value", "recalculated_value", "tolerance", "matches"},
@@ -381,13 +385,7 @@ class ExperimentRunner(ExecutionRuntime):
         self._checkpoint("experiment_capabilities_ready", force=True)
 
     def _program_input(self):
-        experiment = {"configured_input": self.experiment["execution"]["input"], "experiment": {
-            key: deepcopy(self.experiment[key]) for key in (
-                "id", "revision", "study_type", "domain", "research_question", "hypothesis", "method",
-                "parameters", "seed", "run_count", "stopping_rule", "primary_outcomes", "limitations")}}
-        if self.experiment.get("quality_contract") is not None:
-            experiment["experiment"]["quality_contract"] = deepcopy(self.experiment["quality_contract"])
-        return experiment
+        return experiment_program_payload(self.experiment, self.experiment["execution"]["input"])
 
     def _execute_once(self):
         decision = self.time_policy.admit("production", task_count=1)
@@ -641,6 +639,7 @@ class ExperimentRunner(ExecutionRuntime):
 
     def _run(self):
         status, error, package, package_path = "blocked", None, None, None
+        failure = None
         validation_record = assessment_record = None
         try:
             self._initialize()
@@ -673,13 +672,16 @@ class ExperimentRunner(ExecutionRuntime):
         except (Exception, KeyboardInterrupt) as exc:
             error = f"{type(exc).__name__}: {exc}"
             self.blockers.append({"reason": error})
+            if isinstance(exc, KeyboardInterrupt):
+                status = "paused"
+                failure = {"kind": "process_interrupted"}
         finally:
             for row in self.control._conn.execute("SELECT task_id FROM tasks WHERE state='awaiting_review'").fetchall():
                 self.tasks.transition(row[0], "blocked", "command.controller",
                                       reason="Run ended without an accepted experiment result")
             self._checkpoint(status, force=True)
         result = {"run_id": self.run_id, "project_id": self.config["project_id"], "status": status,
-            "error": error, "study_id": self.experiment["id"], "incumbent_ref": self.incumbent,
+            "error": error, "failure": failure, "study_id": self.experiment["id"], "incumbent_ref": self.incumbent,
             "score_ref": getattr(self, "score_ref", None), "literature": self.literature,
             "execution_refs": self.execution_refs,
             "deterministic_validation_ref": validation_record["artifact_ref"] if validation_record else None,

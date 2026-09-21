@@ -26,6 +26,7 @@ from scisaurus.runtime.models import (
     ModelCallError, ModelClient, ModelResult, model_call_budget_available,
     model_context_error, resolve_model_config,
 )
+from scisaurus.runtime.literature import ProviderCooldownError
 from scisaurus.runtime.resume import ResumeController, source_manifest
 
 SYSTEM = (
@@ -185,6 +186,13 @@ class ExecutionRuntime:
         # healthy alternate route instead of repeatedly hammering the dead
         # pool.
         self.provider_cooldowns = {}
+        for pool in self.provider_pools:
+            record = self.store.head(f"command/provider-cooldowns/{pool}")
+            if record:
+                body = json.loads(self.store.read_body(record["body_hash"]))
+                remaining = body["not_before_epoch"] - time.time()
+                if remaining > 0:
+                    self.provider_cooldowns[pool] = time.monotonic() + remaining
         self.cancelled = False
         self.cancellation_reason = None
         self.sources = []
@@ -260,6 +268,17 @@ class ExecutionRuntime:
         if time.monotonic() >= self.deadline:
             raise ValidationError("run deadline reached")
 
+    def _raise_dispatch_failures(self, failures, context):
+        """Preserve backpressure across runner and Composer boundaries."""
+        limited = [failure for failure in failures if failure.get("status_code") == 429]
+        if limited:
+            delay = max(float(failure.get("retry_after_seconds") or
+                              max(0.1, self.deadline - time.monotonic())) for failure in limited)
+            raise ProviderCooldownError(
+                context + ": " + "; ".join(failure["error"] for failure in limited),
+                retry_after_seconds=delay, rate_limit={"provider": "model", "status_code": 429})
+        raise ValidationError(context + ": " + "; ".join(failure["error"] for failure in failures))
+
     def _call_batch(self, specs, *, max_parallel=None):
         """Return each independent result, retaining failures and unknown costs.
 
@@ -329,8 +348,11 @@ class ExecutionRuntime:
                     self._dispatch(entry)
                 if not active:
                     for spec in pending:
-                        outcome = self._undispatched(
-                            spec, "dispatch capacity is held by outstanding reservations")
+                        cooldowns = self._pending_cooldowns(spec)
+                        outcome = self._undispatched(spec,
+                            "configured provider is cooling down" if cooldowns else
+                            "dispatch capacity is held by outstanding reservations",
+                            **({"status_code": 429, "retry_after_seconds": min(cooldowns)} if cooldowns else {}))
                         logical_task_id = spec.get("_logical_task_id", spec["task_id"])
                         self._finalize_logical_task(logical_task_id, spec["task_id"], outcome)
                         outcomes[logical_task_id] = outcome
@@ -563,6 +585,21 @@ class ExecutionRuntime:
             return _ProviderContextBlock(context_error)
         return {"id": f"default:{pool_name}", "pool": pool_name, "_effective": effective}
 
+    def _pending_cooldowns(self, spec):
+        if spec["kind"] != "model":
+            return []
+        params = spec["params"]
+        client = params.get("_routing_client") or params.get("client") or {}
+        role = params.get("role") or spec["actor"]
+        routes = client.get("role_routes", {}).get(role, [])
+        pools = ({route["pool"] for route in routes} if routes else {
+            name for name, pool in self.provider_pools.items()
+            if self._provider_url(self._base_model_config(spec).get("base_url")) in
+               {self._provider_url(url) for url in pool["base_urls"]}})
+        now = time.monotonic()
+        return [self.provider_cooldowns[name] - now for name in pools
+                if self.provider_cooldowns.get(name, 0) > now]
+
     def _mark_provider_cooldown(self, pool_name, message):
         """Quarantine a provider after a known rate-limit response.
 
@@ -576,9 +613,13 @@ class ExecutionRuntime:
         if type(delay) not in (int, float) or delay <= 0:
             until = self.deadline
         else:
-            until = min(self.deadline, time.monotonic() + float(delay))
+            until = time.monotonic() + float(delay)
         self.provider_cooldowns[pool_name] = max(
             until, self.provider_cooldowns.get(pool_name, 0.0))
+        self._publish(f"command/provider-cooldowns/{pool_name}", "note", {
+            "pool": pool_name, "status_code": message.get("status_code"),
+            "not_before_epoch": time.time() + max(0, self.provider_cooldowns[pool_name] - time.monotonic()),
+        }, "command.controller")
 
     @staticmethod
     def _provider_route_failure(message):
@@ -589,6 +630,9 @@ class ExecutionRuntime:
         spec = entry["spec"]
         if spec["kind"] != "model" or not self._provider_route_failure(message):
             return None
+        pool_name = spec["params"].get("provider_pool")
+        if pool_name:
+            self._mark_provider_cooldown(pool_name, message)
         role = spec["params"].get("role") or spec["actor"]
         client = spec["params"].get("_routing_client") or spec["params"].get("client")
         routes = client.get("role_routes", {}).get(role, []) if isinstance(client, dict) else []
@@ -599,9 +643,10 @@ class ExecutionRuntime:
         retry_count = int(spec.get("_provider_retry_count", 0) or 0)
         if route_count < 2 or retry_count >= route_count - 1:
             return None
-        pool_name = spec["params"].get("provider_pool")
-        if pool_name:
-            self._mark_provider_cooldown(pool_name, message)
+        # A different model in the same account pool is not an independent
+        # route around that pool's rate limit.
+        if not any(route.get("pool") != pool_name for route in routes):
+            return None
         logical_task_id = spec.get("_logical_task_id", spec["task_id"])
         retry_count += 1
         retry = dict(spec)
@@ -816,9 +861,9 @@ class ExecutionRuntime:
         if self._reservation(spec) is not None:
             self.budget.settle(window_id="run-window", reservation_id=spec["reservation_id"], actual={})
 
-    def _undispatched(self, spec, reason):
+    def _undispatched(self, spec, reason, **metadata):
         entry = {"spec": spec, "context": None, "dispatched": False, "attempt_id": None}
-        return self._record_outcome(entry, {"ok": False, "error": reason, "outcome_known": True})
+        return self._record_outcome(entry, {"ok": False, "error": reason, "outcome_known": True, **metadata})
 
     def _complete(self, task_id):
         self.tasks.transition(task_id, "completed", "command.controller", reason="scoped output recorded and checked")

@@ -74,7 +74,8 @@ def _text(value, name):
 
 def _identifier(value, name):
     if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
-        raise ValidationError(f"{name} must be a bounded lowercase identifier")
+        raise ValidationError(f"{name} {value!r} must match {IDENTIFIER.pattern!r}; "
+                              "keep the declared ID, executor metric ID and validator references identical")
     return value
 
 
@@ -143,16 +144,18 @@ def _validate_test_vector(value):
     return value
 
 
-def _validate_intent(intent):
-    if not isinstance(intent, dict) or set(intent) != INTENT_FIELDS:
+def validate_experiment_intent(intent):
+    if (not isinstance(intent, dict) or not INTENT_FIELDS.issubset(intent)
+            or set(intent) - (INTENT_FIELDS | {"quality_contract"})):
         observed = sorted(intent) if isinstance(intent, dict) else type(intent).__name__
         raise ValidationError(
-            f"experiment_intent requires exactly {sorted(INTENT_FIELDS)}; observed keys: {observed}")
+            f"experiment_intent requires {sorted(INTENT_FIELDS)} and permits quality_contract; observed keys: {observed}")
     _identifier(intent["id"], "experiment_intent id")
     if type(intent["revision"]) is not int or intent["revision"] < 1:
         raise ValidationError("experiment_intent revision must be a positive integer")
     if intent["study_type"] not in STUDY_TYPES:
-        raise ValidationError("experiment_intent study_type is unsupported")
+        raise ValidationError(
+            f"experiment_intent study_type {intent['study_type']!r} must be one of {sorted(STUDY_TYPES)}")
     for key in ("domain", "research_question", "hypothesis", "method", "stopping_rule"):
         _text(intent[key], f"experiment_intent.{key}")
     try:
@@ -180,7 +183,8 @@ def _validate_intent(intent):
         _text(outcome["definition"], "primary outcome definition")
         _text(outcome["unit"], "primary outcome unit")
         if outcome["direction"] not in DIRECTIONS:
-            raise ValidationError("experiment_intent primary outcome direction is unsupported")
+            raise ValidationError(
+                f"experiment_intent primary outcome direction {outcome['direction']!r} must be one of {sorted(DIRECTIONS)}")
         if outcome["threshold"] is not None and not isinstance(outcome["threshold"], (int, float)):
             raise ValidationError("experiment_intent primary outcome threshold must be numeric or null")
     if not isinstance(intent["limitations"], list) or not intent["limitations"]:
@@ -251,7 +255,7 @@ def _validate_intent(intent):
                            "environment_files": [placeholder], "input": {}},
         },
     }
-    validate_experiment_config(trial)
+    validate_experiment_config(trial, require_literature_gate=False)
     return intent
 
 
@@ -264,7 +268,7 @@ def validate_program_candidate(value):
     _identifier(value["study_id"], "program candidate study_id")
     if type(value["revision"]) is not int or value["revision"] < 1:
         raise ValidationError("program candidate revision must be a positive integer")
-    _validate_intent(value["experiment_intent"])
+    validate_experiment_intent(value["experiment_intent"])
     if value["study_id"] != value["experiment_intent"]["id"]:
         raise ValidationError("program candidate study_id must match its experiment_intent id")
     if value["revision"] != value["experiment_intent"]["revision"]:

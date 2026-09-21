@@ -10,7 +10,7 @@ SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
 GAP_CHECKS = ("closest-prior-work", "scope-comparability", "counterevidence", "full-text-support")
 
 
-def evidence(items, sources, *, required=False, require_spans=False):
+def evidence(items, sources, *, required=False, require_spans=False, windows=None):
     if not isinstance(items, list) or (required and not items):
         raise ValidationError("asserted statements require explicit source evidence")
     errors = []
@@ -24,7 +24,8 @@ def evidence(items, sources, *, required=False, require_spans=False):
             source = sources.get(item["source_ref"])
             if source is None or source["work_id"] != item["work_id"]:
                 raise ValidationError(f"must quote the exact captured text of its identified work ({item['source_ref']})")
-            validate_source_span(item, source, require_span=require_spans)
+            validate_source_span(item, source, require_span=require_spans,
+                                 window=(windows or {}).get(item["source_ref"]))
         except ValidationError as exc:
             errors.append(f"evidence[{index}]: {exc}")
     if errors:
@@ -133,7 +134,7 @@ def validate_work_review(value, relationship_refs):
     _text(value["rationale"], "work review rationale")
 
 
-def validate_assessment(value, sources, works, *, require_spans=False):
+def validate_assessment(value, sources, works, *, require_spans=False, windows=None):
     exact(value, {"state", "rationale", "comparisons", "checks", "evidence"}, "gap assessment")
     if value["state"] not in ("refuted_by_prior_work", "insufficient_evidence", "eligible_for_experiment"):
         raise ValidationError("unsupported gap decision")
@@ -143,7 +144,7 @@ def validate_assessment(value, sources, works, *, require_spans=False):
             check["outcome"] != "passed" for check in value["checks"]):
         raise ValidationError("decisive gap assessment requires every check to pass")
     evidence(value["evidence"], sources, required=value["state"] != "insufficient_evidence",
-             require_spans=require_spans)
+             require_spans=require_spans, windows=windows)
     if not isinstance(value["comparisons"], list):
         raise ValidationError("comparisons must be an explicit list")
     seen = set()
@@ -156,7 +157,7 @@ def validate_assessment(value, sources, works, *, require_spans=False):
             raise ValidationError("unknown comparison relationship")
         _text(item["statement"], "comparison statement")
         evidence(item["evidence"], sources, required=item["relationship"] != "uncertain",
-                 require_spans=require_spans)
+                 require_spans=require_spans, windows=windows)
         if any(proof["work_id"] != item["work_id"] for proof in item["evidence"]):
             raise ValidationError("comparison must cite its own work")
         decisive = value["state"] == "eligible_for_experiment" or (

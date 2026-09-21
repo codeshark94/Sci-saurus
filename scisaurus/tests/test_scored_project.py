@@ -87,6 +87,13 @@ print(json.dumps({"valid": valid}))
 
 
 class ScoredProjectTests(unittest.TestCase):
+    def test_process_stop_is_exported_without_retry(self):
+        def stop_setup(runner):
+            runner._setup_operations = lambda: (_ for _ in ()).throw(KeyboardInterrupt('termination requested'))
+        result, _ = self.run_config(prepare=stop_setup)
+        self.assertEqual(result['status'], 'paused')
+        self.assertEqual(result['failure'], {'kind': 'process_interrupted'})
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="scisaurus-score-test-")
         self.root = Path(self.temp.name)

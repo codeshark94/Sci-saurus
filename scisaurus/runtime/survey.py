@@ -1,5 +1,6 @@
 """Bounded literature discovery, scoped mapping, and independent gap assessment."""
 from copy import deepcopy
+from collections import Counter
 import hashlib
 import itertools
 import json
@@ -11,12 +12,15 @@ import unicodedata
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.core.source_spans import bind as bind_source_spans, contains_legacy
-from scisaurus.core.surveys import RELATIONSHIP_SEMANTICS, SurveyGate, work_review_checks
+from scisaurus.core.source_spans import (bind as bind_source_spans, contains_legacy,
+                                        expand_evidence, index_evidence)
+from scisaurus.core.surveys import (ABSTENTION_REASONS, RELATIONSHIP_SEMANTICS, SurveyGate,
+                                   is_explicit_abstention, work_review_checks)
 from scisaurus.runtime.execution import SYSTEM, ExecutionRuntime, _invoke_worker
 from scisaurus.runtime.config import configured_worker_slots
 from scisaurus.runtime.bibliographic_identity import reconcile_result
 from scisaurus.runtime.models import ModelResult, estimate_input_tokens
+from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
 from scisaurus.runtime.literature import (
     SEARCH_SYNTAX, ProviderCooldownError, provider_cooldown_seconds,
 )
@@ -170,6 +174,7 @@ class SurveyRunner(ExecutionRuntime):
         self.api_calls, self.identity_calls, self.serial, self.survey_revision = 0, 0, 0, 0
         self.expanded, self.full_text_attempted = set(), set()
         self.survey_ref, self.assessment_ref, self.register_ref = None, None, None
+        self.map_record = None
         self.nomination = None
         self.nomination_record = None
         self.counter_plan_record = None
@@ -201,14 +206,16 @@ class SurveyRunner(ExecutionRuntime):
             "wall_clock_seconds": self.config["limits"]["wall_clock_seconds"],
             "policy": self.config.get("time_policy"),
         }
-        requested = self.bounds["max_works"]
+        budget_field = "max_analyzed_works" if "max_analyzed_works" in self.bounds else "max_works"
+        requested = self.bounds[budget_field]
         initial = TimePolicy(unit_count=requested, **kwargs)
         snapshot = initial.snapshot()
         if snapshot["initial_hard_limit_feasible"] and snapshot["initial_target_feasible"]:
             return initial
 
         reserve = self.bounds.get("challenge_reserve", 0)
-        floor = max(reserve + 1, len(self.score["seed_work_ids"]) + reserve)
+        floor = (reserve + 1 if budget_field == "max_analyzed_works" else
+                 max(reserve + 1, len(self.score["seed_work_ids"]) + reserve))
         if floor > requested:
             return initial
 
@@ -229,11 +236,11 @@ class SurveyRunner(ExecutionRuntime):
         if feasible is None:
             return initial
 
-        self.bounds["max_works"] = feasible
+        self.bounds[budget_field] = feasible
         self.work_budget_adjustments.append({
             "kind": "deadline_fit",
-            "requested_max_works": requested,
-            "effective_max_works": feasible,
+            "requested_" + budget_field: requested,
+            "effective_" + budget_field: feasible,
             "minimum_preserved": floor,
             "reason": "configured review schedule exceeded target or hard deadline",
         })
@@ -322,11 +329,30 @@ class SurveyRunner(ExecutionRuntime):
             max((row["number"] for row in reservations), default=0),
         )
         coverage = self.store.head("kb/coverage")
-        if coverage:
-            coverage_body = self._body(coverage)
+        final = self.store.head("command/results/final")
+        coverage_body = self._body(coverage) if coverage else None
+        if final and (not coverage or final["created_at"] > coverage["created_at"]):
+            coverage_body = self._body(final).get("coverage", coverage_body)
+        if coverage_body:
             self.expansion_log = list(coverage_body.get("expansion", []))
             self.gaps = list(coverage_body.get("access_and_limit_gaps", []))
             self.expanded = {wid for row in self.expansion_log for wid in row.get("seed_work_ids", [])}
+        if "retrieval" not in self.resume_session["reopened_scopes"]:
+            # Known failed routes and uncertain reservations consumed the same
+            # acquisition allowance as successful captures. A review-only
+            # resume must not silently start a new retrieval campaign.
+            self.full_text_attempted.update(row["work_id"] for row in self.gaps
+                if row.get("kind") in {"full_text_failure", "full_text_identity_or_scope"} and row.get("work_id") in self.works)
+            # Older checkpoints did not merge acquisition gaps on resume.
+            # Their immutable final reports still identify consumed routes.
+            for version in self.store.versions("command/results/final"):
+                report = self._body(self.store.get(f"artifact:command/results/final@{version}"))
+                self.full_text_attempted.update(row["work_id"]
+                    for row in report.get("coverage", {}).get("access_and_limit_gaps", [])
+                    if row.get("kind") in {"full_text_failure", "full_text_identity_or_scope"}
+                    and row.get("work_id") in self.works)
+            self.full_text_attempted.update(self._body(record)["work_id"]
+                for record in self._heads("command/source-attempts/full-text/"))
         map_record = self.store.head("kb/literature-map")
         if map_record:
             map_body = self._body(map_record)
@@ -347,6 +373,10 @@ class SurveyRunner(ExecutionRuntime):
             candidates = [(record, self._body(record)) for record in self._heads("kb/relationships/")]
             self.relationships = overlay_post_checkpoint_relationships(
                 self.relationships, map_record["created_at"], candidates)
+            for record in self._heads("kb/work-analyses/"):
+                body = self._body(record)
+                if record["created_at"] > map_record["created_at"] and body["work_id"] in self.works:
+                    self.analysis_records[body["work_id"]] = record
         scopes = set(self.resume_session["reopened_scopes"])
         if "mapping" not in scopes:
             for wid, record in self.analysis_records.items():
@@ -505,7 +535,8 @@ class SurveyRunner(ExecutionRuntime):
         for row in rows:
             validation = self.store.get(row["artifact_ref"])
             try:
-                error = self._body(validation)["error"]
+                validation_body = self._body(validation)
+                error = validation_body["error"]
                 proposal = self.store.get(validation["inputs"][0]["ref"])
                 previous_response = self._body(proposal)
                 execution = self.store.get(proposal["inputs"][0]["ref"])
@@ -516,25 +547,91 @@ class SurveyRunner(ExecutionRuntime):
                 continue
             if canonical_bytes(prior_assignment) == canonical_bytes(assignment):
                 return {"error": error, "previous_response": previous_response,
+                    "finish_reason": validation_body.get("finish_reason", "stop"),
                     "scope": "Repair only this assignment's recorded contract violations; preserve every valid field. "
                              "Use every requested field name and enum value exactly as specified; do not substitute synonyms."}
         return None
 
-    def _models_checked(self, jobs, *, stage="production", task_kind="production"):
-        """Validate worker waves and repair only rejected assignments.
+    def _repair_assignment(self, job, feedback):
+        assignment = deepcopy(job["assignment"])
+        if not feedback:
+            return assignment
+        assignment["validation_feedback"] = deepcopy(feedback)
+        repair = assignment["validation_feedback"]
+        if feedback.get("finish_reason") == "length":
+            # An unfinished reasoning transcript is not a partially valid
+            # answer. Echoing it consumes context and encourages continuation.
+            repair.pop("previous_response", None)
+            repair["previous_response_omitted"] = True
+            repair["scope"] = ("The response exhausted its output limit before completion. "
+                "Return only the final JSON object using the required fields and enums. "
+                "Keep explanations concise; omit analysis transcripts, preambles and repeated input. "
+                "Preserve the evidence contract; use supplied evidence IDs when available.")
+        limit = self._map_input_limit(job["actor"])
+        if limit is None or estimate_input_tokens(SYSTEM, json.dumps(assignment, ensure_ascii=False)) <= limit:
+            return assignment
+        # Prior output is diagnostic context, not source evidence. Keep the
+        # exact source assignment and bound only this optional repair echo.
+        prior = json.dumps(repair.pop("previous_response", None), ensure_ascii=False)
+        repair["previous_response_excerpt"] = ""
+        repair["previous_response_omitted"] = True
+        low, high = 0, len(prior)
+        while low < high:
+            middle = (low + high + 1) // 2
+            repair["previous_response_excerpt"] = prior[:middle]
+            if estimate_input_tokens(SYSTEM, json.dumps(assignment, ensure_ascii=False)) <= limit:
+                low = middle
+            else:
+                high = middle - 1
+        repair["previous_response_excerpt"] = prior[:low]
+        if estimate_input_tokens(SYSTEM, json.dumps(assignment, ensure_ascii=False)) > limit:
+            raise ModelWorkBlocked(f"{job['name']} repair contract cannot fit its configured input budget")
+        return assignment
 
-        Ordinary fixture runs retain the historical ``max_rounds`` bound. A
-        long autonomous mission can opt into ``limits.repair_mode`` set to
-        ``until_deadline``; then a malformed response never terminates the
-        stage because an arbitrary retry counter ran out. The runner keeps
-        retrying the rejected assignment until its existing wall-clock and
-        admission policy no longer permits another call.
-        """
-        pending, results = list(jobs), {}
+    def _models_checked(self, jobs, *, stage="production", task_kind="production"):
+        """Retain checked siblings and bound repairs of each exact assignment."""
+        cache = ModelWorkCache(self.store, self._publish)
+        pending, results, keys, states = [], {}, {}, {}
+        def abstain(job, state):
+            handler = job.get("on_exhausted")
+            if not handler or not state.get("feedback") or "did not satisfy its evidence contract" not in state.get("error", ""):
+                return False
+            value, execution = handler(state)
+            job["validator"](value)
+            job["on_valid"](value, execution)
+            cache.put(keys[job["name"]], {"status": "abstained", "value": value, "execution_ref": execution,
+                "error": state["error"], "repair_attempts": state.get("repair_attempts", 0)})
+            results[job["name"]] = (value, execution)
+            return True
+        for job in jobs:
+            model = {**self.config["model"], **job.get("model_overrides", {})}
+            key = cache.key(scope=f"survey:{job['name']}", role=job["actor"],
+                            system=SYSTEM, prompt=job["assignment"], model=model)
+            keys[job["name"]] = key
+            retained = cache.get(key)
+            if retained and retained.get("status") in {"succeeded", "abstained"}:
+                value = deepcopy(retained["value"])
+                try:
+                    job["validator"](value)
+                except (ValidationError, TypeError, ValueError, KeyError):
+                    retained = None
+                else:
+                    if job.get("on_valid"):
+                        job["on_valid"](value, retained["execution_ref"])
+                    results[job["name"]] = (value, retained["execution_ref"])
+                    continue
+            if retained and retained.get("status") == "blocked":
+                if abstain(job, retained):
+                    continue
+                raise ModelWorkBlocked(retained["error"])
+            states[job["name"]] = retained or {}
+            pending.append(job)
+        if not pending:
+            return results
         feedback = {job["name"]: retained for job in pending
-                    if (retained := self._retained_validation_feedback(job["name"], job["assignment"])) is not None}
-        repair_mode = self.config["limits"].get("repair_mode", "bounded")
-        rounds = itertools.count() if repair_mode == "until_deadline" else range(self.config["limits"]["max_rounds"])
+                    if (retained := states[job["name"]].get("feedback") or
+                        self._retained_validation_feedback(job["name"], job["assignment"])) is not None}
+        rounds = range(self.config["limits"]["max_rounds"])
         # A multi-provider run uses a small rolling dispatch buffer.  The
         # execution runtime already backfills a returned slot immediately;
         # keeping the buffer bounded avoids unbounded prompt retention while
@@ -550,7 +647,7 @@ class SurveyRunner(ExecutionRuntime):
                 for job in wave:
                     self.serial += 1
                     repair = feedback.get(job["name"])
-                    assignment = {**job["assignment"], **({"validation_feedback": repair} if repair else {})}
+                    assignment = self._repair_assignment(job, repair)
                     client = deepcopy(self.config["model"])
                     if isinstance(job.get("model_overrides"), dict):
                         client.update(job["model_overrides"])
@@ -564,7 +661,14 @@ class SurveyRunner(ExecutionRuntime):
                     task_id, actor = spec["task_id"], spec["actor"]
                     outcome = outcomes[task_id]
                     if not outcome["ok"]:
-                        failures.append(f"{job['name']}: {outcome['error']}")
+                        if outcome.get("status_code") != 429:
+                            attempts = states[job["name"]].get("repair_attempts", 0) + 1
+                            states[job["name"]] = cache.put(keys[job["name"]], {
+                                "status": "blocked" if attempts >= self.config["limits"]["max_rounds"] else "repairing",
+                                "repair_attempts": attempts, "feedback": feedback.get(job["name"]),
+                                "error": f"{job['name']}: {outcome['error']}",
+                            })
+                        failures.append(outcome)
                         continue
                     result = ModelResult(**outcome["result"])
                     execution = outcome["record_ref"]
@@ -583,24 +687,49 @@ class SurveyRunner(ExecutionRuntime):
                         job["validator"](value)
                     except (ValidationError, TypeError, ValueError, KeyError) as exc:
                         feedback[job["name"]] = {"error": str(exc), "previous_response": value,
+                            "finish_reason": result.finish_reason,
                             "scope": "Repair only this assignment's contract violations; preserve every valid field. "
                                      "Use every requested field name and enum value exactly as specified; do not substitute synonyms."}
                         self.tasks.transition(task_id, "blocked", "command.controller", reason=str(exc))
-                        self._publish(f"command/validation/{task_id}", "note", {"error": str(exc)},
+                        self._publish(f"command/validation/{task_id}", "note",
+                                      {"error": str(exc), "finish_reason": result.finish_reason},
                                       "command.controller", subjects=[proposal["artifact_ref"]])
+                        attempts = states[job["name"]].get("repair_attempts", 0) + 1
+                        exhausted = attempts >= self.config["limits"]["max_rounds"]
+                        states[job["name"]] = cache.put(keys[job["name"]], {
+                            "status": "blocked" if exhausted else "repairing",
+                            "repair_attempts": attempts, "feedback": feedback[job["name"]],
+                            "error": f"{job['name']} did not satisfy its evidence contract: {exc}",
+                        }, subjects=[proposal["artifact_ref"]])
                         rejected.append(job)
                         continue
                     self._ensure_active()
+                    cache.put(keys[job["name"]], {
+                        "status": "succeeded", "value": value, "execution_ref": execution,
+                    }, subjects=[execution])
                     if job.get("on_valid"):
                         job["on_valid"](value, execution)
                     self._complete(task_id)
                     results[job["name"]] = (value, execution)
                 if failures:
-                    raise ValidationError("model dispatch failed: " + "; ".join(failures))
+                    if not any(item.get("status_code") == 429 for item in failures):
+                        exhausted = [states[job["name"]]["error"] for job in wave
+                                     if states[job["name"]].get("status") == "blocked"]
+                        if exhausted:
+                            raise ModelWorkBlocked("; ".join(exhausted))
+                    self._raise_dispatch_failures(failures, "model dispatch failed")
+            if not rejected:
+                return results
+            exhausted = [job for job in rejected if states[job["name"]].get("status") == "blocked"]
+            resolved = {job["name"] for job in exhausted if abstain(job, states[job["name"]])}
+            exhausted = [job for job in exhausted if job["name"] not in resolved]
+            rejected = [job for job in rejected if job["name"] not in resolved]
+            if exhausted:
+                raise ModelWorkBlocked("; ".join(states[job["name"]]["error"] for job in exhausted))
             if not rejected:
                 return results
             pending = rejected
-        raise ValidationError("; ".join(
+        raise ModelWorkBlocked("; ".join(
             f"{job['name']} did not satisfy its evidence contract: {feedback[job['name']]['error']}" for job in pending))
 
     def _plan_validator(self, value):
@@ -638,6 +767,8 @@ class SurveyRunner(ExecutionRuntime):
             client = deepcopy(definition["client"])
             if definition["adapter"] == "mcp_fetch":
                 client.update(cwd=str(self.operations.workspace_dir(definition["id"])), own_process_group=False)
+            if self.resume_session:
+                self.operations.reconcile_interrupted(definition["id"], resume_ref=self.resume_session["artifact_ref"])
             self.operations.register(definition["id"], adapter=definition["adapter"], client=client,
                 representative=definition["representative"], environment_files=definition["environment_files"],
                 engineer="operations.engineer")
@@ -852,7 +983,7 @@ class SurveyRunner(ExecutionRuntime):
         self.time_policy.observe("setup", time.monotonic() - started)
 
     def _initial_plans(self):
-        plans, jobs, plan_ids = [], [], {}
+        plans, jobs = [], []
         for role in ("research.search-planner", "methods.blind-search-planner"):
             plan_id = role.replace(".", "-")
             retained = self.store.head(f"kb/search-plans/{plan_id}") if self.resume_session else None
@@ -861,36 +992,19 @@ class SurveyRunner(ExecutionRuntime):
                 self._plan_validator(value)
                 plans.append((role, value["queries"], retained["artifact_ref"]))
                 continue
-            task_id = plan_id
-            if self.control._conn.execute(
-                    "SELECT 1 FROM tasks WHERE task_id = ?", (task_id,)).fetchone():
-                task_id = f"{plan_id}-{self.run_id}"
             assignment = {"assignment": "Plan a topic search without assuming a particular research gap.",
                 "phase": "blind_plan", "question": self.score["question"],
                 "seed_terms": self.score["seed_queries"], "max_queries": self.bounds["queries_per_role"],
                 "search_syntax": SEARCH_SYNTAX,
                 "instructions": "Return {queries:[search strings],rationale:string}. Use a distinct terminology or neighboring method family. Do not assert novelty."}
-            plan_ids[task_id] = plan_id
-            jobs.append({"task_id": task_id, "kind": "model", "actor": role, "task_kind": "service",
-                         "params": {"client": self.config["model"], "role": role,
-                                    "prompt": json.dumps(assignment, ensure_ascii=False)}})
+            def integrate(value, execution, *, role=role, plan_id=plan_id):
+                record = self._publish(f"kb/search-plans/{plan_id}", "note", value, role, subjects=[execution])
+                plans.append((role, value["queries"], record["artifact_ref"]))
+            jobs.append({"name": plan_id, "actor": role, "assignment": assignment,
+                         "validator": self._plan_validator, "on_valid": integrate})
         if not jobs:
             return plans
-        self._tick("supervision", count=len(jobs))
-        outcomes = self._call_batch(jobs, max_parallel=self.worker_slots)
-        for job in jobs:
-            outcome = outcomes[job["task_id"]]
-            if not outcome["ok"]:
-                raise ValidationError(f"independent search planning failed: {outcome['error']}")
-            result = ModelResult(**outcome["result"])
-            if result.finish_reason != "stop":
-                raise ValidationError("search planner did not finish normally")
-            value = result.json_object()
-            self._plan_validator(value)
-            self.time_policy.observe("supervision", result.elapsed_seconds)
-            record = self._publish(f"kb/search-plans/{plan_ids[job['task_id']]}", "note", value, job["actor"], subjects=[outcome["record_ref"]])
-            self._complete(job["task_id"])
-            plans.append((job["actor"], value["queries"], record["artifact_ref"]))
+        self._models_checked(jobs, stage="supervision", task_kind="service")
         return plans
 
     def _ingest(self, works, execution, *, admission):
@@ -1125,6 +1239,10 @@ class SurveyRunner(ExecutionRuntime):
                 self.gaps.append({"kind": "full_text_limit", "work_id": wid})
                 break
             self.full_text_attempted.add(wid)
+            self._record(f"command/source-attempts/full-text/{wid}", "note", {
+                "work_id": wid, "url": route["url"], "status": "reserved",
+                "scope": "bounded full-text acquisition; outcome is recorded by the execution task",
+            }, "command.controller", subjects=[self.work_records[wid]["artifact_ref"]])
             try:
                 self._wait_provider("full_text")
                 result, execution = self.operations.run(self.bindings["full_text"],
@@ -1225,7 +1343,8 @@ class SurveyRunner(ExecutionRuntime):
         text = source.get("text", "") if isinstance(source, dict) else ""
         limit = max(0, int(limit))
         projected["text"] = text[:limit]
-        projected["window"] = {"start": 0, "end": len(projected["text"])}
+        start = source.get("window", {}).get("start", 0)
+        projected["window"] = {"start": start, "end": start + len(projected["text"])}
         return projected
 
     def _map_input_limit(self, role):
@@ -1468,36 +1587,12 @@ class SurveyRunner(ExecutionRuntime):
         return [*projected_owner, *projected_comparisons]
 
     def _assessment_source_context(self):
-        """Bound source windows for the final gap decision.
-
-        The assessment receives the compact map plus enough source text to
-        check decisive quotations.  A short prefix is not a safe evidence
-        boundary: a verifier can identify the right passage in the captured
-        paper and then fail closed simply because that passage occurs later
-        in the paper.  Send a complete verified paper when it fits the
-        configured capture budget; retain a bounded prefix only for unusually
-        large captures where a full request would exceed the model context.
-        """
+        """Expose immutable captures before evidence-aware context budgeting."""
         result = []
-        for ref, value in self.source_docs.items():
+        for ref in sorted(self.source_docs):
+            value = self.source_docs[ref]
             representation = value["representation"]
-            limit = self.bounds["context_chars"]
-            if representation == "full_text":
-                # Full-text evidence is the decisive input to eligibility and
-                # refutation.  The current configured capture is at most
-                # 999,999 characters; use the whole document up to a
-                # conservative 100k request budget so equations and methods
-                # near the end remain bindable.  Larger documents stay
-                # bounded and must be treated as insufficient evidence.
-                limit = min(self.bounds["max_text_chars"], 100000)
-            elif representation == "unverified_text":
-                # Keep enough of captured pages to retain the exact spans
-                # surfaced by the map, while still avoiding the full HTML
-                # payload that caused the assessment request to overflow.
-                limit = min(limit, 40000)
-            elif representation == "abstract":
-                limit = min(limit, 2500)
-            text = value["text"][:limit]
+            text = value["text"]
             result.append({"source_ref": ref, "work_id": value["work_id"],
                            "representation": representation,
                            "identity_verified": value.get("identity_verified", False),
@@ -1559,8 +1654,11 @@ class SurveyRunner(ExecutionRuntime):
 
     @staticmethod
     def _project_assessment_sources(sources, *, full_text_chars,
-                                    abstract_chars, unverified_chars):
-        """Retain all source identities with bounded displayed text."""
+                                    abstract_chars, unverified_chars, evidence=()):
+        """Shrink background context without cutting any supplied quotation."""
+        anchors = {}
+        for proof in evidence:
+            anchors.setdefault(proof["source_ref"], []).append(proof)
         projected = []
         for source in sources:
             if not isinstance(source, dict):
@@ -1572,22 +1670,46 @@ class SurveyRunner(ExecutionRuntime):
                 limit = unverified_chars
             else:
                 limit = full_text_chars
-            projected.append(SurveyRunner._project_source_window(source, limit))
+            proofs = anchors.get(source["source_ref"], [])
+            if not proofs:
+                projected.append(SurveyRunner._project_source_window(source, limit))
+                continue
+            offset = source["window"]["start"]
+            start = min(proof["start"] for proof in proofs)
+            end = max(proof["end"] for proof in proofs)
+            if not offset <= start < end <= source["window"]["end"]:
+                raise ValidationError("assessment source omits a required evidence span")
+            # Mandatory evidence is never truncated to meet a nominal profile.
+            # The enclosing admission check decides whether the packet fits.
+            spare = max(0, limit - (end - start))
+            start = max(offset, start - spare // 2)
+            end = min(source["window"]["end"], max(end, start + limit))
+            projected.append({**source, "text": source["text"][start-offset:end-offset],
+                              "window": {"start": start, "end": end}})
         return projected
 
     def _fit_assessment_assignment(self, assignment):
         """Fit the aggregate gap decision to the strictest model route."""
         limit = self._map_input_limit("methods.novelty-verifier")
-        if limit is None:
-            return assignment
+        sources = assignment.get("sources", [])
+        source_lookup = {source["source_ref"]: source for source in sources}
+        # Production captures use absolute offsets. A caller may supply a
+        # windowed source, so use its full retained capture for binding.
+        source_lookup.update({ref: value for ref, value in self.source_docs.items()
+                              if ref in source_lookup})
+        mapped, catalog = index_evidence(assignment.get("map", {}), source_lookup)
+        assignment = {**assignment, "map": mapped, "evidence_catalog": catalog,
+                      "coverage": self._compact_assessment_coverage(assignment.get("coverage", {}))}
+        assignment["coverage"]["source_windows"] = [
+            {key: source[key] for key in ("source_ref", "available_chars", "window")}
+            for source in sources]
 
         def fits(candidate):
             prompt = json.dumps(candidate, ensure_ascii=False)
-            return estimate_input_tokens(SYSTEM, prompt) <= limit
+            return limit is None or estimate_input_tokens(SYSTEM, prompt) <= limit
 
         if fits(assignment):
             return assignment
-        sources = assignment.get("sources", [])
         coverage = self._compact_assessment_coverage(assignment.get("coverage", {}))
         profiles = (
             (100000, 2500, 40000),
@@ -1597,6 +1719,7 @@ class SurveyRunner(ExecutionRuntime):
             (8000, 450, 4000),
             (4000, 250, 2000),
             (2000, 128, 512),
+            (0, 0, 0),
         )
         for full_text_chars, abstract_chars, unverified_chars in profiles:
             candidate = {
@@ -1604,20 +1727,24 @@ class SurveyRunner(ExecutionRuntime):
                 "coverage": coverage,
                 "sources": self._project_assessment_sources(
                     sources, full_text_chars=full_text_chars,
-                    abstract_chars=abstract_chars, unverified_chars=unverified_chars),
+                    abstract_chars=abstract_chars, unverified_chars=unverified_chars,
+                    evidence=catalog),
             }
+            candidate["coverage"]["source_windows"] = [
+                {key: source[key] for key in ("source_ref", "available_chars", "window")}
+                for source in candidate["sources"]]
             if fits(candidate):
                 return candidate
         raise ValidationError(
             "literature gap-assessment assignment cannot fit any configured provider context budget: "
-            f"estimated input exceeds {limit} tokens after bounded source projection")
+            f"required evidence exceeds {limit} tokens; split the assessment scope rather than truncate quotations")
 
     @staticmethod
     def _assessment_statement(statement):
         if not isinstance(statement, dict):
             return {"text": None, "evidence": []}
         return {"text": statement.get("text"), "evidence": [
-            {key: proof.get(key) for key in ("work_id", "source_ref", "quote")
+            {key: proof.get(key) for key in ("work_id", "source_ref", "quote", "start", "end", "quote_sha256")
              if proof.get(key) is not None}
             for proof in statement.get("evidence", []) if isinstance(proof, dict)
         ]}
@@ -1694,28 +1821,35 @@ class SurveyRunner(ExecutionRuntime):
         return bind_source_spans(value, self.source_docs, windows=windows)
 
     def _coverage(self):
+        abstentions = []
+        for record in self._heads("command/survey-abstentions/"):
+            body = self._body(record)
+            current = self.analysis_records.get(body["work_id"])
+            if current and body["entry_sha256"] == current["body_hash"]:
+                abstentions.append(body)
+        identity_counts = Counter(self._body(record)["status"] for record in self.identity_records.values())
         return {"unique_works": len(self.works), "abstracts": sum(w.get("abstract") is not None for w in self.works.values()),
             "verified_full_texts": sum(s["representation"] == "full_text" for s in self.source_docs.values()),
             "bibliographic_identities": {"checked": len(self.identity_records),
-                "verified": sum(self._body(record)["status"] in {"verified", "verified_with_gaps"}
-                                for record in self.identity_records.values()),
-                "conflicted": sum(self._body(record)["status"] == "conflicted"
-                                  for record in self.identity_records.values())},
+                "verified": identity_counts["verified"] + identity_counts["verified_with_gaps"],
+                "conflicted": identity_counts["conflicted"],
+                "unresolved": sum(count for status, count in identity_counts.items()
+                                  if status not in {"verified", "verified_with_gaps", "conflicted"}),
+                "by_status": dict(sorted(identity_counts.items()))},
             "searches": self.search_log, "expansion": self.expansion_log, "access_and_limit_gaps": self.gaps,
             "pagination_remaining": any(query["has_more"] for query in self.search_log),
             "saturated": bool(self.expansion_log and self.expansion_log[-1]["quiet_rounds"] >= self.bounds["saturation_rounds"]),
             "scope": "Recorded finite queries and citation expansion; no exhaustive-coverage claim",
+            "deep_analysis_limit": self.bounds.get("max_analyzed_works", self.bounds["max_works"]),
+            "abstentions": abstentions,
             "source_windows": [{"source_ref": item["source_ref"], "available_chars": item["available_chars"], "window": item["window"]}
-                               for item in self._source_context()]}
+                               for item in sorted(self._source_context(), key=lambda item: item["source_ref"])]}
 
     @staticmethod
     def _source_less_reason():
-        return (
-            "The catalog record is relevant by metadata, but no abstract or verified full text was available, "
-            "so substantive content could not be assessed."
-        )
+        return ABSTENTION_REASONS["source_unavailable"]
 
-    def _materialize_source_less_map(self, wid, basis):
+    def _materialize_source_less_map(self, wid, basis, *, reason=None, scope="source_unavailable"):
         """Commit a deterministic abstention without spending a model call.
 
         A catalog-only work has no textual claim for a model to assess.  The
@@ -1725,7 +1859,7 @@ class SurveyRunner(ExecutionRuntime):
         substantive content.  Preserve the same evidence contract and an
         auditable execution report locally instead.
         """
-        reason = self._source_less_reason()
+        reason = reason or self._source_less_reason()
         null_statement = {"text": None, "evidence": []}
         value = {
             "entries": [{
@@ -1744,9 +1878,9 @@ class SurveyRunner(ExecutionRuntime):
             f"command/executions/survey-map-deterministic-{wid}", "report", {
                 "operation": "literature-map",
                 "outcome": "ok",
-                "execution_kind": "deterministic_source_availability",
+                "execution_kind": "deterministic_abstention",
                 "work_id": wid,
-                "source_refs": [],
+                "source_refs": [ref for ref, source in self.source_docs.items() if source["work_id"] == wid],
                 "model_calls": 0,
                 "reason": reason,
             }, "command.controller", subjects=basis)
@@ -1754,6 +1888,10 @@ class SurveyRunner(ExecutionRuntime):
             f"kb/work-analyses/{wid}", "note", value["entries"][0],
             "research.literature-mapper", subjects=[execution["artifact_ref"], *basis])
         self.analyzed_basis[wid] = list(basis)
+        self._record(f"command/survey-abstentions/{wid}", "note", {
+            "work_id": wid, "reason": reason, "entry_sha256": hashlib.sha256(canonical_bytes(value["entries"][0])).hexdigest(),
+            "scope": scope, "model_calls": 0,
+        }, "command.controller", subjects=[execution["artifact_ref"]])
         self.relationships = {
             key: relation for key, relation in self.relationships.items()
             if relation["source"] != wid
@@ -1762,13 +1900,35 @@ class SurveyRunner(ExecutionRuntime):
     def _map(self):
         requested = []
         basis = {}
+        analysis_limit = self.bounds.get("max_analyzed_works", self.bounds["max_works"])
+        existing = {wid for wid, record in self.analysis_records.items()
+                    if any(self._body(record).get(field, {}).get("text") is not None for field in MAP_FIELDS)}
+        query_terms = set(normalized(self.score["question"]).split())
+        def priority(wid):
+            work = self.works[wid]
+            text = normalized(str(work.get("title", "")) + " " + str(work.get("abstract", "")))
+            return (len(query_terms & set(text.split())),
+                    any(s["work_id"] == wid and s["representation"] == "full_text" for s in self.source_docs.values()))
+        # Reserve part of the declared analysis budget for independent
+        # counter-search, even if its terminology differs from the question.
+        challenge_ids = {self.aliases.get(wid, wid) for row in self.search_log
+                         if row.get("role") == "methods.novelty-challenger"
+                         for wid in row.get("returned_work_ids", [])} & set(self.work_records)
+        reserve = self.bounds.get("challenge_reserve", 0)
+        def ranked(ids):
+            return sorted(ids, key=lambda wid: (*priority(wid), wid), reverse=True)
+        discovery = ranked(set(self.work_records) - existing - challenge_ids)
+        challenges = ranked(challenge_ids - existing)
+        selected = existing | set(discovery[:max(0, analysis_limit - reserve - len(existing))])
+        selected.update(challenges[:max(0, analysis_limit - len(selected))])
         for wid, work in self.work_records.items():
             basis[wid] = [work["artifact_ref"], *([self.identity_records[wid]["artifact_ref"]]
                           if wid in self.identity_records else []),
                           *[ref for ref, source in self.source_docs.items() if source["work_id"] == wid]]
             previous = self._body(self.analysis_records[wid]) if wid in self.analysis_records else None
             relationships = [relation for relation in self.relationships.values() if relation["source"] == wid]
-            if (self.analyzed_basis.get(wid) != basis[wid] or previous is None
+            reopened = wid in selected and self._is_deferred_analysis(wid)
+            if (self.analyzed_basis.get(wid) != basis[wid] or previous is None or reopened
                     or contains_legacy(previous) or contains_legacy(relationships)):
                 requested.append(wid)
         changed = set(requested)
@@ -1779,6 +1939,10 @@ class SurveyRunner(ExecutionRuntime):
         if requested:
             model_requested = []
             for wid in requested:
+                if wid not in selected:
+                    self._materialize_source_less_map(wid, basis[wid], scope="deep_analysis_budget",
+                                                     reason=ABSTENTION_REASONS["deep_analysis_budget"])
+                    continue
                 if any(source["work_id"] == wid for source in self.source_docs.values()):
                     model_requested.append(wid)
                 else:
@@ -1797,13 +1961,19 @@ class SurveyRunner(ExecutionRuntime):
             "publication_metadata_status": "provider_reported_with_separate_identity_reconciliation",
         }, "research.literature-mapper", subjects=[self.register_ref])
 
+    def _is_deferred_analysis(self, wid):
+        record = self.store.head(f"command/survey-abstentions/{wid}")
+        current = self.analysis_records.get(wid)
+        return bool(record and current and self._body(record).get("scope") == "deep_analysis_budget"
+                    and self._body(record).get("entry_sha256") == current["body_hash"])
+
     def _map_job(self, wid, basis, *, review_feedback=None):
         previous = json.loads(self.store.read_body(self.analysis_records[wid]["body_hash"])) if wid in self.analysis_records else None
         old_relationships = [relation for relation in self.relationships.values() if relation["source"] == wid]
         sources = self._map_sources(wid, old_relationships=old_relationships,
                                     review_feedback=review_feedback)
         entry_editable = (self.analyzed_basis.get(wid) != basis or contains_legacy(previous)
-                          or contains_legacy(old_relationships))
+                          or contains_legacy(old_relationships) or self._is_deferred_analysis(wid))
         if review_feedback is not None:
             entry_editable = bool(review_feedback["entry_fields"])
         assignment = {
@@ -1952,6 +2122,33 @@ class SurveyRunner(ExecutionRuntime):
                     "research.literature-mapper", subjects=[execution, *[proof["source_ref"] for proof in relationship["claim"]["evidence"]]])
                 self.relationships[key] = {**relationship, "artifact_ref": record["artifact_ref"]}
 
+        def abstain(state):
+            null = {"text": None, "evidence": []}
+            if review_feedback is not None:
+                updates = {field: deepcopy(null) if field in MAP_FIELDS else
+                           "uncertain" if field == "inclusion" else
+                           ABSTENTION_REASONS["screening_unresolved"]
+                           for field in review_feedback["entry_fields"]}
+                value = {"entry_updates": updates, "relationships": []}
+            else:
+                entry = (deepcopy(previous) if previous is not None and not entry_editable else {
+                    "work_id": wid, "inclusion": "uncertain",
+                    "reason": ABSTENTION_REASONS["contract_exhausted"],
+                    **{field: deepcopy(null) for field in MAP_FIELDS}})
+                value = {"entries": [entry], "relationships": []}
+            value = normalize(value)
+            validate(value)
+            execution = self._record(f"command/survey-abstentions/{wid}", "note", {
+                "work_id": wid, "reason": state["error"], "scope": "contract_exhausted",
+                "withdrawn_fields": list(review_feedback["entry_fields"]) if review_feedback else list(MAP_FIELDS),
+                "entry_sha256": hashlib.sha256(canonical_bytes(effective["value"]["entries"][0])).hexdigest(),
+                "model_calls": 0,
+            }, "command.controller", subjects=basis)
+            gap = {"work_id": wid, "kind": "claim_contract_exhausted", "artifact_ref": execution["artifact_ref"]}
+            if gap not in self.gaps:
+                self.gaps.append(gap)
+            return value, execution["artifact_ref"]
+
         return {"name": f"map-{wid}", "actor": "research.literature-mapper", "assignment": assignment,
                 # Preserve the mission's configured inference profile for
                 # source binding as well.  A compute-rich run may deliberately
@@ -1964,7 +2161,7 @@ class SurveyRunner(ExecutionRuntime):
                        if self.config["model"].get("reasoning_effort") is not None else {}),
                 },
                 "normalizer": normalize,
-                "validator": validate, "on_valid": integrate}
+                "validator": validate, "on_valid": integrate, "on_exhausted": abstain}
 
     def _map_body(self):
         return {"entries": [json.loads(self.store.read_body(r["body_hash"])) for r in self.analysis_records.values()],
@@ -1994,7 +2191,8 @@ class SurveyRunner(ExecutionRuntime):
             return {"text": statement.get("text"), "evidence": proofs}
 
         entries = []
-        for record in self.analysis_records.values():
+        for wid in sorted(self.analysis_records):
+            record = self.analysis_records[wid]
             entry = json.loads(self.store.read_body(record["body_hash"]))
             entries.append({
                 "work_id": entry.get("work_id"),
@@ -2004,7 +2202,8 @@ class SurveyRunner(ExecutionRuntime):
             })
 
         relationships = []
-        for relation in self.relationships.values():
+        for key in sorted(self.relationships):
+            relation = self.relationships[key]
             claim = relation.get("claim") or {}
             relationships.append({
                 "source": relation.get("source"),
@@ -2033,23 +2232,38 @@ class SurveyRunner(ExecutionRuntime):
             )
         }
         coverage_summary.update({
+            "deep_analysis_limit": coverage["deep_analysis_limit"],
+            "abstention_count": len(coverage["abstentions"]),
+            "deferred_analysis_count": sum(row.get("scope") == "deep_analysis_budget" for row in coverage["abstentions"]),
             "search_count": len(coverage.get("searches", [])),
             "search_outcomes": search_counts,
             "gap_count": len(coverage.get("access_and_limit_gaps", [])),
             "gap_kinds": gap_counts,
+            "entry_inclusion_counts": dict(sorted(Counter(entry["inclusion"] for entry in entries).items())),
+            "claimless_entry_count": sum(all(entry[field]["text"] is None for field in MAP_FIELDS) for entry in entries),
+            "abstention_work_ids": sorted(row["work_id"] for row in coverage["abstentions"]),
+            "count_definitions": {
+                "abstention_count": "Current hash-bound controller abstention records, including partial withdrawals; not all uncertain entries or all claimless entries.",
+                "entry_inclusion_counts": "Screening decisions for every current map entry; independent of controller abstention records.",
+                "claimless_entry_count": "Entries with no problem, approach, finding, or limitation assertion; these do not provide scientific support.",
+                "bibliographic_identities": "checked equals verified plus conflicted plus unresolved; by_status is the complete partition of checked records.",
+            },
         })
 
         sources = []
-        for source in self._source_context():
+        for source in sorted(self._source_context(), key=lambda source: source["source_ref"]):
             sources.append({key: source.get(key) for key in (
                 "source_ref", "work_id", "representation", "identity_verified", "available_chars",
             )})
 
         focused_reviews = []
-        for wid, record in self.work_reviews.items():
+        for wid in sorted(self.work_reviews):
+            record = self.work_reviews[wid]
             review = self._body(record)
             focused_reviews.append({
                 "work_id": wid,
+                "review_ref": record["artifact_ref"],
+                "verification_kind": review.get("verification_kind", "source_bound_model_review"),
                 "checks": [{"check_id": check.get("check_id"), "outcome": check.get("outcome")}
                            for check in review.get("checks", [])],
                 "rationale": str(review.get("rationale", ""))[:800],
@@ -2059,12 +2273,42 @@ class SurveyRunner(ExecutionRuntime):
             "coverage": coverage_summary,
             "sources": sources,
             "focused_review_summary": focused_reviews,
+            "review_contract": {
+                "decision": "Whether the retained evidence map faithfully represents the captured sources and its disclosed limitations.",
+                "upstream_checks": "Focused reviewers check individual claims and exact source spans; the acceptance gate replays their pinned executions and validates spans independently.",
+                "downstream_decisions": "Gap nomination and counter-search assess novelty; experiments test the research question; manuscript peer review judges the final contribution.",
+                "question_status": "A research question is not an established claim or a required survey conclusion. Its answer remains undecided by this acceptance decision.",
+                "non_assertions": "Excluded, deferred, and null fields do not assert scientific support. Missing support for an absent assertion is not a source-fidelity failure.",
+                "failure_basis": "Identify a specific unsupported assertion, inconsistent accounting, misrepresented source, or missing focused review. Report incomplete coverage honestly without requiring exhaustive retrieval or an answer to the research question.",
+            },
         }
 
+    def _work_review_exhausted(self, wid):
+        """An unchanged, already-withdrawn work does not gain new repair rounds."""
+        withdrawal = self.store.head(f"kb/claim-withdrawals/{wid}")
+        if withdrawal is None:
+            return False
+        entry = self.analysis_records[wid]
+        inputs = {item["ref"] for item in entry.get("inputs", [])}
+        review = self._body(self.store.get(self._body(withdrawal)["review_ref"]))
+        return (set(self.analyzed_basis[wid]).issubset(inputs)
+                and (withdrawal["artifact_ref"] in inputs or review["entry_ref"] == entry["artifact_ref"]))
+
+    def _exclude_unresolved_work(self, wid, feedback):
+        previous = self.analysis_records[wid]
+        self._materialize_source_less_map(wid, self.analyzed_basis[wid], scope="review_exhausted",
+                                         reason=ABSTENTION_REASONS["review_exhausted"])
+        self._record(f"kb/work-exclusions/{wid}", "note", {
+            "work_id": wid, "retained_analysis_ref": previous["artifact_ref"],
+            "review_ref": feedback["review_ref"], "failed_checks": feedback["checks"],
+            "abstention_ref": self.analysis_records[wid]["artifact_ref"],
+            "reason": "The bounded scientific review did not converge; prior work is retained but not admitted as evidence.",
+        }, "command.controller", subjects=[previous["artifact_ref"], feedback["review_ref"],
+                                           self.analysis_records[wid]["artifact_ref"]])
+
     def _review_work_claims(self):
-        repair_mode = self.config["limits"].get("repair_mode", "bounded")
-        rounds = (itertools.count() if repair_mode == "until_deadline"
-                  else range(self.config["limits"]["max_rounds"]))
+        repair_rounds = self.config["limits"]["max_rounds"]
+        rounds = range(repair_rounds + 1)
         for round_number in rounds:
             self._ensure_active()
             jobs, rejected = [], []
@@ -2077,6 +2321,20 @@ class SurveyRunner(ExecutionRuntime):
                 if self.reviewed_basis.get(wid) == basis:
                     continue
                 entry = json.loads(self.store.read_body(entry_record["body_hash"]))
+                abstention = self.store.head(f"command/survey-abstentions/{wid}")
+                if abstention and not refs and is_explicit_abstention(entry, self._body(abstention)):
+                    checks = [{"check_id": check, "outcome": "passed", "method": "deterministic abstention integrity",
+                               "result": "No substantive statement or relationship is admitted; the recorded limitation remains explicit."}
+                              for check in work_review_checks([])]
+                    record = self._record(f"kb/work-reviews/{wid}", "note", {
+                        "entry_ref": entry_record["artifact_ref"], "relationship_refs": [],
+                        "verification_kind": "deterministic_abstention",
+                        "execution_ref": abstention["artifact_ref"], "checks": checks,
+                        "rationale": "Contract-only verification of an explicit abstention, not scientific support.",
+                    }, "methods.work-reviewer", subjects=basis)
+                    self.work_reviews[wid] = record
+                    self.reviewed_basis[wid] = basis
+                    continue
                 assignment = {
                     "phase": "work_review", "assignment": "Independently audit the entailment of each individual literature claim.",
                     "question": self.score["question"], "entry_ref": entry_record["artifact_ref"],
@@ -2098,7 +2356,7 @@ class SurveyRunner(ExecutionRuntime):
                         "A claim may be scientifically plausible yet unsupported by these sources. Fail each unsupported assertion and state the narrowest evidence-grounded correction."
                 }
                 def integrate(value, execution, *, wid=wid, basis=basis, entry_ref=entry_record["artifact_ref"], refs=refs, relations=relations):
-                    record = self._publish(f"kb/work-reviews/{wid}", "note", {
+                    record = self._record(f"kb/work-reviews/{wid}", "note", {
                         "entry_ref": entry_ref, "relationship_refs": refs, "execution_ref": execution, **value},
                         "methods.work-reviewer", subjects=[entry_ref, *refs, execution])
                     self.work_reviews[wid] = record
@@ -2119,10 +2377,39 @@ class SurveyRunner(ExecutionRuntime):
                 self._models_checked(jobs, stage="unit_review", task_kind="verification")
             if not rejected:
                 return
-            if repair_mode != "until_deadline" and round_number + 1 == self.config["limits"]["max_rounds"]:
-                raise ValidationError("focused literature review remains unresolved: " + ", ".join(wid for wid, _ in rejected))
-            self._models_checked([self._map_job(wid, self.analyzed_basis[wid], review_feedback=feedback)
-                                  for wid, feedback in rejected], stage="revision")
+            exhausted = [(wid, feedback) for wid, feedback in rejected
+                         if round_number == repair_rounds or self._work_review_exhausted(wid)]
+            if exhausted:
+                for wid, feedback in exhausted:
+                    self._exclude_unresolved_work(wid, feedback)
+                self._map()
+                excluded_ids = {wid for wid, _ in exhausted}
+                rejected = [(wid, feedback) for wid, feedback in rejected if wid not in excluded_ids]
+                if not rejected:
+                    self._review_work_claims()
+                    return
+            if round_number + 1 == repair_rounds:
+                # Stop trying to invent a stronger statement from unchanged
+                # sources. Withdraw disputed claims, then independently check
+                # the narrowed map before accepting it.
+                for wid, feedback in rejected:
+                    job = self._map_job(wid, self.analyzed_basis[wid], review_feedback=feedback)
+                    updates = {}
+                    for field in feedback["entry_fields"]:
+                        updates[field] = ({"text": None, "evidence": []} if field in MAP_FIELDS else
+                                          "uncertain" if field == "inclusion" else
+                                          "The captured evidence does not resolve the screening rationale.")
+                    value = {"entry_updates": updates, "relationships": []}
+                    value = job["normalizer"](value)
+                    job["validator"](value)
+                    record = self._publish(f"kb/claim-withdrawals/{wid}", "note", {
+                        "review_ref": feedback["review_ref"], "withdrawn_fields": feedback["entry_fields"],
+                        "withdrawn_relationship_targets": feedback["relationship_targets"],
+                    }, "command.controller", subjects=[feedback["review_ref"]])
+                    job["on_valid"](value, record["artifact_ref"])
+            else:
+                self._models_checked([self._map_job(wid, self.analyzed_basis[wid], review_feedback=feedback)
+                                      for wid, feedback in rejected], stage="revision")
             self._map()
 
     def _accept_survey(self):
@@ -2131,6 +2418,9 @@ class SurveyRunner(ExecutionRuntime):
         self._reconcile_identities()
         self._map()
         self._review_work_claims()
+        if not any(self._body(record)[field]["text"] is not None
+                   for record in self.analysis_records.values() for field in MAP_FIELDS):
+            raise ModelWorkBlocked("No substantive literature claim survived bounded extraction; all entries remain explicit abstentions")
         coverage = self._record("kb/coverage", "coverage_report", self._coverage(), "command.search-coordinator",
                                 subjects=[self.register_ref, *self.query_refs])
         dependencies = [self.score_ref, self.protocol["artifact_ref"], self.map_record["artifact_ref"], coverage["artifact_ref"],
@@ -2145,12 +2435,12 @@ class SurveyRunner(ExecutionRuntime):
             *[source["execution_ref"] for source in self.source_docs.values()]]
         body = {"schema_version": "literature-survey-3", "score_ref": self.score_ref, "protocol_ref": self.protocol["artifact_ref"],
                 "map_ref": self.map_record["artifact_ref"], "coverage_ref": coverage["artifact_ref"],
-                "source_refs": list(self.source_docs), "work_refs": [r["artifact_ref"] for r in self.work_records.values()],
+                "source_refs": sorted(self.source_docs), "work_refs": sorted(r["artifact_ref"] for r in self.work_records.values()),
                 "query_refs": list(self.query_refs),
-                "identity_refs": [r["artifact_ref"] for r in self.identity_records.values()],
-                "dependency_refs": list(dict.fromkeys(dependencies))}
-        body["work_review_refs"] = [r["artifact_ref"] for r in self.work_reviews.values()]
-        bundle = self._publish("kb/surveys/current", "note", body, "research.literature-mapper", subjects=body["dependency_refs"])
+                "identity_refs": sorted(r["artifact_ref"] for r in self.identity_records.values()),
+                "dependency_refs": sorted(set(dependencies))}
+        body["work_review_refs"] = sorted(r["artifact_ref"] for r in self.work_reviews.values())
+        bundle = self._record("kb/surveys/current", "note", body, "research.literature-mapper", subjects=body["dependency_refs"])
         self.survey_revision += 1
         review_packet = self._survey_review_packet()
         value, execution = self._model_checked("survey-review", "methods.survey-reviewer", {
@@ -2159,16 +2449,22 @@ class SurveyRunner(ExecutionRuntime):
             "map": review_packet["map"], "coverage": review_packet["coverage"],
             "sources": review_packet["sources"],
             "focused_review_summary": review_packet["focused_review_summary"],
+            "review_contract": review_packet["review_contract"],
             "relationship_semantics": RELATIONSHIP_SEMANTICS,
-            "required_checks": list(SURVEY_CHECKS),
+            "required_checks": sorted(SURVEY_CHECKS),
             "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
             "instructions": "Return {checks:[{check_id,outcome,method,result}],rationale}. Execute exactly the required checks. "
                 "Outcomes passed/failed/insufficient_evidence/check_failed. Passing approves a faithful bounded survey, not novelty or exhaustive coverage. "
-                "Check accurate coverage/accounting, faithful quotations and source scope, and support for every map claim. "
+                "Check accurate coverage/accounting, faithful quotations and source scope, and support for every asserted map claim. "
+                "The question is a hypothesis for later investigation, not a claim that this survey must prove or disprove. "
+                "A lack of an answer to it is not a failed map-support check. Use the explicit count_definitions rather than equating different counters. "
                 "The focused-review summary records independent exact-span checks; use it as the primary support for map claims. "
                 "The sources list is an inventory only and intentionally contains no source body or image bytes; do not infer text that is not represented. "
+                "Do not require the aggregate packet to repeat source bytes already checked by the pinned focused reviews. "
+                "Null or withdrawn fields do not need content-level support for an absent assertion. "
+                "A partial withdrawal exempts only its absent fields; any surviving assertion still requires source support. "
                 "Unknown facts must stay unknown. Unverified provider metadata is not itself a false assertion if explicitly labeled; "
-                "fail unsupported chronology or superiority inferred from it."
+                "fail unsupported chronology or superiority inferred from it. Keep each check result concise; cite specific problems instead of enumerating the whole corpus."
         }, validate_survey_review, stage="unit_review", task_kind="verification")
         review = self._publish(f"kb/survey-reviews/{self.survey_revision}", "note", {
             "survey_ref": bundle["artifact_ref"], "execution_ref": execution, **value}, "methods.survey-reviewer",
@@ -2250,10 +2546,13 @@ class SurveyRunner(ExecutionRuntime):
             "verified_full_text_refs": [source["source_ref"] for source in assessment_sources
                                         if source["representation"] == "full_text"
                                         and source.get("identity_verified") is True],
-            "required_checks": list(GAP_CHECKS),
+            "required_checks": sorted(GAP_CHECKS),
             "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
-            "instructions": "Return exactly {state:string,rationale:string,comparisons:[{work_id:string,relationship:string,statement:string,evidence:[{work_id:string,source_ref:string,quote:string}]}],checks:[{check_id:string,outcome:string,method:string,result:string}],evidence:[{work_id:string,source_ref:string,quote:string}]}. "
-                "Both top-level evidence and every comparison evidence field must be arrays of evidence objects, never arrays of quote strings. Each evidence item quotes exact available source text. Each quote must be unique in its displayed source window. relationship is solves/partial/different/uncertain. "
+            "instructions": "Return only the final JSON object, with no analysis transcript or preamble: {state:string,rationale:string,comparisons:[{work_id:string,relationship:string,statement:string,evidence:[{evidence_id:string}]}],checks:[{check_id:string,outcome:string,method:string,result:string}],evidence:[{evidence_id:string}]}. "
+                "Select evidence_id values from evidence_catalog; their exact source quotations and offsets are attached deterministically. Never rewrite those quotations or reproduce the catalog in the response. "
+                "If an additional passage is essential, an evidence item may instead contain {work_id,source_ref,quote}, quoting exact visible source text. "
+                "Compare only decision-relevant closest prior works, not the entire work inventory. Keep findings concise and do not repeat the same evidence in explanatory prose. "
+                "Each additional quote must be unique in its displayed source window. relationship is solves/partial/different/uncertain. "
                 "state is refuted_by_prior_work, insufficient_evidence, or eligible_for_experiment. Run exactly all required checks. "
                 "For every check, copy outcome from allowed_check_outcomes exactly; words such as pass, incomplete, inconclusive, or partial are invalid. "
                 "A prior solution supported by decisive full-text quotes refutes the gap even if global search is incomplete. "
@@ -2261,7 +2560,9 @@ class SurveyRunner(ExecutionRuntime):
                 "Use insufficient_evidence if access, source windows, missing closest work, or incomparable conditions prevent the judgment. "
                 "A decisive state is valid only when every required check has outcome=passed. If any check is insufficient_evidence, failed, or check_failed, state must be insufficient_evidence. "
                 "For insufficient_evidence, keep comparisons different or uncertain as warranted by the captured text; do not relabel an abstract sentence as full_text. "
-                "If coverage.access_and_limit_gaps is nonempty or any verified full text is longer than the displayed assessment context, state must be insufficient_evidence because the runner cannot adopt a decisive result. "
+                "Assess whether each coverage gap or omitted source window can change the nominated comparison. "
+                "Use insufficient_evidence for decision-critical omissions; peripheral access failures or bounded source windows alone do not veto a supported comparison. "
+                "Explain material coverage limits in the checks and rationale. Never infer support from undisplayed text. "
                 "When state is decisive, every comparison evidence item for that comparison must remain attached to an exact verified full_text quotation; prefer short contiguous prose spans over rendered equations. "
                 "For refuted_by_prior_work or eligible_for_experiment, cite only the listed verified_full_text_refs for any decisive comparison; "
                 "if no listed full-text quote directly supports the comparison, set the state to insufficient_evidence and use relationship=uncertain. "
@@ -2270,33 +2571,20 @@ class SurveyRunner(ExecutionRuntime):
         }
         assessment_assignment = self._fit_assessment_assignment(assessment_assignment)
         assessment_sources = assessment_assignment["sources"]
-        assessment_source_lookup = {source["source_ref"]: source for source in assessment_sources}
+        assessment_source_lookup = {source["source_ref"]: self.source_docs[source["source_ref"]]
+                                    for source in assessment_sources}
+        windows = {source["source_ref"]: source["window"] for source in assessment_sources}
         verified_full_text_refs = assessment_assignment["verified_full_text_refs"]
-        displayed_lengths = {source["source_ref"]: len(source["text"])
-                             for source in assessment_sources}
-
         def validate_gap_assessment(value):
-            validate_assessment(value, assessment_source_lookup, self.works, require_spans=True)
-            # A decisive literature state cannot be adopted while the
-            # accepted survey still records access, identity, or bounded
-            # coverage gaps.  Treat this as a model-contract rejection so the
-            # normal scoped retry asks for an evidence-bounded abstention,
-            # rather than discovering the contradiction after publication.
-            if value["state"] != "insufficient_evidence" and (self.gaps or any(
-                    len(source["text"]) > displayed_lengths.get(ref, 0)
-                    for ref, source in self.source_docs.items()
-                    if source["representation"] == "full_text")):
-                raise ValidationError("decisive gap state requires complete access and source context")
+            validate_assessment(value, assessment_source_lookup, self.works,
+                                require_spans=True, windows=windows)
 
         value, execution = self._model_checked("gap-assessment", "methods.novelty-verifier",
             assessment_assignment, validate_gap_assessment,
-            normalizer=lambda value: self._bind_assessment_spans(value, assessment_sources),
+            normalizer=lambda value: self._bind_assessment_spans(expand_evidence(
+                value, assessment_assignment["evidence_catalog"], self.source_docs,
+                windows=windows), assessment_sources),
             stage="integrated_review", task_kind="verification")
-        if value["state"] == "eligible_for_experiment" and (self.gaps or any(
-                len(source["text"]) > displayed_lengths.get(ref, 0)
-                for ref, source in self.source_docs.items()
-                if source["representation"] == "full_text")):
-            raise ValidationError("gap eligibility lacks complete access or decisive source context")
         record = self._publish("kb/gap-assessments/current", "note", {
             "survey_ref": self.survey_ref, "nomination_ref": self.nomination_record["artifact_ref"],
             "execution_ref": execution, **value}, "methods.novelty-verifier",
@@ -2321,6 +2609,7 @@ class SurveyRunner(ExecutionRuntime):
 
     def _run(self):
         status, error, decision = "blocked", None, "insufficient_evidence"
+        failure = None
         try:
             if not self.resume_session:
                 self._initialize()
@@ -2334,7 +2623,9 @@ class SurveyRunner(ExecutionRuntime):
                 decision = self._body(self.store.get(self.assessment_ref))["state"]
             else:
                 if not self.survey_ref:
-                    if self.nomination is not None:
+                    review_checkpoint = (self.resume_session and self.map_record is not None
+                                         and "retrieval" not in self.resume_session["reopened_scopes"])
+                    if self.nomination is not None or review_checkpoint:
                         self._accept_survey()
                         self._refresh_countersearch_state()
                     else:
@@ -2374,6 +2665,15 @@ class SurveyRunner(ExecutionRuntime):
         except (Exception, KeyboardInterrupt) as exc:
             error = f"{type(exc).__name__}: {exc}"
             self.blockers.append({"reason": error})
+            if isinstance(exc, KeyboardInterrupt):
+                status = "paused"
+                failure = {"kind": "process_interrupted"}
+            elif isinstance(exc, ProviderCooldownError):
+                status = "paused"
+                failure = {"kind": "provider_cooldown", "retry_after_seconds": exc.retry_after_seconds,
+                           "rate_limit": exc.rate_limit}
+            elif isinstance(exc, ModelWorkBlocked):
+                failure = {"kind": "unchanged_assignment_exhausted"}
         finally:
             for row in self.control._conn.execute("SELECT task_id FROM tasks WHERE state='awaiting_review'").fetchall():
                 self.tasks.transition(row[0], "blocked", "command.controller", reason="Run ended without an accepted scoped output")
@@ -2392,6 +2692,7 @@ class SurveyRunner(ExecutionRuntime):
                     pass
             self._checkpoint(status, force=True)
         result = {"run_id": self.run_id, "project_id": self.config["project_id"], "status": status, "error": error,
+            "failure": failure,
             "incumbent_ref": self.incumbent,
             "score_ref": getattr(self, "score_ref", None), "survey_ref": self.survey_ref, "survey_current": current,
             "assessment_ref": self.assessment_ref, "assessment_current": assessment_current,
@@ -2419,7 +2720,7 @@ class SurveyRunner(ExecutionRuntime):
         (output / "bibliographic-identities.json").write_bytes(canonical_bytes([
             self._body(record) for record in self.identity_records.values()]))
         (output / "coverage.json").write_bytes(canonical_bytes(self._coverage()))
-        if hasattr(self, "map_record"):
+        if self.map_record is not None:
             (output / "literature-map.json").write_bytes(canonical_bytes({
                 "survey_ref": self.survey_ref, "survey_current": result["survey_current"],
                 "map_ref": self.map_record["artifact_ref"], "map": self._map_body()}))

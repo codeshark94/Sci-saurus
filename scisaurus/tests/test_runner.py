@@ -108,6 +108,13 @@ def config(mode='pass'):
 
 
 class TestParagraphRunner(unittest.TestCase):
+    def test_process_stop_is_exported_without_retry(self):
+        runner = ParagraphRunner(self.path, config())
+        with patch.object(runner, '_retrieve', side_effect=KeyboardInterrupt('termination requested')):
+            result = runner.run()
+        self.assertEqual(result['status'], 'paused')
+        self.assertEqual(result['failure'], {'kind': 'process_interrupted'})
+
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(prefix='scisaurus-runner-test-')
         self.path=Path(self.temp.name)/'project'
@@ -294,7 +301,8 @@ class TestParagraphRunner(unittest.TestCase):
             return original(runner, phase, **kwargs)
         with patch.object(ParagraphRunner, "_checkpoint", interrupt):
             result, _ = self.run_mode("timeout")
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["status"], "paused")
+        self.assertEqual(result["failure"], {"kind": "process_interrupted"})
         control = ControlStore(self.path)
         self.assertEqual(control._conn.execute("SELECT state FROM attempts WHERE task_id='supervise'").fetchone()[0], "result_unknown")
         self.assertEqual(control._conn.execute("SELECT state FROM tasks WHERE task_id='supervise'").fetchone()[0], "blocked")
@@ -353,7 +361,8 @@ class TestParagraphRunner(unittest.TestCase):
             return original(runner, phase, **kwargs)
         with patch.object(ParagraphRunner, "_checkpoint", terminate_during_call):
             result, _ = self.run_mode("timeout")
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["status"], "paused")
+        self.assertEqual(result["failure"], {"kind": "process_interrupted"})
         self.assertEqual(signal.getsignal(signal.SIGTERM), previous_handler)
         control = ControlStore(self.path)
         self.assertEqual(control._conn.execute("SELECT state FROM attempts WHERE task_id='supervise'").fetchone()[0], "result_unknown")

@@ -7,6 +7,7 @@ import re
 import unicodedata
 
 from scisaurus.core.errors import ValidationError
+from scisaurus.core.schema import canonical_bytes
 
 
 LEGACY_EVIDENCE_FIELDS = {"work_id", "source_ref", "quote"}
@@ -19,6 +20,63 @@ def contains_legacy(value) -> bool:
     if isinstance(value, list):
         return any(contains_legacy(child) for child in value)
     return False
+
+
+def evidence_id(proof):
+    return "ev-" + hashlib.sha256(canonical_bytes(proof)).hexdigest()[:24]
+
+
+def index_evidence(value, sources):
+    """Replace repeated exact quotations with stable IDs in a model packet."""
+    bound = bind(value, sources)
+    catalog = {}
+
+    def visit(item):
+        if isinstance(item, dict):
+            if set(item) == SPAN_EVIDENCE_FIELDS:
+                identifier = evidence_id(item)
+                catalog[identifier] = {"evidence_id": identifier, **item}
+                return {"evidence_id": identifier}
+            return {key: visit(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [visit(child) for child in item]
+        return item
+
+    projected = visit(bound)
+    return projected, [catalog[key] for key in sorted(catalog)]
+
+
+def expand_evidence(value, catalog, sources, *, windows=None):
+    """Replay evidence IDs only against exact, visible, content-bound records."""
+    if not isinstance(catalog, list):
+        raise ValidationError("evidence catalog must be a list")
+    lookup = {}
+    for item in catalog:
+        if not isinstance(item, dict) or set(item) != SPAN_EVIDENCE_FIELDS | {"evidence_id"}:
+            raise ValidationError("evidence catalog entries require exact spans and an ID")
+        proof = {key: item[key] for key in SPAN_EVIDENCE_FIELDS}
+        identifier = item["evidence_id"]
+        if identifier != evidence_id(proof) or identifier in lookup:
+            raise ValidationError("evidence catalog ID is duplicated or does not match its content")
+        source = sources.get(proof["source_ref"])
+        if source is None or source.get("work_id") != proof["work_id"]:
+            raise ValidationError("evidence catalog identifies an unavailable source or different work")
+        validate(proof, source, require_span=True,
+                 window=(windows or {}).get(proof["source_ref"]))
+        lookup[identifier] = proof
+
+    def visit(item):
+        if isinstance(item, dict):
+            if "evidence_id" in item:
+                if set(item) != {"evidence_id"} or not isinstance(item["evidence_id"], str) or item["evidence_id"] not in lookup:
+                    raise ValidationError("evidence selection must identify exactly one supplied evidence ID")
+                return deepcopy(lookup[item["evidence_id"]])
+            return {key: visit(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [visit(child) for child in item]
+        return item
+
+    return visit(value)
 
 
 def quote_sha256(quote: str) -> str:
@@ -223,6 +281,10 @@ def bind(value, sources: dict, *, windows: dict | None = None) -> dict:
                                 and 0 <= start < end <= len(text)
                                 and text[start:end] == item.get("quote")
                                 and item.get("quote_sha256") == quote_sha256(item.get("quote"))):
+                            try:
+                                validate(item, source, require_span=True, window=window)
+                            except ValidationError as exc:
+                                errors.append(f"{path}: {exc}")
                             return
                     item.update(locate(source, item.get("quote"), window=window))
                 except ValidationError as exc:

@@ -38,6 +38,128 @@ The first frontier can still contain only one stage when hard evidence
 dependencies require it; adaptive control does not let an experiment outrun
 its literature gate.
 
+`progression_policy: full_pass` separates a first research pass from publication
+admission. A current, independently accepted survey with unresolved novelty can
+admit an explicitly **exploratory** experiment; it cannot assert an original
+contribution. Unresolved maturity and intermediate adversarial findings travel
+with the evidence to the paper panel. Refuted topics, invalid artifacts, missing
+dependencies and provider failures do not become successful research. The
+legacy `evidence_first` policy remains the default for existing workflows.
+
+Completed specialist assignments and checked survey responses are retained by
+their exact input, role, contract and model configuration. Successful siblings
+are saved before a failed sibling is propagated. Completed stage production is
+also reused when only an outer review failed; reuse checks the saved output
+hash. These records survive process restart. Changed evidence or a scoped work
+order admits new work rather than silently reusing a stale answer.
+
+Survey discovery and deep analysis have separate limits. Optional
+`survey.search.max_analyzed_works` bounds per-work mapping and semantic review;
+`max_works` still bounds the catalog. The declared `challenge_reserve` keeps
+analysis capacity for independent counter-search. Entries outside that scope
+remain explicit deferrals, with no scientific assertions. Previously completed
+analysis is retained even when it exceeds a newly declared first-pass budget.
+Continuation work orders can widen the analysis scope alongside retrieval.
+
+When a map assignment exhausts its schema repairs, only its granted disputed
+fields and relationships are withdrawn. Valid siblings and protected fields
+remain intact, and surviving assertions still require independent review.
+Claimless abstentions receive hash-bound deterministic verification, never a
+fabricated model verdict. An entirely unsupported corpus cannot pass admission.
+Aggregate survey review judges source fidelity and disclosed coverage, not
+whether literature already answers the experimental question. Its packet
+separates screening decisions, controller abstentions, and claimless entries;
+bibliographic identity counts include the unresolved partition. Novelty and
+experimental conclusions remain downstream decisions, not survey prerequisites.
+If scientific critique still rejects a work after its bounded revisions, that
+work is excluded from current evidentiary support. Its prior analysis and exact
+failed reviews remain linked in `kb/work-exclusions/`; other independently
+verified work can proceed. Unchanged source/withdrawal bindings preserve this
+exhaustion decision on resume without starting another repair allowance.
+Restart restores per-work commits newer than the aggregate checkpoint and
+preserves cached review identities. A runtime-contract change reopens stage
+admission without invalidating successful source-level model work.
+Execution and acceptance use the same strict model-response parser, including
+bounded JSON fences and provider reasoning envelopes. Duplicate keys and
+non-finite values remain invalid. An unchanged survey bundle keeps its exact
+artifact identity so a failed acceptance commit can reuse its completed review.
+Gap-assessment context reduction preserves every map quotation within its
+recorded source window, including passages near the end of an abstract. Repeated
+quotations are indexed once by content-bound evidence IDs; the runtime and the
+acceptance gate independently expand those IDs to exact source spans. Unknown
+IDs, altered catalog records and citations outside the displayed window fail
+validation. Coverage reports the actual displayed windows, not pre-projection
+boundaries. If mandatory evidence cannot fit, admission fails before a paid call
+rather than silently dropping its source text.
+An output-limit failure retains its raw response as an artifact but does not
+echo an unfinished reasoning transcript into the repair prompt. The original
+source assignment and output contract remain intact, and the same durable
+repair allowance still applies.
+Review-only resume starts at the retained map checkpoint rather than replaying
+initial acquisition. Failed or uncertain full-text attempts retain their
+acquisition allowance; explicit retrieval reopening is a separate decision.
+If the survey is already accepted and only gap assessment failed, recovery
+reopens that assessment alone. The accepted survey and completed counter-search
+are revalidated from their durable dependencies, not resubmitted to models.
+Interrupted operational probes can be rebound only after their calls and
+resource reservations are reconciled, and must pass a fresh independent probe.
+
+Repair allowances belong to the input, not the retry process. Survey assignments
+use `limits.max_rounds` even inside a deadline-governed mission. Identical stage
+failures share that limit, or the declared retry count, or three attempts when
+neither is specified. Exhausted technical work is recorded as
+`ModelWorkBlocked`; restarting does not replenish its allowance. Scientific
+holds instead produce scoped continuation work. A provider 429 is returned to
+the scheduler immediately, with a durable pool cooldown and parsed Retry-After;
+switching model names within that account does not bypass the cooldown.
+
+Generated experiment capabilities use the same durable work ledger. Every
+authoring request reserves a conservative call before dispatch, records the raw
+response and reported usage immediately, then runs the sandbox admission checks.
+The author returns executor source, validator source and experimental intent;
+runtime provenance and configured test data belong to the controller. Repairs
+replace only explicitly updated code or intent fields. Unchanged source is
+retained. Source repairs can use ordered exact-text edits; each match must be
+unique, stale or ambiguous edits fail atomically, and the assembled candidate
+still runs every admission check. Scientific correction instructions remain a
+structured input even when the display error is abbreviated. Failed checks and
+metric mismatches are projected before successful checks, so long verdicts cannot
+hide the cause of rejection. A retained repair is bound to its original source
+base, including across validation-contract changes.
+Installed package pins are checked before authoring. Virtual-environment launcher
+paths are preserved, and their runtime files are scoped into the sandbox by
+`pyvenv.cfg`; figure caches remain inside the workspace. Compilation and live
+execution share the same input envelope, including optional quality contracts.
+After deterministic replay and recalculation, a separate methods model reviews
+the complete executor and validator source against the declared method, observed
+metrics and input variation. Arithmetic agreement alone cannot approve a
+scientifically invalid estimator. Its verdict and usage are retained against the
+exact candidate hash; rejection returns concrete corrections to the author.
+Malformed or truncated review responses permit one format repair using a
+configured alternative when available, without echoing unfinished reasoning.
+Valid rejections never trigger model substitution. The repair allowance and
+all calls remain charged across restarts. Validator launchability is checked
+before the numerical experiment, and a late verdict cannot register a capability.
+Legacy capabilities without this independent review are re-admitted as new
+immutable revisions before Composer can reuse them.
+A first-pass pilot is classified as exploratory before program authoring, not
+relabelled after generation. Capability compilation and registry integrity do
+not grant literature eligibility: a novel-research capability may be compiled
+with its quality contract, but its actual experiment still requires the current
+literature gate. Both schemas accept the same optional quality-contract field.
+A retained response resumes validation without another model call. An unchanged
+repair error, including an alternating error cycle, ends that assignment instead of replaying the configured attempt
+limit; changed input or validation contracts are distinct work. Duplicate result
+IDs report both conflicting locations, and conditional metrics must use unique
+declared identities. Numerical failures retain a bounded summary of actual
+metrics and input variation for repair. Identical failed programs are not
+executed again within the same work contract. Sandbox execution and validation
+phases are checkpointed separately from model requests.
+Model requests and sandbox executions are capped by the
+remaining mission deadline. Composer reconciles foundry usage from this ledger
+on every checkpoint and restart. Runs predating the ledger may lack historical
+authoring token totals; these are not reconstructed as invented measurements.
+
 The Composer owns procedure and portfolio control: agenda selection, dependency
 binding, time admission, resource accounting, pause/resume state, deadline-
 governed continuation, and the release proposal. It does not author accepted evidence, convert an unresolved
@@ -134,8 +256,10 @@ explanatory depth, comparison design, contribution potential, and
 falsifiability. A direction that clears the full maturity floor is admitted. A
 direction that has substance in every dimension but still lacks journal-level
 mechanism or contribution depth is retained as `provisional_for_survey`; its
-required changes travel with it, and it cannot reach an experiment unless the
-survey establishes `eligible_for_experiment`. A direction below the exploratory
+required changes travel with it. Under `evidence_first` it cannot reach an
+experiment unless the survey establishes `eligible_for_experiment`; `full_pass`
+also permits a clearly labelled exploratory pilot after a current survey and
+assessment. A direction below the exploratory
 floor is regenerated with a substantive change. The topic artifact keeps
 the accepted review chain and a separate history of rejected or refined
 directions, so a later selection cannot inherit a misleading aggregate score. A topic stage
@@ -304,24 +428,30 @@ and release gate.
 After composition, the paper uses a real bounded peer-review cycle. The same
 reviewer panel inspects the incumbent in round one, the author applies only
 the named surgical repairs, and the same panel receives the revised incumbent
-for re-review. Empirical journal papers require three rounds; the final round
-must pass the journal editor and the deterministic editor-in-chief decision.
+for re-review. An accepted, complete independent panel is not repeated on the
+same manuscript merely to fill a round count. The final round must pass the
+journal editor and the deterministic editor-in-chief decision.
 Reviewers can add first-class `research_requests` for an additional experiment,
 literature expansion, interpretation expansion, or analysis repair. Such a
 request cannot be discharged by rewriting prose: the paper stage stops with
 `research_expansion_required`, routes the request to the owning department,
-and refuses PDF release. If the panel still has material findings at the end
+and refuses PDF release. Each round first saves an unapproved PDF and every page
+image under `review-round-N/preview`, with manuscript and PDF hashes in
+`review-round-N/render.json`. Editorial receives all page images in bounded
+batches; a rendered preview is not an approved release. The journal editor
+applies top-tier contribution, evidence, controls, uncertainty, robustness and
+reproducibility criteria and requests scoped upstream work for substantive gaps.
+If the panel still has material findings at the end
 of the cycle, the editor records `review_rejected` rather than publishing a
 review-limit candidate.
 
-Survey mapping and focused-review repairs are a separate control loop. A
-long-running autonomous survey may set `limits.repair_mode` to
-`until_deadline`; malformed model output is then returned to the same scoped
-assignment until the survey wall or its admission policy closes. When the
-Composer retry mode is `until_deadline`, it projects the same repair setting
-into experiment validation and topic intake, so legacy `max_rounds` and
-`max_attempts` values cannot end a deadline-governed repair loop early. The
-three-round limit above remains the independent manuscript peer-review rule.
+Survey mapping and focused-review repairs are a separate, bounded control loop.
+After the allowed repairs, disputed claims are withdrawn into explicit unknowns
+and independently checked again. A failed final check still blocks adoption.
+Optional repair-response echoes are fitted to the input budget without cutting
+source evidence. A peripheral access failure alone does not invalidate a
+supported literature comparison; decisive comparisons still require current,
+verified full-text quotations and all required checks.
 
 Score-3 research-paper descriptors use `empirical_journal` when they do not
 carry an explicit profile, so an omitted field cannot silently lower the desk
@@ -423,9 +553,11 @@ python3 -m scisaurus.cli composer-interim-report /path/to/composer-project
 `hard_seconds` are explicit workflow fields; a ten-hour run is represented by
 `hard_seconds: 36000` and stage deadlines that fit inside it. An optional
 `retry_policy` supplies a backoff and may use `mode: until_deadline` for a
-long autonomous mission. In that mode a failed stage is retried in fresh
-isolated directories for as long as the stage and workflow deadlines admit;
-there is no arbitrary attempt-count stop. If a full downstream estimate no
+long autonomous mission. This keeps provider-reset waits and evidence-changing
+continuations open, but does not replenish an unchanged assignment's repair
+allowance. Survey retries resume the same durable workspace; other stage
+attempts remain isolated while exact completed production can be retained.
+If a full downstream estimate no
 longer fits, the Composer still admits the next stage into the residual window
 until its small control-plane margin, and records any incomplete closure in the
 interim report. This deadline-governed mode is the default when no retry policy
@@ -436,8 +568,9 @@ attempt contract and pauses before a required closure that cannot fit.
 re-entry open by default; `mode: bounded` with `max_cycles` is available for
 small deterministic workflows. This is not a retry count. A retry never
 overwrites the failed attempt and never turns an exception into success. If the
-hard deadline is exhausted, the run becomes `blocked` with every attempt and
-the next recovery condition recorded. Checkpoints persist the wall-clock start
+hard deadline is exhausted after work has started, the run becomes `paused`
+with every attempt and the next recovery condition recorded. An already-expired
+mission that cannot admit any work remains `blocked`. Checkpoints persist the wall-clock start
 and deadline, so a process restart cannot reset the mission's hard window. A
 checkpoint keeps the latest completed stage visible throughout; completion is
 never reported merely because a provider returned text.

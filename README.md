@@ -240,6 +240,7 @@ before using live providers.
 | [Project organization](docs/15-project-organization.md) | Rosters, contracts, custom organizations, and Operations Cell |
 | [Agent / department / stage flow](docs/16-agent-department-flow.md) | Routing, assignments, handoffs, and scoped continuation |
 | [Composer runtime](docs/110-composer-runtime.md) | End-to-end stage admission, review, reallocation, and resume |
+| [Critical review articles](docs/115-review-articles.md) | Journal/theme scouting, review benchmarks, original synthesis, and rendered peer review |
 | [Local dashboard](docs/120-local-dashboard.md) | Workspace overview, project drill-down, research progress, bounded project creation, and Composer start/resume |
 | [Literature survey](docs/75-literature-survey-score.md) | Search, source spans, citation maps, and gap assessment |
 | [Experiment runtime](docs/90-experiment-runtime.md) | Frozen studies, replay, recalculation, and result packages |

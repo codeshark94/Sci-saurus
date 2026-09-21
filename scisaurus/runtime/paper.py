@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+import time
 import unicodedata
 
 from scisaurus.core.documents import Documents
@@ -34,6 +36,33 @@ from scisaurus.runtime.scholarly_depth import (
 )
 from scisaurus.runtime.scientific_interpretation import validate_interpretation
 from scisaurus.runtime.scientific_surface import validate_scientific_surface
+
+
+def resolve_compile_script(configured=None):
+    """Resolve an explicit compiler adapter or the installed LaTeX plugin."""
+    requested = configured or os.environ.get("SCISAURUS_LATEX_COMPILE_SCRIPT")
+    if requested:
+        script = Path(requested).expanduser().resolve()
+        if not script.is_file():
+            raise ValidationError(f"LaTeX compiler adapter is missing: {script}")
+        return script
+    on_path = shutil.which("compile_latex.py")
+    if on_path:
+        return Path(on_path).resolve()
+    codex_root = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    installed = list((codex_root / "plugins/cache/openai-bundled/latex").glob("*/scripts/compile_latex.py"))
+    if installed:
+        return max(installed, key=lambda path: tuple(int(part) for part in
+            re.findall(r"\d+", path.parents[1].name))).resolve()
+    raise ValidationError("No LaTeX compiler adapter found; set SCISAURUS_LATEX_COMPILE_SCRIPT")
+
+
+def validate_render_environment(compile_script=None):
+    script = resolve_compile_script(compile_script)
+    missing = [name for name in ("pdfinfo", "pdftoppm") if not shutil.which(name)]
+    if missing:
+        raise ValidationError("PDF visual verification requires " + ", ".join(missing))
+    return script
 
 
 _SEMANTIC_STOPWORDS = {
@@ -65,7 +94,7 @@ def _text_supports_phrase(phrase, text, *, minimum=2, fraction=0.3):
     return matched >= min(minimum, len(source)) and matched / len(source) >= fraction
 
 
-def load_paper_survey(config):
+def load_paper_survey(config, *, require_eligible=True):
     """Load the current accepted survey basis named by a paper config.
 
     Survey loading is shared by the pre-composition admission gate and the
@@ -79,7 +108,7 @@ def load_paper_survey(config):
         gate.require_current(config["survey_ref"])
         assessment = gate.require_current_assessment(config["assessment_ref"])
         body = json.loads(store.read_body(assessment["body_hash"]))
-        if config["document_type"] == "research_paper" and body["state"] != "eligible_for_experiment":
+        if require_eligible and config["document_type"] == "research_paper" and body["state"] != "eligible_for_experiment":
             raise ValidationError("a research paper candidate requires an experiment-eligible accepted gap assessment")
         survey_record = store.get(config["survey_ref"])
         survey = json.loads(store.read_body(survey_record["body_hash"]))
@@ -449,7 +478,194 @@ def _result_supported(result, evidence, text):
     return not anchors or any(anchor in text_lower for anchor in anchors)
 
 
-class PaperReleaseBuilder:
+class ManuscriptRenderer:
+    """Render structured manuscripts independently of scientific release admission."""
+
+    def __init__(self, directory, config, *, deadline_epoch=None):
+        self.dir = Path(directory).resolve()
+        self.config = config
+        self.deadline_epoch = deadline_epoch
+
+    def _tex(self, manuscript, results=None):
+        lines = [r"\documentclass[11pt]{article}", r"\usepackage[margin=1in]{geometry}",
+                 r"\usepackage[hidelinks]{hyperref}", r"\usepackage{microtype}", r"\usepackage[T1]{fontenc}",
+                 r"\usepackage{graphicx}", r"\usepackage{float}", r"\newsavebox{\scisaurustablebox}",
+                 r"\title{" + _latex(manuscript["title"]) + "}",
+                 r"\author{" + _latex(", ".join(self.config["authors"])) + "}", r"\date{}", r"\begin{document}",
+                 r"\maketitle"]
+        figures = [asset for asset in (results or {}).get("assets", []) if asset.get("role") == "figure"]
+        figure_by_unit = {}
+        if self.config.get("schema_version") == "paper-release-score-3":
+            for argument in self.config.get("figure_arguments", []):
+                figure_by_unit.setdefault(argument["unit_id"], []).append(argument["asset_id"])
+        figure_lookup = {asset["id"]: asset for asset in figures if isinstance(asset.get("id"), str)}
+        placed = set()
+
+        def figure_lines(asset):
+            placed.add(asset.get("id", asset["path"]))
+            return [r"\begin{figure}[H]", r"\centering",
+                    r"\includegraphics[width=0.78\linewidth]{\detokenize{../assets/" + asset["path"] + "}}",
+                    r"\caption{" + _latex(asset["caption"]) + "}", r"\end{figure}"]
+
+        for group in manuscript["groups"]:
+            lines.append(r"\section{" + _latex(group["title"]) + "}")
+            for unit in group["units"]:
+                if unit["kind"] == "list_item":
+                    lines.extend([r"\begin{itemize}", r"\item " + _latex_with_citations(unit["text"]), r"\end{itemize}"])
+                elif unit["kind"] == "table":
+                    # Table units use a small, reader-facing pipe-delimited
+                    # representation: first line is the caption, second line
+                    # the header, and remaining lines the data rows. Keeping
+                    # the source as plain text lets the structured manuscript
+                    # and review layers inspect exactly the values rendered.
+                    raw_rows = [line.strip() for line in unit["text"].splitlines() if line.strip()]
+                    if len(raw_rows) < 3:
+                        raise ValidationError("table units require a caption, header, and rectangular rows")
+                    caption = raw_rows[0]
+                    header = [cell.strip() for cell in raw_rows[1].split("|")]
+                    data_rows, notes = [], []
+                    for line in raw_rows[2:]:
+                        if "|" not in line or re.match(r"^\([a-z]\)\s", line, re.I):
+                            # Table footnotes are reader-facing scientific
+                            # text, not data rows. Keep them in the rendered
+                            # table instead of dropping their qualification.
+                            notes.append(line)
+                            continue
+                        row = [cell.strip() for cell in line.split("|")]
+                        if len(row) != len(header):
+                            raise ValidationError("table units require a caption, header, and rectangular rows")
+                        data_rows.append(row)
+                    if not header or not data_rows:
+                        raise ValidationError("table units require a caption, header, and rectangular rows")
+                    lines.extend([r"\begin{table}[htbp]", r"\centering", r"\small",
+                                  r"\caption{" + _latex(caption) + "}",
+                                  r"\begin{lrbox}{\scisaurustablebox}",
+                                  r"\begin{tabular}{" + "r" * len(header) + "}", r"\hline",
+                                  " & ".join(r"\textbf{" + _latex(cell) + "}" for cell in header) + r" \\", r"\hline"])
+                    for row in data_rows:
+                        lines.append(" & ".join(_latex_with_citations(cell) for cell in row) + r" \\")
+                    lines.extend([r"\hline", r"\end{tabular}", r"\end{lrbox}",
+                                  r"\ifdim\wd\scisaurustablebox>\linewidth",
+                                  r"\resizebox{\linewidth}{!}{\usebox{\scisaurustablebox}}",
+                                  r"\else\usebox{\scisaurustablebox}\fi"])
+                    if notes:
+                        lines.append(r"\parbox{0.95\linewidth}{\footnotesize "
+                                     + _latex(" ".join(notes)) + "}")
+                    lines.extend([r"\end{table}", ""])
+                elif unit["kind"] in {"code", "json"}:
+                    lines.extend([r"\begin{verbatim}", unit["text"], r"\end{verbatim}"])
+                else:
+                    lines.extend([_latex_with_citations(unit["text"]), ""])
+                # Score-3 figures are part of the argument and belong beside
+                # the unit that states their observation.  Keeping the
+                # binding here preserves the manuscript's claim-to-display
+                # order in the rendered PDF; legacy score-1/2 descriptors
+                # retain their appendix-style figure section below.
+                for asset_id in figure_by_unit.get(unit.get("id"), ()):
+                    asset = figure_lookup.get(asset_id)
+                    if asset is not None:
+                        lines.extend(figure_lines(asset))
+                        lines.append("")
+        unplaced = [asset for asset in figures if asset.get("id", asset["path"]) not in placed]
+        if unplaced:
+            lines.append(r"\section{Figures}")
+            for asset in unplaced:
+                lines.extend(figure_lines(asset))
+            # Keep the bibliography together rather than leaving a single
+            # orphaned reference below the final figure.
+            lines.append(r"\clearpage")
+        lines.append(r"\section*{Keywords}")
+        lines.append(_latex(", ".join(self.config["keywords"])))
+        lines.extend([r"\begin{thebibliography}{99}", r"\footnotesize", r"\raggedright",
+                      r"\setlength{\itemsep}{0.25em}"])
+        for reference in self.config["references"]:
+            suffix = (" doi:" + reference["doi"]) if reference["doi"] else (" " + reference["url"] if reference["url"] else "")
+            lines.append(r"\bibitem{" + reference["key"] + "} " + _latex(
+                f"{reference['authors']} ({reference['year']}). {reference['title']}.{suffix}"))
+        lines.extend([r"\end{thebibliography}", r"\end{document}", ""])
+        return "\n".join(lines)
+
+    def _render_artifacts(self, manuscript, results, results_path, *, compile_script):
+        """Render the same layout for editorial previews and release candidates."""
+        compile_script = validate_render_environment(compile_script)
+        def remaining(maximum):
+            deadline = getattr(self, "deadline_epoch", None)
+            allowed = maximum if deadline is None else min(maximum, deadline - time.time())
+            if allowed <= 0:
+                raise ValidationError("manuscript render deadline exceeded")
+            return allowed
+        source_dir = self.dir / "output" / "source"
+        pdf_dir = self.dir / "output" / "pdf"
+        source_dir.mkdir(parents=True); pdf_dir.mkdir(parents=True)
+        copied_assets = []
+        if results["assets"]:
+            asset_dir = self.dir / "output" / "assets"
+            asset_dir.mkdir(parents=True)
+            for asset in results["assets"]:
+                destination = asset_dir / asset["path"]
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(results_path.parent / asset["path"], destination)
+                copied_assets.append({**asset, "release_path": str(destination.relative_to(self.dir))})
+        tex = self._tex(manuscript, results)
+        (source_dir / "main.tex").write_text(tex)
+        entries = []
+        for reference in self.config["references"]:
+            fields = [f"  title = {{{reference['title']}}}", f"  author = {{{reference['authors']}}}",
+                      f"  year = {{{reference['year']}}}"]
+            if reference["doi"]:
+                fields.append(f"  doi = {{{reference['doi']}}}")
+            if reference["url"]:
+                fields.append(f"  url = {{{reference['url']}}}")
+            entries.append("@article{" + reference["key"] + ",\n" + ",\n".join(fields) + "\n}")
+        bibliography = "\n\n".join(entries) + "\n"
+        (source_dir / "references.bib").write_text(bibliography)
+        compile_result = subprocess.run(
+            [sys.executable, str(compile_script), str(source_dir / "main.tex"),
+             "--output-directory", str(pdf_dir), "--json"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=remaining(300))
+        if compile_result.returncode != 0 or not (pdf_dir / "main.pdf").is_file():
+            raise ValidationError("LaTeX compilation failed: " + compile_result.stderr[-2000:])
+        pdf = pdf_dir / f"{self.config['paper_id']}.pdf"
+        (pdf_dir / "main.pdf").replace(pdf)
+        pdfinfo = shutil.which("pdfinfo")
+        pdftoppm = shutil.which("pdftoppm")
+        if not pdfinfo or not pdftoppm:
+            raise ValidationError("PDF visual verification requires pdfinfo and pdftoppm")
+        info = subprocess.run([pdfinfo, str(pdf)], capture_output=True, text=True, check=True, timeout=remaining(30)).stdout
+        match = re.search(r"^Pages:\s+([0-9]+)$", info, re.MULTILINE)
+        pages = int(match.group(1)) if match else 0
+        render_dir = self.dir / "output" / "rendered"
+        render_dir.mkdir()
+        subprocess.run([pdftoppm, "-png", "-r", "120", str(pdf), str(render_dir / "page")],
+                       capture_output=True, check=True, timeout=remaining(120))
+        images = sorted(render_dir.glob("page-*.png"))
+        visual = {"schema_version": "paper-visual-check-1", "pages": pages,
+                  "rendered_pages": [str(path.relative_to(self.dir)) for path in images],
+                  "all_pages_rendered": pages > 0 and len(images) == pages,
+                  "pdfinfo": info, "manual_review_status": "pending_principal_review"}
+        if not visual["all_pages_rendered"] or any(path.stat().st_size < 1000 for path in images):
+            raise ValidationError("rendered PDF pages are missing or empty")
+        (self.dir / "output" / "visual-review.json").write_bytes(canonical_bytes(visual))
+        return tex, pdf, copied_assets, visual
+
+    def render_preview(self, draft, *, compile_script=None, results=None, results_path=None):
+        from scisaurus.runtime.paper_pipeline import validate_manuscript_draft
+        validate_manuscript_draft(draft)
+        manuscript = {"title": draft["title"], "groups": draft["sections"]}
+        _, pdf, _, visual = self._render_artifacts(
+            manuscript, results or {"assets": []}, Path(results_path or self.dir / "assets.json"),
+            compile_script=compile_script)
+        snapshot = {
+            "schema_version": "manuscript-review-render-1", "status": "unreviewed",
+            "manuscript_sha256": sha256_hex(canonical_bytes(draft)),
+            "pdf": str(pdf), "pdf_sha256": sha256_hex(pdf.read_bytes()),
+            "pages": [str(self.dir / page) for page in visual["rendered_pages"]],
+        }
+        (self.dir / "output" / "review-render.json").write_bytes(canonical_bytes(snapshot))
+        return snapshot
+
+
+class PaperReleaseBuilder(ManuscriptRenderer):
     """Prepare a pinned candidate; external submission and final approval remain separate."""
 
     def __init__(self, release_dir, config, *, research_argument=None, argument_review=None):
@@ -727,101 +943,21 @@ class PaperReleaseBuilder:
                           research_argument_review_sha256=sha256_hex(canonical_bytes(self.argument_review)))
         return result
 
-    def _tex(self, manuscript, results=None):
-        lines = [r"\documentclass[11pt]{article}", r"\usepackage[margin=1in]{geometry}",
-                 r"\usepackage[hidelinks]{hyperref}", r"\usepackage{microtype}", r"\usepackage[T1]{fontenc}",
-                 r"\usepackage{graphicx}", r"\usepackage{float}",
-                 r"\title{" + _latex(manuscript["title"]) + "}",
-                 r"\author{" + _latex(", ".join(self.config["authors"])) + "}", r"\date{}", r"\begin{document}",
-                 r"\maketitle"]
-        figures = [asset for asset in (results or {}).get("assets", []) if asset.get("role") == "figure"]
-        figure_by_unit = {}
-        if self.config.get("schema_version") == "paper-release-score-3":
-            for argument in self.config.get("figure_arguments", []):
-                figure_by_unit.setdefault(argument["unit_id"], []).append(argument["asset_id"])
-        figure_lookup = {asset["id"]: asset for asset in figures if isinstance(asset.get("id"), str)}
-        placed = set()
-
-        def figure_lines(asset):
-            placed.add(asset.get("id", asset["path"]))
-            return [r"\begin{figure}[H]", r"\centering",
-                    r"\includegraphics[width=0.78\linewidth]{\detokenize{../assets/" + asset["path"] + "}}",
-                    r"\caption{" + _latex(asset["caption"]) + "}", r"\end{figure}"]
-
-        for group in manuscript["groups"]:
-            lines.append(r"\section{" + _latex(group["title"]) + "}")
-            for unit in group["units"]:
-                if unit["kind"] == "list_item":
-                    lines.extend([r"\begin{itemize}", r"\item " + _latex_with_citations(unit["text"]), r"\end{itemize}"])
-                elif unit["kind"] == "table":
-                    # Table units use a small, reader-facing pipe-delimited
-                    # representation: first line is the caption, second line
-                    # the header, and remaining lines the data rows. Keeping
-                    # the source as plain text lets the structured manuscript
-                    # and review layers inspect exactly the values rendered.
-                    raw_rows = [line.strip() for line in unit["text"].splitlines() if line.strip()]
-                    if len(raw_rows) < 3:
-                        raise ValidationError("table units require a caption, header, and rectangular rows")
-                    caption = raw_rows[0]
-                    header = [cell.strip() for cell in raw_rows[1].split("|")]
-                    data_rows, notes = [], []
-                    for line in raw_rows[2:]:
-                        if "|" not in line or re.match(r"^\([a-z]\)\s", line, re.I):
-                            # Table footnotes are reader-facing scientific
-                            # text, not data rows. Keep them in the rendered
-                            # table instead of dropping their qualification.
-                            notes.append(line)
-                            continue
-                        row = [cell.strip() for cell in line.split("|")]
-                        if len(row) != len(header):
-                            raise ValidationError("table units require a caption, header, and rectangular rows")
-                        data_rows.append(row)
-                    if not header or not data_rows:
-                        raise ValidationError("table units require a caption, header, and rectangular rows")
-                    lines.extend([r"\begin{table}[htbp]", r"\centering", r"\scriptsize",
-                                  r"\caption{" + _latex(caption) + "}",
-                                  r"\resizebox{\linewidth}{!}{%",
-                                  r"\begin{tabular}{" + "r" * len(header) + "}", r"\hline",
-                                  " & ".join(r"\textbf{" + _latex(cell) + "}" for cell in header) + r" \\", r"\hline"])
-                    for row in data_rows:
-                        lines.append(" & ".join(_latex(cell) for cell in row) + r" \\")
-                    lines.extend([r"\hline", r"\end{tabular}}"])
-                    if notes:
-                        lines.append(r"\parbox{0.95\linewidth}{\footnotesize "
-                                     + _latex(" ".join(notes)) + "}")
-                    lines.extend([r"\end{table}", ""])
-                elif unit["kind"] in {"code", "json"}:
-                    lines.extend([r"\begin{verbatim}", unit["text"], r"\end{verbatim}"])
-                else:
-                    lines.extend([_latex_with_citations(unit["text"]), ""])
-                # Score-3 figures are part of the argument and belong beside
-                # the unit that states their observation.  Keeping the
-                # binding here preserves the manuscript's claim-to-display
-                # order in the rendered PDF; legacy score-1/2 descriptors
-                # retain their appendix-style figure section below.
-                for asset_id in figure_by_unit.get(unit.get("id"), ()):
-                    asset = figure_lookup.get(asset_id)
-                    if asset is not None:
-                        lines.extend(figure_lines(asset))
-                        lines.append("")
-        unplaced = [asset for asset in figures if asset.get("id", asset["path"]) not in placed]
-        if unplaced:
-            lines.append(r"\section{Figures}")
-            for asset in unplaced:
-                lines.extend(figure_lines(asset))
-            # Keep the bibliography together rather than leaving a single
-            # orphaned reference below the final figure.
-            lines.append(r"\clearpage")
-        lines.append(r"\section*{Keywords}")
-        lines.append(_latex(", ".join(self.config["keywords"])))
-        lines.extend([r"\begin{thebibliography}{99}", r"\footnotesize", r"\raggedright",
-                      r"\setlength{\itemsep}{0.25em}"])
-        for reference in self.config["references"]:
-            suffix = (" doi:" + reference["doi"]) if reference["doi"] else (" " + reference["url"] if reference["url"] else "")
-            lines.append(r"\bibitem{" + reference["key"] + "} " + _latex(
-                f"{reference['authors']} ({reference['year']}). {reference['title']}.{suffix}"))
-        lines.extend([r"\end{thebibliography}", r"\end{document}", ""])
-        return "\n".join(lines)
+    def render_preview(self, draft, *, compile_script):
+        """Render an unaccepted draft without creating a release or acceptance."""
+        results_path = Path(self.config["results_package"])
+        results = validate_results_package(json.loads(results_path.read_text()), base_dir=results_path.parent)
+        manuscript = {"title": draft["title"], "groups": draft["sections"]}
+        _, pdf, _, visual = self._render_artifacts(manuscript, results, results_path, compile_script=compile_script)
+        snapshot = {
+            "schema_version": "manuscript-review-render-1", "status": "unreviewed",
+            "manuscript_sha256": sha256_hex(canonical_bytes(draft)),
+            "pdf": str(pdf), "pdf_sha256": sha256_hex(pdf.read_bytes()),
+            "pages": [str(self.dir / page) for page in visual["rendered_pages"]],
+        }
+        (self.dir / "output" / "review-render.json").write_bytes(canonical_bytes(snapshot))
+        self.close()
+        return snapshot
 
     def build(self, *, compile_script):
         manuscript, survey = self._manuscript(), self._survey()
@@ -844,62 +980,12 @@ class PaperReleaseBuilder:
                 raise ValidationError(
                     "research paper result package does not meet its substantive quality contract")
         claim_index = self._bind(manuscript, survey, results)
-        source_dir = self.dir / "output" / "source"
-        pdf_dir = self.dir / "output" / "pdf"
-        source_dir.mkdir(parents=True); pdf_dir.mkdir(parents=True)
-        copied_assets = []
-        if results["assets"]:
-            asset_dir = self.dir / "output" / "assets"
-            asset_dir.mkdir(parents=True)
-            for asset in results["assets"]:
-                destination = asset_dir / asset["path"]
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(results_path.parent / asset["path"], destination)
-                copied_assets.append({**asset, "release_path": str(destination.relative_to(self.dir))})
-        tex = self._tex(manuscript, results)
-        (source_dir / "main.tex").write_text(tex)
-        entries = []
-        for reference in self.config["references"]:
-            fields = [f"  title = {{{reference['title']}}}", f"  author = {{{reference['authors']}}}",
-                      f"  year = {{{reference['year']}}}"]
-            if reference["doi"]:
-                fields.append(f"  doi = {{{reference['doi']}}}")
-            if reference["url"]:
-                fields.append(f"  url = {{{reference['url']}}}")
-            entries.append("@article{" + reference["key"] + ",\n" + ",\n".join(fields) + "\n}")
-        bibliography = "\n\n".join(entries) + "\n"
-        (source_dir / "references.bib").write_text(bibliography)
-        (source_dir / "claim-index.json").write_bytes(canonical_bytes(claim_index))
+        tex, pdf, copied_assets, visual = self._render_artifacts(
+            manuscript, results, results_path, compile_script=compile_script)
+        (self.dir / "output" / "source" / "claim-index.json").write_bytes(canonical_bytes(claim_index))
         if claim_index.get("scholarly_depth_review") is not None:
             (self.dir / "output" / "scholarly-depth-review.json").write_bytes(
                 canonical_bytes(claim_index["scholarly_depth_review"]))
-        compile_result = subprocess.run(
-            [sys.executable, str(compile_script), str(source_dir / "main.tex"),
-             "--output-directory", str(pdf_dir), "--json"],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
-        if compile_result.returncode != 0 or not (pdf_dir / "main.pdf").is_file():
-            raise ValidationError("LaTeX compilation failed: " + compile_result.stderr[-2000:])
-        pdf = pdf_dir / f"{self.config['paper_id']}.pdf"
-        (pdf_dir / "main.pdf").replace(pdf)
-        pdfinfo = shutil.which("pdfinfo")
-        pdftoppm = shutil.which("pdftoppm")
-        if not pdfinfo or not pdftoppm:
-            raise ValidationError("PDF visual verification requires pdfinfo and pdftoppm")
-        info = subprocess.run([pdfinfo, str(pdf)], capture_output=True, text=True, check=True, timeout=30).stdout
-        match = re.search(r"^Pages:\s+([0-9]+)$", info, re.MULTILINE)
-        pages = int(match.group(1)) if match else 0
-        render_dir = self.dir / "output" / "rendered"
-        render_dir.mkdir()
-        subprocess.run([pdftoppm, "-png", "-r", "120", str(pdf), str(render_dir / "page")],
-                       capture_output=True, check=True, timeout=120)
-        images = sorted(render_dir.glob("page-*.png"))
-        visual = {"schema_version": "paper-visual-check-1", "pages": pages,
-                  "rendered_pages": [str(path.relative_to(self.dir)) for path in images],
-                  "all_pages_rendered": pages > 0 and len(images) == pages,
-                  "pdfinfo": info, "manual_review_status": "pending_principal_review"}
-        if not visual["all_pages_rendered"] or any(path.stat().st_size < 1000 for path in images):
-            raise ValidationError("rendered PDF pages are missing or empty")
-        (self.dir / "output" / "visual-review.json").write_bytes(canonical_bytes(visual))
         inputs = self.store.publish_artifact(logical_id="inputs/paper-score", artifact_type="note", author="principal",
             body=canonical_bytes(self.config), media_type="application/json")
         results_record = self.store.publish_artifact(logical_id="inputs/results-package", artifact_type="results_package",

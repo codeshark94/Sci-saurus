@@ -1,4 +1,5 @@
 import unittest
+from copy import deepcopy
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.program_admission import (
@@ -77,11 +78,20 @@ def candidate():
         "validator_source": VALIDATOR,
         "runtime": {"python": "3.14", "packages": [{"name": "numpy", "version": "2.5.2"}]},
         "test_vector": {"input": {"probe": True}, "expected_output_sha256": "a" * 64},
-        "experiment_intent": INTENT,
+        "experiment_intent": deepcopy(INTENT),
     }
 
 
 class ProgramAdmissionTests(unittest.TestCase):
+    def test_novel_capability_schema_preserves_its_quality_contract(self):
+        from scisaurus.runtime.research_quality import default_research_quality_contract
+        value = candidate()
+        value["experiment_intent"]["study_type"] = "novel_research"
+        with self.assertRaisesRegex(ValidationError, "quality_contract"):
+            validate_program_candidate(value)
+        value["experiment_intent"]["quality_contract"] = default_research_quality_contract()
+        self.assertEqual(validate_program_candidate(value), value)
+
     def test_valid_candidate_is_admitted(self):
         value = candidate()
         self.assertEqual(validate_program_candidate(value), value)

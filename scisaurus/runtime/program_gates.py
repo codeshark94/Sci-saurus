@@ -30,6 +30,31 @@ from scisaurus.runtime.program_admission import validate_program_candidate
 ADMISSION_SCHEMA = "method-program-admission-1"
 
 
+class ProgramGateRejected(ValidationError):
+    """Keep failed evidence independent of bounded human-readable errors."""
+
+    def __init__(self, message, record, *, gate):
+        self.feedback = {
+            "gate": gate,
+            "decision": record.get("decision", record.get("status")),
+            "failed_checks": [item for item in record.get("checks", [])
+                              if isinstance(item, dict) and item.get("outcome") != "passed"],
+            "findings": record.get("findings", []),
+            "metric_mismatches": [item for item in record.get("metric_recalculations", [])
+                                  if isinstance(item, dict) and item.get("matches") is not True],
+        }
+        super().__init__(message + ": " + json.dumps(self.feedback, ensure_ascii=False)[:2400])
+
+
+class ProgramReviewRejected(ProgramGateRejected):
+    """Preserve a methods verdict and its actionable repair evidence."""
+
+    def __init__(self, review):
+        self.review = review
+        super().__init__("adversarial review rejected the candidate program", review,
+                         gate="adversarial_review")
+
+
 def _parse_json_output(result, name):
     if result.timed_out:
         raise ValidationError(f"{name} exceeded its sandbox deadline")
@@ -41,7 +66,18 @@ def _parse_json_output(result, name):
     try:
         return json.loads(result.stdout)
     except (ValueError, TypeError) as exc:
-        raise ValidationError(f"{name} did not return a JSON document") from exc
+        raise ValidationError(f"{name} did not return a JSON document; "
+                              f"stdout={result.stdout[:500]!r}, stderr={result.stderr[-500:]!r}; "
+                              "verify the entry point and stdin handling") from exc
+
+
+def validate_validator_readiness(result):
+    if getattr(result, "mode", None) != "sandbox-exec":
+        raise ValidationError("validator readiness requires the deny-by-default sandbox-exec boundary")
+    record = _parse_json_output(result, "program validator readiness")
+    if record != {"status": "ready"}:
+        raise ValidationError("program validator readiness must return exactly {'status': 'ready'}")
+    return record
 
 
 def admit_program_candidate(candidate, *, execute, validate, readiness=None, review=None,
@@ -90,12 +126,12 @@ def admit_program_candidate(candidate, *, execute, validate, readiness=None, rev
     verdict = validate_deterministic_validation(
         verdict, candidate["experiment_intent"], digests[0])
     if verdict.get("decision") != "accepted":
-        raise ValidationError(
-            "independent recalculation did not accept the candidate: "
-            + json.dumps(verdict, ensure_ascii=False, sort_keys=True)[:2400])
+        raise ProgramGateRejected("independent recalculation did not accept the candidate", verdict,
+                                  gate="independent_recalculation")
     checks = verdict.get("checks") or []
     if not checks or any(item.get("outcome") != "passed" for item in checks if isinstance(item, dict)):
-        raise ValidationError("independent recalculation reported a failed check")
+        raise ProgramGateRejected("independent recalculation reported a failed check", verdict,
+                                  gate="independent_recalculation")
     recalculations = verdict.get("metric_recalculations") or []
     if not recalculations:
         raise ValidationError("independent recalculation reported no metric comparison")
@@ -103,14 +139,7 @@ def admit_program_candidate(candidate, *, execute, validate, readiness=None, rev
         verdict, document, candidate["experiment_intent"])
     readiness_record = None
     if readiness is not None:
-        readiness_result = readiness()
-        if getattr(readiness_result, "mode", None) != "sandbox-exec":
-            raise ValidationError(
-                "validator readiness requires the deny-by-default sandbox-exec boundary")
-        readiness_record = _parse_json_output(readiness_result, "program validator readiness")
-        if readiness_record != {"status": "ready"}:
-            raise ValidationError(
-                "program validator readiness must return exactly {'status': 'ready'}")
+        readiness_record = validate_validator_readiness(readiness())
     review_record = None
     if review is not None:
         review_record = review(candidate, document, verdict)
@@ -119,7 +148,7 @@ def admit_program_candidate(candidate, *, execute, validate, readiness=None, rev
         blocking = [item for item in review_record.get("findings", [])
                     if isinstance(item, dict) and item.get("severity") == "blocking"]
         if review_record["status"] != "admitted" or blocking:
-            raise ValidationError("adversarial review rejected the candidate program")
+            raise ProgramReviewRejected(review_record)
     return {
         "schema_version": ADMISSION_SCHEMA,
         "study_id": candidate["study_id"],

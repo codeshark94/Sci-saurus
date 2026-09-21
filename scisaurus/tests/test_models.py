@@ -410,40 +410,41 @@ class TestModelClient(unittest.TestCase):
             self.client().complete(system='x',prompt='x')
         self.assertFalse(error.exception.outcome_known)
 
-    def test_retryable_rate_limit_is_retried_within_one_request_budget(self):
+    def test_rate_limit_returns_to_scheduler_without_replaying_request(self):
         self.status = [429, 200]
         self.response = {'choices': [{'message': {'content': '{"value": 4}'}, 'finish_reason': 'stop'}]}
-        result = self.client('openai_compatible', max_retries=2, retry_backoff_seconds=0).complete(
-            system='x', prompt='x')
-        self.assertEqual(self.calls, 2)
-        self.assertEqual(result.request_attempts, 2)
-        self.assertEqual(result.json_object(), {'value': 4})
+        with self.assertRaises(ModelCallError) as error:
+            self.client('openai_compatible', max_retries=2, retry_backoff_seconds=0).complete(
+                system='x', prompt='x')
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(error.exception.status_code, 429)
 
     def test_rate_limit_exhaustion_reports_status_without_provider_body(self):
         self.status = 429
         with self.assertRaises(ModelCallError) as error:
             self.client('openai_compatible', max_retries=2, retry_backoff_seconds=0).complete(
                 system='x', prompt='x')
-        self.assertEqual(self.calls, 3)
+        self.assertEqual(self.calls, 1)
         self.assertTrue(error.exception.outcome_known)
         self.assertEqual(error.exception.status_code, 429)
-        self.assertIsNone(error.exception.retry_after_seconds)
-        self.assertEqual(error.exception.attempts, 3)
+        self.assertEqual(error.exception.retry_after_seconds, 0.0)
+        self.assertEqual(error.exception.attempts, 1)
         self.assertIsNotNone(error.exception.elapsed_seconds)
         self.assertNotIn('private', str(error.exception))
 
-    def test_malformed_response_is_retried_within_one_request_budget(self):
+    def test_malformed_provider_envelope_does_not_repeat_unknown_generation(self):
         self.response_sequence = [
             b'{"done":true}',
             {'model': 'served-model', 'message': {'content': '{"value": 4}'},
              'done': True, 'done_reason': 'stop'},
         ]
-        result = self.client(max_retries=1, retry_backoff_seconds=0).complete(system='x', prompt='x')
-        self.assertEqual(self.calls, 2)
-        self.assertEqual(result.json_object(), {'value': 4})
+        with self.assertRaises(ModelCallError) as error:
+            self.client(max_retries=1, retry_backoff_seconds=0).complete(system='x', prompt='x')
+        self.assertEqual(self.calls, 1)
+        self.assertFalse(error.exception.outcome_known)
 
     def test_shared_model_call_budget_counts_retries_and_blocks_before_network(self):
-        self.status = [429, 200]
+        self.status = [503, 200]
         self.response = {'choices': [{'message': {'content': '{"value": 4}'}, 'finish_reason': 'stop'}]}
         with tempfile.TemporaryDirectory() as directory:
             ledger = str((Path(directory) / 'model-budgets.sqlite').resolve())

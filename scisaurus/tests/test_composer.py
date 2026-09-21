@@ -13,10 +13,18 @@ from scisaurus.runtime.composer import ComposerRunner, read_interim_report, vali
 from scisaurus.runtime.departments import default_organization
 from scisaurus.runtime.literature import ProviderCooldownError
 from scisaurus.core.errors import QuotaExceededError, ValidationError
+from scisaurus.core.events import ControlStore
+from scisaurus.core.schema import canonical_bytes
+from scisaurus.core.store import ArtifactStore
 from scisaurus.tests.test_research_program import topic_package
 
 
 class ComposerWorkflowTests(unittest.TestCase):
+    def test_interrupted_runner_result_propagates_process_stop_not_stage_retry(self):
+        with self.assertRaises(KeyboardInterrupt):
+            ComposerRunner._raise_stage_failure({"status": "paused", "error": "termination requested",
+                                                 "failure": {"kind": "process_interrupted"}})
+
     def _workflow(self, root):
         config = root / "stage.json"
         config.write_text("{}")
@@ -790,6 +798,70 @@ class ComposerWorkflowTests(unittest.TestCase):
             candidate = ComposerRunner._attempt_stage(stage, 9)
             self.assertEqual(Path(candidate["project_dir"]), Path(stage["project_dir"]).resolve())
 
+    def test_survey_resume_scope_keeps_completed_milestones(self):
+        self.assertEqual(ComposerRunner._survey_resume_scope({
+            "survey_current": True, "survey_ref": "artifact:kb/surveys/current@4",
+            "assessment_current": False, "status": "blocked"}), "gap_assessment")
+        for prior in ({}, {"survey_current": True},
+                      {"survey_current": False, "survey_ref": "artifact:kb/surveys/current@4"}):
+            self.assertEqual(ComposerRunner._survey_resume_scope(prior), "focused_review")
+
+    def test_exploratory_admission_is_bound_before_capability_authoring(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            runner.workflow["progression_policy"] = "full_pass"
+            runner.workflow["capability_foundry_config_path"] = "configured-foundry"
+            runner.context["topic"] = {"kind": "topic_discovery", "topic": {
+                "id": "direction", "domain": "physics", "research_question": "A bounded question?"}}
+            runner.context["survey"] = {"kind": "survey", "topic_admission": "exploratory_pilot",
+                "gap_state": "insufficient_evidence", "survey_current": True, "assessment_current": True}
+            with patch.object(runner, "_materialize_topic_capability", side_effect=RuntimeError("authoring boundary")) as author:
+                with self.assertRaisesRegex(RuntimeError, "authoring boundary"):
+                    runner._apply_topic_to_experiment_config(runner.workflow["stages"][1], {"experiment": {}})
+            self.assertEqual(author.call_args.kwargs["study_type"], "exploratory")
+
+    def test_foundry_usage_is_charged_once_and_restored_from_checkpoint(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            runner._publish("command/foundry-work/fixture", "note", {
+                "status": "repairing", "usage": {"model_calls": 2, "input_tokens": 300, "output_tokens": 70}},
+                "command.controller")
+            self.assertTrue(runner._sync_foundry_usage())
+            self.assertEqual(runner.usage["model_calls"], 2)
+            self.assertFalse(runner._sync_foundry_usage())
+            runner._checkpoint("experiment:capability_validation_failed", force=True)
+            runner._publish("command/foundry-work/fixture", "note", {
+                "status": "calling", "usage": {"model_calls": 3, "input_tokens": 300, "output_tokens": 70}},
+                "command.controller")
+            workflow = runner.workflow
+            runner.close()
+            resumed = ComposerRunner(workflow, resume=True)
+            self.addCleanup(resumed.close)
+            self.assertEqual(resumed.usage["model_calls"], 3)
+            self.assertEqual(resumed.usage["input_tokens"], 300)
+            self.assertFalse(resumed._sync_foundry_usage())
+
+    def test_legacy_survey_resume_reads_immutable_runner_config(self):
+        with tempfile.TemporaryDirectory() as path:
+            project = Path(path) / "survey"
+            control = ControlStore(project)
+            store = ArtifactStore(control)
+            store.init_project(principal_note="legacy-survey")
+            stored = {
+                "project_id": str(project.resolve()),
+                "limits": {"wall_clock_seconds": 1200},
+                "survey": {"question": "the admitted question"},
+            }
+            store.publish_artifact(
+                logical_id="inputs/run-config", artifact_type="note", author="principal",
+                body=canonical_bytes(stored), media_type="application/json",
+            )
+            control.close()
+
+            self.assertEqual(ComposerRunner._durable_stage_config(project), stored)
+
     def test_retry_policy_exhaustion_keeps_failures_and_blocks(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -1358,8 +1430,33 @@ class ComposerWorkflowTests(unittest.TestCase):
             runner.context["topic"] = {"kind": "topic_discovery", **result}
             config = {"experiment": {"revision": 1, "literature_gate": {"required_state": "eligible_for_experiment"}},
                       "supplied_context": "base"}
-            projected = runner._apply_topic_to_experiment_config(workflow["stages"][1], config)
+            with patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate", return_value=generated):
+                projected = runner._apply_topic_to_experiment_config(workflow["stages"][1], config)
             self.assertEqual(projected["experiment"]["id"], "generated_frontier")
+            entry = {"id": "generated_frontier", "revision": 1,
+                     "path": str(descriptor_path), "candidate_record_sha256": "a" * 64}
+            admission_path = root / "admission.json"
+            admission_path.write_text(json.dumps({"adversarial_review": {"status": "admitted", "findings": []}}))
+            with patch("scisaurus.runtime.capability_registry.load_registry", return_value={"capabilities": [entry]}), \
+                    patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate", return_value=generated) as upgrade:
+                runner._materialize_topic_capability(result)
+            self.assertEqual(upgrade.call_args.kwargs["required_intent"]["revision"], 2)
+            from scisaurus.tests.test_capability_foundry import CapabilityFoundryTests
+            valid_review = {**CapabilityFoundryTests._review_payload(), "role": "review.methods",
+                "review_method": "independent_model", "candidate_sha256": "a" * 64}
+            for verdict in ({**valid_review, "status": "rejected"},
+                            {name: value for name, value in valid_review.items() if name != "status"}):
+                admission_path.write_text(json.dumps({"adversarial_review": verdict}))
+                with patch("scisaurus.runtime.capability_registry.load_registry", return_value={"capabilities": [entry]}), \
+                        patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate", return_value=generated) as upgrade:
+                    runner._materialize_topic_capability(result)
+                upgrade.assert_called_once()
+            admission_path.write_text(json.dumps({"adversarial_review": valid_review}))
+            with patch("scisaurus.runtime.capability_registry.load_registry", return_value={"capabilities": [entry]}), \
+                    patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate") as regenerate_existing:
+                checked = runner._materialize_topic_capability(result)
+            regenerate_existing.assert_not_called()
+            self.assertTrue(checked["generated_capability"]["reused"])
             lazy_result = json.loads(json.dumps(result))
             lazy_result.pop("generated_capability")
             lazy_result["topic"].pop("experiment_capability_id", None)

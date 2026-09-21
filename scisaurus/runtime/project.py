@@ -589,6 +589,7 @@ class ProjectRunner(ExecutionRuntime):
 
     def _run(self):
         status, error = "blocked", None
+        failure = None
         try:
             self._initialize()
             if self.time_policy and not self.time_policy.snapshot()["initial_hard_limit_feasible"]:
@@ -654,6 +655,8 @@ class ProjectRunner(ExecutionRuntime):
         except (Exception, KeyboardInterrupt) as exc:
             error = f"{type(exc).__name__}: {exc}"
             self.blockers.append({"reason": error})
+            if isinstance(exc, KeyboardInterrupt):
+                status, failure = "paused", {"kind": "process_interrupted"}
         finally:
             self._release_unstarted_reservations()
             if hasattr(self, "baseline"):
@@ -665,6 +668,7 @@ class ProjectRunner(ExecutionRuntime):
                 candidate["adopted"] = candidate["candidate_ref"] == self.incumbent
             self._checkpoint(status, force=True)
         result = {"run_id": self.run_id, "project_id": self.config["project_id"], "status": status, "error": error,
+            "failure": failure,
             "baseline_ref": getattr(self, "baseline", {}).get("artifact_ref"), "incumbent_ref": self.incumbent,
             "candidates": self.candidates, "proposals": self.proposals, "rounds": self.rounds, "worker_errors": self.worker_errors,
             "source_captures": [{key: value for key, value in source.items() if key != "text"} for source in self.sources],

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 import base64
 import hashlib
 import http.client
@@ -17,6 +18,7 @@ import time
 import urllib.parse
 
 from scisaurus.core.errors import ValidationError
+from scisaurus.core.schema import json_object
 
 
 SAMPLING_FIELDS = frozenset({
@@ -515,7 +517,14 @@ class _ProviderHTTPError(RuntimeError):
     def __init__(self, code, retry_after=None):
         super().__init__(f"model HTTP request failed with status {code}")
         self.code = code
-        self.retry_after = retry_after
+        try:
+            delay = float(retry_after)
+        except (TypeError, ValueError):
+            try:
+                delay = parsedate_to_datetime(retry_after).timestamp() - time.time()
+            except (TypeError, ValueError, OverflowError):
+                delay = None
+        self.retry_after = max(0.0, delay) if delay is not None and math.isfinite(delay) else None
 
 
 @dataclass(frozen=True)
@@ -528,33 +537,7 @@ class ModelResult:
     request_attempts: int = 1
 
     def json_object(self):
-        text = self.text.strip()
-        candidates = [text]
-        # Some structured-output providers append a reasoning wrapper
-        # terminator, while others emit a JSON object in an otherwise empty
-        # Markdown JSON fence.  Accept only those two exact, bounded forms;
-        # arbitrary prose and mixed markdown remain invalid.
-        if "</think>" in text:
-            candidates.append(text.rsplit("</think>", 1)[1].strip())
-        for candidate in tuple(candidates):
-            lines = candidate.splitlines()
-            if (len(lines) >= 3 and lines[0].strip().casefold() in {"```json", "```jsonc"}
-                    and lines[-1].strip() == "```"
-                    and all(not line.strip().startswith("```") for line in lines[1:-1])):
-                candidates.append("\n".join(lines[1:-1]).strip())
-        value = None
-        parse_error = None
-        for candidate in candidates:
-            try:
-                value = json.loads(candidate)
-                break
-            except (ValueError, TypeError) as exc:
-                parse_error = exc
-        if parse_error is not None and value is None:
-            raise ValidationError("model output is not a complete JSON object") from parse_error
-        if not isinstance(value, dict):
-            raise ValidationError("model output must be a JSON object")
-        return value
+        return json_object(self.text, "model output", model_envelope=True)
 
 
 def _cache_usage(response):
@@ -772,7 +755,9 @@ class ModelClient:
             request_path = "/" + request_path
         started = time.monotonic()
         deadline = started + self.timeout_seconds
-        retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
+        # Account-wide backpressure belongs to the scheduler, which can retain
+        # siblings and wait without submitting the same prompt again.
+        retryable_statuses = {408, 425, 500, 502, 503, 504}
         attempt = 0
         attempts_made = 0
         parsed = None
@@ -938,14 +923,10 @@ class ModelClient:
                     raise ValueError("unsupported completion state")
                 parsed = (text, reason, usage, data.get("model", self.model))
             except (ValueError, TypeError, KeyError, IndexError):
-                if attempt >= self.max_retries:
-                    raise failure("model returned an invalid or incomplete response") from None
-                delay = self.retry_backoff_seconds * (2 ** attempt)
-                if time.monotonic() + delay >= deadline:
-                    raise failure("model returned an invalid or incomplete response") from None
-                time.sleep(delay)
-                attempt += 1
-                continue
+                # A received HTTP 200 may already have consumed a complete
+                # generation. Its unknown usage must not be hidden by a
+                # transparent second generation of the same request.
+                raise failure("model returned an invalid or incomplete response") from None
             break
         elapsed = time.monotonic() - started
         text, reason, usage, served_model = parsed

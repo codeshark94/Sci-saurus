@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.execution import _invoke_worker
@@ -42,6 +43,13 @@ def fixture_worker(kind, params, channel):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_process_stop_exports_a_resumable_interruption(self):
+        runner = ExperimentRunner(self.root / "interrupted-run", self.config())
+        with patch.object(runner, "_setup", side_effect=KeyboardInterrupt("termination requested")):
+            result = runner.run()
+        self.assertEqual(result["status"], "paused")
+        self.assertEqual(result["failure"], {"kind": "process_interrupted"})
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="scisaurus-experiment-test-")
         self.root = Path(self.temp.name)
@@ -165,6 +173,10 @@ class ExperimentTests(unittest.TestCase):
             "required_analyses": ["uncertainty", "effect_size", "sensitivity", "raw_data"],
             "minimum_figures": 3,
         }
+        with self.assertRaisesRegex(ValidationError, "literature gate"):
+            validate_experiment_config(value)
+        self.assertEqual(validate_experiment_config(value, require_literature_gate=False)["experiment"]["study_type"],
+                         "novel_research")
         with self.assertRaisesRegex(ValidationError, "literature gate"):
             validate_experiment_config(value)
 

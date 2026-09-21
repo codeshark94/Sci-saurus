@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.events import ControlStore
@@ -196,6 +197,13 @@ class TestVisualReviewConfig(unittest.TestCase):
 
 
 class TestVisualReviewRunner(unittest.TestCase):
+    def test_process_stop_is_exported_without_retry(self):
+        runner = VisualReviewRunner(self.root / 'interrupted-run', visual_config(self.path))
+        with patch.object(runner, '_perspective_reviews', side_effect=KeyboardInterrupt('termination requested')):
+            result = runner.run()
+        self.assertEqual(result['status'], 'paused')
+        self.assertEqual(result['failure'], {'kind': 'process_interrupted'})
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

@@ -65,6 +65,32 @@ def provider_exhaustion_worker(kind, params, channel):
 
 
 class TestExecutionRuntime(unittest.TestCase):
+    def test_single_pool_rate_limit_stops_pending_dispatch_and_survives_resume(self):
+        value = config()
+        value["limits"].update(concurrent_calls=2, wall_clock_seconds=20, checkpoint_seconds=1)
+        value["model"].update(base_url="http://127.0.0.1:1/v1", protocol="openai_compatible", timeout_seconds=5)
+        value["limits"]["provider_pools"] = {
+            "ollama": {"max_concurrent": 1, "base_urls": [value["model"]["base_url"]]}}
+        run_dir = self.root / "rate-limited"
+        runtime = ExecutionRuntime(run_dir, validate_config(value), worker_target=provider_exhaustion_worker)
+        specs = [self.spec(f"call-{index}") for index in range(3)]
+        for spec in specs:
+            spec["params"]["client"] = value["model"]
+        outcomes = runtime._call_batch(specs)
+        self.assertTrue(all(outcome.get("status_code") == 429 for outcome in outcomes.values()))
+        self.assertEqual(runtime.control._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 1)
+        runtime.control.close()
+        policy = {"additional_seconds": 20, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+                  "source_changes": {"mode": "reject", "reopen_scopes": []}}
+        resumed = ExecutionRuntime(run_dir, validate_config(value), worker_target=provider_exhaustion_worker,
+                                   resume_policy=policy)
+        self.runtimes.append(resumed)
+        self.assertGreater(resumed.provider_cooldowns["ollama"], time.monotonic())
+        spec = self.spec("after-resume")
+        spec["params"]["client"] = value["model"]
+        self.assertEqual(resumed._call_batch([spec])["after-resume"]["status_code"], 429)
+        self.assertEqual(resumed.control._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 1)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="scisaurus-execution-test-")
         self.root = Path(self.temp.name)

@@ -30,7 +30,7 @@ from scisaurus.runtime.manuscript_review import (
     validate_synthesis,
 )
 from scisaurus.runtime.models import ModelClient, ModelResult, resolve_model_config
-from scisaurus.runtime.paper import PaperReleaseBuilder, load_paper_survey, validate_paper_config
+from scisaurus.runtime.paper import PaperReleaseBuilder, load_paper_survey, validate_render_environment, validate_paper_config
 from scisaurus.runtime.results import validate_results_package
 from scisaurus.runtime.research_quality import (
     default_research_quality_contract,
@@ -708,15 +708,18 @@ class PaperPipelineRunner:
                  argument_deadline_seconds=DEFAULT_ARGUMENT_DEADLINE_SECONDS,
                  min_argument_figures=2, min_argument_tables=1, min_argument_experiments=2,
                  feedback_callback=None,
+                 draft_before_research_review=False, deferred_requirements=None, retained_work_dir=None,
                  research_redteam_deadline_seconds=DEFAULT_RESEARCH_REDTEAM_DEADLINE_SECONDS,
                  research_redteam_max_attempts=3):
         self.packet = deepcopy(packet)
         self.model_config = deepcopy(model_config)
         self.paper_config = deepcopy(paper_config)
+        self.draft_before_research_review = bool(draft_before_research_review)
+        self.deferred_requirements = deepcopy(deferred_requirements or [])
+        self.retained_work_dir = Path(retained_work_dir).resolve() if retained_work_dir else None
         self.output = Path(output_dir).resolve()
         self.image_paths = tuple(Path(path).resolve() for path in image_paths)
-        self.compile_script = Path(compile_script).resolve() if compile_script else Path(
-            "/Users/seungyeop/.codex/plugins/cache/openai-bundled/latex/0.2.6/scripts/compile_latex.py")
+        self.compile_script = Path(compile_script).resolve() if compile_script else None
         if type(max_review_rounds) is not int or not 1 <= max_review_rounds <= 8:
             raise ValidationError("max_review_rounds must be between one and eight")
         if (type(review_deadline_seconds) not in (int, float)
@@ -734,8 +737,6 @@ class PaperPipelineRunner:
         empirical_profile = (self.paper_config.get("schema_version") == "paper-release-score-3"
                              and profile_for_paper(self.paper_config) == "empirical_journal")
         self.empirical_profile = empirical_profile
-        if empirical_profile and max_review_rounds < 3:
-            raise ValidationError("empirical journal papers require three peer-review rounds before editor decision")
         if empirical_profile and release_on_review_limit:
             raise ValidationError("empirical journal papers cannot release an unresolved review-limit candidate")
         if (review_max_output_tokens is not None
@@ -848,7 +849,10 @@ class PaperPipelineRunner:
         if not isinstance(contract, dict):
             contract = {}
         profile = self.paper_config.get("depth_profile")
-        if isinstance(profile, dict):
+        if self.draft_before_research_review:
+            contract.pop("depth", None)
+            contract.pop("depth_source", None)
+        elif isinstance(profile, dict):
             previous = contract.get("depth") if isinstance(contract.get("depth"), dict) else {}
             contract["depth"] = {
                 **previous,
@@ -891,6 +895,7 @@ class PaperPipelineRunner:
             "remaining_seconds": max(0.0, self.deadline - time.monotonic()),
             "stage": self.current_stage,
             "error": self.run_error,
+            "review_renders": [str(path) for path in sorted(self.output.glob("review-round-*/render.json"))],
         }))
 
     def _pipeline_usage(self, review_history=(), extra=()):
@@ -916,6 +921,39 @@ class PaperPipelineRunner:
             raise ValidationError("paper pipeline deadline exceeded")
         return remaining
 
+    def _validate_composition(self, draft):
+        validate_manuscript_draft(draft)
+        if not self.draft_before_research_review:
+            validate_draft_depth(draft, self.paper_config)
+
+    def _render_review_snapshot(self, draft, project_dir, round_number):
+        """Freeze the exact unaccepted pages before the independent panel sees them."""
+        review_dir = self.output / f"review-round-{round_number}"
+        preview_dir = review_dir / "preview"
+        config = deepcopy(self.paper_config)
+        config["manuscript_project_dir"] = str(project_dir)
+        builder = PaperReleaseBuilder(preview_dir, config)
+        try:
+            snapshot = builder.render_preview(draft, compile_script=self.compile_script)
+        finally:
+            builder.close()
+        (review_dir / "render.json").write_bytes(canonical_bytes(snapshot))
+        self._emit_feedback({"event_id": f"paper-render-r{round_number}", "kind": "render",
+                             "round": round_number, "status": "completed",
+                             "pdf_path": snapshot["pdf"], "pages": snapshot["pages"],
+                             "manuscript_sha256": snapshot["manuscript_sha256"],
+                             "artifact_path": str(review_dir / "render.json")})
+        return snapshot
+
+    @staticmethod
+    def _cached_review_matches_layout(package, layout_images):
+        if not isinstance(package, dict) or not layout_images:
+            return False
+        hashes = [hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest() for item in layout_images]
+        return (package.get("layout_images_sha256") == hashes
+                and any(review.get("reviewer_id") == "editorial_compression"
+                        for review in package.get("reviews", [])))
+
     def _client(self, *, max_output_tokens=None, reasoning_effort=None, deadline=None,
                 role="editorial.writer"):
         config = deepcopy(self.model_config)
@@ -933,24 +971,23 @@ class PaperPipelineRunner:
     def _research_admission(self, argument, argument_review):
         """Admit only research inputs that can support the declared paper tier.
 
-        The check runs after the argument has been independently accepted but
-        before a writer or manuscript project is created.  A failed check is
-        a request for new scientific work, never a short paper candidate.
+        The check follows independent argument review. Evidence-first runs
+        check before writing; full-pass runs preserve a rendered exploratory
+        draft first. Failure requests new scientific work and never grants
+        release eligibility.
         """
         if (self.paper_config.get("schema_version") != "paper-release-score-3"
                 or profile_for_paper(self.paper_config) != "empirical_journal"):
             return None
-        # The final manuscript project is intentionally created only after
-        # admission.  Validate the bound paper descriptor against this fresh
-        # pipeline directory as a temporary existing path; the descriptor is
-        # never persisted with that substitution.
+        # The pipeline directory is an existing validation scope even before
+        # a manuscript project exists. This substitution is not persisted.
         validation_config = deepcopy(self.paper_config)
         validation_config["manuscript_project_dir"] = str(self.output)
         paper_config = validate_paper_config(validation_config)
         results_path = Path(paper_config["results_package"])
         results = validate_results_package(
             json.loads(results_path.read_text()), base_dir=results_path.parent)
-        survey = load_paper_survey(paper_config)
+        survey = load_paper_survey(paper_config, require_eligible=not self.draft_before_research_review)
         preflight = evaluate_scholarly_preflight(
             paper_config, results, survey, argument=argument)
         preflight = validate_scholarly_preflight(preflight)
@@ -961,7 +998,15 @@ class PaperPipelineRunner:
         quality_path = self.output / "research-quality-admission.json"
         quality_path.write_bytes(canonical_bytes(quality))
         expansion_requests = [*preflight["expansion_requests"], *quality.get("expansion_requests", [])]
-        if preflight["decision"] == "proceed" and quality["decision"] == "proceed":
+        if survey.get("state") != "eligible_for_experiment":
+            expansion_requests.append({
+                "id": "establish_literature_distinction", "kind": "literature_expansion", "owner": "research",
+                "objective": "Test the proposed distinction against the closest prior work.",
+                "why": "An exploratory manuscript does not establish an original contribution.",
+                "success_condition": "A current independently accepted assessment establishes eligibility or refutes the topic.",
+                "evidence_needed": "Verified full-text comparisons and explicit unresolved novelty limits.",
+            })
+        if not expansion_requests and preflight["decision"] == "proceed" and quality["decision"] == "proceed":
             redteam_packet = research_redteam_packet(
                 results=results,
                 interpretation=self.packet.get("scientific_interpretation"),
@@ -1193,10 +1238,10 @@ class PaperPipelineRunner:
         all_accept = all(review.get("decision") == "accept" for review in final_reviews)
         requests = list(package.get("research_requests", [])
                         or package.get("synthesis", {}).get("research_requests", []))
-        required_rounds = 3 if self.empirical_profile else 1
+        required_rounds = 1
         expected_panel = self.review_panel_ids or review_ids
         checks = {
-            "three_stage_review": len(review_history) >= required_rounds,
+            "complete_review_round": len(review_history) >= required_rounds,
             "same_reviewer_panel": bool(review_ids) and review_ids == expected_panel
                 and (not self.empirical_profile or "journal_editor" in set(review_ids)),
             "all_reviewers_accept": all_accept,
@@ -1386,7 +1431,7 @@ class PaperPipelineRunner:
         self._write_run_metadata()
         if self.imported_draft is not None:
             draft = deepcopy(self.imported_draft)
-            validate_draft_depth(draft, self.paper_config)
+            self._validate_composition(draft)
             (self.output / "writer-response.json").write_bytes(canonical_bytes({
                 "mode": "resumed_from_structured_draft", "argument_sha256": (
                     hashlib.sha256(canonical_bytes(argument)).hexdigest() if argument is not None else None),
@@ -1485,7 +1530,7 @@ class PaperPipelineRunner:
                 continue
             try:
                 draft = validate_manuscript_draft(result.json_object())
-                validate_draft_depth(draft, self.paper_config)
+                self._validate_composition(draft)
             except ValidationError as exc:
                 last_error, previous = exc, result.text
                 continue
@@ -1884,6 +1929,7 @@ class PaperPipelineRunner:
     def run(self):
         try:
             self._remaining()
+            self.compile_script = validate_render_environment(self.compile_script)
             argument, argument_review = self._prepare_argument()
             self._emit_feedback({
                 "event_id": "paper-argument-accepted",
@@ -1892,13 +1938,14 @@ class PaperPipelineRunner:
                 "decision": argument_review.get("decision"),
                 "artifact_path": str(self.output / "research-argument.json"),
             })
-            admission_result = self._research_admission(argument, argument_review)
+            admission_result = (None if self.draft_before_research_review
+                                else self._research_admission(argument, argument_review))
             if admission_result is not None:
                 return admission_result
             draft, writer_result = self._writer(argument)
             draft, _, _ = self._compress_surface(draft, phase="after_writer")
             draft, _, _ = self._bind_claim_citations(draft, phase="after_writer")
-            validate_draft_depth(draft, self.paper_config)
+            self._validate_composition(draft)
             validate_argument_projection(
                 draft, argument,
                 require_discussion=self.paper_config.get("document_type") == "research_paper")
@@ -1929,13 +1976,18 @@ class PaperPipelineRunner:
                 self.current_stage = "review"
                 self._write_run_metadata()
                 self._remaining()
+                snapshot = self._render_review_snapshot(draft, project_dir, round_number)
+                layout_images = self._image_descriptors(tuple(Path(path) for path in snapshot["pages"]))
+                if round_number == 1 and self.draft_before_research_review:
+                    admission_result = self._research_admission(argument, argument_review)
                 # Reviewers inspect a reader-facing projection.  Citation
                 # bindings remain exact in the structured manuscript and
                 # release ledger, while the internal ``[[cite:key]]`` tokens
                 # are rendered as ordinary numeric citations for editorial
                 # judgement.
                 input_doc = _review_input(draft, references=self.paper_config.get("references"))
-                if round_number == 1 and self.initial_review_package is not None:
+                if (round_number == 1 and self._cached_review_matches_layout(
+                        self.initial_review_package, layout_images)):
                     package = deepcopy(self.initial_review_package)
                     # The standalone review command accepts the structured
                     # manuscript draft, while an in-process review receives
@@ -1983,8 +2035,10 @@ class PaperPipelineRunner:
                         call_timeout_seconds=min(self.review_call_timeout_seconds, self._remaining()),
                         inter_request_interval_seconds=self.review_inter_request_interval_seconds,
                         arbiter_enabled=self.review_arbiter_enabled,
+                        retained_work_dir=self.retained_work_dir,
                         max_workers=self.model_concurrency)
                     package = runner.run(input_doc, images=image_descriptors,
+                                         layout_images=layout_images,
                                          interpretation=self.packet.get("scientific_interpretation"),
                                          argument=argument,
                                          evidence={
@@ -1994,6 +2048,11 @@ class PaperPipelineRunner:
                                              "references": self.paper_config.get("references", []),
                                              "research_program": self.packet.get("research_program"),
                                              "argument_defense": self.packet.get("argument_defense"),
+                                             "deferred_requirements": self.deferred_requirements,
+                                             "research_admission": {
+                                                 "status": (admission_result or {}).get("status", "proceed"),
+                                                 "requirements": (admission_result or {}).get("research_expansion_requests", []),
+                                             },
                                              "scholarly_depth": {
                                                  "profile_id": (profile_for_paper(self.paper_config)
                                                                  if self.paper_config.get("schema_version") == "paper-release-score-3"
@@ -2060,6 +2119,8 @@ class PaperPipelineRunner:
                 research_requests = deepcopy(
                     package.get("research_requests")
                     or package.get("synthesis", {}).get("research_requests", []))
+                if admission_result:
+                    research_requests.extend(deepcopy(admission_result.get("research_expansion_requests", [])))
                 if research_requests:
                     return self._research_review_result(
                         research_requests, draft, argument, argument_review,
@@ -2067,12 +2128,6 @@ class PaperPipelineRunner:
                 if package["status"] == "accepted":
                     accepted_package = package
                     review_status = "accepted"
-                    # A journal paper receives a genuine re-review cycle even
-                    # when the first panel reports no repair.  The same panel
-                    # is called again on the frozen incumbent so an early
-                    # acceptance cannot bypass the editor's third-stage gate.
-                    if round_number < (3 if self.empirical_profile else 1):
-                        continue
                     break
                 if round_number == self.max_review_rounds:
                     if not self.release_on_review_limit:

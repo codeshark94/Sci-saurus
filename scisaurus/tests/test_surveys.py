@@ -93,7 +93,8 @@ class TestSurveyGate(unittest.TestCase):
         context = self.publish(f"command/contexts/{task_id}",
             {"client": {"model": "fixture"}, "prompt": json.dumps(request)}, author=author)
         execution = self.publish(f"command/executions/{task_id}", {
-            "text": json.dumps(reply), "model": "fixture", "usage": {"model_calls": 1},
+            "text": getattr(self, "reply_wrapper", lambda text: text)(json.dumps(reply)),
+            "model": "fixture", "usage": {"model_calls": 1},
             "elapsed_seconds": 0.1, "finish_reason": "stop",
         }, author=author, kind="report", inputs=[{"ref": context, "purpose": "subject"}])
         if task:
@@ -251,6 +252,20 @@ class TestSurveyGate(unittest.TestCase):
         self.assertEqual(self.control.replay()[-1]["payload"]["survey_ref"], self.survey)
         self.assertEqual(self.control.replay()[-1]["event_type"], "assessment.accepted")
         self.assertTrue(self.control.verify_chain()[0])
+
+    def test_fenced_review_replies_pass_exact_execution_validation(self):
+        self.reply_wrapper = lambda text: f"```json\n{text}\n```"
+        work_review = self.work_review_for(self.entry)
+        self.survey_with_work_reviews([work_review])
+        self.assertEqual(self.accept()["artifact_ref"], self.survey)
+        assessment = self.assessment()
+        self.assertEqual(self.commit(assessment)["artifact_ref"], assessment)
+
+    def test_reasoning_wrapped_replies_pass_exact_execution_validation(self):
+        self.reply_wrapper = lambda text: f"provider reasoning</think>```json\n{text}\n```"
+        work_review = self.work_review_for(self.entry)
+        self.survey_with_work_reviews([work_review])
+        self.assertEqual(self.accept()["artifact_ref"], self.survey)
 
     def test_unaccepted_survey_cannot_authorize_assessment(self):
         assessment = self.assessment()

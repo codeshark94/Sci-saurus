@@ -9,14 +9,34 @@ import re
 import unicodedata
 
 from scisaurus.core.errors import ConflictError, ValidationError
-from scisaurus.core.schema import canonical_bytes, parse_ref, sha256_hex
-from scisaurus.core.source_spans import bind as bind_source_spans, validate as validate_source_span
+from scisaurus.core.schema import canonical_bytes, json_object, parse_ref, sha256_hex
+from scisaurus.core.source_spans import (bind as bind_source_spans, expand_evidence,
+                                        validate as validate_source_span)
 from scisaurus.runtime.bibliographic_identity import normalize_doi, reconcile_result
 from scisaurus.runtime.operation_adapters import get_adapter
 
 
 SURVEY_CHECKS = frozenset({"coverage-accounting", "source-fidelity", "map-support"})
 WORK_CHECKS = ("inclusion", "reason", "problem", "approach", "finding", "limitations")
+ABSTENTION_REASONS = {
+    "source_unavailable": "The catalog record is relevant by metadata, but no abstract or verified full text was available, so substantive content could not be assessed.",
+    "deep_analysis_budget": "This catalog record is deferred by the declared deep-analysis budget. No substantive claim is admitted; targeted follow-up may expand this scope.",
+    "contract_exhausted": "The bounded extraction did not produce a valid evidence contract; substantive claims remain unknown.",
+    "screening_unresolved": "The captured evidence does not resolve the screening rationale.",
+    "review_exhausted": "Focused review remains unresolved after bounded revision. This work is not admitted as support for scientific assertions; its prior analysis and review remain retained.",
+}
+
+
+def is_explicit_abstention(entry, record):
+    """A mechanical review is valid only when no scientific assertion remains."""
+    return (record.get("scope") in ABSTENTION_REASONS
+            and entry.get("inclusion") == "uncertain"
+            and entry.get("reason") in ABSTENTION_REASONS.values()
+            and record.get("work_id") == entry.get("work_id")
+            and record.get("entry_sha256") == sha256_hex(canonical_bytes(entry))
+            and all(entry.get(field) == {"text": None, "evidence": []} for field in WORK_CHECKS[2:]))
+
+
 RELATIONSHIP_SEMANTICS = {
     "extends": "The source work builds on or extends the target work; the direction is source to target, never the inverse.",
     "contradicts": "The source work reports findings incompatible with the target work under comparable scope.",
@@ -62,21 +82,7 @@ class SurveyGate:
 
     @staticmethod
     def _json(raw, name):
-        def unique(pairs):
-            value = {}
-            for key, item in pairs:
-                if key in value:
-                    raise ValueError("duplicate JSON key")
-                value[key] = item
-            return value
-        try:
-            value = json.loads(raw, object_pairs_hook=unique,
-                               parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
-        except (ValueError, TypeError, UnicodeError) as exc:
-            raise ValidationError(f"{name} must contain valid JSON") from exc
-        if not isinstance(value, dict):
-            raise ValidationError(f"{name} must contain a JSON object")
-        return value
+        return json_object(raw, name)
 
     def _artifact(self, ref, *, current=True):
         if not isinstance(ref, str):
@@ -248,6 +254,16 @@ class SurveyGate:
             checks = body.get("checks")
             self._passed_checks(checks, work_review_checks(relationships), "focused work review")
             self._text(body.get("rationale"), "work review rationale")
+            if body.get("verification_kind") == "deterministic_abstention":
+                execution, abstention = self._note(body.get("execution_ref"))
+                if (relationships or execution["author"] != "command.controller"
+                        or execution["artifact_id"] != f"command/survey-abstentions/{work_id}"
+                        or execution["artifact_ref"] not in dependencies
+                        or not is_explicit_abstention(entry_body, abstention)):
+                    raise ValidationError("deterministic abstention review cannot admit substantive or unbound claims")
+                reviewed.add(entry_ref)
+                evidence.extend((review, execution))
+                continue
             execution, context, prompt, reply = self._model_review_execution(body.get("execution_ref"), review["author"])
             if execution["artifact_ref"] not in dependencies:
                 raise ValidationError("survey dependencies must pin every focused review execution")
@@ -349,7 +365,7 @@ class SurveyGate:
             execution_ref, author, operation="model", task_kinds={"review", "verification"},
         )
         prompt = self._json(params.get("prompt"), "review prompt")
-        reply = self._json(result.get("text"), "review model reply")
+        reply = json_object(result.get("text"), "review model reply", model_envelope=True)
         if result.get("finish_reason") != "stop":
             raise ValidationError("review model reply did not finish normally")
         return execution, context, prompt, reply
@@ -517,6 +533,7 @@ class SurveyGate:
                     raise ValidationError("assessment dispatch source window is not an exact captured slice")
                 source_values[context["source_ref"]] = source
                 windows[context["source_ref"]] = window
+            reply = expand_evidence(reply, prompt.get("evidence_catalog", []), source_values, windows=windows)
             # A model may copy a sentence from the abstract while attaching
             # the same work's full-text reference (or the inverse).  The
             # runner repairs this unambiguous representation mismatch before

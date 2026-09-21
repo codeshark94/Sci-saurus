@@ -114,7 +114,7 @@ class ManuscriptDraftContractTests(unittest.TestCase):
         self.assertEqual(sorted(replacements), ["intro_p1", "intro_p2"])
         self.assertEqual(audit["added"][0]["reference_key"], "talvila2012")
 
-    def test_editor_decision_requires_three_rounds_and_full_panel(self):
+    def test_editor_acceptance_does_not_repeat_an_unchanged_accepted_panel(self):
         runner = PaperPipelineRunner.__new__(PaperPipelineRunner)
         runner.empirical_profile = True
         runner.review_panel_ids = ["science", "methods", "ai_smell", "human_scientist", "editorial_compression", "journal_editor"]
@@ -131,7 +131,9 @@ class ManuscriptDraftContractTests(unittest.TestCase):
             decision = runner._editor_decision(package, [package, package, package])
             self.assertEqual(decision["decision"], "accept")
             self.assertTrue((Path(path) / "editor-decision.json").is_file())
-            rejected = runner._editor_decision(package, [package, package])
+            first_pass = runner._editor_decision(package, [package])
+            self.assertEqual(first_pass["decision"], "accept")
+            rejected = runner._editor_decision(package, [])
             self.assertEqual(rejected["decision"], "reject")
 
     def test_draft_depth_uses_the_paper_descriptor_as_canonical_contract(self):
@@ -216,7 +218,7 @@ class ManuscriptDraftContractTests(unittest.TestCase):
                     patch("scisaurus.runtime.paper_pipeline.validate_results_package",
                           return_value=results), \
                     patch("scisaurus.runtime.paper_pipeline.load_paper_survey",
-                          return_value={}), \
+                          return_value={"state": "eligible_for_experiment"}), \
                     patch("scisaurus.runtime.paper_pipeline.evaluate_scholarly_preflight",
                           return_value=preflight), \
                     patch("scisaurus.runtime.paper_pipeline.validate_scholarly_preflight",

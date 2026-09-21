@@ -28,7 +28,8 @@ def _text(value, name):
 
 def _identifier(value, name):
     if not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", value):
-        raise ValidationError(f"{name} must be a bounded lowercase identifier")
+        raise ValidationError(f"{name} {value!r} must match '[a-z][a-z0-9_-]{{0,63}}'; "
+                              "keep the declared ID, executor metric ID and validator references identical")
     return value
 
 
@@ -42,29 +43,37 @@ def _ref(value, name, *, nullable=False):
 
 
 def _core(value, *, asset_version, base_dir):
-    identifiers = set()
-    for procedure in value["procedures"]:
+    identifiers = {}
+
+    def reserve_id(identifier, location):
+        if identifier in identifiers:
+            raise ValidationError(
+                f"results package identifiers must be unique: {identifier!r} at {location} "
+                f"duplicates {identifiers[identifier]}; use a distinct ID for each condition "
+                "and update primary outcomes and finding references consistently")
+        identifiers[identifier] = location
+
+    for index, procedure in enumerate(value["procedures"]):
         _exact(procedure, {"id", "description", "source"}, "procedure")
         _identifier(procedure["id"], "procedure id")
         _text(procedure["description"], "procedure description")
         _text(procedure["source"], "procedure source")
-        if procedure["id"] in identifiers:
-            raise ValidationError("results package identifiers must be unique")
-        identifiers.add(procedure["id"])
+        reserve_id(procedure["id"], f"procedures[{index}]")
     metric_ids = set()
-    for metric in value["metrics"]:
+    for index, metric in enumerate(value["metrics"]):
         _exact(metric, {"id", "value", "unit", "conditions", "source", "presentation"}, "metric")
         _identifier(metric["id"], "metric id")
         for key in ("unit", "conditions", "source", "presentation"):
             _text(metric[key], f"metric {key}")
         if (isinstance(metric["value"], bool) or not isinstance(metric["value"], (str, int, float))
                 or isinstance(metric["value"], float) and not math.isfinite(metric["value"])):
-            raise ValidationError("metric value must be an exact finite JSON scalar")
-        if metric["id"] in identifiers:
-            raise ValidationError("results package identifiers must be unique")
-        identifiers.add(metric["id"])
+            raise ValidationError(
+                f"metric value must be an exact finite JSON scalar: metrics[{index}] "
+                f"id={metric['id']!r} has {metric['value']!r}; check estimator assumptions and "
+                "input variation, and never replace an undefined estimate with an invented number")
+        reserve_id(metric["id"], f"metrics[{index}]")
         metric_ids.add(metric["id"])
-    for finding in value["findings"]:
+    for index, finding in enumerate(value["findings"]):
         _exact(finding, {"id", "statement", "metric_ids"}, "finding")
         _identifier(finding["id"], "finding id")
         _text(finding["statement"], "finding statement")
@@ -72,24 +81,20 @@ def _core(value, *, asset_version, base_dir):
                 or len(finding["metric_ids"]) != len(set(finding["metric_ids"]))
                 or set(finding["metric_ids"]) - metric_ids):
             raise ValidationError("finding must bind exact package metrics")
-        if finding["id"] in identifiers:
-            raise ValidationError("results package identifiers must be unique")
-        identifiers.add(finding["id"])
+        reserve_id(finding["id"], f"findings[{index}]")
     if not isinstance(value["limitations"], list) or not value["limitations"]:
         raise ValidationError("results package requires explicit limitations")
     for limitation in value["limitations"]:
         _text(limitation, "result limitation")
     if not isinstance(value["assets"], list):
         raise ValidationError("results assets must be an explicit list")
-    for asset in value["assets"]:
+    for index, asset in enumerate(value["assets"]):
         if asset_version == 1:
             _exact(asset, {"path", "sha256", "role"}, "result asset")
         else:
             _exact(asset, {"id", "path", "sha256", "role", "media_type", "caption"}, "result asset")
             _identifier(asset["id"], "result asset id")
-            if asset["id"] in identifiers:
-                raise ValidationError("results package identifiers must be unique")
-            identifiers.add(asset["id"])
+            reserve_id(asset["id"], f"assets[{index}]")
             _text(asset["media_type"], "result asset media_type")
             if asset["caption"] is not None:
                 _text(asset["caption"], "result asset caption")

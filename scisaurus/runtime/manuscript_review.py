@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 import hashlib
 import json
 import math
+from pathlib import Path
 import re
 import time
 from copy import deepcopy
@@ -18,7 +19,7 @@ import threading
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.models import ModelClient, ModelResult, resolve_model_config
+from scisaurus.runtime.models import ModelCallError, ModelClient, ModelResult, model_context_error, resolve_model_config
 
 
 REVIEW_SCHEMA_VERSION = "manuscript-review-2"
@@ -45,9 +46,9 @@ DEFAULT_REVIEWERS = (
     {"id": "human_scientist", "stage": 4,
      "focus": "Read as a skeptical human scientist. Check that the research question is explicit, the important pattern is prioritized, the Discussion explains plausible mechanisms, and proposed explanations are distinguished from established observations."},
     {"id": "editorial_compression", "stage": 5,
-     "focus": "Act as a scientific copy editor. Detect pipeline vocabulary, repeated numeric facts, duplicated caveats, weak figure integration, unprioritized limitations, and section paragraphs that do not perform a human-paper function."},
+     "focus": "Act as a scientific copy and layout editor. Detect repeated facts, duplicated caveats, weak figure integration, and paragraphs without a scientific purpose. When rendered manuscript pages are supplied, inspect every page for clipping, overlap, inconsistent alignment and spacing, illegible figures/tables, detached captions, bad page breaks, and typographic hierarchy. Cite the page and affected unit for each visual finding. Never claim visual inspection without page images."},
     {"id": "journal_editor", "stage": 6,
-     "focus": "Act as a handling editor for the declared scholarly profile. Judge whether the literature review is deep and relevant enough to position the contribution, whether citations are distributed across the argument, and whether the figures and tables are sufficient to support the paper's claims. Desk-reject a thin validation note presented as a journal article; request scoped literature or experiment work rather than padding."},
+     "focus": "Apply the standards of a top-tier scholarly journal: substantive original contribution, importance beyond a narrow benchmark, credible mechanism or explanatory insight, decisive competing hypotheses and controls, quantified uncertainty, robustness, reproducibility, complete claim-level evidence, and candid limitations. Judge the actual contribution, not prose confidence or length. Reject when a material criterion is unsupported, and request specific literature, experiment, or interpretation work with a falsifiable acceptance condition. Do not lower standards after repeated revisions or demand unsupported embellishment."},
 )
 
 
@@ -129,7 +130,7 @@ def _compact_evidence(evidence):
         compact["references"] = deepcopy(evidence["references"])
     if "scholarly_depth" in evidence:
         compact["scholarly_depth"] = deepcopy(evidence["scholarly_depth"])
-    for key in ("research_program", "argument_defense"):
+    for key in ("research_program", "argument_defense", "deferred_requirements", "layout_pages", "research_admission"):
         if key in evidence:
             compact[key] = deepcopy(evidence[key])
     return compact
@@ -788,8 +789,9 @@ class ManuscriptReviewRunner:
                  deadline_seconds=DEFAULT_DEADLINE_SECONDS,
                  max_output_tokens=None, reasoning_effort="xhigh",
                  call_timeout_seconds=300.0, inter_request_interval_seconds=0.5,
-                 arbiter_enabled=False):
+                 arbiter_enabled=False, retained_work_dir=None):
         self.model_config = deepcopy(model)
+        self.retained_work_dir = Path(retained_work_dir).resolve() if retained_work_dir else None
         self.reviewers = deepcopy(reviewers or list(DEFAULT_REVIEWERS))
         if not 3 <= len(self.reviewers) <= 6:
             raise ValidationError("manuscript review requires between three and six reviewer perspectives")
@@ -833,6 +835,7 @@ class ManuscriptReviewRunner:
         self.arbiter_enabled = arbiter_enabled
         self._pace_lock = threading.Lock()
         self._next_dispatch = 0.0
+        self._provider_pauses = {}
 
     @staticmethod
     def _remaining(deadline):
@@ -917,9 +920,22 @@ class ManuscriptReviewRunner:
             if config.get("protocol") == "openai_compatible":
                 config["reasoning_effort"] = self.reasoning_effort
             try:
-                config = resolve_model_config(config, role=f"review.{reviewer['id']}")
+                role = ("editorial.visual-integrator" if reviewer["id"] == "editorial_compression" and images
+                        else f"review.{reviewer['id']}")
+                config = resolve_model_config(config, role=role)
+                provider = config.get("base_url", "").rstrip("/")
+                with self._pace_lock:
+                    pause = self._provider_pauses.get(provider)
+                if pause:
+                    raise ModelCallError("review provider is cooling down", outcome_known=True, status_code=429,
+                        retry_after_seconds=max(0.1, pause - time.monotonic()))
                 result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt, images=images)
             except Exception as exc:
+                if isinstance(exc, ModelCallError) and exc.status_code == 429:
+                    with self._pace_lock:
+                        self._provider_pauses[config.get("base_url", "").rstrip("/")] = (
+                            time.monotonic() + exc.retry_after_seconds if exc.retry_after_seconds
+                            else deadline or time.monotonic() + self.call_timeout_seconds)
                 # Preserve the transport failure at the review boundary.  A
                 # later Composer resume can distinguish a provider failure
                 # from an invalid review object without weakening the review
@@ -1186,8 +1202,80 @@ class ManuscriptReviewRunner:
                                           elapsed_seconds=elapsed, finish_reason="stop")
         raise last_error
 
+    def _retained_review(self, manuscript, reviewer, images, interpretation, deadline,
+                         *, argument, evidence, artifact_dir, layout_images=None):
+        """Persist each independent response before any sibling can fail."""
+        page_images = layout_images if reviewer["id"] == "editorial_compression" else None
+        image_keys = [{"sha256": hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest(),
+                       "media_type": item.get("media_type")} for item in (page_images or images or [])]
+        key = hashlib.sha256(canonical_bytes({
+            "manuscript": manuscript, "reviewer": reviewer, "images": image_keys,
+            "interpretation": interpretation, "argument": argument, "evidence": evidence,
+            "model": self.model_config, "system": SYSTEM,
+            "reasoning_effort": self.reasoning_effort,
+            "max_output_tokens": self.max_output_tokens,
+        })).hexdigest()
+        retained_path = (self.retained_work_dir / f"{key}.json" if self.retained_work_dir else
+                         Path(artifact_dir) / f"retained-{reviewer['id']}.json" if artifact_dir else None)
+        if retained_path and retained_path.is_file():
+            saved = json.loads(retained_path.read_text())
+            if saved.get("input_sha256") == key:
+                value = validate_review(saved["review"], reviewer["id"], reviewer["stage"])
+                return value, ModelResult(text="", model=saved["model"], usage={},
+                                          elapsed_seconds=0, finish_reason="stop")
+        if page_images:
+            parts, usage, elapsed = [], {}, 0.0
+            config = resolve_model_config(self.model_config, role="editorial.visual-integrator")
+            if self.max_output_tokens is not None:
+                config["max_output_tokens"] = min(config.get("max_output_tokens", self.max_output_tokens), self.max_output_tokens)
+            start = 0
+            while start < len(page_images):
+                count = min(16, len(page_images) - start)
+                while count:
+                    batch_evidence = {**(evidence or {}), "layout_pages": {
+                        "first_page": start + 1, "last_page": start + count, "total_pages": len(page_images)}}
+                    error = model_context_error(config, system=SYSTEM,
+                        prompt=_review_prompt(manuscript, reviewer, interpretation, argument, batch_evidence),
+                        image_count=count)
+                    if not error:
+                        break
+                    count -= 1
+                if not count:
+                    raise ValidationError("layout review cannot fit even one page: " + error)
+                batch_dir = Path(artifact_dir) / f"layout-pages-{start + 1}" if artifact_dir else None
+                value, result = self._retained_review(
+                    manuscript, reviewer, page_images[start:start + count], interpretation, deadline,
+                    argument=argument, evidence=batch_evidence, artifact_dir=batch_dir)
+                value = deepcopy(value)
+                for field in ("checks", "findings", "research_requests"):
+                    for item in value.get(field, []):
+                        item["id"] = f"p{start + 1}_{item['id']}"
+                parts.append(value)
+                for dimension, amount in result.usage.items():
+                    usage[dimension] = usage.get(dimension, 0) + amount
+                elapsed += result.elapsed_seconds
+                start += count
+            value = deepcopy(parts[0])
+            for field in ("checks", "findings", "research_requests"):
+                value[field] = [item for part in parts for item in part.get(field, [])]
+            value["protected_units"] = sorted({unit for part in parts for unit in part["protected_units"]})
+            value["rationale"] = "\n".join(part["rationale"] for part in parts)
+            value["decision"] = "accept" if all(part["decision"] == "accept" for part in parts) else "revise"
+            validate_review(value, reviewer["id"], reviewer["stage"])
+            result = ModelResult(text="", model=result.model, usage=usage, elapsed_seconds=elapsed, finish_reason="stop")
+        else:
+            value, result = self._call_review(manuscript, reviewer, images, interpretation, deadline,
+                argument=argument, evidence=evidence, artifact_dir=artifact_dir)
+        if retained_path:
+            retained_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = retained_path.with_suffix(".tmp")
+            temporary.write_bytes(canonical_bytes({"input_sha256": key, "review": value,
+                                                   "model": result.model, "usage": result.usage}))
+            temporary.replace(retained_path)
+        return value, result
+
     def run(self, manuscript, *, images=None, interpretation=None, argument=None, evidence=None,
-            artifact_dir=None, feedback_callback=None):
+            artifact_dir=None, feedback_callback=None, layout_images=None):
         if not isinstance(manuscript, dict):
             raise ValidationError("manuscript review input must be a structured document")
         canonical_bytes(manuscript)
@@ -1202,8 +1290,9 @@ class ManuscriptReviewRunner:
         deadline = (time.monotonic() + self.deadline_seconds
                     if self.deadline_seconds is not None else None)
         pool = ThreadPoolExecutor(max_workers=min(self.max_workers, len(self.reviewers)))
-        futures = [pool.submit(self._call_review, manuscript, reviewer, images, interpretation, deadline,
-                               argument=argument, evidence=evidence, artifact_dir=artifact_dir)
+        futures = [pool.submit(self._retained_review, manuscript, reviewer, images, interpretation, deadline,
+                               argument=argument, evidence=evidence, artifact_dir=artifact_dir,
+                               layout_images=layout_images)
                    for reviewer in self.reviewers]
         future_reviewers = {future: reviewer for future, reviewer in zip(futures, self.reviewers)}
 
@@ -1324,6 +1413,10 @@ class ManuscriptReviewRunner:
         })
         return {"schema_version": PACKAGE_SCHEMA_VERSION,
                 "manuscript_sha256": hashlib.sha256(canonical_bytes(manuscript)).hexdigest(),
+                "layout_images_sha256": ([hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest()
+                                          for item in layout_images]
+                                         if layout_images and any(review["reviewer_id"] == "editorial_compression"
+                                                                  for review in reviews) else []),
                 "reviewer_ids": [reviewer["id"] for reviewer in self.reviewers],
                 "reviews": reviews, "adjudication": adjudication, "synthesis": synthesis,
                 "research_requests": deepcopy(synthesis.get("research_requests", [])),
