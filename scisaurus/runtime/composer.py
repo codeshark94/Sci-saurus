@@ -64,15 +64,26 @@ STAGE_HOLD_STATUSES = frozenset({"research_expansion_required", "review_rejected
 STAGE_ROLES = {route["stage_kind"]: stage_role(route["stage_kind"])
                for route in DEFAULT_STAGE_ROUTES}
 IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
-# Autonomous execution is the safe default: a transient model, provider, or
-# validation failure cannot terminate a workflow merely because a counter was
-# exhausted.  A small deterministic job can opt into ``bounded`` explicitly;
-# every mode remains fenced by the immutable mission and stage deadlines.
+# Legacy execution remains deadline-governed for compatibility: a transient
+# model, provider, or validation failure is not stopped by an arbitrary
+# counter. New autonomous-lab workflows should opt into ``forward_first``;
+# that policy supplies the bounded repair lease and provisional backfill path.
 DEFAULT_RETRY_POLICY = {"mode": "until_deadline", "max_attempts": None, "backoff_seconds": 2.0}
 # Research re-entry is also deadline-governed by default.  A deterministic
 # workflow may opt into a finite cycle budget explicitly; the manuscript's
 # independent three-round peer review remains a separate contract.
 DEFAULT_CONTINUATION_POLICY = {"mode": "until_deadline", "max_cycles": None}
+# ``forward_first`` is the autonomous-lab policy. It keeps the older strict
+# policies available for exact/release-oriented workflows, but gives a new
+# mission a finite repair lease and a durable provisional path instead of
+# replaying the same stage until the wall clock expires.
+FORWARD_FIRST_POLICY = "forward_first"
+FORWARD_FIRST_RETRY_POLICY = {
+    "mode": "bounded", "max_attempts": 2, "backoff_seconds": 2.0,
+}
+FORWARD_FIRST_CONTINUATION_POLICY = {
+    "mode": "bounded", "max_cycles": 2,
+}
 # Workflows created before agenda selection existed retain declaration-order
 # semantics. New autonomous-lab workflows opt into adaptive selection
 # explicitly, so replaying an immutable legacy graph never changes its meaning.
@@ -213,7 +224,7 @@ def validate_workflow(value):
                                "topic_preferences", "runtime_env_files", "progression_policy"}
     if not isinstance(value, dict) or set(value) - allowed_fields or not fields.issubset(value):
         raise ValidationError(
-            f"composer workflow requires {sorted(fields)} and permits ['agenda_policy', 'capability_foundry_config_path', 'continuation_policy', 'exploration_seed', 'experiment_catalog', 'organization', 'retry_policy', 'runtime_env_files', 'topic_exclusions', 'topic_history_path', 'topic_preferences', 'topic_reuse_allowed']")
+            f"composer workflow requires {sorted(fields)} and permits ['agenda_policy', 'capability_foundry_config_path', 'continuation_policy', 'exploration_seed', 'experiment_catalog', 'organization', 'progression_policy', 'retry_policy', 'runtime_env_files', 'topic_exclusions', 'topic_history_path', 'topic_preferences', 'topic_reuse_allowed']")
     if value["schema_version"] != SCHEMA_VERSION:
         raise ValidationError(f"composer workflow schema must be {SCHEMA_VERSION}")
     _identifier(value["id"], "workflow id")
@@ -230,8 +241,11 @@ def validate_workflow(value):
         _validate_topic_preferences(value["topic_preferences"])
     agenda_policy = value.get("agenda_policy")
     if "progression_policy" in value and (not isinstance(value["progression_policy"], str)
-            or value["progression_policy"] not in {"evidence_first", "full_pass"}):
-        raise ValidationError("progression_policy must be evidence_first or full_pass")
+            or value["progression_policy"] not in {
+                "evidence_first", "full_pass", FORWARD_FIRST_POLICY,
+            }):
+        raise ValidationError(
+            "progression_policy must be evidence_first, full_pass, or forward_first")
     if agenda_policy is not None:
         if (not isinstance(agenda_policy, dict)
                 or set(agenda_policy) != {"mode"}
@@ -625,6 +639,28 @@ class ComposerRunner:
             if head is None or json.loads(self.store.read_body(head["body_hash"])) != self.workflow:
                 raise ValidationError("composer resume workflow does not match the original immutable workflow")
             self._restore()
+            # A stopped process can leave older generations of department
+            # work orders in ``running`` even after the Composer checkpoint
+            # has advanced to a newer continuation.  Fence those rows during
+            # resume, before the dashboard or scheduler treats them as live.
+            # Keep every request in the restored continuation: requests may
+            # belong to a later stage and remain intentionally open until
+            # that stage gets its turn.
+            active_request_ids = {
+                item.get("id") for item in self.active_research_requests
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            }
+            retired_work_orders = self.departments.retire_superseded_work_orders(
+                active_request_ids,
+                reason="superseded work order fenced during Composer resume",
+            )
+            if retired_work_orders:
+                self.organization_snapshot = deepcopy(self.departments.snapshot())
+                self.department_activity.append({
+                    "cycle": self.continuation_cycles,
+                    "action": "retire_superseded_work_orders_on_resume",
+                    "work_orders": retired_work_orders,
+                })
             if self._sync_foundry_usage():
                 self._checkpoint("recovered_usage", force=True)
         if additional_seconds is not None:
@@ -845,6 +881,167 @@ class ComposerRunner:
             and bool(getattr(error, "retryable_topic_intake", False))
         )
 
+    @staticmethod
+    def _is_local_topic_budget_exhaustion(error, stage):
+        """Distinguish a Composer topic envelope from a provider quota.
+
+        A topic envelope is intentionally finite for one exploration cycle. It
+        must trigger a fresh research direction, not terminate the mission and
+        not be retried with the same exhausted prompt. Provider/model quotas
+        remain hard resource fences and do not match this predicate.
+        """
+        if stage.get("kind") != "topic_discovery":
+            return False
+        if isinstance(error, QuotaExceededError):
+            if getattr(error, "topic_budget_scope", None) in {"intake", "continuation"}:
+                return True
+            diagnostics = getattr(error, "diagnostics", None)
+            if isinstance(diagnostics, list) and any(
+                    isinstance(item, dict) and item.get("kind") == "composer_topic_budget"
+                    for item in diagnostics):
+                return True
+        return "topic discovery quota exhausted" in str(error).casefold()
+
+    @staticmethod
+    def _forward_failure_class(error):
+        """Classify a failed attempt without turning every defect into a stop."""
+        if isinstance(error, (ProviderCooldownError, QuotaExceededError,
+                              ComposerHardDeadlineExceeded, ComposerLateStageResult)):
+            return "resource_fence"
+        if isinstance(error, ModelCallError) and not getattr(error, "outcome_known", True):
+            return "unknown_external_outcome"
+        if isinstance(error, KeyboardInterrupt):
+            return "process_interruption"
+        text = str(error or "").casefold()
+        if any(token in text for token in (
+                "deadline", "quota", "cooldown", "result_unknown",
+                "unknown external outcome", "provider is unavailable",
+                "provider error", "authentication")):
+            return "resource_fence"
+        if isinstance(error, ModelWorkBlocked) or any(token in text for token in (
+                "adversarial", "claim_support", "estimator_definedness",
+                "independent_validation", "scientific", "hypothesis",
+                "evidence contract", "review rejected", "insufficient evidence")):
+            return "scientific_hold"
+        return "mechanical_contract"
+
+    @staticmethod
+    def _topic_candidate_from_failure(error):
+        """Recover a model-selected topic for a truthful provisional handoff."""
+        traces = getattr(error, "candidate_attempt_trace", [])
+        if not isinstance(traces, list):
+            return None
+        for trace in reversed(traces):
+            if not isinstance(trace, dict):
+                continue
+            selected = trace.get("selected_topic")
+            if isinstance(selected, dict) and isinstance(selected.get("id"), str):
+                return deepcopy(selected)
+        return None
+
+    def _materialize_forward_progress(self, stage, attempt_stage, error, context,
+                                      specialist_bundle, attempt_history):
+        """Create an honest provisional node so the agenda can keep moving."""
+        if not self._forward_first():
+            return None
+        failure_class = self._forward_failure_class(error)
+        if failure_class in {"resource_fence", "unknown_external_outcome",
+                             "process_interruption"}:
+            return None
+        stage_id = stage["id"]
+        candidate = deepcopy(context) if isinstance(context, dict) else {}
+        incumbent = self.context.get(stage_id)
+        if not candidate and isinstance(incumbent, dict):
+            candidate = deepcopy(incumbent)
+        if stage["kind"] == "topic_discovery" and not isinstance(candidate.get("topic"), dict):
+            selected = self._topic_candidate_from_failure(error)
+            if selected is None:
+                # A topic-less packet cannot feed a survey honestly. It gets a
+                # bounded retry/pivot, not a fabricated question.
+                return None
+            candidate.update({
+                "topic": selected,
+                "selected_id": selected["id"],
+                "admission_state": "provisional_for_survey",
+            })
+
+        output_root = Path(attempt_stage["project_dir"]).resolve() / "output"
+        output_root.mkdir(parents=True, exist_ok=True)
+        output_path = output_root / "forward-progress.json"
+        available = {
+            key: deepcopy(candidate.get(key))
+            for key in (
+                "output_path", "survey_ref", "survey_current", "assessment_current",
+                "gap_state", "topic_admission", "results_package", "argument_package_path",
+                "topic", "selected_id",
+            )
+            if key in candidate
+        }
+        debt = {
+            "stage_id": stage_id,
+            "kind": stage["kind"],
+            "failure_class": failure_class,
+            "error": str(error)[:4096],
+            "attempts": len(attempt_history),
+            "next_action": "backfill this scope after the agenda completes higher-value work",
+            "release_blocking": True,
+        }
+        body = {
+            "schema_version": "composer-forward-progress-1",
+            "status": "candidate_needs_review",
+            "provisional": True,
+            "stage_id": stage_id,
+            "kind": stage["kind"],
+            "failure_debt": debt,
+            "available_context": available,
+            "usage": deepcopy(candidate.get("usage", {}))
+                if isinstance(candidate.get("usage"), dict) else {},
+            "specialist_usage": deepcopy(specialist_bundle.get("usage", {}))
+                if isinstance(specialist_bundle, dict) else {},
+        }
+        artifact = self._publish(
+            f"command/composer/forward-progress/{stage_id}/{self.continuation_cycles}-"
+            f"{len(attempt_history)}",
+            "note", body, "command.composer",
+        )
+        body["artifact_ref"] = artifact["artifact_ref"]
+        output_path.write_bytes(canonical_bytes(body))
+
+        candidate.update({
+            "stage_id": stage_id,
+            "kind": stage["kind"],
+            "status": "candidate_needs_review",
+            "provisional": True,
+            "forward_progress": True,
+            "release_blocking": True,
+            "forward_progress_artifact": artifact["artifact_ref"],
+            "forward_progress_path": str(output_path),
+            "failure_debt": debt,
+            "output_path": str(output_path),
+            # Do not let a technical failure immediately regenerate the same
+            # continuation. The debt is visible and can be backfilled later.
+            "research_expansion_requests": [],
+            "research_requests": [],
+            "deferred_research_requests": [debt],
+        })
+        if stage["kind"] == "survey":
+            candidate.setdefault("gap_state", "insufficient_evidence")
+            candidate.setdefault("topic_admission", "exploratory_pilot")
+            candidate.setdefault("survey_current", False)
+            candidate.setdefault("assessment_current", False)
+        if stage["kind"] == "experiment":
+            candidate.setdefault("results_status", "not_executed")
+        self.department_activity.append({
+            "cycle": self.continuation_cycles,
+            "action": "forward_provisional_stage",
+            "stage_id": stage_id,
+            "failure_class": failure_class,
+            "artifact_ref": artifact["artifact_ref"],
+            "release_blocking": True,
+            "next_action": debt["next_action"],
+        })
+        return candidate
+
     def _remaining(self):
         remaining = self.deadline - self.clock()
         if isinstance(self.deadline_epoch, (int, float)) and math.isfinite(self.deadline_epoch):
@@ -1061,6 +1258,20 @@ class ComposerRunner:
         # while an omitted policy gets the autonomous deadline-governed mode.
         if "mode" not in configured and "max_attempts" in configured:
             policy["mode"] = "bounded"
+        if self._forward_first():
+            # A forward-first mission never inherits an unbounded retry loop
+            # from a legacy/template workflow. Even an explicit larger bounded
+            # value is clamped: one blocker may not monopolize the provider
+            # budget before the rest of the graph gets a turn.
+            bounded = dict(FORWARD_FIRST_RETRY_POLICY)
+            if isinstance(configured, dict) and type(configured.get("max_attempts")) is int:
+                bounded["max_attempts"] = min(
+                    FORWARD_FIRST_RETRY_POLICY["max_attempts"],
+                    max(1, configured["max_attempts"]),
+                )
+            if isinstance(configured, dict) and type(configured.get("backoff_seconds")) in (int, float):
+                bounded["backoff_seconds"] = max(0.0, float(configured["backoff_seconds"]))
+            policy = bounded
         return policy
 
     def _continuation_policy(self):
@@ -1070,7 +1281,31 @@ class ComposerRunner:
         # Preserve the pre-mode meaning of an explicitly supplied cycle count.
         if "mode" not in configured and "max_cycles" in configured:
             policy["mode"] = "bounded"
+        if self._forward_first():
+            bounded = dict(FORWARD_FIRST_CONTINUATION_POLICY)
+            if isinstance(configured, dict) and type(configured.get("max_cycles")) is int:
+                bounded["max_cycles"] = min(
+                    FORWARD_FIRST_CONTINUATION_POLICY["max_cycles"],
+                    max(0, configured["max_cycles"]),
+                )
+            policy = bounded
         return policy
+
+    def _forward_first(self):
+        """Whether this mission prioritizes a truthful next move over a hard stop.
+
+        This is deliberately a Composer policy, not a relaxation of a stage's
+        scientific claims. Release gates remain strict; the policy only
+        decides what to do when the current attempt cannot produce an accepted
+        artifact.
+        """
+        return self.workflow.get("progression_policy") == FORWARD_FIRST_POLICY
+
+    def _allows_provisional_progress(self):
+        """Whether the mission may carry an honest, release-blocking draft."""
+        return self.workflow.get("progression_policy") in {
+            "full_pass", FORWARD_FIRST_POLICY,
+        }
 
     def _agenda_policy(self):
         """Return how Composer chooses among dependency-ready research work.
@@ -1085,6 +1320,8 @@ class ComposerRunner:
             return {**DEFAULT_AGENDA_POLICY, **configured}
         if isinstance(self._restored_agenda_policy, dict):
             return deepcopy(self._restored_agenda_policy)
+        if self._forward_first():
+            return {"mode": "adaptive"}
         return deepcopy(DEFAULT_AGENDA_POLICY)
 
     def _autonomous_recovery_request(self, stage_id, context):
@@ -1259,7 +1496,9 @@ class ComposerRunner:
             if not isinstance(context, dict):
                 continue
             containers = []
-            for label in ("research_expansion_requests", "research_requests"):
+            for label in (
+                    "research_expansion_requests", "research_requests",
+                    "deferred_research_requests"):
                 if label not in context or context[label] is None:
                     continue
                 value = context[label]
@@ -1276,6 +1515,19 @@ class ComposerRunner:
                     })
                     continue
                 for request in candidates:
+                    raw_request = request
+                    if label == "deferred_research_requests":
+                        request = self._forward_debt_work_order(stage_id, request)
+                        if request is None:
+                            rejection = self.departments.reject_request(
+                                raw_request, source_stage_id=stage_id,
+                                reason="deferred failure debt could not be mapped to a stage work order",
+                            )
+                            self.department_activity.append({
+                                "action": "reject_work_order", "stage_id": stage_id,
+                                "request_id": rejection["request_id"], "rejection": rejection,
+                            })
+                            continue
                     if not isinstance(request, dict):
                         rejection = self.departments.reject_request(
                             request, source_stage_id=stage_id,
@@ -1407,6 +1659,10 @@ class ComposerRunner:
         targets = self._continuation_targets(requests, by_id)
         if not requests or not targets:
             return False
+        retired_work_orders = self.departments.retire_superseded_work_orders(
+            {item.get("id") for item in requests if isinstance(item, dict)},
+            reason="superseded by the current scoped continuation",
+        )
         self.continuation_cycles += 1
         self.active_research_requests = requests
         self.reopened_stage_ids = set(targets)
@@ -1418,6 +1674,12 @@ class ComposerRunner:
             "action": "activate_work_orders",
             "work_orders": self.departments.activate_work_orders(requests),
         })
+        if retired_work_orders:
+            self.department_activity.append({
+                "cycle": self.continuation_cycles,
+                "action": "retire_superseded_work_orders",
+                "work_orders": retired_work_orders,
+            })
         self._checkpoint(f"continuation:{self.continuation_cycles}:admitted", force=True)
         return True
 
@@ -2090,6 +2352,62 @@ class ComposerRunner:
                 continue
             self._attempted_request_signatures.add(self._research_request_signature(request))
 
+    @staticmethod
+    def _forward_debt_work_order(stage_id, debt):
+        """Turn deferred failure debt into one deterministic backfill order."""
+        if not isinstance(debt, dict):
+            return None
+        stage_kind = debt.get("kind")
+        mapping = {
+            "topic_discovery": (
+                "topic_refinement", "research.intelligence",
+                "Return to the failed topic envelope with a materially different, source-grounded question.",
+            ),
+            "survey": (
+                "literature_expansion", "research.intelligence",
+                "Backfill the survey evidence debt with identity-reconciled primary and full-text support.",
+            ),
+            "experiment": (
+                "additional_experiment", "methods.validation",
+                "Backfill the methods debt with a discriminating control, sensitivity check, or independent recalculation.",
+            ),
+            "interpretation": (
+                "interpretation_expansion", "strategy.interpretation",
+                "Backfill the interpretation debt by separating competing mechanisms and relinking claims to observations.",
+            ),
+            "argument": (
+                "interpretation_expansion", "strategy.interpretation",
+                "Backfill the argument debt by repairing the claim-evidence graph and unsupported inferential steps.",
+            ),
+            "paper": (
+                "manuscript_revision", "editorial.composer",
+                "Backfill the manuscript debt with a fresh evidence-linked revision and rendered review pass.",
+            ),
+        }
+        mapped = mapping.get(stage_kind)
+        if mapped is None:
+            return None
+        kind, owner, default_objective = mapped
+        stable = {
+            "stage_id": stage_id,
+            "kind": kind,
+            "failure_class": debt.get("failure_class"),
+            "error": debt.get("error"),
+            "attempts": debt.get("attempts"),
+        }
+        request_id = "forward-" + hashlib.sha256(canonical_bytes(stable)).hexdigest()[:20]
+        error = str(debt.get("error") or "the previous assignment did not produce an accepted artifact")[:1800]
+        return {
+            "id": request_id,
+            "kind": kind,
+            "owner": owner,
+            "objective": default_objective,
+            "why": f"The Composer carried a release-blocking provisional result for {stage_id}. Failure debt: {error}",
+            "success_condition": "Produce the missing evidence or analysis, rerun the affected acceptance checks, and preserve the prior candidate if the debt remains unresolved.",
+            "evidence_needed": "The prior candidate artifact, failure debt, exact input identity, and a fresh independently checked result.",
+            "source_stage_id": stage_id,
+        }
+
     def _free_topic_stage(self):
         """Return a topic stage that feeds a scholarly survey.
 
@@ -2330,7 +2648,7 @@ class ComposerRunner:
             return result
         if state not in {"refuted_by_prior_work", "insufficient_evidence"}:
             return result
-        if (self.workflow.get("progression_policy") == "full_pass"
+        if (self._allows_provisional_progress()
                 and state == "insufficient_evidence"
                 and result.get("survey_current") is True
                 and result.get("assessment_current") is True):
@@ -2598,6 +2916,27 @@ class ComposerRunner:
             if type(width) is int and width > 0:
                 unique_queries = unique_queries[:width]
             survey["seed_queries"] = unique_queries
+        # Provider readiness is an operational check, but its representative
+        # workload is still part of the live survey input.  A free-topic
+        # stage must not probe a descriptor's historical paper (the template
+        # used to probe an Attention paper even when the selected question
+        # concerned another field).  Use the selected question's first search
+        # family so a successful probe also proves that the actual route can
+        # serve this mission.
+        probe_query = next(
+            (item for item in survey.get("seed_queries", [])
+             if isinstance(item, str) and item.strip()),
+            topic.get("research_question", "scholarly research"),
+        )
+        bibliography = survey.get("bibliography")
+        if isinstance(bibliography, dict) and bibliography.get("adapter") == "openalex":
+            bibliography["representative"] = {
+                "operation": "search", "query": str(probe_query)[:2048],
+                "work_id": None, "limit": 1, "cursor": None,
+            }
+        identity = survey.get("identity")
+        if isinstance(identity, dict) and identity.get("adapter") == "crossref":
+            identity["representative"] = {"query": str(probe_query)[:2048], "limit": 1}
         if isinstance(config.get("objective"), str):
             config["objective"] = (
                 f"Investigate the selected question with a bounded scholarly survey: "
@@ -2618,52 +2957,18 @@ class ComposerRunner:
 
     @staticmethod
     def _topic_search_queries(topic):
-        """Add one compact exact-concept query to the selected topic.
+        """Return the selected topic's bounded search families unchanged.
 
-        OpenAlex's stemmed ``search`` endpoint treats long mixed queries as a
-        relevance bag.  A broad first query can therefore return unrelated
-        records before a distinctive method phrase is ever searched.  The
-        selected topic already supplies the terminology; recover a repeated
-        two-to-four-token phrase (or a hyphenated method name) and place its
-        exact form first.  The rest of the model's queries remain intact.
+        Search planning already supplies independent terminology families.
+        Earlier code manufactured an exact query by splitting a hyphenated
+        word from the research question (for example ``friction-triggered``
+        became ``"friction triggered"``).  That synthetic query was not a
+        declared search family and regularly admitted unrelated records before
+        the substantive queries ran.  Exact phrases remain available when a
+        planner explicitly declares them.
         """
         raw = [item.strip() for item in topic.get("search_queries", [])
                if isinstance(item, str) and item.strip()]
-        raw = list(dict.fromkeys(raw))
-        if not raw:
-            return []
-        text = " ".join([
-            str(topic.get("title", "")),
-            str(topic.get("research_question", "")),
-            *raw,
-        ])
-        phrase_candidates = []
-        for match in re.finditer(r"\b[a-zA-Z][a-zA-Z0-9]*(?:-[a-zA-Z0-9]+)+\b", text):
-            pieces = [piece.casefold() for piece in match.group(0).split("-") if piece]
-            if len(pieces) >= 2:
-                phrase_candidates.append(" ".join(pieces))
-        token_lists = [re.findall(r"[a-zA-Z][a-zA-Z0-9]*", query.casefold()) for query in raw]
-        stop = {
-            "a", "an", "and", "at", "by", "for", "from", "how", "in", "of", "on", "or", "the", "to",
-            "under", "with", "without", "versus", "relative", "does", "do", "can", "what", "when", "which",
-            "using", "across", "between", "within", "on",
-        }
-        if token_lists:
-            first = token_lists[0]
-            for width in range(4, 1, -1):
-                for start in range(0, len(first) - width + 1):
-                    window = first[start:start + width]
-                    content = [token for token in window if token not in stop and not token.isdigit()]
-                    if len(content) < 2:
-                        continue
-                    support = sum(set(window).issubset(set(other)) for other in token_lists[1:])
-                    if support:
-                        phrase_candidates.append(" ".join(window))
-        phrase = next((candidate for candidate in phrase_candidates
-                       if len(candidate.split()) >= 2), None)
-        if phrase:
-            exact_query = f'"{phrase}"'
-            raw = [exact_query, *raw]
         return list(dict.fromkeys(raw))
 
     @staticmethod
@@ -2773,13 +3078,13 @@ class ComposerRunner:
                     "disconfirmation_test", "resource_plan")},
                 "source_challenge": result.get("source_challenge"),
                 "continuation": {
-                    "cycle": self.continuation_cycles if force_regenerate else None,
+                    "cycle": self.continuation_cycles if continuation_requests else None,
                     "prior_capability_id": (
                         prior_capability.get("capability_id")
                         if isinstance(prior_capability, dict) else None
                     ),
                     "requests": self._follow_up_projection(continuation_requests)
-                    if force_regenerate else [],
+                    if continuation_requests else [],
                 },
                 "closest_prior_work": [{key: item.get(key) for key in (
                     "work_id", "title", "year", "abstract", "source_url")}
@@ -2889,7 +3194,7 @@ class ComposerRunner:
             return config
         topic_stage_id, topic_context = topic_match
         pilot_survey = next((self.context[ancestor_id] for ancestor_id in ancestor_ids
-            if self.workflow.get("progression_policy") == "full_pass"
+            if self._allows_provisional_progress()
             and by_id[ancestor_id]["kind"] == "survey"
             and self.context.get(ancestor_id, {}).get("topic_admission") == "exploratory_pilot"
             and self.context[ancestor_id].get("gap_state") == "insufficient_evidence"
@@ -2908,7 +3213,7 @@ class ComposerRunner:
                 if (isinstance(survey_context, dict) and (
                         (survey_context.get("gap_state") == "eligible_for_experiment"
                          and survey_context.get("topic_admission") == "provisional_supported_for_experiment")
-                        or (self.workflow.get("progression_policy") == "full_pass"
+                        or (self._allows_provisional_progress()
                             and survey_context.get("topic_admission") == "exploratory_pilot"
                             and survey_context.get("gap_state") == "insufficient_evidence"
                             and survey_context.get("survey_current") is True
@@ -2923,16 +3228,48 @@ class ComposerRunner:
         selected = topic_context["topic"]
         generated = topic_context.get("generated_capability")
         continuation_requests = self._requests_for_stage(stage["id"])
+        prior_experiment = self.context.get(stage["id"])
+        has_observed_experiment = (
+            isinstance(prior_experiment, dict)
+            and (
+                prior_experiment.get("results_package") is not None
+                or prior_experiment.get("raw_results") is not None
+                or isinstance(prior_experiment.get("metrics"), list)
+            )
+        )
+        pre_execution_capability_blocked = (
+            isinstance(prior_experiment, dict)
+            and prior_experiment.get("review_status") == "scientific_assignment_blocked"
+            and "capability foundry" in str(prior_experiment.get("error", "")).casefold()
+            and not has_observed_experiment
+        )
+        capability_repair_attempts = 0
+        if isinstance(prior_experiment, dict):
+            value = prior_experiment.get("capability_repair_attempts", 0)
+            if type(value) is int and value >= 0:
+                capability_repair_attempts = value
+        # A pre-execution program rejection is materially different from an
+        # additional experiment after observed data. Give the foundry two
+        # fresh, cycle-specific chances to repair it; after that the Composer
+        # pivots the research direction instead of spending the deadline on
+        # an unchanged program.
+        fresh_pre_execution_repair = (
+            pre_execution_capability_blocked and capability_repair_attempts < 2
+        )
         needs_fresh_capability = (
             bool(self.continuation_cycles and continuation_requests)
             and any(item.get("kind") in {"additional_experiment", "analysis_display", "analysis_repair"}
                     for item in continuation_requests)
-        )
+                    and has_observed_experiment
+        ) or fresh_pre_execution_repair
         if needs_fresh_capability and not self.workflow.get("capability_foundry_config_path"):
             raise ValidationError(
                 "a substantive experiment continuation requires capability_foundry_config_path; "
                 "a pinned catalog cannot silently repeat the prior experiment")
         if needs_fresh_capability and self.workflow.get("capability_foundry_config_path"):
+            if fresh_pre_execution_repair and isinstance(prior_experiment, dict):
+                prior_experiment["capability_repair_attempts"] = capability_repair_attempts + 1
+                self.context[stage["id"]] = prior_experiment
             self._materialize_topic_capability(
                 topic_context, force_regenerate=True,
                 continuation_requests=continuation_requests,
@@ -2983,10 +3320,15 @@ class ComposerRunner:
         if pilot_survey is not None:
             selected_experiment["study_type"] = "exploratory"
             selected_experiment["literature_gate"]["required_state"] = "insufficient_evidence"
-            selected_experiment["limitations"] = list(dict.fromkeys([
-                *selected_experiment.get("limitations", []),
-                *pilot_survey.get("carried_maturity_requirements", []),
-            ]))
+            # Maturity requirements are deferred scientific obligations, not
+            # part of the generated program's frozen execution contract.  The
+            # foundry program was admitted against its own experiment_intent
+            # limitations; appending survey requirements here changes that
+            # intent after admission and makes an otherwise identical replay
+            # fail with "output omits a frozen design limitation".  Keep the
+            # requirements in supplied_context (and the downstream review
+            # ledger) where they can constrain interpretation without
+            # mutating the executable capability.
         selected_experiment["revision"] = int(current.get("revision", selected_experiment.get("revision", 1)))
         # A design-driven capability executes a bounded declarative design that
         # the topic stage proposed.  The program, estimators and data-process
@@ -3136,7 +3478,7 @@ class ComposerRunner:
     def _ensure_journal_quality_contract(self, stage, config):
         """Bind a substantive analysis floor to experiments feeding a paper."""
         profile = self._paper_depth_profile(stage["id"])
-        if self.workflow.get("progression_policy") == "full_pass" and not self._requests_for_stage(stage["id"]):
+        if self._allows_provisional_progress() and not self._requests_for_stage(stage["id"]):
             return config
         if profile is None or stage["kind"] != "experiment":
             return config
@@ -3153,7 +3495,7 @@ class ComposerRunner:
 
     def _argument_minimums(self, stage_id, config):
         """Raise argument display floors to the publication profile."""
-        if self.workflow.get("progression_policy") == "full_pass":
+        if self._allows_provisional_progress():
             return {"figures": 0, "tables": 0, "experiments": 1}
         minimums = {"figures": 2, "tables": 1, "experiments": 2}
         profile = self._paper_depth_profile(stage_id)
@@ -3293,7 +3635,7 @@ class ComposerRunner:
             # Composer retry path instead of silently falling back to an old
             # packet with no literature basis.
             survey = load_paper_survey(paper_config,
-                require_eligible=self.workflow.get("progression_policy") != "full_pass")
+                require_eligible=not self._allows_provisional_progress())
         if isinstance(survey, dict):
             cards, literature = [], []
             for source_ref, source in list(survey.get("sources", {}).items())[:50]:
@@ -3518,16 +3860,15 @@ class ComposerRunner:
                 search["max_api_calls"] = min(1000, max(search.get("max_api_calls", 1) + 20, 40))
             search["expansion_rounds"] = min(8, search.get("expansion_rounds", 0) + 1)
             if "max_analyzed_works" in search:
-                # A follow-up increases deep analysis in proportion to the
-                # declared retrieval batch, rather than remapping the catalog.
-                search["max_analyzed_works"] = min(search["max_works"],
-                    search["max_analyzed_works"] + search["results_per_query"])
+                # A continuation may widen discovery, but it must not turn a
+                # repair request into a wholesale remap of the catalog.  Keep
+                # the substantive-analysis increment small and independent of
+                # the provider page size; citation and full-text work are
+                # selected separately by the survey funnel.
+                increment = max(1, min(5, search.get("results_per_query", 1) // 10 or 1))
+                search["max_analyzed_works"] = min(
+                    search["max_works"], search["max_analyzed_works"] + increment)
             survey["revision"] = int(survey.get("revision", 1)) + self.continuation_cycles
-            extra_queries = [item["objective"][:2048] for item in requests
-                             if item.get("kind") in {"literature_expansion", "full_text_retrieval"}]
-            for query in extra_queries:
-                if query and query not in survey.get("seed_queries", []):
-                    survey.setdefault("seed_queries", []).append(query)
             self._augment_full_text_routes(config, self._prior_stage_project("survey", self.context))
         elif kind == "experiment":
             config["project_id"] = str(Path(stage["project_dir"]).resolve())
@@ -4077,7 +4418,11 @@ class ComposerRunner:
 
     def _start_live_progress(self, stage):
         """Start a bounded ticker for one admitted stage."""
-        interval = max(0.5, float(self.workflow["time_policy"]["checkpoint_seconds"]))
+        # Durable checkpoint cadence may be deliberately coarse for large
+        # artifacts, but the supervisor and dashboard need a much tighter
+        # liveness signal while a provider/worker is active.
+        interval = max(0.5, min(
+            15.0, float(self.workflow["time_policy"]["checkpoint_seconds"])))
         stop = threading.Event()
         with self._progress_lock:
             self._live_progress_epoch += 1
@@ -4516,7 +4861,7 @@ class ComposerRunner:
         try:
             from scisaurus.runtime.paper import load_paper_survey
             survey = load_paper_survey(paper_config,
-                require_eligible=self.workflow.get("progression_policy") != "full_pass")
+                require_eligible=not self._allows_provisional_progress())
         except Exception:
             # The normal paper validator will report the precise dependency
             # problem.  Do not hide it behind a best-effort synchronization.
@@ -4727,6 +5072,43 @@ class ComposerRunner:
         return fields
 
     @staticmethod
+    def _retire_stage_assignment(fields):
+        """Separate the last dispatch from roles that are still executing.
+
+        Assignment plans are durable evidence, but their ``active_agents``
+        projection is live state.  Keeping the dispatch list after a stage
+        returns makes a completed or retrying stage look like it still owns
+        worker slots.  Preserve the list for auditability under
+        ``last_active_agents`` and expose an empty live list until the next
+        admission installs a fresh plan.
+        """
+        retired = deepcopy(fields) if isinstance(fields, dict) else {}
+        active = retired.get("active_agents")
+        if isinstance(active, list) and active:
+            retired["last_active_agents"] = deepcopy(active)
+        retired["active_agents"] = []
+        return retired
+
+    @staticmethod
+    def _active_stage_role_ids(stage):
+        """Select the smallest useful preflight pool for the stage.
+
+        The organization manifest describes the complete bounded capability
+        pool, but every role is not a reason to make a model call.  Survey's
+        production runner already owns search, cataloging, source capture,
+        identity checks, and fact verification.  Activating all six of those
+        roles before production duplicated the same work without giving them
+        a concrete result to review.  Keep one search-planning specialist for
+        admission and reserve the independent adversary for the completed
+        stage result.
+        """
+        if not isinstance(stage, dict):
+            return None
+        if stage.get("kind") == "survey":
+            return ["search-strategist"]
+        return None
+
+    @staticmethod
     def _specialist_model_config(stage, descriptor):
         """Load the model config used by a stage, when one is declared."""
         if not isinstance(descriptor, dict):
@@ -4903,6 +5285,47 @@ class ComposerRunner:
         feasibility_plan = feasibility_plan if isinstance(feasibility_plan, dict) else {}
         configured_experiment = descriptor.get("experiment") if isinstance(descriptor, dict) else None
         configured_experiment = configured_experiment if isinstance(configured_experiment, dict) else {}
+        capability_source = "topic_only"
+        generated = topic_context.get("generated_capability")
+        generated_experiment = None
+        if isinstance(generated, dict) and isinstance(generated.get("descriptor_path"), str):
+            try:
+                generated_descriptor = json.loads(Path(generated["descriptor_path"]).read_text())
+                candidate_experiment = generated_descriptor.get("experiment")
+                if isinstance(candidate_experiment, dict):
+                    generated_experiment = candidate_experiment
+            except (OSError, TypeError, ValueError):
+                generated_experiment = None
+
+        # Specialist admission happens before _run_stage materializes the
+        # selected capability.  The immutable stage descriptor can therefore
+        # still contain a template from an older mission (the live workflow
+        # used robust_mean while the selected topic is spectral winding).
+        # Never expose that unrelated design as if it were the current
+        # experiment. Prefer the already admitted topic capability; otherwise
+        # accept the stage descriptor only when its scientific identity matches
+        # the selected topic.
+        if isinstance(generated_experiment, dict):
+            generated_question = generated_experiment.get("research_question")
+            generated_id = generated_experiment.get("id")
+            selected_capability_id = (
+                selected.get("experiment_capability_id")
+                or generated.get("capability_id")
+            )
+            if (generated_question == selected.get("research_question")
+                    or generated_id == selected_capability_id):
+                configured_experiment = generated_experiment
+                capability_source = "admitted_topic_capability"
+        if capability_source == "topic_only":
+            descriptor_question = configured_experiment.get("research_question")
+            descriptor_id = configured_experiment.get("id")
+            selected_capability_id = selected.get("experiment_capability_id")
+            if (descriptor_question == selected.get("research_question")
+                    or (isinstance(selected_capability_id, str)
+                        and descriptor_id == selected_capability_id)):
+                capability_source = "matching_stage_descriptor"
+            else:
+                configured_experiment = {}
         result = stage_result if isinstance(stage_result, dict) else {}
 
         question = topic_context.get("question") or selected.get("research_question")
@@ -4939,6 +5362,7 @@ class ComposerRunner:
             "disconfirmation_test": selected.get("disconfirmation_test"),
             "primary_outcomes": deepcopy(configured_experiment.get("primary_outcomes", [])),
             "stopping_rule": deepcopy(configured_experiment.get("stopping_rule")),
+            "capability_source": capability_source,
             "state": "pre_execution" if not result else "stage_result_available",
         }
         raw_results = result.get("results_package") or result.get("raw_results")
@@ -4972,6 +5396,7 @@ class ComposerRunner:
             "execution_manifest": {
                 "state": "planned",
                 "capability_id": selected.get("experiment_capability_id"),
+                "capability_source": capability_source,
                 "execution_mode": feasibility_plan.get("execution_mode"),
                 "required_executables": deepcopy(feasibility_plan.get("required_executables", [])),
                 "required_packages": deepcopy(feasibility_plan.get("required_packages", [])),
@@ -5341,7 +5766,22 @@ class ComposerRunner:
                         system="checked-stage-output-1", prompt=packet, model={})
         retained = cache.get(key)
         if retained and retained.get("status") == "blocked":
-            raise ModelWorkBlocked(retained["error"])
+            # A scientific recovery cycle is a new execution boundary.  The
+            # old stage cache records why the previous program was rejected,
+            # but must not prevent `_execute_stage` from materializing the
+            # cycle-specific repair requested by the Composer.  Without this
+            # distinction the specialist pool can repeat forever while the
+            # actual experiment runner is never reached.
+            recovery_context = self.context.get(stage["id"])
+            scientific_recovery = (
+                stage["kind"] == "experiment"
+                and stage["id"] in self.reopened_stage_ids
+                and bool(self.continuation_cycles)
+                and isinstance(recovery_context, dict)
+                and recovery_context.get("review_status") == "scientific_assignment_blocked"
+            )
+            if not scientific_recovery:
+                raise ModelWorkBlocked(retained["error"])
         if (retained and retained.get("status") == "succeeded"
                 and Path(retained["result"]["output_path"]).is_file()
                 and hashlib.sha256(Path(retained["result"]["output_path"]).read_bytes()).hexdigest()
@@ -5439,7 +5879,7 @@ class ComposerRunner:
         config = self._adapt_continuation_config(stage, config)
         # The mission deadline governs total autonomy, not the number of
         # attempts spent repairing one unchanged model assignment.
-        if kind in {"survey", "experiment"} and self.workflow.get("progression_policy") == "full_pass":
+        if kind in {"survey", "experiment"} and self._allows_provisional_progress():
             config.setdefault("limits", {})["repair_mode"] = "bounded"
         if (kind == "topic_discovery"
                 and self._retry_policy().get("mode", "bounded") == "until_deadline"):
@@ -5614,42 +6054,55 @@ class ComposerRunner:
                 project_dir = Path(stage["project_dir"])
                 prior_run = project_dir / "output" / "run.json"
                 resume_policy = None
+                project_has_checkpoint = (project_dir / "state" / "control.sqlite").is_file()
+                prior = {}
                 if prior_run.is_file():
                     try:
                         prior = json.loads(prior_run.read_text())
                     except (OSError, ValueError):
                         prior = {}
-                    if prior.get("status") in {"blocked", "paused"}:
-                        durable_config = self._durable_stage_config(project_dir)
-                        if durable_config is not None:
-                            # The durable runner input is authoritative for a
-                            # resumed workspace.  Reapplying the current
-                            # descriptor would replace the selected topic,
-                            # project identity, or provider route and makes
-                            # ResumeController reject the checkpoint.
-                            config = durable_config
-                        scope = self._survey_resume_scope(prior)
-                        resume_policy = {
-                            # Composer owns autonomous recovery.  A process
-                            # interruption cannot observe an in-flight model
-                            # response, so reconcile it as one conservative
-                            # model call before retrying the scoped survey.
-                            "additional_seconds": min(
-                                float(config["limits"]["wall_clock_seconds"]),
-                                max(1.0, self._remaining()),
-                            ),
-                            "unknown_outcomes": {
-                                "mode": "charge_and_retry",
-                                "usage_per_attempt": {"model_calls": 1},
-                            },
-                            "source_changes": {"mode": "reopen", "reopen_scopes": [scope]},
-                        }
-                        self._publish(f"command/composer/recovery/{stage['id']}-{len(self.feedback) + 1}",
-                                      "decision_note", {
-                                          "stage_id": stage["id"], "action": "resume_scoped_stage",
-                                          "scope": scope, "reason": prior.get("error", "recoverable stage blocker"),
-                                          "additional_seconds": resume_policy["additional_seconds"],
-                                      }, "command.composer")
+                # A continuation can be interrupted after the durable survey
+                # store is created but before SurveyRunner writes run.json.
+                # That is still a resumable run, not a new-directory request.
+                # The old condition only recognized blocked/paused run.json
+                # files, so watch mode repeatedly retried the same validation
+                # error without ever reaching search or model work.
+                resumable_checkpoint = (
+                    project_has_checkpoint
+                    and (not prior_run.is_file()
+                         or prior.get("status") in {"blocked", "paused", "running"})
+                )
+                if resumable_checkpoint:
+                    durable_config = self._durable_stage_config(project_dir)
+                    if durable_config is not None:
+                        # The durable runner input is authoritative for a
+                        # resumed workspace.  Reapplying the current
+                        # descriptor would replace the selected topic,
+                        # project identity, or provider route and makes
+                        # ResumeController reject the checkpoint.
+                        config = durable_config
+                    scope = self._survey_resume_scope(prior)
+                    resume_policy = {
+                        # Composer owns autonomous recovery.  A process
+                        # interruption cannot observe an in-flight model
+                        # response, so reconcile it as one conservative
+                        # model call before retrying the scoped survey.
+                        "additional_seconds": min(
+                            float(config["limits"]["wall_clock_seconds"]),
+                            max(1.0, self._remaining()),
+                        ),
+                        "unknown_outcomes": {
+                            "mode": "charge_and_retry",
+                            "usage_per_attempt": {"model_calls": 1},
+                        },
+                        "source_changes": {"mode": "reopen", "reopen_scopes": [scope]},
+                    }
+                    self._publish(f"command/composer/recovery/{stage['id']}-{len(self.feedback) + 1}",
+                                  "decision_note", {
+                                      "stage_id": stage["id"], "action": "resume_scoped_stage",
+                                      "scope": scope, "reason": prior.get("error", "recoverable stage blocker"),
+                                      "additional_seconds": resume_policy["additional_seconds"],
+                                  }, "command.composer")
                 result = SurveyRunner(stage["project_dir"], config, on_progress=self._stage_progress(stage),
                                       resume_policy=resume_policy).run()
                 result["usage"] = self._incremental_stage_usage(stage, result.get("usage", {}))
@@ -5827,7 +6280,7 @@ class ComposerRunner:
                 research_redteam_max_attempts=config.get("research_redteam_max_attempts", 3),
                 draft=draft, initial_review_package=initial_review_package,
                 release_on_review_limit=bool(config.get("release_on_review_limit", False)),
-                draft_before_research_review=self.workflow.get("progression_policy") == "full_pass",
+                draft_before_research_review=self._allows_provisional_progress(),
                 retained_work_dir=self.root / "retained-paper-work" / stage["id"],
                 deferred_requirements=[{
                     "stage_id": key, "findings": value.get("deferred_review_findings"),
@@ -5835,9 +6288,9 @@ class ComposerRunner:
                 } for key, value in self.context.items() if isinstance(value, dict)
                    and (value.get("deferred_review_findings") or value.get("carried_maturity_requirements"))],
                 initial_argument_package=argument_package,
-                min_argument_figures=(0 if self.workflow.get("progression_policy") == "full_pass" else config["min_argument_figures"]),
-                min_argument_tables=(0 if self.workflow.get("progression_policy") == "full_pass" else config["min_argument_tables"]),
-                min_argument_experiments=(1 if self.workflow.get("progression_policy") == "full_pass" else config["min_argument_experiments"]),
+                min_argument_figures=(0 if self._allows_provisional_progress() else config["min_argument_figures"]),
+                min_argument_tables=(0 if self._allows_provisional_progress() else config["min_argument_tables"]),
+                min_argument_experiments=(1 if self._allows_provisional_progress() else config["min_argument_experiments"]),
                 feedback_callback=lambda event: self._record_internal_feedback(stage, event))
             result = runner.run()
             output_path = Path(result["pdf"] or result.get("preflight_path")
@@ -5887,7 +6340,8 @@ class ComposerRunner:
             "owner_agent": route["chief"],
             "adversary_agent": route["adversary"],
             "required_agents": deepcopy(assignment.get("required_agents", route["required_agents"])),
-            "active_agents": deepcopy(assignment.get("active_agents", [])),
+            "active_agents": deepcopy(assignment.get(
+                "active_agents", assignment.get("last_active_agents", []))),
             "verifier_agent": assignment.get("verifier_agent", route["verifier_agent"]),
             "chief_synthesis_ref": assignment.get("chief_synthesis_ref"),
             "verifier_artifact_ref": assignment.get("verifier_artifact_ref"),
@@ -6110,7 +6564,8 @@ class ComposerRunner:
             "owner_agent": route["chief"],
             "adversary_agent": route["adversary"],
             "required_agents": deepcopy(assignment.get("required_agents", route["required_agents"])),
-            "active_agents": deepcopy(assignment.get("active_agents", [])),
+            "active_agents": deepcopy(assignment.get(
+                "active_agents", assignment.get("last_active_agents", []))),
             "verifier_agent": assignment.get("verifier_agent", route["verifier_agent"]),
             "chief_synthesis_ref": assignment.get("chief_synthesis_ref"),
             "verifier_artifact_ref": assignment.get("verifier_artifact_ref"),
@@ -6150,22 +6605,247 @@ class ComposerRunner:
             })
         return resolved
 
+    def _pivot_topic_after_scientific_blocker(self, stage, context, completed, by_id,
+                                              *, reason, objective, why):
+        """Open one fresh topic direction for a non-productive stage blocker."""
+        pending = list(stage.get("depends_on", []))
+        seen = set()
+        topic_stage_id = None
+        while pending:
+            candidate_id = pending.pop()
+            if candidate_id in seen or candidate_id not in by_id:
+                continue
+            seen.add(candidate_id)
+            candidate_stage = by_id[candidate_id]
+            if candidate_stage.get("kind") == "topic_discovery":
+                topic_stage_id = candidate_id
+                break
+            pending.extend(candidate_stage.get("depends_on", []))
+        if topic_stage_id is None:
+            return False
+        topic_context = self.context.get(topic_stage_id)
+        topic_context = deepcopy(topic_context) if isinstance(topic_context, dict) else {
+            "kind": "topic_discovery"
+        }
+        pivot_cycle = self.continuation_cycles + 1
+        topic_context["status"] = "research_expansion_required"
+        topic_context["topic_pivot"] = {
+            "status": "required", "reason": reason,
+            "source_stage_id": stage["id"], "cycle": pivot_cycle,
+        }
+        topic_context.pop("generated_capability", None)
+        topic_context["research_expansion_requests"] = [{
+            "id": f"auto-topic-pivot-{pivot_cycle}",
+            "kind": "topic_refinement",
+            "owner": "research.intelligence",
+            "objective": objective,
+            "why": why,
+            "success_condition": (
+                "A new topic survives maturity and adversarial review, passes the bounded literature "
+                "gate, and has an executable primary estimand."
+            ),
+            "evidence_needed": (
+                "The failed stage's concrete checks, retained evidence boundary, a materially changed "
+                "research question, and a bounded execution plan."
+            ),
+        }]
+        self.context[topic_stage_id] = topic_context
+        context["research_expansion_requests"] = []
+        context["research_requests"] = []
+        context["pivoted_to_topic"] = topic_stage_id
+        self.context[stage["id"]] = context
+        if not self._begin_continuation(completed, by_id):
+            return False
+        self.department_activity.append({
+            "cycle": self.continuation_cycles,
+            "action": "pivot_topic_after_scientific_blocker",
+            "stage_id": stage["id"], "topic_stage_id": topic_stage_id,
+            "reason": reason,
+        })
+        return True
+
+    def _reopen_blocked_checkpoint(self, completed, by_id):
+        """Turn a recoverable stop checkpoint into one fresh work cycle.
+
+        The Composer normally admits recovery in the same process that sees a
+        stage failure. A crash, manual restart, or an older runtime can leave
+        only the durable ``blocked`` projection behind. Without this bridge,
+        the next ``--resume`` merely redispatches or reports the same stale
+        blocker. This method is deliberately conservative: environmental
+        quota/deadline/cooldown and unknown outcomes are left for their own
+        policies, while scientific assignment failures get a new scoped order.
+        """
+        for stage in self.workflow.get("stages", []):
+            stage_id = stage.get("id")
+            record = self.stage_records.get(stage_id, {})
+            if not isinstance(record, dict) or record.get("status") != "blocked":
+                continue
+            error_text = str(record.get("error") or "")
+            lowered = error_text.casefold()
+            if any(token in lowered for token in (
+                    "hard deadline", "provider cooldown", "result_unknown",
+                    "unknown_external_outcome", "process_interrupted")):
+                continue
+            if "quotaexceedederror" in lowered and not (
+                    stage.get("kind") == "topic_discovery"
+                    and "topic discovery quota exhausted" in lowered):
+                continue
+            if stage.get("kind") == "topic_discovery" and (
+                    "topic discovery quota exhausted" in lowered):
+                error = QuotaExceededError(
+                    error_text or "topic discovery quota exhausted",
+                    dimension="model_calls", limit=0, observed=0,
+                    usage={}, diagnostics=[{"kind": "composer_topic_budget"}],
+                )
+                error.topic_budget_scope = "restored_checkpoint"
+                error.usage_is_snapshot = True
+            else:
+                error = ModelWorkBlocked(error_text or "recoverable stage assignment blocker")
+            if self._admit_scientific_blocker_recovery(
+                    stage, error, completed, by_id):
+                record["status"] = "retrying"
+                record["recovery_admitted"] = True
+                return True
+        return False
+
     def _admit_scientific_blocker_recovery(self, stage, error, completed, by_id,
                                            specialist_verifier=None):
         """Turn a bounded scientific failure into a fresh scoped work order.
 
         ``ModelWorkBlocked`` means the current assignment exhausted its own
-        validation/repair contract. It is not evidence that the research
-        mission is finished: preserve that attempt, change the scientific
-        work, and reopen only the affected dependency closure. Provider
-        cooldowns, quota failures, deadlines, and process interruptions never
-        enter this path.
+        validation/repair contract. A Composer-owned topic envelope is the
+        same kind of bounded scientific failure: preserve that cycle, change
+        the research direction, and reopen only the affected dependency
+        closure. Provider/model quotas, deadlines, and process interruptions
+        remain environmental fences and never enter this path.
         """
-        if not isinstance(error, ModelWorkBlocked) or stage.get("kind") not in STAGE_KINDS:
+        if self._forward_first():
+            # ``run`` converts actionable blockers into release-blocking
+            # provisional nodes. A restored old ``blocked`` projection must
+            # not reopen the same stage and consume another mission cycle.
+            return False
+        topic_budget_exhausted = self._is_local_topic_budget_exhaustion(error, stage)
+        # A full survey pass can be scientifically non-productive even when
+        # the runner returns a normal ValidationError rather than the generic
+        # ModelWorkBlocked wrapper.  It must enter the same scoped topic-pivot
+        # path; otherwise until-deadline retry policy replays an unchanged
+        # literature map indefinitely.
+        survey_review_blocker = (
+            stage.get("kind") == "survey"
+            and isinstance(error, ValidationError)
+            and "survey review did not pass every required check" in str(error).casefold()
+        )
+        if ((not isinstance(error, ModelWorkBlocked)
+             and not topic_budget_exhausted
+             and not survey_review_blocker)
+                or stage.get("kind") not in STAGE_KINDS):
             return False
         self._remaining()
-        context = self.context.get(stage["id"])
-        context = deepcopy(context) if isinstance(context, dict) else {}
+        if isinstance(error, ModelWorkBlocked) and stage.get("kind") != "topic_discovery":
+            # A survey/experiment-only workflow has no upstream frontier to
+            # replan. Do not manufacture repeated same-stage repair cycles;
+            # preserve the blocker for an explicit caller. Full research
+            # missions always have a topic ancestor and continue through that
+            # pivot path instead.
+            pending = list(stage.get("depends_on", []))
+            seen = set()
+            has_topic_ancestor = False
+            while pending:
+                candidate_id = pending.pop()
+                if candidate_id in seen or candidate_id not in by_id:
+                    continue
+                seen.add(candidate_id)
+                candidate_stage = by_id[candidate_id]
+                if candidate_stage.get("kind") == "topic_discovery":
+                    has_topic_ancestor = True
+                    break
+                pending.extend(candidate_stage.get("depends_on", []))
+            if not has_topic_ancestor:
+                return False
+        prior_context = self.context.get(stage["id"])
+        prior_context = deepcopy(prior_context) if isinstance(prior_context, dict) else {}
+        context = deepcopy(prior_context)
+        observed_experiment = bool(
+            prior_context.get("results_package") is not None
+            or prior_context.get("raw_results") is not None
+            or isinstance(prior_context.get("metrics"), list)
+        )
+        repair_attempts = prior_context.get("capability_repair_attempts", 0)
+        pre_execution_loop = (
+            stage.get("kind") == "experiment"
+            and prior_context.get("review_status") == "scientific_assignment_blocked"
+            and "capability foundry" in str(prior_context.get("error", "")).casefold()
+            and not observed_experiment
+            and type(repair_attempts) is int
+            and repair_attempts >= 2
+        )
+        if topic_budget_exhausted:
+            # The previous cycle has no remaining model/retrieval capacity.
+            # Clear only its emitted work orders so _continuation_requests()
+            # creates a cycle-specific strategy instead of replaying the same
+            # exhausted request. The selected topic is retained as negative
+            # evidence for the next prompt, not as an executable incumbent.
+            context.update({
+                "stage_id": stage["id"],
+                "kind": stage["kind"],
+                "status": "research_expansion_required",
+                "error": str(error)[:4096],
+                "review_status": "topic_budget_exhausted",
+                "topic_budget_recovery": {
+                    "status": "required",
+                    "scope": getattr(error, "topic_budget_scope", "unknown"),
+                    "reason": "the current topic exploration envelope was exhausted",
+                    "previous_cycle": self.continuation_cycles,
+                },
+                "research_expansion_requests": [],
+                "research_requests": [],
+            })
+            self.context[stage["id"]] = context
+            if not self._begin_continuation(completed, by_id):
+                return False
+            self.department_activity.append({
+                "cycle": self.continuation_cycles,
+                "action": "pivot_topic_after_budget_exhaustion",
+                "stage_id": stage["id"],
+                "previous_cycle": self.continuation_cycles - 1,
+                "reason": "topic envelope exhausted; opened a fresh bounded exploration cycle",
+            })
+            return True
+        if pre_execution_loop:
+            # Two fresh executable-program repairs are enough evidence that
+            # this framing is not currently implementable by the available
+            # runtime. Route the mission back to topic discovery with a typed
+            # pivot order; do not spend the remaining wall replaying the same
+            # capability-authoring failure.
+            return self._pivot_topic_after_scientific_blocker(
+                stage, context, completed, by_id,
+                reason="the selected topic exhausted two pre-execution capability repairs",
+                objective=(
+                    "Abandon the current executable framing and generate a materially different, "
+                    "source-grounded computational question with a simpler falsifiable estimand."
+                ),
+                why=(
+                    "The selected topic exhausted two independent capability repairs before any "
+                    "experiment result was produced; repeating the same program is not progress."
+                ),
+            )
+        if survey_review_blocker:
+            # A complete literature pass has already paid for retrieval,
+            # claim extraction, and independent review. Replaying the same
+            # map until the mission wall is exhausted only burns model quota;
+            # route the scientific direction back to topic discovery.
+            return self._pivot_topic_after_scientific_blocker(
+                stage, context, completed, by_id,
+                reason="the literature acceptance gate rejected the current direction after a full pass",
+                objective=(
+                    "Generate a materially different, source-grounded computational question whose "
+                    "literature map can pass independent evidence-fidelity checks before execution."
+                ),
+                why=(
+                    "The current literature survey failed its independent required checks after a full "
+                    "bounded pass; repeating the same map is not progress."
+                ),
+            )
         context.update({
             "stage_id": stage["id"],
             "kind": stage["kind"],
@@ -6228,6 +6908,14 @@ class ComposerRunner:
                 self.status = hold_status
                 self._checkpoint(f"resume:{hold_status}", force=True)
                 return self._finish()
+            # A supervisor may restart after the previous process wrote a
+            # terminal-looking blocker. Reopen recoverable scientific stages
+            # before dependency scheduling so a restart is a continuation, not
+            # another pass through the same dead end. Hard deadlines, provider
+            # cooldowns, global quotas, and unknown external outcomes remain
+            # explicit stop conditions.
+            if self._reopen_blocked_checkpoint(completed, by_id):
+                self._checkpoint("resume:blocked_stage_recovery_admitted", force=True)
             while True:
                 if required_ids.issubset(completed) and self.continuation_pending_stage_ids.issubset(completed):
                     # A completed graph may still contain a first-class
@@ -6413,6 +7101,7 @@ class ComposerRunner:
                                     })).hexdigest(),
                                 },
                                 deadline_seconds=min(float(stage["deadline_seconds"]), self._remaining()),
+                                active_role_ids=self._active_stage_role_ids(stage),
                             )
                             self.stage_records[stage_id].update(
                                 self._stage_assignment_fields(stage_assignment))
@@ -6514,7 +7203,9 @@ class ComposerRunner:
                                             context, specialist_verifier)
                                     )
                                     if not carried:
-                                        defer = (self.workflow.get("progression_policy") == "full_pass"
+                                        defer = (self.workflow.get("progression_policy") in {
+                                                     "full_pass", FORWARD_FIRST_POLICY,
+                                                 }
                                                  and stage["kind"] != "paper"
                                                  and specialist_verifier.get("status") == "succeeded"
                                                  and outcome in STAGE_READY_STATUSES)
@@ -6788,6 +7479,7 @@ class ComposerRunner:
                                 )
                                 if key in self.stage_records.get(stage_id, {})
                             }
+                            assignment_fields = self._retire_stage_assignment(assignment_fields)
                             self.stage_records[stage_id] = {
                                 "kind": stage["kind"],
                                 "status": ("paused" if provider_paused
@@ -6872,9 +7564,47 @@ class ComposerRunner:
                         # reassess the frontier before dispatching it again.
                         progress = True
                         break
+                    if (not stage_succeeded and self._forward_first()
+                            and last_error is not None):
+                        provisional = self._materialize_forward_progress(
+                            stage, attempt_stage, last_error, context,
+                            specialist_bundle, attempt_history)
+                        if provisional is not None:
+                            context = provisional
+                            self.context[stage_id] = deepcopy(provisional)
+                            current_record = deepcopy(self.stage_records.get(stage_id, {}))
+                            current_record.update({
+                                "status": "candidate_needs_review",
+                                "output_path": provisional.get("output_path"),
+                                "forward_progress": True,
+                                "release_blocking": True,
+                                "failure_debt": deepcopy(provisional.get("failure_debt", {})),
+                            })
+                            self.stage_records[stage_id] = current_record
+                            stage_succeeded = True
                     if stage_succeeded:
                         completed.add(stage_id)
                         self._record_feedback(stage, context)
+                        self.stage_records[stage_id] = self._retire_stage_assignment(
+                            self.stage_records.get(stage_id, {}))
+                        if (self._forward_first()
+                                and context.get("status") in STAGE_HOLD_STATUSES):
+                            hold_error = ValidationError(
+                                context.get("error")
+                                or f"{stage_id} returned {context.get('status')}")
+                            forwarded = self._materialize_forward_progress(
+                                stage, attempt_stage, hold_error, context,
+                                specialist_bundle, attempt_history)
+                            if forwarded is not None:
+                                context = forwarded
+                                self.context[stage_id] = deepcopy(forwarded)
+                                self.stage_records[stage_id].update({
+                                    "status": "candidate_needs_review",
+                                    "output_path": forwarded.get("output_path"),
+                                    "forward_progress": True,
+                                    "release_blocking": True,
+                                    "failure_debt": deepcopy(forwarded.get("failure_debt", {})),
+                                })
                         if context.get("status") in STAGE_HOLD_STATUSES:
                             # A hold is a control decision, not a successful
                             # dependency.  Start the owning continuation now;
@@ -6903,6 +7633,7 @@ class ComposerRunner:
                         )
                         if key in self.stage_records.get(stage_id, {})
                     }
+                    assignment_fields = self._retire_stage_assignment(assignment_fields)
                     self.stage_records[stage_id] = {
                         "kind": stage["kind"], "status": "blocked",
                         "task_id": task_id,
@@ -7058,6 +7789,9 @@ class ComposerRunner:
                 # The run report remains publishable even if a secondary
                 # progress projection encounters an I/O or ledger failure.
                 interim_error = f"{type(exc).__name__}: {exc}"
+        remaining_seconds = max(0.0, self.deadline - self.clock())
+        if isinstance(self.deadline_epoch, (int, float)) and math.isfinite(self.deadline_epoch):
+            remaining_seconds = max(0.0, min(remaining_seconds, self.deadline_epoch - time.time()))
         result = {
             "schema_version": RUN_SCHEMA_VERSION, "run_id": self.run_id, "workflow_id": self.workflow["id"],
             "status": self.status, "stages": deepcopy(self.stage_records), "context": deepcopy(self.context),
@@ -7082,7 +7816,8 @@ class ComposerRunner:
             "topic_history_scope": self.topic_history_scope,
             "topic_history_entries": len(self.topic_history.get("entries", [])),
             "started_at_epoch": self.started_epoch, "deadline_at_epoch": self.deadline_epoch,
-            "elapsed_seconds": elapsed, "deadline_seconds": self.workflow["time_policy"]["hard_seconds"],
+            "elapsed_seconds": elapsed, "remaining_seconds": remaining_seconds,
+            "deadline_seconds": self.workflow["time_policy"]["hard_seconds"],
             "release_status": (
                 "research_expansion_required" if self.status == "research_expansion_required"
                 else "review_rejected" if self.status == "review_rejected"
@@ -7171,6 +7906,16 @@ def read_interim_report(project_dir):
             row["output_path"] = record["output_path"]
         if isinstance(record.get("error"), str):
             row["error"] = record["error"][:240]
+        if record.get("forward_progress") is True:
+            row["forward_progress"] = True
+            row["release_blocking"] = record.get("release_blocking", True)
+            debt = record.get("failure_debt")
+            if isinstance(debt, dict):
+                row["failure_debt"] = {
+                    key: deepcopy(debt.get(key))
+                    for key in ("failure_class", "error", "attempts", "next_action", "release_blocking")
+                    if key in debt
+                }
         rows.append(row)
         if status in STAGE_READY_STATUSES:
             completed.append(stage_id)

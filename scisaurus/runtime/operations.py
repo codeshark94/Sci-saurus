@@ -371,7 +371,11 @@ class OperationsCell:
             checks, schema = self._inspect(profile, result, params, representative=False)
             self.authorize(binding)
             if not all(check["outcome"] == "passed" for check in checks) or schema != binding["schema_identity"]:
-                raise ValidationError("Workload output or provider schema failed operational validation")
+                raise ValidationError(
+                    "Workload output or provider schema failed operational validation: "
+                    + json.dumps({"checks": checks, "observed_schema": schema,
+                                  "expected_schema": binding["schema_identity"]},
+                                 ensure_ascii=False, sort_keys=True))
             self._publish(capability_id, "workloads", {**execution, "checks": checks, "binding": binding,
                           "domain_acceptance": "not_assessed"}, "operations.controller", subjects=[ref, binding["verification_ref"]])
             if self.tasks.get(task_id)["state"] == "awaiting_review":

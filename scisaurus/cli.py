@@ -22,6 +22,54 @@ def _default_dashboard_project_dir():
     return str(autolab if autolab.is_dir() else current)
 
 
+def _composer_progress_line(state):
+    """Render a bounded live line instead of dumping the entire checkpoint.
+
+    Durable progress checkpoints intentionally retain the complete stage and
+    assignment ledger for the dashboard and resume logic.  Sending that whole
+    object to stdout on every heartbeat made a long Composer run emit the
+    entire historical attempt list repeatedly, obscuring the current action
+    and creating needless I/O.  The CLI stream is operational telemetry; the
+    artifact store remains the source of full detail.
+    """
+    state = state if isinstance(state, dict) else {}
+    stages = state.get("stages") if isinstance(state.get("stages"), dict) else {}
+    active = []
+    current = None
+    phase = state.get("phase")
+    phase_stage = phase.split(":", 1)[0] if isinstance(phase, str) else None
+    if phase_stage in stages and isinstance(stages.get(phase_stage), dict):
+        # The phase prefix is the controller's current boundary even when the
+        # checkpoint is the short completed/failed transition between stages.
+        # Do not fall back to an older retrying stage and report its workers as
+        # live during that transition.
+        phase_record = stages[phase_stage]
+        current = phase_stage
+        if phase_record.get("status") in {"running", "retrying", "paused"}:
+            active.extend(phase_record.get("active_agents", []))
+    for stage_id, record in stages.items():
+        if not isinstance(record, dict):
+            continue
+        if record.get("status") in {"running", "retrying", "paused"}:
+            if current is None:
+                current = stage_id
+                active.extend(record.get("active_agents", []))
+            elif stage_id == current:
+                continue
+    usage = state.get("usage") if isinstance(state.get("usage"), dict) else {}
+    compact = {
+        "phase": state.get("phase"),
+        "stage": current,
+        "elapsed_seconds": state.get("elapsed_seconds"),
+        "remaining_seconds": state.get("remaining_seconds"),
+        "active_agents": list(dict.fromkeys(item for item in active if isinstance(item, str))),
+        "usage": {key: usage.get(key, 0) for key in (
+            "model_calls", "input_tokens", "output_tokens", "openalex_requests")},
+        "blockers": len(state.get("blockers", [])) if isinstance(state.get("blockers"), list) else 0,
+    }
+    return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="scisaurus")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -169,6 +217,12 @@ def main(argv=None) -> int:
     p_composer.add_argument(
         "--env-file", action="append", default=[],
         help="owner-local runtime env file; may be repeated and is loaded before model dispatch")
+    p_composer.add_argument(
+        "--watch", action="store_true",
+        help="keep supervising the mission and automatically resume recoverable exits")
+    p_composer.add_argument(
+        "--watch-interval", type=float, default=5.0,
+        help="minimum seconds between automatic Composer resumes")
 
     p_review_article = sub.add_parser("run-review-article", help="scout, synthesize, render and independently review a critical review article")
     p_review_article.add_argument("--config", required=True)
@@ -215,9 +269,18 @@ def main(argv=None) -> int:
         try:
             workflow = json.loads(Path(args.workflow).read_text())
             load_runtime_environment_files(args.env_file)
-            result = ComposerRunner(workflow, resume=args.resume,
-                                    additional_seconds=args.extend_deadline_seconds,
-                                    on_progress=lambda state: print(json.dumps(state), flush=True)).run()
+            on_progress = lambda state: print(_composer_progress_line(state), flush=True)
+            if args.watch:
+                from scisaurus.runtime.composer_supervisor import supervise_composer
+                if args.extend_deadline_seconds is not None:
+                    raise ValidationError("--extend-deadline-seconds cannot be combined with --watch")
+                result = supervise_composer(
+                    workflow, initial_resume=args.resume,
+                    poll_seconds=args.watch_interval, on_progress=on_progress)
+            else:
+                result = ComposerRunner(workflow, resume=args.resume,
+                                        additional_seconds=args.extend_deadline_seconds,
+                                        on_progress=on_progress).run()
         except (OSError, ValueError, ValidationError) as exc:
             print(f"composer workflow rejected: {exc}", file=sys.stderr)
             return 2

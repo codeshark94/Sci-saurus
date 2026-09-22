@@ -45,6 +45,10 @@ SYSTEM = (
 
 
 _NO_PROVIDER_CAPACITY = object()
+# A worker operation is still retriable at the Composer stage level.  It must
+# not inherit a 30-minute route timeout and monopolize a bounded provider pool
+# while the outer control plane believes the stage is making progress.
+MODEL_OPERATION_TIMEOUT_SECONDS = 300.0
 
 
 class _ProviderContextBlock:
@@ -732,6 +736,14 @@ class ExecutionRuntime:
             spec["params"] = dict(spec["params"])
             spec["params"]["role"] = actor
             entry["spec"] = spec
+        if spec["kind"] == "model":
+            client = dict(spec["params"]["client"])
+            configured_timeout = client.get("timeout_seconds")
+            client["timeout_seconds"] = min(
+                float(configured_timeout), MODEL_OPERATION_TIMEOUT_SECONDS)
+            spec["params"] = dict(spec["params"])
+            spec["params"]["client"] = client
+            entry["spec"] = spec
         self.tasks.create(task_id, spec["task_kind"],
                           {"operation": spec["kind"], "objective": self.config["objective"]}, actor)
         self.tasks.admit(task_id, "command.controller")
@@ -753,8 +765,10 @@ class ExecutionRuntime:
         process = multiprocessing.get_context("spawn").Process(
             target=_worker_entry, args=(self.worker_target, spec["kind"], spec["params"], entry["channel"]))
         entry["process"] = process
-        operation_limit = (spec["params"]["client"]["timeout_seconds"] if spec["kind"] == "model"
-                           else spec["params"]["client"]["timeout"])
+        if spec["kind"] == "model":
+            operation_limit = spec["params"]["client"]["timeout_seconds"]
+        else:
+            operation_limit = spec["params"]["client"]["timeout"]
         entry["deadline"] = min(self.deadline, time.monotonic() + operation_limit)
         self._before_dispatch(spec)
         try:

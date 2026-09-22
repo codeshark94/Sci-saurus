@@ -47,6 +47,10 @@ VERIFIER_SYSTEM = (
 
 
 DEFAULT_PROVIDER_CAPACITY = {"ollama": 3, "qwen": 1}
+# A role quota bounds the whole assignment.  A single transport request must
+# be shorter so one slow local/cloud route cannot consume the assignment and
+# leave the rest of the pool waiting indefinitely.
+SPECIALIST_MODEL_CALL_TIMEOUT_SECONDS = 300.0
 _SENSITIVE_KEY_PARTS = (
     "api_key", "apikey", "authorization", "credential", "password", "secret", "token",
 )
@@ -968,6 +972,20 @@ class SpecialistDispatcher:
                             outcome_known=True)
                     config["timeout_seconds"] = min(
                         float(config.get("timeout_seconds", remaining)), remaining)
+                # A provider request is part of the role's bounded assignment,
+                # not of the whole stage deadline.  Without this clamp a
+                # route configured with a generous 30-minute transport timeout
+                # could occupy one of the three Ollama slots for the entire
+                # stage while the assignment quota promised a 15-minute
+                # maximum.  The dispatcher must be able to release the slot
+                # and let the Composer retry or pivot the scoped work order.
+                role_seconds = quota.get("max_seconds")
+                if (type(role_seconds) in (int, float)
+                        and math.isfinite(role_seconds) and role_seconds > 0):
+                    config["timeout_seconds"] = min(
+                        float(config["timeout_seconds"]), float(role_seconds))
+                config["timeout_seconds"] = min(
+                    float(config["timeout_seconds"]), SPECIALIST_MODEL_CALL_TIMEOUT_SECONDS)
                 self.on_progress({"event": "dispatched", "role": assigned_role,
                                   "role_id": assignment.get("role_id"),
                                   "task_id": assignment.get("task_id"),

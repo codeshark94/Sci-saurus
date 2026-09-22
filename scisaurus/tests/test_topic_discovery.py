@@ -3,6 +3,7 @@ import hashlib
 import tempfile
 import time
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -38,6 +39,8 @@ from scisaurus.runtime.topic_discovery import (
     _merge_candidate_source_records,
     _materialize_foundry_capability_requirements,
     _materialize_foundry_feasibility,
+    _repair_feasibility_input_contract,
+    _strip_topic_controller_metadata,
     _materialize_seed_bindings,
     _materialize_seed_domains,
     _materialize_topic_objective,
@@ -1440,6 +1443,14 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertGreater(client.timeout_seconds, 0)
         self.assertLessEqual(client.timeout_seconds, 5)
 
+    def test_topic_client_has_a_bounded_provider_call_timeout(self):
+        runner = TopicDiscoveryRunner({
+            "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+            "timeout_seconds": 1800, "max_output_tokens": 4096,
+        })
+        client = runner._client("topic_discovery", deadline=time.monotonic() + 1200)
+        self.assertLessEqual(client.timeout_seconds, 300)
+
     def test_grounded_portfolio_rejects_invented_sources_and_seed_collapse(self):
         value = package("Choose a feasible research direction")
         seeds = frontier_plan(3)["seeds"]
@@ -1625,6 +1636,100 @@ class TopicDiscoveryTests(unittest.TestCase):
         repairs = _materialize_foundry_feasibility(value, context)
         self.assertEqual(repairs[0]["field"], "feasibility")
         self.assertIn("bounded experiment baseline", value["candidates"][0]["feasibility"])
+
+    def test_echoed_topic_artifact_metadata_is_discarded_without_relaxing_package_shape(self):
+        value = package("Choose a feasible research direction")
+        value.update({
+            "status": "completed",
+            "topic": deepcopy(value["candidates"][1]),
+            "question": value["candidates"][1]["research_question"],
+            "budget": {"model_calls": 3},
+        })
+        repairs = _strip_topic_controller_metadata(value)
+        self.assertEqual(set(value), {
+            "schema_version", "objective", "candidates", "selected_id",
+            "selection_rationale",
+        })
+        self.assertEqual(
+            {item["field"] for item in repairs},
+            {"status", "topic", "question", "budget"},
+        )
+        validate_topic_package(value, objective=value["objective"], candidate_count=3)
+
+    def test_feasibility_input_label_is_repaired_from_declared_self_contained_inputs(self):
+        value = package("Choose a feasible research direction")
+        selected = value["candidates"][1]
+        selected["evidence_mode"] = "analytical_derivation"
+        selected["feasibility_plan"] = foundry_feasibility_plan(
+            experiment_input="project_artifact",
+            data_access="project_local",
+            estimated_compute_seconds=120.0,
+            evidence_inputs=[{
+                "kind": "analytical_parameters", "status": "available",
+                "source": "bounded analytic parameters supplied by the study",
+            }],
+        )
+        context = {
+            "capability_foundry": {
+                "enabled": True,
+                "allowed_evidence_modes": ["analytical_derivation", "synthetic_simulation"],
+            },
+            "research_feasibility": {
+                "execution_modes": ["foundry"],
+                "allowed_input_kinds": ["analytical_parameters", "synthetic"],
+                "allowed_data_access": ["closed_world"],
+                "network_access": False, "undeclared_data": False,
+                "max_external_requests": 0, "max_model_calls": 0,
+                "max_experiment_seconds": 900,
+                "available_executables": ["python3"],
+                "available_packages": ["numpy"],
+            },
+            "executables": {"python3": True},
+            "python_packages": {"numpy": True},
+            "configured_stage_kinds": ["experiment"],
+        }
+        repairs = _repair_feasibility_input_contract(value, context)
+        self.assertEqual(selected["feasibility_plan"]["experiment_input"], "self_contained")
+        self.assertEqual(selected["feasibility_plan"]["data_access"], "closed_world")
+        self.assertEqual(
+            {item["field"] for item in repairs},
+            {"experiment_input", "data_access", "estimated_compute_seconds"},
+        )
+        from scisaurus.runtime.topic_discovery import validate_topic_feasibility
+        self.assertEqual(validate_topic_feasibility(value, context)["status"], "feasible")
+
+    def test_feasibility_input_repair_does_not_invent_an_unsupported_input(self):
+        value = package("Choose a feasible research direction")
+        selected = value["candidates"][1]
+        selected["feasibility_plan"] = foundry_feasibility_plan(
+            experiment_input="survey_artifact",
+            evidence_inputs=[{
+                "kind": "public_dataset", "status": "available",
+                "source": "named public dataset to be acquired by the survey stage",
+            }],
+        )
+        original = json.loads(json.dumps(selected["feasibility_plan"]))
+        context = {
+            "capability_foundry": {"enabled": True},
+            "research_feasibility": {
+                "allowed_input_kinds": ["analytical_parameters", "synthetic"],
+            },
+        }
+        self.assertEqual(_repair_feasibility_input_contract(value, context), [])
+        self.assertEqual(selected["feasibility_plan"], original)
+
+    def test_feasibility_numeric_repair_runs_before_optional_input_inventory(self):
+        value = package("Choose a feasible research direction")
+        selected = value["candidates"][1]
+        selected["feasibility_plan"] = foundry_feasibility_plan(
+            estimated_compute_seconds=600.0,
+        )
+        selected["feasibility_plan"].pop("evidence_inputs")
+        repairs = _repair_feasibility_input_contract(
+            value, {"capability_foundry": {"enabled": True}}
+        )
+        self.assertEqual(selected["feasibility_plan"]["estimated_compute_seconds"], 600)
+        self.assertEqual(repairs[0]["field"], "estimated_compute_seconds")
 
     def test_foundry_topic_rejects_external_evidence_mode(self):
         value = package("Choose a feasible research direction")

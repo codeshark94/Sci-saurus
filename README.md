@@ -51,6 +51,14 @@ Hard dependencies may correctly leave a single initial frontier; the flow
 becomes non-linear through retained candidate branches and evidence-triggered
 reopenings rather than by bypassing those dependencies.
 
+Autonomous missions can use `progression_policy: forward_first`: after a
+bounded attempt budget, an actionable mechanical or scientific blocker becomes
+a clearly marked `candidate_needs_review` node with a failure-debt artifact and
+a deferred backfill order. The graph can continue to downstream work, then
+return to that debt at a bounded continuation cycle. Release remains blocked by
+the unresolved debt; provider quotas, cooldowns, unknown calls, and the hard
+mission deadline still stop safely.
+
 The same runtime can also produce bounded reports, guides, JSON artifacts, and
 Python source units. A scientific result is never inferred from a model response
 or a successful process exit alone.
@@ -117,7 +125,6 @@ flowchart TB
     Q[Scoped repair work order<br/>gap · control · test · claim finding] -.-> F
 
     classDef control fill:#e8edf5,stroke:#52657a,color:#17212b
-    classDef stage fill:#f5f6f8,stroke:#68727d,color:#17212b
     classDef feedback fill:#f5f6f8,stroke:#68727d,color:#17212b
     class C,F,A control
     class T,S,M,I,R,P stage
@@ -219,7 +226,7 @@ before using live providers.
 ## Guardrails that matter
 
 - **Human authority is explicit.** The Principal owns mission scope and final release.
-- **Scientific recovery is autonomous.** A hold, rejected direction, or missing typed repair order produces a cycle-specific work order, changes the strategy, and reopens only the affected closure. Human input is not the normal next step.
+- **Scientific recovery is autonomous.** A hold, rejected direction, or missing typed repair order produces a cycle-specific work order, changes the strategy, and reopens only the affected closure. In `forward_first`, an actionable blocker is first carried as release-blocking failure debt so the rest of the graph can move; the debt becomes a bounded backfill order after the first pass. Human input is not the normal next step.
 - **Only real fences stop autonomous progress.** Topic intake retries share one bounded intake envelope, and every deliberate continuation pivot receives its own bounded envelope. Provider/account limits, API policy, worker capacity, and the mission deadline remain independently reserved and recorded; a historical pivot cannot exhaust the budget of a newly admitted direction.
 - **Resource fences are not scientific decisions.** A resettable provider/API cooldown is waited out and retried automatically in autonomous mode; exhausted quotas, worker capacity, and the mission deadline remain hard resource boundaries recorded in the checkpoint, never scientific conclusions.
 - **Failure is not success.** A timeout, provider block, malformed response, or rejected review remains visible and scoped.
@@ -228,6 +235,7 @@ before using live providers.
 - **Topic feasibility is explicit.** A prose feasibility note is never enough: experiment-backed topic admission checks the actual execution boundary, every input, dependency availability, network use, provider/model work, compute estimate, and disconfirmation-oriented study shape. The current deterministic project boundary admits only self-contained closed-world inputs, zero experiment-side API/model calls, and the foundry timeout; topic intake has its own bounded intake/continuation envelopes.
 - **OpenAlex topic intake fails closed.** Provider cooldown state is persisted; 429s stop fresh query variants until the recorded provider boundary, while bounded retries honor provider cooldown metadata. Crossref identity metadata cannot substitute for the citation graph used for topic discovery.
 - **Specialists are on demand.** A 34-role roster does not mean 34 model processes are running.
+- **Forward progress is explicit.** A provisional candidate is never silently promoted: its artifact, failure class, unresolved debt, and backfill order remain visible in the checkpoint and assignment ledger.
 - **LangGraph is optional, not the control plane.** The native Composer, TaskManager, and ArtifactStore own lifecycle and provenance; adapters can be used per department where useful.
 
 ## Documentation map

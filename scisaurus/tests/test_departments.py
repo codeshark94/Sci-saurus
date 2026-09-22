@@ -301,6 +301,33 @@ class DepartmentRuntimeTests(unittest.TestCase):
         self.assertEqual(replay["work_order_ref"], completed_head["artifact_ref"])
         self.assertNotEqual(running_ref, completed_head["artifact_ref"])
 
+    def test_retire_superseded_work_orders_removes_old_generation_from_live_backlog(self):
+        first = self.runtime.activate_work_orders([{
+            "id": "old-order", "kind": "literature_expansion", "owner": "research.intelligence",
+            "objective": "Search the first frontier.", "why": "The first frontier was inconclusive.",
+            "success_condition": "A bounded source set is verified.",
+            "evidence_needed": "Source identities and exact evidence spans.",
+        }])[0]
+        second = self.runtime.activate_work_orders([{
+            "id": "current-order", "kind": "additional_experiment", "owner": "methods.validation",
+            "objective": "Run the current discriminating control.", "why": "The current result is ambiguous.",
+            "success_condition": "The control separates the explanations.",
+            "evidence_needed": "Versioned raw output and an independent recalculation.",
+        }])[0]
+
+        retired = self.runtime.retire_superseded_work_orders(
+            {"current-order"}, reason="new continuation superseded the old scope")
+
+        self.assertEqual(retired[0]["task_id"], first["task_id"])
+        self.assertEqual(self.tasks.get(first["task_id"])["state"], "stale")
+        self.assertEqual(self.tasks.get(second["task_id"])["state"], "running")
+        snapshot = self.runtime.snapshot()
+        self.assertEqual(len(snapshot["open_work_orders"]), 1)
+        self.assertEqual(snapshot["open_work_orders"][0]["task_id"], second["task_id"])
+        stale = self.store.head("command/departments/research/work-orders/old-order")
+        stale_body = json.loads(self.store.read_body(stale["body_hash"]))
+        self.assertEqual(stale_body["state"], "stale")
+
     def test_changed_generation_fences_a_paused_prior_task(self):
         request = {
             "schema_version": "department-work-order-1", "id": "paused-order",

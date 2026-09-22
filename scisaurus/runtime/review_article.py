@@ -630,8 +630,9 @@ def prepare_review_workflow(source_workflow, output_dir, brief):
                     "depends_on": [], "bindings": [], "estimate_seconds": 1800, "deadline_seconds": 86400,
                     "reuse_completed": False, "reuse_output_path": None}],
         "time_policy": {"first_result_seconds": 1800, "target_seconds": 43200, "hard_seconds": 86400, "checkpoint_seconds": 300},
-        "agenda_policy": {"mode": "adaptive"}, "progression_policy": "full_pass",
-        "retry_policy": {"mode": "until_deadline", "backoff_seconds": 60},
+        "agenda_policy": {"mode": "adaptive"}, "progression_policy": "forward_first",
+        "retry_policy": {"mode": "bounded", "max_attempts": 2, "backoff_seconds": 2},
+        "continuation_policy": {"mode": "bounded", "max_cycles": 2},
         "completion": {"required_stage_ids": ["review"], "release_requires_human": True}}
     if source.get("runtime_env_files"):
         workflow["runtime_env_files"] = deepcopy(source["runtime_env_files"])

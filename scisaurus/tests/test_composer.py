@@ -469,7 +469,8 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(result["organization"]["schema_version"], "project-organization-2")
             for stage_id in ("survey", "experiment"):
                 record = result["stages"][stage_id]
-                self.assertTrue(record["active_agents"])
+                self.assertEqual(record["active_agents"], [])
+                self.assertTrue(record["last_active_agents"])
                 self.assertTrue(record["assignment_ids"])
                 self.assertNotEqual(record["chief_agent"], record["verifier_agent"])
                 self.assertTrue(record["verifier_artifact_ref"].startswith("artifact:"))
@@ -737,17 +738,13 @@ class ComposerWorkflowTests(unittest.TestCase):
                     workflow["stages"][1],
                     ModelWorkBlocked("independent review rejected the estimator"),
                     completed, by_id)
-                self.assertTrue(admitted)
-                self.assertEqual(runner.continuation_cycles, 1)
+                # This fixture has no topic ancestor, so there is no changed
+                # scientific frontier to reopen. Preserve the blocker instead
+                # of manufacturing a same-stage repair loop.
+                self.assertFalse(admitted)
+                self.assertEqual(runner.continuation_cycles, 0)
                 self.assertNotIn("experiment", completed)
-                self.assertIn("experiment", runner.reopened_stage_ids)
-                self.assertEqual(runner.context["experiment"]["status"],
-                                 "research_expansion_required")
-                self.assertEqual(len(runner.active_research_requests), 1)
-                self.assertEqual(runner.active_research_requests[0]["kind"],
-                                 "additional_experiment")
-                self.assertTrue(any(item.get("action") == "auto_recover_scientific_blocker"
-                                    for item in runner.department_activity))
+                self.assertEqual(runner.active_research_requests, [])
             finally:
                 runner.close()
 
@@ -803,6 +800,60 @@ class ComposerWorkflowTests(unittest.TestCase):
                                  "The contrast weakens below a boundary.")
                 self.assertEqual(projected["available_assets"]["required_packages"], ["numpy"])
                 self.assertEqual(prompt["shared_stage_context"]["stage_kind"], "experiment")
+            finally:
+                runner.close()
+
+    def test_experiment_specialist_brief_does_not_leak_an_unrelated_template(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            try:
+                capability_path = root / "finite-size-capability.json"
+                capability_path.write_text(json.dumps({
+                    "schema_version": "experiment-capability-1",
+                    "capability_id": "finite_size_winding_breakdown",
+                    "experiment": {
+                        "id": "finite_size_winding_breakdown",
+                        "research_question": "Does the diagnostic survive the finite-size boundary?",
+                        "study_type": "exploratory",
+                        "method": "Seeded finite-matrix simulation.",
+                        "parameters": {"sizes": [16, 32]},
+                        "primary_outcomes": [{"id": "rho_l16", "unit": "dimensionless"}],
+                        "stopping_rule": "Run the declared grid exactly once.",
+                        "limitations": ["Only the declared finite-size grid is covered."],
+                    },
+                }))
+                runner.context["topic"] = {
+                    "kind": "topic_discovery",
+                    "question": "Does the diagnostic survive the finite-size boundary?",
+                    "topic": {
+                        "id": "direction_0",
+                        "experiment_capability_id": "finite_size_winding_breakdown",
+                        "research_question": "Does the diagnostic survive the finite-size boundary?",
+                        "hypothesis": "The contrast weakens below a boundary.",
+                        "comparison": "diagnostic A versus diagnostic B",
+                        "measurement": "difference in predictive power",
+                        "disconfirmation_test": "No size-dependent difference.",
+                    },
+                    "generated_capability": {
+                        "capability_id": "finite_size_winding_breakdown",
+                        "descriptor_path": str(capability_path.resolve()),
+                    },
+                }
+                stage = next(item for item in workflow["stages"] if item["id"] == "experiment")
+                packet = runner._specialist_stage_packet(stage, {
+                    "experiment": {
+                        "id": "robust_mean_pilot",
+                        "research_question": "Does median-of-means reduce contaminated tail error?",
+                        "primary_outcomes": [{"id": "contamination_p95_reduction_percent"}],
+                    },
+                })
+                self.assertEqual(packet["analysis_plan"]["primary_outcomes"][0]["id"], "rho_l16")
+                self.assertEqual(packet["analysis_plan"]["capability_source"],
+                                 "admitted_topic_capability")
+                self.assertEqual(packet["execution_manifest"]["capability_source"],
+                                 "admitted_topic_capability")
             finally:
                 runner.close()
 
@@ -1330,6 +1381,46 @@ class ComposerWorkflowTests(unittest.TestCase):
                  "output_tokens": 0, "openalex_requests": 0})
             runner.close()
 
+    def test_local_topic_budget_exhaustion_opens_a_fresh_continuation_cycle(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            topic_config = root / "topic.json"
+            topic_config.write_text("{}")
+            workflow["stages"] = [{
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": str(topic_config.resolve()),
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            }]
+            workflow["completion"]["required_stage_ids"] = ["topic"]
+            runner = ComposerRunner(workflow)
+            runner.continuation_cycles = 1
+            runner.context["topic"] = {
+                "kind": "topic_discovery",
+                "status": "research_expansion_required",
+                "topic": {"id": "old", "title": "Old", "research_question": "Old?"},
+                "research_expansion_requests": [],
+            }
+            error = QuotaExceededError(
+                "topic discovery quota exhausted: model_calls=10, limit=10",
+                dimension="model_calls", limit=10, observed=10,
+                usage={}, diagnostics=[{"kind": "composer_topic_budget"}],
+            )
+            error.topic_budget_scope = "continuation"
+            self.assertTrue(runner._admit_scientific_blocker_recovery(
+                workflow["stages"][0], error, set(), {"topic": workflow["stages"][0]}))
+            self.assertEqual(runner.continuation_cycles, 2)
+            self.assertIn("topic", runner.reopened_stage_ids)
+            self.assertTrue(any(
+                item.get("action") == "pivot_topic_after_budget_exhaustion"
+                for item in runner.department_activity
+            ))
+            runner.close()
+
     def test_until_deadline_retry_mode_does_not_stop_at_attempt_counter(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -1595,6 +1686,14 @@ class ComposerWorkflowTests(unittest.TestCase):
             }]
             runner.context["topic"] = {"kind": "topic_discovery", "topic": result["topic"],
                                          "generated_capability": generated}
+            # A fresh capability is warranted only after the prior capability
+            # produced an observed result that the scoped work order is meant
+            # to extend. Before first execution, the admitted capability is
+            # reused so authoring failures cannot starve the actual experiment.
+            runner.context["experiment"] = {
+                "kind": "experiment", "status": "research_expansion_required",
+                "results_package": {"schema_version": "results-package-1"},
+            }
             regenerated = {
                 **generated,
                 "registration": {
@@ -1844,8 +1943,19 @@ class ComposerWorkflowTests(unittest.TestCase):
                 "median of means finite sample comparison",
             ],
         })
-        self.assertEqual(queries[0], '"median of means"')
-        self.assertEqual(len(queries), 3)
+        self.assertEqual(queries, [
+            "median of means estimator contamination",
+            "median of means finite sample comparison",
+        ])
+
+    def test_survey_activates_only_its_search_preflight_specialist(self):
+        self.assertEqual(
+            ComposerRunner._active_stage_role_ids({"kind": "survey"}),
+            ["search-strategist"],
+        )
+        self.assertIsNone(
+            ComposerRunner._active_stage_role_ids({"kind": "experiment"})
+        )
 
     def test_free_topic_literature_hold_requests_question_refinement(self):
         with tempfile.TemporaryDirectory() as path:
@@ -2085,6 +2195,11 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertIn(
                 "literature gap decision does not by itself resolve them",
                 selected["supplied_context"])
+            self.assertEqual(
+                selected["experiment"]["limitations"],
+                config["experiment"]["limitations"],
+                "deferred maturity requirements must not mutate the generated program contract",
+            )
             runner.close()
 
     def test_design_driven_capability_injects_the_proposed_design(self):

@@ -3,8 +3,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
-from scisaurus.runtime.models import estimate_input_tokens
+from scisaurus.runtime.models import ModelResult, estimate_input_tokens
 from scisaurus.runtime.specialists import (
     SPECIALIST_SYSTEM, VERIFIER_SYSTEM, SpecialistDispatcher,
     build_specialist_prompt, build_verifier_prompt,
@@ -107,6 +108,35 @@ class _ProviderFallbackHandler(BaseHTTPRequestHandler):
 
 
 class SpecialistDispatcherTests(unittest.TestCase):
+    def test_role_quota_clamps_route_timeout_before_provider_dispatch(self):
+        model = {
+            "protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+            "model": "fallback", "timeout_seconds": 120.0,
+            "max_output_tokens": 100, "context_window_tokens": 4096,
+            "max_input_tokens": 2048,
+        }
+        assignment = {
+            "assigned_role": "research.role", "role_id": "role",
+            "model_role": "research.role", "execution_kind": "model",
+            "stage_id": "topic", "stage_kind": "topic_discovery",
+            "quota": {"max_calls": 1, "max_input_tokens": 1000,
+                      "max_output_tokens": 100, "max_seconds": 5},
+            "_prompt": json.dumps({"objective": "bounded"}),
+        }
+        result = ModelResult(
+            json.dumps({"decision": "pass", "summary": "ok", "findings": [],
+                        "evidence_gaps": [], "requested_actions": []}),
+            "fake", {"model_calls": 1, "input_tokens": 3, "output_tokens": 2},
+            0.01, "stop", 1,
+        )
+        with patch("scisaurus.runtime.specialists.ModelClient") as client:
+            client.return_value.complete.return_value = result
+            reports = SpecialistDispatcher(
+                model, max_parallel=1, deadline=time.monotonic() + 10,
+            ).dispatch([assignment], {"objective": "bounded"})
+        self.assertEqual(reports[0]["status"], "succeeded")
+        self.assertEqual(client.call_args.kwargs["timeout_seconds"], 5.0)
+
     def test_specialist_prompt_uses_declared_projection_and_fits_role_quota(self):
         assignment = {
             "assigned_role": "research.cataloger", "model_role": "research.literature-mapper",

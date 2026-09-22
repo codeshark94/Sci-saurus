@@ -1,0 +1,111 @@
+import tempfile
+import unittest
+import json
+import sqlite3
+from pathlib import Path
+from unittest.mock import patch
+
+from scisaurus.runtime.composer_supervisor import ComposerSupervisor, supervise_composer
+
+
+class ComposerSupervisorTests(unittest.TestCase):
+    def test_process_watchdog_returns_child_result(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = {"id": "watch-process-test", "project_id": str(root / "project")}
+
+            class FakeRunner:
+                def __init__(self, value, *, resume, on_progress):
+                    pass
+
+                def run(self):
+                    return {"status": "completed", "remaining_seconds": 10,
+                            "stages": {}, "blockers": [], "continuation_cycles": 0}
+
+            with patch("scisaurus.runtime.composer_supervisor.ComposerRunner", FakeRunner):
+                result = supervise_composer(
+                    workflow, poll_seconds=0.01, process_watchdog=True,
+                    watchdog_seconds=30)
+
+            self.assertEqual(result["status"], "completed")
+            state = json.loads((root / "project" / "output" / "supervisor-state.json").read_text())
+            self.assertEqual(state["schema_version"], "composer-supervisor-3")
+
+    def test_heartbeat_only_does_not_count_as_semantic_progress(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            project = root / "project"
+            stage = project / "stages" / "survey"
+            (project / "output").mkdir(parents=True)
+            (project / "state").mkdir(parents=True)
+            (stage / "output").mkdir(parents=True)
+            (stage / "state").mkdir(parents=True)
+            progress = {
+                "phase": "survey:running", "status": "running", "state_revision": 3,
+                "continuation_cycles": 0, "usage": {"model_calls": 1},
+                "stages": {"survey": {"status": "running", "attempt_count": 1,
+                                         "project_dir": str(stage)}},
+            }
+            (project / "output" / "progress.json").write_text(json.dumps(progress))
+            (stage / "output" / "progress.json").write_text(json.dumps({
+                "phase": "executing", "checkpoint": 4, "active_tasks": ["task-1"],
+                "information_changes": [], "verified_changes": [], "blockers": [],
+            }))
+            for database in (project / "state" / "control.sqlite", stage / "state" / "control.sqlite"):
+                connection = sqlite3.connect(database)
+                connection.executescript(
+                    "CREATE TABLE events (seq INTEGER);"
+                    "CREATE TABLE tasks (task_id TEXT, state TEXT, updated_at TEXT);"
+                )
+                connection.execute("INSERT INTO events VALUES (1)")
+                connection.commit()
+                connection.close()
+            supervisor = ComposerSupervisor({"id": "signal-test", "project_id": str(project)})
+            first = supervisor._live_snapshot()
+            (project / "output" / "progress.json").write_text(json.dumps(progress) + "\n")
+            second = supervisor._live_snapshot()
+            self.assertEqual(first["signature"], second["signature"])
+            progress["state_revision"] = 4
+            (project / "output" / "progress.json").write_text(json.dumps(progress))
+            third = supervisor._live_snapshot()
+            self.assertNotEqual(second["signature"], third["signature"])
+
+    def test_restarts_from_durable_state_after_recoverable_exit(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = {"id": "watch-test", "project_id": str(root / "project")}
+            results = [
+                {
+                    "status": "blocked", "remaining_seconds": 20,
+                    "stages": {"topic": {"status": "blocked", "error": "scientific blocker"}},
+                    "blockers": [{"stage_id": "topic", "reason": "scientific blocker"}],
+                    "continuation_cycles": 1,
+                },
+                {"status": "completed", "remaining_seconds": 10,
+                 "stages": {}, "blockers": [], "continuation_cycles": 2},
+            ]
+            calls = []
+
+            class FakeRunner:
+                def __init__(self, value, *, resume, on_progress):
+                    calls.append(resume)
+
+                def run(self):
+                    return results.pop(0)
+
+            with patch("scisaurus.runtime.composer_supervisor.ComposerRunner", FakeRunner):
+                result = supervise_composer(
+                    workflow, poll_seconds=0, process_watchdog=False)
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(calls, [False, True])
+            self.assertEqual(len(results), 0)
+            self.assertEqual(
+                ComposerSupervisor(workflow, poll_seconds=0)._should_resume(
+                    {"status": "paused", "remaining_seconds": 0}),
+                False,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -69,4 +69,4 @@ if [ -f local-private/openalex.env ]; then
 fi
 set +a
 
-exec "$python_bin" -m scisaurus.cli run-composer --workflow "$workflow" --resume "$@"
+exec "$python_bin" -m scisaurus.cli run-composer --workflow "$workflow" --resume --watch "$@"

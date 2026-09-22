@@ -82,6 +82,22 @@ class CapabilityDeadlineError(ValidationError):
     """A time boundary leaves retained source awaiting validation, not repair."""
 
 
+def _normalize_program_validation_error(error):
+    """Collapse equivalent non-finite-output failures into one repair key.
+
+    ``json.dumps(..., allow_nan=False)`` reports ``nan`` and ``inf`` with
+    value-specific text.  Treating those strings as different failures lets a
+    generated program consume the whole authoring budget changing nothing
+    material.  The program remains rejected; only the retry identity becomes
+    stable so the Composer can pivot after one bounded repair.
+    """
+    if isinstance(error, ValueError) and "Out of range float values are not JSON compliant" in str(error):
+        return ValidationError(
+            "generated program emitted a non-finite JSON scalar (NaN or Infinity); "
+            "expected a finite JSON scalar")
+    return error
+
+
 def validate_foundry_config(value):
     """Validate the immutable host paths and budgets for generated programs."""
     if (not isinstance(value, dict)
@@ -820,9 +836,11 @@ class CapabilityFoundry:
                     state["status"] = "response_received"
                     save("validation_pending")
                     raise CapabilityDeadlineError("capability validation reached its mission deadline") from exc
+                normalized_error = _normalize_program_validation_error(exc)
                 last_error = (ValidationError(
                     f"generated program omitted required field {exc.args[0]!r}")
-                    if isinstance(exc, KeyError) and exc.args else exc)
+                    if isinstance(exc, KeyError) and exc.args
+                    else normalized_error)
                 failures = state.setdefault("validation_errors", [])
                 repeated = isinstance(exc, ModelWorkBlocked) or (
                     (str(last_error) in failures or str(last_error) == feedback) and not seed_replay)

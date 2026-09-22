@@ -199,13 +199,16 @@ full downstream forecast no longer fits, this autonomous mode may admit the
 next stage into the residual window until a small control-plane margin remains;
 the specialist's own deadline and acceptance contract still decide whether a
 useful result is produced, and an unfinished closure is never reported as a
-release. This deadline-governed mode is the default. A small deterministic job
+release. This deadline-governed mode is the default for legacy workflows. The
+`forward_first` mission policy clamps retries to at most two attempts, carries
+actionable failure debt as a release-blocking provisional artifact, and lets
+the agenda return later through a bounded work order. A small deterministic job
 may opt into `mode: bounded` with a maximum of one to eight attempts; bounded
 jobs retain the full-closure reservation and pause when it cannot fit. Every
-attempt, error, retry decision, and residual-window admission is persisted, and
-a ten-hour mission is an explicit `hard_seconds: 36000` policy. The hard wall,
-provider outcome, or a genuine control-plane failure remains the termination
-condition.
+attempt, error, retry decision, provisional artifact, and residual-window
+admission is persisted, and a ten-hour mission is an explicit
+`hard_seconds: 36000` policy. The hard wall, provider outcome, or a genuine
+control-plane failure remains the termination condition.
 
 
 **D60 — Free-topic intake is sampled, recent, and capability-aware.** When a
@@ -242,6 +245,14 @@ An unresolved research or review hold never satisfies a dependency while the
 current graph is being scheduled: the owning closure is reopened before any
 consumer can read that hold's packet, or the workflow returns the hold when no
 authorized continuation remains.
+
+In `forward_first`, a mechanical or scientific blocker is allowed to satisfy
+the scheduling dependency only as a provisional, release-blocking candidate;
+the exact failure debt is converted into a typed backfill order after the
+first graph pass. The downstream stages may inspect that candidate and record
+their own limitations, but cannot release it as accepted evidence. Resource
+fences and unknown external outcomes remain hard stops rather than provisional
+science.
 
 **D62 — Templates seed a live project organization; they do not prescribe its work.**
 Each Composer project materializes a versioned department charter, durable

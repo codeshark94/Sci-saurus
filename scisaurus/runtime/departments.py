@@ -1254,6 +1254,53 @@ class DepartmentRuntime:
             resolved.append({"task_id": task_id, "state": task["state"], "request_id": request.get("id")})
         return resolved
 
+    def retire_superseded_work_orders(self, request_ids, *, actor="command.composer", reason):
+        """Fence open work orders that are no longer in the active continuation.
+
+        A hold intentionally keeps its current order open for the next
+        continuation, but a later pivot can replace that order with a new
+        scoped objective.  Leaving every prior generation in ``running`` made
+        the backlog claim that old work was still executing and obscured the
+        real worker pool.  Mark superseded generations stale while retaining
+        their immutable history and any actual attempt accounting.
+        """
+        keep = {item for item in (request_ids or []) if isinstance(item, str) and item}
+        retired = []
+        rows = self.control._conn.execute(
+            "SELECT task_id, state, payload_json FROM tasks ORDER BY task_id"
+        ).fetchall()
+        terminal = {"completed", "failed", "cancelled", "stale", "rejected"}
+        for row in rows:
+            if row["state"] in terminal:
+                continue
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError):
+                continue
+            if not payload.get("work_order_ref"):
+                continue
+            order_id = payload.get("id")
+            if isinstance(order_id, str) and order_id in keep:
+                continue
+            try:
+                task = self.tasks.transition(row["task_id"], "stale", actor, reason=reason)
+            except (NotFoundError, StateError):
+                continue
+            department = payload.get("department")
+            if isinstance(department, str) and "." in department:
+                department = department.split(".", 1)[0]
+            if isinstance(department, str) and isinstance(order_id, str) and department in self.charters:
+                try:
+                    self._set_work_order_state(
+                        {"department": department, "id": order_id}, "stale", actor=actor)
+                except (NotFoundError, StateError, ValidationError):
+                    # The task lifecycle is authoritative even if an older
+                    # artifact head was concurrently superseded.
+                    pass
+            retired.append({"task_id": row["task_id"], "request_id": order_id,
+                            "state": task["state"]})
+        return retired
+
     @staticmethod
     def _safe_assignment_component(value):
         return re.sub(r"[^a-z0-9_.-]+", "-", str(value).lower()).strip("-") or "item"

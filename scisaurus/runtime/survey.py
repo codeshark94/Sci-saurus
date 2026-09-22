@@ -36,6 +36,21 @@ def normalized(text):
     return " ".join(re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold()))
 
 
+_SEARCH_STOP_WORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "by", "can", "does", "for", "from",
+    "how", "if", "in", "into", "is", "of", "on", "or", "that", "the", "this",
+    "to", "under", "versus", "what", "when", "which", "with", "without", "across",
+    "between", "within", "using", "based", "model", "models", "study", "studies",
+})
+
+
+def _content_tokens(text):
+    return {
+        token for token in normalized(str(text)).split()
+        if len(token) >= 3 and token not in _SEARCH_STOP_WORDS and not token.isdigit()
+    }
+
+
 def _normalize_scoped_entry_updates(wid, updates):
     """Normalize the per-work wrapper used by model repair responses."""
     if not isinstance(updates, dict) or wid not in updates:
@@ -1178,9 +1193,21 @@ class SurveyRunner(ExecutionRuntime):
 
     def _expand(self):
         quiet = 0
+        candidates = self._expansion_candidates()
+        # ``expansion_seed_count`` is a total precision budget, not a fresh
+        # allowance for every round.  The old interpretation multiplied a
+        # three- or four-seed citation crawl by every expansion round and
+        # admitted whole, weakly related citing pages into the catalog.
+        seed_budget = max(1, min(
+            self.bounds["expansion_seed_count"],
+            self.bounds.get("max_analyzed_works", self.bounds["max_works"]),
+        ))
+        citing_limit = self._expansion_result_limit()
         for number in range(self.bounds["expansion_rounds"]):
             before = len(self.works)
-            seeds = [wid for wid in self.works if wid not in self.expanded][:self.bounds["expansion_seed_count"]]
+            expanded_selected = len(set(candidates) & self.expanded)
+            remaining = max(0, seed_budget - expanded_selected)
+            seeds = [wid for wid in candidates if wid not in self.expanded][:remaining]
             if not seeds:
                 break
             completed = True
@@ -1188,12 +1215,17 @@ class SurveyRunner(ExecutionRuntime):
                 self.expanded.add(wid)
                 for reference in self.works[wid]["referenced_works"][:self.bounds["references_per_work"]]:
                     if reference not in self.aliases:
-                        completed &= self._bibliographic_call("work", role="research.citation-tracer", work_id=reference) is not None
-                completed &= self._bibliographic_call("citing", role="research.citation-tracer", work_id=wid) is not None
+                        completed &= self._bibliographic_call(
+                            "work", role="research.citation-tracer", work_id=reference,
+                            result_limit=1) is not None
+                completed &= self._bibliographic_call(
+                    "citing", role="research.citation-tracer", work_id=wid,
+                    result_limit=citing_limit) is not None
             new = len(self.works) - before
             quiet = quiet + 1 if completed and new < self.bounds["min_new_works"] else 0
             self.expansion_log.append({"round": number + 1, "seed_work_ids": seeds, "new_unique_works": new,
-                                       "completed": completed, "quiet_rounds": quiet})
+                                       "completed": completed, "quiet_rounds": quiet,
+                                       "selection": "relevance_gated", "citing_result_limit": citing_limit})
             if quiet >= self.bounds["saturation_rounds"]:
                 break
 
@@ -1201,6 +1233,10 @@ class SurveyRunner(ExecutionRuntime):
         if "full_text" not in self.bindings:
             return
         routes = [(route, False) for route in self.score["full_text_sources"]]
+        selected_ids = self._analysis_selection()
+        analysis_limit = self.bounds.get("max_analyzed_works", self.bounds["max_works"])
+        auto_full_text_limit = min(
+            self.bounds["max_full_texts"], max(1, int(analysis_limit) // 2))
         # A free-topic run may discover Crossref records after its initial
         # route list was authored.  Use the verified catalog URLs as additional
         # candidates so a stale seed route cannot cap the entire full-text
@@ -1208,8 +1244,11 @@ class SurveyRunner(ExecutionRuntime):
         # its provenance is marked locally as auto-discovered.
         if self.bibliography_mode == "crossref" or not routes:
             known = {route.get("work_id") for route, _ in routes if isinstance(route, dict)}
-            for work in self.works.values():
-                wid = work.get("work_id")
+            ranked = sorted(
+                (wid for wid in selected_ids if wid in self.works),
+                key=lambda wid: (self._work_relevance(wid), wid), reverse=True)
+            for wid in ranked:
+                work = self.works[wid]
                 if not isinstance(wid, str) or wid in known:
                     continue
                 locations = work.get("locations") or []
@@ -1229,10 +1268,15 @@ class SurveyRunner(ExecutionRuntime):
                     "section_markers": ["Introduction"],
                 }, True))
                 known.add(wid)
-                if len(routes) >= max(10, self.bounds["max_full_texts"] * 2):
+                if sum(1 for _, auto in routes if auto) >= auto_full_text_limit:
                     break
         for index, (route, auto_discovered) in enumerate(routes):
             wid = self.aliases.get(route["work_id"], route["work_id"])
+            # Explicit routes are user-authored evidence requests. Automatic
+            # routes are only a second-pass deep-analysis surface; never spend
+            # the full-text budget on the long-tailed catalog.
+            if auto_discovered and wid not in selected_ids:
+                continue
             if wid not in self.works or wid in self.full_text_attempted:
                 continue
             if len(self.full_text_attempted) >= self.bounds["max_full_texts"]:
@@ -1295,7 +1339,16 @@ class SurveyRunner(ExecutionRuntime):
     def _reconcile_identities(self):
         if "identity" not in self.bindings:
             return
+        # Identity reconciliation is a verification input for substantive
+        # map/review work, not a requirement for every catalog hit.  The
+        # catalog may contain up to ``max_works`` records while the declared
+        # deep-analysis budget is intentionally much smaller.  Running
+        # Crossref for the entire catalog made the survey spend its first pass
+        # on hundreds of metadata lookups before any scientific assessment.
+        identity_scope = self._analysis_selection()
         for wid, work in list(self.works.items()):
+            if wid not in identity_scope:
+                continue
             if not work.get("doi") or wid in self.identity_records:
                 continue
             if self.api_calls >= self.bounds["max_api_calls"]:
@@ -1323,6 +1376,108 @@ class SurveyRunner(ExecutionRuntime):
                 self.gaps.append({"kind": "bibliographic_identity_" + status, "work_id": wid,
                                   "identity_ref": record["artifact_ref"]})
         self._update_register()
+
+    def _analysis_selection(self):
+        """Choose the bounded set that receives substantive analysis.
+
+        Discovery and counter-search retain their full catalog accounting, but
+        identity reconciliation, source-grounded mapping, and model review
+        must honor the explicit deep-analysis budget. Existing substantive
+        entries remain in scope on resume so a narrower config cannot silently
+        invalidate accepted work.
+        """
+        analysis_limit = self.bounds.get("max_analyzed_works", self.bounds["max_works"])
+        existing = {wid for wid, record in self.analysis_records.items()
+                    if any(self._body(record).get(field, {}).get("text") is not None
+                           for field in MAP_FIELDS)}
+        def priority(wid):
+            work = self.works[wid]
+            return (
+                *self._work_relevance(wid),
+                any(source["work_id"] == wid and source["representation"] == "full_text"
+                    for source in self.source_docs.values()),
+            )
+
+        # Reserve part of the declared analysis budget for the independent
+        # counter-search even when its terminology differs from the question.
+        challenge_ids = {
+            self.aliases.get(wid, wid)
+            for row in self.search_log
+            if row.get("role") == "methods.novelty-challenger"
+            for wid in row.get("returned_work_ids", [])
+        } & set(self.work_records)
+        reserve = self.bounds.get("challenge_reserve", 0)
+        # Keep provider/discovery order as the final tie-breaker.  A work ID is
+        # an opaque provider identifier, not a scientific relevance signal;
+        # sorting equal-scoring records by it used to pick arbitrary seeds and
+        # made fixture/live runs drift between unrelated citation branches.
+        discovery_order = {wid: index for index, wid in enumerate(self.works)}
+        ranked = lambda ids: sorted(
+            ids, key=lambda wid: (priority(wid), -discovery_order.get(wid, 0)), reverse=True)
+        discovery = ranked(set(self.work_records) - existing - challenge_ids)
+        challenges = ranked(challenge_ids - existing)
+        selected = existing | set(
+            discovery[:max(0, analysis_limit - reserve - len(existing))])
+        selected.update(challenges[:max(0, analysis_limit - len(selected))])
+        return selected
+
+    def _survey_search_terms(self):
+        values = [self.score.get("question", ""), *self.score.get("seed_queries", [])]
+        return _content_tokens(" ".join(str(value) for value in values))
+
+    def _survey_search_phrases(self):
+        """Return declared two-to-four-token anchors for relevance ranking."""
+        phrases = []
+        values = [self.score.get("question", ""), *self.score.get("seed_queries", [])]
+        for value in values:
+            tokens = [token for token in normalized(str(value)).split()
+                      if len(token) >= 3 and token not in _SEARCH_STOP_WORDS
+                      and not token.isdigit()]
+            for width in range(min(4, len(tokens)), 1, -1):
+                for start in range(0, len(tokens) - width + 1):
+                    phrase = " ".join(tokens[start:start + width])
+                    if phrase not in phrases:
+                        phrases.append(phrase)
+        return phrases[:48]
+
+    def _work_relevance(self, wid):
+        work = self.works[wid]
+        title = normalized(work.get("title", ""))
+        text = normalized(" ".join(
+            str(work.get(key, "")) for key in ("title", "abstract")))
+        title_tokens = set(title.split())
+        text_tokens = set(text.split())
+        terms = self._survey_search_terms()
+        phrase_hits = sum(phrase in text for phrase in self._survey_search_phrases())
+        title_hits = len(terms & title_tokens)
+        text_hits = len(terms & text_tokens)
+        return (phrase_hits, title_hits, text_hits, bool(work.get("abstract")))
+
+    def _expansion_candidates(self):
+        selected = self._analysis_selection()
+        discovery_order = {wid: index for index, wid in enumerate(self.works)}
+        ranked = sorted(
+            selected,
+            key=lambda wid: (self._work_relevance(wid), -discovery_order.get(wid, 0)),
+            reverse=True,
+        )
+        # Citation expansion is a precision operation.  Keep weak catalog hits
+        # available for coverage, but do not let a title that shares one broad
+        # word seed a citation flood.  If the relevance gate has no positive
+        # candidate, retain the best ranked candidate so a sparse survey still
+        # makes progress.
+        relevant = [wid for wid in ranked
+                    if self._work_relevance(wid)[0] > 0
+                    or self._work_relevance(wid)[1] >= 2]
+        return relevant or ranked
+
+    def _expansion_result_limit(self):
+        analysis_limit = max(1, int(self.bounds.get(
+            "max_analyzed_works", self.bounds["max_works"])))
+        return max(1, min(
+            self.bounds["results_per_query"],
+            max(5, analysis_limit // 8),
+        ))
 
     def _update_register(self):
         body = {"work_refs": [r["artifact_ref"] for r in self.work_records.values()],
@@ -1900,27 +2055,7 @@ class SurveyRunner(ExecutionRuntime):
     def _map(self):
         requested = []
         basis = {}
-        analysis_limit = self.bounds.get("max_analyzed_works", self.bounds["max_works"])
-        existing = {wid for wid, record in self.analysis_records.items()
-                    if any(self._body(record).get(field, {}).get("text") is not None for field in MAP_FIELDS)}
-        query_terms = set(normalized(self.score["question"]).split())
-        def priority(wid):
-            work = self.works[wid]
-            text = normalized(str(work.get("title", "")) + " " + str(work.get("abstract", "")))
-            return (len(query_terms & set(text.split())),
-                    any(s["work_id"] == wid and s["representation"] == "full_text" for s in self.source_docs.values()))
-        # Reserve part of the declared analysis budget for independent
-        # counter-search, even if its terminology differs from the question.
-        challenge_ids = {self.aliases.get(wid, wid) for row in self.search_log
-                         if row.get("role") == "methods.novelty-challenger"
-                         for wid in row.get("returned_work_ids", [])} & set(self.work_records)
-        reserve = self.bounds.get("challenge_reserve", 0)
-        def ranked(ids):
-            return sorted(ids, key=lambda wid: (*priority(wid), wid), reverse=True)
-        discovery = ranked(set(self.work_records) - existing - challenge_ids)
-        challenges = ranked(challenge_ids - existing)
-        selected = existing | set(discovery[:max(0, analysis_limit - reserve - len(existing))])
-        selected.update(challenges[:max(0, analysis_limit - len(selected))])
+        selected = self._analysis_selection()
         for wid, work in self.work_records.items():
             basis[wid] = [work["artifact_ref"], *([self.identity_records[wid]["artifact_ref"]]
                           if wid in self.identity_records else []),

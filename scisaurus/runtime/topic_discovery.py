@@ -48,6 +48,10 @@ TOPIC_ABSTRACT_CHARS = 1200
 # permission to run until the mission deadline; the stage budget remains the
 # hard limit on model calls, tokens, and provider requests.
 MAX_BOUNDED_TOPIC_ATTEMPTS = 12
+# A topic-stage provider request is a bounded assignment, not a lease on the
+# entire multi-hour stage.  This cap ensures a stalled Ollama route returns a
+# typed provider failure that the Composer can retry or pivot.
+TOPIC_MODEL_CALL_TIMEOUT_SECONDS = 300.0
 FRONTIER_SEED_SCHEMA_VERSION = "topic-frontier-seeds-1"
 SOURCE_CHALLENGE_SCHEMA_VERSION = "topic-source-challenge-2"
 FRONTIER_SEED_FIELDS = {
@@ -132,6 +136,21 @@ FEASIBILITY_INPUT_STATUSES = {
 }
 FEASIBILITY_DATA_ACCESS = {
     "closed_world", "project_local", "survey_artifact", "external_provider",
+}
+
+# A completed topic artifact contains controller-owned projections beside the
+# strict intake package.  Models sometimes echo that artifact when repairing a
+# package.  These fields carry no candidate information and can be discarded
+# losslessly when the five immutable package fields are present.
+TOPIC_CONTROLLER_OUTPUT_FIELDS = {
+    "status", "topic", "question", "search_queries", "proposed_gap",
+    "feasibility_check", "recent_papers", "frontier_seed_plan",
+    "candidate_prior_work", "candidate_sampling_trace", "source_challenge",
+    "sampling_seed", "generation_seed", "sampling_trace", "portfolio_profile",
+    "candidate_attempt_trace", "rejected_topic_history", "maturity_reviews",
+    "maturity_review_history", "maturity_score", "admission_state",
+    "maturity_open_requirements", "next_evidence_action", "topic_evolution",
+    "research_program", "research_program_path", "usage", "budget",
 }
 EVIDENCE_MODE_INPUTS = {
     "analytical_derivation": {"analytical_parameters", "synthetic"},
@@ -519,6 +538,33 @@ def _topic_retry_reason(error, candidate_attempt_trace, rejected_topic_history):
     return None
 
 
+def _strip_topic_controller_metadata(package):
+    """Remove only echoed controller projections from a complete package.
+
+    The model is allowed to return the strict package contract, while the
+    persisted topic artifact also contains derived fields such as ``topic``
+    and ``budget``.  If those projections are echoed during a repair, keeping
+    them makes an otherwise usable package fail an exact-key check.  Unknown
+    fields remain strict failures; this helper never relaxes the scientific
+    candidate contract.
+    """
+    required = {"schema_version", "objective", "candidates", "selected_id",
+                "selection_rationale"}
+    if not isinstance(package, dict) or not required.issubset(package):
+        return []
+    extra = set(package) - required
+    if not extra or not extra.issubset(TOPIC_CONTROLLER_OUTPUT_FIELDS):
+        return []
+    repairs = []
+    for field in sorted(extra):
+        package.pop(field, None)
+        repairs.append({
+            "field": field,
+            "source": "discarded_echoed_controller_metadata",
+        })
+    return repairs
+
+
 def _repair_known_candidate_field_aliases(package):
     """Canonicalize only explicit, lossless aliases from model JSON."""
     if not isinstance(package, dict) or not isinstance(package.get("candidates"), list):
@@ -571,6 +617,113 @@ def _materialize_foundry_feasibility(package, runtime_context):
             "field": "feasibility",
             "source": "foundry_runtime_boundary",
         })
+    return repairs
+
+
+def _repair_feasibility_input_contract(package, runtime_context):
+    """Align a redundant input enum with inputs the candidate already declared.
+
+    ``experiment_input`` is a compact execution label while ``evidence_inputs``
+    is the auditable inventory.  Models occasionally emit a label from the
+    previous repair turn (for example ``project_artifact``) while retaining a
+    self-contained synthetic or analytical input list.  Requiring another
+    prose/model turn for that lossless disagreement wastes the topic budget and
+    can strand the Composer at intake.  Derive only the label when the
+    declared input inventory provides an unambiguous, runtime-admitted family;
+    leave genuinely unsupported or undeclared inputs for the normal validator.
+    """
+    if not isinstance(package, dict) or not isinstance(runtime_context, dict):
+        return []
+    foundry = runtime_context.get("capability_foundry")
+    foundry_enabled = isinstance(foundry, dict) and foundry.get("enabled") is True
+    feasibility_runtime = runtime_context.get("research_feasibility")
+    allowed_inputs = set(feasibility_runtime.get("allowed_input_kinds", [])) \
+        if isinstance(feasibility_runtime, dict) else set()
+    repairs = []
+    for candidate in package.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        plan = candidate.get("feasibility_plan")
+        if not isinstance(plan, dict):
+            continue
+        for field in (
+                "estimated_compute_seconds", "estimated_api_requests",
+                "estimated_model_calls"):
+            value = plan.get(field)
+            if (isinstance(value, float) and math.isfinite(value)
+                    and value.is_integer()):
+                plan[field] = int(value)
+                repairs.append({
+                    "candidate_id": candidate.get("id"),
+                    "field": field,
+                    "from": value,
+                    "to": int(value),
+                    "source": "lossless_integral_numeric_normalization",
+                })
+        if not isinstance(plan.get("evidence_inputs"), list):
+            continue
+        observed = {
+            item.get("kind") for item in plan["evidence_inputs"]
+            if isinstance(item, dict) and isinstance(item.get("kind"), str)
+        }
+        self_contained = observed.intersection({"synthetic", "analytical_parameters"})
+        project_local = observed.intersection({"project_artifact"})
+        survey_inputs = observed.intersection({"survey_metadata", "survey_full_text"})
+        old_input = plan.get("experiment_input")
+        new_input = old_input
+
+        # A foundry can only execute a self-contained plan.  For a regular
+        # project runner, the same normalization is valid when the declared
+        # evidence is already synthetic/analytical; no external artifact is
+        # invented by changing this redundant label.
+        if self_contained and old_input in {"project_artifact", "survey_artifact"}:
+            new_input = "self_contained"
+            if (foundry_enabled or plan.get("data_access") == "survey_artifact"):
+                if plan.get("data_access") != "closed_world":
+                    old_access = plan.get("data_access")
+                    plan["data_access"] = "closed_world"
+                    repairs.append({
+                        "candidate_id": candidate.get("id"),
+                        "field": "data_access",
+                        "from": old_access,
+                        "to": "closed_world",
+                        "source": "declared_self_contained_inputs",
+                    })
+        elif project_local and old_input == "survey_artifact" and not foundry_enabled:
+            new_input = "project_artifact"
+            if plan.get("data_access") == "survey_artifact":
+                plan["data_access"] = "project_local"
+                repairs.append({
+                    "candidate_id": candidate.get("id"),
+                    "field": "data_access",
+                    "from": "survey_artifact",
+                    "to": "project_local",
+                    "source": "declared_project_artifact_input",
+                })
+        elif survey_inputs and old_input == "project_artifact" and not foundry_enabled:
+            # Keep this conservative: survey inputs are only promoted to the
+            # survey label when the current runtime explicitly permits them.
+            if not allowed_inputs or survey_inputs.issubset(allowed_inputs):
+                new_input = "survey_artifact"
+                if plan.get("data_access") == "project_local":
+                    plan["data_access"] = "survey_artifact"
+                    repairs.append({
+                        "candidate_id": candidate.get("id"),
+                        "field": "data_access",
+                        "from": "project_local",
+                        "to": "survey_artifact",
+                        "source": "declared_survey_inputs",
+                    })
+
+        if new_input != old_input:
+            plan["experiment_input"] = new_input
+            repairs.append({
+                "candidate_id": candidate.get("id"),
+                "field": "experiment_input",
+                "from": old_input,
+                "to": new_input,
+                "source": "declared_evidence_inputs",
+            })
     return repairs
 
 
@@ -3486,7 +3639,8 @@ class TopicDiscoveryRunner:
                     or not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
                 raise ValidationError(
                     "topic discovery model config requires a finite positive timeout_seconds")
-            config["timeout_seconds"] = min(float(timeout_seconds), remaining)
+            config["timeout_seconds"] = min(
+                float(timeout_seconds), remaining, TOPIC_MODEL_CALL_TIMEOUT_SECONDS)
         return ModelClient(**config)
 
     def _repair_missing_topic_fields(self, package, *, deadline, budget,
@@ -3507,7 +3661,10 @@ class TopicDiscoveryRunner:
             }
             for index, candidate in enumerate(package["candidates"])
             if isinstance(candidate, dict)
-            and any(field not in candidate for field in _TOPIC_REPAIRABLE_TEXT_FIELDS)
+            and any(field not in candidate for field in (
+                _TOPIC_REPAIRABLE_TEXT_FIELDS
+                + (_TOPIC_REPAIRABLE_STRUCTURED_FIELDS if require_feasibility_plan else ())
+            ))
         ]
         if not targets:
             return []
@@ -4128,6 +4285,7 @@ class TopicDiscoveryRunner:
                     )
                 else:
                     package = parsed_package
+                controller_metadata_repairs = _strip_topic_controller_metadata(package)
                 alias_repairs = _repair_known_candidate_field_aliases(package)
                 grounding_repairs = _materialize_seed_bindings(
                     package,
@@ -4154,6 +4312,8 @@ class TopicDiscoveryRunner:
                     package, (frontier_seed_plan or {}).get("seeds", []))
                 feasibility_repairs = _materialize_foundry_feasibility(
                     package, runtime_context)
+                input_contract_repairs = _repair_feasibility_input_contract(
+                    package, runtime_context)
                 package = _materialize_foundry_capability_requirements(
                     package, runtime_context)
                 query_anchor_repairs = _anchor_topic_candidate_queries(
@@ -4172,12 +4332,18 @@ class TopicDiscoveryRunner:
                 if feasibility_repairs:
                     attempt_record.setdefault("derived_field_repairs", []).extend(
                         feasibility_repairs)
+                if input_contract_repairs:
+                    attempt_record.setdefault("derived_field_repairs", []).extend(
+                        input_contract_repairs)
                 if missing_field_repairs:
                     attempt_record.setdefault("derived_field_repairs", []).extend(
                         missing_field_repairs)
                 if alias_repairs:
                     attempt_record.setdefault("derived_field_repairs", []).extend(
                         alias_repairs)
+                if controller_metadata_repairs:
+                    attempt_record.setdefault("derived_field_repairs", []).extend(
+                        controller_metadata_repairs)
                 candidate_attempt_trace.append(attempt_record)
                 validation_history = _topic_validation_history(
                     (runtime_context or {}).get("topic_history"),
@@ -4882,4 +5048,5 @@ __all__ = [
     "validate_topic_refinement",
     "validate_frontier_seed_plan", "validate_source_challenge", "validate_topic_stage_config",
     "validate_topic_package", "validate_topic_feasibility", "validate_feasibility_plan", "topic_prompt",
+    "_repair_feasibility_input_contract",
 ]

@@ -46,6 +46,21 @@ with the evidence to the paper panel. Refuted topics, invalid artifacts, missing
 dependencies and provider failures do not become successful research. The
 legacy `evidence_first` policy remains the default for existing workflows.
 
+`progression_policy: forward_first` is the autonomous-lab operating mode. It
+does not weaken release gates or turn an error into a scientific result. After
+at most two attempts, a mechanical contract defect or actionable scientific hold
+is materialized as a `candidate_needs_review` node with a
+`composer-forward-progress-1` artifact, a failure class, and an explicit
+`failure_debt`. The dependency graph may continue to downstream analysis using
+that node only as provisional context; release remains blocked. At the end of
+the first graph pass, the debt is converted into a typed backfill work order and
+the affected closure is reopened for at most two continuation cycles. Resource
+fences (provider cooldown/quota, unknown external outcome, process interruption,
+and the hard deadline) do not get guessed through: they remain paused or
+blocked with their durable reason. This prevents one malformed response or
+over-strict local gate from monopolizing the mission while preserving a precise
+route back to the missing work.
+
 Completed specialist assignments and checked survey responses are retained by
 their exact input, role, contract and model configuration. Successful siblings
 are saved before a failed sibling is propagated. Completed stage production is
@@ -258,8 +273,10 @@ direction that has substance in every dimension but still lacks journal-level
 mechanism or contribution depth is retained as `provisional_for_survey`; its
 required changes travel with it. Under `evidence_first` it cannot reach an
 experiment unless the survey establishes `eligible_for_experiment`; `full_pass`
-also permits a clearly labelled exploratory pilot after a current survey and
-assessment. A direction below the exploratory
+and `forward_first` also permit a clearly labelled exploratory pilot after a
+current survey and assessment. In `forward_first`, any resulting experiment or
+paper remains release-blocking until its carried evidence debt is backfilled. A
+direction below the exploratory
 floor is regenerated with a substantive change. The topic artifact keeps
 the accepted review chain and a separate history of rejected or refined
 directions, so a later selection cannot inherit a misleading aggregate score. A topic stage
@@ -560,10 +577,10 @@ python3 -m scisaurus.cli composer-interim-report /path/to/composer-project
 `hard_seconds` are explicit workflow fields; a ten-hour run is represented by
 `hard_seconds: 36000` and stage deadlines that fit inside it. An optional
 `retry_policy` supplies a backoff and may use `mode: until_deadline` for a
-long autonomous mission. This keeps provider-reset waits and evidence-changing
-continuations open, but does not replenish an unchanged assignment's repair
-allowance. Survey retries resume the same durable workspace; other stage
-attempts remain isolated while exact completed production can be retained.
+legacy long autonomous mission. `forward_first` clamps an omitted or
+deadline-governed retry policy to two bounded attempts so one stage cannot
+consume the mission. Survey retries resume the same durable workspace; other
+stage attempts remain isolated while exact completed production can be retained.
 If a full downstream estimate no
 longer fits, the Composer still admits the next stage into the residual window
 until its small control-plane margin, and records any incomplete closure in the
@@ -572,9 +589,11 @@ is declared. A small deterministic job that needs a finite retry budget must
 opt into `mode: bounded` explicitly; that mode retains the one-through-eight
 attempt contract and pauses before a required closure that cannot fit.
 `continuation_policy.mode: until_deadline` likewise keeps research-driven
-re-entry open by default; `mode: bounded` with `max_cycles` is available for
-small deterministic workflows. This is not a retry count. A retry never
-overwrites the failed attempt and never turns an exception into success. If the
+re-entry open for legacy workflows; `mode: bounded` with `max_cycles` is
+available for small deterministic workflows. `forward_first` clamps omitted
+or deadline-governed continuation to two cycles and uses deferred failure debt
+to decide what is revisited. This is not a retry count. A retry never overwrites
+the failed attempt and never turns an exception into success. If the
 hard deadline is exhausted after work has started, the run becomes `paused`
 with every attempt and the next recovery condition recorded. An already-expired
 mission that cannot admit any work remains `blocked`. Checkpoints persist the wall-clock start
