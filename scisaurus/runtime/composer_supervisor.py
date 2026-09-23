@@ -23,6 +23,7 @@ from scisaurus.runtime.composer import ComposerRunner
 TERMINAL_STATUSES = frozenset({"completed", "candidate_needs_review"})
 STOP_REASONS = frozenset({
     "hard_deadline", "required_stage_window_does_not_fit_remaining_deadline",
+    "provider_configuration", "missing_stage_input", "stage_quota_exhausted",
 })
 SUPERVISOR_SCHEMA_VERSION = "composer-supervisor-3"
 DEFAULT_WATCHDOG_SECONDS = 300.0
@@ -308,6 +309,7 @@ class ComposerSupervisor:
             "stages": deepcopy(progress.get("stages", {})),
             "active_research_requests": deepcopy(
                 progress.get("active_research_requests", [])),
+            "retry_schedule": deepcopy(progress.get("retry_schedule", {})),
             "blockers": [{
                 "stage_id": phase.split(":", 1)[0],
                 "reason": (
@@ -318,6 +320,34 @@ class ComposerSupervisor:
                 "active_attempts": [item.get("task_id") for item in active],
             }],
         }
+
+    @staticmethod
+    def _scheduled_retry_wait(snapshot):
+        """Return whether the child is intentionally sleeping until a retry.
+
+        A Composer retry can wait for a provider reset for hours while still
+        making the correct durable decision every checkpoint. The watchdog
+        must not kill that process merely because the semantic state is
+        unchanged; doing so discards the persisted retry fence and can
+        redispatch the same provider-blocked packet.
+        """
+        if not isinstance(snapshot, dict):
+            return False
+        progress = snapshot.get("progress", {})
+        if not isinstance(progress, dict) or progress.get("status") != "running":
+            return False
+        if snapshot.get("active_attempts"):
+            return False
+        schedule = progress.get("retry_schedule")
+        if not isinstance(schedule, dict):
+            return False
+        now = time.time()
+        return any(
+            isinstance(item, dict)
+            and isinstance(item.get("not_before_epoch"), (int, float))
+            and item["not_before_epoch"] > now
+            for item in schedule.values()
+        )
 
     def _wait_before_resume(self, result):
         remaining = _remaining(result)
@@ -359,6 +389,18 @@ class ComposerSupervisor:
             return bool(result.get("active_research_requests"))
         return status in {"blocked", "paused", "failed"}
 
+    def _child_exception_text(self, message):
+        """Convert a child exception message without reviving an interrupt."""
+        if isinstance(message, dict) and message.get("type") == "KeyboardInterrupt":
+            self._write_state(
+                child_status="interrupted", action="stop",
+                error=message.get("error") or "Composer child interrupted",
+            )
+            raise KeyboardInterrupt(message.get("error") or "Composer child interrupted")
+        if isinstance(message, dict):
+            return f"{message.get('type', 'ComposerError')}: {message.get('error', '')}"
+        return "Composer child exited without a result"
+
     def _run_in_process(self):
         resume = self.initial_resume or (self.project_root / "state" / "control.sqlite").is_file()
         while True:
@@ -368,6 +410,7 @@ class ComposerSupervisor:
                     self.workflow, resume=resume, on_progress=self.on_progress)
                 result = runner.run()
             except KeyboardInterrupt:
+                self._mark_interrupted_checkpoint()
                 self._write_state(child_status="interrupted", action="stop")
                 raise
             except Exception as exc:
@@ -396,6 +439,44 @@ class ComposerSupervisor:
                 self._write_state(child_status=result.get("status"), action="stop", result=result)
                 return result
             resume = True
+
+    def _mark_interrupted_checkpoint(self):
+        """Make a foreground stop visible before the next explicit resume."""
+        output = self.project_root / "output"
+        for name in ("progress.json", "run.json", "interim_report.json"):
+            path = output / name
+            try:
+                value = json.loads(path.read_text())
+            except (OSError, TypeError, ValueError):
+                continue
+            if not isinstance(value, dict):
+                continue
+            value["status"] = "paused"
+            if name == "progress.json":
+                value["phase"] = "paused"
+            blockers = value.setdefault("blockers", [])
+            if not isinstance(blockers, list):
+                blockers = []
+                value["blockers"] = blockers
+            if not any(isinstance(item, dict)
+                       and item.get("stage_id") == "workflow"
+                       and item.get("stop_reason") == "process_interrupted"
+                       for item in blockers):
+                blockers.append({
+                    "stage_id": "workflow",
+                    "reason": "KeyboardInterrupt: termination requested",
+                    "stop_reason": "process_interrupted",
+                })
+            value["updated_at_epoch"] = time.time()
+            temporary = path.with_name(path.name + ".tmp")
+            try:
+                temporary.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True))
+                temporary.replace(path)
+            except OSError:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
 
     def _run_one_process(self, resume):
         """Run one Composer attempt while the parent remains killable."""
@@ -431,6 +512,7 @@ class ComposerSupervisor:
                     last_signature = signature
                     last_activity = time.monotonic()
                 stale = time.monotonic() - last_activity
+                scheduled_wait = self._scheduled_retry_wait(snapshot)
                 self._write_state(
                     child_status="running", action="monitoring",
                     result=snapshot.get("progress"),
@@ -449,7 +531,7 @@ class ComposerSupervisor:
                         "stage_signal_count": len(snapshot.get("stage_signals", [])),
                     },
                 )
-                if stale >= self.watchdog_seconds:
+                if stale >= self.watchdog_seconds and not scheduled_wait:
                     result = self._watchdog_result(snapshot, stale)
                     self._write_state(
                         child_status="watchdog_terminated",
@@ -480,6 +562,7 @@ class ComposerSupervisor:
             if child.is_alive():
                 child.terminate()
                 child.join(timeout=5.0)
+            self._mark_interrupted_checkpoint()
             self._write_state(child_status="interrupted", action="stop")
             raise
         finally:
@@ -487,7 +570,12 @@ class ComposerSupervisor:
         if isinstance(message, dict) and message.get("kind") == "result":
             return message.get("result")
         if isinstance(message, dict) and message.get("kind") == "exception":
-            error = f"{message.get('type', 'ComposerError')}: {message.get('error', '')}"
+            # A terminal interrupt can arrive at the Composer child rather
+            # than the supervisor process when both share the launcher's
+            # foreground input.  Do not reinterpret that explicit stop as a
+            # recoverable blocker: doing so leaves the supervisor alive and
+            # dispatches a second Composer against the same checkpoint.
+            error = self._child_exception_text(message)
         else:
             error = f"Composer child exited without a result (exitcode={child.exitcode})"
         return {

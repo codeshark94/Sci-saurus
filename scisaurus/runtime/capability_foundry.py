@@ -23,6 +23,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from dataclasses import asdict
 from pathlib import Path
 
@@ -76,10 +77,150 @@ CONFIG_FIELDS = {
     "max_attempts", "timeout_seconds",
 }
 CONFIG_OPTIONAL_FIELDS = {"model_timeout_seconds"}
+REPAIR_GATE_LIMIT = 2
+
+
+def _canonical_capability_identifier(value):
+    """Return the stable identifier spelling accepted by the program contract.
+
+    Model-authored identifiers are data, not scientific content.  Providers
+    routinely vary only case or introduce punctuation while copying an ID
+    between the intent, executor, and validator.  Normalizing that transport
+    defect before admission preserves the declared identity and lets the
+    existing uniqueness and cross-reference checks remain authoritative.
+    """
+    if not isinstance(value, str):
+        return value
+    value = unicodedata.normalize("NFKC", value).casefold()
+    value = re.sub(r"[^a-z0-9_-]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_-")
+    if not value:
+        value = "id"
+    if not ("a" <= value[0] <= "z"):
+        value = "x_" + value
+    value = value[:64].rstrip("_-") or "x"
+    return value
+
+
+def normalize_capability_candidate(candidate):
+    """Repair provider-only identifier drift across the complete candidate.
+
+    The same mapping is applied to intent IDs and exact source references, so
+    the executor and independently authored validator remain bound to the
+    normalized declaration.  Scientific fields, formulas, and prose are not
+    altered.  The returned repair ledger is diagnostic only and is never part
+    of the candidate admission record.
+    """
+    if not isinstance(candidate, dict):
+        return candidate, []
+    result = deepcopy_config(candidate)
+    intent = result.get("experiment_intent")
+    if not isinstance(intent, dict):
+        return result, []
+
+    locations = [(intent, "id")]
+    for collection_name, field in (("primary_outcomes", "id"),
+                                   ("required_assets", "role"),
+                                   ("reviewers", "id")):
+        collection = intent.get(collection_name)
+        if isinstance(collection, list):
+            locations.extend(
+                (item, field) for item in collection if isinstance(item, dict))
+
+    used = {
+        item[field]
+        for item, field in locations
+        if isinstance(item.get(field), str) and IDENTIFIER.fullmatch(item[field])
+    }
+    mapping = {}
+    repairs = []
+    for item, field in locations:
+        original = item.get(field)
+        if not isinstance(original, str) or IDENTIFIER.fullmatch(original):
+            continue
+        if original in mapping:
+            normalized = mapping[original]
+        else:
+            base = _canonical_capability_identifier(original)
+            normalized = base
+            suffix = 2
+            while normalized in used:
+                tail = f"_{suffix}"
+                normalized = f"{base[:64 - len(tail)]}{tail}"
+                suffix += 1
+            mapping[original] = normalized
+            used.add(normalized)
+        item[field] = normalized
+        repairs.append({"field": field, "from": original, "to": normalized})
+
+    if not mapping:
+        return result, []
+    for source_name in ("executor_source", "validator_source"):
+        source = result.get(source_name)
+        if not isinstance(source, str):
+            continue
+        for original, normalized in sorted(mapping.items(), key=lambda pair: -len(pair[0])):
+            source = re.sub(
+                rf"(?<![A-Za-z0-9_-]){re.escape(original)}(?![A-Za-z0-9_-])",
+                normalized,
+                source,
+            )
+        result[source_name] = source
+    return result, repairs
 
 
 class CapabilityDeadlineError(ValidationError):
     """A time boundary leaves retained source awaiting validation, not repair."""
+
+
+class CapabilityModelBudgetExceeded(ModelWorkBlocked):
+    """A bounded foundry pass ran out of model calls before admission."""
+
+    def __init__(self, message, *, limit, observed, usage=None):
+        super().__init__(message)
+        self.limit = limit
+        self.observed = observed
+        # This is diagnostic stage usage, not a fresh global charge.  The
+        # Composer already reconciles durable foundry work while the request
+        # is in flight.
+        self.foundry_usage = deepcopy_config(usage) if isinstance(usage, dict) else {}
+
+
+def _repair_gate(error):
+    """Return the admission gate that produced a repairable failure."""
+    feedback = getattr(error, "feedback", None)
+    if isinstance(feedback, dict) and isinstance(feedback.get("gate"), str):
+        return feedback["gate"]
+    text = str(error).casefold()
+    if "adversarial review" in text:
+        return "adversarial_review"
+    if "independent recalculation" in text or "deterministic validation" in text:
+        return "independent_recalculation"
+    if "deterministic replay" in text or "test-vector digest" in text:
+        return "deterministic_replay"
+    if "validator readiness" in text:
+        return "validator_readiness"
+    if "static scan" in text or "program candidate" in text:
+        return "static_scan"
+    return None
+
+
+def _seed_repair_gate_counts(state):
+    """Migrate old foundry cache entries into the bounded gate ledger."""
+    counts = state.get("repair_gate_counts")
+    if isinstance(counts, dict):
+        return {key: value for key, value in counts.items()
+                if isinstance(key, str) and type(value) is int and value >= 0}
+    counts = {}
+    for message in state.get("validation_errors", []):
+        gate = _repair_gate(message)
+        if gate:
+            counts[gate] = counts.get(gate, 0) + 1
+    feedback = state.get("validation_feedback")
+    if isinstance(feedback, dict) and isinstance(feedback.get("gate"), str):
+        gate = feedback["gate"]
+        counts.setdefault(gate, 0)
+    return counts
 
 
 def _normalize_program_validation_error(error):
@@ -277,6 +418,18 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             "the executor and independently written validator must implement that same declared formula from raw observations",
             "the validator must emit one metric_recalculations row for every declared primary outcome, including "
             "reported_value, recalculated_value, tolerance, and matches",
+            "Every primary outcome must be sensitive to at least one declared intervention or stochastic draw when the "
+            "question claims an effect. Do not algebraically cancel the variable being tested; run a small sensitivity "
+            "check before production and choose a descriptive or explicitly model-internal outcome when no variation is possible.",
+            "An ablation or null branch must not return the comparison baseline by definition. It must be derived from "
+            "a separately declared mechanism that could in principle differ; if the null is intentionally tautological, "
+            "label it as a diagnostic and do not claim physical support from it.",
+            "Do not calibrate a model with a parameter and then multiply by that same parameter so it cancels. "
+            "The recorded observations must expose the intervention, baseline, and response needed to distinguish the "
+            "declared explanations.",
+            "Prefer a minimal, falsifiable seeded experiment with one clear intervention, one baseline, and finite "
+            "estimands over an elaborate multi-mechanism simulation. A smaller valid result is better than an impressive "
+            "but unidentifiable program.",
         ],
     }
     if required_intent:
@@ -367,15 +520,36 @@ def validate_program_review(value):
     if not isinstance(limitations, list) or any(not isinstance(item, str) or not item.strip() for item in limitations):
         raise ValidationError("scientific program review limitations must be nonempty strings")
     checks = value["checks"]
-    if (not isinstance(checks, list) or len(checks) != len(PROGRAM_REVIEW_CHECKS)
-            or any(not isinstance(item, dict) or set(item) != {"id", "outcome", "evidence"}
-                   or not isinstance(item.get("id"), str)
-                   or not isinstance(item.get("outcome"), str)
-                   or item.get("outcome") not in {"passed", "failed"}
-                   or not isinstance(item.get("evidence"), str) or not item["evidence"].strip()
-                   for item in checks)
-            or {item["id"] for item in checks} != PROGRAM_REVIEW_CHECKS):
-        raise ValidationError("scientific program review must execute every required check")
+    if not isinstance(checks, list):
+        raise ValidationError(
+            "scientific program review checks must be a list containing exactly: "
+            + ", ".join(sorted(PROGRAM_REVIEW_CHECKS)))
+    malformed = [index for index, item in enumerate(checks)
+                 if (not isinstance(item, dict)
+                     or set(item) != {"id", "outcome", "evidence"}
+                     or not isinstance(item.get("id"), str)
+                     or not isinstance(item.get("outcome"), str)
+                     or item.get("outcome") not in {"passed", "failed"}
+                     or not isinstance(item.get("evidence"), str)
+                     or not item["evidence"].strip())]
+    ids = [item.get("id") for item in checks if isinstance(item, dict)]
+    string_ids = [item for item in ids if isinstance(item, str)]
+    missing = sorted(PROGRAM_REVIEW_CHECKS - set(string_ids))
+    unexpected = sorted(set(string_ids) - PROGRAM_REVIEW_CHECKS)
+    duplicates = sorted({item for item in string_ids if string_ids.count(item) > 1})
+    if (len(checks) != len(PROGRAM_REVIEW_CHECKS) or malformed or missing or unexpected or duplicates):
+        details = []
+        if malformed:
+            details.append("malformed rows=" + ",".join(str(index) for index in malformed))
+        if missing:
+            details.append("missing=" + ",".join(missing))
+        if unexpected:
+            details.append("unexpected=" + ",".join(unexpected))
+        if duplicates:
+            details.append("duplicates=" + ",".join(duplicates))
+        raise ValidationError(
+            "scientific program review must execute every required check ("
+            + "; ".join(details) + ")")
     findings = value["findings"]
     if (not isinstance(findings, list) or any(
             not isinstance(item, dict) or set(item) != {"severity", "finding", "evidence", "required_change"}
@@ -394,7 +568,8 @@ def validate_program_review(value):
 class CapabilityFoundry:
     def __init__(self, model_config, *, runtime_python, workspace_root, registry_root, repo_root,
                  requirements_file, runtime_packages, max_attempts=4, timeout_seconds=900.0,
-                 model_timeout_seconds=300.0, reviewer_client=None):
+                 model_timeout_seconds=300.0, reviewer_client=None,
+                 author_max_output_tokens=24000, reviewer_max_output_tokens=12000):
         self.model_config = deepcopy_config(model_config)
         self.runtime_python = Path(runtime_python)
         self.workspace_root = Path(workspace_root)
@@ -405,6 +580,8 @@ class CapabilityFoundry:
         self.max_attempts = int(max_attempts)
         self.timeout_seconds = timeout_seconds
         self.model_timeout_seconds = model_timeout_seconds
+        self.author_max_output_tokens = author_max_output_tokens
+        self.reviewer_max_output_tokens = reviewer_max_output_tokens
         self.deadline = None
         self.reviewer_client = reviewer_client
         if type(max_attempts) is not int or not 1 <= max_attempts <= 12:
@@ -415,6 +592,10 @@ class CapabilityFoundry:
         if (type(model_timeout_seconds) not in (int, float)
                 or not math.isfinite(model_timeout_seconds) or model_timeout_seconds <= 0):
             raise ValidationError("foundry model_timeout_seconds must be finite and positive")
+        for name, value in (("author_max_output_tokens", author_max_output_tokens),
+                            ("reviewer_max_output_tokens", reviewer_max_output_tokens)):
+            if type(value) is not int or not 1024 <= value <= 65536:
+                raise ValidationError(f"foundry {name} must be an integer between 1024 and 65536")
         for path in (self.runtime_python, self.requirements_file):
             if not path.is_file():
                 raise ValidationError(f"foundry requires an existing file: {path}")
@@ -422,6 +603,21 @@ class CapabilityFoundry:
             raise ValidationError(
                 "capability foundry requires the deny-by-default sandbox-exec boundary")
         self.workspace_root.mkdir(parents=True, exist_ok=True)
+
+    def _model_config_for_role(self, role, output_limit):
+        """Give source authoring enough room without changing ordinary roles."""
+        config = resolve_model_config(self.model_config, role=role)
+        requested = max(int(config["max_output_tokens"]), int(output_limit))
+        window = config.get("context_window_tokens")
+        input_limit = config.get("max_input_tokens")
+        if type(window) is int:
+            available = window - (input_limit if type(input_limit) is int else 1024)
+            if available <= 0:
+                raise ValidationError(
+                    f"foundry {role} route leaves no output context after its input reservation")
+            requested = min(requested, available)
+        config["max_output_tokens"] = requested
+        return config
 
     def _runtime(self):
         probe = (
@@ -476,11 +672,15 @@ class CapabilityFoundry:
                              input_bytes=payload, timeout_seconds=timeout, max_bytes=60_000_000)
 
     def generate(self, brief, *, test_input=None, required_intent=None, client=None,
-                 work_cache=None, on_progress=None, deadline=None):
+                 work_cache=None, on_progress=None, deadline=None,
+                 model_call_budget=None):
+        if model_call_budget is not None and (
+                type(model_call_budget) is not int or model_call_budget < 1):
+            raise ValidationError("foundry model_call_budget must be a positive integer when supplied")
         self.deadline = deadline
         if client is None:
-            model_config = resolve_model_config(
-                self.model_config, role="research.experiment-author")
+            model_config = self._model_config_for_role(
+                "research.experiment-author", self.author_max_output_tokens)
             model_config["timeout_seconds"] = min(
                 float(model_config["timeout_seconds"]), float(self.model_timeout_seconds))
             client = ModelClient(**model_config)
@@ -490,6 +690,7 @@ class CapabilityFoundry:
             required_intent=required_intent, runtime_version=runtime["python"])
         key = None
         state = {"status": "pending", "attempts": 0, "usage": {}, "requests": [],
+                 "repair_gate_counts": {},
                  "assignment": base_prompt}
         if work_cache is not None:
             contract = hashlib.sha256()
@@ -548,7 +749,8 @@ class CapabilityFoundry:
                         if not response or response.get("finish_reason") != "stop":
                             continue
                         try:
-                            checked = validate_program_review(ModelResult(**response).json_object())
+                            checked = validate_program_review(
+                                ModelResult(**response).json_object(allow_missing_closers=True))
                         except (ValidationError, TypeError):
                             continue
                         if checked["status"] == "rejected":
@@ -560,6 +762,32 @@ class CapabilityFoundry:
                 work_cache.put(key, state)
             if on_progress is not None:
                 on_progress(phase, deepcopy_config(state))
+
+        state["repair_gate_counts"] = _seed_repair_gate_counts(state)
+        if model_call_budget is not None:
+            state["model_call_budget"] = model_call_budget
+
+        def ensure_model_call_budget():
+            if model_call_budget is None:
+                return
+            observed = state.get("usage", {}).get("model_calls", 0)
+            if type(observed) is not int:
+                observed = 0
+            if observed < model_call_budget:
+                return
+            state["status"] = "blocked"
+            state["error"] = (
+                "capability foundry model-call budget exhausted before admission: "
+                f"{observed} >= {model_call_budget}; change the scientific framing "
+                "or continue from a fresh scoped work order instead of replaying the same candidate")
+            state["budget_exhausted"] = {
+                "dimension": "model_calls", "limit": model_call_budget,
+                "observed": observed, "usage": deepcopy_config(state.get("usage", {})),
+            }
+            save("model_call_budget_exhausted")
+            raise CapabilityModelBudgetExceeded(
+                state["error"], limit=model_call_budget, observed=observed,
+                usage=state.get("usage", {}))
 
         def record_result(request, result):
             request.update(status="succeeded", model=result.model, usage=result.usage,
@@ -586,7 +814,7 @@ class CapabilityFoundry:
                 try:
                     if result.finish_reason != "stop":
                         raise ValidationError(f"independent program reviewer finish_reason={result.finish_reason}")
-                    review = validate_program_review(result.json_object())
+                    review = validate_program_review(result.json_object(allow_missing_closers=True))
                 except ValidationError as exc:
                     retained.update(status="repairing", error=str(exc))
                     state["prefer_review_fallback"] = True
@@ -607,6 +835,19 @@ class CapabilityFoundry:
                 if (review_attempt or state.get("prefer_review_fallback")) and alternatives:
                     model_config.setdefault("role_models", {})["review.methods"] = alternatives[0]
                 config = resolve_model_config(model_config, role="review.methods")
+                configured_limit = max(
+                    int(config.get("max_output_tokens", 0)),
+                    int(self.reviewer_max_output_tokens),
+                )
+                window = config.get("context_window_tokens")
+                input_limit = config.get("max_input_tokens")
+                if type(window) is int:
+                    available = window - (input_limit if type(input_limit) is int else 1024)
+                    if available <= 0:
+                        raise ValidationError(
+                            "foundry reviewer route leaves no output context after its input reservation")
+                    configured_limit = min(configured_limit, available)
+                config["max_output_tokens"] = configured_limit
                 config["timeout_seconds"] = min(float(config["timeout_seconds"]), self.model_timeout_seconds)
                 reviewer = ModelClient(**config)
             if deadline is not None:
@@ -615,6 +856,7 @@ class CapabilityFoundry:
                     raise CapabilityDeadlineError("independent program review reached its mission deadline")
                 if hasattr(reviewer, "timeout_seconds"):
                     reviewer.timeout_seconds = min(reviewer.timeout_seconds, remaining)
+            ensure_model_call_budget()
             prompt = {"assignment": "independent_scientific_program_review",
                 "research_assignment": brief,
                 "experiment_intent": candidate["experiment_intent"],
@@ -631,8 +873,11 @@ class CapabilityFoundry:
             if review_attempt:
                 prompt["format_repair"] = {
                     "error": retained.get("error"),
+                    "required_check_ids": sorted(PROGRAM_REVIEW_CHECKS),
                     "instructions": "Return the complete concise JSON verdict only. Do not repeat long reasoning. "
-                                    "Judge the same evidence independently; do not relax the criteria."}
+                                    "Judge the same evidence independently; do not relax the criteria. "
+                                    "Include exactly one check row for every required_check_ids entry, even "
+                                    "when the outcome is failed; do not omit independent_validation."}
             request = {"role": "review.methods", "candidate_sha256": identity,
                        "review_attempt": review_attempt + 1,
                        "status": "started", "prompt": json.dumps(prompt, ensure_ascii=False, sort_keys=True),
@@ -670,6 +915,24 @@ class CapabilityFoundry:
                 error="process exited before the provider result was recorded")
             state["status"] = "repairing"
             save("reconciled")
+        exhausted_gate = next(
+            (gate for gate, count in state["repair_gate_counts"].items()
+             if type(count) is int and count >= REPAIR_GATE_LIMIT),
+            None,
+        )
+        if exhausted_gate is not None:
+            state["status"] = "blocked"
+            state["error"] = (
+                f"capability foundry {exhausted_gate} repair budget exhausted after "
+                f"{state['repair_gate_counts'][exhausted_gate]} failures; change the scientific framing "
+                f"instead of repeatedly repairing the same gate: {state.get('feedback', '')[:2400]}")
+            state["repair_budget_exhausted"] = {
+                "gate": exhausted_gate,
+                "failures": state["repair_gate_counts"][exhausted_gate],
+                "limit": REPAIR_GATE_LIMIT,
+            }
+            save("repair_budget_exhausted")
+            raise ModelWorkBlocked(state["error"])
         feedback = state.get("feedback")
         last_error = feedback
         last_attempt = state.get("last_attempt")
@@ -710,6 +973,7 @@ class CapabilityFoundry:
                         raise CapabilityDeadlineError("capability authoring reached its mission deadline")
                     if hasattr(client, "timeout_seconds"):
                         client.timeout_seconds = min(client.timeout_seconds, remaining)
+                ensure_model_call_budget()
                 state["attempts"] = attempt + 1
                 request = {"attempt": attempt + 1, "role": "research.experiment-author", "status": "started", "prompt": prompt,
                            "usage": {"model_calls": 1}}
@@ -743,7 +1007,11 @@ class CapabilityFoundry:
                 continue
             attempt_value = document = candidate_fingerprint = None
             try:
-                attempt_value = result.json_object()
+                # A provider may stop after emitting a complete inner object
+                # but omit only the outermost closing brace.  Recover that
+                # transport defect locally; all authoring, sandbox, and
+                # admission gates still run on the recovered object.
+                attempt_value = result.json_object(allow_missing_closers=True)
                 if "updates" in attempt_value:
                     attempt_value = apply_authoring_patch(state.get("response_base", last_attempt), attempt_value)
                 if (not ATTEMPT_FIELDS.issubset(attempt_value)
@@ -765,6 +1033,13 @@ class CapabilityFoundry:
                                        if not isinstance(intent, dict) or intent.get(key) != value}
                         raise ValidationError(
                             "program author changed a required scientific intent field: " + json.dumps(differences))
+                attempt_value, identifier_repairs = normalize_capability_candidate(attempt_value)
+                if identifier_repairs:
+                    state.setdefault("normalizations", []).append({
+                        "attempt": attempt + 1,
+                        "kind": "capability_identifier",
+                        "repairs": identifier_repairs,
+                    })
                 executor, validator = attempt_value["executor_source"], attempt_value["validator_source"]
                 validate_experiment_intent(attempt_value["experiment_intent"])
                 scan_program_source(executor, "program executor")
@@ -831,6 +1106,11 @@ class CapabilityFoundry:
                 state["status"] = "response_received"
                 save("validation_pending")
                 raise
+            except CapabilityModelBudgetExceeded:
+                # The Composer owns this scientific budget boundary. Do not
+                # reinterpret it as a candidate defect and spend another
+                # repair call before the pivot/recovery path sees it.
+                raise
             except (ValidationError, KeyError, TypeError, ValueError) as exc:
                 if deadline is not None and time.monotonic() >= deadline:
                     state["status"] = "response_received"
@@ -862,6 +1142,23 @@ class CapabilityFoundry:
                 state.update(status="blocked" if repeated else "repairing", feedback=feedback,
                     last_attempt=last_attempt,
                     error=f"capability foundry did not admit a program: {feedback}")
+                gate = _repair_gate(exc)
+                if gate:
+                    counts = state["repair_gate_counts"]
+                    counts[gate] = counts.get(gate, 0) + 1
+                    if counts[gate] >= REPAIR_GATE_LIMIT:
+                        state["status"] = "blocked"
+                        state["error"] = (
+                            f"capability foundry {gate} repair budget exhausted after "
+                            f"{counts[gate]} failures; change the scientific framing "
+                            f"instead of repeatedly repairing the same gate: {feedback[:2400]}")
+                        state["repair_budget_exhausted"] = {
+                            "gate": gate,
+                            "failures": counts[gate],
+                            "limit": REPAIR_GATE_LIMIT,
+                        }
+                        save("repair_budget_exhausted")
+                        raise ModelWorkBlocked(state["error"]) from exc
                 save("validation_failed")
                 if repeated:
                     raise ModelWorkBlocked(state["error"]) from exc

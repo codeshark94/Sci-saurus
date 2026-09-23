@@ -11,6 +11,21 @@ class ValidationError(ContractError):
     """A record failed schema/field validation."""
 
 
+class ProviderConfigurationError(ValidationError):
+    """A required provider cannot be used with the current local configuration.
+
+    This is intentionally distinct from a scientific or model-contract
+    failure.  Missing credentials, an invalid endpoint configuration, and
+    similar operator-owned conditions must pause at the provider boundary;
+    they must never trigger a topic pivot or consume another model repair.
+    """
+
+    def __init__(self, message, *, provider=None, credential_env=None):
+        super().__init__(message)
+        self.provider = provider
+        self.credential_env = credential_env
+
+
 class QuotaExceededError(ContractError):
     """A declared execution quota was exhausted before more work could run."""
 

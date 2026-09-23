@@ -536,8 +536,9 @@ class ModelResult:
     finish_reason: str
     request_attempts: int = 1
 
-    def json_object(self):
-        return json_object(self.text, "model output", model_envelope=True)
+    def json_object(self, *, allow_missing_closers=False):
+        return json_object(self.text, "model output", model_envelope=True,
+                           allow_missing_closers=allow_missing_closers)
 
 
 def _cache_usage(response):

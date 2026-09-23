@@ -25,7 +25,7 @@ from scisaurus.runtime.survey import (SurveyRunner, apply_scoped_map_repair,
                                       overlay_post_checkpoint_relationships)
 from scisaurus.runtime.survey_config import validate_survey_config
 from scisaurus.runtime.survey_records import (GAP_CHECKS, MAP_FIELDS, SURVEY_CHECKS,
-                                               validate_assessment, validate_map)
+                                               normalize_check_envelope, validate_assessment, validate_map)
 from scisaurus.runtime.time_policy import STAGES
 
 
@@ -175,7 +175,12 @@ def simulated_survey_worker(kind, params, channel):
         if mode == "survey-fails":
             value["checks"][1].update(outcome="failed", result="The independent fixture review rejects source fidelity.")
     elif phase == "work_review":
-        value = {"checks": check_rows(assignment["required_checks"]), "rationale": "Each scoped claim is supported or explicitly unknown."}
+        if mode == "review-malformed" and assignment["entry"]["work_id"] == "W101":
+            value = {"checks": [{"check_id": "duplicate-check", "outcome": "passed",
+                                  "method": "Malformed fixture response.", "result": "Not a valid focused review."}],
+                     "rationale": "Malformed fixture response."}
+        else:
+            value = {"checks": check_rows(assignment["required_checks"]), "rationale": "Each scoped claim is supported or explicitly unknown."}
         if mode == "review-never-resolves" and assignment["entry"]["work_id"] == "W101":
             next(check for check in value["checks"] if check["check_id"] == "reason").update(
                 outcome="insufficient_evidence", result="The screening rationale remains unresolved.")
@@ -280,6 +285,21 @@ class TestSurveyRunner(unittest.TestCase):
         SurveyHTTPFixture.requests.clear()
         SurveyHTTPFixture.refresh_target = False
         SurveyHTTPFixture.rate_limit_once = None
+
+    def test_check_envelope_projection_drops_extra_rows_without_reordering(self):
+        rows = [
+            {"check_id": "source-fidelity", "outcome": "passed", "method": "m", "result": "r"},
+            {"check_id": "question:stochastic_resonance_peak", "outcome": "passed",
+             "method": "extra", "result": "extra"},
+            {"check_id": "coverage-accounting", "outcome": "passed", "method": "m", "result": "r"},
+            {"check_id": "map-support", "outcome": "passed", "method": "m", "result": "r"},
+        ]
+        value = {"checks": rows, "rationale": "bounded"}
+        projected = normalize_check_envelope(value, SURVEY_CHECKS)
+        self.assertEqual([row["check_id"] for row in projected["checks"]],
+                         ["source-fidelity", "coverage-accounting", "map-support"])
+        incomplete = {"checks": rows[:2], "rationale": "bounded"}
+        self.assertIs(normalize_check_envelope(incomplete, SURVEY_CHECKS), incomplete)
 
     def test_balanced_query_limit_preserves_capacity_for_independent_families(self):
         from scisaurus.runtime.survey import SurveyRunner
@@ -633,6 +653,17 @@ class TestSurveyRunner(unittest.TestCase):
         retained = json.loads(store.read_body(store.get(exclusion["retained_analysis_ref"])["body_hash"]))
         self.assertIsNotNone(retained["problem"]["text"])
         self.assertEqual(store.versions("kb/work-analyses/W201"), [1])
+
+    def test_malformed_focused_review_withdraws_one_work_without_blocking_survey(self):
+        config = survey_config(self.endpoint, "review-malformed")
+        result = self.runtime(config).run()
+        self.assertEqual(result["status"], "completed", result)
+        _, store = self.open_store()
+        entry = json.loads(store.read_body(store.head("kb/work-analyses/W101")["body_hash"]))
+        self.assertEqual(entry["inclusion"], "uncertain")
+        self.assertTrue(all(entry[field]["text"] is None for field in MAP_FIELDS))
+        self.assertIsNotNone(store.head("kb/work-exclusions/W101"))
+        self.assertIsNotNone(store.head("kb/work-reviews/W201"))
 
     def test_resume_does_not_replenish_exhausted_scientific_repair(self):
         config = survey_config(self.endpoint, "review-never-resolves")
@@ -1054,6 +1085,15 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(coverage["abstention_count"], 2)
         self.assertEqual(coverage["abstention_work_ids"], ["W101", "W102"])
         self.assertIn("partial withdrawals", coverage["count_definitions"]["abstention_count"])
+        self.assertEqual(packet["deterministic_integrity"]["map_entry_count"], 2)
+        self.assertEqual(packet["deterministic_integrity"]["source_inventory_work_count"], 2)
+        self.assertTrue(packet["deterministic_integrity"]["all_relationship_endpoints_in_map_entries"])
+        self.assertIn("abstract_work_count", coverage["count_definitions"])
+        self.assertEqual(packet["map"]["projection"], packet["projection"])
+        self.assertLessEqual(packet["projection"]["presented_entry_count"],
+                             packet["projection"]["entry_count"])
+        self.assertLessEqual(packet["projection"]["presented_source_count"],
+                             packet["projection"]["source_record_count"])
         self.assertIn("not an established claim", packet["review_contract"]["question_status"])
         self.assertIn("experiments", packet["review_contract"]["downstream_decisions"])
         runner.source_docs = dict(reversed(list(runner.source_docs.items())))

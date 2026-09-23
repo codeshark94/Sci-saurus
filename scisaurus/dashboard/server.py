@@ -149,6 +149,40 @@ def _bounded_notices(value):
     return [_bounded_notice(item) for item in value[:MAX_NOTICES]]
 
 
+def _blocker_projection(state):
+    """Separate current gating blockers from the append-only audit trail."""
+    state = state if isinstance(state, dict) else {}
+    historical = state.get("blockers")
+    historical_count = len(historical) if isinstance(historical, list) else (1 if historical else 0)
+    if isinstance(state.get("active_blockers"), list):
+        active = state["active_blockers"]
+    else:
+        held_statuses = {"blocked", "paused", "candidate_needs_review",
+                         "research_expansion_required", "review_rejected"}
+        mission_held = state.get("status") in held_statuses
+        stages = state.get("stages") if isinstance(state.get("stages"), dict) else {}
+        active = []
+        for item in historical if isinstance(historical, list) else []:
+            if not isinstance(item, dict):
+                if mission_held:
+                    active.append({"reason": str(item)[:240]})
+                continue
+            if (item.get("gating") is False
+                    or item.get("release_blocking") is False
+                    or item.get("recovery") == "cycle_admitted"
+                    or item.get("disposition") == "forwarded_with_findings"):
+                continue
+            stage_id = item.get("stage_id")
+            if stage_id is None:
+                if mission_held:
+                    active.append(item)
+                continue
+            record = stages.get(stage_id)
+            if isinstance(record, dict) and record.get("status") in held_statuses:
+                active.append(item)
+    return active, {"active": len(active), "historical": historical_count}
+
+
 def _redact_log_text(value):
     text = str(value)
     return re.sub(
@@ -1943,6 +1977,7 @@ class DashboardSnapshot:
     def payload(self):
         live = self._live_checkpoint()
         live_value = live["value"] if live else {}
+        active_blockers, blocker_counts = _blocker_projection(live_value)
         db = self._db_records()
         stages = [self._stage_summary(spec, live) for spec in self._stage_specs()]
         current_stage = None
@@ -2067,7 +2102,8 @@ class DashboardSnapshot:
                 "deadline_at_epoch": deadline_at, "last_phase": live_value.get("last_phase"),
                 "stop_reason": live_value.get("stop_reason"),
                 "next_actions": _bounded_notices(live_value.get("next_actions")),
-                "blockers": _bounded_notices(live_value.get("blockers")),
+                "blockers": _bounded_notices(active_blockers),
+                "blocker_counts": blocker_counts,
                 "current_activity": current_activity,
                 "usage": usage,
             },
@@ -2259,8 +2295,8 @@ class DashboardService:
         remaining = _safe_float(progress.get("remaining_seconds"))
         if remaining is None and isinstance(deadline_at, (int, float)):
             remaining = max(0, deadline_at - datetime.now(timezone.utc).timestamp())
-        blockers = progress.get("blockers")
-        blocker_count = len(blockers) if isinstance(blockers, list) else (1 if blockers else 0)
+        active_blockers, blocker_counts = _blocker_projection(progress)
+        blocker_count = blocker_counts["active"]
         source = "live process" if running_processes else ("checkpoint" if progress else "workflow")
         return {
             "ref": ref,
@@ -2284,6 +2320,7 @@ class DashboardService:
             "deadline_at_epoch": deadline_at,
             "run_id": progress.get("run_id"),
             "blocker_count": blocker_count,
+            "historical_blocker_count": blocker_counts["historical"],
             "stages": stages,
         }
 
@@ -2428,16 +2465,134 @@ class DashboardService:
             repository = Path(__file__).resolve().parents[2]
             command = [sys.executable, "-m", "scisaurus.cli", "run-composer",
                        "--workflow", str(workflow_path)]
+            from scisaurus.runtime.composer import default_runtime_environment_files
+            for env_file in default_runtime_environment_files(repository):
+                command.extend(["--env-file", env_file])
             if resume:
                 command.append("--resume")
-            process = subprocess.Popen(
-                command, cwd=str(repository), stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, start_new_session=True,
-            )
+            log_path = project_id / "output" / "composer-console.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("ab") as log_file:
+                process = subprocess.Popen(
+                    command, cwd=str(repository), stdout=log_file,
+                    stderr=subprocess.STDOUT, start_new_session=True,
+                )
             self._owned_processes[str(workflow_path)] = process
             return {"status": "started", "project": project_dir.name,
                     "workflow_path": str(workflow_path), "pid": process.pid,
-                    "resume": resume, "command": command}
+                    "resume": resume, "command": command, "log_path": str(log_path)}
+
+    @staticmethod
+    def _rewrite_template_paths(value, template_dir, target_dir):
+        """Relocate template-owned absolute paths into a new mission root."""
+        template_prefix = str(Path(template_dir).resolve())
+        target_prefix = Path(target_dir).resolve()
+        if isinstance(value, str):
+            if value == template_prefix:
+                return str(target_prefix)
+            prefix = template_prefix + os.sep
+            if value.startswith(prefix):
+                return str(target_prefix / value[len(prefix):])
+            return value
+        if isinstance(value, list):
+            return [DashboardService._rewrite_template_paths(
+                item, template_dir, target_dir) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: DashboardService._rewrite_template_paths(
+                    item, template_dir, target_dir)
+                for key, item in value.items()
+            }
+        return value
+
+    @classmethod
+    def _clone_template_assets(cls, template_dir, target_dir):
+        """Copy only reusable template assets, never mutable run state."""
+        template_dir = Path(template_dir).resolve()
+        target_dir = Path(target_dir).resolve()
+        excluded_directories = {
+            ".git", ".staging", "__pycache__", "composer", "projects",
+            "foundry-workspace", "missions", "retained-review-work",
+        }
+        excluded_files = {"workflow.json", "composer-run.log"}
+        for source in template_dir.iterdir():
+            if source.name in excluded_directories or source.name in excluded_files:
+                continue
+            destination = target_dir / source.name
+            if source.is_dir():
+                shutil.copytree(source, destination)
+            elif source.is_file():
+                shutil.copy2(source, destination)
+
+        # JSON configs are copied with their template-owned paths rewritten;
+        # this makes provider cooldown state, inputs, outputs, and capability
+        # descriptors project-scoped without mutating the source template.
+        for path in target_dir.rglob("*.json"):
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError):
+                continue
+            relocated = cls._rewrite_template_paths(value, template_dir, target_dir)
+            temporary = path.with_name(f".{path.name}.tmp")
+            try:
+                temporary.write_text(
+                    json.dumps(relocated, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(temporary, path)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+
+        # Capability descriptors contain template-owned absolute paths.  The
+        # generic relocation above correctly changes those paths, but the
+        # registry index also pins the bytes of every relocated descriptor,
+        # candidate, and admission record.  Recompute those pins after the
+        # relocation so a fresh mission fails neither before execution nor
+        # after its first specialist admission.
+        index_path = target_dir / "registry" / "capabilities" / "index.json"
+        index = _read_json(index_path)
+        if index is not None:
+            if (not isinstance(index, dict)
+                    or index.get("schema_version") != "experiment-capability-registry-1"
+                    or not isinstance(index.get("capabilities"), list)):
+                raise ValueError("cloned capability registry index has an unsupported schema")
+            for entry in index["capabilities"]:
+                if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+                    raise ValueError("cloned capability registry entry has no descriptor path")
+                descriptor_path = Path(entry["path"])
+                if not descriptor_path.is_file() or not descriptor_path.resolve().is_relative_to(target_dir):
+                    raise ValueError("cloned capability registry descriptor escaped the new project")
+                revision_dir = descriptor_path.parent
+                descriptor = _read_json(descriptor_path)
+                candidate_path = revision_dir / "candidate.json"
+                admission_path = revision_dir / "admission.json"
+                if descriptor is None or not candidate_path.is_file() or not admission_path.is_file():
+                    raise ValueError("cloned capability registry revision is incomplete")
+                candidate = _read_json(candidate_path)
+                admission = _read_json(admission_path)
+                if candidate is None or admission is None:
+                    raise ValueError("cloned capability registry revision has unreadable records")
+                entry["descriptor_sha256"] = sha256_hex(canonical_bytes(descriptor))
+                entry["candidate_record_sha256"] = sha256_hex(canonical_bytes(candidate))
+                entry["admission_sha256"] = sha256_hex(canonical_bytes(admission))
+                for name, key in (("executor.py", "executor_sha256"),
+                                  ("validator.py", "validator_sha256")):
+                    source_path = revision_dir / name
+                    if not source_path.is_file():
+                        raise ValueError(f"cloned capability registry revision lacks {name}")
+                    entry[key] = sha256_hex(source_path.read_bytes())
+            temporary = index_path.with_name(f".{index_path.name}.tmp")
+            try:
+                temporary.write_bytes(canonical_bytes(index))
+                os.replace(temporary, index_path)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+
+        # These are mutable execution roots and must start empty for a new
+        # mission even when the template had prior generated files.
+        (target_dir / "foundry-workspace").mkdir(parents=True, exist_ok=True)
 
     def create_project(self, payload):
         if not isinstance(payload, dict):
@@ -2473,14 +2628,27 @@ class DashboardService:
             raise ValueError("hard_seconds must be an integer")
         if not MIN_PROJECT_HARD_SECONDS <= hard_seconds <= MAX_PROJECT_HARD_SECONDS:
             raise ValueError(f"hard_seconds must be between {MIN_PROJECT_HARD_SECONDS} and {MAX_PROJECT_HARD_SECONDS}")
-        workflow = json.loads(json.dumps(template))
         target = self.project_dir / "missions" / slug
         if target.exists():
             raise FileExistsError(f"project already exists: {target}")
+        workflow = self._rewrite_template_paths(
+            json.loads(json.dumps(template)), template_path.parent, target)
         workflow["id"] = f"mission-{slug}"[:64]
         workflow["revision"] = 1
         workflow["project_id"] = str((target / "composer").resolve())
         workflow["objective"] = objective.strip()
+        # New autonomous missions must make forward progress without allowing
+        # one malformed response or scientific hold to consume the whole wall.
+        # Existing projects retain their immutable policy; only this fresh
+        # project manifest receives the bounded forward-first contract.
+        workflow["agenda_policy"] = {"mode": "adaptive"}
+        workflow["progression_policy"] = "forward_first"
+        workflow["retry_policy"] = {
+            "mode": "bounded", "max_attempts": 2, "backoff_seconds": 2,
+        }
+        workflow["continuation_policy"] = {
+            "mode": "bounded", "max_cycles": 2,
+        }
         policy = workflow.setdefault("time_policy", {})
         policy["hard_seconds"] = hard_seconds
         policy["target_seconds"] = min(int(policy.get("target_seconds", hard_seconds)), hard_seconds)
@@ -2497,9 +2665,75 @@ class DashboardService:
             created_target = True
             temporary = None
             try:
+                self._clone_template_assets(template_path.parent, target)
                 (target / "composer").mkdir()
                 for stage in workflow["stages"]:
                     Path(stage["project_dir"]).mkdir(parents=True, exist_ok=False)
+                    if stage.get("kind") == "topic_discovery":
+                        config_path = Path(stage["config_path"])
+                        if config_path.is_file():
+                            config = _read_json(config_path)
+                            if isinstance(config, dict) and type(config.get("max_attempts")) is int:
+                                # A journal-oriented intake may spend one or
+                                # more bounded turns on a maturity-directed
+                                # refinement.  Do not let the fresh-mission
+                                # cap consume that slot before the candidate
+                                # can be repaired; keep the total finite.
+                                maturity_rounds = config.get("maturity_review_rounds", 0)
+                                required_attempts = 3 + maturity_rounds \
+                                    if type(maturity_rounds) is int and maturity_rounds >= 0 else 3
+                                config["max_attempts"] = min(
+                                    max(config["max_attempts"], required_attempts), 5)
+                                temporary_config = config_path.with_name(
+                                    f".{config_path.name}.tmp")
+                                try:
+                                    temporary_config.write_text(
+                                        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+                                        encoding="utf-8",
+                                    )
+                                    os.replace(temporary_config, config_path)
+                                finally:
+                                    if temporary_config.exists():
+                                        temporary_config.unlink()
+                    elif stage.get("kind") == "survey":
+                        config_path = Path(stage["config_path"])
+                        if config_path.is_file():
+                            config = _read_json(config_path)
+                            survey = config.get("survey") if isinstance(config, dict) else None
+                            search = survey.get("search") if isinstance(survey, dict) else None
+                            limits = config.get("limits") if isinstance(config, dict) else None
+                            changed = False
+                            if isinstance(limits, dict) and type(limits.get("max_rounds")) is int:
+                                # A fresh mission gets one focused repair pass;
+                                # Composer owns any later scoped continuation.
+                                bounded_rounds = min(limits["max_rounds"], 1)
+                                if limits["max_rounds"] != bounded_rounds:
+                                    limits["max_rounds"] = bounded_rounds
+                                    changed = True
+                            if isinstance(search, dict):
+                                # Keep the first survey pass useful but finite.
+                                # Discovery remains broad; deep model analysis
+                                # is intentionally reserved for a compact
+                                # decision-relevant slice.
+                                for key, ceiling in (("max_analyzed_works", 12),
+                                                     ("max_full_texts", 12),
+                                                     ("expansion_rounds", 1),
+                                                     ("saturation_rounds", 1)):
+                                    if type(search.get(key)) is int and search[key] > ceiling:
+                                        search[key] = ceiling
+                                        changed = True
+                            if changed:
+                                temporary_config = config_path.with_name(
+                                    f".{config_path.name}.tmp")
+                                try:
+                                    temporary_config.write_text(
+                                        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+                                        encoding="utf-8",
+                                    )
+                                    os.replace(temporary_config, config_path)
+                                finally:
+                                    if temporary_config.exists():
+                                        temporary_config.unlink()
                 from scisaurus.runtime.composer import validate_workflow
                 workflow = validate_workflow(workflow)
                 workflow_path = target / "workflow.json"

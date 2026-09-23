@@ -14,6 +14,7 @@ from scisaurus.core.source_spans import (bind as bind_source_spans, expand_evide
                                         validate as validate_source_span)
 from scisaurus.runtime.bibliographic_identity import normalize_doi, reconcile_result
 from scisaurus.runtime.operation_adapters import get_adapter
+from scisaurus.runtime.survey_records import normalize_check_envelope
 
 
 SURVEY_CHECKS = frozenset({"coverage-accounting", "source-fidelity", "map-support"})
@@ -265,6 +266,7 @@ class SurveyGate:
                 evidence.extend((review, execution))
                 continue
             execution, context, prompt, reply = self._model_review_execution(body.get("execution_ref"), review["author"])
+            reply = normalize_check_envelope(reply, work_review_checks(relationships))
             if execution["artifact_ref"] not in dependencies:
                 raise ValidationError("survey dependencies must pin every focused review execution")
             if prompt.get("entry_ref") != entry_ref or prompt.get("relationship_refs") != relationships:
@@ -349,7 +351,24 @@ class SurveyGate:
         checks = body.get("checks")
         self._passed_checks(checks, SURVEY_CHECKS, "survey review")
         self._text(body.get("rationale"), "review rationale")
+        if body.get("verification_kind") == "deterministic_aggregate":
+            execution, execution_raw = self._artifact(body.get("execution_ref"))
+            execution_body = self._json(execution_raw, "deterministic survey review")
+            if (execution["artifact_type"] != "verification"
+                    or execution["author"] != "command.controller"
+                    or not execution["artifact_id"].startswith("command/survey-review-deterministic/")
+                    or execution_body.get("verification_kind") != "deterministic_aggregate"
+                    or execution_body.get("survey_ref") != survey["artifact_ref"]
+                    or execution_body.get("checks") != checks
+                    or execution_body.get("rationale") != body["rationale"]):
+                raise ValidationError("deterministic survey review is not bound to its exact verification")
+            subjects = [item["ref"] for item in execution.get("inputs", [])
+                        if item.get("purpose") == "subject"]
+            if subjects != [survey["artifact_ref"]]:
+                raise ValidationError("deterministic survey review must pin its exact survey version")
+            return review, execution, None
         execution, context, reply = self._execution(body.get("execution_ref"), review["author"], survey["artifact_ref"])
+        reply = normalize_check_envelope(reply, SURVEY_CHECKS)
         if reply.get("checks") != checks or reply.get("rationale") != body["rationale"]:
             raise ValidationError("survey review does not match the completed model reply")
         return review, execution, context
@@ -365,7 +384,10 @@ class SurveyGate:
             execution_ref, author, operation="model", task_kinds={"review", "verification"},
         )
         prompt = self._json(params.get("prompt"), "review prompt")
-        reply = json_object(result.get("text"), "review model reply", model_envelope=True)
+        reply = json_object(
+            result.get("text"), "review model reply", model_envelope=True,
+            allow_missing_closers=True,
+        )
         if result.get("finish_reason") != "stop":
             raise ValidationError("review model reply did not finish normally")
         return execution, context, prompt, reply
@@ -423,11 +445,14 @@ class SurveyGate:
         survey, body, dependencies = self._survey(survey_ref)
         work_evidence = self._work_reviews(body)
         review, execution, context = self._review(survey, review_ref)
+        evidence = [survey, review, execution, *work_evidence]
+        if context is not None:
+            evidence.insert(3, context)
         return survey, {
             "survey_ref": survey_ref, "review_ref": review_ref,
             "execution_ref": execution["artifact_ref"], "dependency_pins": dependencies,
             "evidence_pins": [{"ref": item["artifact_ref"], "body_hash": item["body_hash"]}
-                              for item in (survey, review, execution, context, *work_evidence)],
+                              for item in evidence],
         }
 
     def accept(self, survey_ref, review_ref, *, author, expected_version=None, guard=None):

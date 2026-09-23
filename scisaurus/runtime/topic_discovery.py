@@ -10,6 +10,7 @@ gates remain the authorities for evidence and release.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from copy import deepcopy
 import hashlib
 import itertools
@@ -93,6 +94,37 @@ DEFAULT_TOPIC_CONTINUATION_BUDGETS = {
     "max_input_tokens": 750_000,
     "max_output_tokens": 200_000,
 }
+
+
+def _topic_cache_query_key(endpoint, query, limit=10):
+    """Build a wording-stable key for reusable OpenAlex search pages."""
+    normalized_query = " ".join(str(query).casefold().split())
+    return hashlib.sha256(canonical_bytes({
+        "endpoint": endpoint, "query": normalized_query, "limit": limit,
+    })).hexdigest()
+
+
+@contextmanager
+def _topic_cache_lock(path):
+    """Serialize shared topic-cache reads and merges across Composer runs."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = path.with_name(path.name + ".lock").open("a+")
+    flock = None
+    try:
+        try:
+            import fcntl
+            flock = fcntl
+            flock.flock(lock.fileno(), flock.LOCK_EX)
+        except ImportError:
+            flock = None
+        yield
+    finally:
+        if flock is not None:
+            try:
+                flock.flock(lock.fileno(), flock.LOCK_UN)
+            except OSError:
+                pass
+        lock.close()
 CANDIDATE_FIELDS = {
     "id", "title", "domain", "research_question", "scope", "search_queries",
     "why_promising", "disconfirmation_test", "feasibility", "resource_plan",
@@ -131,8 +163,48 @@ FEASIBILITY_INPUT_KINDS = {
     "synthetic", "analytical_parameters", "project_artifact", "survey_metadata",
     "survey_full_text", "public_dataset", "new_measurement", "external_service",
 }
+FEASIBILITY_INPUT_KIND_ALIASES = {
+    "synthetic_data": "synthetic",
+    "synthetic_simulation": "synthetic",
+    "simulation": "synthetic",
+    "analytical": "analytical_parameters",
+    "analytical_input": "analytical_parameters",
+    "theoretical_parameters": "analytical_parameters",
+    "local_artifact": "project_artifact",
+    "project_local_artifact": "project_artifact",
+    "survey_fulltext": "survey_full_text",
+    "full_text": "survey_full_text",
+    "dataset": "public_dataset",
+    "public_data": "public_dataset",
+    "measurement": "new_measurement",
+    "new_measurement_data": "new_measurement",
+    "external": "external_service",
+}
 FEASIBILITY_INPUT_STATUSES = {
     "available", "acquirable_before_experiment", "unavailable",
+}
+FEASIBILITY_INPUT_STATUS_ALIASES = {
+    "available_now": "available",
+    "available-now": "available",
+    "ready": "available",
+    "present": "available",
+    "existing": "available",
+    "on_hand": "available",
+    "on-hand": "available",
+    "locally_available": "available",
+    "acquirable": "acquirable_before_experiment",
+    "obtainable": "acquirable_before_experiment",
+    "can_be_acquired": "acquirable_before_experiment",
+    "can_acquire": "acquirable_before_experiment",
+    "to_be_acquired": "acquirable_before_experiment",
+    "available_before_experiment": "acquirable_before_experiment",
+    "acquire_before_experiment": "acquirable_before_experiment",
+    "planned": "acquirable_before_experiment",
+    "not_available": "unavailable",
+    "not-available": "unavailable",
+    "missing": "unavailable",
+    "absent": "unavailable",
+    "unavailable_now": "unavailable",
 }
 FEASIBILITY_DATA_ACCESS = {
     "closed_world", "project_local", "survey_artifact", "external_provider",
@@ -149,7 +221,7 @@ TOPIC_CONTROLLER_OUTPUT_FIELDS = {
     "sampling_seed", "generation_seed", "sampling_trace", "portfolio_profile",
     "candidate_attempt_trace", "rejected_topic_history", "maturity_reviews",
     "maturity_review_history", "maturity_score", "admission_state",
-    "maturity_open_requirements", "next_evidence_action", "topic_evolution",
+    "maturity_open_requirements", "maturity_review_error", "next_evidence_action", "topic_evolution",
     "research_program", "research_program_path", "usage", "budget",
 }
 EVIDENCE_MODE_INPUTS = {
@@ -440,7 +512,7 @@ _MODEL_CANDIDATE_FIELD_ALIASES = {
 
 
 _TOPIC_SEMANTIC_REJECTION_TYPES = frozenset({
-    "novelty", "source_challenge", "maturity",
+    "novelty", "source_challenge", "maturity", "feasibility",
 })
 
 
@@ -466,6 +538,23 @@ def _topic_validation_rejection_type(error):
         return "source_challenge"
     if "topic maturity review requires substantive refinement" in text:
         return "maturity"
+    feasibility_plan_marker = (
+        "feasibility_plan" in text or "feasibility plan" in text
+    )
+    if (feasibility_plan_marker
+            and any(marker in text for marker in (
+                "requires exactly", "must declare", "is unsupported",
+                "evidence_inputs", "data_access", "network_access",
+                "estimated_compute_seconds", "estimated_api_requests",
+                "estimated_model_calls", "required_packages",
+                "required_executables",
+                "must include feasibility_plan", "requires feasibility_plan",
+            ))):
+        # The direction cannot enter the configured execution boundary as
+        # declared. This is candidate-level negative evidence, not a generic
+        # JSON formatting failure: retain its signature so the Composer can
+        # pivot rather than spend the intake budget regenerating it unchanged.
+        return "feasibility"
     return None
 
 
@@ -672,6 +761,46 @@ def _repair_feasibility_input_contract(package, runtime_context):
         old_input = plan.get("experiment_input")
         new_input = old_input
 
+        # The compact label and the evidence inventory are redundant.  When
+        # the inventory identifies one unambiguous family, align the label
+        # from that inventory rather than spending another model turn on a
+        # lossless consistency repair.
+        if self_contained and observed.issubset({"synthetic", "analytical_parameters"}):
+            new_input = "self_contained"
+            if plan.get("data_access") != "closed_world":
+                old_access = plan.get("data_access")
+                plan["data_access"] = "closed_world"
+                repairs.append({
+                    "candidate_id": candidate.get("id"),
+                    "field": "data_access",
+                    "from": old_access,
+                    "to": "closed_world",
+                    "source": "declared_self_contained_inputs",
+                })
+        elif project_local:
+            new_input = "project_artifact"
+            if plan.get("data_access") == "survey_artifact":
+                plan["data_access"] = "project_local"
+                repairs.append({
+                    "candidate_id": candidate.get("id"),
+                    "field": "data_access",
+                    "from": "survey_artifact",
+                    "to": "project_local",
+                    "source": "declared_project_artifact_input",
+                })
+        elif (survey_inputs and not foundry_enabled
+              and (not allowed_inputs or survey_inputs.issubset(allowed_inputs))):
+            new_input = "survey_artifact"
+            if plan.get("data_access") == "project_local":
+                plan["data_access"] = "survey_artifact"
+                repairs.append({
+                    "candidate_id": candidate.get("id"),
+                    "field": "data_access",
+                    "from": "project_local",
+                    "to": "survey_artifact",
+                    "source": "declared_survey_inputs",
+                })
+
         # A foundry can only execute a self-contained plan.  For a regular
         # project runner, the same normalization is valid when the declared
         # evidence is already synthetic/analytical; no external artifact is
@@ -723,6 +852,70 @@ def _repair_feasibility_input_contract(package, runtime_context):
                 "from": old_input,
                 "to": new_input,
                 "source": "declared_evidence_inputs",
+            })
+    return repairs
+
+
+def _repair_feasibility_input_statuses(package):
+    """Normalize only unambiguous model aliases to the canonical status enum."""
+    if not isinstance(package, dict):
+        return []
+    repairs = []
+    for candidate in package.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        plan = candidate.get("feasibility_plan")
+        if not isinstance(plan, dict) or not isinstance(plan.get("evidence_inputs"), list):
+            continue
+        for item in plan["evidence_inputs"]:
+            if not isinstance(item, dict) or not isinstance(item.get("status"), str):
+                continue
+            raw = item["status"].strip().casefold()
+            normalized = re.sub(r"[\s/]+", "_", raw)
+            canonical = (raw if raw in FEASIBILITY_INPUT_STATUSES
+                         else FEASIBILITY_INPUT_STATUS_ALIASES.get(raw)
+                         or FEASIBILITY_INPUT_STATUS_ALIASES.get(normalized))
+            if canonical is None or canonical == item["status"]:
+                continue
+            item["status"] = canonical
+            repairs.append({
+                "candidate_id": candidate.get("id"),
+                "field": "feasibility_plan.evidence_inputs.status",
+                "from": raw,
+                "to": canonical,
+                "source": "lossless_status_alias",
+            })
+    return repairs
+
+
+def _repair_feasibility_input_kinds(package):
+    """Normalize only explicit evidence-kind aliases to the canonical enum."""
+    if not isinstance(package, dict):
+        return []
+    repairs = []
+    for candidate in package.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        plan = candidate.get("feasibility_plan")
+        if not isinstance(plan, dict) or not isinstance(plan.get("evidence_inputs"), list):
+            continue
+        for item in plan["evidence_inputs"]:
+            if not isinstance(item, dict) or not isinstance(item.get("kind"), str):
+                continue
+            raw = item["kind"].strip().casefold()
+            normalized = re.sub(r"[\s/-]+", "_", raw)
+            canonical = (raw if raw in FEASIBILITY_INPUT_KINDS
+                         else FEASIBILITY_INPUT_KIND_ALIASES.get(raw)
+                         or FEASIBILITY_INPUT_KIND_ALIASES.get(normalized))
+            if canonical is None or canonical == item["kind"]:
+                continue
+            item["kind"] = canonical
+            repairs.append({
+                "candidate_id": candidate.get("id"),
+                "field": "feasibility_plan.evidence_inputs.kind",
+                "from": raw,
+                "to": canonical,
+                "source": "lossless_kind_alias",
             })
     return repairs
 
@@ -1114,7 +1307,7 @@ def validate_topic_stage_config(value):
     if (not isinstance(value, dict) or set(value) - allowed
             or not fields.issubset(value)):
         raise ValidationError(
-            f"topic discovery config requires {sorted(fields)} and permits repair_mode, bibliography, budgets, continuation_budgets")
+            f"topic discovery config requires {sorted(fields)} and permits repair_mode, maturity_review_rounds, bibliography, budgets, continuation_budgets")
     if value["schema_version"] != STAGE_CONFIG_SCHEMA_VERSION:
         raise ValidationError("topic discovery config schema version is unsupported")
     model_path = Path(value["model_config_path"])
@@ -1656,6 +1849,14 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
         if "capability_requirements" in candidate:
             _validate_capability_requirements(candidate["capability_requirements"])
         if "feasibility_plan" in candidate:
+            # The enum is redundant with evidence_inputs.  Apply the same
+            # lossless normalization used by the runner before the strict
+            # shape validator so a stale project_artifact label cannot consume
+            # a second model repair when the declared inputs are plainly
+            # self-contained (or plainly survey-backed).
+            _repair_feasibility_input_kinds({"candidates": [candidate]})
+            _repair_feasibility_input_statuses({"candidates": [candidate]})
+            _repair_feasibility_input_contract({"candidates": [candidate]}, {})
             validate_feasibility_plan(candidate["feasibility_plan"])
         if capability_ids:
             selected_capability = candidate.get("experiment_capability_id")
@@ -1903,17 +2104,115 @@ def _topic_validation_history(topic_history, rejected_candidate_directions):
     if not rejected:
         return topic_history
     entries = _topic_history_entries(topic_history)
-    return {
+    projected = {
         "schema_version": (topic_history.get("schema_version", TOPIC_HISTORY_SCHEMA_VERSION)
                            if isinstance(topic_history, dict) else TOPIC_HISTORY_SCHEMA_VERSION),
         "entries": [*deepcopy(entries), *deepcopy(rejected)],
     }
+    # The Composer keeps the prompt projection bounded, but carries aggregate
+    # history statistics beside it. Preserve those statistics when a local
+    # rejected direction is added; otherwise the novelty guard would forget
+    # that the full archive is already saturated during the same intake.
+    if isinstance(topic_history, dict):
+        for key in ("history_summary", "capability_counts", "scope_key"):
+            if key in topic_history:
+                projected[key] = deepcopy(topic_history[key])
+    return projected
 
 
 def _jaccard(left, right):
     left, right = set(left), set(right)
     union = left | right
     return len(left & right) / len(union) if union else 0.0
+
+
+# The portfolio vocabulary is deliberately finite. Once a mission has
+# explored enough distinct shapes, insisting on a never-before-seen
+# research-form/evidence/comparison tuple makes the intake mathematically
+# impossible even when the scientific question is genuinely new. The
+# saturation path below is a bounded cooldown: it still rejects exact and
+# semantically warm repeats, and only permits a cold question/content pair to
+# reuse an already explored shape.
+TOPIC_NOVELTY_SATURATION_MIN_ENTRIES = 48
+TOPIC_NOVELTY_SATURATION_MIN_ARCHETYPES = 12
+TOPIC_NOVELTY_SATURATION_MAX_QUESTION_OVERLAP = 0.42
+TOPIC_NOVELTY_SATURATION_MAX_TITLE_OVERLAP = 0.35
+TOPIC_NOVELTY_SATURATION_MAX_CONTENT_OVERLAP = 0.50
+
+
+def _topic_history_saturated(topic_history):
+    """Return whether the durable direction archive has exhausted many shapes."""
+    entries = _topic_history_entries(topic_history)
+    summary = topic_history.get("history_summary") if isinstance(topic_history, dict) else None
+    total_entries = len(entries)
+    distinct_archetypes = set()
+    if isinstance(summary, dict):
+        if type(summary.get("total_entries")) is int:
+            total_entries = summary["total_entries"]
+        if type(summary.get("distinct_structure_fingerprints")) is int:
+            distinct_count = summary["distinct_structure_fingerprints"]
+        else:
+            distinct_count = None
+    else:
+        distinct_count = None
+    if distinct_count is None:
+        for entry in entries:
+            signature = entry.get("signature") if isinstance(entry, dict) else None
+            if not isinstance(signature, dict):
+                signature = topic_signature(entry)
+            fingerprint = signature.get("structure_fingerprint")
+            if isinstance(fingerprint, str) and fingerprint:
+                distinct_archetypes.add(fingerprint)
+        distinct_count = len(distinct_archetypes)
+    return (total_entries >= TOPIC_NOVELTY_SATURATION_MIN_ENTRIES
+            and distinct_count >= TOPIC_NOVELTY_SATURATION_MIN_ARCHETYPES)
+
+
+def _cold_structural_repeat_allowed(candidate, prior, topic_history):
+    """Allow a cold question to reuse a shape after the archive saturates.
+
+    This is intentionally narrower than the normal novelty guard. It is not
+    a general override: exact identifiers/questions/fingerprints and warm
+    lexical neighbourhoods remain rejected. The fallback exists because the
+    three portfolio dimensions have a finite vocabulary while subject matter
+    and scientific questions do not.
+    """
+    if not _topic_history_saturated(topic_history):
+        return False
+    current = topic_signature(candidate)
+    previous = prior.get("signature") if isinstance(prior, dict) else None
+    if not isinstance(previous, dict):
+        previous = topic_signature(prior)
+    current_structure = current.get("structure", {})
+    previous_structure = previous.get("structure", {})
+    if (not isinstance(current_structure, dict)
+            or not isinstance(previous_structure, dict)
+            or not all(current_structure.get(field) and previous_structure.get(field)
+                       for field in PORTFOLIO_DIMENSIONS)):
+        return False
+    same_shape = current.get("structure_fingerprint") == previous.get("structure_fingerprint")
+    if not same_shape:
+        same_shape = all(current_structure.get(field) == previous_structure.get(field)
+                         for field in PORTFOLIO_DIMENSIONS)
+    if not same_shape:
+        return False
+    if current.get("fingerprint") == previous.get("fingerprint"):
+        return False
+    if current.get("question") and current.get("question") == previous.get("question"):
+        return False
+    if current.get("title") and current.get("title") == previous.get("title"):
+        return False
+    question_overlap = _jaccard(
+        current.get("question_tokens", []), previous.get("question_tokens", []))
+    title_overlap = _jaccard(
+        current.get("title_tokens", []), previous.get("title_tokens", []))
+    content_overlap = _jaccard(
+        current.get("content_tokens", []), previous.get("content_tokens", []))
+    return (
+        question_overlap < TOPIC_NOVELTY_SATURATION_MAX_QUESTION_OVERLAP
+        and title_overlap < TOPIC_NOVELTY_SATURATION_MAX_TITLE_OVERLAP
+        and content_overlap < TOPIC_NOVELTY_SATURATION_MAX_CONTENT_OVERLAP
+    )
 
 
 def _topic_repeat_score(candidate, prior):
@@ -1990,6 +2289,8 @@ def validate_topic_novelty(candidate, topic_history, *, threshold=0.78):
             raise ValidationError("selected topic repeats a previously attempted direction")
         score = _topic_repeat_score(candidate, prior)
         if score >= threshold:
+            if _cold_structural_repeat_allowed(candidate, prior, topic_history):
+                continue
             raise ValidationError(
                 "selected topic is too similar to a previously attempted direction")
     return True
@@ -2141,6 +2442,64 @@ def _repair_foundry_selection(package, runtime_context):
     return None
 
 
+def _repair_executable_selection(package, runtime_context):
+    """Choose an already-proposed candidate that passes the full runtime gate.
+
+    A portfolio can be structurally valid while its ranked member declares an
+    evidence mode that does not match its machine-readable input inventory.
+    That is a selection error, not a reason to spend another model turn
+    regenerating the entire portfolio.  Test the existing candidates in their
+    emitted order and select the first one that passes the same deterministic
+    feasibility gate used for admission.  No evidence, capability, or prose
+    is invented by this repair.
+    """
+    if not isinstance(package, dict) or not isinstance(runtime_context, dict):
+        return None
+    if not isinstance(runtime_context.get("research_feasibility"), dict):
+        return None
+    selected_id = package.get("selected_id")
+    candidates = package.get("candidates")
+    if not isinstance(selected_id, str) or not isinstance(candidates, list):
+        return None
+
+    rejected = []
+    for index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict) or not isinstance(candidate.get("id"), str):
+            continue
+        trial = deepcopy(package)
+        trial["selected_id"] = candidate["id"]
+        _materialize_foundry_capability_requirements(trial, runtime_context)
+        try:
+            feasibility = validate_topic_feasibility(trial, runtime_context)
+        except ValidationError as exc:
+            rejected.append({
+                "candidate_id": candidate["id"],
+                "candidate_index": index,
+                "reason": str(exc)[:512],
+            })
+            continue
+
+        if candidate["id"] == selected_id:
+            return None
+        original_rationale = package.get("selection_rationale")
+        package["selected_id"] = candidate["id"]
+        _materialize_foundry_capability_requirements(package, runtime_context)
+        package["selection_rationale"] = (
+            f"The execution-eligible portfolio member {candidate['id']} was selected "
+            "from the already-proposed candidates after deterministic feasibility "
+            "checking; no new evidence or capability was introduced."
+        )
+        return {
+            "from_selected_id": selected_id,
+            "to_selected_id": candidate["id"],
+            "candidate_index": index,
+            "original_selection_rationale": original_rationale,
+            "rejected_candidates": rejected,
+            "feasibility": feasibility,
+        }
+    return None
+
+
 def _repair_topic_refinement_selection(package, parent_topic, runtime_context=None,
                                        *, require_frontier_seed_pivot=False,
                                        rejected_frontier_seed_ids=None):
@@ -2241,6 +2600,15 @@ def validate_topic_feasibility(package, runtime_context):
     """
     if not isinstance(runtime_context, dict):
         return {"status": "not_checked", "unavailable": []}
+    # ``experiment_input`` is a compact label duplicated by
+    # ``evidence_inputs``.  Normalize that lossless redundancy at the final
+    # feasibility boundary as well as during the model-repair path.  This
+    # closes the old failure mode where a repaired package was normalized once
+    # but a later portfolio/feasibility validator read the stale enum and
+    # sent the same candidate back through another model turn.
+    _repair_feasibility_input_kinds(package)
+    _repair_feasibility_input_statuses(package)
+    _repair_feasibility_input_contract(package, runtime_context)
     selected = next(item for item in package["candidates"] if item["id"] == package["selected_id"])
     catalog = runtime_context.get("experiment_catalog") or []
     if catalog:
@@ -2918,7 +3286,13 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "feasibility_plan": {
             "execution_mode": "foundry, configured_program, or project_runner",
             "experiment_input": "self_contained, project_artifact, or survey_artifact",
-            "evidence_inputs": "one to eight {kind,status,source} objects; declare every input used by the experiment",
+            "evidence_inputs": (
+                "one to eight {kind,status,source} objects; kind must be exactly "
+                "synthetic, analytical_parameters, project_artifact, survey_metadata, "
+                "survey_full_text, public_dataset, new_measurement, or external_service; "
+                "status must be exactly available, acquirable_before_experiment, or "
+                "unavailable; declare every input used"
+            ),
             "data_access": "closed_world, project_local, survey_artifact, or external_provider",
             "required_packages": "exact package names required by the study",
             "required_executables": "exact executable names required by the study",
@@ -2944,6 +3318,10 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "search queries must be usable as ordinary scholarly search strings",
         "capability_requirements is derived from the declared runtime boundary; do not emit it in candidate objects",
         "feasibility_plan must be an exact machine-readable inventory, not a second prose claim; declare synthetic or analytical inputs for the deterministic foundry and never hide an external dataset, measurement, or network request",
+        "evidence_inputs.status must use exactly one of available, acquirable_before_experiment, or unavailable; do not use synonyms such as ready, planned, missing, or obtainable",
+        "evidence_inputs.kind must use exactly one of synthetic, analytical_parameters, project_artifact, survey_metadata, survey_full_text, public_dataset, new_measurement, or external_service; do not use shorthand such as simulation, dataset, or measurement",
+        "keep experiment_input consistent with evidence_inputs: self_contained uses only synthetic or analytical_parameters; project_artifact includes project_artifact; survey_artifact includes survey_metadata or survey_full_text",
+        "keep evidence_mode aligned with evidence_inputs: analytical_derivation requires analytical_parameters or synthetic; synthetic_simulation requires synthetic; published_observations requires survey_metadata or survey_full_text; public_dataset requires public_dataset or survey_metadata; cross_source_synthesis requires survey_metadata or survey_full_text; controlled_measurement requires new_measurement",
         "for a foundry-backed runtime, use execution_mode=foundry, experiment_input=self_contained, data_access=closed_world, network_access=false, and estimated_api_requests=0",
         "do not call a literature record, public dataset, digitized curve, instrument, or external service an available experiment input unless the runtime_context explicitly permits that input kind",
         "never invent a citation, dataset, result, or prior-work claim",
@@ -3034,7 +3412,7 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
                 "do not select any capability or topic listed in topic_exclusions; excluded directions may remain only as alternatives")
         if (runtime_context.get("topic_history") or {}).get("entries"):
             constraints.append(
-                "avoid repeating any previously attempted direction or research archetype in topic_history; select a materially different question, research form, evidence mode, or comparison type")
+                "avoid repeating any previously attempted direction; keep the question and evidence anchors cold even when a finite research archetype must be reused after the history summary reports saturation")
         design_driven = [item for item in catalog
                          if isinstance(item, dict) and item.get("design_driven")]
         if design_driven:
@@ -3565,6 +3943,10 @@ class TopicDiscoveryRunner:
     def __init__(self, model, *, deadline_seconds=None):
         self.model_config = deepcopy(model)
         self._route_cursors = {}
+        self._active_topic_budget = None
+        self._active_topic_trace = []
+        self._active_topic_reviews = []
+        self._active_topic_rejections = []
         if (deadline_seconds is not None and
                 (type(deadline_seconds) not in (int, float) or not math.isfinite(deadline_seconds)
                  or deadline_seconds <= 0)):
@@ -3644,10 +4026,18 @@ class TopicDiscoveryRunner:
         return ModelClient(**config)
 
     def _repair_missing_topic_fields(self, package, *, deadline, budget,
-                                     require_feasibility_plan=False):
-        """Fill omitted contract fields while keeping all other fields immutable."""
+                                     require_feasibility_plan=False,
+                                     runtime_context=None):
+        """Fill omitted contract fields while keeping all other fields immutable.
+
+        A portfolio alternative is not an executable commitment.  Its
+        operational plan is only needed if that alternative is selected, so
+        the targeted repair lane must not spend a model call repairing plans
+        for every unselected candidate.
+        """
         if not isinstance(package, dict) or not isinstance(package.get("candidates"), list):
             return []
+        selected_id = package.get("selected_id")
         targets = [
             {
                 "candidate_index": index,
@@ -3655,7 +4045,12 @@ class TopicDiscoveryRunner:
                 "candidate": candidate,
                 "missing_fields": [
                     field for field in _TOPIC_REPAIRABLE_TEXT_FIELDS
-                    + (_TOPIC_REPAIRABLE_STRUCTURED_FIELDS if require_feasibility_plan else ())
+                    + (
+                        _TOPIC_REPAIRABLE_STRUCTURED_FIELDS
+                        if require_feasibility_plan
+                        and candidate.get("id") == selected_id
+                        else ()
+                    )
                     if field not in candidate
                 ],
             }
@@ -3663,7 +4058,12 @@ class TopicDiscoveryRunner:
             if isinstance(candidate, dict)
             and any(field not in candidate for field in (
                 _TOPIC_REPAIRABLE_TEXT_FIELDS
-                + (_TOPIC_REPAIRABLE_STRUCTURED_FIELDS if require_feasibility_plan else ())
+                + (
+                    _TOPIC_REPAIRABLE_STRUCTURED_FIELDS
+                    if require_feasibility_plan
+                    and candidate.get("id") == selected_id
+                    else ()
+                )
             ))
         ]
         if not targets:
@@ -3690,7 +4090,7 @@ class TopicDiscoveryRunner:
             budget.record_validation_error(error)
             raise error
         try:
-            patch = result.json_object()
+            patch = result.json_object(allow_missing_closers=True)
             if not isinstance(patch, dict) or set(patch) != {"candidate_patches"}:
                 raise ValidationError(
                     "topic field repair requires exactly ['candidate_patches']")
@@ -3702,6 +4102,7 @@ class TopicDiscoveryRunner:
                 raise ValidationError(
                     "topic field repair must return one unique patch per target")
             by_id = {}
+            field_repairs = []
             for item in patches:
                 if not isinstance(item, dict) or set(item) != {"id", "fields"}:
                     raise ValidationError(
@@ -3718,7 +4119,34 @@ class TopicDiscoveryRunner:
                         "topic field repair returned fields outside the missing-field contract")
                 for field, value in fields.items():
                     if field == "feasibility_plan":
+                        # The field-repair response enters before the normal
+                        # candidate normalization pass. Apply the same
+                        # lossless enum/input reconciliation here so a model
+                        # cannot strand intake by repeating a redundant
+                        # ``project_artifact`` label beside an explicitly
+                        # self-contained analytical input. No evidence is
+                        # added; genuinely external inputs still fail closed.
+                        repair_package = {
+                            "candidates": [{
+                                "id": identifier,
+                                "feasibility_plan": value,
+                            }]
+                        }
+                        contract_repairs = _repair_feasibility_input_kinds(
+                            repair_package)
+                        contract_repairs.extend(_repair_feasibility_input_statuses(
+                            repair_package))
+                        contract_repairs.extend(_repair_feasibility_input_contract(
+                            repair_package, runtime_context or {}))
+                        value = repair_package["candidates"][0]["feasibility_plan"]
                         validate_feasibility_plan(value)
+                        for repair in contract_repairs:
+                            field_repairs.append({
+                                **repair,
+                                "source": "targeted_model_field_repair_"
+                                "contract_normalization",
+                            })
+                        fields[field] = value
                     else:
                         _text(value, f"topic candidate {field}")
                 by_id[identifier] = fields
@@ -3726,6 +4154,7 @@ class TopicDiscoveryRunner:
                 raise ValidationError(
                     "topic field repair did not cover every target candidate")
             repairs = []
+            repairs.extend(field_repairs)
             for candidate in targets:
                 identifier = candidate["id"]
                 for field, value in by_id[identifier].items():
@@ -3793,7 +4222,8 @@ class TopicDiscoveryRunner:
                     budget.record_validation_error(last_error)
                 continue
             try:
-                plan = _anchor_frontier_seed_queries(result.json_object())
+                plan = _anchor_frontier_seed_queries(
+                    result.json_object(allow_missing_closers=True))
                 return validate_frontier_seed_plan(plan, seed_count=seed_count)
             except ValidationError as exc:
                 if budget is not None:
@@ -3859,7 +4289,7 @@ class TopicDiscoveryRunner:
                 previous = result.text
                 continue
             try:
-                review = result.json_object()
+                review = result.json_object(allow_missing_closers=True)
                 # Duplicate references or repeated repair instructions carry
                 # no scientific meaning.  Normalize those harmless formatting
                 # slips before applying the strict challenge contract.
@@ -3906,7 +4336,46 @@ class TopicDiscoveryRunner:
                 previous = result.text
         raise last_error or ValidationError("topic source challenge did not produce a valid review")
 
-    def run(self, objective, *, candidate_count=4, max_attempts=3,
+    def run(self, *args, **kwargs):
+        """Run one intake and normalize every validation exit for Composer.
+
+        Topic discovery has several nested repair and review gates.  A
+        validation error escaping one of those gates must still carry the
+        bounded usage snapshot and scientific retry class; otherwise the
+        Composer records a zero-use stage failure and cancels specialists
+        before it can pivot.  The implementation remains in ``_run_impl`` so
+        this boundary covers future gates without duplicating their catches.
+        """
+        try:
+            return self._run_impl(*args, **kwargs)
+        except ValidationError as exc:
+            budget = self._active_topic_budget
+            snapshot = budget.snapshot() if isinstance(budget, TopicBudget) else {}
+            if not isinstance(getattr(exc, "topic_budget", None), dict):
+                setattr(exc, "topic_budget", snapshot)
+            if not isinstance(getattr(exc, "candidate_attempt_trace", None), list):
+                setattr(exc, "candidate_attempt_trace",
+                        deepcopy(self._active_topic_trace))
+            if not isinstance(getattr(exc, "maturity_review_history", None), list):
+                setattr(exc, "maturity_review_history",
+                        deepcopy(self._active_topic_reviews))
+            if not isinstance(getattr(exc, "rejected_topic_history", None), list):
+                setattr(exc, "rejected_topic_history",
+                        deepcopy(self._active_topic_rejections))
+            usage = (getattr(exc, "topic_budget", {}) or {}).get("usage", {})
+            if not isinstance(getattr(exc, "usage", None), dict):
+                setattr(exc, "usage", deepcopy(usage))
+            retry_reason = _topic_retry_reason(
+                exc,
+                getattr(exc, "candidate_attempt_trace", []),
+                getattr(exc, "rejected_topic_history", []),
+            )
+            if retry_reason is not None:
+                setattr(exc, "topic_retry_reason", retry_reason)
+                setattr(exc, "topic_intake_recoverable", True)
+            raise
+
+    def _run_impl(self, objective, *, candidate_count=4, max_attempts=3,
             repair_mode="bounded", recent_papers=None, runtime_context=None,
             bibliography=None, sampling_seed=None, maturity_review_rounds=0,
             refinement_context=None, budgets=None, specialist_reports=None):
@@ -3940,6 +4409,37 @@ class TopicDiscoveryRunner:
         sampling_trace = []
         frontier_seed_plan = None
         if bibliography is not False and not recent_papers:
+            # Do not spend a proposal call when the next literature request is
+            # already fenced by the shared account ledger. The fake clients
+            # used by offline tests need not implement this optional method.
+            bibliography_config = bibliography if isinstance(bibliography, dict) else {}
+            client_config = {
+                "timeout": 120, "max_bytes": 2_000_000,
+                "endpoint": "https://api.openalex.org/works", "auth_env": None,
+                "max_retries": 5, "retry_backoff_seconds": 1.0,
+                "min_interval_seconds": 1.05,
+            }
+            client_config.update({key: bibliography_config[key]
+                                  for key in TOPIC_BIBLIOGRAPHY_CLIENT_FIELDS
+                                  if key in bibliography_config})
+            if bibliography_config.get("auth_env") is None:
+                for candidate in ("SCISAURUS_OPENALEX_API_KEY", "OPENALEX_API_KEY"):
+                    if os.environ.get(candidate):
+                        client_config["auth_env"] = candidate
+                        break
+            preflight_client = OpenAlexClient(**client_config)
+            cooldown = getattr(preflight_client, "preflight", lambda **_: None)(
+                operation="search", query="topic discovery preflight", limit=1, cursor=None)
+            if cooldown is not None:
+                rate_limit = dict(cooldown.get("rate_limit") or {})
+                delay = cooldown.get("retry_after_seconds")
+                if type(delay) in (int, float) and math.isfinite(delay) and delay > 0:
+                    raise ProviderCooldownError(
+                        "OpenAlex topic sampling is paused before model admission because "
+                        "the shared provider budget is exhausted",
+                        retry_after_seconds=delay,
+                        rate_limit=rate_limit,
+                    )
             frontier_seed_plan = self._generate_frontier_seed_plan(
                 objective, seed_count=max(6, candidate_count), sampling_seed=sampling_seed,
                 deadline=deadline, usage=usage, budget=budget)
@@ -3966,6 +4466,10 @@ class TopicDiscoveryRunner:
         maturity_review_history = []
         candidate_attempt_trace = []
         rejected_topic_history = []
+        self._active_topic_budget = budget
+        self._active_topic_trace = candidate_attempt_trace
+        self._active_topic_reviews = maturity_review_history
+        self._active_topic_rejections = rejected_topic_history
         refinement_base_package = None
         refinement_parent_index = None
         attempts = itertools.count() if repair_mode == "until_deadline" else range(max_attempts)
@@ -3995,7 +4499,9 @@ class TopicDiscoveryRunner:
                            portfolio_profile, candidate_prior_work,
                            candidate_sampling_trace, source_challenge,
                            review=None, admission_state="mature",
-                           evolution_dimensions=None):
+                           evolution_dimensions=None,
+                           maturity_open_requirements=None,
+                           maturity_review_error=None):
             """Assemble one admitted topic without duplicating gate semantics."""
             output = {
                 **package,
@@ -4026,12 +4532,21 @@ class TopicDiscoveryRunner:
                     "maturity_score": sum(review["scores"].values()),
                 })
             if admission_state == "provisional_for_survey":
+                requirements = (
+                    review.get("required_changes", [])
+                    if isinstance(review, dict) else []
+                )
+                if isinstance(maturity_open_requirements, list):
+                    requirements = [*maturity_open_requirements, *requirements]
                 output.update({
                     "admission_state": admission_state,
-                    "maturity_open_requirements": deepcopy(
-                        review.get("required_changes", []) if isinstance(review, dict) else []),
+                    "maturity_open_requirements": list(dict.fromkeys(
+                        str(item).strip() for item in requirements if str(item).strip()
+                    ))[:8],
                     "next_evidence_action": "literature_survey",
                 })
+                if isinstance(maturity_review_error, str) and maturity_review_error.strip():
+                    output["maturity_review_error"] = maturity_review_error[:2048]
             if refinement_context:
                 output["topic_evolution"] = {
                     "mode": "refinement",
@@ -4258,7 +4773,7 @@ class TopicDiscoveryRunner:
                 continue
             attempt_record = None
             try:
-                parsed_package = result.json_object()
+                parsed_package = result.json_object(allow_missing_closers=True)
                 if single_candidate_refinement:
                     if (not isinstance(parsed_package, dict)
                             or set(parsed_package) != {"candidate"}
@@ -4301,7 +4816,8 @@ class TopicDiscoveryRunner:
                 missing_field_repairs = self._repair_missing_topic_fields(
                     package, deadline=deadline, budget=budget,
                     require_feasibility_plan=isinstance(
-                        (runtime_context or {}).get("research_feasibility"), dict))
+                        (runtime_context or {}).get("research_feasibility"), dict),
+                    runtime_context=runtime_context)
                 objective_normalized = (
                     isinstance(package, dict)
                     and isinstance(package.get("objective"), str)
@@ -4312,6 +4828,8 @@ class TopicDiscoveryRunner:
                     package, (frontier_seed_plan or {}).get("seeds", []))
                 feasibility_repairs = _materialize_foundry_feasibility(
                     package, runtime_context)
+                kind_repairs = _repair_feasibility_input_kinds(package)
+                status_repairs = _repair_feasibility_input_statuses(package)
                 input_contract_repairs = _repair_feasibility_input_contract(
                     package, runtime_context)
                 package = _materialize_foundry_capability_requirements(
@@ -4335,6 +4853,12 @@ class TopicDiscoveryRunner:
                 if input_contract_repairs:
                     attempt_record.setdefault("derived_field_repairs", []).extend(
                         input_contract_repairs)
+                if kind_repairs:
+                    attempt_record.setdefault("derived_field_repairs", []).extend(
+                        kind_repairs)
+                if status_repairs:
+                    attempt_record.setdefault("derived_field_repairs", []).extend(
+                        status_repairs)
                 if missing_field_repairs:
                     attempt_record.setdefault("derived_field_repairs", []).extend(
                         missing_field_repairs)
@@ -4371,7 +4895,8 @@ class TopicDiscoveryRunner:
                             "evidence_mode", "comparison_type", "experiment_capability_id")
                     }
                 validate_topic_package(
-                    package, objective=objective, candidate_count=candidate_count,
+                    _topic_package_for_structural_validation(package, runtime_context),
+                    objective=objective, candidate_count=candidate_count,
                     experiment_capability_ids=catalog_ids,
                     require_capability_coverage=bool(catalog_ids),
                     excluded_capability_ids=(runtime_context or {}).get("topic_exclusions", {}).get("capability_ids", []),
@@ -4401,13 +4926,20 @@ class TopicDiscoveryRunner:
                         ))
                 if refinement_selection_repair is not None:
                     attempt_record["refinement_selection_repair"] = refinement_selection_repair
-                if selection_repair is not None or refinement_selection_repair is not None:
+                executable_selection_repair = _repair_executable_selection(
+                    package, runtime_context)
+                if executable_selection_repair is not None:
+                    attempt_record["executable_selection_repair"] = executable_selection_repair
+                if (selection_repair is not None
+                        or refinement_selection_repair is not None
+                        or executable_selection_repair is not None):
                     # Selection repairs mutate only selected_id and the
                     # rationale, but the final choice must cross every same
                     # package gate again before it is sent to literature or
                     # maturity review.
                     validate_topic_package(
-                        package, objective=objective, candidate_count=candidate_count,
+                        _topic_package_for_structural_validation(package, runtime_context),
+                        objective=objective, candidate_count=candidate_count,
                         experiment_capability_ids=catalog_ids,
                         require_capability_coverage=bool(catalog_ids),
                         excluded_capability_ids=(runtime_context or {}).get("topic_exclusions", {}).get("capability_ids", []),
@@ -4455,9 +4987,54 @@ class TopicDiscoveryRunner:
                 else:
                     attempt_record["status"] = "rejected"
                     attempt_record["error"] = str(exc)[:2048]
+                if rejection_type in {"feasibility", "novelty"}:
+                    # No safe deterministic repair exists once the declared
+                    # execution inventory is outside the boundary, or once a
+                    # direction is already excluded by exploration history.
+                    # Either error can be raised while repairing a missing
+                    # field, before the candidate record exists, so the stop
+                    # condition must not depend on that record. A second
+                    # model turn would see the same candidate and burn the
+                    # entire local intake quota; preserve the rejection and
+                    # let the Composer sample a fresh direction. Maturity and
+                    # source-challenge feedback remain repairable because they
+                    # contain substantive changes the next turn can address.
+                    break
                 continue
             selected = next(item for item in package["candidates"] if item["id"] == package["selected_id"])
-            feasibility = validate_topic_feasibility(package, runtime_context)
+            try:
+                # Keep the final post-repair feasibility check inside the
+                # bounded intake error boundary.  This call used to sit
+                # outside the validation ``try`` block, so a malformed
+                # selected plan escaped without ``topic_budget`` and
+                # ``candidate_attempt_trace``.  Composer then recorded zero
+                # usage and cancelled the specialist pool as if no intake had
+                # run at all.
+                feasibility = validate_topic_feasibility(package, runtime_context)
+            except ValidationError as exc:
+                budget.record_validation_error(exc)
+                last_error = exc
+                rejection_type = _topic_validation_rejection_type(exc)
+                if attempt_record is not None:
+                    attempt_record["status"] = "rejected"
+                    attempt_record["error"] = str(exc)[:2048]
+                    if rejection_type is not None:
+                        attempt_record["rejection_type"] = rejection_type
+                        attempt_record["rejection_reason"] = str(exc)[:2048]
+                        if rejection_type in _TOPIC_SEMANTIC_REJECTION_TYPES:
+                            _remember_topic_rejection(
+                                rejected_topic_history,
+                                attempt_record.get("selected_topic"),
+                                rejection_type=rejection_type,
+                                reason=exc,
+                            )
+                else:
+                    candidate_attempt_trace.append(_candidate_attempt_record(
+                        {}, attempt=attempt + 1, status="rejected", error=str(exc),
+                        outcome_known=True))
+                if rejection_type in {"feasibility", "novelty"}:
+                    break
+                continue
             portfolio_profile = (
                 topic_portfolio_profile(package["candidates"])
                 if frontier_seed_plan is not None else None
@@ -4630,7 +5207,7 @@ class TopicDiscoveryRunner:
                         budget.record_validation_error(review_error)
                         continue
                     try:
-                        parsed_review = review_result.json_object()
+                        parsed_review = review_result.json_object(allow_missing_closers=True)
                         validate_topic_maturity_review(
                             parsed_review,
                             candidate_ids=[item["id"] for item in package["candidates"]],
@@ -4647,9 +5224,33 @@ class TopicDiscoveryRunner:
                 if review is None:
                     last_error = review_error or ValidationError(
                         "topic maturity review did not produce a valid review")
-                    attempt_record["status"] = "maturity_review_error"
+                    # The candidate has already crossed the strict package,
+                    # feasibility, source-grounding, and challenge gates. A
+                    # reviewer response that is malformed or truncated is a
+                    # missing quality signal, not a reason to regenerate the
+                    # whole frontier portfolio. Preserve the candidate as an
+                    # explicitly provisional branch and let the literature
+                    # survey perform the independent novelty/gap assessment.
+                    attempt_record["status"] = "provisional_for_survey"
                     attempt_record["error"] = str(last_error)[:2048]
-                    continue
+                    open_requirements = [
+                        "Independent topic-maturity review was incomplete: "
+                        f"{last_error}. The literature survey must independently assess "
+                        "novelty, mechanism specificity, and the strongest competing explanation.",
+                    ]
+                    return finalize_topic(
+                        package, selected, feasibility,
+                        generation_seed=generation_seed,
+                        portfolio_profile=portfolio_profile,
+                        candidate_prior_work=candidate_prior_work,
+                        candidate_sampling_trace=candidate_sampling_trace,
+                        source_challenge=source_challenge,
+                        review=None,
+                        admission_state="provisional_for_survey",
+                        evolution_dimensions=refinement_changed_dimensions,
+                        maturity_open_requirements=open_requirements,
+                        maturity_review_error=str(last_error),
+                    )
                 maturity_review_history.append({
                     "attempt": attempt,
                     "selected_id": package["selected_id"],
@@ -4836,32 +5437,57 @@ class TopicDiscoveryRunner:
             client_config["timeout"] = min(float(client_config["timeout"]), remaining)
         client = OpenAlexClient(**client_config)
 
-        cache_path = Path(bibliography["cache_path"]) if bibliography.get("cache_path") else None
+        shared_cache_path = os.environ.get("SCISAURUS_OPENALEX_SHARED_TOPIC_CACHE_PATH")
+        if shared_cache_path is not None:
+            shared_cache_path = Path(shared_cache_path)
+            if (not shared_cache_path.is_absolute()
+                    or shared_cache_path.exists() and not shared_cache_path.is_file()):
+                raise ValidationError(
+                    "SCISAURUS_OPENALEX_SHARED_TOPIC_CACHE_PATH must be an absolute file path")
+        cache_path = (shared_cache_path
+                      if shared_cache_path is not None
+                      else Path(bibliography["cache_path"]) if bibliography.get("cache_path") else None)
         cache_ttl = float(bibliography.get("cache_ttl_seconds", 7 * 24 * 3600))
         cache = {"schema_version": "topic-openalex-cache-1", "entries": {}}
         if cache_path is not None and cache_path.is_file():
-            try:
-                loaded = json.loads(cache_path.read_text())
-                if (isinstance(loaded, dict) and loaded.get("schema_version") == cache["schema_version"]
-                        and isinstance(loaded.get("entries"), dict)):
-                    cache = loaded
-            except (OSError, ValueError, TypeError):
-                cache = {"schema_version": "topic-openalex-cache-1", "entries": {}}
+            with _topic_cache_lock(cache_path):
+                try:
+                    loaded = json.loads(cache_path.read_text())
+                    if (isinstance(loaded, dict)
+                            and loaded.get("schema_version") == cache["schema_version"]
+                            and isinstance(loaded.get("entries"), dict)):
+                        cache = loaded
+                except (OSError, ValueError, TypeError):
+                    cache = {"schema_version": "topic-openalex-cache-1", "entries": {}}
 
         def persist_cache():
+            nonlocal cache
             if cache_path is None:
                 return
-            if len(cache["entries"]) > 512:
-                newest = sorted(
-                    cache["entries"].items(),
-                    key=lambda item: float(item[1].get("stored_at", 0))
-                    if isinstance(item[1], dict) else 0,
-                    reverse=True)[:512]
-                cache["entries"] = dict(newest)
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = cache_path.with_name(f".{cache_path.name}.{uuid.uuid4().hex}.tmp")
-            temporary.write_bytes(canonical_bytes(cache))
-            os.replace(temporary, cache_path)
+            with _topic_cache_lock(cache_path):
+                latest = {"schema_version": "topic-openalex-cache-1", "entries": {}}
+                if cache_path.is_file():
+                    try:
+                        loaded = json.loads(cache_path.read_text())
+                        if (isinstance(loaded, dict)
+                                and loaded.get("schema_version") == latest["schema_version"]
+                                and isinstance(loaded.get("entries"), dict)):
+                            latest = loaded
+                    except (OSError, ValueError, TypeError):
+                        pass
+                latest["entries"].update(cache["entries"])
+                if len(latest["entries"]) > 512:
+                    newest = sorted(
+                        latest["entries"].items(),
+                        key=lambda item: float(item[1].get("stored_at", 0))
+                        if isinstance(item[1], dict) else 0,
+                        reverse=True)[:512]
+                    latest["entries"] = dict(newest)
+                cache = latest
+                temporary = cache_path.with_name(
+                    f".{cache_path.name}.{uuid.uuid4().hex}.tmp")
+                temporary.write_bytes(canonical_bytes(cache))
+                os.replace(temporary, cache_path)
 
         # One query per independent frontier preserves domain balance. A
         # selected-candidate challenge has one seed and may use up to three
@@ -4882,13 +5508,22 @@ class TopicDiscoveryRunner:
             if deadline is not None and deadline - time.monotonic() <= 0.2:
                 raise ValidationError("topic discovery deadline exceeded during literature sampling")
             query = spec["query"]
-            cache_key = hashlib.sha256(canonical_bytes({
-                "endpoint": client_config["endpoint"], "query": query, "limit": 10,
-            })).hexdigest()
+            cache_key = _topic_cache_query_key(client_config["endpoint"], query, 10)
             cached = cache["entries"].get(cache_key)
+            if not isinstance(cached, dict):
+                # Read caches written before normalized query keys existed.
+                normalized_query = " ".join(query.casefold().split())
+                for legacy_entry in cache["entries"].values():
+                    if (isinstance(legacy_entry, dict)
+                            and " ".join(str(legacy_entry.get("query", "")).casefold().split())
+                            == normalized_query):
+                        cached = legacy_entry
+                        break
             cache_hit = bool(
                 isinstance(cached, dict)
-                and cached.get("query") == query
+                and (cached.get("query_key") == cache_key
+                     or " ".join(str(cached.get("query", "")).casefold().split())
+                     == " ".join(query.casefold().split()))
                 and isinstance(cached.get("stored_at"), (int, float))
                 and time.time() - float(cached["stored_at"]) <= cache_ttl
                 and isinstance(cached.get("works"), list)
@@ -4914,7 +5549,7 @@ class TopicDiscoveryRunner:
                     budget.record_openalex_result(result)
                 if result.get("outcome") in {"ok", "empty"}:
                     cache["entries"][cache_key] = {
-                        "query": query, "stored_at": time.time(),
+                        "query": query, "query_key": cache_key, "stored_at": time.time(),
                         "works": deepcopy(result.get("works", [])),
                         "source_url": result.get("source_url"),
                         "capture_sha256": result.get("capture_sha256"),
@@ -5039,6 +5674,27 @@ class TopicDiscoveryRunner:
             if not advanced:
                 break
         return pool, sampling_seed, sampling_trace
+
+
+def _topic_package_for_structural_validation(package, runtime_context):
+    """Project a topic portfolio before its non-execution structural checks.
+
+    The selected candidate is checked against the live feasibility boundary
+    by ``validate_topic_feasibility``.  Applying the same strict execution
+    plan contract during generic package validation prevents deterministic
+    selection repair from trying the already-proposed alternatives.  Keep
+    the original package untouched and defer every feasibility plan to the
+    runtime-aware gate.
+    """
+    if (not isinstance(package, dict)
+            or not isinstance(runtime_context, dict)
+            or not isinstance(runtime_context.get("research_feasibility"), dict)):
+        return package
+    projection = deepcopy(package)
+    for candidate in projection.get("candidates", []):
+        if isinstance(candidate, dict):
+            candidate.pop("feasibility_plan", None)
+    return projection
 
 
 __all__ = [

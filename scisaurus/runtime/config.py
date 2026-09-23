@@ -123,6 +123,9 @@ def validate_common(value, extra_fields, *, retrieval=True):
     for key in integer_limits:
         if type(limits.get(key)) is not int or limits[key] <= 0:
             raise ValidationError(f"limits.{key} must be a positive integer")
+    if "max_model_calls" in limits and (
+            type(limits["max_model_calls"]) is not int or limits["max_model_calls"] <= 0):
+        raise ValidationError("limits.max_model_calls must be a positive integer when configured")
     time_limits = ["wall_clock_seconds", "checkpoint_seconds"]
     if retrieval:
         time_limits += ["retrieval_timeout_seconds"]

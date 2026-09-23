@@ -341,12 +341,13 @@ class TestOpenAlex(unittest.TestCase):
             self.assertGreater(second["metadata"]["rate_limit"]["retry_after_seconds"], 0)
             self.assertEqual(len(OpenAlexFixture.requests), before + 1)
 
-            # A search-budget cooldown does not suppress free singleton work
-            # lookups, which have a separate OpenAlex request-cost class.
+            # A daily credit budget is account-wide, not a per-operation
+            # search budget. Singleton work must not bypass the same fence.
             singleton = self.client(rate_state_path=state_path).run(
                 **self.arguments(None, operation="work", work_id="W456"))
-            self.assertEqual(singleton["outcome"], "ok")
-            self.assertEqual(len(OpenAlexFixture.requests), before + 2)
+            self.assertEqual(singleton["outcome"], "rate_limited")
+            self.assertEqual(singleton["metadata"]["attempts"], 0)
+            self.assertEqual(len(OpenAlexFixture.requests), before + 1)
 
             # Authentication has a separate provider budget scope. The state
             # file never contains the credential itself.
@@ -355,9 +356,31 @@ class TestOpenAlex(unittest.TestCase):
                     auth_env="SCISAURUS_OPENALEX_TEST", rate_state_path=state_path,
                 ).run(**self.arguments("authenticated query"))
             self.assertEqual(authenticated["outcome"], "ok")
-            self.assertEqual(len(OpenAlexFixture.requests), before + 3)
+            self.assertEqual(len(OpenAlexFixture.requests), before + 2)
             with open(state_path) as stream:
                 self.assertNotIn("another-credential", stream.read())
+
+    def test_shared_account_ledger_migrates_legacy_stage_state(self):
+        with tempfile.TemporaryDirectory(prefix="scisaurus-openalex-shared-") as directory:
+            root = Path(directory)
+            legacy = root / "projects" / "topic" / "provider-state" / "openalex.json"
+            shared = root / "provider-state" / "openalex.json"
+            before = len(OpenAlexFixture.requests)
+            first = self.client(max_retries=0, rate_state_path=str(legacy)).run(
+                **self.arguments("daily-budget"))
+            self.assertEqual(first["outcome"], "rate_limited")
+            with patch.dict(os.environ, {"SCISAURUS_OPENALEX_SHARED_RATE_STATE_PATH": str(shared)}):
+                second = self.client(max_retries=3, rate_state_path=str(
+                    legacy
+                )).run(**self.arguments("a query from another stage"))
+            self.assertEqual(second["outcome"], "rate_limited")
+            self.assertEqual(second["metadata"]["attempts"], 0)
+            self.assertEqual(len(OpenAlexFixture.requests), before + 1)
+            document = json.loads(shared.read_text())
+            self.assertTrue(any(
+                entry.get("rate_limit", {}).get("kind") == "daily_budget"
+                for entry in document["scopes"].values()
+            ))
 
     def test_anonymous_load_on_503_uses_the_same_persistent_throttle_boundary(self):
         with tempfile.TemporaryDirectory(prefix="scisaurus-openalex-rate-state-") as directory:

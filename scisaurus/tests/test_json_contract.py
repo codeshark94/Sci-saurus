@@ -12,7 +12,8 @@ class TestJSONContract(unittest.TestCase):
     def test_model_wrappers_decode_identically_on_execution_and_replay(self):
         for text in ('{"ok":true}', '```json\n{"ok":true}\n```',
                      'reasoning</think>{"ok":true}',
-                     'reasoning</think>```json\n{"ok":true}\n```'):
+                     'reasoning</think>```json\n{"ok":true}\n```',
+                     '{"ok":true}"}'):
             with self.subTest(text=text):
                 result = ModelResult(text, "fixture", {}, 0, "stop")
                 self.assertEqual(result.json_object(), {"ok": True})
@@ -27,6 +28,14 @@ class TestJSONContract(unittest.TestCase):
             for text in (raw, f'```json\n{raw}\n```', f'reasoning</think>{raw}'):
                 with self.subTest(text=text), self.assertRaises(ValidationError):
                     ModelResult(text, "fixture", {}, 0, "stop").json_object()
+        self.assertEqual(
+            ModelResult('{"x":1', "fixture", {}, 0, "stop").json_object(
+                allow_missing_closers=True),
+            {"x": 1},
+        )
+        with self.assertRaises(ValidationError):
+            ModelResult('{"x":', "fixture", {}, 0, "stop").json_object(
+                allow_missing_closers=True)
         for text in ('Here is JSON:\n```json\n{"x":1}\n```',
                      '```json\n{"x":1}\n```\nmore',
                      '```json\n{"x":1}\n```\n```json\n{"x":2}\n```'):

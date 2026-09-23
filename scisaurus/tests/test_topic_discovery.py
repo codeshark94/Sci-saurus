@@ -1,5 +1,6 @@
 import json
 import hashlib
+import os
 import tempfile
 import time
 import unittest
@@ -40,16 +41,20 @@ from scisaurus.runtime.topic_discovery import (
     _materialize_foundry_capability_requirements,
     _materialize_foundry_feasibility,
     _repair_feasibility_input_contract,
+    _repair_feasibility_input_kinds,
+    _repair_feasibility_input_statuses,
     _strip_topic_controller_metadata,
     _materialize_seed_bindings,
     _materialize_seed_domains,
     _materialize_topic_objective,
     _portfolio_shape_plan,
+    _repair_executable_selection,
     _repair_foundry_selection,
     _repair_topic_novelty_selection,
     _repair_topic_refinement_selection,
     _source_challenge_requires_frontier_seed_pivot,
     _topic_retry_reason,
+    _topic_validation_rejection_type,
 )
 
 
@@ -407,6 +412,23 @@ class MaturityMalformedRepairModel(MaturityModel):
             return ModelResult(text=json.dumps(review), model="fake",
                                usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
                                elapsed_seconds=0.01, finish_reason="stop")
+        return super().complete(system=system, prompt=prompt, images=images)
+
+
+class MaturityLengthModel(MaturityModel):
+    """Return a bounded but incomplete maturity response on both review lanes."""
+
+    review_calls = 0
+
+    def complete(self, *, system, prompt, images=None):
+        payload = json.loads(prompt)
+        if payload.get("assignment") in {
+                "topic_maturity_review", "repair_topic_maturity_review"}:
+            type(self).review_calls += 1
+            return ModelResult(
+                text='{"decision": "admit"}', model="fake",
+                usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 900},
+                elapsed_seconds=0.01, finish_reason="length")
         return super().complete(system=system, prompt=prompt, images=images)
 
 
@@ -771,6 +793,41 @@ class TopicDiscoveryTests(unittest.TestCase):
                 "topic_id": "old_direction", "signature": topic_signature(prior),
             }]})
 
+    def test_saturated_history_allows_a_cold_question_to_reuse_an_archetype(self):
+        forms = ("theory_simulation", "observational_reanalysis", "experimental_design",
+                 "methodological_benchmark")
+        modes = ("analytical_derivation", "synthetic_simulation", "published_observations")
+        comparisons = ("mechanism_ablation", "model_selection", "cross_method")
+        entries = []
+        for index in range(60):
+            prior = {
+                "topic_id": f"old_{index}",
+                "title": f"Prior direction {index}",
+                "domain": f"prior domain {index}",
+                "research_question": f"How does prior phenomenon {index} change under its test condition?",
+                "research_form": forms[index % len(forms)],
+                "evidence_mode": modes[(index // len(forms)) % len(modes)],
+                "comparison_type": comparisons[(index // (len(forms) * len(modes))) % len(comparisons)],
+            }
+            entries.append(prior)
+        candidate = {
+            "id": "new_resonator_direction",
+            "title": "Boundary resonance in cryogenic phonon transport",
+            "domain": "quantum acoustics",
+            "research_question": "Which localization threshold emerges for phonon packets in a disordered resonator?",
+            "research_form": entries[0]["research_form"],
+            "evidence_mode": entries[0]["evidence_mode"],
+            "comparison_type": entries[0]["comparison_type"],
+        }
+        history = {
+            "entries": entries,
+            "history_summary": {
+                "total_entries": len(entries),
+                "distinct_structure_fingerprints": 12,
+            },
+        }
+        self.assertTrue(validate_topic_novelty(candidate, history))
+
     def test_maturity_refinement_requires_structural_pivot_when_enabled(self):
         review = {
             "decision": "refine", "selected_id": "direction_1",
@@ -859,6 +916,70 @@ class TopicDiscoveryTests(unittest.TestCase):
             value["candidates"][0]["capability_requirements"],
             {"executables": ["python3"], "python_packages": [], "stage_kinds": ["experiment"]},
         )
+
+    def test_executable_selection_repair_reuses_valid_portfolio_member(self):
+        value = package("Choose a feasible research direction")
+        value["candidates"][0]["evidence_mode"] = "synthetic_simulation"
+        value["candidates"][0]["feasibility_plan"] = foundry_feasibility_plan(
+            evidence_inputs=[{
+                "kind": "analytical_parameters", "status": "available",
+                "source": "bounded analytical parameters",
+            }])
+        value["candidates"][1]["evidence_mode"] = "synthetic_simulation"
+        value["candidates"][1]["feasibility_plan"] = foundry_feasibility_plan()
+        value["selected_id"] = "direction_0"
+        context = {
+            "capability_foundry": {
+                "enabled": True,
+                "allowed_evidence_modes": ["analytical_derivation", "synthetic_simulation"],
+            },
+            "research_feasibility": {
+                "execution_modes": ["foundry"],
+                "allowed_input_kinds": ["analytical_parameters", "synthetic"],
+                "allowed_data_access": ["closed_world"],
+                "network_access": False, "undeclared_data": False,
+                "max_external_requests": 0, "max_model_calls": 0,
+                "max_experiment_seconds": 900,
+                "available_executables": ["python3"],
+                "available_packages": ["numpy"],
+            },
+            "executables": {"python3": True},
+            "python_packages": {"numpy": True},
+            "configured_stage_kinds": ["experiment"],
+        }
+        repair = _repair_executable_selection(value, context)
+        self.assertEqual(repair["from_selected_id"], "direction_0")
+        self.assertEqual(repair["to_selected_id"], "direction_1")
+        self.assertEqual(value["selected_id"], "direction_1")
+        self.assertEqual(repair["rejected_candidates"][0]["candidate_id"], "direction_0")
+
+    def test_executable_selection_repair_does_not_invent_a_feasible_candidate(self):
+        value = package("Choose a feasible research direction")
+        for candidate in value["candidates"]:
+            candidate["evidence_mode"] = "synthetic_simulation"
+            candidate["feasibility_plan"] = foundry_feasibility_plan(
+                evidence_inputs=[{
+                    "kind": "analytical_parameters", "status": "available",
+                    "source": "bounded analytical parameters",
+                }])
+        context = {
+            "capability_foundry": {"enabled": True},
+            "research_feasibility": {
+                "execution_modes": ["foundry"],
+                "allowed_input_kinds": ["analytical_parameters", "synthetic"],
+                "allowed_data_access": ["closed_world"],
+                "network_access": False, "undeclared_data": False,
+                "max_external_requests": 0, "max_model_calls": 0,
+                "max_experiment_seconds": 900,
+                "available_executables": ["python3"],
+                "available_packages": ["numpy"],
+            },
+            "executables": {"python3": True},
+            "python_packages": {"numpy": True},
+            "configured_stage_kinds": ["experiment"],
+        }
+        self.assertIsNone(_repair_executable_selection(value, context))
+        self.assertEqual(value["selected_id"], "direction_1")
 
     def test_refinement_selection_repair_uses_actual_candidate_shapes(self):
         value = package("Choose a feasible research direction")
@@ -1037,6 +1158,72 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(len(result["candidate_attempt_trace"][0]["candidate_signatures"]), 3)
         self.assertEqual(result["candidate_attempt_trace"][0]["portfolio_profile"]["distinct"]["research_form"], 3)
 
+    def test_runner_ignores_malformed_unselected_plans_and_repairs_selection(self):
+        class InconsistentFeasibilityPortfolioModel(FakeModel):
+            def complete(self, *, system, prompt, images=None):
+                result = super().complete(system=system, prompt=prompt, images=images)
+                payload = json.loads(prompt)
+                if payload.get("assignment") != "free_topic_discovery":
+                    return result
+                value = json.loads(result.text)
+                value["candidates"][0]["feasibility_plan"] = foundry_feasibility_plan()
+                value["candidates"][1]["feasibility_plan"] = foundry_feasibility_plan(
+                    experiment_input="project_artifact",
+                    data_access="project_local",
+                    evidence_inputs=[{
+                        "kind": "public_dataset", "status": "available",
+                        "source": "a dataset that is not injected into the foundry",
+                    }],
+                )
+                value["candidates"][2]["feasibility_plan"] = foundry_feasibility_plan(
+                    experiment_input="project_artifact",
+                    data_access="project_local",
+                    evidence_inputs=[{
+                        "kind": "public_dataset", "status": "available",
+                        "source": "another dataset that is not injected into the foundry",
+                    }],
+                )
+                return ModelResult(
+                    text=json.dumps(value), model="fake", usage=result.usage,
+                    elapsed_seconds=result.elapsed_seconds, finish_reason=result.finish_reason)
+
+        runtime_context = {
+            "capability_foundry": {
+                "enabled": True,
+                "allowed_evidence_modes": ["synthetic_simulation"],
+            },
+            "research_feasibility": {
+                "execution_modes": ["foundry"],
+                "allowed_input_kinds": ["synthetic", "analytical_parameters"],
+                "allowed_data_access": ["closed_world"],
+                "network_access": False,
+                "undeclared_data": False,
+                "max_external_requests": 0,
+                "max_model_calls": 0,
+                "max_experiment_seconds": 900,
+                "available_executables": ["python3"],
+                "available_packages": ["numpy"],
+            },
+            "executables": {"python3": True},
+            "python_packages": {"numpy": True},
+            "configured_stage_kinds": ["experiment"],
+        }
+        with patch("scisaurus.runtime.topic_discovery.ModelClient",
+                   InconsistentFeasibilityPortfolioModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+            }).run(
+                "Choose a feasible research direction", candidate_count=3,
+                bibliography=False, max_attempts=1, runtime_context=runtime_context,
+            )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["selected_id"], "direction_0")
+        self.assertEqual(
+            result["candidate_attempt_trace"][0]["selection_repair"]["from_selected_id"],
+            "direction_1",
+        )
+
     def test_schema_failure_is_retryable_but_does_not_poison_rejection_history(self):
         with patch("scisaurus.runtime.topic_discovery.ModelClient", InvalidCandidateShapeModel):
             with self.assertRaises(ValidationError) as raised:
@@ -1058,6 +1245,71 @@ class TopicDiscoveryTests(unittest.TestCase):
             ),
             "intake_contract_failure",
         )
+
+    def test_feasibility_contract_failure_before_attempt_record_stops_local_intake(self):
+        runner = TopicDiscoveryRunner({
+            "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+            "timeout_seconds": 1, "max_output_tokens": 4096,
+        })
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", FakeModel), \
+                patch.object(
+                    runner, "_repair_missing_topic_fields",
+                    side_effect=ValidationError(
+                        "feasibility_plan.project_artifact must declare a project_artifact input"),
+                ):
+            with self.assertRaises(ValidationError) as raised:
+                runner.run(
+                    "Choose a feasible research direction", candidate_count=3,
+                    bibliography=False, max_attempts=6,
+                    runtime_context={"capability_foundry": {"enabled": True}},
+                )
+        error = raised.exception
+        self.assertEqual(len(error.candidate_attempt_trace), 1)
+        self.assertEqual(error.candidate_attempt_trace[0]["status"], "rejected")
+        self.assertEqual(error.topic_retry_reason, "scientific_candidate_rejected")
+        self.assertEqual(error.topic_budget["usage"]["model_calls"], 1)
+
+    def test_novelty_failure_before_attempt_record_stops_local_intake(self):
+        runner = TopicDiscoveryRunner({
+            "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+            "timeout_seconds": 1, "max_output_tokens": 4096,
+        })
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", FakeModel), \
+                patch.object(
+                    runner, "_repair_missing_topic_fields",
+                    side_effect=ValidationError(
+                        "selected topic is too similar to a previously attempted direction"),
+                ):
+            with self.assertRaises(ValidationError) as raised:
+                runner.run(
+                    "Choose a feasible research direction", candidate_count=3,
+                    bibliography=False, max_attempts=6,
+                )
+        error = raised.exception
+        self.assertEqual(len(error.candidate_attempt_trace), 1)
+        self.assertEqual(error.topic_retry_reason, "scientific_candidate_rejected")
+        self.assertEqual(error.topic_budget["usage"]["model_calls"], 1)
+
+    def test_outer_runner_boundary_preserves_unexpected_validation_usage(self):
+        runner = TopicDiscoveryRunner({
+            "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+            "timeout_seconds": 1, "max_output_tokens": 4096,
+        })
+        runner._active_topic_budget = TopicBudget(
+            usage={"model_calls": 2, "input_tokens": 120, "output_tokens": 40,
+                   "openalex_requests": 3})
+        runner._active_topic_trace = [{"status": "rejected"}]
+        error = ValidationError(
+            "feasibility_plan.project_artifact must declare a project_artifact input")
+        with patch.object(runner, "_run_impl", side_effect=error):
+            with self.assertRaises(ValidationError) as raised:
+                runner.run("Choose a feasible research direction")
+        caught = raised.exception
+        self.assertTrue(caught.topic_intake_recoverable)
+        self.assertEqual(caught.topic_retry_reason, "scientific_candidate_rejected")
+        self.assertEqual(caught.topic_budget["usage"]["model_calls"], 2)
+        self.assertEqual(caught.usage["openalex_requests"], 3)
+        self.assertEqual(caught.candidate_attempt_trace, [{"status": "rejected"}])
 
     def test_runner_passes_rejected_candidate_history_to_repair(self):
         PortfolioRepairModel.topic_calls = 0
@@ -1131,6 +1383,23 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(MaturityMalformedRepairModel.assignments[-2:], [
             "topic_maturity_review", "repair_topic_maturity_review",
         ])
+
+    def test_runner_forwards_incomplete_maturity_review_to_survey(self):
+        MaturityLengthModel.review_calls = 0
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", MaturityLengthModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+            }).run("Choose a feasible research direction", candidate_count=3,
+                   bibliography=False, maturity_review_rounds=1, max_attempts=6)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["admission_state"], "provisional_for_survey")
+        self.assertEqual(MaturityLengthModel.review_calls, 2)
+        self.assertIn("topic maturity review did not finish normally: length",
+                      result["maturity_review_error"])
+        self.assertTrue(result["maturity_open_requirements"])
+        self.assertEqual(result["candidate_attempt_trace"][-1]["status"],
+                         "provisional_for_survey")
 
     def test_runner_carries_source_challenge_feedback_into_repair(self):
         SourceChallengeRefinementModel.calls = []
@@ -1220,6 +1489,34 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(len(first[2]), 6)
         self.assertTrue(all(item["year"] >= 2022 for item in first[0]))
         self.assertGreaterEqual(len({item["frontier_seed_id"] for item in first[0]}), 4)
+
+    def test_shared_topic_cache_reuses_results_across_stage_cache_paths(self):
+        with tempfile.TemporaryDirectory(prefix="scisaurus-topic-cache-") as directory:
+            root = Path(directory)
+            shared = root / "shared" / "topic-openalex.json"
+            local_a = root / "mission-a" / "topic.json"
+            local_b = root / "mission-b" / "topic.json"
+            FakeOpenAlex.queries = []
+            with patch.dict(os.environ, {
+                "SCISAURUS_OPENALEX_SHARED_TOPIC_CACHE_PATH": str(shared),
+            }), patch("scisaurus.runtime.topic_discovery.OpenAlexClient", FakeOpenAlex):
+                first = TopicDiscoveryRunner._recent_paper_sample(
+                    "cache-backed science", sampling_seed=17,
+                    frontier_seed_plan=frontier_plan(),
+                    bibliography={"cache_path": str(local_a.resolve())},
+                )
+                first_call_count = len(FakeOpenAlex.queries)
+                second = TopicDiscoveryRunner._recent_paper_sample(
+                    "cache-backed science", sampling_seed=17,
+                    frontier_seed_plan=frontier_plan(),
+                    bibliography={"cache_path": str(local_b.resolve())},
+                )
+            self.assertEqual(len(FakeOpenAlex.queries), first_call_count)
+            self.assertEqual(first[0], second[0])
+            self.assertEqual(first[1], second[1])
+            self.assertEqual(len(first[2]), len(second[2]))
+            self.assertTrue(all(item["cache_hit"] for item in second[2]))
+            self.assertTrue(shared.is_file())
 
     def test_topic_budget_stops_openalex_before_the_next_network_request(self):
         FakeOpenAlex.queries = []
@@ -1416,6 +1713,59 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(repairs[0]["field"], "research_question")
         self.assertEqual(repairs[0]["source"], "targeted_model_field_repair")
 
+    def test_missing_feasibility_plan_reuses_input_normalization_before_validation(self):
+        class MissingPlanModel:
+            calls = 0
+
+            def __init__(self, **config):
+                self.config = config
+
+            def complete(self, *, system, prompt, images=None):
+                type(self).calls += 1
+                payload = json.loads(prompt)
+                patches = [{
+                    "id": item["id"],
+                    "fields": {
+                        "feasibility_plan": foundry_feasibility_plan(
+                            experiment_input="project_artifact",
+                            data_access="project_local",
+                            evidence_inputs=[{
+                                "kind": "analytical_parameters",
+                                "status": "available",
+                                "source": "bounded analytic parameters supplied by the study",
+                            }],
+                        ),
+                    },
+                } for item in payload["candidate_context"]]
+                return ModelResult(
+                    text=json.dumps({"candidate_patches": patches}), model="fake",
+                    usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                    elapsed_seconds=0.01, finish_reason="stop")
+
+        value = package("Choose a feasible research direction")
+        for candidate in value["candidates"]:
+            candidate["feasibility_plan"] = foundry_feasibility_plan()
+        value["candidates"][1].pop("feasibility_plan")
+        runner = TopicDiscoveryRunner({
+            "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+            "timeout_seconds": 1, "max_output_tokens": 4096,
+        })
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", MissingPlanModel):
+            repairs = runner._repair_missing_topic_fields(
+                value, deadline=None, budget=TopicBudget(None, {}),
+                require_feasibility_plan=True,
+                runtime_context={"capability_foundry": {"enabled": True}},
+            )
+        plan = value["candidates"][1]["feasibility_plan"]
+        self.assertEqual(MissingPlanModel.calls, 1)
+        self.assertEqual(plan["experiment_input"], "self_contained")
+        self.assertEqual(plan["data_access"], "closed_world")
+        self.assertEqual(validate_feasibility_plan(plan), plan)
+        self.assertTrue(any(
+            item.get("source") == "targeted_model_field_repair_contract_normalization"
+            for item in repairs
+        ))
+
     def test_runner_repairs_only_a_missing_title(self):
         objective = "Choose a feasible research direction"
         MissingTitleModel.assignments = []
@@ -1560,6 +1910,28 @@ class TopicDiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "network_access"):
             validate_feasibility_plan(invalid)
 
+    def test_model_status_aliases_are_normalized_without_relaxing_gate(self):
+        value = package("Choose a feasible research direction")
+        value["candidates"][0]["feasibility_plan"] = foundry_feasibility_plan(
+            evidence_inputs=[{
+                "kind": "synthetic", "status": "ready", "source": "generated inputs",
+            }])
+        repairs = _repair_feasibility_input_statuses(value)
+        self.assertEqual(value["candidates"][0]["feasibility_plan"]["evidence_inputs"][0]["status"], "available")
+        self.assertEqual(repairs[0]["source"], "lossless_status_alias")
+        self.assertEqual(validate_feasibility_plan(value["candidates"][0]["feasibility_plan"])["network_access"], False)
+
+    def test_model_kind_aliases_are_normalized_without_relaxing_gate(self):
+        value = package("Choose a feasible research direction")
+        value["candidates"][0]["feasibility_plan"] = foundry_feasibility_plan(
+            evidence_inputs=[{
+                "kind": "synthetic simulation", "status": "available", "source": "generated inputs",
+            }])
+        repairs = _repair_feasibility_input_kinds(value)
+        self.assertEqual(value["candidates"][0]["feasibility_plan"]["evidence_inputs"][0]["kind"], "synthetic")
+        self.assertEqual(repairs[0]["source"], "lossless_kind_alias")
+        self.assertEqual(validate_feasibility_plan(value["candidates"][0]["feasibility_plan"])["data_access"], "closed_world")
+
     def test_current_foundry_gate_rejects_hidden_external_inputs_and_network(self):
         value = package("Choose a feasible research direction")
         selected = value["candidates"][1]
@@ -1697,6 +2069,43 @@ class TopicDiscoveryTests(unittest.TestCase):
         )
         from scisaurus.runtime.topic_discovery import validate_topic_feasibility
         self.assertEqual(validate_topic_feasibility(value, context)["status"], "feasible")
+
+    def test_topic_package_normalizes_input_alias_before_strict_feasibility_gate(self):
+        value = package("Choose a feasible research direction")
+        selected = value["candidates"][1]
+        selected["evidence_mode"] = "analytical_derivation"
+        selected["feasibility_plan"] = foundry_feasibility_plan(
+            experiment_input="project_artifact",
+            data_access="project_local",
+            evidence_inputs=[{
+                "kind": "analytical input", "status": "ready",
+                "source": "bounded analytic parameters supplied by the study",
+            }],
+        )
+
+        validate_topic_package(
+            value, objective=value["objective"], candidate_count=3,
+        )
+        self.assertEqual(
+            selected["feasibility_plan"]["experiment_input"], "self_contained")
+        self.assertEqual(
+            selected["feasibility_plan"]["evidence_inputs"][0]["kind"],
+            "analytical_parameters",
+        )
+        self.assertEqual(
+            selected["feasibility_plan"]["evidence_inputs"][0]["status"],
+            "available",
+        )
+        self.assertEqual(selected["feasibility_plan"]["data_access"], "closed_world")
+
+    def test_incompatible_feasibility_plan_is_a_candidate_pivot_not_a_format_retry(self):
+        error = ValidationError(
+            "feasibility_plan.project_artifact must declare a project_artifact input")
+        self.assertEqual(_topic_validation_rejection_type(error), "feasibility")
+        self.assertEqual(
+            _topic_retry_reason(error, [{"status": "rejected"}], []),
+            "scientific_candidate_rejected",
+        )
 
     def test_feasibility_input_repair_does_not_invent_an_unsupported_input(self):
         value = package("Choose a feasible research direction")
@@ -1950,6 +2359,39 @@ class TopicDiscoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "source-diversity floor"):
                 TopicDiscoveryRunner._recent_paper_sample(
                     "feasible science", sampling_seed=3, frontier_seed_plan=frontier_plan())
+
+    def test_provider_cooldown_preflight_spends_no_topic_model_call(self):
+        class BlockedOpenAlex:
+            def __init__(self, **config):
+                self.config = config
+
+            def preflight(self, **kwargs):
+                return {
+                    "retry_after_seconds": 123,
+                    "rate_limit": {"kind": "daily_budget", "remaining": 2},
+                }
+
+        class ExplodingModel:
+            calls = 0
+
+            def __init__(self, **config):
+                pass
+
+            def complete(self, **kwargs):
+                type(self).calls += 1
+                raise AssertionError("topic model must not run behind a provider fence")
+
+        with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", BlockedOpenAlex), \
+                patch("scisaurus.runtime.topic_discovery.ModelClient", ExplodingModel):
+            with self.assertRaises(ProviderCooldownError) as caught:
+                TopicDiscoveryRunner({
+                    "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                    "timeout_seconds": 1, "max_output_tokens": 4096,
+                }).run(
+                    "feasible science", sampling_seed=3, bibliography={}, max_attempts=1,
+                )
+        self.assertEqual(caught.exception.retry_after_seconds, 123)
+        self.assertEqual(ExplodingModel.calls, 0)
 
     def test_rate_limited_openalex_fails_closed_without_crossref_topic_admission(self):
         class FailedOpenAlex:

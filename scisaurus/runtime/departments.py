@@ -1222,6 +1222,29 @@ class DepartmentRuntime:
                            "task_state": task["state"]})
         return active
 
+    def pause_work_orders(self, requests, *, actor="command.composer", reason):
+        """Mark continuation orders dormant when no Composer process is live."""
+        paused = []
+        for request in requests or []:
+            if not isinstance(request, dict):
+                continue
+            proposal = {key: request.get(key) for key in (
+                "id", "kind", "owner", "objective", "why", "success_condition", "evidence_needed")}
+            proposal["schema_version"] = WORK_ORDER_SCHEMA_VERSION
+            try:
+                result = self.propose(proposal, source_stage_id=request.get("source_stage_id"))
+                task = self.tasks.get(result["task_id"])
+                if task["state"] in {"queued", "running"}:
+                    task = self.tasks.transition(result["task_id"], "paused", actor, reason=reason)
+                record = self._set_work_order_state(result, task["state"], actor=actor)
+                paused.append({"task_id": result["task_id"], "request_id": request.get("id"),
+                               "state": task["state"], "work_order_ref": record["artifact_ref"]})
+            except (NotFoundError, StateError, ValidationError):
+                # The Composer result remains authoritative; an already
+                # terminal or superseded order needs no second transition.
+                continue
+        return paused
+
     def resolve_work_orders(self, requests, *, stage_kind, outcome, actor="command.composer"):
         """Close work orders whose owning stage produced an accepted result.
 

@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from scisaurus.cli import _composer_progress_line
 from scisaurus.runtime.composer import ComposerRunner, read_interim_report, validate_workflow
 from scisaurus.runtime.departments import default_organization
 from scisaurus.runtime.literature import ProviderCooldownError
@@ -748,6 +749,210 @@ class ComposerWorkflowTests(unittest.TestCase):
             finally:
                 runner.close()
 
+    def test_pre_execution_capability_failure_pivots_instead_of_parking_a_candidate(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            topic_stage = {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            }
+            workflow["stages"].insert(0, topic_stage)
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            workflow["continuation_policy"] = {"mode": "bounded", "max_cycles": 1}
+            workflow["progression_policy"] = "forward_first"
+            workflow["completion"]["required_stage_ids"] = ["topic", "survey", "experiment"]
+            runner = ComposerRunner(workflow)
+            try:
+                error = "ModelWorkBlocked: capability foundry did not admit a program: metric is nan"
+                runner.context["topic"] = {
+                    "kind": "topic_discovery", "status": "completed",
+                    "topic": {"id": "old", "title": "Old direction",
+                              "research_question": "Does A change B?"},
+                }
+                runner.context["survey"] = {"kind": "survey", "status": "completed"}
+                runner.context["experiment"] = {
+                    "kind": "experiment", "status": "candidate_needs_review",
+                    "results_status": "not_executed", "failure_debt": {
+                    "attempts": 3, "error": error,
+                    },
+                }
+                runner.stage_records["topic"] = {"kind": "topic_discovery", "status": "completed"}
+                runner.stage_records["survey"] = {"kind": "survey", "status": "completed"}
+                runner.stage_records["experiment"] = {
+                    "kind": "experiment", "status": "candidate_needs_review",
+                    "attempt_count": 3, "error": error,
+                }
+                by_id = {stage["id"]: stage for stage in workflow["stages"]}
+                completed = {"topic", "survey"}
+                self.assertTrue(runner._admit_scientific_blocker_recovery(
+                    workflow["stages"][2], ModelWorkBlocked(error), completed, by_id))
+                self.assertEqual(runner.continuation_cycles, 1)
+                self.assertEqual(runner.context["topic"]["status"], "research_expansion_required")
+                self.assertTrue(any(
+                    item.get("action") == "pivot_topic_after_scientific_blocker"
+                    for item in runner.department_activity
+                ))
+            finally:
+                runner.close()
+
+    def test_survey_evidence_contract_failure_pivots_instead_of_replaying_assessment(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            workflow["completion"]["required_stage_ids"] = ["topic", "survey", "experiment"]
+            runner = ComposerRunner(workflow)
+            try:
+                runner.context["topic"] = {
+                    "kind": "topic_discovery", "status": "completed",
+                    "topic": {"id": "old", "title": "Old direction",
+                              "research_question": "Does A change B?"},
+                }
+                runner.context["survey"] = {
+                    "kind": "survey", "status": "blocked",
+                    "error": "gap-assessment did not satisfy its evidence contract",
+                }
+                runner.stage_records["topic"] = {"kind": "topic_discovery", "status": "completed"}
+                runner.stage_records["survey"] = {
+                    "kind": "survey", "status": "blocked", "attempt_count": 2,
+                }
+                by_id = {stage["id"]: stage for stage in workflow["stages"]}
+                completed = {"topic"}
+                error = ModelWorkBlocked(
+                    "survey-gap-assessment did not satisfy its evidence contract: "
+                    "unknown or duplicate required check"
+                )
+                self.assertTrue(runner._admit_scientific_blocker_recovery(
+                    workflow["stages"][1], error, completed, by_id))
+                self.assertEqual(runner.continuation_cycles, 1)
+                self.assertEqual(runner.context["topic"]["status"], "research_expansion_required")
+                self.assertEqual(
+                    runner.context["topic"]["research_expansion_requests"][0]["kind"],
+                    "topic_refinement",
+                )
+                self.assertTrue(any(
+                    item.get("action") == "pivot_topic_after_scientific_blocker"
+                    for item in runner.department_activity
+                ))
+            finally:
+                runner.close()
+
+    def test_resume_reconciles_interrupted_survey_contract_before_dispatch(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            workflow["completion"]["required_stage_ids"] = ["topic", "survey", "experiment"]
+            runner = ComposerRunner(workflow)
+            try:
+                runner.continuation_cycles = 9
+                runner.continuation_pending_stage_ids = {"survey", "experiment"}
+                runner.context["topic"] = {
+                    "kind": "topic_discovery", "status": "completed",
+                    "topic": {"id": "old", "title": "Old direction",
+                              "research_question": "Does A change B?"},
+                }
+                runner.context["survey"] = {
+                    "kind": "survey", "status": "research_expansion_required",
+                    "error": (
+                        "Unchanged survey input failed 1 time(s): ModelWorkBlocked: "
+                        "gap-assessment did not satisfy its evidence contract: "
+                        "model generation did not finish normally: length"
+                    ),
+                }
+                runner.stage_records["topic"] = {"kind": "topic_discovery", "status": "completed"}
+                runner.stage_records["survey"] = {"kind": "survey", "status": "running"}
+                runner.active_research_requests = []
+                by_id = {stage["id"]: stage for stage in workflow["stages"]}
+                completed = {"topic"}
+                self.assertTrue(runner._resume_stale_survey_contract_pivot(completed, by_id))
+                self.assertEqual(runner.continuation_cycles, 10)
+                self.assertEqual(runner.context["topic"]["status"], "research_expansion_required")
+                self.assertEqual(
+                    runner.context["topic"]["research_expansion_requests"][0]["kind"],
+                    "topic_refinement",
+                )
+            finally:
+                runner.close()
+
+    def test_continuation_fences_stale_stage_aggregate_and_unknown_attempt(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            try:
+                aggregate = runner._stage_task(workflow["stages"][0])
+                aggregate_attempt = f"{aggregate['task_id']}-attempt"
+                runner.tasks.start_attempt(
+                    aggregate["task_id"], aggregate_attempt, owner="command.composer",
+                    lease_ttl_seconds=60, payload={"stage_id": "survey"})
+                specialist_id = "composer-demo-workflow-survey-specialist"
+                runner.tasks.create(
+                    specialist_id, "production",
+                    {"stage_id": "survey", "assignment_id": "specialist-1"},
+                    "research.search-strategist")
+                runner.tasks.admit(specialist_id, "command.composer")
+                specialist_attempt = f"{specialist_id}-attempt"
+                runner.tasks.start_attempt(
+                    specialist_id, specialist_attempt, owner="research.search-strategist",
+                    lease_ttl_seconds=60, payload={"assignment_id": "specialist-1"})
+
+                retired = runner._retire_superseded_stage_tasks(
+                    {"survey"}, reason="superseded by a newly admitted continuation")
+
+                self.assertEqual(retired, [{
+                    "task_id": aggregate["task_id"],
+                    "stage_id": "survey",
+                    "state": "stale",
+                }])
+                self.assertEqual(runner.tasks.get(aggregate["task_id"])["state"], "stale")
+                self.assertEqual(
+                    runner.tasks.get_attempt(aggregate_attempt)["state"], "result_unknown")
+                self.assertEqual(runner.tasks.get(specialist_id)["state"], "running")
+                self.assertEqual(
+                    runner.tasks.get_attempt(specialist_attempt)["state"], "started")
+            finally:
+                runner.close()
+
+    def test_known_topic_contract_debt_is_eligible_for_one_resume_repair(self):
+        stage = {"kind": "topic_discovery"}
+        record = {
+            "status": "candidate_needs_review",
+            "failure_debt": {
+                "failure_class": "mechanical_contract",
+                "error": "ValidationError: feasibility_plan.project_artifact must declare a project_artifact input",
+            },
+        }
+        self.assertTrue(
+            ComposerRunner._release_blocked_topic_contract_retry_allowed(stage, record))
+        record["contract_recovery_admitted"] = True
+        self.assertFalse(
+            ComposerRunner._release_blocked_topic_contract_retry_allowed(stage, record))
+
     def test_experiment_recovery_specialists_receive_a_bounded_scientific_brief(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -1108,6 +1313,62 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(progress["status"], "paused")
             self.assertEqual(progress["phase"], "paused_process_interruption")
 
+    def test_specialist_live_cards_survive_an_ordinary_checkpoint(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            stage = workflow["stages"][0]
+            runner.stage_records[stage["id"]] = {
+                "kind": stage["kind"], "status": "running",
+                "assignment_task_ids": ["specialist-survey-cataloger"],
+            }
+            runner._checkpoint("survey:admitted", force=True)
+            runner._specialist_progress(stage["id"], {
+                "event": "dispatched", "role": "research.cataloger",
+                "role_id": "cataloger", "task_id": "specialist-survey-cataloger",
+                "stage_id": stage["id"], "execution_mode": "model",
+                "model": "qwen", "status": "running",
+            })
+            runner._checkpoint("survey:running", force=True)
+            progress = json.loads((root / "composer" / "output" / "progress.json").read_text())
+            live = progress["stages"][stage["id"]]["specialist_live"]
+            self.assertEqual(live["research.cataloger"]["task_id"],
+                             "specialist-survey-cataloger")
+            runner.close()
+
+    def test_blocker_projection_separates_recovered_history_from_live_stop(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            runner = ComposerRunner(self._workflow(root))
+            try:
+                runner.stage_records["survey"] = {"kind": "survey", "status": "running"}
+                runner.blockers = [
+                    {"stage_id": "survey", "reason": "old scientific failure",
+                     "recovery": "cycle_admitted"},
+                    {"stage_id": "survey", "reason": "forwarded finding",
+                     "gating": False, "release_blocking": False},
+                ]
+                self.assertEqual(runner._active_blockers(), [])
+
+                runner.stage_records["survey"]["status"] = "blocked"
+                runner.blockers.append({"stage_id": "survey", "reason": "current stop"})
+                active = runner._active_blockers()
+                self.assertEqual([item["reason"] for item in active], ["current stop"])
+                runner._checkpoint("survey:blocked", force=True)
+                progress = json.loads(
+                    (root / "composer" / "output" / "progress.json").read_text())
+                self.assertEqual(progress["blocker_counts"], {"active": 1, "historical": 3})
+                self.assertEqual(progress["active_blockers"][0]["reason"], "current stop")
+                progress["usage"] = {"model_calls": 7, "input_tokens": 11,
+                                     "output_tokens": 13, "openalex_requests": 17}
+                line = json.loads(_composer_progress_line(progress))
+                self.assertEqual(line["usage"]["model_calls"], 7)
+                self.assertEqual(line["blockers"], 1)
+                self.assertEqual(line["historical_blockers"], 3)
+            finally:
+                runner.close()
+
     def test_resume_uses_the_process_interruption_checkpoint_at_equal_frontier(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -1289,6 +1550,37 @@ class ComposerWorkflowTests(unittest.TestCase):
             finally:
                 runner.close()
 
+    def test_raw_topic_feasibility_boundary_failure_becomes_scientific_retry(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_config = root / "topic.json"
+            topic_config.write_text("{}")
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            stage = {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": str(topic_config.resolve()),
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            }
+            runner = ComposerRunner(workflow)
+            error = ValidationError(
+                "feasibility_plan.estimated_compute_seconds must be an integer between 1 and 604800")
+            try:
+                runner._execute_stage = lambda *args, **kwargs: (_ for _ in ()).throw(error)
+                with self.assertRaises(ValidationError) as raised:
+                    runner._run_stage(stage)
+                caught = raised.exception
+                self.assertTrue(caught.retryable_topic_intake)
+                self.assertTrue(caught.topic_intake_recoverable)
+                self.assertEqual(caught.topic_retry_reason,
+                                 "scientific_candidate_rejected")
+                self.assertTrue(runner._is_topic_intake_retry(caught, stage))
+            finally:
+                runner.close()
+
     def test_topic_budget_is_cumulative_across_isolated_attempts(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -1340,6 +1632,224 @@ class ComposerWorkflowTests(unittest.TestCase):
                 "topic", {"max_model_calls": 6}, scope="continuation")
             self.assertEqual(initial["max_model_calls"], 2)
             self.assertEqual(continuation["max_model_calls"], 4)
+            runner.close()
+
+    def test_reopened_stage_quota_isolated_per_admitted_cycle(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            runner.continuation_cycles = 1
+            runner.reopened_stage_ids = {"survey"}
+            runner.stage_records["survey"] = {
+                "kind": "survey",
+                # This is the prior cycle snapshot. It must not consume the
+                # fresh quota envelope before the reopened cycle dispatches.
+                "usage": {"model_calls": 80, "input_tokens": 100,
+                           "output_tokens": 20, "openalex_requests": 2},
+                "attempts": [
+                    {"state": "failed", "cycle": 0,
+                     "usage": {"model_calls": 80, "input_tokens": 100,
+                                "output_tokens": 20, "openalex_requests": 2}},
+                    {"state": "succeeded", "cycle": 1,
+                     "usage": {"model_calls": 12, "input_tokens": 40,
+                                "output_tokens": 10, "openalex_requests": 1}},
+                ],
+            }
+            survey = next(item for item in workflow["stages"] if item["id"] == "survey")
+            survey["quota"] = {
+                "max_model_calls": 24,
+                "max_input_tokens": 1000,
+                "max_output_tokens": 500,
+                "max_openalex_requests": 12,
+            }
+            self.assertEqual(runner._stage_usage("survey"), {
+                "model_calls": 12, "input_tokens": 40,
+                "output_tokens": 10, "openalex_requests": 1,
+            })
+            self.assertIsNone(runner._stage_quota_error(survey))
+            runner.close()
+
+    def test_stage_quota_exhaustion_admits_narrow_scoped_recovery(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            try:
+                runner.context["survey"] = {
+                    "kind": "survey", "status": "completed",
+                    "survey_current": True,
+                }
+                by_id = {item["id"]: item for item in workflow["stages"]}
+                error = QuotaExceededError(
+                    "stage survey quota exhausted: model_calls=97 > 96",
+                    dimension="max_model_calls", limit=96, observed=97,
+                    usage={"model_calls": 97},
+                )
+                self.assertTrue(runner._admit_stage_quota_recovery(
+                    by_id["survey"], error, set(), by_id))
+                self.assertEqual(runner.continuation_cycles, 1)
+                self.assertEqual(
+                    runner.context["survey"]["quota_recovery"]["mode"],
+                    "narrow_scope",
+                )
+                request = next(
+                    item for item in runner.active_research_requests
+                    if item.get("kind") == "literature_expansion")
+                self.assertIn("narrower decisive gate", request["objective"])
+                self.assertTrue(any(
+                    item.get("action") == "stage_quota_recovery_admitted"
+                    for item in runner.department_activity
+                ))
+            finally:
+                runner.close()
+
+    def test_openalex_cooldown_admits_bounded_crossref_fallback(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            descriptor = root / "survey-descriptor.json"
+            descriptor.write_text(json.dumps({
+                "survey": {
+                    "bibliography_fallback": "disabled",
+                    "identity": {"adapter": "crossref"},
+                }
+            }))
+            workflow["stages"][0]["config_path"] = str(descriptor.resolve())
+            runner = ComposerRunner(workflow)
+            try:
+                runner.stage_records["survey"] = {
+                    "kind": "survey", "status": "paused",
+                    "error": "ProviderCooldownError: OpenAlex survey retrieval is paused until the provider quota resets",
+                }
+                runner.retry_schedule["survey"] = {
+                    "error": "ProviderCooldownError: OpenAlex daily quota",
+                    "not_before_epoch": time.time() + 86400,
+                }
+                self.assertTrue(runner._resume_survey_provider_fallback({
+                    item["id"]: item for item in workflow["stages"]
+                }))
+                self.assertNotIn("survey", runner.retry_schedule)
+                self.assertEqual(
+                    runner.context["survey"]["provider_fallback"]["mode"],
+                    "crossref_metadata",
+                )
+                config = {
+                    "project_id": str(root / "survey"),
+                    "survey": {
+                        "revision": 5,
+                        "bibliography_fallback": "disabled",
+                        "seed_work_ids": [],
+                        "search": {
+                            "max_works": 120, "max_analyzed_works": 20,
+                            "challenge_reserve": 5, "queries_per_role": 3,
+                            "results_per_query": 10, "max_api_calls": 900,
+                            "max_full_texts": 40, "expansion_rounds": 3,
+                            "expansion_seed_count": 3, "saturation_rounds": 3,
+                        },
+                    },
+                }
+                with patch.object(runner, "_augment_full_text_routes"):
+                    adapted = runner._adapt_continuation_config(
+                        workflow["stages"][0], config)
+                self.assertEqual(
+                    adapted["survey"]["bibliography_fallback"], "crossref_metadata")
+                self.assertEqual(adapted["survey"]["search"]["max_works"], 20)
+                self.assertEqual(adapted["survey"]["search"]["expansion_rounds"], 0)
+                self.assertEqual(adapted["survey"]["search"]["max_api_calls"], 32)
+            finally:
+                runner.close()
+
+    def test_stage_work_order_projection_does_not_cross_contaminate_reopened_stages(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            runner = ComposerRunner(self._workflow(root))
+            runner.active_research_requests = [
+                {"id": "survey-repair", "source_stage_id": "survey",
+                 "kind": "literature_expansion", "objective": "Refresh the literature map."},
+                {"id": "experiment-repair", "source_stage_id": "experiment",
+                 "kind": "additional_experiment", "objective": "Run a control."},
+            ]
+            runner.reopened_stage_ids = {"survey", "experiment"}
+            self.assertEqual(
+                [item["id"] for item in runner._requests_for_stage("survey")],
+                ["survey-repair"],
+            )
+            self.assertEqual(
+                [item["id"] for item in runner._requests_for_stage("experiment")],
+                ["experiment-repair"],
+            )
+            runner.close()
+
+    def test_topic_refinement_supersedes_downstream_work_orders(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            runner = ComposerRunner(workflow)
+            runner.context = {
+                "topic": {
+                    "kind": "topic_discovery", "status": "research_expansion_required",
+                    "research_expansion_requests": [{
+                        "id": "topic-repair", "kind": "topic_refinement",
+                        "owner": "research.intelligence", "objective": "Change direction.",
+                        "why": "The old direction was not supported.",
+                        "success_condition": "A new admitted topic.",
+                        "evidence_needed": "Source-grounded feasibility.",
+                    }],
+                },
+                "experiment": {
+                    "kind": "experiment", "status": "research_expansion_required",
+                    "research_expansion_requests": [{
+                        "id": "stale-experiment-repair", "kind": "additional_experiment",
+                        "owner": "methods.validation", "objective": "Repair the old experiment.",
+                        "why": "The previous frontier failed.",
+                        "success_condition": "A valid result.",
+                        "evidence_needed": "Raw output.",
+                    }],
+                },
+            }
+            requests = runner._continuation_requests()
+            self.assertEqual([item["id"] for item in requests], ["topic-repair"])
+            runner.close()
+
+    def test_restored_requests_are_fenced_to_the_new_topic_frontier(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            runner = ComposerRunner(workflow)
+            runner.context["topic"] = {
+                "kind": "topic_discovery", "status": "completed",
+                "topic": {"id": "new-topic"},
+                "topic_evolution": {"mode": "refinement", "cycle": 3},
+            }
+            runner.stage_records["topic"] = {"status": "completed"}
+            requests = [
+                {"id": "legacy", "source_stage_id": "experiment"},
+                {"id": "current", "source_stage_id": "experiment",
+                 "topic_id": "new-topic", "topic_cycle": 3},
+            ]
+            self.assertEqual(
+                [item["id"] for item in runner._scope_active_research_requests(requests)],
+                ["current"],
+            )
             runner.close()
 
     def test_terminal_topic_failure_closes_active_revalidation_order(self):
@@ -2753,6 +3263,31 @@ class ComposerWorkflowTests(unittest.TestCase):
                     "SELECT state FROM tasks WHERE task_id=?", (recovery_task,)).fetchone()[0],
                     "completed")
 
+    def test_resuming_after_stale_continuation_task_uses_recovery_generation(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            try:
+                runner.continuation_cycles = 1
+                runner.reopened_stage_ids = {"survey"}
+                first = runner._stage_task(workflow["stages"][0])
+                runner.tasks.transition(
+                    first["task_id"], "stale", "command.composer",
+                    reason="watchdog fenced the prior continuation",
+                )
+                runner.stage_records["survey"] = {
+                    "kind": "survey", "status": "retrying",
+                    "attempt_id": "prior-attempt",
+                }
+                recovered = runner._stage_task(workflow["stages"][0])
+                self.assertNotEqual(recovered["task_id"], first["task_id"])
+                self.assertIn("recovery-", recovered["task_id"])
+                self.assertEqual(recovered["state"], "queued")
+                self.assertEqual(runner.tasks.get(first["task_id"])["state"], "stale")
+            finally:
+                runner.close()
+
     def test_terminal_run_report_does_not_mask_a_more_advanced_live_checkpoint(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -2889,6 +3424,55 @@ class ComposerWorkflowTests(unittest.TestCase):
             runner._run_stage = fake_stage
             result = runner.run()
             self.assertEqual(calls, ["experiment"])
+
+    def test_reopened_topic_cycle_does_not_reuse_blocked_stage_cache(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            topic_stage = {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": str((root / "stage.json").resolve()),
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            }
+            workflow["stages"].insert(0, topic_stage)
+            runner = ComposerRunner(workflow)
+            try:
+                runner.continuation_cycles = 1
+                runner.reopened_stage_ids = {"topic"}
+                runner.context["topic"] = {
+                    "kind": "topic_discovery",
+                    "review_status": "topic_budget_exhausted",
+                }
+                calls = []
+
+                def blocked(stage, **kwargs):
+                    calls.append("blocked")
+                    raise ModelWorkBlocked("the previous topic envelope was exhausted")
+
+                with patch.object(runner, "_execute_stage", side_effect=blocked):
+                    with self.assertRaises(ModelWorkBlocked):
+                        runner._run_stage(topic_stage)
+
+                output = topic_dir / "output" / "topic.json"
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(json.dumps({"status": "completed"}))
+
+                def recovered(stage, **kwargs):
+                    calls.append("recovered")
+                    return {
+                        "status": "completed", "output_path": str(output.resolve()),
+                    }
+
+                with patch.object(runner, "_execute_stage", side_effect=recovered):
+                    result = runner._run_stage(topic_stage)
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(calls, ["blocked", "recovered"])
+            finally:
+                runner.close()
 
     def test_free_topic_checkpoint_reuse_is_opt_in(self):
         with tempfile.TemporaryDirectory() as path:

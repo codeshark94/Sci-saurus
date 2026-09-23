@@ -12,6 +12,8 @@ import time
 import unittest
 
 from scisaurus.core.errors import ValidationError
+from scisaurus.core.events import ControlStore
+from scisaurus.core.store import ArtifactStore
 from scisaurus.runtime.config import validate_config
 from scisaurus.runtime.execution import ExecutionRuntime
 from scisaurus.tests.test_runner import config
@@ -65,6 +67,18 @@ def provider_exhaustion_worker(kind, params, channel):
 
 
 class TestExecutionRuntime(unittest.TestCase):
+    def test_crash_created_empty_scaffold_is_initialized_as_a_fresh_run(self):
+        value = validate_config(config())
+        run_dir = self.root / "empty-scaffold"
+        control = ControlStore(run_dir)
+        ArtifactStore(control).init_project(principal_note="crash-before-run-config")
+        control.close()
+
+        runtime = ExecutionRuntime(run_dir, value, worker_target=execution_worker)
+        self.runtimes.append(runtime)
+        self.assertIsNotNone(runtime.store.head("inputs/run-config"))
+        self.assertIsNone(runtime.resume_session)
+
     def test_single_pool_rate_limit_stops_pending_dispatch_and_survives_resume(self):
         value = config()
         value["limits"].update(concurrent_calls=2, wall_clock_seconds=20, checkpoint_seconds=1)

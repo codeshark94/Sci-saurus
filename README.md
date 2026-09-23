@@ -55,9 +55,11 @@ Autonomous missions can use `progression_policy: forward_first`: after a
 bounded attempt budget, an actionable mechanical or scientific blocker becomes
 a clearly marked `candidate_needs_review` node with a failure-debt artifact and
 a deferred backfill order. The graph can continue to downstream work, then
-return to that debt at a bounded continuation cycle. Release remains blocked by
-the unresolved debt; provider quotas, cooldowns, unknown calls, and the hard
-mission deadline still stop safely.
+return to that debt at a bounded continuation cycle. In this policy the
+Composer, not the deterministic harness, authorizes dependency release; the
+candidate remains visibly unverified and cannot be treated as accepted
+evidence or an external release. Provider quotas, cooldowns, unknown calls,
+and the hard mission deadline still stop safely.
 
 The same runtime can also produce bounded reports, guides, JSON artifacts, and
 Python source units. A scientific result is never inferred from a model response
@@ -226,7 +228,7 @@ before using live providers.
 ## Guardrails that matter
 
 - **Human authority is explicit.** The Principal owns mission scope and final release.
-- **Scientific recovery is autonomous.** A hold, rejected direction, or missing typed repair order produces a cycle-specific work order, changes the strategy, and reopens only the affected closure. In `forward_first`, an actionable blocker is first carried as release-blocking failure debt so the rest of the graph can move; the debt becomes a bounded backfill order after the first pass. Human input is not the normal next step.
+- **Scientific recovery is autonomous.** A hold, rejected direction, or missing typed repair order produces a cycle-specific work order, changes the strategy, and reopens only the affected closure. In `forward_first`, an actionable blocker is carried as non-gating failure debt after Composer admission so the rest of the graph can move; the debt becomes a bounded backfill order after the first pass. Human input is not the normal next step.
 - **Only real fences stop autonomous progress.** Topic intake retries share one bounded intake envelope, and every deliberate continuation pivot receives its own bounded envelope. Provider/account limits, API policy, worker capacity, and the mission deadline remain independently reserved and recorded; a historical pivot cannot exhaust the budget of a newly admitted direction.
 - **Resource fences are not scientific decisions.** A resettable provider/API cooldown is waited out and retried automatically in autonomous mode; exhausted quotas, worker capacity, and the mission deadline remain hard resource boundaries recorded in the checkpoint, never scientific conclusions.
 - **Failure is not success.** A timeout, provider block, malformed response, or rejected review remains visible and scoped.
@@ -234,6 +236,7 @@ before using live providers.
 - **Experiments are bounded.** A deterministic replay proves reproducibility of the pinned execution, not mathematical truth or real-world novelty.
 - **Topic feasibility is explicit.** A prose feasibility note is never enough: experiment-backed topic admission checks the actual execution boundary, every input, dependency availability, network use, provider/model work, compute estimate, and disconfirmation-oriented study shape. The current deterministic project boundary admits only self-contained closed-world inputs, zero experiment-side API/model calls, and the foundry timeout; topic intake has its own bounded intake/continuation envelopes.
 - **OpenAlex topic intake fails closed.** Provider cooldown state is persisted; 429s stop fresh query variants until the recorded provider boundary, while bounded retries honor provider cooldown metadata. Crossref identity metadata cannot substitute for the citation graph used for topic discovery.
+- **OpenAlex budget state is shared.** Composer migrates legacy topic/survey state into one credential-scoped ledger under `local-private/provider-state/`, reserves a small remaining-credit margin, and reuses normalized topic pages from the shared cache. A fresh continuation cannot reset the provider budget by changing stage or project directories.
 - **Specialists are on demand.** A 34-role roster does not mean 34 model processes are running.
 - **Forward progress is explicit.** A provisional candidate is never silently promoted: its artifact, failure class, unresolved debt, and backfill order remain visible in the checkpoint and assignment ledger.
 - **LangGraph is optional, not the control plane.** The native Composer, TaskManager, and ArtifactStore own lifecycle and provenance; adapters can be used per department where useful.

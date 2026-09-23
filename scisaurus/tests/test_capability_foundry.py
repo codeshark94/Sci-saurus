@@ -11,9 +11,11 @@ from scisaurus.core.errors import ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.capability_foundry import (CapabilityFoundry, CapabilityDeadlineError,
-                                                apply_authoring_patch, program_failure_context,
-                                                PROGRAM_REVIEW_CHECKS)
+from scisaurus.runtime.capability_foundry import (
+    CapabilityFoundry, CapabilityDeadlineError, CapabilityModelBudgetExceeded,
+    apply_authoring_patch, normalize_capability_candidate, program_failure_context,
+    PROGRAM_REVIEW_CHECKS,
+)
 from unittest.mock import patch
 from scisaurus.runtime.capability_registry import load_registry
 from scisaurus.runtime.experiment import ExperimentRunner
@@ -257,6 +259,16 @@ class CapabilityFoundryTests(unittest.TestCase):
             self.assertTrue(outcome["candidate"]["runtime"]["python"].startswith(
                 f"{sys.version_info.major}.{sys.version_info.minor}."))
 
+    def test_model_call_budget_stops_before_independent_review_can_repeat(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            author = StubClient(self._payload())
+            with self.assertRaises(CapabilityModelBudgetExceeded):
+                foundry.generate("bounded comparison", client=author, model_call_budget=1)
+            self.assertEqual(author.calls, 1)
+            self.assertEqual(foundry.reviewer_client.calls, 0)
+
     def test_author_cannot_replace_the_configured_test_data(self):
         payload = self._payload()
         payload["test_input"] = {"invented_data": [1, 2, 3]}
@@ -265,6 +277,30 @@ class CapabilityFoundryTests(unittest.TestCase):
             foundry.max_attempts = 1
             with self.assertRaisesRegex(ValidationError, "controller-owned configured_input"):
                 foundry.generate("bounded comparison", client=StubClient(payload))
+
+    def test_identifier_drift_is_normalized_across_intent_and_program_sources(self):
+        payload = self._payload()
+        drifted = "Max_DvPdP_Window"
+        payload["experiment_intent"] = deepcopy(payload["experiment_intent"])
+        payload["experiment_intent"]["primary_outcomes"][0]["id"] = drifted
+        payload["executor_source"] = payload["executor_source"].replace("tail_error", drifted)
+        payload["validator_source"] = payload["validator_source"].replace("tail_error", drifted)
+        normalized, repairs = normalize_capability_candidate(payload)
+        self.assertEqual(
+            normalized["experiment_intent"]["primary_outcomes"][0]["id"],
+            "max_dvpdp_window",
+        )
+        self.assertNotIn(drifted, normalized["executor_source"])
+        self.assertNotIn(drifted, normalized["validator_source"])
+        self.assertEqual(len(repairs), 1)
+        with tempfile.TemporaryDirectory() as path:
+            outcome = self._foundry(Path(path)).generate(
+                "bounded comparison", client=StubClient(payload))
+            self.assertEqual(outcome["status"], "registered")
+            self.assertEqual(
+                outcome["candidate"]["experiment_intent"]["primary_outcomes"][0]["id"],
+                "max_dvpdp_window",
+            )
 
     def test_metadata_repair_retains_sources_and_revalidates_the_assembled_program(self):
         payload = self._payload()
@@ -649,7 +685,9 @@ class CapabilityFoundryTests(unittest.TestCase):
             complete = reviewer.complete
             def repair(**kwargs):
                 if reviewer.calls:
-                    self.assertIn("format_repair", json.loads(kwargs["prompt"]))
+                    repair_contract = json.loads(kwargs["prompt"])["format_repair"]
+                    self.assertEqual(set(repair_contract["required_check_ids"]), PROGRAM_REVIEW_CHECKS)
+                    self.assertIn("independent_validation", repair_contract["instructions"])
                     reviewer.payload = self._review_payload()
                 return complete(**kwargs)
             reviewer.complete = repair
@@ -793,6 +831,41 @@ class CapabilityFoundryTests(unittest.TestCase):
             self.assertEqual(states[-1]["last_attempt"]["executor_source"], payload["executor_source"])
             self.assertEqual(len(states[-1]["requests"]), 2)
 
+    def test_repeated_admission_gate_stops_before_authoring_budget_is_spent(self):
+        payload = self._payload()
+
+        class VaryingAuthor:
+            def __init__(self, value):
+                self.value = value
+                self.calls = 0
+
+            def complete(self, *, system, prompt):
+                self.calls += 1
+                candidate = deepcopy(self.value)
+                candidate["executor_source"] = (
+                    f"# repair-{self.calls}\n" + candidate["executor_source"])
+                return ModelResult(json.dumps(candidate), "author", {"model_calls": 1}, 0.0, "stop")
+
+        rejecting_review = StubClient({
+            "status": "rejected",
+            "checks": [
+                {"id": key, "outcome": "failed", "evidence": "The fixture is not scientifically adequate."}
+                for key in sorted(PROGRAM_REVIEW_CHECKS)
+            ],
+            "findings": [{"severity": "blocking", "finding": "same gate defect",
+                           "evidence": "same evidence", "required_change": "change the design"}],
+            "limitations": ["The fixture remains bounded."],
+        })
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            foundry.reviewer_client = rejecting_review
+            author = VaryingAuthor(payload)
+            with self.assertRaisesRegex(ModelWorkBlocked, "adversarial_review repair budget exhausted"):
+                foundry.generate("bounded comparison", client=author)
+            self.assertEqual(author.calls, 2)
+            self.assertEqual(rejecting_review.calls, 2)
+
     def test_alternating_validation_errors_cannot_consume_the_full_allowance(self):
         client = StubClient({})
         def alternate(*, system, prompt):
@@ -823,6 +896,22 @@ class CapabilityFoundryTests(unittest.TestCase):
             self.assertEqual(outcome["status"], "registered")
             self.assertEqual(client.calls, 1)
             self.assertEqual(foundry.generate("bounded comparison", client=client, work_cache=cache), outcome)
+            self.assertEqual(client.calls, 1)
+
+    def test_author_outer_json_closer_is_repaired_without_a_second_model_call(self):
+        payload = self._payload()
+
+        class TruncatedEnvelopeClient(StubClient):
+            def complete(self, *, system, prompt):
+                self.calls += 1
+                return ModelResult(json.dumps(self.payload)[:-1], "stub",
+                                   {"model_calls": 1}, 0.0, "stop")
+
+        with tempfile.TemporaryDirectory() as path:
+            foundry = self._foundry(Path(path))
+            client = TruncatedEnvelopeClient(payload)
+            outcome = foundry.generate("bounded comparison", client=client)
+            self.assertEqual(outcome["status"], "registered")
             self.assertEqual(client.calls, 1)
 
     def test_deadline_blocks_dispatch_before_a_model_call(self):

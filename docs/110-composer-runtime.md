@@ -47,19 +47,22 @@ dependencies and provider failures do not become successful research. The
 legacy `evidence_first` policy remains the default for existing workflows.
 
 `progression_policy: forward_first` is the autonomous-lab operating mode. It
-does not weaken release gates or turn an error into a scientific result. After
-at most two attempts, a mechanical contract defect or actionable scientific hold
-is materialized as a `candidate_needs_review` node with a
+does not weaken scientific release gates or turn an error into a scientific
+result. After at most two attempts, a mechanical contract defect or actionable
+scientific hold is materialized as a `candidate_needs_review` node with a
 `composer-forward-progress-1` artifact, a failure class, and an explicit
-`failure_debt`. The dependency graph may continue to downstream analysis using
-that node only as provisional context; release remains blocked. At the end of
-the first graph pass, the debt is converted into a typed backfill work order and
-the affected closure is reopened for at most two continuation cycles. Resource
-fences (provider cooldown/quota, unknown external outcome, process interruption,
-and the hard deadline) do not get guessed through: they remain paused or
-blocked with their durable reason. This prevents one malformed response or
-over-strict local gate from monopolizing the mission while preserving a precise
-route back to the missing work.
+`failure_debt`. Once the Composer has admitted the stage, that node is
+dependency-releasable with `composer_decision: advance_with_findings`; the
+deterministic harness records the finding but cannot veto downstream dispatch.
+The candidate remains `evidence_state: unverified`, and external release still
+requires the normal evidence contract. At the end of the first graph pass, the
+debt is converted into a typed backfill work order and the affected closure is
+reopened for at most two continuation cycles. Resource fences (provider
+cooldown/quota, unknown external outcome, process interruption, and the hard
+deadline) do not get guessed through: they remain paused or blocked with their
+durable reason. This prevents one malformed response or over-strict local gate
+from monopolizing the mission while preserving a precise route back to the
+missing work.
 
 Completed specialist assignments and checked survey responses are retained by
 their exact input, role, contract and model configuration. Successful siblings
@@ -251,6 +254,18 @@ evaluate a new direction without charging that direction against unrelated
 historical pivots. The budgets must not be confused with provider/account
 limits or the per-call output contract.
 
+OpenAlex account state is a separate cross-mission ledger. Composer exposes
+`local-private/provider-state/openalex-rate-state.json` to every owner-local
+stage while preserving each descriptor's stage-local path for provenance. The
+ledger serializes request admission, promotes daily-budget cooldowns to the
+credential-wide scope, and migrates legacy topic/survey state on first use.
+Successful responses that leave only the configured reserve are fenced before
+the next request, so a continuation cannot spend a fresh local envelope
+against an already exhausted provider balance. Topic search pages use the
+shared `local-private/provider-cache/topic-openalex.json` with normalized query
+keys and an interprocess merge lock; a wording variant or a new mission can
+reuse an existing source page without issuing another OpenAlex call.
+
 For a free-topic mission, `topic_discovery` runs before the survey. It queries
 OpenAlex with objective-derived and broad recent-literature searches, filters to
 a four-year recent publication window (falling back to the newest returned
@@ -275,7 +290,8 @@ required changes travel with it. Under `evidence_first` it cannot reach an
 experiment unless the survey establishes `eligible_for_experiment`; `full_pass`
 and `forward_first` also permit a clearly labelled exploratory pilot after a
 current survey and assessment. In `forward_first`, any resulting experiment or
-paper remains release-blocking until its carried evidence debt is backfilled. A
+paper remains visibly provisional and non-releasable as scientific evidence
+until its carried evidence debt is backfilled. A
 direction below the exploratory
 floor is regenerated with a substantive change. The topic artifact keeps
 the accepted review chain and a separate history of rejected or refined

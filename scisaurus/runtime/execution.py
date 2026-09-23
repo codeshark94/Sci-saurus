@@ -15,7 +15,7 @@ import uuid
 from scisaurus.core.budget import BudgetManager, _quantities
 from scisaurus.core.changes import ChangeService
 from scisaurus.core.documents import Documents
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import QuotaExceededError, ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.progress import ProgressManager
 from scisaurus.core.schema import TASK_KINDS, canonical_bytes
@@ -144,18 +144,44 @@ class ExecutionRuntime:
     The owner passes validated configuration and a spawn-picklable worker.
     Unknown external outcomes retain their reservations until reconciliation.
     """
+    @staticmethod
+    def _is_empty_scaffold(control):
+        """Allow a crash-created project shell to be initialized once.
+
+        ``ControlStore`` is created before the runner can publish its durable
+        input configuration.  If that process dies in the narrow interval
+        after project initialization, a later fresh dispatch must not mistake
+        the shell for an existing run and enter resume validation.  Any
+        artifact, task, or non-genesis event makes the workspace durable and
+        therefore ineligible for this fresh-start path.
+        """
+        if control._conn.execute(
+                "SELECT 1 FROM artifacts LIMIT 1").fetchone() is not None:
+            return False
+        if control._conn.execute(
+                "SELECT 1 FROM tasks LIMIT 1").fetchone() is not None:
+            return False
+        events = control._conn.execute(
+            "SELECT event_type FROM events ORDER BY seq").fetchall()
+        return all(row["event_type"] == "project.created" for row in events)
+
     def __init__(self, project_dir, config, *, worker_target, on_progress=None,
                  resume_policy=None, repository_root=None):
         self.config = config
         self.worker_target = worker_target
         self.dir = Path(project_dir).resolve()
         existing = (self.dir / "state" / "control.sqlite").exists()
-        if existing and resume_policy is None:
-            raise ValidationError("run requires a new project directory; inspect existing runs without overwriting them")
-        if not existing and resume_policy is not None:
-            raise ValidationError("resume requires an existing durable run")
         self.control = ControlStore(self.dir)
         self.store = ArtifactStore(self.control)
+        if existing and resume_policy is None:
+            if self._is_empty_scaffold(self.control):
+                existing = False
+            else:
+                self.control.close()
+                raise ValidationError("run requires a new project directory; inspect existing runs without overwriting them")
+        if not existing and resume_policy is not None:
+            self.control.close()
+            raise ValidationError("resume requires an existing durable run")
         self.store.init_project(principal_note=self.config["project_id"])
         self.documents = Documents(self.control, self.store)
         self.changes = ChangeService(self.control, self.store, self.documents)
@@ -190,6 +216,7 @@ class ExecutionRuntime:
         # healthy alternate route instead of repeatedly hammering the dead
         # pool.
         self.provider_cooldowns = {}
+        self.model_calls_dispatched = 0
         for pool in self.provider_pools:
             record = self.store.head(f"command/provider-cooldowns/{pool}")
             if record:
@@ -259,6 +286,12 @@ class ExecutionRuntime:
         }])[task_id]
         self._ensure_active()
         if not outcome["ok"]:
+            if outcome.get("error_type") == "quota":
+                raise QuotaExceededError(
+                    outcome["error"], dimension="max_model_calls",
+                    limit=self.config.get("limits", {}).get("max_model_calls"),
+                    observed=self.model_calls_dispatched,
+                )
             raise ModelCallError(
                 outcome["error"], outcome_known=outcome["outcome_known"],
                 status_code=outcome.get("status_code"),
@@ -328,6 +361,18 @@ class ExecutionRuntime:
                     if index is None:
                         break
                     raw_spec = pending.pop(index)
+                    if (raw_spec["kind"] == "model"
+                            and type(self.config.get("limits", {}).get("max_model_calls")) is int
+                            and self.model_calls_dispatched >= self.config["limits"]["max_model_calls"]):
+                        outcome = self._undispatched(
+                            raw_spec,
+                            "stage model-call quota exhausted before dispatch",
+                            error_type="quota",
+                        )
+                        logical_task_id = raw_spec.get("_logical_task_id", raw_spec["task_id"])
+                        self._finalize_logical_task(logical_task_id, raw_spec["task_id"], outcome)
+                        outcomes[logical_task_id] = outcome
+                        continue
                     if context_block is not None:
                         outcome = self._undispatched(raw_spec, context_block.reason)
                         logical_task_id = raw_spec.get("_logical_task_id", raw_spec["task_id"])
@@ -349,6 +394,8 @@ class ExecutionRuntime:
                     self._reserve_provider(entry)
                     active[spec["task_id"]] = entry
                     self._set_active(active)
+                    if spec["kind"] == "model":
+                        self.model_calls_dispatched += 1
                     self._dispatch(entry)
                 if not active:
                     for spec in pending:
@@ -860,6 +907,8 @@ class ExecutionRuntime:
         for key in ("status_code", "retry_after_seconds"):
             if message.get(key) is not None:
                 result[key] = message[key]
+        if message.get("error_type") is not None:
+            result["error_type"] = message["error_type"]
         return result
 
     def _block_pending(self, spec, reason):

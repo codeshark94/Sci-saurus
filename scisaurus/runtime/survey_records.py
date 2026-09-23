@@ -10,6 +10,38 @@ SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
 GAP_CHECKS = ("closest-prior-work", "scope-comparability", "counterevidence", "full-text-support")
 
 
+def normalize_check_envelope(value, required):
+    """Project a model envelope to the checks actually assigned.
+
+    Reviewers sometimes append question-specific diagnostics or repeat a
+    required row after completing the requested checks. Those extra rows are
+    outside the assignment contract and cannot affect admission. Projection is
+    allowed only when every required ID occurs exactly once; missing required
+    checks still fail normally.
+    """
+    if not isinstance(value, dict) or not isinstance(value.get("checks"), list):
+        return value
+    required = tuple(required)
+    required_ids = set(required)
+    rows = value["checks"]
+    counts = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            return value
+        check_id = row.get("check_id")
+        if check_id in required_ids:
+            counts[check_id] = counts.get(check_id, 0) + 1
+    if set(counts) != required_ids or any(count != 1 for count in counts.values()):
+        return value
+    projected = dict(value)
+    # Preserve the model's requested order.  The acceptance gate treats check
+    # IDs as a set, while replay compares the completed envelope byte-for-byte
+    # at the list level; reordering here would turn a valid response into a
+    # false mismatch when the caller supplied a different but valid order.
+    projected["checks"] = [row for row in rows if row.get("check_id") in required_ids]
+    return projected
+
+
 def evidence(items, sources, *, required=False, require_spans=False, windows=None):
     if not isinstance(items, list) or (required and not items):
         raise ValidationError("asserted statements require explicit source evidence")

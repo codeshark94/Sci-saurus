@@ -201,8 +201,8 @@ the specialist's own deadline and acceptance contract still decide whether a
 useful result is produced, and an unfinished closure is never reported as a
 release. This deadline-governed mode is the default for legacy workflows. The
 `forward_first` mission policy clamps retries to at most two attempts, carries
-actionable failure debt as a release-blocking provisional artifact, and lets
-the agenda return later through a bounded work order. A small deterministic job
+actionable failure debt as a non-gating provisional artifact after Composer
+admission, and lets the agenda return later through a bounded work order. A small deterministic job
 may opt into `mode: bounded` with a maximum of one to eight attempts; bounded
 jobs retain the full-closure reservation and pause when it cannot fit. Every
 attempt, error, retry decision, provisional artifact, and residual-window
@@ -247,12 +247,12 @@ consumer can read that hold's packet, or the workflow returns the hold when no
 authorized continuation remains.
 
 In `forward_first`, a mechanical or scientific blocker is allowed to satisfy
-the scheduling dependency only as a provisional, release-blocking candidate;
-the exact failure debt is converted into a typed backfill order after the
-first graph pass. The downstream stages may inspect that candidate and record
-their own limitations, but cannot release it as accepted evidence. Resource
-fences and unknown external outcomes remain hard stops rather than provisional
-science.
+the scheduling dependency as a provisional, non-gating candidate once the
+Composer has admitted the stage; the exact failure debt is converted into a
+typed backfill order after the first graph pass. The downstream stages may
+inspect that candidate and record their own limitations, but neither the
+candidate nor its debt is accepted evidence. Resource fences and unknown
+external outcomes remain hard stops rather than provisional science.
 
 **D62 — Templates seed a live project organization; they do not prescribe its work.**
 Each Composer project materializes a versioned department charter, durable

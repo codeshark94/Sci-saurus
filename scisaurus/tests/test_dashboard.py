@@ -7,6 +7,7 @@ import unittest
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from scisaurus.core.schema import canonical_bytes
 from scisaurus.dashboard.server import DashboardServer, DashboardService, DashboardSnapshot
 from scisaurus.runtime.argument_defense import build_argument_defense
 from scisaurus.runtime.research_program import build_research_program
@@ -81,6 +82,27 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(any(item["ref"] == "project::output/progress.json"
                             for item in snapshot["checkpoints"]))
         self.assertEqual((root / "README.md").read_text(encoding="utf-8"), "# Dashboard fixture\n")
+
+    def test_snapshot_does_not_present_recovered_blocker_history_as_live(self):
+        temporary, root = self.make_project()
+        self.addCleanup(temporary.cleanup)
+        progress_path = root / "output" / "progress.json"
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        progress["blockers"] = [
+            {"stage_id": "survey", "reason": "old failure", "recovery": "cycle_admitted"},
+            {"stage_id": "survey", "reason": "forwarded finding",
+             "gating": False, "release_blocking": False},
+        ]
+        progress["stages"]["survey"]["status"] = "running"
+        progress_path.write_text(json.dumps(progress), encoding="utf-8")
+
+        snapshot = DashboardSnapshot(root).payload()
+
+        self.assertEqual(snapshot["live"]["blockers"], [])
+        self.assertEqual(snapshot["live"]["blocker_counts"], {"active": 0, "historical": 2})
+        overview = DashboardService(root).workspace()
+        self.assertEqual(overview["projects"][0]["blocker_count"], 0)
+        self.assertEqual(overview["projects"][0]["historical_blocker_count"], 2)
 
     def test_snapshot_discovers_latest_retry_workspace_from_stage_attempt_ledger(self):
         temporary, root = self.make_project()
@@ -411,7 +433,13 @@ class DashboardTests(unittest.TestCase):
         root = Path(temporary.name)
         stage_config = root / "stage.json"
         stage_dir = root / "stage"
-        stage_config.write_text("{}\n", encoding="utf-8")
+        stage_config.write_text(json.dumps({
+            "limits": {"max_rounds": 2},
+            "survey": {"search": {
+                "max_analyzed_works": 20, "max_full_texts": 40,
+                "expansion_rounds": 3, "saturation_rounds": 3,
+            }},
+        }) + "\n", encoding="utf-8")
         stage_dir.mkdir()
         template = {
             "schema_version": "composer-workflow-1",
@@ -451,7 +479,22 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(workflow["id"], "mission-fixture-run")
         self.assertEqual(workflow["objective"], "Test an isolated Composer project lifecycle.")
         self.assertEqual(Path(workflow["project_id"]).resolve(), (target / "composer").resolve())
+        self.assertEqual(workflow["progression_policy"], "forward_first")
+        self.assertEqual(workflow["agenda_policy"], {"mode": "adaptive"})
+        self.assertEqual(workflow["retry_policy"]["max_attempts"], 2)
+        self.assertEqual(workflow["continuation_policy"]["max_cycles"], 2)
         self.assertTrue(all(Path(stage["project_dir"]).is_dir() for stage in workflow["stages"]))
+        self.assertTrue(all(Path(stage["config_path"]).is_file() for stage in workflow["stages"]))
+        self.assertTrue(all(
+            Path(stage["config_path"]).resolve().is_relative_to(target.resolve())
+            for stage in workflow["stages"]
+        ))
+        copied_config = json.loads(Path(workflow["stages"][0]["config_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(copied_config["limits"]["max_rounds"], 1)
+        self.assertEqual(copied_config["survey"]["search"]["max_analyzed_works"], 12)
+        self.assertEqual(copied_config["survey"]["search"]["max_full_texts"], 12)
+        self.assertEqual(copied_config["survey"]["search"]["expansion_rounds"], 1)
+        self.assertEqual(copied_config["survey"]["search"]["saturation_rounds"], 1)
         self.assertFalse(any(path.name.startswith(".workflow-") for path in target.iterdir()))
 
         projects = service.projects()["projects"]
@@ -480,6 +523,67 @@ class DashboardTests(unittest.TestCase):
             action = json.loads(response.read())
         self.assertEqual(response.status, 201)
         self.assertEqual(action["project"], "missions/http-run")
+
+    def test_project_manager_rehashes_relocated_capability_registry(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        capability_dir = root / "registry" / "capabilities" / "fixture_capability" / "r1"
+        capability_dir.mkdir(parents=True)
+        (root / "stage.json").write_text("{}\n", encoding="utf-8")
+        executor = "print('executor')\n"
+        validator = "print('validator')\n"
+        (capability_dir / "executor.py").write_text(executor, encoding="utf-8")
+        (capability_dir / "validator.py").write_text(validator, encoding="utf-8")
+        candidate = {"source": str(root / "stage.json")}
+        admission = {"source": str(root / "stage.json")}
+        descriptor = {"source": str(root / "stage.json")}
+        for name, value in (("candidate.json", candidate), ("admission.json", admission),
+                            ("capability.json", descriptor)):
+            (capability_dir / name).write_bytes(canonical_bytes(value))
+
+        def digest_json(value):
+            return hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+        index = {
+            "schema_version": "experiment-capability-registry-1",
+            "capabilities": [{
+                "id": "fixture_capability", "revision": 1,
+                "path": str((capability_dir / "capability.json").resolve()),
+                "descriptor_sha256": digest_json(descriptor),
+                "executor_sha256": hashlib.sha256(executor.encode()).hexdigest(),
+                "validator_sha256": hashlib.sha256(validator.encode()).hexdigest(),
+                "candidate_record_sha256": digest_json(candidate),
+                "admission_sha256": digest_json(admission),
+            }],
+        }
+        index_path = root / "registry" / "capabilities" / "index.json"
+        index_path.write_bytes(canonical_bytes(index))
+        (root / "workflow.json").write_text(json.dumps({
+            "schema_version": "composer-workflow-1", "id": "dashboard-template", "revision": 1,
+            "project_id": str((root / "composer").resolve()), "objective": "registry fixture",
+            "stages": [{"id": "survey", "kind": "survey", "config_path": str((root / "stage.json").resolve()),
+                        "project_dir": str((root / "projects" / "survey").resolve()), "depends_on": [],
+                        "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                        "reuse_completed": False, "reuse_output_path": None}],
+            "time_policy": {"first_result_seconds": 1, "target_seconds": 10,
+                             "hard_seconds": 30, "checkpoint_seconds": 1},
+            "completion": {"required_stage_ids": ["survey"], "release_requires_human": True},
+        }), encoding="utf-8")
+
+        service = DashboardService(root)
+        service.create_project({"template": ".", "slug": "registry-run",
+                                "objective": "Test registry relocation integrity.", "hard_seconds": 3600})
+        target = root / "missions" / "registry-run"
+        cloned_index = json.loads((target / "registry" / "capabilities" / "index.json").read_text())
+        entry = cloned_index["capabilities"][0]
+        revision = target / "registry" / "capabilities" / "fixture_capability" / "r1"
+        self.assertEqual(entry["descriptor_sha256"], digest_json(json.loads((revision / "capability.json").read_text())))
+        self.assertEqual(entry["candidate_record_sha256"], digest_json(json.loads((revision / "candidate.json").read_text())))
+        self.assertEqual(entry["admission_sha256"], digest_json(json.loads((revision / "admission.json").read_text())))
+        self.assertEqual(entry["executor_sha256"], hashlib.sha256((revision / "executor.py").read_bytes()).hexdigest())
+        self.assertEqual(entry["validator_sha256"], hashlib.sha256((revision / "validator.py").read_bytes()).hexdigest())
+        self.assertTrue(str(target) in entry["path"])
 
 
 if __name__ == "__main__":

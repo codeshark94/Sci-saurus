@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import json
 import sqlite3
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -70,6 +71,52 @@ class ComposerSupervisorTests(unittest.TestCase):
             third = supervisor._live_snapshot()
             self.assertNotEqual(second["signature"], third["signature"])
 
+    def test_scheduled_provider_retry_is_not_killed_as_watchdog_stall(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            project = root / "project"
+            (project / "output").mkdir(parents=True)
+            (project / "output" / "progress.json").write_text(json.dumps({
+                "phase": "survey:retry_wait",
+                "status": "running",
+                "state_revision": 8,
+                "retry_schedule": {
+                    "survey": {"not_before_epoch": time.time() + 3600}
+                },
+                "stages": {},
+            }))
+            supervisor = ComposerSupervisor({
+                "id": "scheduled-wait-test",
+                "project_id": str(project),
+            })
+            snapshot = supervisor._live_snapshot()
+            self.assertTrue(supervisor._scheduled_retry_wait(snapshot))
+
+    def test_interrupted_checkpoint_is_not_left_visibly_running(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            project = root / "project"
+            output = project / "output"
+            output.mkdir(parents=True)
+            for name in ("progress.json", "run.json", "interim_report.json"):
+                (output / name).write_text(json.dumps({
+                    "schema_version": "fixture",
+                    "status": "running",
+                    "blockers": [],
+                }))
+            supervisor = ComposerSupervisor({
+                "id": "interrupt-checkpoint-test",
+                "project_id": str(project),
+            })
+            supervisor._mark_interrupted_checkpoint()
+            for name in ("progress.json", "run.json", "interim_report.json"):
+                value = json.loads((output / name).read_text())
+                self.assertEqual(value["status"], "paused")
+                self.assertTrue(any(
+                    item.get("stop_reason") == "process_interrupted"
+                    for item in value["blockers"]
+                ))
+
     def test_restarts_from_durable_state_after_recoverable_exit(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -105,6 +152,19 @@ class ComposerSupervisorTests(unittest.TestCase):
                     {"status": "paused", "remaining_seconds": 0}),
                 False,
             )
+
+    def test_child_keyboard_interrupt_is_terminal_for_supervisor(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = {"id": "interrupt-test", "project_id": str(root / "project")}
+            supervisor = ComposerSupervisor(workflow, poll_seconds=0)
+            message = {"kind": "exception", "type": "KeyboardInterrupt",
+                       "error": "termination requested"}
+            with patch.object(supervisor, "_write_state") as write_state:
+                with self.assertRaises(KeyboardInterrupt):
+                    supervisor._child_exception_text(message)
+            write_state.assert_called_once_with(
+                child_status="interrupted", action="stop", error="termination requested")
 
 
 if __name__ == "__main__":

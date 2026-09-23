@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from scisaurus.core.errors import ValidationError
+from scisaurus.runtime.model_work import ModelWorkBlocked
 from scisaurus.runtime.composer import ComposerRunner, validate_workflow
 
 
@@ -80,7 +81,42 @@ class ForwardProgressTests(unittest.TestCase):
             finally:
                 runner.close()
 
-    def test_failed_stage_becomes_candidate_and_downstream_runs(self):
+    def test_pre_execution_failure_is_non_gating_after_composer_admission(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            try:
+                stage = workflow["stages"][1]
+                attempt_dir = root / "experiment-attempt"
+                error = ModelWorkBlocked(
+                    "capability foundry did not admit a program: model output must contain valid JSON"
+                )
+                candidate = runner._materialize_forward_progress(
+                    stage,
+                    {"project_dir": str(attempt_dir)},
+                    error,
+                    {"status": "blocked", "results_status": "not_executed"},
+                    {"reports": [{"role_id": "methodologist", "status": "failed",
+                                  "error": "length"}], "usage": {}},
+                    [{"attempt_number": 1, "state": "failed"}],
+                    force_advance=True,
+                )
+                self.assertEqual(candidate["composer_decision"], "advance_with_findings")
+                self.assertFalse(candidate["release_blocking"])
+                self.assertFalse(candidate["failure_debt"]["release_blocking"])
+                self.assertEqual(candidate["results_status"], "not_executed")
+                self.assertTrue(candidate["backfill_required"])
+                self.assertTrue(ComposerRunner._stage_releases_dependencies({
+                    "status": candidate["status"],
+                    "composer_decision": candidate["composer_decision"],
+                    "release_blocking": candidate["release_blocking"],
+                    "failure_debt": candidate["failure_debt"],
+                }))
+            finally:
+                runner.close()
+
+    def test_composer_admission_releases_downstream_with_visible_debt(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
             workflow = self._workflow(root)
@@ -107,15 +143,22 @@ class ForwardProgressTests(unittest.TestCase):
             runner._run_specialist_verifier = lambda *args, **kwargs: None
             try:
                 result = runner.run()
-                self.assertIn("experiment", attempted)
                 self.assertGreaterEqual(attempted.count("survey"), 2)
+                self.assertIn("experiment", attempted)
+                # The first pass must finish the dependent stage before the
+                # bounded backfill cycle reopens the failed survey scope.
                 self.assertEqual(runner.continuation_cycles, 1)
-                self.assertIn(result["status"], {"candidate_needs_review", "completed"})
+                self.assertGreaterEqual(attempted.count("experiment"), 2)
+                self.assertEqual(runner.continuation_pending_stage_ids, set())
+                self.assertEqual(result["status"], "candidate_needs_review")
                 survey = runner.context["survey"]
                 self.assertEqual(survey["status"], "candidate_needs_review")
                 self.assertTrue(survey["forward_progress"])
                 self.assertTrue(Path(survey["forward_progress_path"]).is_file())
-                self.assertTrue(survey["failure_debt"]["release_blocking"])
+                self.assertEqual(survey["composer_decision"], "advance_with_findings")
+                self.assertFalse(survey["failure_debt"]["release_blocking"])
+                self.assertFalse(survey["release_blocking"])
+                self.assertTrue(survey["backfill_required"])
                 self.assertTrue(any(
                     item.get("action") == "forward_provisional_stage"
                     for item in runner.department_activity

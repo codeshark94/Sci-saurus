@@ -211,9 +211,18 @@ def build_research_program(topic_package):
     if package.get("schema_version") != "topic-discovery-1":
         raise ValidationError("research program requires a topic-discovery-1 package")
     # Reuse the topic contract as the input gate, while allowing the caller to
-    # pass the richer Composer result around it.
+    # pass the richer Composer result around it.  Runtime topic admission
+    # validates the selected candidate's executable plan; retained branches
+    # are conditional alternatives and may carry a stale or incomplete plan
+    # from the model's portfolio response.  They are not dispatched by this
+    # program, so re-validating their execution inventory here would turn an
+    # admitted selected direction into a pre-specialist stage failure.
     from scisaurus.runtime.topic_discovery import validate_topic_package
-    validate_topic_package(package, objective=package.get("objective"))
+    validation_package = deepcopy(package)
+    for candidate in validation_package.get("candidates", []):
+        if candidate.get("id") != validation_package.get("selected_id"):
+            candidate.pop("feasibility_plan", None)
+    validate_topic_package(validation_package, objective=validation_package.get("objective"))
 
     candidates = package["candidates"]
     selected_id = package["selected_id"]

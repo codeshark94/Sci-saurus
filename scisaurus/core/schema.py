@@ -102,7 +102,44 @@ def canonical_bytes(obj) -> bytes:
     return text.encode("utf-8")
 
 
-def json_object(raw, name="JSON", *, model_envelope=False) -> dict:
+def _append_missing_json_closers(text: str) -> str | None:
+    """Return a safely closed JSON candidate when only outer closers are missing.
+
+    This is deliberately a structural repair, not a JSON extractor.  It refuses
+    open strings, dangling values, mismatched closers, and trailing prose.  The
+    caller still performs the ordinary duplicate-key, finite-number, and schema
+    validation checks on the repaired value.
+    """
+    stack = []
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            stack.append("}")
+        elif char == "[":
+            stack.append("]")
+        elif char in "}]":
+            if not stack or stack.pop() != char:
+                return None
+    if in_string or escaped or not stack:
+        return None
+    if text.rstrip()[-1:] in "{[,:":
+        return None
+    return text.rstrip() + "".join(reversed(stack))
+
+
+def json_object(raw, name="JSON", *, model_envelope=False,
+                allow_missing_closers=False) -> dict:
     """Parse one unambiguous object, with optional provider transport wrappers.
 
     Immutable control records remain plain JSON. Model replies may additionally
@@ -138,6 +175,23 @@ def json_object(raw, name="JSON", *, model_envelope=False) -> dict:
                     and lines[-1].strip() == "```"
                     and all(not line.strip().startswith("```") for line in lines[1:-1])):
                 candidates.append("\n".join(lines[1:-1]).strip())
+        # A few OpenAI-compatible gateways have been observed to append the
+        # closing characters of an outer JSON-string envelope after an
+        # otherwise complete object, yielding ``{...}"}``.  Accept only that
+        # exact two-character tail and still run the normal duplicate-key and
+        # finite-number checks on the recovered object.  Other trailing text
+        # remains invalid and cannot be silently discarded.
+        for candidate in tuple(candidates):
+            if candidate.endswith('"}'):
+                candidates.append(candidate[:-2].rstrip())
+        if allow_missing_closers:
+            # Some gateways report a normal stop after dropping only the final
+            # outer `}`.  Recover that unambiguous transport defect locally;
+            # semantic validation remains the caller's responsibility.
+            for candidate in tuple(candidates):
+                repaired = _append_missing_json_closers(candidate)
+                if repaired is not None:
+                    candidates.append(repaired)
     error = None
     for candidate in candidates:
         try:

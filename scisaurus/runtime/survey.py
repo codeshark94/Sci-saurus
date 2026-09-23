@@ -10,7 +10,7 @@ import threading
 import time
 import unicodedata
 
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import ProviderConfigurationError, ValidationError
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.source_spans import (bind as bind_source_spans, contains_legacy,
                                         expand_evidence, index_evidence)
@@ -27,8 +27,10 @@ from scisaurus.runtime.literature import (
 from scisaurus.runtime.operations import OperationsCell
 from scisaurus.runtime.scores import exact, identifier
 from scisaurus.runtime.survey_config import validate_survey_config, search_query
-from scisaurus.runtime.survey_records import (MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, validate_map,
-                                             validate_survey_review, validate_assessment, validate_work_review)
+from scisaurus.runtime.survey_records import (
+    MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, normalize_check_envelope, validate_map,
+    validate_survey_review, validate_assessment, validate_work_review,
+)
 from scisaurus.runtime.time_policy import TimePolicy
 
 
@@ -152,7 +154,8 @@ def overlay_post_checkpoint_relationships(relationships, checkpoint_created_at, 
 
 
 class SurveyRunner(ExecutionRuntime):
-    def __init__(self, project_dir, config, *, on_progress=None, resume_policy=None):
+    def __init__(self, project_dir, config, *, on_progress=None, resume_policy=None,
+                 provider_fallback=None):
         super().__init__(project_dir, validate_survey_config(config), worker_target=_invoke_worker,
                          on_progress=on_progress, resume_policy=resume_policy)
         self.score = self.config["survey"]
@@ -163,6 +166,14 @@ class SurveyRunner(ExecutionRuntime):
         self.bibliography_mode = "openalex"
         self.bibliography_fallback_policy = self.score.get(
             "bibliography_fallback", "crossref_metadata")
+        if provider_fallback is not None:
+            if provider_fallback != "crossref_metadata":
+                raise ValidationError(
+                    "unsupported survey provider fallback: " + str(provider_fallback))
+            # A resumed run must pass ResumeController's exact immutable
+            # config check.  Provider recovery is therefore an explicit
+            # runtime route, not a mutation of the accepted run input.
+            self.bibliography_fallback_policy = provider_fallback
         self.bibliography_fallback_reason = None
         self.bibliography_fallback_capability = None
         self.work_budget_adjustments = []
@@ -185,6 +196,11 @@ class SurveyRunner(ExecutionRuntime):
         self.aliases, self.dois, self.analysis_records, self.analyzed_basis = {}, {}, {}, {}
         self.relationships, self.bindings, self.capability_ids = {}, {}, []
         self.work_reviews, self.reviewed_basis = {}, {}
+        # A malformed focused-review envelope is a local evidence problem,
+        # not a reason to discard the rest of a bounded survey.  Keep this
+        # marker in the current runner so the review loop can withdraw only
+        # the affected work before continuing with its siblings.
+        self._contract_exhausted_work_reviews = set()
         self.query_refs, self.search_log, self.expansion_log, self.gaps, self.time_decisions = [], [], [], [], []
         self.api_calls, self.identity_calls, self.serial, self.survey_revision = 0, 0, 0, 0
         self.expanded, self.full_text_attempted = set(), set()
@@ -534,10 +550,14 @@ class SurveyRunner(ExecutionRuntime):
         self._ensure_active()
 
     def _model_checked(self, name, actor, assignment, validator, *, normalizer=None,
-                       stage="production", task_kind="production"):
-        return self._models_checked([{"name": name, "actor": actor, "assignment": assignment,
-            "validator": validator, **({"normalizer": normalizer} if normalizer else {})}],
-            stage=stage, task_kind=task_kind)[name]
+                       model_overrides=None, stage="production", task_kind="production"):
+        job = {"name": name, "actor": actor, "assignment": assignment,
+               "validator": validator}
+        if normalizer:
+            job["normalizer"] = normalizer
+        if isinstance(model_overrides, dict):
+            job["model_overrides"] = deepcopy(model_overrides)
+        return self._models_checked([job], stage=stage, task_kind=task_kind)[name]
 
     def _retained_validation_feedback(self, name, assignment):
         """Reuse a failed response only when its original assignment is still exact."""
@@ -563,6 +583,7 @@ class SurveyRunner(ExecutionRuntime):
             if canonical_bytes(prior_assignment) == canonical_bytes(assignment):
                 return {"error": error, "previous_response": previous_response,
                     "finish_reason": validation_body.get("finish_reason", "stop"),
+                    "execution_ref": execution["artifact_ref"],
                     "scope": "Repair only this assignment's recorded contract violations; preserve every valid field. "
                              "Use every requested field name and enum value exactly as specified; do not substitute synonyms."}
         return None
@@ -636,6 +657,40 @@ class SurveyRunner(ExecutionRuntime):
                     results[job["name"]] = (value, retained["execution_ref"])
                     continue
             if retained and retained.get("status") == "blocked":
+                # A provider can return a semantically complete JSON object
+                # with a duplicated outer closing tail.  If the immutable
+                # proposal is now parseable under the bounded model envelope
+                # parser, adopt it from the retained execution rather than
+                # paying for the same assignment again on resume.  Validator
+                # failure still leaves the blocker intact.
+                retained_feedback = self._retained_validation_feedback(
+                    job["name"], job["assignment"])
+                recovery = retained_feedback or retained.get("feedback")
+                previous = recovery.get("previous_response") if recovery else None
+                raw_previous = (previous.get("raw_text")
+                                if isinstance(previous, dict) else previous)
+                execution_ref = recovery.get("execution_ref") if recovery else None
+                recovered = None
+                if isinstance(raw_previous, str) and execution_ref:
+                    try:
+                        recovered = ModelResult(
+                            text=raw_previous, model="retained", usage={},
+                            elapsed_seconds=0.0, finish_reason="stop",
+                        ).json_object(allow_missing_closers=True)
+                        if job.get("normalizer"):
+                            recovered = job["normalizer"](recovered)
+                        job["validator"](recovered)
+                    except (ValidationError, TypeError, ValueError, KeyError):
+                        recovered = None
+                if recovered is not None:
+                    job["on_valid"](recovered, execution_ref) if job.get("on_valid") else None
+                    cache.put(keys[job["name"]], {
+                        "status": "succeeded", "value": recovered,
+                        "execution_ref": execution_ref,
+                        "recovered_from_retained_execution": True,
+                    }, subjects=[execution_ref])
+                    results[job["name"]] = (recovered, execution_ref)
+                    continue
                 if abstain(job, retained):
                     continue
                 raise ModelWorkBlocked(retained["error"])
@@ -689,14 +744,14 @@ class SurveyRunner(ExecutionRuntime):
                     execution = outcome["record_ref"]
                     self.time_policy.observe(stage, result.elapsed_seconds)
                     try:
-                        value = result.json_object()
+                        value = result.json_object(allow_missing_closers=True)
                     except ValidationError:
                         value = {"raw_text": result.text}
                     proposal = self._publish(f"kb/model-proposals/{task_id}", "note", value, actor, subjects=[execution])
                     try:
                         if result.finish_reason != "stop":
                             raise ValidationError(f"model generation did not finish normally: {result.finish_reason}")
-                        value = result.json_object()
+                        value = result.json_object(allow_missing_closers=True)
                         if job.get("normalizer"):
                             value = job["normalizer"](value)
                         job["validator"](value)
@@ -799,6 +854,14 @@ class SurveyRunner(ExecutionRuntime):
                 if key == "bibliography":
                     if self.bibliography_fallback_policy == "disabled":
                         detail = self._failure_detail(definition["id"])
+                        if detail.get("outcome") in {"auth_required", "access_denied"}:
+                            client = definition.get("client", {})
+                            raise ProviderConfigurationError(
+                                "OpenAlex bibliography is not authenticated; configure "
+                                f"{client.get('auth_env') or 'the configured credential'} before retrying",
+                                provider="openalex",
+                                credential_env=client.get("auth_env"),
+                            )
                         self._raise_provider_cooldown(
                             detail,
                             "OpenAlex survey readiness is paused until the provider quota resets",
@@ -1983,7 +2046,11 @@ class SurveyRunner(ExecutionRuntime):
             if current and body["entry_sha256"] == current["body_hash"]:
                 abstentions.append(body)
         identity_counts = Counter(self._body(record)["status"] for record in self.identity_records.values())
-        return {"unique_works": len(self.works), "abstracts": sum(w.get("abstract") is not None for w in self.works.values()),
+        abstract_count = sum(w.get("abstract") is not None for w in self.works.values())
+        return {"unique_works": len(self.works), "abstracts": abstract_count,
+            "source_inventory_work_records": len(self.works),
+            "map_entry_count": len(self.analysis_records),
+            "abstract_work_count": abstract_count,
             "verified_full_texts": sum(s["representation"] == "full_text" for s in self.source_docs.values()),
             "bibliographic_identities": {"checked": len(self.identity_records),
                 "verified": identity_counts["verified"] + identity_counts["verified_with_gaps"],
@@ -2364,6 +2431,7 @@ class SurveyRunner(ExecutionRuntime):
             key: coverage.get(key) for key in (
                 "unique_works", "abstracts", "verified_full_texts", "bibliographic_identities",
                 "source_windows", "pagination_remaining", "saturated",
+                "source_inventory_work_records", "map_entry_count", "abstract_work_count",
             )
         }
         coverage_summary.update({
@@ -2382,20 +2450,68 @@ class SurveyRunner(ExecutionRuntime):
                 "entry_inclusion_counts": "Screening decisions for every current map entry; independent of controller abstention records.",
                 "claimless_entry_count": "Entries with no problem, approach, finding, or limitation assertion; these do not provide scientific support.",
                 "bibliographic_identities": "checked equals verified plus conflicted plus unresolved; by_status is the complete partition of checked records.",
+                "unique_works": "Distinct catalog work IDs captured by the finite search; this is the source inventory size.",
+                "source_inventory_work_records": "The number of distinct catalog work IDs in the source inventory, equal to unique_works.",
+                "map_entry_count": "The number of current literature-map entries, including explicit uncertain or deferred entries.",
+                "abstract_work_count": "The number of catalog records with a non-null abstract; it is not the number of map entries or source records.",
+                "abstracts": "Legacy label for abstract_work_count; it must not be compared to map_entry_count as if they were the same partition.",
             },
         })
 
-        sources = []
+        all_sources = []
         for source in sorted(self._source_context(), key=lambda source: source["source_ref"]):
-            sources.append({key: source.get(key) for key in (
+            all_sources.append({key: source.get(key) for key in (
                 "source_ref", "work_id", "representation", "identity_verified", "available_chars",
             )})
 
-        focused_reviews = []
+        entry_work_ids = {entry["work_id"] for entry in entries}
+        source_work_ids = {source["work_id"] for source in all_sources}
+        relationship_endpoint_ids = {
+            endpoint
+            for relationship in relationships
+            for endpoint in (relationship.get("source"), relationship.get("target"))
+            if isinstance(endpoint, str)
+        }
+        deterministic_integrity = {
+            "map_entry_count": len(entry_work_ids),
+            "source_inventory_work_count": len(source_work_ids),
+            "abstract_work_count": coverage_summary["abstract_work_count"],
+            "relationship_count": len(relationships),
+            "all_relationship_endpoints_in_map_entries": relationship_endpoint_ids.issubset(entry_work_ids),
+            "all_source_work_ids_in_map_entries": source_work_ids.issubset(entry_work_ids),
+            "relationship_endpoint_count": len(relationship_endpoint_ids),
+        }
+
+        # The aggregate reviewer does not need every abstention or every
+        # claimless catalog row: those are already represented exactly by the
+        # controller-computed counts above.  Passing them back through a model
+        # makes it recount long lists and can exhaust the response budget
+        # before it returns its three required checks.  Keep every claim-bearing
+        # row and relationship endpoint visible, and disclose the projection.
+        visible_work_ids = {
+            entry["work_id"] for entry in entries
+            if any(entry[field]["text"] is not None for field in MAP_FIELDS)
+        } | relationship_endpoint_ids
+        visible_entries = [entry for entry in entries if entry["work_id"] in visible_work_ids]
+        visible_source_refs = {
+            proof["source_ref"]
+            for entry in visible_entries
+            for field in MAP_FIELDS
+            for proof in entry[field]["evidence"]
+            if proof.get("source_ref")
+        } | {
+            proof["source_ref"]
+            for relationship in relationships
+            for proof in relationship["claim"]["evidence"]
+            if proof.get("source_ref")
+        }
+        sources = [source for source in all_sources if source["source_ref"] in visible_source_refs]
+
+        all_focused_reviews = []
         for wid in sorted(self.work_reviews):
             record = self.work_reviews[wid]
             review = self._body(record)
-            focused_reviews.append({
+            all_focused_reviews.append({
                 "work_id": wid,
                 "review_ref": record["artifact_ref"],
                 "verification_kind": review.get("verification_kind", "source_bound_model_review"),
@@ -2403,8 +2519,26 @@ class SurveyRunner(ExecutionRuntime):
                            for check in review.get("checks", [])],
                 "rationale": str(review.get("rationale", ""))[:800],
             })
+        focused_reviews = [review for review in all_focused_reviews
+                           if review["work_id"] in visible_work_ids
+                           or review["verification_kind"] != "deterministic_abstention"]
+        projection = {
+            "entry_count": len(entries),
+            "presented_entry_count": len(visible_entries),
+            "omitted_claimless_entry_count": len(entries) - len(visible_entries),
+            "source_record_count": len(all_sources),
+            "presented_source_count": len(sources),
+            "omitted_source_record_count": len(all_sources) - len(sources),
+            "focused_review_count": len(all_focused_reviews),
+            "presented_focused_review_count": len(focused_reviews),
+            "omitted_deterministic_abstention_review_count": sum(
+                review["verification_kind"] == "deterministic_abstention"
+                for review in all_focused_reviews if review not in focused_reviews
+            ),
+        }
         return {
-            "map": {"entries": entries, "relationships": relationships},
+            "map": {"entries": visible_entries, "relationships": relationships,
+                    "projection": projection},
             "coverage": coverage_summary,
             "sources": sources,
             "focused_review_summary": focused_reviews,
@@ -2414,8 +2548,10 @@ class SurveyRunner(ExecutionRuntime):
                 "downstream_decisions": "Gap nomination and counter-search assess novelty; experiments test the research question; manuscript peer review judges the final contribution.",
                 "question_status": "A research question is not an established claim or a required survey conclusion. Its answer remains undecided by this acceptance decision.",
                 "non_assertions": "Excluded, deferred, and null fields do not assert scientific support. Missing support for an absent assertion is not a source-fidelity failure.",
-                "failure_basis": "Identify a specific unsupported assertion, inconsistent accounting, misrepresented source, or missing focused review. Report incomplete coverage honestly without requiring exhaustive retrieval or an answer to the research question.",
+                "failure_basis": "Identify a specific unsupported assertion, inconsistent accounting, misrepresented source, or missing focused review. Report incomplete coverage honestly without requiring exhaustive retrieval or an answer to the research question. The map and source lists are claim-bearing projections; their omitted counts are explicit in map.projection and the full inventory counts are in coverage and deterministic_integrity. The deterministic_integrity block is computed from the full survey state; do not invent a missing map entry or relationship endpoint that contradicts it.",
             },
+            "deterministic_integrity": deterministic_integrity,
+            "projection": projection,
         }
 
     def _work_review_exhausted(self, wid):
@@ -2428,6 +2564,107 @@ class SurveyRunner(ExecutionRuntime):
         review = self._body(self.store.get(self._body(withdrawal)["review_ref"]))
         return (set(self.analyzed_basis[wid]).issubset(inputs)
                 and (withdrawal["artifact_ref"] in inputs or review["entry_ref"] == entry["artifact_ref"]))
+
+    def _deterministic_survey_review(self, packet, survey_ref, failure):
+        """Close an aggregate-review format failure without another model call.
+
+        Per-work reviewers have already checked every surviving assertion and
+        exact source span.  The aggregate pass adds accounting and projection
+        checks; when its provider returns an unusable envelope, recompute those
+        checks from immutable controller state instead of redispatching the
+        same 12k-token review prompt.  Any failed deterministic check still
+        blocks admission.
+        """
+        integrity = packet["deterministic_integrity"]
+        coverage = packet["coverage"]
+        projection = packet["projection"]
+        entries = packet["map"]["entries"]
+        relationships = packet["map"]["relationships"]
+        sources = packet["sources"]
+        source_refs = {source.get("source_ref") for source in sources}
+        focused = {review.get("work_id"): review
+                   for review in packet["focused_review_summary"]}
+        coverage_errors = []
+        if not integrity.get("all_relationship_endpoints_in_map_entries"):
+            coverage_errors.append("a relationship endpoint is outside the current map")
+        if not integrity.get("all_source_work_ids_in_map_entries"):
+            coverage_errors.append("a source record is outside the current map")
+        if integrity.get("map_entry_count") != coverage.get("map_entry_count"):
+            coverage_errors.append("map entry count disagrees with the controller count")
+        if coverage.get("unique_works") != coverage.get("source_inventory_work_records"):
+            coverage_errors.append("source inventory count disagrees with unique work count")
+        if projection.get("presented_entry_count", 0) > projection.get("entry_count", 0):
+            coverage_errors.append("claim-bearing entry projection exceeds the full inventory")
+        if projection.get("presented_source_count", 0) > projection.get("source_record_count", 0):
+            coverage_errors.append("claim-bound source projection exceeds the source inventory")
+
+        support_errors = []
+        for entry in entries:
+            work_id = entry.get("work_id")
+            has_claim = False
+            for field in MAP_FIELDS:
+                statement = entry.get(field) or {}
+                if statement.get("text") is None:
+                    continue
+                has_claim = True
+                evidence = statement.get("evidence") or []
+                if not evidence:
+                    support_errors.append(f"{work_id}:{field} has no evidence")
+                for proof in evidence:
+                    if proof.get("source_ref") not in source_refs:
+                        support_errors.append(f"{work_id}:{field} cites an unpresented source")
+            if has_claim:
+                review = focused.get(work_id)
+                if review is None:
+                    support_errors.append(f"{work_id} has no focused review")
+                elif any(check.get("outcome") != "passed" for check in review.get("checks", [])):
+                    support_errors.append(f"{work_id} has a non-passing focused review")
+        for relation in relationships:
+            claim = relation.get("claim") or {}
+            for proof in claim.get("evidence") or []:
+                if proof.get("source_ref") not in source_refs:
+                    support_errors.append("a relationship cites an unpresented source")
+            source_work = relation.get("source")
+            review = focused.get(source_work)
+            if review is None:
+                support_errors.append(f"relationship source {source_work} has no focused review")
+            elif any(check.get("outcome") != "passed" for check in review.get("checks", [])):
+                support_errors.append(f"relationship source {source_work} has a non-passing focused review")
+
+        checks = [
+            {"check_id": "coverage-accounting",
+             "outcome": "passed" if not coverage_errors else "failed",
+             "method": "Recompute controller counts, projection bounds, and endpoint inclusion from the immutable survey packet.",
+             "result": "All deterministic counts and inclusion booleans agree."
+             if not coverage_errors else "; ".join(coverage_errors[:3])},
+            {"check_id": "source-fidelity",
+             "outcome": "passed" if not support_errors else "failed",
+             "method": "Require every surviving claim and relationship to retain a source reference and a passing focused review.",
+             "result": "Every retained assertion is covered by the bounded focused-review ledger."
+             if not support_errors else "; ".join(support_errors[:3])},
+            {"check_id": "map-support",
+             "outcome": "passed" if not support_errors else "failed",
+             "method": "Check claim-bearing map fields and relationship evidence against the projected source references.",
+             "result": "All projected map assertions have source-bound evidence."
+             if not support_errors else "; ".join(support_errors[:3])},
+        ]
+        value = {"checks": checks,
+                 "rationale": (
+                     "Deterministic aggregate admission was used after the model review envelope failed; "
+                     "the retained per-work reviews and exact evidence references were replayed without a new provider call."
+                 )}
+        validate_survey_review(value)
+        execution = self._record(
+            f"command/survey-review-deterministic/{self.survey_revision}", "verification",
+            {"verification_kind": "deterministic_aggregate", "survey_ref": survey_ref,
+             "fallback_reason": str(failure)[:2048], **value},
+            "command.controller", subjects=[survey_ref])
+        if any(check["outcome"] != "passed" for check in checks):
+            raise ModelWorkBlocked(
+                "deterministic aggregate survey review failed: "
+                + "; ".join(check["result"] for check in checks if check["outcome"] != "passed")
+            )
+        return value, execution["artifact_ref"]
 
     def _exclude_unresolved_work(self, wid, feedback):
         previous = self.analysis_records[wid]
@@ -2506,14 +2743,45 @@ class SurveyRunner(ExecutionRuntime):
                                       for check in failed if check["check_id"].startswith("relationship:")})
                     rejected.append((wid, {"review_ref": record["artifact_ref"], "entry_fields": fields,
                                            "relationship_targets": targets, "checks": failed, "rationale": value["rationale"]}))
+
+                def contract_exhausted(state, *, wid=wid, basis=basis, refs=refs):
+                    """Withdraw one unreviewable work without another provider call."""
+                    self._contract_exhausted_work_reviews.add(wid)
+                    required = work_review_checks(refs)
+                    checks = [{
+                        "check_id": check_id,
+                        "outcome": "check_failed",
+                        "method": "Controller recorded that the focused reviewer did not return the required contract.",
+                        "result": "The work is withdrawn from substantive evidence until a later scoped review reopens it.",
+                    } for check_id in required]
+                    execution = self._record(
+                        f"command/executions/survey-review-contract-exhausted-{wid}", "report", {
+                            "operation": "focused-work-review",
+                            "outcome": "contract_exhausted",
+                            "work_id": wid,
+                            "relationship_refs": list(refs),
+                            "error": state.get("error"),
+                            "model_calls": 0,
+                            "scope": "review_exhausted",
+                        }, "command.controller", subjects=basis)
+                    return {
+                        "checks": checks,
+                        "rationale": "The focused reviewer response was not contract-valid; substantive claims remain unknown.",
+                    }, execution["artifact_ref"]
+
                 jobs.append({"name": f"work-review-{wid}", "actor": "methods.work-reviewer", "assignment": assignment,
-                             "validator": lambda value, refs=refs: validate_work_review(value, refs), "on_valid": integrate})
+                             "normalizer": lambda value, refs=refs: normalize_check_envelope(
+                                 value, work_review_checks(refs)),
+                             "validator": lambda value, refs=refs: validate_work_review(value, refs),
+                             "on_valid": integrate, "on_exhausted": contract_exhausted})
             if jobs:
                 self._models_checked(jobs, stage="unit_review", task_kind="verification")
             if not rejected:
                 return
             exhausted = [(wid, feedback) for wid, feedback in rejected
-                         if round_number == repair_rounds or self._work_review_exhausted(wid)]
+                         if (round_number == repair_rounds
+                             or self._work_review_exhausted(wid)
+                             or wid in self._contract_exhausted_work_reviews)]
             if exhausted:
                 for wid, feedback in exhausted:
                     self._exclude_unresolved_work(wid, feedback)
@@ -2578,32 +2846,57 @@ class SurveyRunner(ExecutionRuntime):
         bundle = self._record("kb/surveys/current", "note", body, "research.literature-mapper", subjects=body["dependency_refs"])
         self.survey_revision += 1
         review_packet = self._survey_review_packet()
-        value, execution = self._model_checked("survey-review", "methods.survey-reviewer", {
+        review_assignment = {
             "assignment": "Independently check this exact survey, including honest reporting of incomplete coverage.",
             "phase": "survey_review", "survey_ref": bundle["artifact_ref"], "question": self.score["question"],
             "map": review_packet["map"], "coverage": review_packet["coverage"],
             "sources": review_packet["sources"],
             "focused_review_summary": review_packet["focused_review_summary"],
+            "deterministic_integrity": review_packet["deterministic_integrity"],
             "review_contract": review_packet["review_contract"],
             "relationship_semantics": RELATIONSHIP_SEMANTICS,
             "required_checks": sorted(SURVEY_CHECKS),
             "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
-            "instructions": "Return {checks:[{check_id,outcome,method,result}],rationale}. Execute exactly the required checks. "
+            "instructions": "Return exactly one compact JSON object {checks:[{check_id,outcome,method,result}],rationale}; no preamble, markdown, or analysis transcript. Execute exactly the required checks. "
                 "Outcomes passed/failed/insufficient_evidence/check_failed. Passing approves a faithful bounded survey, not novelty or exhaustive coverage. "
                 "Check accurate coverage/accounting, faithful quotations and source scope, and support for every asserted map claim. "
                 "The question is a hypothesis for later investigation, not a claim that this survey must prove or disprove. "
-                "A lack of an answer to it is not a failed map-support check. Use the explicit count_definitions rather than equating different counters. "
+                "A lack of an answer to it is not a failed map-support check. Use the explicit count_definitions rather than equating different counters. The deterministic_integrity block is a controller-computed checksum of the exact packet: treat its endpoint and count booleans as authoritative for packet accounting, and do not report a missing map entry when the corresponding boolean is true. "
                 "The focused-review summary records independent exact-span checks; use it as the primary support for map claims. "
                 "The sources list is an inventory only and intentionally contains no source body or image bytes; do not infer text that is not represented. "
                 "Do not require the aggregate packet to repeat source bytes already checked by the pinned focused reviews. "
                 "Null or withdrawn fields do not need content-level support for an absent assertion. "
                 "A partial withdrawal exempts only its absent fields; any surviving assertion still requires source support. "
                 "Unknown facts must stay unknown. Unverified provider metadata is not itself a false assertion if explicitly labeled; "
-                "fail unsupported chronology or superiority inferred from it. Keep each check result concise; cite specific problems instead of enumerating the whole corpus."
-        }, validate_survey_review, stage="unit_review", task_kind="verification")
-        review = self._publish(f"kb/survey-reviews/{self.survey_revision}", "note", {
-            "survey_ref": bundle["artifact_ref"], "execution_ref": execution, **value}, "methods.survey-reviewer",
-            subjects=[bundle["artifact_ref"], execution])
+                "fail unsupported chronology or superiority inferred from it. The map entries and sources are deliberate claim-bearing projections; use their projection counts and deterministic_integrity rather than recounting omitted rows. "
+                "Keep each method/result to one short sentence and rationale under 120 words; cite specific problems instead of enumerating the corpus."
+        }
+        deterministic_review = False
+        try:
+            value, execution = self._model_checked(
+                "survey-review", "methods.survey-reviewer", review_assignment,
+                validate_survey_review,
+                normalizer=lambda value: normalize_check_envelope(value, SURVEY_CHECKS),
+                model_overrides={"max_output_tokens": 2048, "temperature": 0.1},
+                stage="unit_review", task_kind="verification")
+        except ModelWorkBlocked as exc:
+            # The aggregate model is a synthesis layer over already checked
+            # per-work claims.  A length/format failure here must not replay
+            # retrieval or consume another large context; deterministic
+            # accounting and focused-review checks are sufficient to close the
+            # aggregate gate, and still block when any retained assertion is
+            # unsupported.
+            if not any(marker in str(exc).casefold() for marker in (
+                    "survey-review", "survey review", "valid json", "finish normally: length")):
+                raise
+            value, execution = self._deterministic_survey_review(
+                review_packet, bundle["artifact_ref"], exc)
+            deterministic_review = True
+        review_body = {"survey_ref": bundle["artifact_ref"], "execution_ref": execution, **value}
+        if deterministic_review:
+            review_body["verification_kind"] = "deterministic_aggregate"
+        review = self._publish(f"kb/survey-reviews/{self.survey_revision}", "note", review_body,
+                               "methods.survey-reviewer", subjects=[bundle["artifact_ref"], execution])
         accepted = self.store.accepted(bundle["artifact_id"])
         adopted = self.gate.accept(bundle["artifact_ref"], review["artifact_ref"], author="strategy.survey-integrator",
                                   expected_version=accepted["version"] if accepted else None, guard=self._admission_guard)
@@ -2717,7 +3010,8 @@ class SurveyRunner(ExecutionRuntime):
         value, execution = self._model_checked("gap-assessment", "methods.novelty-verifier",
             assessment_assignment, validate_gap_assessment,
             normalizer=lambda value: self._bind_assessment_spans(expand_evidence(
-                value, assessment_assignment["evidence_catalog"], self.source_docs,
+                normalize_check_envelope(value, GAP_CHECKS),
+                assessment_assignment["evidence_catalog"], self.source_docs,
                 windows=windows), assessment_sources),
             stage="integrated_review", task_kind="verification")
         record = self._publish("kb/gap-assessments/current", "note", {
@@ -2807,6 +3101,10 @@ class SurveyRunner(ExecutionRuntime):
                 status = "paused"
                 failure = {"kind": "provider_cooldown", "retry_after_seconds": exc.retry_after_seconds,
                            "rate_limit": exc.rate_limit}
+            elif isinstance(exc, ProviderConfigurationError):
+                status = "paused"
+                failure = {"kind": "provider_configuration", "provider": exc.provider,
+                           "credential_env": exc.credential_env}
             elif isinstance(exc, ModelWorkBlocked):
                 failure = {"kind": "unchanged_assignment_exhausted"}
         finally:

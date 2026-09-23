@@ -6,6 +6,7 @@ remain metadata; neither proves that source full text has been acquired.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 from email.utils import parsedate_to_datetime
 from http.client import HTTPConnection, HTTPSConnection, HTTPException, IncompleteRead
 import hashlib
@@ -38,6 +39,14 @@ PROVIDER_THROTTLE_KINDS = frozenset({
     "anonymous_search_load", "daily_budget", "request_rate",
 })
 RATE_STATE_SCHEMA_VERSION = "openalex-rate-state-1"
+# The provider's credit balance is account-wide even when the workflow has
+# separate topic and survey projects. Composer sets this path for an
+# owner-local run; direct library users can opt in with the same variable.
+SHARED_RATE_STATE_ENV = "SCISAURUS_OPENALEX_SHARED_RATE_STATE_PATH"
+# Keep a small provider-side reserve. OpenAlex does not expose a reliable
+# per-operation cost in every response, so admitting the next request at
+# exactly zero is too late to prevent an overspend race.
+DEFAULT_MIN_REMAINING_CREDITS = 2
 # OpenAlex daily budgets reset at midnight UTC. A two-day ceiling accepts a
 # complete daily reset window plus clock skew without allowing malformed
 # provider metadata to freeze a client indefinitely.
@@ -562,10 +571,18 @@ class OpenAlexClient:
                     or rate_state_path.exists() and not rate_state_path.is_file()):
                 raise ValueError("OpenAlex rate_state_path must be an absolute file path")
             rate_state_path = rate_state_path.resolve()
+        shared_rate_state_path = os.environ.get(SHARED_RATE_STATE_ENV)
+        if shared_rate_state_path is not None:
+            shared_rate_state_path = Path(shared_rate_state_path)
+            if (not shared_rate_state_path.is_absolute()
+                    or shared_rate_state_path.exists() and not shared_rate_state_path.is_file()):
+                raise ValueError(f"{SHARED_RATE_STATE_ENV} must be an absolute file path")
+            shared_rate_state_path = shared_rate_state_path.resolve()
         self.timeout, self.max_bytes, self.endpoint, self.auth_env = timeout, max_bytes, endpoint, auth_env
         self.max_retries, self.retry_backoff_seconds = max_retries, float(retry_backoff_seconds)
         self.min_interval_seconds = float(min_interval_seconds)
-        self.rate_state_path = rate_state_path
+        self.legacy_rate_state_path = rate_state_path
+        self.rate_state_path = shared_rate_state_path or rate_state_path
         self.allow_anonymous_fallback = allow_anonymous_fallback
         self._pacing_lock = threading.Lock()
         self._next_request_at = 0.0
@@ -589,9 +606,70 @@ class OpenAlexClient:
             "request_class": request_class,
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
+    def _merge_legacy_rate_state(self, principal):
+        """Promote a stage-local state file into the account-wide ledger.
+
+        Older immutable descriptors put state below ``projects/topic`` or
+        ``projects/survey``. Reading that state on first use makes an old
+        checkpoint safe to resume without rewriting its descriptor. Daily
+        budget observations are promoted to the global request class so a
+        legacy search observation also fences singleton/citation requests.
+        """
+        legacy = self.legacy_rate_state_path
+        target = self.rate_state_path
+        if legacy is None or target is None or legacy == target or not legacy.is_file():
+            return
+        with _locked_rate_state(legacy):
+            source = _read_rate_state(legacy)
+        changed = False
+        allowed_keys = {
+            self._rate_scope_key(scope, principal)
+            for scope in ("global", "search", "filter", "singleton")
+        }
+        if principal == "anonymous":
+            allowed_keys.update({
+                self._legacy_anonymous_scope_key("global"),
+                self._legacy_anonymous_scope_key("search"),
+                self._legacy_anonymous_scope_key("filter"),
+                self._legacy_anonymous_scope_key("singleton"),
+            })
+        with _locked_rate_state(target):
+            document = _read_rate_state(target)
+            for key, entry in source.get("scopes", {}).items():
+                if (key not in allowed_keys or not isinstance(entry, dict)
+                        or not isinstance(entry.get("rate_limit"), dict)):
+                    continue
+                old_until = entry.get("blocked_until_epoch")
+                if (not isinstance(old_until, (int, float))
+                        or not math.isfinite(old_until)):
+                    continue
+                target_key = key
+                if entry["rate_limit"].get("kind") == "daily_budget":
+                    target_key = self._rate_scope_key("global", principal)
+                existing = document["scopes"].get(target_key)
+                new_until = existing.get("blocked_until_epoch") if isinstance(existing, dict) else None
+                if (not isinstance(new_until, (int, float))
+                        or not math.isfinite(new_until) or old_until > new_until):
+                    document["scopes"][target_key] = deepcopy(entry)
+                    changed = True
+            if changed:
+                _write_rate_state(target, document)
+
+    @staticmethod
+    def _remaining_credit_reserve():
+        value = os.environ.get("SCISAURUS_OPENALEX_MIN_REMAINING_CREDITS")
+        if value is None:
+            return DEFAULT_MIN_REMAINING_CREDITS
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return DEFAULT_MIN_REMAINING_CREDITS
+        return parsed if parsed >= 0 else DEFAULT_MIN_REMAINING_CREDITS
+
     def _active_persistent_cooldown(self, request_class, principal):
         if self.rate_state_path is None:
             return None
+        self._merge_legacy_rate_state(principal)
         with _locked_rate_state(self.rate_state_path):
             document = _read_rate_state(self.rate_state_path)
             keys = [self._rate_scope_key("global", principal),
@@ -656,7 +734,8 @@ class OpenAlexClient:
             preserved["message"] = preserved["message"][:2048]
         with _locked_rate_state(self.rate_state_path):
             document = _read_rate_state(self.rate_state_path)
-            scope_class = ("global" if rate_limit.get("kind") in {"request_rate", "unknown"}
+            scope_class = ("global" if rate_limit.get("kind") in {
+                               "request_rate", "unknown", "daily_budget"}
                            else request_class)
             scope_key = self._rate_scope_key(scope_class, principal)
             existing = document["scopes"].get(scope_key)
@@ -697,6 +776,29 @@ class OpenAlexClient:
                 "started_at": timestamp, "completed_at": timestamp,
             },
         }
+
+    def preflight(self, *, operation="search", query=None, work_id=None,
+                  limit=5, cursor=None):
+        """Check the persisted provider fence without making an HTTP call.
+
+        Composer uses this before topic model work. A provider reset should
+        not consume a proposal call merely to discover that the subsequent
+        literature request is already inadmissible.
+        """
+        arguments = validate_arguments({"operation": operation, "query": query,
+                                        "work_id": work_id, "limit": limit, "cursor": cursor})
+        credential = os.environ.get(self.auth_env) if self.auth_env is not None else None
+        credential_ready = self.auth_env is None or bool(
+            credential and all(33 <= ord(character) <= 126 for character in credential))
+        anonymous_fallback = self.auth_env is not None and not credential_ready \
+            and self.allow_anonymous_fallback
+        if anonymous_fallback:
+            credential = None
+        if self.auth_env is not None and not credential_ready and not anonymous_fallback:
+            return None
+        principal = ("anonymous" if self.auth_env is None or anonymous_fallback else
+                     "key:" + hashlib.sha256(credential.encode("utf-8")).hexdigest())
+        return self._active_persistent_cooldown(self._request_class(arguments), principal)
 
     def _reserve_request_slot(self, deadline):
         """Serialize this client's requests and honor any provider cooldown."""
@@ -818,9 +920,11 @@ class OpenAlexClient:
                 rate_limit = (last.get("metadata") or {}).get("rate_limit") or {}
                 remaining_credits = rate_limit.get("remaining")
                 request_credits = rate_limit.get("credits_used")
+                reserve = self._remaining_credit_reserve()
+                known_cost = (request_credits if type(request_credits) in (int, float)
+                               and request_credits > 0 else 0)
                 if (type(remaining_credits) in (int, float)
-                        and type(request_credits) in (int, float)
-                        and request_credits > 0 and remaining_credits < request_credits):
+                        and remaining_credits <= max(reserve, known_cost)):
                     preventive = {**rate_limit, "kind": "daily_budget"}
                     delay = provider_cooldown_seconds(preventive)
                     if delay is not None:

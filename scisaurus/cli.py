@@ -57,6 +57,10 @@ def _composer_progress_line(state):
             elif stage_id == current:
                 continue
     usage = state.get("usage") if isinstance(state.get("usage"), dict) else {}
+    active_blockers = state.get("active_blockers")
+    if not isinstance(active_blockers, list):
+        active_blockers = state.get("blockers") if isinstance(state.get("blockers"), list) else []
+    blocker_counts = state.get("blocker_counts") if isinstance(state.get("blocker_counts"), dict) else {}
     compact = {
         "phase": state.get("phase"),
         "stage": current,
@@ -65,7 +69,9 @@ def _composer_progress_line(state):
         "active_agents": list(dict.fromkeys(item for item in active if isinstance(item, str))),
         "usage": {key: usage.get(key, 0) for key in (
             "model_calls", "input_tokens", "output_tokens", "openalex_requests")},
-        "blockers": len(state.get("blockers", [])) if isinstance(state.get("blockers"), list) else 0,
+        "blockers": len(active_blockers),
+        "historical_blockers": blocker_counts.get("historical", len(state.get("blockers", [])))
+        if isinstance(state.get("blockers"), list) else blocker_counts.get("historical", 0),
     }
     return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
 

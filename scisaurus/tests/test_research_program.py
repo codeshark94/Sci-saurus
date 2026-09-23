@@ -42,6 +42,23 @@ def topic_package():
 
 
 class ResearchProgramTests(unittest.TestCase):
+    def test_unselected_malformed_feasibility_plan_does_not_block_program_materialization(self):
+        package = topic_package()
+        package["candidates"][0]["feasibility_plan"] = {
+            "experiment_input": "self_contained",
+            "evidence_inputs": [{
+                "kind": "project_artifact", "status": "available", "source": "stale output",
+            }],
+            "execution_mode": "foundry", "data_access": "closed_world",
+            "required_packages": [], "required_executables": [],
+            "estimated_compute_seconds": 600.0,
+            "estimated_api_requests": 0, "estimated_model_calls": 0,
+            "network_access": False,
+        }
+        program = build_research_program(package)
+        self.assertEqual(program["selected_id"], "branch_1")
+        self.assertEqual(len(program["branches"]), 3)
+
     def test_builds_selected_and_retained_conditional_branches(self):
         program = build_research_program(topic_package())
         validate_research_program(program)
