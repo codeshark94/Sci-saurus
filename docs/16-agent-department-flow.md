@@ -98,6 +98,16 @@ finding remains attached to the research state. At topic intake, a provisional
 hold is carried into the literature brief rather than discarded or falsely
 marked resolved; experiment admission remains closed until the survey verdict.
 
+When a survey or experiment exposes a repairable scientific weakness, the
+Composer admits a bounded salvage ladder before abandoning the direction. The
+ladder changes one repair family at a time across mechanism/observable,
+comparison/baseline, and evidence boundary. Each branch has its own continuation
+artifacts and lineage. Only after the permitted branches are exhausted, or an
+independent source/feasibility check makes the parent unsafe, does the Composer
+route a structural pivot. Model reviewers recommend repairability; deterministic
+checks and the Composer record the disposition, and no historical candidate is
+deleted.
+
 An adaptive failure does not own the worker until the deadline. Composer
 persists its retry boundary, yields to any other ready work, and re-scores the
 frontier before the next isolated attempt. A one-item frontier is still valid
@@ -188,6 +198,21 @@ created -> queued -> running -> awaiting_review -> completed
 controlled states according to the task contract. `research_expansion_required`
 and `review_rejected` are scientific holds at the Composer level: they are not
 successful dependencies and cannot release a paper.
+
+The Composer may still let `argument` produce an explicitly provisional,
+exploratory draft when the configured progression policy permits it. That
+does not weaken publication admission. The `paper` stage has a transitive
+scientific release fence: an upstream candidate, verifier hold, provisional
+topic or survey admission, unexecuted experiment, or release-blocking/backfill
+debt prevents paper dispatch and keeps the paper candidate visibly blocked.
+This is a repair boundary, not an automatic discard: the Composer preserves
+the current branch and evidence, creates one scoped work order for the
+earliest unresolved ancestor, and reruns that closure within the remaining
+continuation budget. Only after the affected upstream closure is repaired and
+re-verified can the same workflow resume the paper stage; a paper candidate
+itself never releases another dependency. Topic refinement uses the bounded
+salvage ladder before a structural pivot unless an independent source or
+feasibility finding makes the parent direction unsafe.
 
 ### Department work order
 

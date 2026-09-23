@@ -404,24 +404,58 @@ def model_context_error(config, *, system, prompt, image_count=0):
     are metadata for admission control; they are not sent as unsupported
     provider request fields such as Ollama's ``num_ctx``.
     """
+    budget = model_context_budget(
+        config, system=system, prompt=prompt, image_count=image_count)
+    if budget["allowed_input_tokens"] is None or budget["fits"]:
+        return None
+    model_name = budget["model"]
+    limit_text = f"{budget['allowed_input_tokens']} input tokens"
+    window_text = (
+        f"; context window {budget['context_window_tokens']} with max output "
+        f"{budget['max_output_tokens']}")
+    return (
+        f"model context budget exceeded for {model_name}: conservative input estimate "
+        f"{budget['estimated_input_tokens']} tokens exceeds {limit_text}{window_text}"
+    )
+
+
+def model_context_budget(config, *, system, prompt, image_count=0):
+    """Return the resolved, tokenizer-independent input admission budget.
+
+    Callers that build a structured packet before dispatch can use this to
+    project the packet into a smaller role-specific view.  Keeping this
+    calculation beside :func:`model_context_error` prevents the planner and
+    the actual client from disagreeing about the effective input ceiling.
+    """
     policy = _validate_context_policy(config)
     window = policy["context_window_tokens"]
     input_limit = policy["max_input_tokens"]
     if window is None and input_limit is None:
-        return None
+        return {
+            "model": config.get("model", "configured model"),
+            "estimated_input_tokens": None,
+            "allowed_input_tokens": None,
+            "context_window_tokens": window,
+            "max_input_tokens": input_limit,
+            "max_output_tokens": policy["max_output_tokens"],
+            "image_count": image_count,
+            "fits": True,
+        }
     estimated = estimate_input_tokens(system, prompt, image_count=image_count)
-    allowed = input_limit if input_limit is not None else float("inf")
+    allowed = input_limit if input_limit is not None else None
     if window is not None:
-        allowed = min(allowed, window - policy["max_output_tokens"])
-    if estimated <= allowed:
-        return None
-    model_name = config.get("model", "configured model")
-    limit_text = f"{int(allowed)} input tokens"
-    window_text = f"; context window {window} with max output {policy['max_output_tokens']}"
-    return (
-        f"model context budget exceeded for {model_name}: conservative input estimate "
-        f"{estimated} tokens exceeds {limit_text}{window_text}"
-    )
+        window_input = window - policy["max_output_tokens"]
+        allowed = window_input if allowed is None else min(allowed, window_input)
+    return {
+        "model": config.get("model", "configured model"),
+        "estimated_input_tokens": estimated,
+        "allowed_input_tokens": int(allowed) if allowed is not None else None,
+        "context_window_tokens": window,
+        "max_input_tokens": input_limit,
+        "max_output_tokens": policy["max_output_tokens"],
+        "image_count": image_count,
+        "fits": allowed is None or estimated <= allowed,
+    }
 
 
 def resolve_model_config(model, *, role=None, overrides=None):
@@ -510,6 +544,29 @@ class ModelCallError(RuntimeError):
             and math.isfinite(retry_after_seconds) and retry_after_seconds >= 0
             else None
         )
+
+
+class ModelContextBudgetError(ValidationError):
+    """A request was rejected locally because its input cannot fit the route.
+
+    This is a deterministic admission result, not a provider call failure.
+    The structured measurements let an orchestrator change the projection or
+    route instead of replaying the identical oversized packet.
+    """
+
+    def __init__(self, message, *, model, estimated_input_tokens,
+                 allowed_input_tokens, context_window_tokens,
+                 max_input_tokens, max_output_tokens, image_count=0):
+        super().__init__(message)
+        self.model = model
+        self.estimated_input_tokens = estimated_input_tokens
+        self.allowed_input_tokens = allowed_input_tokens
+        self.context_window_tokens = context_window_tokens
+        self.max_input_tokens = max_input_tokens
+        self.max_output_tokens = max_output_tokens
+        self.image_count = image_count
+        self.failure_class = "context_budget"
+        self.outcome_known = True
 
 
 class _ProviderHTTPError(RuntimeError):
@@ -692,13 +749,27 @@ class ModelClient:
             raise ValidationError("model images must be a list containing at most 16 items")
         if images and self.protocol != "openai_compatible":
             raise ValidationError("multimodal image input requires the openai_compatible protocol")
-        context_error = model_context_error(
-            {"model": self.model, "max_output_tokens": self.max_output_tokens,
-             "context_window_tokens": self.context_window_tokens,
-             "max_input_tokens": self.max_input_tokens},
-            system=system, prompt=prompt, image_count=len(images))
-        if context_error:
-            raise ValidationError(context_error)
+        context_config = {
+            "model": self.model, "max_output_tokens": self.max_output_tokens,
+            "context_window_tokens": self.context_window_tokens,
+            "max_input_tokens": self.max_input_tokens,
+        }
+        context_budget = model_context_budget(
+            context_config, system=system, prompt=prompt, image_count=len(images))
+        if not context_budget["fits"]:
+            context_error = model_context_error(
+                context_config, system=system, prompt=prompt,
+                image_count=len(images))
+            raise ModelContextBudgetError(
+                context_error,
+                model=context_budget["model"],
+                estimated_input_tokens=context_budget["estimated_input_tokens"],
+                allowed_input_tokens=context_budget["allowed_input_tokens"],
+                context_window_tokens=context_budget["context_window_tokens"],
+                max_input_tokens=context_budget["max_input_tokens"],
+                max_output_tokens=context_budget["max_output_tokens"],
+                image_count=context_budget["image_count"],
+            )
         parts, total = [{"type": "text", "text": prompt}], 0
         for descriptor in images:
             raw, media_type = self._read_image(descriptor)

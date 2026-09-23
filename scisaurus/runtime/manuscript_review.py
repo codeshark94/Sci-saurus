@@ -1206,8 +1206,10 @@ class ManuscriptReviewRunner:
                          *, argument, evidence, artifact_dir, layout_images=None):
         """Persist each independent response before any sibling can fail."""
         page_images = layout_images if reviewer["id"] == "editorial_compression" else None
+        review_images = ((page_images or images or [])
+                         if reviewer["id"] == "editorial_compression" else None)
         image_keys = [{"sha256": hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest(),
-                       "media_type": item.get("media_type")} for item in (page_images or images or [])]
+                       "media_type": item.get("media_type")} for item in (review_images or [])]
         key = hashlib.sha256(canonical_bytes({
             "manuscript": manuscript, "reviewer": reviewer, "images": image_keys,
             "interpretation": interpretation, "argument": argument, "evidence": evidence,
@@ -1264,7 +1266,7 @@ class ManuscriptReviewRunner:
             validate_review(value, reviewer["id"], reviewer["stage"])
             result = ModelResult(text="", model=result.model, usage=usage, elapsed_seconds=elapsed, finish_reason="stop")
         else:
-            value, result = self._call_review(manuscript, reviewer, images, interpretation, deadline,
+            value, result = self._call_review(manuscript, reviewer, review_images, interpretation, deadline,
                 argument=argument, evidence=evidence, artifact_dir=artifact_dir)
         if retained_path:
             retained_path.parent.mkdir(parents=True, exist_ok=True)

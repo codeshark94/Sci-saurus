@@ -23,6 +23,7 @@ from scisaurus.runtime.topic_discovery import (
     topic_maturity_survey_eligible,
     topic_portfolio_profile,
     topic_refinement_dimensions,
+    topic_salvage_plan,
     topic_signature,
     validate_topic_package,
     validate_feasibility_plan,
@@ -41,12 +42,14 @@ from scisaurus.runtime.topic_discovery import (
     _materialize_foundry_capability_requirements,
     _materialize_foundry_feasibility,
     _repair_feasibility_input_contract,
+    _repair_feasibility_input_duplicates,
     _repair_feasibility_input_kinds,
     _repair_feasibility_input_statuses,
     _strip_topic_controller_metadata,
     _materialize_seed_bindings,
     _materialize_seed_domains,
     _materialize_topic_objective,
+    _normalise_topic_model_response,
     _portfolio_shape_plan,
     _repair_executable_selection,
     _repair_foundry_selection,
@@ -635,6 +638,37 @@ class RefinementValidationRepairModel(FakeModel):
 
 
 class TopicDiscoveryTests(unittest.TestCase):
+    def test_topic_response_adapter_recovers_wrappers_and_non_stop_content(self):
+        value = package("objective")
+        raw = "preface\n```json\n" + json.dumps(
+            {"result": value}, ensure_ascii=False) + "\n```\ntrailing note"
+        result = ModelResult(
+            text=raw, model="fake", usage={}, elapsed_seconds=0.01,
+            finish_reason="length")
+        parsed, repairs = _normalise_topic_model_response(result)
+        self.assertEqual(parsed, value)
+        self.assertIn({"kind": "wrapper_unwrap", "wrapper": "result"}, repairs)
+        self.assertIn({
+            "kind": "non_stop_finish_with_parseable_content",
+            "finish_reason": "length",
+        }, repairs)
+
+    def test_topic_response_adapter_recovers_unclosed_outer_object(self):
+        value = package("objective")
+        result = ModelResult(
+            text=json.dumps(value, ensure_ascii=False)[:-1], model="fake",
+            usage={}, elapsed_seconds=0.01, finish_reason="stop")
+        parsed, repairs = _normalise_topic_model_response(result)
+        self.assertEqual(parsed, value)
+        self.assertEqual(repairs, [])
+
+    def test_topic_response_adapter_does_not_invent_package_from_prose(self):
+        result = ModelResult(
+            text="The candidate should study a measurable transition.", model="fake",
+            usage={}, elapsed_seconds=0.01, finish_reason="stop")
+        with self.assertRaisesRegex(ValidationError, "valid JSON"):
+            _normalise_topic_model_response(result)
+
     def test_config_and_package_contracts(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -860,6 +894,77 @@ class TopicDiscoveryTests(unittest.TestCase):
         })
         changed = validate_topic_refinement(parent, child, require_structural_pivot=True)
         self.assertEqual(changed, ["research_question", "research_form", "evidence_mode"])
+
+    def test_salvage_plan_advances_bounded_repairs_before_structural_pivot(self):
+        first = topic_salvage_plan()
+        self.assertEqual(first["mode"], "salvage")
+        self.assertEqual(first["active_branch"]["id"], "mechanism-observable")
+        self.assertEqual(first["remaining_branch_ids"], [
+            "comparison-baseline", "evidence-boundary",
+        ])
+        second = topic_salvage_plan(["mechanism-observable"])
+        self.assertEqual(second["active_branch"]["id"], "comparison-baseline")
+        third = topic_salvage_plan([
+            "mechanism-observable", "comparison-baseline",
+        ])
+        self.assertEqual(third["active_branch"]["id"], "evidence-boundary")
+        exhausted = topic_salvage_plan([
+            "mechanism-observable", "comparison-baseline", "evidence-boundary",
+        ])
+        self.assertEqual(exhausted["mode"], "structural_pivot")
+        self.assertTrue(exhausted["exhausted"])
+        forced = topic_salvage_plan(["mechanism-observable"], force_structural_pivot=True)
+        self.assertEqual(forced["mode"], "structural_pivot")
+        self.assertTrue(forced["forced"])
+
+    def test_topic_prompt_exposes_active_salvage_branch_and_rejects_cosmetic_repair(self):
+        value = package("Choose a feasible research direction")
+        plan = topic_salvage_plan()
+        payload = json.loads(topic_prompt(
+            "Choose a feasible research direction", 3,
+            refinement_context={
+                "mode": "refinement", "cycle": 2,
+                "parent_topic_id": value["candidates"][0]["id"],
+                "parent_topic": value["candidates"][0],
+                "salvage_plan": plan,
+            },
+        ))
+        self.assertEqual(
+            payload["refinement_context"]["salvage_plan"]["active_branch"]["id"],
+            "mechanism-observable",
+        )
+        self.assertTrue(any(
+            "bounded salvage branch" in item for item in payload["constraints"]
+        ))
+
+    def test_runner_records_salvage_branch_in_topic_evolution(self):
+        MaturityModel.calls = []
+        MaturityModel.review_count = 0
+        parent = package("Choose a feasible research direction")["candidates"][1]
+        refinement_context = {
+            "mode": "refinement",
+            "cycle": 4,
+            "parent_topic_id": parent["id"],
+            "parent_topic": parent,
+            "reason": "survey repair",
+            "salvage_plan": topic_salvage_plan(),
+        }
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", MaturityModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+            }).run(
+                "Choose a feasible research direction", candidate_count=3,
+                bibliography=False, refinement_context=refinement_context,
+                maturity_review_rounds=0, max_attempts=2,
+            )
+        salvage = result["topic_evolution"]["salvage"]
+        self.assertEqual(salvage["branch_id"], "mechanism-observable")
+        self.assertEqual(salvage["attempted_branch_ids"], ["mechanism-observable"])
+        self.assertEqual(
+            salvage["remaining_branch_ids"],
+            ["comparison-baseline", "evidence-boundary"],
+        )
 
     def test_refinement_shape_plan_moves_the_parent_slot(self):
         initial = _portfolio_shape_plan(4, seed=123456)
@@ -1931,6 +2036,21 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(value["candidates"][0]["feasibility_plan"]["evidence_inputs"][0]["kind"], "synthetic")
         self.assertEqual(repairs[0]["source"], "lossless_kind_alias")
         self.assertEqual(validate_feasibility_plan(value["candidates"][0]["feasibility_plan"])["data_access"], "closed_world")
+
+    def test_duplicate_feasibility_kinds_are_merged_without_losing_sources(self):
+        value = package("Choose a feasible research direction")
+        plan = foundry_feasibility_plan(evidence_inputs=[
+            {"kind": "synthetic", "status": "available", "source": "generated inputs"},
+            {"kind": "synthetic", "status": "available", "source": "seeded perturbations"},
+        ])
+        value["candidates"][0]["feasibility_plan"] = plan
+        repairs = _repair_feasibility_input_duplicates(value)
+        inputs = value["candidates"][0]["feasibility_plan"]["evidence_inputs"]
+        self.assertEqual(len(inputs), 1)
+        self.assertIn("generated inputs", inputs[0]["source"])
+        self.assertIn("seeded perturbations", inputs[0]["source"])
+        self.assertEqual(repairs[0]["source"], "lossless_duplicate_kind_merge")
+        validate_feasibility_plan(value["candidates"][0]["feasibility_plan"])
 
     def test_current_foundry_gate_rejects_hidden_external_inputs_and_network(self):
         value = package("Choose a feasible research direction")

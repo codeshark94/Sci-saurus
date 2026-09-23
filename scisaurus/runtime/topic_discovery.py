@@ -24,7 +24,7 @@ import time
 import uuid
 
 from scisaurus.core.errors import QuotaExceededError, ValidationError
-from scisaurus.core.schema import canonical_bytes
+from scisaurus.core.schema import canonical_bytes, json_object
 from scisaurus.runtime.models import (
     MAX_PROVIDER_SEED, ModelCallError, ModelClient, estimate_input_tokens,
     model_call_budget_available, resolve_model_config,
@@ -206,6 +206,11 @@ FEASIBILITY_INPUT_STATUS_ALIASES = {
     "absent": "unavailable",
     "unavailable_now": "unavailable",
 }
+FEASIBILITY_STATUS_PRIORITY = {
+    "available": 0,
+    "acquirable_before_experiment": 1,
+    "unavailable": 2,
+}
 FEASIBILITY_DATA_ACCESS = {
     "closed_world", "project_local", "survey_artifact", "external_provider",
 }
@@ -336,6 +341,31 @@ REFINEMENT_DIMENSIONS = (
     "mechanism", "data_regime", "comparison", "measurement", "theory",
     "research_form", "evidence_mode", "comparison_type",
 )
+# A downstream scientific failure should first get a small, inspectable set of
+# salvage attempts.  These are deliberately different repair axes: a model may
+# recommend a direction, but the controller chooses the next branch and keeps
+# the branch history durable in ``topic_evolution``.
+SALVAGE_LADDER_SCHEMA_VERSION = "topic-salvage-ladder-1"
+TOPIC_SALVAGE_BRANCHES = (
+    {
+        "id": "mechanism-observable",
+        "goal": "change the mechanism and primary observable while preserving the supported phenomenon",
+        "change_dimensions": ("mechanism", "measurement", "theory_target", "comparison_type"),
+        "preserve": "supported phenomenon and source grounding unless the evidence refutes them",
+    },
+    {
+        "id": "comparison-baseline",
+        "goal": "replace the comparator or baseline and make the competing predictions separable",
+        "change_dimensions": ("comparison", "data_regime", "disconfirmation_test", "research_form"),
+        "preserve": "the strongest supported mechanism and the declared execution boundary",
+    },
+    {
+        "id": "evidence-boundary",
+        "goal": "change the evidence mode and study boundary to an independently testable question",
+        "change_dimensions": ("evidence_mode", "research_form", "scope", "comparison_type"),
+        "preserve": "only claims that remain supported after the new evidence boundary is applied",
+    },
+)
 MATURITY_REVIEW_FIELDS = {
     "decision", "selected_id", "scores", "rationale", "required_changes",
     "changed_dimensions",
@@ -348,6 +378,56 @@ MATURITY_MIN_DIMENSION = 2
 # journal-oriented threshold above for a mature intake decision.
 MATURITY_SURVEY_MIN_TOTAL = 10
 MATURITY_SURVEY_MIN_DIMENSION = 2
+
+
+def topic_salvage_plan(attempted_branch_ids=None, *, force_structural_pivot=False):
+    """Return the next bounded salvage branch or a structural-pivot decision.
+
+    This is a deterministic routing projection.  It does not decide whether a
+    scientific claim is true; it only prevents a rejected direction from being
+    abandoned after one failed repair or replayed indefinitely.  A forced pivot
+    is reserved for an independent source/feasibility finding that makes
+    preserving the parent direction unsafe.
+    """
+    if type(force_structural_pivot) is not bool:
+        raise ValidationError("force_structural_pivot must be boolean")
+    known = {item["id"] for item in TOPIC_SALVAGE_BRANCHES}
+    attempted = []
+    for branch_id in attempted_branch_ids or []:
+        if not isinstance(branch_id, str) or branch_id not in known:
+            continue
+        if branch_id not in attempted:
+            attempted.append(branch_id)
+    remaining = [item for item in TOPIC_SALVAGE_BRANCHES
+                 if item["id"] not in attempted]
+    if force_structural_pivot or not remaining:
+        return {
+            "schema_version": SALVAGE_LADDER_SCHEMA_VERSION,
+            "policy": "bounded_salvage_before_structural_pivot",
+            "mode": "structural_pivot",
+            "active_branch": None,
+            "branches": [deepcopy(item) for item in TOPIC_SALVAGE_BRANCHES],
+            "attempted_branch_ids": attempted,
+            "remaining_branch_ids": [],
+            "exhausted": not force_structural_pivot,
+            "forced": force_structural_pivot,
+        }
+    active = deepcopy(remaining[0])
+    active["index"] = next(
+        index for index, item in enumerate(TOPIC_SALVAGE_BRANCHES)
+        if item["id"] == active["id"]
+    )
+    return {
+        "schema_version": SALVAGE_LADDER_SCHEMA_VERSION,
+        "policy": "bounded_salvage_before_structural_pivot",
+        "mode": "salvage",
+        "active_branch": active,
+        "branches": [deepcopy(item) for item in TOPIC_SALVAGE_BRANCHES],
+        "attempted_branch_ids": attempted,
+        "remaining_branch_ids": [item["id"] for item in remaining[1:]],
+        "exhausted": False,
+        "forced": False,
+    }
 
 _TOPIC_STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "can", "does", "do", "for", "from",
@@ -654,6 +734,139 @@ def _strip_topic_controller_metadata(package):
     return repairs
 
 
+_TOPIC_RESPONSE_WRAPPER_KEYS = (
+    "topic_package", "package", "result", "output", "data", "response", "answer",
+)
+
+
+def _topic_json_fragments(raw):
+    """Yield bounded JSON candidates from a model response.
+
+    Topic intake is content-first: a gateway may add a short preface, close a
+    markdown fence incorrectly, or return a complete object with a non-``stop``
+    finish reason.  The scientific validator still owns acceptance, but the
+    transport adapter should recover an unambiguous object before spending
+    another topic-generation call.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    sources = []
+    seen_sources = set()
+
+    def add_source(value):
+        if not isinstance(value, str):
+            return
+        value = value.strip()
+        if value and value not in seen_sources:
+            seen_sources.add(value)
+            sources.append(value)
+
+    add_source(raw)
+    if "</think>" in raw:
+        add_source(raw.rsplit("</think>", 1)[1])
+    for match in re.finditer(
+            r"```(?:json|jsonc)?\s*(.*?)```", raw, flags=re.IGNORECASE | re.DOTALL):
+        add_source(match.group(1))
+
+    fragments = []
+    seen_fragments = set()
+
+    def add_fragment(value):
+        if not isinstance(value, str):
+            return
+        value = value.strip()
+        if value and value not in seen_fragments:
+            seen_fragments.add(value)
+            fragments.append(value)
+
+    for source in sources:
+        # The exact response is tried first so the established strict parser
+        # remains authoritative for clean model envelopes.
+        add_fragment(source)
+        starts = [index for index, char in enumerate(source) if char == "{"][:32]
+        for start in starts:
+            stack = []
+            in_string = False
+            escaped = False
+            closed = False
+            for index in range(start, len(source)):
+                char = source[index]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        in_string = False
+                    continue
+                if char == '"':
+                    in_string = True
+                elif char == "{":
+                    stack.append("}")
+                elif char == "[":
+                    stack.append("]")
+                elif char in "}]":
+                    if not stack or stack[-1] != char:
+                        break
+                    stack.pop()
+                    if not stack:
+                        add_fragment(source[start:index + 1])
+                        closed = True
+                        break
+            if not closed:
+                # Let json_object decide whether the missing closers are
+                # unambiguous.  Semantic validation happens later.
+                add_fragment(source[start:])
+    return fragments
+
+
+def _unwrap_topic_response(value, *, single_candidate_refinement=False):
+    """Unwrap common provider envelopes without relaxing the topic schema."""
+    if not isinstance(value, dict):
+        raise ValidationError("model output must contain a JSON object")
+    if single_candidate_refinement and set(value) == {"selected_candidate"}:
+        candidate = value.get("selected_candidate")
+        if isinstance(candidate, dict):
+            return {"candidate": candidate}, [{
+                "kind": "wrapper_unwrap", "wrapper": "selected_candidate",
+            }]
+    if ("candidates" in value or "candidate" in value):
+        return value, []
+    for key in _TOPIC_RESPONSE_WRAPPER_KEYS:
+        nested = value.get(key)
+        if not isinstance(nested, dict):
+            continue
+        if ("candidates" in nested or "candidate" in nested):
+            return nested, [{"kind": "wrapper_unwrap", "wrapper": key}]
+    return value, []
+
+
+def _normalise_topic_model_response(result, *, single_candidate_refinement=False):
+    """Recover a topic package before semantic gates and bounded retries.
+
+    This adapter only repairs transport shape: prose is not converted into
+    scientific fields, missing candidates are not invented, and all normal
+    topic/feasibility/novelty gates still run unchanged.
+    """
+    parse_error = None
+    for fragment in _topic_json_fragments(getattr(result, "text", None)):
+        try:
+            parsed = json_object(
+                fragment, "model output", model_envelope=True,
+                allow_missing_closers=True)
+            package, repairs = _unwrap_topic_response(
+                parsed, single_candidate_refinement=single_candidate_refinement)
+            if result.finish_reason != "stop":
+                repairs = [*repairs, {
+                    "kind": "non_stop_finish_with_parseable_content",
+                    "finish_reason": result.finish_reason,
+                }]
+            return package, repairs
+        except ValidationError as exc:
+            parse_error = exc
+    raise ValidationError("model output must contain valid JSON") from parse_error
+
+
 def _repair_known_candidate_field_aliases(package):
     """Canonicalize only explicit, lossless aliases from model JSON."""
     if not isinstance(package, dict) or not isinstance(package.get("candidates"), list):
@@ -917,6 +1130,66 @@ def _repair_feasibility_input_kinds(package):
                 "to": canonical,
                 "source": "lossless_kind_alias",
             })
+    return repairs
+
+
+def _repair_feasibility_input_duplicates(package):
+    """Merge repeated evidence kinds without discarding their declaration.
+
+    ``kind`` is the execution contract's identity for one input family. A
+    model can list that family twice with different wording or sources. This
+    is a lossless-enough shape repair: sources are joined in stable order,
+    the most conservative availability status wins, and the audit records the
+    merge. It does not add a new input, upgrade an unavailable one, or invent
+    feasibility evidence.
+    """
+    if not isinstance(package, dict):
+        return []
+    repairs = []
+    for candidate in package.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        plan = candidate.get("feasibility_plan")
+        if not isinstance(plan, dict) or not isinstance(plan.get("evidence_inputs"), list):
+            continue
+        merged = []
+        positions = {}
+        counts = {}
+        for item in plan["evidence_inputs"]:
+            if not isinstance(item, dict) or not isinstance(item.get("kind"), str):
+                merged.append(item)
+                continue
+            kind = item["kind"]
+            if kind not in positions:
+                positions[kind] = len(merged)
+                counts[kind] = 1
+                merged.append(item)
+                continue
+            index = positions[kind]
+            existing = merged[index]
+            counts[kind] += 1
+            sources = []
+            for source in (existing.get("source"), item.get("source")):
+                if isinstance(source, str) and source.strip() and source not in sources:
+                    sources.append(source)
+            joined = " | ".join(sources)
+            source_truncated = len(joined) > 320
+            existing["source"] = joined[:317].rstrip() + "..." if source_truncated else joined
+            statuses = [existing.get("status"), item.get("status")]
+            known_statuses = [status for status in statuses if status in FEASIBILITY_STATUS_PRIORITY]
+            if known_statuses:
+                existing["status"] = max(
+                    known_statuses, key=lambda status: FEASIBILITY_STATUS_PRIORITY[status])
+            repairs.append({
+                "candidate_id": candidate.get("id"),
+                "field": "feasibility_plan.evidence_inputs",
+                "kind": kind,
+                "merged_count": counts[kind],
+                "source": "lossless_duplicate_kind_merge",
+                "source_truncated": source_truncated,
+            })
+        if len(merged) != len(plan["evidence_inputs"]):
+            plan["evidence_inputs"] = merged
     return repairs
 
 
@@ -1856,6 +2129,7 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
             # self-contained (or plainly survey-backed).
             _repair_feasibility_input_kinds({"candidates": [candidate]})
             _repair_feasibility_input_statuses({"candidates": [candidate]})
+            _repair_feasibility_input_duplicates({"candidates": [candidate]})
             _repair_feasibility_input_contract({"candidates": [candidate]}, {})
             validate_feasibility_plan(candidate["feasibility_plan"])
         if capability_ids:
@@ -2608,6 +2882,7 @@ def validate_topic_feasibility(package, runtime_context):
     # sent the same candidate back through another model turn.
     _repair_feasibility_input_kinds(package)
     _repair_feasibility_input_statuses(package)
+    _repair_feasibility_input_duplicates(package)
     _repair_feasibility_input_contract(package, runtime_context)
     selected = next(item for item in package["candidates"] if item["id"] == package["selected_id"])
     catalog = runtime_context.get("experiment_catalog") or []
@@ -3172,6 +3447,24 @@ def _topic_prompt_refinement_projection(value):
         ]
     if value.get("reason") is not None:
         result["reason"] = _topic_prompt_clip(value.get("reason"), 1200)
+    salvage_plan = value.get("salvage_plan")
+    if isinstance(salvage_plan, dict):
+        result["salvage_plan"] = {
+            key: deepcopy(salvage_plan.get(key))
+            for key in (
+                "schema_version", "policy", "mode", "active_branch",
+                "attempted_branch_ids", "remaining_branch_ids", "exhausted", "forced",
+            ) if key in salvage_plan
+        }
+        result["salvage_plan"]["branches"] = [
+            {
+                key: deepcopy(branch.get(key))
+                for key in ("id", "goal", "change_dimensions", "preserve", "index")
+                if key in branch
+            }
+            for branch in salvage_plan.get("branches", [])[:3]
+            if isinstance(branch, dict)
+        ]
     return result
 
 
@@ -3470,6 +3763,25 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
             "do not select a direction that the supplied evidence already refutes; if the parent is refuted, pivot to a discriminating unresolved question",
             "treat the supplied survey evidence and source spans as the reason for the redesign; do not invent a gap that is absent from them",
         ])
+        salvage_plan = refinement_context.get("salvage_plan")
+        if isinstance(salvage_plan, dict):
+            active_branch = salvage_plan.get("active_branch")
+            if salvage_plan.get("mode") == "salvage" and isinstance(active_branch, dict):
+                branch_id = active_branch.get("id")
+                change_dimensions = active_branch.get("change_dimensions") or []
+                constraints.extend([
+                    "This is a bounded salvage branch before a structural pivot. Preserve the parent's supported scientific core where the evidence allows; do not abandon it merely because the first executable formulation failed.",
+                    f"Implement salvage branch {branch_id!r}: {active_branch.get('goal', '')}",
+                    "Make the active branch observable in the selected candidate, not only in selection_rationale.",
+                    "Change at least two of the active branch dimensions: "
+                    + ", ".join(str(item) for item in change_dimensions) + ".",
+                    "Do not reuse an already attempted salvage branch, and do not emit a cosmetic title or threshold change as a branch.",
+                ])
+            elif salvage_plan.get("mode") == "structural_pivot":
+                constraints.extend([
+                    "All permitted salvage branches are exhausted or a deterministic/source gate forced a pivot. Produce a structurally independent question and state a discriminating unresolved comparison.",
+                    "Do not present the structural pivot as a repaired version of the rejected candidate; preserve the rejection lineage and change the scientific shape materially.",
+                ])
         rejected_seed_ids = refinement_context.get("rejected_frontier_seed_ids")
         if (refinement_context.get("require_frontier_seed_pivot") is True
                 and isinstance(rejected_seed_ids, list) and rejected_seed_ids):
@@ -4136,6 +4448,8 @@ class TopicDiscoveryRunner:
                             repair_package)
                         contract_repairs.extend(_repair_feasibility_input_statuses(
                             repair_package))
+                        contract_repairs.extend(_repair_feasibility_input_duplicates(
+                            repair_package))
                         contract_repairs.extend(_repair_feasibility_input_contract(
                             repair_package, runtime_context or {}))
                         value = repair_package["candidates"][0]["feasibility_plan"]
@@ -4548,7 +4862,7 @@ class TopicDiscoveryRunner:
                 if isinstance(maturity_review_error, str) and maturity_review_error.strip():
                     output["maturity_review_error"] = maturity_review_error[:2048]
             if refinement_context:
-                output["topic_evolution"] = {
+                evolution = {
                     "mode": "refinement",
                     "cycle": refinement_context.get("cycle"),
                     "parent_topic_id": refinement_context.get("parent_topic_id"),
@@ -4558,7 +4872,69 @@ class TopicDiscoveryRunner:
                     )) or refinement_context.get("changed_dimensions", []),
                     "reason": refinement_context.get("reason"),
                 }
+                salvage_plan = refinement_context.get("salvage_plan")
+                if isinstance(salvage_plan, dict):
+                    active_branch = salvage_plan.get("active_branch")
+                    attempted = list(salvage_plan.get("attempted_branch_ids", []))
+                    if (salvage_plan.get("mode") == "salvage"
+                            and isinstance(active_branch, dict)
+                            and active_branch.get("id") not in attempted):
+                        attempted.append(active_branch.get("id"))
+                    evolution["salvage"] = {
+                        "schema_version": salvage_plan.get("schema_version"),
+                        "policy": salvage_plan.get("policy"),
+                        "mode": salvage_plan.get("mode"),
+                        "disposition": (
+                            "salvage_branch"
+                            if salvage_plan.get("mode") == "salvage"
+                            else "structural_pivot"
+                        ),
+                        "branch_id": (
+                            active_branch.get("id")
+                            if isinstance(active_branch, dict) else None
+                        ),
+                        "branch_index": (
+                            active_branch.get("index")
+                            if isinstance(active_branch, dict) else None
+                        ),
+                        "attempted_branch_ids": attempted,
+                        "remaining_branch_ids": list(
+                            salvage_plan.get("remaining_branch_ids", [])
+                        ),
+                        "exhausted": bool(salvage_plan.get("exhausted")),
+                        "forced": bool(salvage_plan.get("forced")),
+                    }
+                output["topic_evolution"] = evolution
             return output
+
+        def apply_salvage_prompt(payload):
+            """Attach the controller-selected branch to every repair prompt."""
+            if not isinstance(payload, dict) or not isinstance(refinement_context, dict):
+                return payload
+            salvage_plan = refinement_context.get("salvage_plan")
+            if not isinstance(salvage_plan, dict):
+                return payload
+            projected = _topic_prompt_refinement_projection(
+                {"salvage_plan": salvage_plan})
+            payload["salvage_plan"] = projected.get("salvage_plan", {})
+            active = salvage_plan.get("active_branch")
+            instruction = payload.get("refinement_instruction", "")
+            if salvage_plan.get("mode") == "salvage" and isinstance(active, dict):
+                instruction += (
+                    f" This is bounded salvage branch {active.get('id')}: "
+                    f"{active.get('goal', '')}. Preserve the supported parent core, "
+                    "make the branch observable in the candidate, and change at least "
+                    "two of these dimensions: "
+                    + ", ".join(str(item) for item in active.get("change_dimensions", []))
+                    + ". Do not make a cosmetic title or threshold edit."
+                )
+            elif salvage_plan.get("mode") == "structural_pivot":
+                instruction += (
+                    " The bounded salvage ladder is exhausted or was forcibly bypassed. "
+                    "Produce a structurally independent question and retain the rejection lineage."
+                )
+            payload["refinement_instruction"] = instruction
+            return payload
 
         for attempt in attempts:
             generation_seed = (sampling_seed + attempt) % MAX_PROVIDER_SEED if sampling_seed is not None else None
@@ -4624,6 +5000,7 @@ class TopicDiscoveryRunner:
                             "output_contract. Keep the exact candidate id, required shape, target "
                             "seed, and allowed work IDs; repair only validation_error."
                         )
+                    apply_salvage_prompt(refinement_payload)
                     prompt = json.dumps(
                         refinement_payload, ensure_ascii=False, sort_keys=True)
             if refinement_feedback is not None and not single_candidate_refinement:
@@ -4651,6 +5028,7 @@ class TopicDiscoveryRunner:
                     "evidence_mode, or comparison_type. The selected direction must be an orthogonal pivot, "
                     "not a cosmetic rewrite."
                 )
+                apply_salvage_prompt(refinement_payload)
                 if isinstance(refinement_feedback, dict) and refinement_feedback.get(
                         "require_frontier_seed_pivot") is True:
                     refinement_payload["refinement_instruction"] += (
@@ -4714,6 +5092,7 @@ class TopicDiscoveryRunner:
                     "and rewrite any useful boundary detail into data_regime or theory_target rather than "
                     "creating a key such as mechanism_boundary."
                 )
+                apply_salvage_prompt(repair_payload)
                 if (last_error is not None
                         and str(last_error).startswith("topic candidate portfolio")):
                     observed_profile = (
@@ -4764,16 +5143,10 @@ class TopicDiscoveryRunner:
                 continue
             budget.record_model_result(result)
             previous = result.text
-            if result.finish_reason != "stop":
-                last_error = ValidationError(f"topic discovery did not finish normally: {result.finish_reason}")
-                budget.record_validation_error(last_error)
-                candidate_attempt_trace.append(_candidate_attempt_record(
-                    {}, attempt=attempt + 1, status="incomplete", error=str(last_error),
-                    outcome_known=True))
-                continue
             attempt_record = None
             try:
-                parsed_package = result.json_object(allow_missing_closers=True)
+                parsed_package, response_repairs = _normalise_topic_model_response(
+                    result, single_candidate_refinement=single_candidate_refinement)
                 if single_candidate_refinement:
                     if (not isinstance(parsed_package, dict)
                             or set(parsed_package) != {"candidate"}
@@ -4830,6 +5203,7 @@ class TopicDiscoveryRunner:
                     package, runtime_context)
                 kind_repairs = _repair_feasibility_input_kinds(package)
                 status_repairs = _repair_feasibility_input_statuses(package)
+                duplicate_repairs = _repair_feasibility_input_duplicates(package)
                 input_contract_repairs = _repair_feasibility_input_contract(
                     package, runtime_context)
                 package = _materialize_foundry_capability_requirements(
@@ -4838,6 +5212,8 @@ class TopicDiscoveryRunner:
                     package, frontier_seeds=(frontier_seed_plan or {}).get("seeds", []))
                 attempt_record = _candidate_attempt_record(
                     package, attempt=attempt + 1, outcome_known=True)
+                if response_repairs:
+                    attempt_record["response_normalization"] = response_repairs
                 if objective_normalized:
                     attempt_record["objective_normalized"] = True
                 if query_anchor_repairs:
@@ -4859,6 +5235,9 @@ class TopicDiscoveryRunner:
                 if status_repairs:
                     attempt_record.setdefault("derived_field_repairs", []).extend(
                         status_repairs)
+                if duplicate_repairs:
+                    attempt_record.setdefault("derived_field_repairs", []).extend(
+                        duplicate_repairs)
                 if missing_field_repairs:
                     attempt_record.setdefault("derived_field_repairs", []).extend(
                         missing_field_repairs)
@@ -5701,8 +6080,9 @@ __all__ = [
     "SCHEMA_VERSION", "STAGE_CONFIG_SCHEMA_VERSION", "TOPIC_HISTORY_SCHEMA_VERSION",
     "RECENT_YEAR_WINDOW", "TopicDiscoveryRunner", "topic_signature", "validate_topic_novelty",
     "topic_portfolio_profile", "validate_topic_portfolio", "topic_refinement_dimensions",
-    "validate_topic_refinement",
+    "validate_topic_refinement", "topic_salvage_plan",
     "validate_frontier_seed_plan", "validate_source_challenge", "validate_topic_stage_config",
     "validate_topic_package", "validate_topic_feasibility", "validate_feasibility_plan", "topic_prompt",
-    "_repair_feasibility_input_contract",
+    "_repair_feasibility_input_contract", "_repair_feasibility_input_duplicates",
+    "_normalise_topic_model_response",
 ]

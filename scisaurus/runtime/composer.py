@@ -45,11 +45,12 @@ from scisaurus.runtime.specialists import (
     build_specialist_prompt, build_verifier_prompt,
 )
 from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
-from scisaurus.runtime.models import ModelCallError
+from scisaurus.runtime.models import ModelCallError, ModelContextBudgetError
 from scisaurus.runtime.topic_discovery import (
     DEFAULT_TOPIC_BUDGETS,
     DEFAULT_TOPIC_CONTINUATION_BUDGETS,
     EVIDENCE_MODE_VALUES,
+    topic_salvage_plan,
     _topic_validation_rejection_type,
 )
 
@@ -1048,6 +1049,8 @@ class ComposerRunner:
     @staticmethod
     def _forward_failure_class(error):
         """Classify a failed attempt without turning every defect into a stop."""
+        if getattr(error, "failure_class", None) == "context_budget":
+            return "resource_fence"
         if isinstance(error, (ProviderConfigurationError, ProviderCooldownError, QuotaExceededError,
                               ComposerHardDeadlineExceeded, ComposerLateStageResult)):
             return "resource_fence"
@@ -1757,6 +1760,8 @@ class ComposerRunner:
                     "A source-grounded topic package addresses the recorded blocker, survives maturity and adversarial review, and is admitted before survey."
                 ),
                 "evidence_needed": evidence_text,
+                "salvage_policy": "bounded_salvage_before_structural_pivot",
+                "salvage_branch_limit": 3,
                 "source_stage_id": stage_id,
             }
         if stage_kind == "survey":
@@ -3134,7 +3139,8 @@ class ComposerRunner:
             "assessment_ref": survey.get("assessment_ref") if isinstance(survey, dict) else None,
             "evidence": survey_evidence,
             "requests": [{key: item.get(key) for key in (
-                "id", "kind", "objective", "why", "success_condition", "evidence_needed")}
+                "id", "kind", "objective", "why", "success_condition", "evidence_needed",
+                "salvage_policy", "salvage_branch_limit")}
                          for item in requests],
         }
         specialist_feedback = []
@@ -3170,6 +3176,48 @@ class ComposerRunner:
                 "critical_findings": [str(item)[:1600] for item in (
                     verifier_response.get("critical_findings", []) or [])[:12]],
             }
+        parent_evolution = (
+            parent_context.get("topic_evolution")
+            if isinstance(parent_context, dict) else None
+        )
+        parent_salvage = (
+            parent_evolution.get("salvage")
+            if isinstance(parent_evolution, dict) else None
+        )
+        # A structural pivot starts a new lineage. A successful salvage branch
+        # carries its attempted IDs forward so the next continuation selects a
+        # different repair axis instead of replaying the same one.
+        attempted_salvage = []
+        if isinstance(parent_salvage, dict) and parent_salvage.get("mode") == "salvage":
+            attempted_salvage = list(parent_salvage.get("attempted_branch_ids", []))
+        source_challenge = (
+            parent_context.get("source_challenge")
+            if isinstance(parent_context, dict) else None
+        )
+        feasibility_revalidation = (
+            parent_context.get("runtime_feasibility_revalidation")
+            if isinstance(parent_context, dict) else None
+        )
+        force_structural_pivot = (
+            any(
+                isinstance(item, dict)
+                and item.get("require_frontier_seed_pivot") is True
+                for item in requests
+            )
+            or verifier_response.get("require_frontier_seed_pivot") is True
+            or (
+                isinstance(source_challenge, dict)
+                and source_challenge.get("prior_work_risk") == "high"
+            )
+            or (
+                isinstance(feasibility_revalidation, dict)
+                and feasibility_revalidation.get("status") == "required"
+            )
+        )
+        salvage_plan = topic_salvage_plan(
+            attempted_salvage,
+            force_structural_pivot=force_structural_pivot,
+        )
         return {
             "mode": "refinement",
             "cycle": self.continuation_cycles,
@@ -3183,6 +3231,7 @@ class ComposerRunner:
             "survey_feedback": feedback,
             "specialist_feedback": specialist_feedback,
             "refinement_feedback": refinement_feedback,
+            "salvage_plan": salvage_plan,
         }
 
     @staticmethod
@@ -6004,7 +6053,7 @@ class ComposerRunner:
         return config
 
     @staticmethod
-    def _stage_releases_dependencies(record):
+    def _stage_releases_dependencies(record, *, stage_kind=None):
         """Return whether a stage is safe to expose to dependent stages."""
         if not isinstance(record, dict):
             return False
@@ -6012,6 +6061,13 @@ class ComposerRunner:
         if status in {"completed", "accepted"}:
             return True
         if status != "candidate_needs_review":
+            return False
+        # A paper candidate is never a dependency release.  Exploratory
+        # argument work may be useful before all scientific debt is cleared,
+        # but publication must remain behind an explicit evidence closure.
+        # This is deliberately independent of ``composer_decision`` so a
+        # forward-first handoff cannot turn a draft into a release input.
+        if stage_kind == "paper":
             return False
         # In the autonomous-lab policy, this is an explicit Composer handoff,
         # not a release approval by the deterministic harness.  The candidate
@@ -6023,6 +6079,238 @@ class ComposerRunner:
             return False
         debt = record.get("failure_debt")
         return not (isinstance(debt, dict) and debt.get("release_blocking") is True)
+
+    def _paper_release_blockers(self, paper_stage, by_id):
+        """Return unresolved scientific ancestors that fence paper release.
+
+        The scheduler may let an adaptive Composer inspect provisional work in
+        ``argument``.  A paper is a different boundary: every ancestor must
+        have an accepted/completed scientific packet with no active verifier,
+        evidence, or backfill debt.  Keep this check on the Composer side so
+        it applies equally to a fresh run and a restored checkpoint.
+        """
+        if not isinstance(paper_stage, dict) or paper_stage.get("kind") != "paper":
+            return []
+        pending = list(paper_stage.get("depends_on", []))
+        ancestor_ids = set()
+        while pending:
+            stage_id = pending.pop()
+            if stage_id in ancestor_ids or stage_id not in by_id:
+                continue
+            ancestor_ids.add(stage_id)
+            pending.extend(by_id[stage_id].get("depends_on", []))
+
+        blockers = []
+        workflow_order = [
+            stage.get("id") for stage in self.workflow.get("stages", [])
+            if isinstance(stage, dict) and stage.get("id") in ancestor_ids
+        ]
+        survey_ancestors = [
+            stage_id for stage_id in workflow_order
+            if by_id[stage_id].get("kind") == "survey"
+        ]
+        for stage_id in workflow_order:
+            stage = by_id[stage_id]
+            record = self.stage_records.get(stage_id, {})
+            context = self.context.get(stage_id, {})
+            if not isinstance(record, dict):
+                record = {}
+            if not isinstance(context, dict):
+                context = {}
+            record_status = record.get("status")
+            context_status = context.get("status")
+            specialist_verifier = context.get("specialist_verifier")
+            if not isinstance(specialist_verifier, dict):
+                specialist_verifier = {}
+            reasons = []
+
+            if record_status in STAGE_HOLD_STATUSES or context_status in STAGE_HOLD_STATUSES:
+                reasons.append("scientific_hold")
+            if (record_status == "candidate_needs_review"
+                    or context_status == "candidate_needs_review"):
+                reasons.append("provisional_candidate")
+            if (record.get("verifier_outcome") == "hold"
+                    or context.get("verifier_outcome") == "hold"
+                    or specialist_verifier.get("verdict") == "hold"
+                    or specialist_verifier.get("decision") == "hold"):
+                reasons.append("verifier_hold")
+            if (record.get("release_blocking") is True
+                    or context.get("release_blocking") is True):
+                reasons.append("release_blocking")
+            debt = record.get("failure_debt")
+            context_debt = context.get("failure_debt")
+            if (isinstance(debt, dict) and debt.get("release_blocking") is True
+                    or isinstance(context_debt, dict)
+                    and context_debt.get("release_blocking") is True):
+                reasons.append("failure_debt")
+            if (record.get("backfill_required") is True
+                    or context.get("backfill_required") is True
+                    or record.get("progression_state") in {"deferred", "advanced_with_findings"}
+                    or context.get("progression_state") in {"deferred", "advanced_with_findings"}):
+                reasons.append("backfill_required")
+
+            kind = stage.get("kind")
+            if kind == "topic_discovery" and (
+                    context.get("admission_state") == "provisional_for_survey"
+                    or record.get("admission_state") == "provisional_for_survey"):
+                # A topic is intentionally provisional at the topic -> survey
+                # boundary.  Once an ancestor survey has produced a current,
+                # experiment-eligible assessment, that provisional label is
+                # resolved for the paper branch; otherwise the survey (or the
+                # missing survey) remains the repair target.
+                # If a survey ancestor exists but has not resolved the topic,
+                # its own evidence gate is the repair target.  Do not pivot
+                # the topic merely because the first survey pass is thin.
+                if not survey_ancestors:
+                    reasons.append("provisional_topic")
+            if kind == "survey":
+                effective_status = context_status or record_status
+                if context.get("topic_admission") in {
+                        "exploratory_pilot", "expand_literature_before_refine",
+                        "refine_before_experiment"}:
+                    reasons.append("survey_not_experiment_eligible")
+                if context.get("gap_state") in {"insufficient_evidence", "refuted_by_prior_work"}:
+                    reasons.append("survey_gap_unresolved")
+                if context.get("survey_current") is False or context.get("assessment_current") is False:
+                    reasons.append("survey_assessment_not_current")
+                if (effective_status in {"completed", "accepted"}
+                        and "gap_state" in context
+                        and context.get("gap_state") != "eligible_for_experiment"):
+                    reasons.append("survey_not_experiment_eligible")
+                if (effective_status in {"completed", "accepted"}
+                        and ("survey_current" in context or "assessment_current" in context)
+                        and (context.get("survey_current") is not True
+                             or context.get("assessment_current") is not True)):
+                    reasons.append("survey_assessment_not_current")
+            if kind == "experiment" and context.get("results_status") == "not_executed":
+                reasons.append("experiment_not_executed")
+
+            if reasons:
+                blockers.append({
+                    "stage_id": stage_id,
+                    "kind": kind,
+                    "status": context_status or record_status or "pending",
+                    "reasons": list(dict.fromkeys(reasons)),
+                })
+        return blockers
+
+    def _ensure_paper_gate_repair_requests(self, blockers):
+        """Create one scoped repair order without discarding the current branch."""
+        repairs = []
+        for blocker in blockers[:1]:
+            stage_id = blocker.get("stage_id") if isinstance(blocker, dict) else None
+            if not isinstance(stage_id, str):
+                continue
+            context = self.context.get(stage_id, {})
+            if not isinstance(context, dict):
+                context = {}
+            existing = []
+            for key in ("research_expansion_requests", "research_requests",
+                        "deferred_research_requests"):
+                value = context.get(key)
+                if isinstance(value, list):
+                    existing.extend(item for item in value if isinstance(item, dict))
+            unattempted = [
+                item for item in existing
+                if self._research_request_signature(item)
+                not in self._attempted_request_signatures
+            ]
+            if unattempted:
+                repairs.extend(deepcopy(unattempted))
+                continue
+
+            # Candidate packets do not always emit a typed work order.  Reuse
+            # the stage's deterministic recovery strategy, but present the
+            # candidate as a hold to that helper so a repair is generated.
+            repair_context = deepcopy(context)
+            repair_context["status"] = "research_expansion_required"
+            request = self._autonomous_recovery_request(stage_id, repair_context)
+            if not isinstance(request, dict):
+                continue
+            request["repair_policy"] = "preserve_branch_before_rejection"
+            request["preserve_artifacts"] = True
+            request["source_blocker"] = {
+                "stage_id": stage_id,
+                "reasons": deepcopy(blocker.get("reasons", [])),
+            }
+            context.setdefault("research_requests", []).append(request)
+            context["repair_policy"] = "preserve_branch_before_rejection"
+            context["repair_target_stage_id"] = stage_id
+            self.context[stage_id] = context
+            repairs.append(deepcopy(request))
+        return repairs
+
+    def _refresh_paper_release_gate(self, completed, by_id, release_blocked_stage_ids):
+        """Fence paper dispatch until every scientific ancestor is releasable."""
+        changed = False
+        self._paper_gate_repair_requests = []
+        for paper_stage in self.workflow.get("stages", []):
+            if paper_stage.get("kind") != "paper":
+                continue
+            paper_id = paper_stage["id"]
+            # A paper only becomes schedulable after its direct dependencies
+            # are complete.  Once that frontier is reached, evaluate the full
+            # transitive scientific closure rather than only the last stage.
+            if not set(paper_stage.get("depends_on", [])).issubset(completed):
+                continue
+            blockers = self._paper_release_blockers(paper_stage, by_id)
+            record = deepcopy(self.stage_records.get(paper_id, {}))
+            gate = record.get("release_gate") if isinstance(record, dict) else None
+            gate_is_ours = isinstance(gate, dict) and gate.get("kind") == "upstream_scientific_hold"
+            if blockers:
+                repairs = self._ensure_paper_gate_repair_requests(blockers)
+                self._paper_gate_repair_requests.extend(repairs)
+                completed.discard(paper_id)
+                release_blocked_stage_ids.add(paper_id)
+                next_gate = {
+                    "kind": "upstream_scientific_hold",
+                    "stage_id": paper_id,
+                    "release_blocking": True,
+                    "blockers": blockers,
+                    "repair_requests": repairs,
+                }
+                if (record.get("status") != "candidate_needs_review"
+                        or record.get("release_blocking") is not True
+                        or gate != next_gate):
+                    record.update({
+                        "kind": "paper",
+                        "status": "candidate_needs_review",
+                        "release_blocking": True,
+                        "release_gate": next_gate,
+                        "error": "paper release blocked by unresolved upstream scientific evidence",
+                    })
+                    self.stage_records[paper_id] = record
+                    self.blockers.append({
+                        "stage_id": paper_id,
+                        "reason": "paper release blocked by unresolved upstream scientific evidence",
+                        "stop_reason": "upstream_scientific_hold",
+                        "gating": True,
+                        "release_blocking": True,
+                        "dependencies": blockers,
+                        "repair_requests": repairs,
+                    })
+                    self.department_activity.append({
+                        "cycle": self.continuation_cycles,
+                        "action": "paper_release_gate",
+                        "stage_id": paper_id,
+                        "blockers": blockers,
+                        "repair_requests": repairs,
+                        "next_action": "resolve upstream scientific debt before dispatching paper",
+                    })
+                    changed = True
+                continue
+
+            # Remove only a gate created by this method.  A real paper attempt
+            # or a separately produced editorial candidate must remain intact.
+            if (gate_is_ours and record.get("attempt_count", 0) == 0
+                    and not record.get("attempts") and not record.get("output_path")):
+                for key in ("release_gate", "error", "release_blocking"):
+                    record.pop(key, None)
+                record["status"] = "pending"
+                self.stage_records[paper_id] = record
+                release_blocked_stage_ids.discard(paper_id)
+                changed = True
+        return changed
 
     def _can_migrate_forward_candidate(self, record):
         """Identify an old forward-first candidate eligible for handoff."""
@@ -7096,7 +7384,11 @@ class ComposerRunner:
                 )
             )
             if not scientific_recovery:
-                raise ModelWorkBlocked(retained["error"])
+                blocked = ModelWorkBlocked(retained["error"])
+                if retained.get("failure_class") == "context_budget":
+                    blocked.failure_class = "context_budget"
+                    blocked.context_budget = deepcopy(retained.get("context_budget", {}))
+                raise blocked
         if (retained and retained.get("status") == "succeeded"
                 and Path(retained["result"]["output_path"]).is_file()
                 and hashlib.sha256(Path(retained["result"]["output_path"]).read_bytes()).hexdigest()
@@ -7129,6 +7421,28 @@ class ComposerRunner:
                 # and can cancel a valid next intake before it starts.
                 # Never cache a topic-stage failure as generic model work.
                 raise
+            if isinstance(exc, ModelContextBudgetError):
+                failures = (retained or {}).get("failed_attempts", 0) + 1
+                budget = {
+                    key: deepcopy(getattr(exc, key, None)) for key in (
+                        "model", "estimated_input_tokens", "allowed_input_tokens",
+                        "context_window_tokens", "max_input_tokens",
+                        "max_output_tokens", "image_count",
+                    )
+                }
+                error = (
+                    f"stage {stage['id']} input projection cannot fit the selected model: "
+                    f"{exc}")
+                cache.put(key, {
+                    "status": "blocked", "failed_attempts": failures,
+                    "failure_class": "context_budget", "context_budget": budget,
+                    "error": error,
+                })
+                blocked = ModelWorkBlocked(error)
+                blocked.failure_class = "context_budget"
+                blocked.context_budget = budget
+                blocked.usage = getattr(exc, "usage", {})
+                raise blocked from exc
             failures = (retained or {}).get("failed_attempts", 0) + 1
             limit = ((descriptor.get("limits") or {}).get("max_rounds")
                      or self._retry_policy().get("max_attempts") or 3)
@@ -8153,6 +8467,11 @@ class ComposerRunner:
         closure. Provider/model quotas, deadlines, and process interruptions
         remain environmental fences and never enter this path.
         """
+        if getattr(error, "failure_class", None) == "context_budget":
+            # The smallest role-specific packet already failed local
+            # admission. Reopening the same scientific scope cannot add
+            # evidence and would only replay the deterministic failure.
+            return False
         prior_context = self.context.get(stage["id"])
         prior_context = deepcopy(prior_context) if isinstance(prior_context, dict) else {}
         pre_execution_capability_failure = self._is_pre_execution_capability_failure(
@@ -8344,7 +8663,8 @@ class ComposerRunner:
         try:
             by_id = {stage["id"]: stage for stage in self.workflow["stages"]}
             completed = {stage_id for stage_id, row in self.stage_records.items()
-                         if self._stage_releases_dependencies(row)}
+                         if self._stage_releases_dependencies(
+                             row, stage_kind=by_id.get(stage_id, {}).get("kind"))}
             resume_keep_task_ids = {
                 row.get("task_id") for row in self.stage_records.values()
                 if isinstance(row, dict)
@@ -8366,7 +8686,8 @@ class ComposerRunner:
             release_blocked_stage_ids = {
                 stage_id for stage_id, row in self.stage_records.items()
                 if row.get("status") == "candidate_needs_review"
-                and not self._stage_releases_dependencies(row)
+                and not self._stage_releases_dependencies(
+                    row, stage_kind=by_id.get(stage_id, {}).get("kind"))
             }
             # A prior attempt may have produced a release-blocking candidate
             # solely because a provider wrapped an otherwise complete JSON
@@ -8435,7 +8756,8 @@ class ComposerRunner:
             for stage_id in tuple(release_blocked_stage_ids):
                 stage = by_id.get(stage_id)
                 record = self.stage_records.get(stage_id, {})
-                if not self._can_migrate_forward_candidate(record) or stage is None:
+                if (not self._can_migrate_forward_candidate(record)
+                        or stage is None or stage.get("kind") == "paper"):
                     continue
                 context = self.context.get(stage_id, {})
                 context = self._authorize_forward_context(
@@ -8517,6 +8839,22 @@ class ComposerRunner:
             if self._resume_stale_survey_contract_pivot(completed, by_id):
                 self._checkpoint("resume:survey_contract_pivot_admitted", force=True)
             while True:
+                paper_gate_changed = self._refresh_paper_release_gate(
+                    completed, by_id, release_blocked_stage_ids)
+                if paper_gate_changed:
+                    self._checkpoint("paper:upstream_scientific_hold", force=True)
+                if self._paper_gate_repair_requests:
+                    if self._begin_continuation(completed, by_id):
+                        # The repair closure includes the paper consumer.  It
+                        # must be retried after the repaired upstream packet,
+                        # rather than remaining in the old release-blocked set.
+                        release_blocked_stage_ids.difference_update(
+                            self.reopened_stage_ids)
+                        self._checkpoint(
+                            f"paper:scoped_repair_admitted:{self.continuation_cycles}",
+                            force=True,
+                        )
+                        continue
                 if required_ids.issubset(completed) and self.continuation_pending_stage_ids.issubset(completed):
                     # A completed graph may still contain a first-class
                     # research request or an editorial rejection.  Reopen only
@@ -9360,6 +9698,12 @@ class ComposerRunner:
                             or isinstance(context.get("failure_debt"), dict)
                             and context["failure_debt"].get("release_blocking") is True
                         )
+                        # A paper result remains a review candidate until its
+                        # own publication contract is accepted.  Never let a
+                        # provisional editorial packet satisfy a dependency.
+                        if (stage["kind"] == "paper"
+                                and context.get("status") == "candidate_needs_review"):
+                            release_blocking = True
                         if release_blocking:
                             release_blocked_stage_ids.add(stage_id)
                         else:
@@ -9409,6 +9753,10 @@ class ComposerRunner:
                     }
                     blocker = {"stage_id": stage_id, "reason": str(error),
                                "attempts": len(attempt_history)}
+                    if getattr(error, "failure_class", None) == "context_budget":
+                        blocker["failure_class"] = "context_budget"
+                        blocker["context_budget"] = deepcopy(
+                            getattr(error, "context_budget", {}))
                     if stage["kind"] == "topic_discovery":
                         rejected_history = getattr(error, "rejected_topic_history", None)
                         if isinstance(rejected_history, list) and rejected_history:

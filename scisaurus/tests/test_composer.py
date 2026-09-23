@@ -629,6 +629,215 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(result["feedback"][-1]["to"], {"dept": "executive-command", "agent": "intent-keeper"})
             self.assertIn("principal review", result["feedback"][-1]["next_condition"])
 
+    def test_paper_release_gate_fences_provisional_scientific_ancestors(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            argument_dir = root / "argument"
+            paper_dir = root / "paper"
+            argument_dir.mkdir()
+            paper_dir.mkdir()
+            config_path = workflow["stages"][0]["config_path"]
+            workflow["stages"].extend([
+                {
+                    "id": "argument", "kind": "argument", "config_path": config_path,
+                    "project_dir": str(argument_dir.resolve()), "depends_on": ["experiment"],
+                    "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                    "reuse_completed": False, "reuse_output_path": None,
+                },
+                {
+                    "id": "paper", "kind": "paper", "config_path": config_path,
+                    "project_dir": str(paper_dir.resolve()), "depends_on": ["argument"],
+                    "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                    "reuse_completed": False, "reuse_output_path": None,
+                },
+            ])
+            runner = ComposerRunner(workflow)
+            try:
+                runner.stage_records = {
+                    "survey": {
+                        "kind": "survey", "status": "candidate_needs_review",
+                        "composer_decision": "advance_with_findings",
+                        "release_blocking": False,
+                    },
+                    "experiment": {"kind": "experiment", "status": "completed"},
+                    "argument": {"kind": "argument", "status": "completed"},
+                    "paper": {
+                        "kind": "paper", "status": "candidate_needs_review",
+                        "forward_progress": True,
+                        "composer_decision": "advance_with_findings",
+                        "release_blocking": False,
+                        "failure_debt": {},
+                    },
+                }
+                runner.context = {
+                    "survey": {
+                        "kind": "survey", "status": "candidate_needs_review",
+                        "verifier_outcome": "hold", "gap_state": "insufficient_evidence",
+                        "topic_admission": "exploratory_pilot", "survey_current": False,
+                        "assessment_current": False,
+                    },
+                    "experiment": {"kind": "experiment", "status": "completed"},
+                    "argument": {"kind": "argument", "status": "completed"},
+                }
+                by_id = {stage["id"]: stage for stage in workflow["stages"]}
+                paper = by_id["paper"]
+                blockers = runner._paper_release_blockers(paper, by_id)
+                self.assertEqual([item["stage_id"] for item in blockers], ["survey"])
+                self.assertIn("provisional_candidate", blockers[0]["reasons"])
+                self.assertIn("verifier_hold", blockers[0]["reasons"])
+                self.assertFalse(ComposerRunner._stage_releases_dependencies(
+                    {"status": "candidate_needs_review", "composer_decision": "advance_with_findings"},
+                    stage_kind="paper"))
+
+                completed = {"survey", "experiment", "argument"}
+                release_blocked = set()
+                self.assertTrue(runner._refresh_paper_release_gate(
+                    completed, by_id, release_blocked))
+                self.assertIn("paper", release_blocked)
+                self.assertEqual(
+                    runner.stage_records["paper"]["release_gate"]["kind"],
+                    "upstream_scientific_hold")
+
+                runner.stage_records["survey"] = {"kind": "survey", "status": "completed"}
+                runner.context["survey"] = {"kind": "survey", "status": "completed"}
+                self.assertTrue(runner._refresh_paper_release_gate(
+                    completed, by_id, release_blocked))
+                self.assertNotIn("paper", release_blocked)
+                self.assertEqual(runner.stage_records["paper"]["status"], "pending")
+            finally:
+                runner.close()
+
+    def test_paper_is_not_dispatched_while_upstream_candidate_is_provisional(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            argument_dir = root / "argument"
+            paper_dir = root / "paper"
+            argument_dir.mkdir()
+            paper_dir.mkdir()
+            config_path = workflow["stages"][0]["config_path"]
+            workflow["stages"].extend([
+                {
+                    "id": "argument", "kind": "argument", "config_path": config_path,
+                    "project_dir": str(argument_dir.resolve()), "depends_on": ["experiment"],
+                    "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                    "reuse_completed": False, "reuse_output_path": None,
+                },
+                {
+                    "id": "paper", "kind": "paper", "config_path": config_path,
+                    "project_dir": str(paper_dir.resolve()), "depends_on": ["argument"],
+                    "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                    "reuse_completed": False, "reuse_output_path": None,
+                },
+            ])
+            workflow["completion"]["required_stage_ids"] = ["paper"]
+            workflow["continuation_policy"] = {"mode": "bounded", "max_cycles": 0}
+            runner = ComposerRunner(workflow)
+            calls = []
+            try:
+                runner.stage_records = {
+                    "survey": {
+                        "kind": "survey", "status": "candidate_needs_review",
+                        "composer_decision": "advance_with_findings",
+                        "release_blocking": False,
+                    },
+                    "experiment": {"kind": "experiment", "status": "completed"},
+                    "argument": {"kind": "argument", "status": "completed"},
+                }
+                runner.context = {
+                    "survey": {
+                        "kind": "survey", "status": "candidate_needs_review",
+                        "verifier_outcome": "hold",
+                    },
+                    "experiment": {"kind": "experiment", "status": "completed"},
+                    "argument": {"kind": "argument", "status": "completed"},
+                }
+
+                def must_not_dispatch(stage, **_kwargs):
+                    calls.append(stage["id"])
+                    raise AssertionError("paper was dispatched behind a scientific hold")
+
+                runner._run_stage = must_not_dispatch
+                result = runner.run()
+                self.assertEqual(result["status"], "candidate_needs_review")
+                self.assertEqual(calls, [])
+                self.assertEqual(
+                    result["stages"]["paper"]["release_gate"]["kind"],
+                    "upstream_scientific_hold")
+                self.assertTrue(any(
+                    item.get("stop_reason") == "upstream_scientific_hold"
+                    for item in result["blockers"]))
+            finally:
+                runner.close()
+
+    def test_paper_gate_admits_scoped_repair_before_returning_a_candidate(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            argument_dir = root / "argument"
+            paper_dir = root / "paper"
+            argument_dir.mkdir()
+            paper_dir.mkdir()
+            config_path = workflow["stages"][0]["config_path"]
+            workflow["stages"].extend([
+                {
+                    "id": "argument", "kind": "argument", "config_path": config_path,
+                    "project_dir": str(argument_dir.resolve()), "depends_on": ["experiment"],
+                    "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                    "reuse_completed": False, "reuse_output_path": None,
+                },
+                {
+                    "id": "paper", "kind": "paper", "config_path": config_path,
+                    "project_dir": str(paper_dir.resolve()), "depends_on": ["argument"],
+                    "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                    "reuse_completed": False, "reuse_output_path": None,
+                },
+            ])
+            workflow["completion"]["required_stage_ids"] = ["paper"]
+            workflow["continuation_policy"] = {"mode": "bounded", "max_cycles": 1}
+            runner = ComposerRunner(workflow)
+            calls = []
+            try:
+                runner.stage_records = {
+                    "survey": {
+                        "kind": "survey", "status": "candidate_needs_review",
+                        "composer_decision": "advance_with_findings",
+                        "release_blocking": False,
+                    },
+                    "experiment": {"kind": "experiment", "status": "completed"},
+                    "argument": {"kind": "argument", "status": "completed"},
+                }
+                runner.context = {
+                    "survey": {
+                        "kind": "survey", "status": "candidate_needs_review",
+                        "verifier_outcome": "hold", "gap_state": "insufficient_evidence",
+                    },
+                    "experiment": {"kind": "experiment", "status": "completed"},
+                    "argument": {"kind": "argument", "status": "completed"},
+                }
+
+                def recover(stage, **_kwargs):
+                    calls.append(stage["id"])
+                    output = root / f"{stage['id']}-repaired.json"
+                    output.write_text(json.dumps({"stage": stage["id"], "repaired": True}))
+                    return {
+                        "status": "completed", "output_path": str(output),
+                        "project_dir": stage["project_dir"], "stage_id": stage["id"],
+                    }
+
+                runner._run_stage = recover
+                result = runner.run()
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(calls, ["survey", "experiment", "argument", "paper"])
+                self.assertEqual(result["continuation_cycles"], 1)
+                self.assertTrue(any(
+                    item.get("action") == "paper_release_gate"
+                    and item.get("repair_requests")
+                    for item in result["department_activity"]))
+            finally:
+                runner.close()
+
     def test_scientific_hold_remains_visible_in_stage_task_backlog(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -2514,6 +2723,32 @@ class ComposerWorkflowTests(unittest.TestCase):
             context = runner._topic_refinement_context(workflow["stages"][0])
             self.assertEqual(context["parent_topic_id"], "direction_a")
             self.assertEqual(context["mode"], "refinement")
+            self.assertEqual(context["salvage_plan"]["mode"], "salvage")
+            self.assertEqual(
+                context["salvage_plan"]["active_branch"]["id"],
+                "mechanism-observable",
+            )
+            # A completed salvage branch is carried in the immutable topic
+            # lineage so the next continuation selects the next repair axis.
+            runner.context["topic"]["topic_evolution"] = {
+                "mode": "refinement",
+                "salvage": {
+                    "mode": "salvage",
+                    "attempted_branch_ids": ["mechanism-observable"],
+                },
+            }
+            next_context = runner._topic_refinement_context(workflow["stages"][0])
+            self.assertEqual(
+                next_context["salvage_plan"]["active_branch"]["id"],
+                "comparison-baseline",
+            )
+            runner.context["topic"]["runtime_feasibility_revalidation"] = {
+                "status": "required",
+                "reason": "the restored topic exceeds the current execution boundary",
+            }
+            forced_context = runner._topic_refinement_context(workflow["stages"][0])
+            self.assertEqual(forced_context["salvage_plan"]["mode"], "structural_pivot")
+            self.assertTrue(forced_context["salvage_plan"]["forced"])
             self.assertIn("topic", runner._continuation_targets(
                 runner.active_research_requests, {"topic": workflow["stages"][0],
                                                   "survey": workflow["stages"][1],

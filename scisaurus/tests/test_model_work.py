@@ -245,7 +245,8 @@ class ModelWorkTests(unittest.TestCase):
                 result.update(topic={"id": "direction", "research_question": "A testable mechanism?"},
                               admission_state="provisional_for_survey")
             if stage["kind"] == "survey":
-                result.update(gap_state="insufficient_evidence", survey_current=True, assessment_current=True)
+                result.update(gap_state="eligible_for_experiment", survey_current=True,
+                              assessment_current=True, topic_admission="eligible_for_experiment")
                 result = runner._gate_free_topic_survey(result, stage=stage)
             if stage["id"] == "paper" and calls.count("paper") == 1:
                 result.update(status="research_expansion_required", research_expansion_requests=[{

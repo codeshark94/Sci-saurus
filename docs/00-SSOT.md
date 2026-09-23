@@ -252,7 +252,21 @@ Composer has admitted the stage; the exact failure debt is converted into a
 typed backfill order after the first graph pass. The downstream stages may
 inspect that candidate and record their own limitations, but neither the
 candidate nor its debt is accepted evidence. Resource fences and unknown
-external outcomes remain hard stops rather than provisional science.
+external outcomes remain hard stops rather than provisional science. This
+exception is exploratory only: `argument` may draft against a provisional
+packet so the Composer can expose the next discriminating work. `paper` is a
+hard scientific release fence. It is not dispatched, and it cannot satisfy a
+dependency, while any transitive research ancestor is held, a
+`candidate_needs_review`, verifier-held, provisional-topic/survey packet, or
+carrying release-blocking/backfill debt. A paper candidate produced after an
+editorial attempt is likewise never treated as a completed dependency; the
+same workflow must clear the upstream closure and re-enter the paper stage.
+The fence does not mean discard: it selects the earliest unresolved branch,
+preserves the candidate and its evidence, and emits one scoped repair order.
+Within the authorized continuation budget, that branch is rerun first and
+downstream consumers are rebuilt from it. Topic refinement follows the
+bounded salvage ladder before a structural pivot unless an independent source
+or feasibility finding makes the parent direction unsafe.
 
 **D62 — Templates seed a live project organization; they do not prescribe its work.**
 Each Composer project materializes a versioned department charter, durable
@@ -285,8 +299,12 @@ the question is redesigned; if the expanded evidence still cannot establish
 an experiment-worthy distinction, or prior work already answers the question,
 the Composer holds the downstream experiment, issues a typed topic-refinement
 work order, and reopens the topic→survey closure with the parent question and
-assessment attached. Every refinement records its lineage and changed
-scientific dimension; a cosmetic rewrite cannot satisfy the loop.
+assessment attached. Before a structural pivot, a bounded salvage ladder may
+try up to three distinct repair axes (mechanism/observable, comparison/baseline,
+and evidence boundary) when the parent remains scientifically supportable.
+Every refinement records its lineage, branch, and changed scientific dimension;
+a cosmetic rewrite cannot satisfy the loop. A source or feasibility finding
+that makes the parent unsafe can force the structural pivot immediately.
 
 **D65 — Scientific sufficiency is red-teamed before composition.** After the
 research argument and deterministic admission floors pass, a paper must receive

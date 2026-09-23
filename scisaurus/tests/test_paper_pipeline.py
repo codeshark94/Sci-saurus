@@ -1,15 +1,19 @@
 """Pure contract tests for the AI-native manuscript pipeline boundary."""
 
 import unittest
+import json
 from pathlib import Path
 import tempfile
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scisaurus.core.errors import ValidationError
+from scisaurus.runtime.models import ModelResult
 from scisaurus.runtime.paper_pipeline import (
     bind_claim_citations,
     compress_reader_surface,
+    normalise_manuscript_draft,
     _review_input,
+    project_writer_packet,
     validate_argument_projection,
     validate_manuscript_draft,
     draft_depth_report,
@@ -27,6 +31,71 @@ class ManuscriptDraftContractTests(unittest.TestCase):
 
     def test_accepts_structured_draft(self):
         self.assertEqual(validate_manuscript_draft(self.draft())["title"], "A paper")
+
+    def test_writer_content_survives_loose_wrapper_and_shape_normalization(self):
+        packet = {"writer_contract": {"section_order": [
+            {"id": "introduction", "title": "Introduction", "unit_ids": ["intro_p1"]},
+            {"id": "results", "title": "Results", "unit_ids": ["results_p1"]},
+        ]}}
+        loose = {"manuscript": {"title": "Loose paper", "sections": {
+            "Introduction": "The accepted question is tested under the declared boundary.",
+            "Results": {"kind": "markdown", "content": "The measured result changes across the sweep."},
+        }}}
+        draft, audit = normalise_manuscript_draft(loose, packet=packet)
+        checked = validate_manuscript_draft(draft)
+        self.assertEqual(checked["title"], "Loose paper")
+        self.assertEqual([item["id"] for item in checked["sections"]], ["introduction", "results"])
+        self.assertEqual(checked["sections"][1]["units"][0]["id"], "results_p1")
+        self.assertEqual(checked["sections"][1]["units"][0]["kind"], "paragraph")
+        self.assertIn("unwrapped_response_envelope", audit["format_repairs"])
+        self.assertIn("unit_kind:results_p1", audit["format_repairs"])
+
+    def test_writer_plain_text_headings_are_content_not_a_format_failure(self):
+        packet = {"writer_contract": {"section_order": [
+            {"id": "introduction", "title": "Introduction", "unit_ids": ["intro_p1"]},
+            {"id": "results", "title": "Results", "unit_ids": ["results_p1"]},
+        ]}}
+        draft, audit = normalise_manuscript_draft(
+            "# Introduction\nThe question is bounded.\n# Results\nThe result is observed.",
+            packet=packet,
+        )
+        validate_manuscript_draft(draft)
+        self.assertEqual(len(draft["sections"]), 2)
+        self.assertNotIn("no_parseable_sections", audit["fallback_fields"])
+
+    def test_writer_accepts_content_with_loose_shape_without_format_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = PaperPipelineRunner.__new__(PaperPipelineRunner)
+            runner.packet = {"writer_contract": {"section_order": [
+                {"id": "introduction", "title": "Introduction", "unit_ids": ["intro_p1"]},
+                {"id": "results", "title": "Results", "unit_ids": ["results_p1"]},
+            ]}}
+            runner.paper_config = {"title": "Loose paper", "references": []}
+            runner.model_config = {
+                "base_url": "http://127.0.0.1:1/v1", "protocol": "openai_compatible",
+                "model": "writer", "timeout_seconds": 2, "max_output_tokens": 8192,
+                "context_window_tokens": 65536, "max_input_tokens": 56000,
+            }
+            runner.output = Path(directory)
+            runner.imported_draft = None
+            runner.draft_before_research_review = True
+            runner.current_stage = "composition"
+            runner.deadline = 10**12
+            client = Mock()
+            client.complete.return_value = ModelResult(
+                text=json.dumps({"manuscript": {"sections": {
+                    "Introduction": "The accepted question is tested under the declared boundary.",
+                    "Results": "The measured result changes across the sweep.",
+                }}}),
+                model="writer", usage={"model_calls": 1}, elapsed_seconds=0.01,
+                finish_reason="stop",
+            )
+            with patch.object(runner, "_client", return_value=client), \
+                    patch.object(runner, "_write_run_metadata"):
+                draft, _ = runner._writer()
+            self.assertEqual(client.complete.call_count, 1)
+            self.assertEqual([item["id"] for item in draft["sections"]], ["introduction", "results"])
+            self.assertTrue((Path(directory) / "writer-content-normalization-1.json").is_file())
 
     def test_rejects_duplicate_unit_identity(self):
         value = self.draft()
@@ -96,6 +165,58 @@ class ManuscriptDraftContractTests(unittest.TestCase):
                      {"id": "intro_p1", "kind": "paragraph", "text": "Prior work [[cite:alpha]]."}]}]}
         projected = _review_input(draft, references=[{"key": "alpha"}])
         self.assertEqual(projected["sections"][0]["units"][0]["text"], "Prior work [1].")
+
+    def test_writer_projection_keeps_every_reference_without_replaying_full_abstracts(self):
+        cards = [{"source_ref": f"source-{index}", "work_id": f"W{index}",
+                  "title": f"Work {index}", "authors": "Author", "year": 2025,
+                  "representation": "abstract", "abstract": "x" * 1800,
+                  "reader_use": "background"} for index in range(50)]
+        packet = {
+            "reference_cards": cards,
+            "research_argument_review": {
+                "schema_version": "research-argument-review-1",
+                "decision": "accept", "checks": [], "findings": [],
+                "rationale": "accepted",
+            },
+            "research_program": {"unprojected": "preserved when invalid"},
+        }
+        original = json.loads(json.dumps(packet))
+        projected = project_writer_packet(
+            packet,
+            {"references": [{"key": "ref-1", "source_ref": "source-1"}]},
+            abstract_chars=240,
+            include_argument_review=False,
+        )
+        self.assertEqual(len(projected["reference_cards"]), 50)
+        self.assertEqual(len(projected["reference_cards"][0]["abstract"]), 240)
+        self.assertNotIn("research_argument_review", projected)
+        self.assertEqual(projected["reference_cards"][1]["citation_key"], "ref-1")
+        self.assertEqual(packet, original)
+
+    def test_writer_context_projection_is_below_route_limit_before_dispatch(self):
+        runner = PaperPipelineRunner.__new__(PaperPipelineRunner)
+        runner.packet = {
+            "reference_cards": [{"source_ref": f"source-{index}",
+                                 "work_id": f"W{index}",
+                                 "title": f"Work {index}",
+                                 "abstract": "x" * 1800}
+                                for index in range(50)],
+            "research_argument": {"research_question": "Does X change Y?"},
+            "research_program": {"unprojected": "invalid program is still bounded by card projection"},
+            "research_argument_review": {"findings": ["finding"] * 100},
+        }
+        runner.paper_config = {"references": []}
+        runner.model_config = {
+            "base_url": "http://127.0.0.1:1/v1", "protocol": "openai_compatible",
+            "model": "writer", "timeout_seconds": 2, "max_output_tokens": 8192,
+            "context_window_tokens": 65536, "max_input_tokens": 56000,
+        }
+        prompt, audit = runner._writer_context_projection(
+            {"writer_output_contract": {"schema_version": "manuscript-draft-2"}},
+            "s" * 3500,
+        )
+        self.assertLess(audit["selected"]["estimated_input_tokens"], 56000)
+        self.assertIn("reference_cards", json.loads(prompt))
 
     def test_claim_citation_binding_projects_literature_to_claim_unit(self):
         draft = {"schema_version": "manuscript-draft-2", "title": "A paper", "citation": "markers",

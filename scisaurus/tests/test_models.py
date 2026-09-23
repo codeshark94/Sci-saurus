@@ -13,7 +13,8 @@ from unittest.mock import patch
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.models import (
-    ModelClient, ModelCallError, estimate_input_tokens, model_context_error,
+    ModelClient, ModelCallError, ModelContextBudgetError, estimate_input_tokens,
+    model_context_budget, model_context_error,
     resolve_model_config,
 )
 
@@ -233,13 +234,28 @@ class TestModelClient(unittest.TestCase):
         self.assertGreater(estimate_input_tokens('x', 'y' * 3000), 1000)
         client = self.client('openai_compatible', context_window_tokens=8192,
                              max_input_tokens=1000)
-        with self.assertRaisesRegex(ValidationError, 'context budget exceeded'):
+        with self.assertRaisesRegex(ModelContextBudgetError, 'context budget exceeded') as caught:
             client.complete(system='x', prompt='y' * 3000)
+        self.assertEqual(caught.exception.failure_class, 'context_budget')
+        self.assertGreater(caught.exception.estimated_input_tokens,
+                           caught.exception.allowed_input_tokens)
         self.assertFalse(hasattr(self, 'request'))
         self.assertIsNone(model_context_error(
             {'model': 'fits', 'max_output_tokens': 64,
              'context_window_tokens': 4096, 'max_input_tokens': 3000},
             system='x', prompt='short'))
+
+    def test_context_budget_projection_reports_the_same_effective_limit(self):
+        value = {'model': 'fits', 'max_output_tokens': 512,
+                 'context_window_tokens': 4096, 'max_input_tokens': 3000}
+        budget = model_context_budget(value, system='x', prompt='y' * 9000)
+        self.assertEqual(budget['allowed_input_tokens'], 3000)
+        self.assertFalse(budget['fits'])
+        self.assertEqual(
+            model_context_error(value, system='x', prompt='y' * 9000),
+            'model context budget exceeded for fits: conservative input estimate '
+            f"{budget['estimated_input_tokens']} tokens exceeds 3000 input tokens; "
+            'context window 4096 with max output 512')
 
     def test_context_policy_must_leave_output_room(self):
         with self.assertRaisesRegex(ValidationError, 'leave room'):
