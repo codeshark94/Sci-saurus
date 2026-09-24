@@ -105,6 +105,19 @@ class TestModelClient(unittest.TestCase):
         self.assertEqual(result.usage, {'model_calls':1,'input_tokens':10,'output_tokens':5})
         self.assertEqual(result.model,'served-model')
 
+    def test_native_ollama_receives_role_specific_context_window(self):
+        result = self.client('ollama', context_window_tokens=32768).complete(
+            system='instruction', prompt='data')
+        self.assertEqual(result.json_object(), {'value': 4})
+        self.assertEqual(self.request['options']['num_ctx'], 32768)
+
+    def test_openai_compatible_bridge_does_not_claim_dynamic_ollama_context(self):
+        self.response = {'choices': [{'message': {'content': '{"ok":true}'}, 'finish_reason': 'stop'}]}
+        self.client('openai_compatible', context_window_tokens=32768).complete(
+            system='instruction', prompt='data')
+        self.assertNotIn('num_ctx', self.request)
+        self.assertNotIn('options', self.request)
+
     def test_compatible_protocol_and_missing_usage_remains_unknown(self):
         self.response={'choices':[{'message':{'content':'{"ok":true}'},'finish_reason':'stop'}]}
         result=self.client('openai_compatible').complete(system='instruction',prompt='data')

@@ -10,10 +10,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scisaurus.cli import _composer_progress_line
+from scisaurus.runtime.capability_foundry import SYSTEM, candidate_prompt
 from scisaurus.runtime.composer import ComposerRunner, read_interim_report, validate_workflow
 from scisaurus.runtime.departments import default_organization
 from scisaurus.runtime.literature import ProviderCooldownError
 from scisaurus.runtime.model_work import ModelWorkBlocked
+from scisaurus.runtime.models import ModelResult, estimate_input_tokens
 from scisaurus.runtime.specialists import build_specialist_prompt
 from scisaurus.core.errors import QuotaExceededError, ValidationError
 from scisaurus.core.events import ControlStore
@@ -27,6 +29,418 @@ class ComposerWorkflowTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             ComposerRunner._raise_stage_failure({"status": "paused", "error": "termination requested",
                                                  "failure": {"kind": "process_interrupted"}})
+
+    def test_non_admissible_stage_result_is_carried_with_the_failure(self):
+        result = {"status": "blocked", "error": "independent review rejected the result",
+                  "execution_refs": ["execution-1"], "metrics": [{"id": "x", "value": 1.0}]}
+        with self.assertRaises(ValidationError) as raised:
+            ComposerRunner._raise_stage_failure(result)
+        self.assertEqual(raised.exception.stage_result, result)
+        self.assertEqual(raised.exception.usage, {})
+
+    def test_argument_review_diagnostics_are_visible_to_failure_specialists(self):
+        error = ValidationError("research argument adjudication requires revision")
+        error.research_argument = {
+            "schema_version": "research-argument-1",
+            "observed_patterns": [{"id": "pattern-1", "evidence_ids": ["e1"]}],
+            "hypotheses": [],
+            "limitations": ["The mechanism is not calibrated."],
+        }
+        error.research_review = {
+            "schema_version": "research-argument-review-1",
+            "decision": "revise",
+            "checks": [],
+            "required_repairs": [{"id": "calibration", "repair": "Run a sensitivity sweep."}],
+            "rationale": "The comparator is uncalibrated.",
+        }
+        result = ComposerRunner._failure_stage_result(
+            {"id": "argument", "kind": "argument"}, error)
+        self.assertIn("argument_package", result)
+        self.assertEqual(result["argument_package"]["review"]["decision"], "revise")
+        self.assertEqual(result["argument"]["observed_patterns"][0]["id"], "pattern-1")
+
+    def test_repair_order_prevents_forward_handoff_until_rerun(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            runner = ComposerRunner(self._workflow(root))
+            try:
+                runner.context["experiment"] = {
+                    "kind": "experiment",
+                    "status": "research_expansion_required",
+                    "results_status": "observed",
+                    "failure_recovery": {"recovery_mode": "repair_then_rerun"},
+                    "research_requests": [{"id": "repair-experiment"}],
+                }
+                runner.workflow["progression_policy"] = "forward_first"
+                self.assertFalse(runner._composer_can_advance_after_admission(
+                    runner.workflow["stages"][1], ModelWorkBlocked("scientific review hold")))
+            finally:
+                runner.close()
+
+    def test_capability_repair_order_blocks_forward_without_observed_projection(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            runner = ComposerRunner(self._workflow(root))
+            try:
+                runner.context["experiment"] = {
+                    "kind": "experiment",
+                    "status": "research_expansion_required",
+                    "review_status": "scientific_assignment_blocked",
+                    "error": "capability foundry adversarial review rejected the program",
+                    "failure_recovery": {"recovery_mode": "repair_then_rerun"},
+                    "research_requests": [{
+                        "id": "repair-experiment",
+                        "kind": "additional_experiment",
+                        "owner": "methods.validation",
+                    }],
+                }
+                runner.workflow["progression_policy"] = "forward_first"
+                stage = runner.workflow["stages"][1]
+                # The failed authoring/admission path has no observed result
+                # to project. It must still execute the explicit Methods order
+                # before a downstream interpretation can be admitted.
+                self.assertFalse(runner._composer_can_advance_after_admission(
+                    stage, ModelWorkBlocked("capability repair exhausted")))
+            finally:
+                runner.close()
+
+    def test_forward_progress_does_not_erase_actionable_repair_order(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            runner = ComposerRunner(self._workflow(root))
+            try:
+                stage = runner.workflow["stages"][1]
+                context = {
+                    "kind": "experiment",
+                    "status": "research_expansion_required",
+                    "failure_recovery": {"recovery_mode": "repair_then_rerun"},
+                    "research_requests": [{
+                        "id": "repair-experiment",
+                        "kind": "additional_experiment",
+                        "owner": "methods.validation",
+                    }],
+                }
+                result = runner._materialize_forward_progress(
+                    stage,
+                    {"project_dir": stage["project_dir"]},
+                    ModelWorkBlocked("capability repair exhausted"),
+                    context,
+                    {"reports": []},
+                    [],
+                    force_advance=True,
+                )
+                self.assertIsNone(result)
+            finally:
+                runner.close()
+
+    def test_model_contract_failure_cannot_forward_an_unexecuted_experiment(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            runner = ComposerRunner(self._workflow(root))
+            try:
+                stage = runner.workflow["stages"][1]
+                runner.workflow["progression_policy"] = "forward_first"
+                context = {
+                    "kind": "experiment",
+                    "status": "candidate_needs_review",
+                    "results_status": "not_executed",
+                    "review_status": "model_contract_repair",
+                    "format_recovery": True,
+                    "format_recovery_attempts": 1,
+                    "failure_recovery": {
+                        "failure_class": "model_contract",
+                        "recovery_mode": "format_repair_then_rerun",
+                    },
+                }
+                runner.context["experiment"] = context
+                runner.stage_records["experiment"] = {
+                    "kind": "experiment", "status": "candidate_needs_review",
+                    "attempt_count": 80, "forward_progress": True,
+                    "composer_decision": "advance_with_findings",
+                }
+                error = ModelWorkBlocked("capability foundry did not admit a program: model output must contain valid JSON")
+                self.assertFalse(runner._composer_can_advance_after_admission(stage, error))
+                self.assertIsNone(runner._materialize_forward_progress(
+                    stage, {"project_dir": stage["project_dir"]}, error, context,
+                    {"reports": []}, [], force_advance=True))
+                held = runner._hold_unexecuted_experiment(
+                    stage, context, reason=str(error))
+                self.assertEqual(held["status"], "research_expansion_required")
+                self.assertTrue(held["release_blocking"])
+                self.assertEqual(held["results_status"], "not_executed")
+                self.assertEqual(held["research_requests"][0]["kind"], "recovery")
+            finally:
+                runner.close()
+
+    def test_forward_progress_uses_durable_recovery_over_stale_runner_packet(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            runner = ComposerRunner(self._workflow(root))
+            try:
+                stage = runner.workflow["stages"][1]
+                runner.context["experiment"] = {
+                    "kind": "experiment",
+                    "status": "format_recovery_required",
+                    "results_status": "not_executed",
+                    "review_status": "model_contract_repair",
+                    "format_recovery": True,
+                    "failure_recovery": {
+                        "failure_class": "model_contract",
+                        "recovery_mode": "format_repair_then_rerun",
+                    },
+                }
+                stale_runner_packet = {
+                    "kind": "experiment",
+                    "status": "blocked",
+                    "results_status": "not_executed",
+                }
+                result = runner._materialize_forward_progress(
+                    stage,
+                    {"project_dir": stage["project_dir"]},
+                    ModelWorkBlocked("program author did not finish normally"),
+                    stale_runner_packet,
+                    {"reports": []},
+                    [],
+                    force_advance=True,
+                )
+                self.assertIsNone(result)
+            finally:
+                runner.close()
+
+    def test_resume_reconciles_legacy_forwarded_experiment_before_dependency_admission(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            runner = ComposerRunner(self._workflow(root))
+            try:
+                stage = runner.workflow["stages"][1]
+                runner.stage_records["experiment"] = {
+                    "kind": "experiment",
+                    "status": "candidate_needs_review",
+                    "composer_decision": "advance_with_findings",
+                    "forward_progress": True,
+                    "release_blocking": False,
+                    "attempt_count": 4,
+                }
+                runner.context["experiment"] = {
+                    "kind": "experiment",
+                    "status": "candidate_needs_review",
+                    "composer_decision": "advance_with_findings",
+                    "results_status": "not_executed",
+                    "failure_recovery": {
+                        "failure_class": "experiment_failure",
+                        "recovery_mode": "repair_then_rerun",
+                        "dossier_ref": "artifact:failure@1",
+                        "input_sha256": "a" * 64,
+                        "repair_commands": [{"id": "repair", "instruction": "fix the program"}],
+                        "acceptance_checks": ["fresh independent check"],
+                    },
+                    "error": "capability authoring failed after the prior handoff",
+                    "failure_dossier_ref": "artifact:failure@1",
+                    "repair_commands": [{"id": "repair", "instruction": "fix the program"}],
+                    "acceptance_checks": ["fresh independent check"],
+                }
+                by_id = {item["id"]: item for item in runner.workflow["stages"]}
+                reconciled = runner._reconcile_stale_forward_handoffs(by_id)
+                self.assertEqual([item["stage_id"] for item in reconciled], ["experiment"])
+                self.assertEqual(runner.stage_records["experiment"]["status"], "retrying")
+                context = runner.context["experiment"]
+                self.assertEqual(context["status"], "research_expansion_required")
+                self.assertTrue(context["research_requests"])
+                self.assertEqual(context["research_requests"][0]["kind"], "additional_experiment")
+                self.assertEqual(context["research_requests"][0]["target_stage_id"], "experiment")
+                self.assertIn("experiment", runner.continuation_pending_stage_ids)
+            finally:
+                runner.close()
+
+    def test_resume_migrates_legacy_program_author_contract_to_format_repair(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            runner = ComposerRunner(self._workflow(root))
+            try:
+                stage = runner.workflow["stages"][1]
+                runner.stage_records["experiment"] = {
+                    "kind": "experiment",
+                    "status": "candidate_needs_review",
+                    "composer_decision": "advance_with_findings",
+                    "release_blocking": False,
+                    "attempt_count": 88,
+                }
+                runner.context["experiment"] = {
+                    "kind": "experiment",
+                    "status": "candidate_needs_review",
+                    "results_status": "not_executed",
+                    "release_blocking": False,
+                    "error": (
+                        "Unchanged experiment input failed: ModelWorkBlocked: "
+                        "capability foundry did not admit a program: "
+                        "program author did not finish normally"
+                    ),
+                    "failure_dossier_ref": "artifact:failure@legacy",
+                    "failure_recovery": {
+                        "failure_class": "model_contract",
+                        "recovery_mode": "format_repair_then_rerun",
+                        "dossier_ref": "artifact:failure@legacy",
+                        "input_sha256": "b" * 64,
+                    },
+                    "format_recovery": True,
+                    "format_recovery_attempts": 1,
+                }
+                by_id = {item["id"]: item for item in runner.workflow["stages"]}
+                reconciled = runner._reconcile_stale_forward_handoffs(by_id)
+                self.assertEqual([item["stage_id"] for item in reconciled], ["experiment"])
+                context = runner.context["experiment"]
+                self.assertEqual(context["failure_recovery"]["failure_class"],
+                                 "model_contract")
+                self.assertEqual(context["failure_recovery"]["recovery_mode"],
+                                 "format_repair_then_rerun")
+                self.assertTrue(context["format_recovery"])
+                self.assertEqual(context["research_requests"][0]["kind"], "recovery")
+                self.assertEqual(runner.stage_records["experiment"]["status"], "retrying")
+            finally:
+                runner.close()
+
+    def test_argument_evidence_repairs_route_to_existing_experiment(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            (root / "interpretation").mkdir()
+            (root / "argument").mkdir()
+            interpretation = {
+                "id": "interpretation", "kind": "interpretation", "depends_on": ["experiment"],
+                "config_path": str((root / "stage.json").resolve()),
+                "project_dir": str((root / "interpretation").resolve()),
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            }
+            argument_stage = {
+                "id": "argument", "kind": "argument", "depends_on": ["interpretation"],
+                "config_path": str((root / "stage.json").resolve()),
+                "project_dir": str((root / "argument").resolve()),
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            }
+            workflow["stages"].extend([interpretation, argument_stage])
+            runner = ComposerRunner(workflow)
+            try:
+                request = runner._argument_experiment_repair_request(
+                    argument_stage,
+                    {
+                        "input_sha256": "a" * 64,
+                        "review_directives": [{
+                            "text": "Run a threshold sensitivity sweep and independently recalculate the onset.",
+                        }],
+                        "repair_commands": [], "acceptance_checks": [],
+                        "artifact_ref": "artifact:failure@1",
+                    },
+                )
+                self.assertEqual(request["target_stage_id"], "experiment")
+                self.assertEqual(request["kind"], "additional_experiment")
+                self.assertEqual(request["repair_priority"], "immediate")
+            finally:
+                runner.close()
+
+    def test_exhausted_assignment_preserves_runner_handoff(self):
+        result = {
+            "status": "blocked",
+            "error": "gap assessment response contract exhausted",
+            "failure": {"kind": "unchanged_assignment_exhausted"},
+            "project_dir": "/tmp/survey",
+            "survey_ref": "artifact:survey/current@1",
+            "assessment_ref": None,
+            "survey_current": True,
+            "assessment_current": False,
+        }
+        with self.assertRaises(ModelWorkBlocked) as raised:
+            ComposerRunner._raise_stage_failure(result)
+        self.assertEqual(raised.exception.stage_result, result)
+        self.assertEqual(raised.exception.failure_scope, "stage")
+
+    def test_failure_analysis_persists_dossier_and_scoped_repair_order(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            try:
+                stage = workflow["stages"][1]
+                attempt_stage = {"attempt_number": 1, "project_dir": stage["project_dir"]}
+                error = ValidationError("independent recalculation rejected the result")
+                error.stage_result = {
+                    "status": "blocked", "error": str(error),
+                    "execution_refs": ["execution-1"],
+                    "metrics": [{"id": "onset", "value": 1.0}],
+                }
+                dossier = runner._record_failure_recovery(
+                    stage, attempt_stage, error, None,
+                    {"reports": []}, None, 1)
+                self.assertEqual(dossier["failure_class"], "experiment_failure")
+                self.assertTrue(dossier["artifact_ref"])
+                self.assertEqual(
+                    runner.context["experiment"]["failure_recovery"]["recovery_mode"],
+                    "repair_then_rerun",
+                )
+                requests = runner._continuation_requests()
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(requests[0]["kind"], "additional_experiment")
+                self.assertTrue(requests[0]["repair_commands"])
+            finally:
+                runner.close()
+
+    def test_model_contract_failure_does_not_regenerate_experiment_program(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            try:
+                stage = workflow["stages"][1]
+                error = ModelWorkBlocked(
+                    "work-review-1 did not satisfy its evidence contract")
+                dossier = runner._record_failure_recovery(
+                    stage,
+                    {"attempt_number": 1, "project_dir": str(root / "experiment")},
+                    error,
+                    {},
+                    {"reports": []},
+                    None,
+                    1,
+                )
+                self.assertFalse(
+                    runner.context["experiment"]["failure_recovery"]
+                    ["requires_capability_repair"])
+                self.assertEqual(dossier["failure_class"], "experiment_contract")
+            finally:
+                runner.close()
+
+    def test_format_contract_failure_stays_in_stage_without_scientific_order(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            try:
+                stage = workflow["stages"][1]
+                error = ValidationError(
+                    "research argument review did not finish normally: length")
+                dossier = runner._record_failure_recovery(
+                    stage,
+                    {"attempt_number": 1, "project_dir": str(root / "experiment")},
+                    error,
+                    {},
+                    {"reports": []},
+                    None,
+                    1,
+                )
+                context = runner.context["experiment"]
+                self.assertEqual(dossier["failure_class"], "model_contract")
+                self.assertTrue(context["format_recovery"])
+                self.assertEqual(context["format_recovery_attempts"], 1)
+                self.assertEqual(len(context["research_requests"]), 1)
+                self.assertEqual(context["research_requests"][0]["kind"], "recovery")
+                self.assertEqual(context["research_requests"][0]["target_stage_id"], "experiment")
+                self.assertEqual(
+                    context["failure_recovery"]["recovery_mode"],
+                    "format_repair_then_rerun",
+                )
+            finally:
+                runner.close()
 
     def _workflow(self, root):
         config = root / "stage.json"
@@ -536,6 +950,64 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(packet["prior_work"][0]["work_id"], "W1")
             runner.close()
 
+    def test_downstream_specialists_receive_materialized_scientific_inputs(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            runner = ComposerRunner(self._workflow(root))
+            try:
+                runner.workflow["stages"].extend([
+                    {"id": "interpretation", "kind": "interpretation",
+                     "depends_on": ["experiment"]},
+                    {"id": "argument", "kind": "argument",
+                     "depends_on": ["interpretation"]},
+                ])
+                runner.context["experiment"] = {
+                    "kind": "experiment",
+                    "results_package": {
+                        "question": "Does the onset survive the control?",
+                        "metrics": [{"id": "onset", "value": 4.2, "unit": "nm"}],
+                        "findings": [{"id": "finding-1", "statement": "The onset is interior."}],
+                        "limitations": ["Reduced model."],
+                    },
+                }
+                interpretation = runner._specialist_stage_result_projection(
+                    runner.workflow["stages"][-2], {
+                        "status": "completed",
+                        "interpretation": {
+                            "research_question": "Does the onset survive the control?",
+                            "result_patterns": [{"id": "pattern-1", "result_ref": "onset"}],
+                            "competing_explanations": [{"id": "aging", "status": "possible"}],
+                        },
+                    })
+                self.assertEqual(interpretation["results"]["metrics"][0]["id"], "onset")
+                self.assertEqual(interpretation["alternative_hypotheses"][0]["id"], "aging")
+
+                runner.context["interpretation"] = {
+                    "kind": "interpretation",
+                    "interpretation": {"interpretation": interpretation["interpretation"]},
+                }
+                argument = runner._specialist_stage_result_projection(
+                    runner.workflow["stages"][-1], {
+                        "status": "completed",
+                        "argument_package": {
+                            "argument": {
+                                "research_question": "Does the onset survive the control?",
+                                "observed_patterns": [{"id": "pattern-1"}],
+                                "hypotheses": [{"id": "aging"}],
+                                "primary_argument": {"thesis": "The result is bounded."},
+                                "limitations": ["Reduced model."],
+                            },
+                            "review": {"decision": "accept", "findings": []},
+                        },
+                    })
+                self.assertEqual(argument["claims"][0]["id"], "pattern-1")
+                self.assertEqual(argument["argument_plan"]["primary_argument"]["thesis"],
+                                 "The result is bounded.")
+                self.assertEqual(argument["review_findings"]["decision"], "accept")
+                self.assertEqual(argument["evidence_records"][0]["id"], "onset")
+            finally:
+                runner.close()
+
     def test_provisional_topic_verifier_hold_becomes_survey_requirements(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -958,7 +1430,7 @@ class ComposerWorkflowTests(unittest.TestCase):
             finally:
                 runner.close()
 
-    def test_pre_execution_capability_failure_pivots_instead_of_parking_a_candidate(self):
+    def test_pre_execution_capability_failure_opens_scoped_repair_cycle(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
             workflow = self._workflow(root)
@@ -1002,11 +1474,104 @@ class ComposerWorkflowTests(unittest.TestCase):
                 self.assertTrue(runner._admit_scientific_blocker_recovery(
                     workflow["stages"][2], ModelWorkBlocked(error), completed, by_id))
                 self.assertEqual(runner.continuation_cycles, 1)
-                self.assertEqual(runner.context["topic"]["status"], "research_expansion_required")
-                self.assertTrue(any(
+                self.assertFalse(any(
                     item.get("action") == "pivot_topic_after_scientific_blocker"
                     for item in runner.department_activity
                 ))
+                self.assertFalse(runner._composer_can_advance_after_admission(
+                    workflow["stages"][2], ModelWorkBlocked(error)))
+            finally:
+                runner.close()
+
+    def test_exhausted_pre_execution_capability_pivots_to_a_fresh_topic(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            workflow["continuation_policy"] = {"mode": "bounded", "max_cycles": 1}
+            workflow["progression_policy"] = "forward_first"
+            runner = ComposerRunner(workflow)
+            try:
+                topic = {
+                    "kind": "topic_discovery", "status": "completed",
+                    "topic": {"id": "old", "title": "Old direction",
+                              "domain": "computational physics",
+                              "research_question": "Does A change B?"},
+                }
+                recovery = {
+                    "failure_class": "experiment_failure",
+                    "requires_capability_repair": True,
+                    "recovery_mode": "repair_then_rerun",
+                    "dossier_ref": "artifact:failure-dossier",
+                    "input_sha256": "a" * 64,
+                    "repair_commands": [{"id": "edit", "operation": "edit_program",
+                                         "instruction": "repair the executor"}],
+                    "acceptance_checks": ["independent recalculation"],
+                    "review_directives": [{"text": "change the failed mechanism"}],
+                }
+                runner.context = {
+                    "topic": topic,
+                    "survey": {"kind": "survey", "status": "completed"},
+                    "experiment": {
+                        "kind": "experiment", "status": "research_expansion_required",
+                        "review_status": "scientific_assignment_blocked",
+                        "error": "capability foundry independent recalculation failed",
+                        "failure_recovery": recovery,
+                    },
+                }
+                runner.stage_records = {
+                    "topic": {"kind": "topic_discovery", "status": "completed"},
+                    "survey": {"kind": "survey", "status": "completed"},
+                    "experiment": {"kind": "experiment", "status": "blocked"},
+                }
+                by_id = {stage["id"]: stage for stage in workflow["stages"]}
+                completed = {"topic", "survey"}
+                error = ModelWorkBlocked(
+                    "capability foundry independent recalculation repair budget exhausted")
+                self.assertTrue(runner._admit_scientific_blocker_recovery(
+                    by_id["experiment"], error, completed, by_id))
+                self.assertEqual(runner.continuation_cycles, 1)
+                request = runner.active_research_requests[0]
+                self.assertEqual(request["kind"], "topic_refinement")
+                self.assertEqual(request["owner"], "research.intelligence")
+                self.assertEqual(runner.context["experiment"]["research_requests"], [])
+                self.assertEqual(
+                    runner.context["experiment"]["pivoted_to_topic"], "topic")
+                self.assertNotIn("failure_recovery", runner.context["experiment"])
+                self.assertNotIn("capability_repair_attempts", runner.context["experiment"])
+                self.assertTrue(any(
+                    item.get("action") == "pivot_topic_after_experiment_repair_limit"
+                    for item in runner.department_activity
+                ))
+            finally:
+                runner.close()
+
+    def test_unexecuted_capability_can_never_be_forwarded_after_repair_lease(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            workflow["progression_policy"] = "forward_first"
+            runner = ComposerRunner(workflow)
+            try:
+                runner.context["experiment"] = {
+                    "kind": "experiment", "status": "research_expansion_required",
+                    "review_status": "scientific_assignment_blocked",
+                    "error": "capability foundry did not admit a program",
+                    "capability_repair_attempts": 99,
+                    "results_status": "not_executed",
+                    "failure_recovery": {"requires_capability_repair": True},
+                }
+                self.assertFalse(runner._composer_can_advance_after_admission(
+                    workflow["stages"][1], ModelWorkBlocked("capability foundry failed")))
             finally:
                 runner.close()
 
@@ -1357,6 +1922,41 @@ class ComposerWorkflowTests(unittest.TestCase):
         for prior in ({}, {"survey_current": True},
                       {"survey_current": False, "survey_ref": "artifact:kb/surveys/current@4"}):
             self.assertEqual(ComposerRunner._survey_resume_scope(prior), "focused_review")
+
+    def test_reopened_survey_reuses_latest_current_checkpoint(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            stage = workflow["stages"][0]
+            stale = root / "survey" / "continuations" / "cycle-8"
+            current = root / "survey" / "continuations" / "cycle-7"
+            for project, survey_ref, current_flag in (
+                    (stale, "artifact:kb/surveys/current@1", False),
+                    (current, "artifact:kb/surveys/current@2", True)):
+                (project / "state").mkdir(parents=True)
+                (project / "state" / "control.sqlite").write_bytes(b"checkpoint")
+                (project / "output").mkdir()
+                (project / "output" / "run.json").write_text(json.dumps({
+                    "status": "blocked", "survey_ref": survey_ref,
+                    "survey_current": current_flag, "assessment_current": False,
+                }))
+            runner = ComposerRunner(workflow)
+            try:
+                runner.continuation_cycles = 9
+                runner.reopened_stage_ids = {"survey"}
+                runner.context["survey"] = {
+                    "kind": "survey", "project_dir": str(stale),
+                    "survey_ref": "artifact:kb/surveys/current@1",
+                    "survey_current": False, "assessment_current": False,
+                }
+                runner.stage_records["survey"] = {
+                    "attempts": [{"project_dir": str(current), "state": "failed"}],
+                }
+                dispatched = runner._stage_for_cycle(stage)
+                self.assertEqual(Path(dispatched["project_dir"]), current.resolve())
+                self.assertNotIn("continuations/cycle-9", dispatched["project_dir"])
+            finally:
+                runner.close()
 
     def test_exploratory_admission_is_bound_before_capability_authoring(self):
         with tempfile.TemporaryDirectory() as path:
@@ -1913,6 +2513,233 @@ class ComposerWorkflowTests(unittest.TestCase):
             finally:
                 runner.close()
 
+    def test_repeated_survey_quota_exhaustion_pivots_to_topic(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            topic_dir = root / "topic"
+            topic_dir.mkdir()
+            workflow["stages"].insert(0, {
+                "id": "topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"],
+                "project_dir": str(topic_dir.resolve()), "depends_on": [],
+                "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None,
+            })
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            runner = ComposerRunner(workflow)
+            try:
+                runner.continuation_cycles = 1
+                runner.context["topic"] = {
+                    "kind": "topic_discovery",
+                    "status": "completed",
+                    "topic": {
+                        "id": "prior-topic",
+                        "title": "Prior direction",
+                        "research_question": "Does the mechanism change the observable?",
+                    },
+                }
+                runner.context["survey"] = {
+                    "kind": "survey",
+                    "status": "research_expansion_required",
+                    "quota_recovery": {
+                        "status": "required",
+                        "mode": "narrow_scope",
+                        "previous_cycle": 0,
+                        "recovery_count": 1,
+                    },
+                }
+                by_id = {item["id"]: item for item in workflow["stages"]}
+                error = QuotaExceededError(
+                    "stage survey quota exhausted: model_calls=97 > 96",
+                    dimension="max_model_calls", limit=96, observed=97,
+                    usage={"model_calls": 97},
+                )
+                self.assertTrue(runner._admit_stage_quota_recovery(
+                    by_id["survey"], error, {"topic"}, by_id))
+                self.assertEqual(runner.continuation_cycles, 2)
+                self.assertEqual(
+                    runner.context["survey"]["quota_recovery"]["mode"],
+                    "topic_pivot",
+                )
+                self.assertEqual(
+                    runner.context["topic"]["topic_pivot"]["source_stage_id"],
+                    "survey",
+                )
+                self.assertTrue(any(
+                    item.get("action") == "pivot_topic_after_repeated_survey_quota"
+                    for item in runner.department_activity
+                ))
+            finally:
+                runner.close()
+
+    def test_continuation_clears_stale_live_assignment_projection(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            try:
+                runner.stage_records["survey"] = {
+                    "kind": "survey",
+                    "status": "running",
+                    "active_agents": ["research.search-strategist"],
+                    "last_active_agents": [],
+                }
+                runner.context["survey"] = {
+                    "kind": "survey",
+                    "status": "research_expansion_required",
+                    "research_requests": [{
+                        "id": "survey-repair",
+                        "kind": "literature_expansion",
+                        "owner": "research.intelligence",
+                        "source_stage_id": "survey",
+                    }],
+                }
+                by_id = {item["id"]: item for item in workflow["stages"]}
+                completed = set()
+                self.assertTrue(runner._begin_continuation(completed, by_id))
+                self.assertEqual(runner.stage_records["survey"]["status"], "retrying")
+                self.assertEqual(runner.stage_records["survey"]["active_agents"], [])
+                self.assertEqual(
+                    runner.stage_records["survey"]["last_active_agents"],
+                    ["research.search-strategist"],
+                )
+            finally:
+                runner.close()
+
+    def test_resumed_continuation_lease_ignores_historical_cycles(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            workflow["continuation_policy"] = {"mode": "bounded", "max_cycles": 1}
+            runner = ComposerRunner(workflow)
+            try:
+                runner.continuation_cycles = 231
+                runner._continuation_budget_baseline = 231
+                request = {
+                    "id": "survey-recovery",
+                    "kind": "literature_expansion",
+                    "owner": "research.intelligence",
+                    "objective": "Run a changed boundary-focused search.",
+                    "why": "The previous survey allocation was exhausted.",
+                    "success_condition": "The gap decision is refreshed.",
+                    "evidence_needed": "Identity-reconciled primary records.",
+                    "source_stage_id": "survey",
+                }
+                runner.context["survey"] = {
+                    "kind": "survey", "status": "completed",
+                    "research_requests": [request],
+                }
+                runner.active_research_requests = [request]
+                completed = {"survey"}
+                by_id = {item["id"]: item for item in workflow["stages"]}
+
+                self.assertTrue(runner._begin_continuation(completed, by_id))
+                self.assertEqual(runner.continuation_cycles, 232)
+                self.assertEqual(runner._continuation_budget_used(), 1)
+                self.assertFalse(runner._begin_continuation(completed, by_id))
+            finally:
+                runner.close()
+
+    def test_failed_materialized_stage_is_reviewed_before_recovery(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            config = root / "argument.json"
+            config.write_text("{}")
+            argument_dir = root / "argument"
+            argument_dir.mkdir()
+            workflow = {
+                "schema_version": "composer-workflow-1",
+                "id": "failed-materialized-review",
+                "revision": 1,
+                "project_id": str(root / "composer"),
+                "objective": "Review a failed scientific artifact.",
+                "progression_policy": "forward_first",
+                "continuation_policy": {"mode": "bounded", "max_cycles": 0},
+                "stages": [{
+                    "id": "argument", "kind": "argument",
+                    "config_path": str(config.resolve()),
+                    "project_dir": str(argument_dir.resolve()), "depends_on": [],
+                    "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                    "reuse_completed": False, "reuse_output_path": None,
+                }],
+                "time_policy": {"first_result_seconds": 1, "target_seconds": 10,
+                                 "hard_seconds": 30, "checkpoint_seconds": 1},
+                "completion": {"required_stage_ids": ["argument"],
+                                "release_requires_human": True},
+            }
+            runner = ComposerRunner(workflow)
+            packets = []
+            try:
+                def failed(_stage, **_kwargs):
+                    error = ValidationError("the argument needs a narrower claim")
+                    error.stage_result = {
+                        "status": "blocked", "error": str(error),
+                        "argument_package": {"claims": [{"id": "claim-1"}]},
+                    }
+                    raise error
+
+                def review(_stage, _assignment, _descriptor, *, stage_result=None):
+                    packets.append(stage_result)
+                    return {"reports": [], "by_role": {}, "usage": {},
+                            "model_enabled": False, "packet": {}}
+
+                runner._run_stage = failed
+                runner._run_specialist_pool = review
+                runner._publish_specialist_reports = lambda _s, _a, bundle: bundle
+                runner._run_specialist_verifier = lambda *_args, **_kwargs: None
+                result = runner.run()
+
+                self.assertEqual(len(packets), 1)
+                self.assertEqual(
+                    packets[0]["argument_package"]["claims"][0]["id"], "claim-1")
+                self.assertTrue(any(
+                    item.get("action") == "failure_specialist_review_completed"
+                    for item in result["department_activity"]))
+            finally:
+                runner.close()
+
+    def test_failed_survey_handoff_is_rehydrated_before_dependency_admission(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            survey_dir = root / "survey" / "continuations" / "cycle-3"
+            (survey_dir / "output").mkdir(parents=True)
+            (survey_dir / "output" / "run.json").write_text(json.dumps({
+                "status": "blocked",
+                "survey_ref": "artifact:survey/current@1",
+                "assessment_ref": None,
+                "nomination_ref": "artifact:nomination@1",
+                "survey_current": True,
+                "assessment_current": False,
+                "gap_state": "insufficient_evidence",
+            }))
+            runner = ComposerRunner(workflow)
+            try:
+                runner.stage_records["survey"] = {
+                    "kind": "survey",
+                    "status": "candidate_needs_review",
+                    "composer_decision": "advance_with_findings",
+                    "attempts": [{"state": "failed", "cycle": 3,
+                                  "project_dir": str(survey_dir)}],
+                }
+                runner.context["survey"] = {
+                    "kind": "survey", "status": "candidate_needs_review",
+                    "forward_progress": True,
+                }
+                runner._hydrate_provisional_handoffs()
+                self.assertEqual(
+                    runner.context["survey"]["survey_ref"],
+                    "artifact:survey/current@1",
+                )
+                self.assertIsNone(runner.context["survey"]["assessment_ref"])
+                self.assertEqual(
+                    runner.context["survey"]["project_dir"],
+                    str(survey_dir.resolve()),
+                )
+            finally:
+                runner.close()
+
     def test_openalex_cooldown_admits_bounded_crossref_fallback(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -1969,6 +2796,42 @@ class ComposerWorkflowTests(unittest.TestCase):
             finally:
                 runner.close()
 
+    def test_resume_invalidates_legacy_route_agnostic_specialist_cooldown(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            try:
+                runner.stage_records["experiment"] = {
+                    "kind": "experiment", "status": "paused",
+                    "error": "ProviderCooldownError: specialist provider is cooling down",
+                }
+                runner.retry_schedule["experiment"] = {
+                    "delay_seconds": 86400,
+                    "error": "ProviderCooldownError: specialist provider is cooling down",
+                    "failed_attempt_number": 64,
+                    "next_attempt_number": 65,
+                    "not_before_epoch": time.time() + 86400,
+                }
+                runner.retry_schedule["argument"] = {
+                    "delay_seconds": 15,
+                    "error": "ProviderCooldownError: specialist provider is cooling down",
+                    "route_id": "ollama-glm",
+                    "not_before_epoch": time.time() + 15,
+                }
+                stages = {item["id"]: item for item in workflow["stages"]}
+                invalidated = runner._invalidate_legacy_provider_retry_schedules(stages)
+                self.assertEqual([item["stage_id"] for item in invalidated], ["experiment"])
+                self.assertNotIn("experiment", runner.retry_schedule)
+                self.assertIn("argument", runner.retry_schedule)
+                self.assertEqual(runner.stage_records["experiment"]["status"], "retrying")
+                self.assertTrue(any(
+                    item.get("action") == "invalidate_legacy_provider_retry_schedules"
+                    for item in runner.department_activity
+                ))
+            finally:
+                runner.close()
+
     def test_stage_work_order_projection_does_not_cross_contaminate_reopened_stages(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -1989,6 +2852,68 @@ class ComposerWorkflowTests(unittest.TestCase):
                 ["experiment-repair"],
             )
             runner.close()
+
+    def test_argument_repair_targets_argument_and_outranks_unrelated_ready_work(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            runner = ComposerRunner(self._workflow(root))
+            try:
+                request = {
+                    "id": "repair-argument-review",
+                    "kind": "interpretation_expansion",
+                    "owner": "strategy.interpretation",
+                    "objective": "Repair the reviewed claim-evidence graph.",
+                    "why": "The independent argument review found five scoped repairs.",
+                    "success_condition": "The revised argument passes independent adjudication.",
+                    "evidence_needed": "The prior argument and fresh evidence links.",
+                    "source_stage_id": "argument",
+                    "target_stage_id": "argument",
+                    "target_stage_kind": "argument",
+                    "repair_priority": "immediate",
+                }
+                by_id = {
+                    "survey": {"id": "survey", "kind": "survey", "depends_on": []},
+                    "argument": {"id": "argument", "kind": "argument", "depends_on": []},
+                    "paper": {"id": "paper", "kind": "paper", "depends_on": ["argument"]},
+                }
+                self.assertEqual(
+                    ComposerRunner._continuation_targets([request], by_id),
+                    {"argument", "paper"},
+                )
+                runner.active_research_requests = [request]
+                runner.reopened_stage_ids = {"argument", "paper"}
+                runner.workflow["agenda_policy"] = {"mode": "adaptive"}
+                ordered = runner._agenda_order(
+                    [by_id["survey"], by_id["argument"]],
+                    completed=set(), by_id=by_id,
+                )
+                self.assertEqual(ordered[0]["id"], "argument")
+                self.assertEqual(
+                    [item["id"] for item in runner._requests_for_stage("argument")],
+                    ["repair-argument-review"],
+                )
+                self.assertEqual(runner._requests_for_stage("survey"), [])
+            finally:
+                runner.close()
+
+    def test_legacy_argument_recovery_gets_an_explicit_execution_address(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            runner = ComposerRunner(self._workflow(root))
+            try:
+                request = runner._autonomous_recovery_request(
+                    "argument",
+                    {
+                        "kind": "argument",
+                        "status": "research_expansion_required",
+                        "error": "independent adjudicator requested revision",
+                    },
+                )
+                self.assertEqual(request["target_stage_id"], "argument")
+                self.assertEqual(request["target_stage_kind"], "argument")
+                self.assertEqual(request["repair_priority"], "immediate")
+            finally:
+                runner.close()
 
     def test_topic_refinement_supersedes_downstream_work_orders(self):
         with tempfile.TemporaryDirectory() as path:
@@ -2411,7 +3336,11 @@ class ComposerWorkflowTests(unittest.TestCase):
             # reused so authoring failures cannot starve the actual experiment.
             runner.context["experiment"] = {
                 "kind": "experiment", "status": "research_expansion_required",
-                "results_package": {"schema_version": "results-package-1"},
+                "results_package": {
+                    "schema_version": "results-package-1",
+                    "id": "generated_frontier",
+                    "metrics": [{"id": "observed_metric", "value": 1.0}],
+                },
             }
             regenerated = {
                 **generated,
@@ -2421,14 +3350,355 @@ class ComposerWorkflowTests(unittest.TestCase):
                 },
             }
             with patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate",
-                       return_value=regenerated) as regenerate:
+                       return_value=regenerated) as regenerate, \
+                    patch.object(runner, "_run_capability_repair_panel", return_value={
+                        "schema_version": "capability-repair-panel-1",
+                        "decision": "repair", "input_sha256": "b" * 64,
+                        "root_causes": ["the observed result did not separate the explanations"],
+                        "required_changes": ["add a discriminating control"],
+                        "ledger": {"panel_stage_id": "experiment-repair-panel"},
+                    }) as repair_panel:
                 runner._apply_topic_to_experiment_config(workflow["stages"][1], {
                     "experiment": {"revision": 2,
                                    "literature_gate": {"required_state": "eligible_for_experiment"}},
                     "supplied_context": "base"})
+            repair_panel.assert_called_once()
             self.assertEqual(regenerate.call_args.kwargs["required_intent"]["id"], "frontier-cycle-1")
             self.assertEqual(regenerate.call_args.kwargs["required_intent"]["revision"], 2)
             runner.close()
+
+    def test_stale_experiment_result_does_not_count_for_current_capability(self):
+        stale = {
+            "study_id": "old_capability",
+            "results_package": {
+                "id": "old_capability",
+                "metrics": [{"id": "old_metric", "value": 1.0}],
+            },
+        }
+        self.assertFalse(
+            ComposerRunner._has_executed_experiment_result(stale, "current_capability"))
+        self.assertTrue(
+            ComposerRunner._has_executed_experiment_result(stale, "old_capability"))
+
+    def test_capability_repair_panel_routes_upper_methods_roles_into_authoring_context(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            try:
+                runner.context["topic"] = {
+                    "kind": "topic_discovery",
+                    "topic": {
+                        "id": "frontier",
+                        "title": "A falsifiable direction",
+                        "domain": "computational physics",
+                        "research_question": "Does mechanism A change response B?",
+                        "comparison": "mechanism-off baseline",
+                        "measurement": "finite transition radius",
+                    },
+                }
+                stage = workflow["stages"][1]
+                descriptor = {"model": {"base_url": "http://example.invalid", "model": "stub"}}
+                prior = {
+                    "kind": "experiment",
+                    "status": "research_expansion_required",
+                    "review_status": "scientific_assignment_blocked",
+                    "error": "capability foundry did not admit a program: constant observations",
+                    "specialist_reports": [{
+                        "role_id": "analysis-reviewer",
+                        "status": "failed",
+                        "response": {"findings": ["the declared intervention cancels from the output"]},
+                    }],
+                }
+                topic = runner.context["topic"]
+                assignment = {
+                    "active_agents": [
+                        "methods.methodologist", "methods.statistical-reviewer",
+                        "methods.reproducibility-reviewer", "methods.analysis-reviewer",
+                    ],
+                    "verifier_agent": "methods.adversarial-reviewer",
+                    "plan_ref": "artifact:plan",
+                }
+                reports = [{
+                    "role_id": "methodologist",
+                    "assigned_role": "methods.methodologist",
+                    "status": "succeeded",
+                    "response": {
+                        "decision": "repair",
+                        "summary": "Replace the cancelling algebra with a state-evolution design.",
+                        "findings": ["The intervention is absent from the simulated dynamics."],
+                        "requested_actions": ["Integrate the declared state variables across the intervention grid."],
+                    },
+                    "usage": {"model_calls": 1},
+                    "artifact_ref": "artifact:methodologist",
+                }]
+                bundle = {
+                    "reports": reports, "by_role": {"methodologist": reports[0]},
+                    "usage": {"model_calls": 1, "input_tokens": 10, "output_tokens": 10},
+                    "model_enabled": True,
+                }
+                verifier = {
+                    "status": "succeeded",
+                    "response": {
+                        "decision": "hold",
+                        "rationale": "The repair is required before authoring.",
+                        "critical_findings": ["The old mechanism is not identifiable."],
+                        "repair_scope": ["Add an independent recalculation from raw observations."],
+                    },
+                    "usage": {"model_calls": 1},
+                    "artifact_ref": "artifact:adversary",
+                }
+                with patch.object(runner, "_latest_foundry_failure_projection", return_value={
+                        "feedback": "constant observations", "last_attempt": {
+                            "experiment_intent": {"hypothesis": "A changes B"},
+                            "executor_source": "old executor",
+                            "validator_source": "old validator",
+                        }}), \
+                        patch.object(runner.departments, "begin_stage", return_value=assignment) as begin, \
+                        patch.object(runner, "_run_specialist_pool", return_value=bundle), \
+                        patch.object(runner, "_publish_specialist_reports", side_effect=lambda _s, _a, b: b), \
+                        patch.object(runner, "_run_specialist_verifier", return_value=verifier), \
+                        patch.object(runner.departments, "finish_stage", return_value={
+                            "chief_synthesis_ref": "artifact:chief",
+                            "verifier_artifact_ref": "artifact:verdict",
+                        }), \
+                        patch.object(runner, "_checkpoint"):
+                    panel = runner._run_capability_repair_panel(
+                        stage, descriptor, topic, prior, prior["error"])
+                self.assertEqual(panel["decision"], "repair")
+                self.assertIn("intervention is absent", " ".join(panel["root_causes"]))
+                self.assertIn("independent recalculation", " ".join(panel["required_changes"]))
+                self.assertEqual(panel["ledger"]["verifier_artifact_ref"], "artifact:verdict")
+                begin.assert_called_once()
+                self.assertEqual(begin.call_args.args[1], "experiment")
+            finally:
+                runner.close()
+
+    def test_pre_execution_repair_passes_panel_to_fresh_foundry_generation(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            runner.workflow["capability_foundry_config_path"] = "configured-by-test"
+            descriptor = root / "generated.json"
+            descriptor.write_text(json.dumps({
+                "experiment": {
+                    "id": "frontier-cycle-1", "revision": 1,
+                    "domain": "computational physics",
+                    "research_question": "Does mechanism A change response B?",
+                    "execution": {}, "validation": {},
+                }
+            }))
+            runner.context["topic"] = {
+                "kind": "topic_discovery",
+                "topic": {
+                    "id": "frontier", "domain": "computational physics",
+                    "research_question": "Does mechanism A change response B?",
+                },
+            }
+            runner.context["experiment"] = {
+                "kind": "experiment", "status": "research_expansion_required",
+                "review_status": "scientific_assignment_blocked",
+                "error": "capability foundry did not admit a program: constant observations",
+            }
+            runner.continuation_cycles = 1
+            runner.reopened_stage_ids = {"experiment"}
+            runner.active_research_requests = [{
+                "id": "repair", "kind": "additional_experiment",
+                "owner": "methods.validation", "objective": "Repair the executable",
+                "why": "The first capability was rejected", "success_condition": "Independent recalculation",
+                "evidence_needed": "Raw observations",
+            }]
+            panel = {
+                "schema_version": "capability-repair-panel-1",
+                "input_sha256": "a" * 64,
+                "decision": "repair", "root_causes": ["constant output"],
+                "required_changes": ["integrate the state variables"],
+                "ledger": {"panel_stage_id": "experiment-repair-panel-1-1",
+                           "verifier_artifact_ref": "artifact:verdict"},
+            }
+            def materialize(topic_result, **kwargs):
+                self.assertEqual(kwargs["repair_context"]["decision"], "repair")
+                topic_result["generated_capability"] = {
+                    "capability_id": "frontier-cycle-1",
+                    "descriptor_path": str(descriptor.resolve()),
+                }
+                return topic_result
+            with patch.object(runner, "_run_capability_repair_panel", return_value=panel) as panel_call, \
+                    patch.object(runner, "_materialize_topic_capability", side_effect=materialize) as materialize_call:
+                result = runner._apply_topic_to_experiment_config(
+                    workflow["stages"][1],
+                    {"experiment": {"revision": 1, "literature_gate": {}},
+                     "supplied_context": "base"},
+                )
+            panel_call.assert_called_once()
+            materialize_call.assert_called_once()
+            self.assertEqual(result["experiment"]["id"], "frontier-cycle-1")
+            runner.close()
+
+    def test_capability_authoring_repair_projection_fits_context_without_losing_sources(self):
+        source = "# executable repair source\n" + ("value = 1\n" * 1400)
+        repair = {
+            "schema_version": "capability-repair-panel-1",
+            "input_sha256": "a" * 64,
+            "packet": {
+                "topic": {"id": "frontier", "domain": "computational physics",
+                          "research_question": "Does mechanism A change response B?"},
+                "failure": {"error": "invalid estimator", "failure_debt": {"finding": "bad"}},
+                "failure_recovery": {
+                    "failure_class": "scientific_hold", "recovery_mode": "repair_then_rerun",
+                    "requires_capability_repair": True,
+                    "repair_commands": [{"id": "repair", "instruction": "Change the mechanism."}],
+                    "review_directives": [{"kind": "requested_actions", "text": "Run a control."}],
+                },
+                "program_snapshot": [{"path": "/tmp/executor.py", "sha256": "b" * 64,
+                                      "size_bytes": len(source), "source": source,
+                                      "source_truncated": False}],
+                "prior_foundry_work": {
+                    "status": "repairing", "attempts": 1,
+                    "feedback": "adversarial review rejected the candidate",
+                    "last_attempt": {"executor_source": source, "validator_source": source,
+                                      "experiment_intent": {"id": "frontier", "revision": 1}},
+                },
+                "repair_contract": {"must_change": ["the mechanism"]},
+            },
+            "root_causes": ["The estimator is not identifiable."],
+            "required_changes": ["Add a discriminating control."],
+            "acceptance_checks": ["Independent recalculation."],
+            "repair_commands": [{"id": "repair", "operation": "edit_program",
+                                 "instruction": "Change the source."}],
+            "verifier": {"decision": "repair", "critical_findings": ["The mechanism is invalid."]},
+            "reports": [{"role_id": "methodologist", "status": "completed",
+                         "summary": "Bounded repair required.",
+                         "findings": ["The intervention is absent."],
+                         "requested_actions": ["Add a control."]}],
+        }
+        projected = ComposerRunner._capability_authoring_repair_projection(repair)
+        self.assertNotIn("packet", projected)
+        self.assertEqual(projected["failed_program"]["executor_source"], source)
+        brief = {
+            "topic": {"id": "frontier", "domain": "computational physics",
+                      "research_question": "Does mechanism A change response B?"},
+            "capability_repair": projected,
+            "required_properties": ["bounded reproducible experiment"],
+        }
+        prompt = json.dumps(candidate_prompt(
+            json.dumps(brief, ensure_ascii=False, sort_keys=True),
+            [("numpy", "2.5.2")], {"probe": True},
+            required_intent={"domain": "computational physics",
+                             "research_question": "Does mechanism A change response B?"},
+            runtime_version="3.12"), ensure_ascii=False, sort_keys=True)
+        self.assertLessEqual(
+            estimate_input_tokens(SYSTEM, prompt), 56000,
+            "program-repair authoring packet must fit the configured 64k route")
+
+    def test_observed_experiment_repair_requires_panel_and_reserves_full_envelope(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            stage = workflow["stages"][1]
+            stage["quota"] = {
+                "max_model_calls": 14, "max_input_tokens": 100000,
+                "max_output_tokens": 20000, "max_openalex_requests": 0,
+            }
+            runner = ComposerRunner(workflow)
+            try:
+                runner.workflow["capability_foundry_config_path"] = "configured-by-test"
+                runner.context["topic"] = {
+                    "kind": "topic_discovery",
+                    "topic": {
+                        "id": "frontier", "domain": "computational physics",
+                        "research_question": "Does mechanism A change response B?",
+                    },
+                    "generated_capability": {"capability_id": "capability-a"},
+                }
+                runner.context["experiment"] = {
+                    "kind": "experiment", "status": "research_expansion_required",
+                    "results_package": {
+                        "id": "capability-a", "metrics": [{"id": "metric", "value": 1.0}],
+                    },
+                    "failure_debt": {"failure_class": "scientific_hold"},
+                }
+                runner.continuation_cycles = 1
+                runner.active_research_requests = [{
+                    "id": "repair", "kind": "additional_experiment",
+                    "owner": "methods.validation", "objective": "Add a control",
+                    "why": "The result is not discriminating",
+                    "success_condition": "The control separates the explanations",
+                    "evidence_needed": "Raw observations and independent recalculation",
+                }]
+                self.assertTrue(runner._capability_repair_panel_required(stage))
+                self.assertEqual(runner._foundry_model_call_budget(stage, []), 2)
+            finally:
+                runner.close()
+
+    def test_capability_repair_panel_fake_model_e2e_publishes_real_assignment_ledger(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            try:
+                runner.context["topic"] = {
+                    "kind": "topic_discovery",
+                    "topic": {
+                        "id": "frontier", "domain": "computational physics",
+                        "research_question": "Does mechanism A change response B?",
+                    },
+                }
+                stage = next(item for item in workflow["stages"] if item["id"] == "experiment")
+                descriptor = {
+                    "model": {
+                        "protocol": "openai_compatible", "base_url": "http://fake/v1",
+                        "model": "fake", "context_window_tokens": 20000,
+                        "max_input_tokens": 16000, "max_output_tokens": 4000,
+                        "timeout_seconds": 5,
+                    },
+                    "limits": {"concurrent_calls": 4},
+                }
+                prior = {
+                    "kind": "experiment", "status": "research_expansion_required",
+                    "review_status": "scientific_assignment_blocked",
+                    "error": "capability foundry did not admit a program: constant observations",
+                }
+
+                class FakeModel:
+                    def __init__(self, **_config):
+                        pass
+
+                    def complete(self, *, system, prompt):
+                        if system.startswith("You are an independent adversarial verifier"):
+                            payload = {
+                                "decision": "hold",
+                                "rationale": "A new executable is required.",
+                                "critical_findings": ["The failed mechanism is not identifiable."],
+                                "repair_scope": ["Change the state evolution and recalculate from raw observations."],
+                            }
+                        else:
+                            role = json.loads(prompt)["assignment"]["assigned_role"]
+                            payload = {
+                                "decision": "repair",
+                                "summary": f"{role} found a bounded repair.",
+                                "findings": ["The intervention must enter the dynamics."],
+                                "evidence_gaps": [],
+                                "requested_actions": ["Use a materially different state-evolution design."],
+                            }
+                        return ModelResult(json.dumps(payload), "fake", {"model_calls": 1}, 0.0, "stop")
+
+                with patch("scisaurus.runtime.specialists.ModelClient", FakeModel):
+                    panel = runner._run_capability_repair_panel(
+                        stage, descriptor, runner.context["topic"], prior, prior["error"])
+                self.assertEqual(panel["status"], "completed")
+                self.assertEqual(len(panel["reports"]), 4)
+                self.assertEqual(panel["verifier"]["decision"], "hold")
+                self.assertEqual(len(panel["ledger"]["active_agents"]), 4)
+                rows = runner.control._conn.execute(
+                    "SELECT state FROM tasks WHERE task_id LIKE ?",
+                    (f"%{panel['ledger']['panel_stage_id']}%",),
+                ).fetchall()
+                self.assertEqual(len(rows), 5)
+                self.assertTrue(all(row["state"] == "completed" for row in rows))
+            finally:
+                runner.close()
 
     def test_topic_history_is_append_only_and_rotates_recent_capability(self):
         with tempfile.TemporaryDirectory() as path:
@@ -3704,6 +4974,46 @@ class ComposerWorkflowTests(unittest.TestCase):
 
                 with patch.object(runner, "_execute_stage", side_effect=recovered):
                     result = runner._run_stage(topic_stage)
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(calls, ["blocked", "recovered"])
+            finally:
+                runner.close()
+
+    def test_reopened_survey_cycle_does_not_reuse_blocked_stage_cache(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            runner = ComposerRunner(workflow)
+            try:
+                runner.continuation_cycles = 1
+                runner.reopened_stage_ids = {"survey"}
+                runner.context["survey"] = {
+                    "kind": "survey", "status": "research_expansion_required",
+                    "review_status": "survey_handoff_incomplete",
+                    "handoff_repair_required": True,
+                }
+                calls = []
+
+                def blocked(stage, **kwargs):
+                    calls.append("blocked")
+                    raise ModelWorkBlocked("gap-assessment evidence contract failed")
+
+                with patch.object(runner, "_execute_stage", side_effect=blocked):
+                    with self.assertRaises(ModelWorkBlocked):
+                        runner._run_stage(workflow["stages"][0])
+
+                output = root / "survey" / "output" / "run.json"
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(json.dumps({"status": "completed"}))
+
+                def recovered(stage, **kwargs):
+                    calls.append("recovered")
+                    return {
+                        "status": "completed", "output_path": str(output.resolve()),
+                    }
+
+                with patch.object(runner, "_execute_stage", side_effect=recovered):
+                    result = runner._run_stage(workflow["stages"][0])
                 self.assertEqual(result["status"], "completed")
                 self.assertEqual(calls, ["blocked", "recovered"])
             finally:

@@ -31,6 +31,47 @@ REVIEW_DECISIONS = {"accept", "revise", "insufficient_evidence"}
 REVIEW_OUTCOMES = {"passed", "failed", "insufficient_evidence"}
 
 
+def _repair_model_config(model, *, role, use_fallback=False):
+    """Resolve a bounded response-repair route without replaying the primary call.
+
+    A provider response that is truncated or fails the JSON contract is a
+    model-interface defect, not evidence that the scientific argument changed.
+    Prefer the first configured route with a different model for that repair and
+    cap the response so the repair prompt cannot consume another full review
+    budget.  The fallback is explicit here because the normal resolver only
+    switches routes when a durable call quota is exhausted.
+    """
+    selected_model = None
+    if use_fallback:
+        fallbacks = model.get("role_model_fallbacks", {}) if isinstance(model, dict) else {}
+        candidates = fallbacks.get(role, []) if isinstance(fallbacks, dict) else []
+        primary = (model.get("role_models", {}).get(role, {}).get("model")
+                   if isinstance(model, dict) and isinstance(model.get("role_models"), dict)
+                   and isinstance(model["role_models"].get(role), dict) else
+                   model.get("model") if isinstance(model, dict) else None)
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or not candidate.get("model"):
+                continue
+            if candidate.get("model") == primary:
+                continue
+            selected_model = deepcopy(candidate)
+            break
+    if selected_model is None:
+        config = resolve_model_config(model, role=role)
+    else:
+        routed = deepcopy(model)
+        routed["role_models"] = deepcopy(routed.get("role_models", {}))
+        routed["role_models"][role] = selected_model
+        # The repair route is already selected. Do not silently bounce it back
+        # to the primary route because of a second quota lookup.
+        routed["role_model_fallbacks"] = {}
+        config = resolve_model_config(routed, role=role)
+    if use_fallback:
+        configured_limit = config.get("max_output_tokens", 4096)
+        config["max_output_tokens"] = min(int(configured_limit), 4096)
+    return config
+
+
 def _text(value, name, *, public=True):
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(f"{name} must be a nonempty string")
@@ -331,6 +372,15 @@ def argument_evidence_packet(packet):
     if isinstance(packet.get("research_program"), dict):
         from scisaurus.runtime.research_program import project_research_program
         context["research_program"] = project_research_program(packet["research_program"])
+    # Continuation work orders are part of the scientific input for a repaired
+    # argument.  Dropping them here made every adjudication retry regenerate
+    # the incumbent narrative without addressing the reviewer's requested
+    # experiment, recalculation, or evidence link.
+    follow_up = packet.get("scientific_follow_up")
+    if isinstance(follow_up, list) and follow_up:
+        context["scientific_follow_up"] = deepcopy(follow_up[:8])
+    if isinstance(packet.get("follow_up_instruction"), str):
+        context["follow_up_instruction"] = packet["follow_up_instruction"][:2400]
     # Raw replicate matrices are inputs to the experiment stage, not a reason
     # to let the argument model silently perform a new analysis.
     if isinstance(result, dict):
@@ -405,11 +455,29 @@ def argument_prompt(evidence_packet, *, min_figures=2, min_tables=1, min_experim
             "previous_response": validation_feedback.get("previous_response"),
             "instructions": "Repair only contract violations while preserving valid scientific content.",
         }
+    follow_up = evidence_packet.get("scientific_follow_up")
+    if isinstance(follow_up, list) and follow_up:
+        payload["scientific_repair_order"] = {
+            "instruction": evidence_packet.get("follow_up_instruction") or (
+                "Address each supplied repair order in the fresh argument; if it requires new evidence, "
+                "keep the corresponding claim provisional rather than inventing a result."
+            ),
+            "orders": follow_up[:8],
+        }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
-def _normalise_argument_candidate(value, *, available_asset_ids=None, available_assets=None):
-    """Repair unambiguous provider formatting without changing scientific content."""
+def _normalise_argument_candidate(value, *, available_asset_ids=None, available_assets=None,
+                                   available_evidence_ids=None):
+    """Repair unambiguous provider formatting without changing scientific content.
+
+    A provider can state the evidence against a supported or disfavored
+    hypothesis in ``counterevidence`` while omitting the parallel
+    ``evidence_ids`` links.  That is a contract omission, not a missing
+    experiment, when the same strings already occur in the observed-pattern
+    evidence.  Restore only exact, already-known IDs and leave genuinely
+    unsupported hypotheses for the scientific validator to reject.
+    """
     if not isinstance(value, dict):
         return value, []
     candidate = deepcopy(value)
@@ -462,6 +530,111 @@ def _normalise_argument_candidate(value, *, available_asset_ids=None, available_
                 if mapped is not None:
                     item["asset_id"] = mapped
                     changes.append({"field": f"figure_plan[{index}].asset_id", "action": "bind_asset_path"})
+
+    # Keep evidence links lossless and conservative.  First prefer explicit
+    # counterevidence IDs, then fall back to evidence attached to the named
+    # observed patterns.  Both routes are restricted to the packet's known
+    # evidence set when one was supplied; no identifier is invented here.
+    patterns_by_id = {
+        item.get("id"): item for item in candidate.get("observed_patterns", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    known_evidence = (set(item for item in (available_evidence_ids or [])
+                          if isinstance(item, str))
+                      if available_evidence_ids is not None else None)
+    for index, hypothesis in enumerate(candidate.get("hypotheses", [])):
+        if not isinstance(hypothesis, dict):
+            continue
+        if hypothesis.get("status") not in {"supported", "disfavored"}:
+            continue
+        refs = hypothesis.get("evidence_ids")
+        if not isinstance(refs, list) or refs:
+            continue
+        derived = []
+        source = None
+        for evidence_id in hypothesis.get("counterevidence", []):
+            if not isinstance(evidence_id, str):
+                continue
+            if known_evidence is None or evidence_id in known_evidence:
+                if evidence_id not in derived:
+                    derived.append(evidence_id)
+        if derived:
+            source = "counterevidence"
+        else:
+            for pattern_id in hypothesis.get("explains_pattern_ids", []):
+                pattern = patterns_by_id.get(pattern_id)
+                if not isinstance(pattern, dict):
+                    continue
+                for evidence_id in pattern.get("evidence_ids", []):
+                    if not isinstance(evidence_id, str):
+                        continue
+                    if known_evidence is None or evidence_id in known_evidence:
+                        if evidence_id not in derived:
+                            derived.append(evidence_id)
+            if derived:
+                source = "observed_pattern"
+        if derived:
+            hypothesis["evidence_ids"] = derived
+            changes.append({
+                "field": f"hypotheses[{index}].evidence_ids",
+                "action": "restore_existing_evidence_links",
+                "source": source,
+                "evidence_ids": list(derived),
+            })
+
+    # A table plan is a reader-facing presentation of supplied results, not a
+    # new scientific claim. Providers occasionally return a complete
+    # argument with figures for the observed patterns but omit the table slot
+    # required by the manuscript contract. Materialize that missing display
+    # from the already-bound pattern evidence instead of spending the whole
+    # argument budget on an unchanged formatting retry. The table has no
+    # asset because composition renders it from the frozen result package.
+    plans = candidate.get("figure_plan")
+    planned_tables = (sum(1 for item in plans
+                          if isinstance(item, dict) and item.get("kind") == "table")
+                      if isinstance(plans, list) else 0)
+    if planned_tables == 0 and isinstance(plans, list):
+        table_sources = []
+        table_supports = []
+        for pattern in candidate.get("observed_patterns", []):
+            if not isinstance(pattern, dict):
+                continue
+            pattern_id = pattern.get("id")
+            if isinstance(pattern_id, str) and pattern_id not in table_supports:
+                table_supports.append(pattern_id)
+            for evidence_id in pattern.get("evidence_ids", []):
+                if isinstance(evidence_id, str) and evidence_id not in table_sources:
+                    table_sources.append(evidence_id)
+        if table_supports and table_sources:
+            existing_ids = {item.get("id") for item in plans
+                            if isinstance(item, dict) and isinstance(item.get("id"), str)}
+            table_id = "table_result_summary"
+            suffix = 2
+            while table_id in existing_ids:
+                table_id = f"table_result_summary_{suffix}"
+                suffix += 1
+            plans.append({
+                "id": table_id,
+                "kind": "table",
+                "asset_id": None,
+                "purpose": (
+                    "Tabulate the supplied conditions and result metrics so readers can compare "
+                    "the observed patterns without inferring values from figures."
+                ),
+                "supports": table_supports,
+                "source_refs": table_sources,
+                "readout": (
+                    "Rows are limited to values already present in the supplied results; "
+                    "the table introduces no new measurement or interpretation."
+                ),
+                "placement": "Results after the primary quantitative figure.",
+            })
+            changes.append({
+                "field": "figure_plan",
+                "action": "materialize_result_table_from_bound_evidence",
+                "table_id": table_id,
+                "reason": "provider omitted the required reader-facing table plan",
+            })
     return candidate, changes
 
 
@@ -524,14 +697,19 @@ class ArgumentAdjudicator:
                                      "argument": argument,
                                      "output_contract": {"exact_top_level_keys": ["schema_version", "decision", "checks", "required_repairs", "rationale"],
                                                          "schema_version": REVIEW_SCHEMA_VERSION}}, ensure_ascii=False, sort_keys=True)
-            config = resolve_model_config(self.model_config, role="strategy.argument-reviewer")
+            repairing_response = previous is not None
+            config = _repair_model_config(
+                self.model_config, role="strategy.argument-reviewer",
+                use_fallback=repairing_response)
             if deadline is not None:
                 config["timeout_seconds"] = min(float(config["timeout_seconds"]), max(0.2, remaining))
             result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt)
             for key in usage:
                 usage[key] += result.usage.get(key, 0)
             if result.finish_reason != "stop":
-                last_error = ValidationError("research argument review did not finish normally")
+                last_error = ValidationError(
+                    "research argument review did not finish normally: "
+                    f"{result.finish_reason}")
                 previous = result.text
                 continue
             try:
@@ -587,16 +765,44 @@ class ResearchArgumentRunner:
                 prompt = argument_prompt(evidence_packet, min_figures=min_figures, min_tables=min_tables,
                                          min_experiments=min_experiments,
                                          validation_feedback=prompt_feedback)
-                config = resolve_model_config(self.model_config, role="strategy.argument")
+                repairing_response = previous is not None
+                config = _repair_model_config(
+                    self.model_config, role="strategy.argument",
+                    use_fallback=repairing_response)
                 if deadline is not None:
                     config["timeout_seconds"] = min(float(config["timeout_seconds"]), max(0.2, remaining))
                 result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt)
                 for key in usage:
                     usage[key] += result.usage.get(key, 0)
                 if result.finish_reason != "stop":
-                    last_error = ValidationError("research argument did not finish normally")
-                    previous = result.text
-                    continue
+                    # A length finish can still be a complete JSON object
+                    # whose final structural closers were dropped by the
+                    # gateway. Recover only that unambiguous transport defect
+                    # and run the ordinary semantic validator; do not accept
+                    # arbitrary prefixes or silently discard scientific text.
+                    try:
+                        argument = result.json_object(allow_missing_closers=True)
+                        argument, _ = _normalise_argument_candidate(
+                            argument,
+                            available_asset_ids=evidence_packet.get("asset_ids"),
+                            available_assets=(evidence_packet.get("results_package") or {}).get("assets", [])
+                            if isinstance(evidence_packet.get("results_package"), dict) else [],
+                            available_evidence_ids=evidence_ids,
+                        )
+                        validate_research_argument(
+                            argument, evidence_ids=evidence_ids,
+                            asset_ids=evidence_packet.get("asset_ids"),
+                            min_figures=min_figures, min_tables=min_tables,
+                            min_experiments=min_experiments)
+                    except ValidationError as exc:
+                        last_error = ValidationError(
+                            "research argument did not finish normally: "
+                            f"{result.finish_reason}")
+                        last_error.__cause__ = exc
+                        previous = result.text
+                        continue
+                    generated = True
+                    break
                 try:
                     argument = result.json_object()
                     argument, _ = _normalise_argument_candidate(
@@ -604,6 +810,7 @@ class ResearchArgumentRunner:
                         available_asset_ids=evidence_packet.get("asset_ids"),
                         available_assets=(evidence_packet.get("results_package") or {}).get("assets", [])
                         if isinstance(evidence_packet.get("results_package"), dict) else [],
+                        available_evidence_ids=evidence_ids,
                     )
                     validate_research_argument(argument, evidence_ids=evidence_ids,
                                                 asset_ids=evidence_packet.get("asset_ids"),
@@ -615,7 +822,11 @@ class ResearchArgumentRunner:
                 generated = True
                 break
             if not generated:
-                raise last_error or ValidationError("research argument was not accepted")
+                error = last_error or ValidationError("research argument was not accepted")
+                error.research_argument = deepcopy(argument)
+                error.research_response = previous[:24000] if isinstance(previous, str) else None
+                error.research_feedback = deepcopy(feedback)
+                raise error
 
             from scisaurus.runtime.argument_defense import build_argument_defense
             defense_packet = deepcopy(evidence_packet)
@@ -637,7 +848,15 @@ class ResearchArgumentRunner:
                 "adjudication": review,
             }
         else:
-            raise ValidationError("research argument adjudication requires revision")
+            error = ValidationError("research argument adjudication requires revision")
+            # Preserve the final independent verdict instead of collapsing a
+            # substantive rejection into a generic retryable string.  The
+            # Composer failure dossier turns these fields into exact repair
+            # directives for the next argument/experiment work order.
+            error.research_argument = deepcopy(argument)
+            error.research_review = deepcopy(review)
+            error.research_feedback = deepcopy(feedback)
+            raise error
         return {
             "schema_version": PACKAGE_SCHEMA_VERSION,
             "argument": argument,

@@ -395,6 +395,45 @@ def _bounded_response(text, limit=WRITER_REPAIR_CANDIDATE_CHARS):
     return text[:head] + "\n...[candidate response elided for context budget]...\n" + text[-tail:]
 
 
+def _bound_writer_context(value, *, max_string_chars=1200, max_list_items=256,
+                          path=""):
+    """Bound the final writer projection without mutating its source packet.
+
+    ``project_writer_packet`` removes execution-only fields and trims known
+    literature cards, but a valid result can still contain long reviewer
+    rationales or repeated evidence prose. Those strings are useful in the
+    immutable audit artifacts, not worth replaying until a provider rejects
+    an otherwise runnable composition. This pass keeps identifiers, list
+    shape, and scientific ordering while bounding only the prompt view.
+    """
+    if isinstance(value, str):
+        if len(value) <= max_string_chars:
+            return value
+        return value[:max_string_chars] + "\n[writer context bounded; full value retained in the artifact]"
+    if isinstance(value, dict):
+        return {
+            key: _bound_writer_context(item, max_string_chars=max_string_chars,
+                                       max_list_items=max_list_items,
+                                       path=f"{path}.{key}" if path else str(key))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        bounded = [
+            _bound_writer_context(item, max_string_chars=max_string_chars,
+                                  max_list_items=max_list_items,
+                                  path=f"{path}[{index}]")
+            for index, item in enumerate(value[:max_list_items])
+        ]
+        if len(value) > max_list_items:
+            bounded.append({
+                "_bounded_writer_context": True,
+                "omitted_items": len(value) - max_list_items,
+                "path": path,
+            })
+        return bounded
+    return deepcopy(value)
+
+
 def _writer_program_projection(program):
     """Keep the selected decision surface without copying the full program."""
     if not isinstance(program, dict):
@@ -435,11 +474,105 @@ def project_writer_packet(packet, paper_config, *, abstract_chars=720,
 
     The Composer packet is deliberately rich because it is also a provenance
     envelope.  A writer needs the scientific spine and a usable literature
-    index, not repeated reviewer envelopes, full branch decision logs, or
-    fifty unbounded abstracts.  Every reference remains present; only the
-    prose attached to each card is reduced.
+    index, not repeated reviewer envelopes, full branch decision logs, raw
+    execution traces, or duplicated survey payloads.  The whitelist is the
+    context boundary: adding a new Composer bookkeeping field cannot silently
+    make the writer prompt grow until the provider rejects it. Every reference
+    remains present; only the prose attached to each card is reduced.
     """
-    projected = deepcopy(packet) if isinstance(packet, dict) else {}
+    packet = packet if isinstance(packet, dict) else {}
+    allowed = {
+        "schema_version", "study_question", "research_question", "scope_statement",
+        "composition_goal", "writer_contract", "results_package",
+        "scientific_interpretation", "research_argument", "research_argument_review",
+        "argument_defense",
+        "literature_evidence", "reference_cards", "evidence_ids", "asset_ids",
+        "research_program", "scientific_follow_up", "follow_up_instruction",
+        "deferred_requirements", "argument", "evidence", "paper_contract",
+    }
+    projected = {
+        key: deepcopy(packet[key]) for key in allowed if key in packet
+    }
+
+    def records(value, keys, *, limit=256):
+        if not isinstance(value, list):
+            return deepcopy(value)
+        output = []
+        for item in value[:limit]:
+            if not isinstance(item, dict):
+                output.append(deepcopy(item))
+                continue
+            output.append({key: deepcopy(item[key]) for key in keys if key in item})
+        return output
+
+    results = projected.get("results_package")
+    if isinstance(results, dict):
+        projected["results_package"] = {
+            key: deepcopy(results[key]) for key in (
+                "schema_version", "id", "revision", "study_type", "question",
+                "hypothesis", "procedures", "metrics", "findings", "limitations",
+                "assets", "validation") if key in results
+        }
+        for key, fields in {
+            "procedures": ("id", "description", "source"),
+            "metrics": ("id", "value", "unit", "conditions", "presentation", "source"),
+            "findings": ("id", "statement", "metric_ids", "source"),
+            "assets": ("id", "caption", "media_type", "path", "role", "sha256"),
+        }.items():
+            if key in projected["results_package"]:
+                projected["results_package"][key] = records(
+                    projected["results_package"][key], fields)
+
+    interpretation = projected.get("scientific_interpretation")
+    if isinstance(interpretation, dict):
+        if isinstance(interpretation.get("interpretation"), dict):
+            interpretation = interpretation["interpretation"]
+        projected["scientific_interpretation"] = {
+            key: deepcopy(interpretation[key]) for key in (
+                "schema_version", "research_question", "result_patterns",
+                "competing_explanations", "prioritization", "conclusion",
+                "discriminating_experiments", "limitations", "evidence_gaps",
+                "requested_actions") if key in interpretation
+        }
+
+    argument = projected.get("research_argument")
+    if isinstance(argument, dict):
+        if isinstance(argument.get("argument"), dict):
+            argument = argument["argument"]
+        projected["research_argument"] = {
+            key: deepcopy(argument[key]) for key in (
+                "schema_version", "research_question", "observed_patterns",
+                "hypotheses", "primary_argument", "limitations",
+                "discriminating_experiments", "figure_plan", "claims")
+            if key in argument
+        }
+
+    defense = projected.get("argument_defense")
+    if isinstance(defense, dict):
+        projected["argument_defense"] = {
+            key: deepcopy(defense[key]) for key in (
+                "schema_version", "research_question", "policy",
+                "claim_postures", "weak_points") if key in defense
+        }
+
+    if "literature_evidence" in projected:
+        projected["literature_evidence"] = records(
+            projected["literature_evidence"], (
+                "id", "kind", "source_ref", "work_id", "title", "authors", "year",
+                "locator", "claim", "evidence", "evidence_type", "source_location",
+                "relationship", "support", "status"))
+    for key in ("evidence", "argument"):
+        if key in projected and isinstance(projected[key], list):
+            projected[key] = records(projected[key], (
+                "id", "kind", "source_ref", "work_id", "title", "statement",
+                "claim", "evidence", "evidence_ids", "source", "status"))
+    if isinstance(projected.get("scientific_follow_up"), list):
+        projected["scientific_follow_up"] = records(projected["scientific_follow_up"], (
+            "id", "kind", "objective", "why", "success_condition", "evidence_needed",
+            "review_directives", "model_diagnostics"))
+    if isinstance(projected.get("deferred_requirements"), list):
+        projected["deferred_requirements"] = records(projected["deferred_requirements"], (
+            "stage_id", "findings", "requirements"))
     cards = projected.get("reference_cards")
     reference_keys = {
         item.get("source_ref"): item.get("key")
@@ -1366,6 +1499,35 @@ class PaperPipelineRunner:
         smallest.update(deepcopy(payload))
         prompt = json.dumps(smallest, ensure_ascii=False, sort_keys=True)
         budget = model_context_budget(config, system=system, prompt=prompt)
+        # The whitelist above is the normal path. A large but valid evidence
+        # packet can still exceed a provider's strict input ceiling because a
+        # reviewer returned unusually verbose prose inside an otherwise useful
+        # field. Try deterministic scientific compaction before declaring the
+        # stage blocked; the full unbounded values remain in their source
+        # artifacts and are available to a later targeted review.
+        for level, (max_string_chars, max_list_items) in enumerate((
+                (2400, 256), (1600, 256), (1000, 192), (700, 128), (480, 96)), 1):
+            compacted = _bound_writer_context(
+                smallest, max_string_chars=max_string_chars,
+                max_list_items=max_list_items)
+            compact_prompt = json.dumps(compacted, ensure_ascii=False, sort_keys=True)
+            compact_budget = model_context_budget(
+                config, system=system, prompt=compact_prompt)
+            if compact_budget["fits"]:
+                return compact_prompt, {
+                    "schema_version": "paper-writer-context-projection-1",
+                    "selected": {
+                        "mode": "bounded_scientific_compaction",
+                        "max_string_chars": max_string_chars,
+                        "max_list_items": max_list_items,
+                        "estimated_input_tokens": compact_budget["estimated_input_tokens"],
+                        "allowed_input_tokens": compact_budget["allowed_input_tokens"],
+                        "prompt_bytes": len(compact_prompt.encode("utf-8")),
+                    },
+                    "target_input_tokens": compact_budget["allowed_input_tokens"],
+                    "steps": audit_steps,
+                    "compaction_level": level,
+                }
         message = (
             f"writer context projection cannot fit {budget['estimated_input_tokens']} "
             f"tokens into {budget['allowed_input_tokens']} input tokens")

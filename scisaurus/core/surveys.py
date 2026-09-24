@@ -7,6 +7,8 @@ import json
 import math
 import re
 import unicodedata
+from pathlib import Path
+from urllib.parse import urlsplit
 
 from scisaurus.core.errors import ConflictError, ValidationError
 from scisaurus.core.schema import canonical_bytes, json_object, parse_ref, sha256_hex
@@ -742,10 +744,8 @@ class SurveyGate:
         if (result.get("outcome") != "ok" or result.get("text") != source["text"]
                 or params.get("url") != self._text(source.get("url"), "full-text URL")
                 or not isinstance(metadata, dict)
-                or metadata.get("representation") != "extracted_text"
-                or metadata.get("provider") != "mcp-fetch" or metadata.get("transport") != "mcp_stdio"
                 or metadata.get("capture_truncated") or metadata.get("capture_incomplete")):
-            raise ValidationError("full text must match a complete successful MCP Fetch execution")
+            raise ValidationError("full text must match a complete successful source execution")
         capture = result.get("capture")
         try:
             raw = base64.b64decode(capture["body"], validate=True)
@@ -755,7 +755,40 @@ class SurveyGate:
         except (KeyError, TypeError, ValueError):
             valid = False
         if not valid:
-            raise ValidationError("full-text capture bytes do not match the execution integrity record")
+            raise ValidationError("extracted-text capture bytes do not match the execution integrity record")
+        if (metadata.get("representation") == "extracted_text"
+                and metadata.get("provider") == "mcp-fetch" and metadata.get("transport") == "mcp_stdio"):
+            return
+        if (metadata.get("representation") != "pdf_extracted_text"
+                or metadata.get("provider") != "scholarly-pdf"
+                or metadata.get("transport") != "http_pdf"):
+            raise ValidationError("full-text execution has an unsupported source representation")
+        pdf = metadata.get("pdf_extraction")
+        source_capture = pdf.get("source_capture") if isinstance(pdf, dict) else None
+        parser = pdf.get("parser") if isinstance(pdf, dict) else None
+        try:
+            pdf_bytes = base64.b64decode(source_capture["body"], validate=True)
+            pdf_valid = (source_capture["encoding"] == "base64"
+                and type(source_capture["bytes"]) is int and source_capture["bytes"] == len(pdf_bytes)
+                and pdf_bytes[:1024].find(b"%PDF-") >= 0
+                and source_capture.get("media_type") in {
+                    "application/pdf", "application/x-pdf", "application/octet-stream"}
+                and sha256_hex(pdf_bytes) == source_capture["sha256"] == pdf.get("source_sha256")
+                and pdf.get("download_bytes") == len(pdf_bytes)
+                and type(pdf.get("http_status")) is int and pdf["http_status"] == 200
+                and isinstance(pdf.get("final_url"), str)
+                and urlsplit(pdf["final_url"]).scheme in {"http", "https"}
+                and isinstance(parser, dict) and parser.get("name") == "poppler-pdftotext"
+                and isinstance(parser.get("path"), str) and Path(parser["path"]).is_absolute()
+                and isinstance(parser.get("version"), str) and bool(parser["version"])
+                and isinstance(parser.get("sha256"), str)
+                and bool(re.fullmatch(r"[0-9a-f]{64}", parser["sha256"]))
+                and type(pdf.get("parser_returncode")) is int and pdf["parser_returncode"] == 0
+                and pdf.get("text_sha256") == sha256_hex(source["text"].encode("utf-8")))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            pdf_valid = False
+        if not pdf_valid:
+            raise ValidationError("PDF bytes, extracted text and parser provenance do not match the execution record")
 
     def commit_assessment(self, assessment_ref, *, survey_ref, author, guard=None):
         self._text(author, "assessment acceptance author")

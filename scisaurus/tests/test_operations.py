@@ -42,7 +42,8 @@ def empty_crossref_result(result):
 
 def mcp_result(params):
     schema = {"type": "object", "properties": {key: {"type": kind} for key, kind in (
-        ("url", "string"), ("max_length", "integer"), ("start_index", "integer"), ("raw", "boolean"))}}
+        ("url", "string"), ("max_length", "integer"), ("start_index", "integer"), ("raw", "boolean"))},
+        "required": ["url"]}
     reply = {"content": [{"type": "text", "text": "Contents of the paper: a representative extracted paragraph."}]}
     content = reply["content"][0]["text"]
     server = {"name": "mcp-fetch", "version": "1.30.0"}
@@ -62,6 +63,7 @@ def mcp_result(params):
             "metadata": {"provider": "mcp-fetch", "transport": "mcp_stdio", "representation": "extracted_text", "reported_media_types": [],
                          "command": params["client"]["command"], "protocol_version": "2025-11-25", "server_info": server,
                          "tool_schema_sha256": sha256_hex(json.dumps(schema, ensure_ascii=False, separators=(",", ":")).encode()),
+                         "tool_schema_wire_json": json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
                          "transcript": transcript, "process_returncode": 0}}
 
 
@@ -296,7 +298,9 @@ class TestOperationsCell(unittest.TestCase):
         def changed_schema(result):
             schema = result["metadata"]["transcript"][4]["message"]["result"]["tools"][0]["inputSchema"]
             schema["properties"]["max_length"]["maximum"] = 50000
-            result["metadata"]["tool_schema_sha256"] = sha256_hex(canonical_bytes(schema))
+            wire_json = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+            result["metadata"]["tool_schema_wire_json"] = wire_json
+            result["metadata"]["tool_schema_sha256"] = sha256_hex(wire_json.encode())
         refreshed = self.cell.ensure_ready("papers", RecordedExecutor(self.control, self.store, mutate=changed_schema),
                                           operator="operations.operator", verifier="operations.verifier")
         self.assertEqual(refreshed["state"], "degraded")

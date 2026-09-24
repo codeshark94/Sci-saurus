@@ -138,6 +138,50 @@ def _append_missing_json_closers(text: str) -> str | None:
     return text.rstrip() + "".join(reversed(stack))
 
 
+def _final_json_object_candidate(text: str) -> str | None:
+    """Return a structurally complete object that is the final text value.
+
+    Some model gateways ignore a JSON-only instruction and emit a reasoning
+    transcript followed by the requested object. This extractor is limited to
+    a final, balanced object; it does not discard trailing prose or repair an
+    arbitrary prefix. Duplicate-key and finite-number checks remain the
+    responsibility of the normal JSON decoder below.
+    """
+    end = len(text.rstrip())
+    if end == 0 or text[end - 1] != "}":
+        return None
+    for start, char in enumerate(text[:end]):
+        if char != "{":
+            continue
+        stack = []
+        in_string = False
+        escaped = False
+        for index in range(start, end):
+            current = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif current == "\\":
+                    escaped = True
+                elif current == '"':
+                    in_string = False
+                continue
+            if current == '"':
+                in_string = True
+            elif current == "{":
+                stack.append("}")
+            elif current == "[":
+                stack.append("]")
+            elif current in "}]":
+                if not stack or stack.pop() != current:
+                    break
+                if not stack:
+                    if index == end - 1:
+                        return text[start:end]
+                    break
+    return None
+
+
 def json_object(raw, name="JSON", *, model_envelope=False,
                 allow_missing_closers=False) -> dict:
     """Parse one unambiguous object, with optional provider transport wrappers.
@@ -187,11 +231,24 @@ def json_object(raw, name="JSON", *, model_envelope=False,
         if allow_missing_closers:
             # Some gateways report a normal stop after dropping only the final
             # outer `}`.  Recover that unambiguous transport defect locally;
-            # semantic validation remains the caller's responsibility.
+            # semantic validation remains the caller's responsibility.  This
+            # pass intentionally precedes transcript extraction: for a
+            # truncated outer envelope, the last balanced nested object is
+            # also a syntactically valid candidate, but it is the wrong role
+            # payload. Repair the original envelope before considering a
+            # transcript's final object.
             for candidate in tuple(candidates):
                 repaired = _append_missing_json_closers(candidate)
                 if repaired is not None:
                     candidates.append(repaired)
+        # A few local/cloud models prepend an analysis transcript even when
+        # the response contract says "JSON only". Recover only a final,
+        # structurally complete object; role-specific validation still owns
+        # the scientific contract.
+        for candidate in tuple(candidates):
+            extracted = _final_json_object_candidate(candidate)
+            if extracted is not None and extracted != candidate:
+                candidates.append(extracted)
     error = None
     for candidate in candidates:
         try:

@@ -14,7 +14,7 @@ from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.capability_foundry import (
     CapabilityFoundry, CapabilityDeadlineError, CapabilityModelBudgetExceeded,
     apply_authoring_patch, normalize_capability_candidate, program_failure_context,
-    PROGRAM_REVIEW_CHECKS,
+    candidate_prompt, PROGRAM_REVIEW_CHECKS,
 )
 from unittest.mock import patch
 from scisaurus.runtime.capability_registry import load_registry
@@ -182,6 +182,39 @@ class CapabilityFoundryTests(unittest.TestCase):
                 foundry.generate("bounded comparison", client=client)
             self.assertEqual(client.calls, 0)
 
+    def test_author_format_failure_uses_peer_route_before_consuming_author_lease(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            foundry.model_config["role_models"] = {
+                "research.experiment-author": {
+                    "protocol": "openai_compatible", "base_url": "https://primary.invalid/v1",
+                    "model": "primary-author", "context_window_tokens": 131072,
+                    "max_input_tokens": 112000, "output_format": "json_object",
+                },
+            }
+            foundry.model_config["role_model_fallbacks"] = {
+                "research.experiment-author": [{
+                    "protocol": "openai_compatible", "base_url": "https://fallback.invalid/v1",
+                    "model": "fallback-author", "context_window_tokens": 131072,
+                    "max_input_tokens": 112000, "output_format": "json_object",
+                }],
+            }
+            malformed = StubClient({"not": "an author envelope"})
+            valid = StubClient(self._payload())
+            with patch(
+                    "scisaurus.runtime.capability_foundry.ModelClient",
+                    side_effect=[malformed, valid]) as factory:
+                outcome = foundry.generate(
+                    "bounded comparison", client=None, work_cache=self._cache(root))
+            self.assertEqual(outcome["status"], "registered")
+            self.assertEqual(malformed.calls, 1)
+            self.assertEqual(valid.calls, 1)
+            self.assertEqual(
+                [call.kwargs["model"] for call in factory.call_args_list],
+                ["primary-author", "fallback-author"],
+            )
+
     def test_failure_projection_retains_degeneracy_without_nonfinite_json(self):
         projected = program_failure_context({"metrics": [{"id": "correlation", "value": float("nan")}],
             "observations": [{"predictor": 0.0, "response": 1.0},
@@ -242,13 +275,22 @@ class CapabilityFoundryTests(unittest.TestCase):
             root = Path(path)
             foundry = self._foundry(root)
             client = StubClient(payload)
-            outcome = foundry.generate("compare a declared estimator against a baseline", client=client)
+            outcome = foundry.generate(
+                "compare a declared estimator against a baseline", client=client,
+                repair_provenance={
+                    "kind": "independent_repair",
+                    "origin": "composer_model_panel",
+                    "panel_stage_id": "experiment-repair-panel-1-1",
+                })
             self.assertEqual(outcome["status"], "registered")
             self.assertEqual(client.calls, 1)
             self.assertEqual(outcome["admission"]["gates"][:4], [
                 "static_scan", "deterministic_replay", "test_vector_digest", "independent_recalculation"])
             self.assertEqual(outcome["admission"]["adversarial_review"]["status"], "admitted")
             self.assertEqual(outcome["admission"]["adversarial_review"]["review_method"], "independent_model")
+            self.assertEqual(
+                outcome["admission"]["repair_provenance"]["origin"],
+                "composer_model_panel")
             self.assertEqual(foundry.reviewer_client.calls, 1)
             descriptor = json.loads(Path(outcome["registration"]["descriptor_path"]).read_text())
             self.assertEqual(descriptor["capability_id"], "generated_study")
@@ -328,6 +370,15 @@ class CapabilityFoundryTests(unittest.TestCase):
     def test_authoring_patch_cannot_change_host_owned_fields(self):
         with self.assertRaisesRegex(ValidationError, "may change only"):
             apply_authoring_patch(self._payload(), {"updates": {"runtime": {"python": "invented"}}})
+
+    def test_candidate_contract_keeps_independent_validation_on_the_same_estimand(self):
+        prompt = candidate_prompt(
+            "bounded comparison", [("numpy", "2.0")], {"probe": True})
+        constraints = " ".join(prompt["constraints"])
+        self.assertIn("same declared formula", constraints)
+        self.assertIn("nearest-rank cannot validate a linear-interpolation percentile", constraints)
+        self.assertIn("separately labelled secondary diagnostic", constraints)
+        self.assertIn("do not manufacture an onset", constraints)
 
     def test_exact_source_edits_preserve_unchanged_code_and_input(self):
         previous = self._payload()

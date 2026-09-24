@@ -9,6 +9,14 @@ from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.models import resolve_model_config, ModelClient
 
 
+WORKER_RESULT_TOO_LARGE = {
+    "ok": False,
+    "error": "worker result exceeded the IPC byte limit",
+    "outcome_known": False,
+}
+MIN_WORKER_RESULT_BYTES = len(json.dumps(WORKER_RESULT_TOO_LARGE).encode("utf-8"))
+
+
 def _text(value, field):
     if not isinstance(value, str) or not value.strip() or value == "runtime_required":
         raise ValidationError(f"{field} requires an explicit nonempty value")
@@ -123,6 +131,8 @@ def validate_common(value, extra_fields, *, retrieval=True):
     for key in integer_limits:
         if type(limits.get(key)) is not int or limits[key] <= 0:
             raise ValidationError(f"limits.{key} must be a positive integer")
+    if limits["max_result_bytes"] < MIN_WORKER_RESULT_BYTES:
+        raise ValidationError("limits.max_result_bytes must fit the minimum worker IPC failure envelope")
     if "max_model_calls" in limits and (
             type(limits["max_model_calls"]) is not int or limits["max_model_calls"] <= 0):
         raise ValidationError("limits.max_model_calls must be a positive integer when configured")

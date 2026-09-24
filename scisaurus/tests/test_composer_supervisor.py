@@ -6,10 +6,24 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.composer_supervisor import ComposerSupervisor, supervise_composer
 
 
 class ComposerSupervisorTests(unittest.TestCase):
+    def test_supervisor_rejects_a_second_owner_of_the_same_project(self):
+        with tempfile.TemporaryDirectory() as path:
+            project = Path(path) / "project"
+            first = ComposerSupervisor({"id": "lock-test", "project_id": str(project)})
+            second = ComposerSupervisor({"id": "lock-test", "project_id": str(project)})
+            try:
+                first._acquire_project_lock()
+                with self.assertRaises(ValidationError):
+                    second._acquire_project_lock()
+            finally:
+                first._release_project_lock()
+                second._release_project_lock()
+
     def test_process_watchdog_returns_child_result(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -165,6 +179,26 @@ class ComposerSupervisorTests(unittest.TestCase):
                     supervisor._child_exception_text(message)
             write_state.assert_called_once_with(
                 child_status="interrupted", action="stop", error="termination requested")
+
+    def test_validation_error_is_a_terminal_workflow_stop(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = {"id": "validation-stop-test", "project_id": str(root / "project")}
+
+            class InvalidRunner:
+                def __init__(self, value, *, resume, on_progress):
+                    pass
+
+                def run(self):
+                    raise ValidationError("workflow artifact is invalid")
+
+            with patch("scisaurus.runtime.composer_supervisor.ComposerRunner", InvalidRunner):
+                result = supervise_composer(
+                    workflow, poll_seconds=0, process_watchdog=False)
+
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["stop_reason"], "workflow_validation")
+            self.assertEqual(result["blockers"][0]["recoverable"], False)
 
 
 if __name__ == "__main__":

@@ -400,9 +400,11 @@ def model_context_error(config, *, system, prompt, image_count=0):
     """Return a dispatch-blocking context error, or ``None`` when it fits.
 
     ``context_window_tokens`` is the provider's total input-plus-output window.
-    ``max_input_tokens`` is an optional stricter input admission ceiling.  Both
-    are metadata for admission control; they are not sent as unsupported
-    provider request fields such as Ollama's ``num_ctx``.
+    ``max_input_tokens`` is an optional stricter input admission ceiling.  The
+    latter is always local metadata; for the native Ollama protocol the former
+    is also forwarded as ``options.num_ctx`` so the server allocates the same
+    role-specific window.  OpenAI-compatible bridges keep it local because
+    they do not have a portable per-request context field.
     """
     budget = model_context_budget(
         config, system=system, prompt=prompt, image_count=image_count)
@@ -797,6 +799,13 @@ class ModelClient:
                 "num_predict": self.max_output_tokens,
                 **{key: value for key, value in sampling.items() if key in OLLAMA_SAMPLING_FIELDS},
             }
+            # ``num_ctx`` is a server-side context allocation, not merely an
+            # admission hint.  Keep it role/model-specific by deriving it
+            # from the selected route's context window.  The OpenAI-compatible
+            # bridge below deliberately does not receive this field: its
+            # contract has no portable per-request context parameter.
+            if self.context_window_tokens is not None:
+                body["options"]["num_ctx"] = self.context_window_tokens
         else:
             path = "/chat/completions"
             body["max_tokens"] = self.max_output_tokens

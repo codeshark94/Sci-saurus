@@ -93,6 +93,14 @@ class SourceSpanTests(unittest.TestCase):
         self.assertEqual(expand_evidence(projected, catalog, sources), bind(value, sources))
         self.assertEqual(index_evidence(bind(value, sources), sources), (projected, catalog))
 
+    def test_evidence_catalog_accepts_bare_ids_inside_evidence_arrays(self):
+        sources = {"source": {"work_id": "W1", "text": "prefix exact quotation suffix"}}
+        proof = {"work_id": "W1", "source_ref": "source", "quote": "exact quotation"}
+        projected, catalog = index_evidence({"evidence": [proof]}, sources)
+        selected = {"evidence": [catalog[0]["evidence_id"]]}
+        expanded = expand_evidence(selected, catalog, sources)
+        self.assertEqual(expanded, bind({"evidence": [proof]}, sources))
+
     def test_valid_hidden_span_cannot_relocate_to_a_visible_duplicate(self):
         text = "exact quotation hidden separator exact quotation"
         source = {"work_id": "W1", "text": text}

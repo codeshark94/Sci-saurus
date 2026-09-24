@@ -25,3 +25,11 @@ if 'preserves the supplied observation' not in (result.get('content') or ''):
 for package in ('mcp-server-fetch', 'mcp', 'readabilipy'):
     print(f'{package}=={version(package)}')
 PY
+if command -v pdftotext >/dev/null 2>&1; then
+  printf 'PDF text extraction enabled: %s\n' "$(command -v pdftotext)"
+  pdftotext -v 2>&1 | sed -n '1p'
+else
+  printf '%s\n' 'PDF text extraction unavailable (HTML/XML retrieval remains enabled).' \
+    'Install Poppler to enable OA PDF text extraction: brew install poppler' \
+    'Debian/Ubuntu: sudo apt-get install poppler-utils'
+fi

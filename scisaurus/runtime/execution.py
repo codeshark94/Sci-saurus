@@ -27,6 +27,7 @@ from scisaurus.runtime.models import (
     model_context_error, resolve_model_config,
 )
 from scisaurus.runtime.literature import ProviderCooldownError
+from scisaurus.runtime.config import MIN_WORKER_RESULT_BYTES, WORKER_RESULT_TOO_LARGE
 from scisaurus.runtime.resume import ResumeController, source_manifest
 
 SYSTEM = (
@@ -67,13 +68,14 @@ def _is_process_cancellation(error):
 class _ResultFile:
     """Atomic JSON publication keeps partial worker writes out of the poll loop."""
     def __init__(self, path, max_bytes):
+        if type(max_bytes) is not int or max_bytes < MIN_WORKER_RESULT_BYTES:
+            raise ValueError("worker result byte limit cannot fit the minimum failure envelope")
         self.path, self.max_bytes = Path(path), max_bytes
 
     def put(self, value):
         body = json.dumps(value, ensure_ascii=False, allow_nan=False).encode()
         if len(body) > self.max_bytes:
-            body = json.dumps({"ok": False, "error": "worker result exceeded the IPC byte limit",
-                               "outcome_known": False}).encode()
+            body = json.dumps(WORKER_RESULT_TOO_LARGE).encode()
         with tempfile.NamedTemporaryFile(dir=self.path.parent, delete=False) as handle:
             temporary = Path(handle.name)
             handle.write(body)

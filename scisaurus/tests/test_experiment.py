@@ -14,6 +14,7 @@ from scisaurus.runtime.execution import _invoke_worker
 from scisaurus.runtime.experiment import (ExperimentRunner, validate_assessment,
                                           validate_deterministic_validation, validate_program_output)
 from scisaurus.runtime.experiment_config import validate_experiment_config
+from scisaurus.runtime.research_quality import evaluate_result_package_quality
 from scisaurus.runtime.results import validate_results_package
 
 
@@ -140,6 +141,33 @@ class ExperimentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "contradicts"):
             validate_deterministic_validation(rejected, config, "0" * 64)
 
+    def test_censored_metric_is_replayed_as_matching_null_not_zero(self):
+        package = {
+            "schema_version": "results-package-1", "id": "censored-study", "revision": 1,
+            "procedures": [{"id": "method", "description": "Bounded crossing scan.",
+                             "source": "observations"}],
+            "metrics": [{"id": "onset", "value": None, "unit": "nm",
+                          "conditions": "no interior crossing", "source": "observations",
+                          "presentation": "censored when no interior crossing exists"}],
+            "findings": [{"id": "censored", "statement": "The onset is censored.",
+                           "metric_ids": ["onset"]}],
+            "limitations": ["Only the declared grid is covered."], "assets": [],
+        }
+        validate_results_package(package)
+        experiment = self.config()["experiment"]
+        experiment["primary_outcomes"] = [{"id": "onset", "definition": "Crossing onset",
+                                            "unit": "nm", "direction": "descriptive", "threshold": None}]
+        validation = {
+            "schema_version": "experiment-validation-1", "study_id": "fixture_study",
+            "candidate_sha256": "0" * 64, "decision": "accepted",
+            "checks": [{"id": "crossing", "outcome": "passed", "evidence": "Both paths found no crossing."}],
+            "metric_recalculations": [{"metric_id": "onset", "reported_value": None,
+                                        "recalculated_value": None, "tolerance": 0,
+                                        "matches": True}],
+            "limitations": ["Censoring is explicit."]}
+        self.assertEqual(validate_deterministic_validation(validation, experiment, "0" * 64)["decision"],
+                         "accepted")
+
     def test_program_asset_shape_failure_is_actionable_validation_error(self):
         config = validate_experiment_config(self.config())["experiment"]
         candidate = {
@@ -180,7 +208,7 @@ class ExperimentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "literature gate"):
             validate_experiment_config(value)
 
-    def test_quality_contract_rejects_program_without_analysis_summary(self):
+    def test_quality_contract_defers_missing_analysis_to_research_admission(self):
         config = validate_experiment_config(self.config())["experiment"]
         config["quality_contract"] = {
             "minimum_conditions": 2, "minimum_independent_seeds": 1,
@@ -196,8 +224,13 @@ class ExperimentTests(unittest.TestCase):
             "findings": [{"id": "observed", "statement": "Observed.", "metric_ids": ["accuracy"]}],
             "limitations": config["limitations"], "assets": [{"id": "main_figure", "path": "figure.png",
                          "sha256": "0" * 64, "role": "figure", "media_type": "image/png", "caption": "Figure."}]}
-        with self.assertRaisesRegex(ValidationError, "analysis summary"):
-            validate_program_output(candidate, config)
+        self.assertEqual(validate_program_output(candidate, config)["study_id"], "fixture_study")
+        admission = evaluate_result_package_quality({
+            "quality_contract": config["quality_contract"],
+            "assets": candidate["assets"],
+        })
+        self.assertEqual(admission["decision"], "research_expansion_required")
+        self.assertTrue(any(item["field"] == "analysis" for item in admission["deficits"]))
 
     def test_assessment_cannot_rephrase_or_duplicate_program_limitations(self):
         value = {"schema_version": "experiment-assessment-1", "study_id": "fixture_study",
@@ -225,6 +258,23 @@ class ExperimentTests(unittest.TestCase):
         self.assertNotEqual(package["provenance"]["replay_sha256"], "0" * 64)
         self.assertTrue((package_path.parent / "figure.png").is_file())
         self.assertTrue(result["event_chain"][0])
+
+    def test_missing_analysis_is_quality_debt_after_valid_execution(self):
+        config = self.config()
+        config["experiment"]["quality_contract"] = {
+            "minimum_conditions": 1, "minimum_independent_seeds": 1,
+            "minimum_controls": 0, "minimum_comparisons": 0,
+            "required_analyses": ["raw_data"], "minimum_figures": 1,
+        }
+        runner = ExperimentRunner(self.root / "quality-debt-run", config)
+        runner.worker_target = fixture_worker
+        result = runner.run()
+        self.assertEqual(result["status"], "completed", result)
+        package_path = Path(result["results_package"])
+        package = json.loads(package_path.read_text())
+        self.assertEqual(package["quality_admission"]["decision"], "research_expansion_required")
+        self.assertTrue(any(item["field"] == "analysis" for item in package["quality_admission"]["deficits"]))
+        validate_results_package(package, base_dir=package_path.parent)
 
     def test_generated_package_detects_changed_assets(self):
         runner = ExperimentRunner(self.root / "run", self.config())

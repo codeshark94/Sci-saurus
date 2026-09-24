@@ -27,6 +27,7 @@ from scisaurus.runtime.survey_config import validate_survey_config
 from scisaurus.runtime.survey_records import (GAP_CHECKS, MAP_FIELDS, SURVEY_CHECKS,
                                                normalize_check_envelope, validate_assessment, validate_map)
 from scisaurus.runtime.time_policy import STAGES
+from scisaurus.tests.test_retrieval import minimal_pdf
 
 
 GAP = "No prior method solves delayed recall with a fixed observation budget."
@@ -51,6 +52,8 @@ class SurveyHTTPFixture(BaseHTTPRequestHandler):
     requests = []
     refresh_target = False
     rate_limit_once = None
+    locations_by_work = {}
+    robots_disallow = None
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *_):
@@ -60,6 +63,30 @@ class SurveyHTTPFixture(BaseHTTPRequestHandler):
         path = urlsplit(self.path)
         query = parse_qs(path.query)
         self.requests.append({"path": path.path, "query": query})
+        if path.path == "/robots.txt":
+            disallow = type(self).robots_disallow or ""
+            body = f"User-agent: *\nDisallow: {disallow}\n".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path.path == "/denied.pdf":
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path.path in {"/paper.pdf", "/fallback.pdf"}:
+            body = minimal_pdf(
+                "Recall study W401\nIntroduction\nMethods\nRecall timing is examined.\n"
+                "Results\nThis prior method solves delayed recall.")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path.path == "/works/W404":
             body = json.dumps({"error": "Work not found"}).encode()
             self.send_response(404)
@@ -97,6 +124,7 @@ class SurveyHTTPFixture(BaseHTTPRequestHandler):
             return
         if path.path != "/works":
             payload = survey_work(path.path.rsplit("/", 1)[1])
+            payload["locations"] = type(self).locations_by_work.get(payload["id"].rsplit("/", 1)[-1], [])
         else:
             term = query.get("search", [""])[0]
             ids = ["W401"] if term == "prior solution" else (
@@ -105,8 +133,11 @@ class SurveyHTTPFixture(BaseHTTPRequestHandler):
                 ids = ["W301"]
             if term == "prior solution" and self.refresh_target:
                 ids.append("W102")
+            results = [survey_work(wid) for wid in ids]
+            for item in results:
+                item["locations"] = type(self).locations_by_work.get(item["id"].rsplit("/", 1)[-1], [])
             payload = {"meta": {"count": len(ids), "per_page": int(query["per_page"][0]),
-                                "next_cursor": None}, "results": [survey_work(wid) for wid in ids]}
+                                "next_cursor": None}, "results": results}
             if term == "prior solution" and self.refresh_target:
                 payload["results"][-1]["abstract_inverted_index"]["Updated."] = [9]
         body = json.dumps(payload).encode()
@@ -227,12 +258,13 @@ for line in sys.stdin:
                   'capabilities': {'tools': {}}}
     elif method == 'tools/list':
         result = {'tools': [{'name': 'fetch', 'inputSchema': {'type': 'object', 'properties': {
-            key: {} for key in ('url', 'max_length', 'start_index', 'raw')}}}]}
+            'url': {'type': 'string'}, 'max_length': {'type': 'integer'},
+            'start_index': {'type': 'integer'}, 'raw': {'type': 'boolean'}}, 'required': ['url']}}]}
     elif method == 'tools/call':
         text = 'Recall study W401\nMethods\nRecall timing is examined. The observation budget is fixed.\nResults\nThis prior method solves delayed recall.'
         unavailable = message['params']['arguments']['url'].endswith('/unavailable')
-        result = {'content': [{'type': 'text', 'text': 'Fixture source unavailable.' if unavailable else text}],
-                  'isError': unavailable}
+        raw = 'Content type text/html cannot be simplified to markdown, but here is the raw content:\nFixture route unavailable.'
+        result = {'content': [{'type': 'text', 'text': raw if unavailable else text}], 'isError': False}
     else:
         raise AssertionError(method)
     print(json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}), flush=True)
@@ -285,6 +317,8 @@ class TestSurveyRunner(unittest.TestCase):
         SurveyHTTPFixture.requests.clear()
         SurveyHTTPFixture.refresh_target = False
         SurveyHTTPFixture.rate_limit_once = None
+        SurveyHTTPFixture.locations_by_work = {}
+        SurveyHTTPFixture.robots_disallow = None
 
     def test_check_envelope_projection_drops_extra_rows_without_reordering(self):
         rows = [
@@ -1040,6 +1074,14 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(result["status"], "completed", result.get("error"))
         self.assertEqual(result["survey_ref"], first["survey_ref"])
         self.assertTrue(result["assessment_current"])
+        control, store = self.open_store()
+        assessment = next(
+            prompt for _, prompt in self.model_contexts(control, store)
+            if prompt["phase"] == "gap_assessment"
+        )
+        self.assertEqual(assessment["resume_boundary"], "gap-assessment-resume-1")
+        self.assertIn("every evidence item in that comparison must resolve to the same W",
+                      assessment["instructions"])
 
     def test_acceptance_retry_reuses_exact_survey_and_completed_review(self):
         runner = self.runtime()
@@ -1319,6 +1361,70 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(execution["metadata"]["process_returncode"], 0)
         self.assertEqual(execution["metadata"]["transport"], "mcp_stdio")
 
+    def test_accessible_openalex_pdf_fallback_is_extracted_and_verified(self):
+        SurveyHTTPFixture.locations_by_work = {"W401": [{
+            "is_oa": True,
+            "landing_page_url": "https://example.org/unavailable",
+            "pdf_url": f"http://127.0.0.1:{self.server.server_port}/paper.pdf",
+        }]}
+        config = self.full_text_config("fulltext-refutes", source_url="https://example.org/unavailable")
+        result = self.runtime(config).run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertEqual(result["gap_state"], "refuted_by_prior_work")
+        self.assertEqual(result["coverage"]["verified_full_texts"], 1)
+        control, store = self.open_store()
+        capture = json.loads(store.read_body(store.head("kb/full-text/W401")["body_hash"]))
+        self.assertTrue(capture["identity_verified"])
+        self.assertTrue(capture["url"].endswith("/paper.pdf"))
+        execution = json.loads(store.read_body(store.get(capture["execution_ref"])["body_hash"]))
+        self.assertEqual(execution["metadata"]["representation"], "pdf_extracted_text")
+        self.assertEqual(execution["metadata"]["pdf_extraction"]["http_status"], 200)
+        self.assertIn("This prior method solves delayed recall.", capture["text"])
+        workload = store.head("command/operations/full-text/workloads")
+        checks = json.loads(store.read_body(workload["body_hash"]))["checks"]
+        check_outcomes = {check["check_id"]: check["outcome"] for check in checks}
+        self.assertEqual(check_outcomes["pdf-result-budget"], "passed")
+        self.assertEqual(check_outcomes["pdf-extraction-reproducible"], "passed")
+        gaps = [item for item in result["coverage"]["access_and_limit_gaps"]
+                if item.get("kind") == "full_text_failure"]
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["source_url"], "https://example.org/unavailable")
+
+    def test_http_denial_does_not_fall_through_to_openalex_pdf(self):
+        denied_url = f"http://127.0.0.1:{self.server.server_port}/denied.pdf"
+        SurveyHTTPFixture.locations_by_work = {"W401": [{
+            "is_oa": True,
+            "landing_page_url": denied_url,
+            "pdf_url": f"http://127.0.0.1:{self.server.server_port}/paper.pdf",
+        }]}
+        result = self.runtime(self.full_text_config("pass", source_url=denied_url)).run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertEqual(result["coverage"]["verified_full_texts"], 0)
+        self.assertIn("/robots.txt", [item["path"] for item in SurveyHTTPFixture.requests])
+        self.assertIn("/denied.pdf", [item["path"] for item in SurveyHTTPFixture.requests])
+        self.assertNotIn("/paper.pdf", [item["path"] for item in SurveyHTTPFixture.requests])
+        failure = next(item for item in result["coverage"]["access_and_limit_gaps"]
+                       if item.get("kind") == "full_text_failure")
+        self.assertEqual(failure["outcome"], "access_denied")
+
+    def test_robots_denial_does_not_fall_through_to_openalex_pdf(self):
+        primary_url = f"http://127.0.0.1:{self.server.server_port}/paper.pdf"
+        fallback_url = f"http://127.0.0.1:{self.server.server_port}/fallback.pdf"
+        SurveyHTTPFixture.robots_disallow = "/paper.pdf"
+        SurveyHTTPFixture.locations_by_work = {"W401": [{
+            "is_oa": True, "landing_page_url": primary_url, "pdf_url": fallback_url,
+        }]}
+        result = self.runtime(self.full_text_config("pass", source_url=primary_url)).run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertEqual(result["coverage"]["verified_full_texts"], 0)
+        requested_paths = [item["path"] for item in SurveyHTTPFixture.requests]
+        self.assertIn("/robots.txt", requested_paths)
+        self.assertNotIn("/paper.pdf", requested_paths)
+        self.assertNotIn("/fallback.pdf", requested_paths)
+        failure = next(item for item in result["coverage"]["access_and_limit_gaps"]
+                       if item.get("kind") == "full_text_failure")
+        self.assertEqual(failure["outcome"], "robots_denied")
+
     def test_optional_full_text_failure_preserves_abstract_survey_and_uncertainty(self):
         config = self.full_text_config("pass", source_url="https://example.org/unavailable")
         result = self.runtime(config).run()
@@ -1333,11 +1439,11 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(failures[0]["work_id"], "W401")
         self.assertEqual(result["usage"]["cumulative_usage"]["retrieval_calls"], 10)
         capability = result["capabilities"]["full-text"]
-        self.assertEqual(capability["state"], "degraded")
+        self.assertEqual(capability["state"], "idle")
         control, store = self.open_store()
         readiness = json.loads(store.read_body(store.get(capability["verification_ref"])["body_hash"]))
         self.assertEqual(readiness["outcome"], "passed")
-        self.assertIsNotNone(capability["failure_ref"])
+        self.assertIsNone(capability["failure_ref"])
         self.assertIsNone(store.head("kb/full-text/W401"))
         assessment = next(prompt for _, prompt in self.model_contexts(control, store) if prompt["phase"] == "gap_assessment")
         self.assertTrue(all(source["representation"] == "abstract" for source in assessment["sources"]))
@@ -1508,6 +1614,87 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertTrue(projected["validation_feedback"]["previous_response_omitted"])
         self.assertIn("final JSON object", projected["validation_feedback"]["scope"])
         self.assertIn("previous_response", feedback)
+
+    def test_gap_assessment_repair_projects_to_catalog_and_omits_transcript(self):
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        assignment = {
+            "assignment": "Assess the bounded gap.", "phase": "gap_assessment",
+            "question": "Does the proposed mechanism survive prior-work challenge?",
+            "gap": {"id": "bounded-gap", "statement": "A testable unresolved distinction."},
+            "nomination_ref": "artifact:kb/gap-nomination@1",
+            "survey_ref": "artifact:kb/surveys/current@1",
+            "prerequisite_survey_ref": "artifact:kb/surveys/current@1",
+            "map": {"entries": [{"work_id": "W1", "inclusion": "included",
+                                  "reason": "A captured claim.",
+                                  "problem": {"text": "A claim", "evidence": [{
+                                      "work_id": "W1", "source_ref": "artifact:kb/abstracts/W1@1",
+                                      "quote": "Exact captured quote"}]}}],
+                    "relationships": []},
+            "coverage": {"unique_works": 1, "abstracts": 1, "verified_full_texts": 0,
+                         "searches": [{"request": {"query": "bounded gap"}, "outcome": "ok"}],
+                         "source_windows": []},
+            "sources": [{"source_ref": "artifact:kb/abstracts/W1@1", "work_id": "W1",
+                         "representation": "abstract", "available_chars": 20}],
+            "verified_full_text_refs": [],
+            "evidence_catalog": [{"evidence_id": "ev-1", "work_id": "W1",
+                                   "source_ref": "artifact:kb/abstracts/W1@1",
+                                   "quote": "Exact captured quote", "start": 0, "end": 20}],
+            "required_checks": ["closest-prior-work", "scope-comparability",
+                                 "counterevidence", "full-text-support"],
+            "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
+        }
+        feedback = {"error": "comparison must cite its own work", "finish_reason": "length",
+                    "previous_response": {"raw_text": "reasoning " * 5000}}
+        projected = runner._repair_assignment(
+            {"name": "gap-assessment", "actor": "methods.novelty-verifier",
+             "assignment": assignment}, feedback)
+        self.assertIn("evidence_catalog", projected)
+        self.assertEqual(projected["claim_index"]["entries"][0]["evidence_by_field"], {"problem": ["ev-1"]})
+        self.assertNotIn("map", projected)
+        self.assertNotIn("raw_text", json.dumps(projected))
+        self.assertNotIn("previous_response", projected["validation_feedback"])
+        self.assertIn("same work_id", projected["instructions"])
+
+    def test_retained_contract_blocker_gets_one_fresh_resume_cache_identity(self):
+        from scisaurus.runtime.model_work import ModelWorkCache
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        runner._initialize()
+        runner._complete = lambda task_id: None
+        runner.resume_session = {"session": 7}
+        job = {"name": "gap-assessment", "actor": "methods.novelty-verifier",
+               "assignment": {"phase": "gap_assessment", "question": "bounded",
+                              "gap": {"id": "g", "statement": "test"},
+                              "evidence_catalog": [], "map": {"entries": [], "relationships": []},
+                              "coverage": {}, "sources": [], "required_checks": [],
+                              "allowed_check_outcomes": []},
+               "validator": lambda value: None}
+        model = {**runner.config["model"]}
+        cache = ModelWorkCache(runner.store, runner._publish)
+        key = cache.key(scope="survey:gap-assessment", role=job["actor"], system=SYSTEM,
+                        prompt=job["assignment"], model=model)
+        cache.put(key, {"status": "blocked", "repair_attempts": 2,
+                        "error": "gap-assessment did not satisfy its evidence contract: model output must contain valid JSON",
+                        "feedback": {"error": "model output must contain valid JSON",
+                                     "finish_reason": "length"}})
+        calls = []
+
+        def fake_call(specs, **kwargs):
+            calls.append(json.loads(specs[0]["params"]["prompt"]))
+            execution = runner._publish("command/executions/resume-repair", "report", {},
+                                        "methods.novelty-verifier")
+            return {specs[0]["task_id"]: {"ok": True, "record_ref": execution["artifact_ref"],
+                    "result": {"text": '{"ok": true}', "model": "fixture",
+                               "usage": {"model_calls": 1}, "elapsed_seconds": 0.01,
+                               "finish_reason": "stop"}}}
+
+        with patch.object(runner, "_call_batch", side_effect=fake_call):
+            result = runner._models_checked([job])
+            runner._models_checked([job])
+        self.assertEqual(result["gap-assessment"][0]["ok"], True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["_contract_repair_boundary"], "model-contract-repair-7")
 
     def test_resume_finishes_pending_searches_after_partial_capture_and_rate_limit(self):
         config = survey_config(self.endpoint)

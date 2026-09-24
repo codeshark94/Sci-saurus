@@ -12,7 +12,7 @@ from urllib.parse import urlencode, urlsplit
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes, sha256_hex
-from scisaurus.runtime import literature, programs, retrieval
+from scisaurus.runtime import literature, pdf_text, programs, retrieval
 
 
 def _text(value, name):
@@ -88,6 +88,8 @@ def _openalex_client(client, project_path, environment_files):
 def _process_client(client, project_path, environment_files, label):
     _limits(client)
     allowed = {"timeout", "max_bytes", "command", "env", "own_process_group", "cwd"}
+    if label == "MCP Fetch":
+        allowed.update({"pdf_max_bytes", "result_max_bytes"})
     if label == "Local program":
         allowed.add("sandbox_required")
     if set(client) - allowed:
@@ -117,7 +119,14 @@ def _mcp_client(client, project_path, environment_files):
             or not isinstance(command[0], str) or not Path(command[0]).is_absolute()
             or not Path(command[0]).is_file() or not os.access(command[0], os.X_OK)):
         raise ValidationError("Official MCP Fetch requires an absolute configured Python executable and -m mcp_server_fetch")
-    return _process_client(client, project_path, environment_files, "MCP Fetch")
+    client.setdefault("pdf_max_bytes", pdf_text.DEFAULT_MAX_PDF_BYTES)
+    client.setdefault("result_max_bytes", pdf_text.DEFAULT_RESULT_MAX_BYTES)
+    client = _process_client(client, project_path, environment_files, "MCP Fetch")
+    try:
+        retrieval.MCPFetchClient(**client)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(str(exc)) from exc
+    return client
 
 
 def _program_client(client, project_path, environment_files):
@@ -183,7 +192,13 @@ def _process_files(profile):
     cwd = Path(profile["client"]["cwd"])
     if not cwd.is_dir() or str(cwd.resolve()) != profile["client"]["cwd"]:
         raise ValidationError("Pinned process working directory is unavailable or changed")
-    return [profile["client"]["command"][0], str(Path(retrieval.__file__).absolute())]
+    files = [profile["client"]["command"][0], str(Path(retrieval.__file__).absolute())]
+    if profile["adapter"] == "mcp_fetch":
+        files.append(str(Path(pdf_text.__file__).absolute()))
+        parser = pdf_text.parser_path()
+        if parser:
+            files.append(parser)
+    return files
 
 
 def _inspect_retrieval(profile, result, params, *, representative=True):
@@ -196,14 +211,46 @@ def _inspect_retrieval(profile, result, params, *, representative=True):
     def check(name, condition, detail):
         checks.append({"check_id": name, "outcome": "passed" if condition else "failed", "result": detail})
     metadata = result.get("metadata", {})
+    if (profile["adapter"] == "mcp_fetch" and isinstance(metadata, dict)
+            and isinstance(metadata.get("pdf_extraction"), dict)):
+        return _inspect_pdf_retrieval(profile, result, params)
     catalog = CATALOG[profile["adapter"]]
+    reply = result.get("raw_response")
+    content = reply.get("content", []) if isinstance(reply, dict) else []
+    text_blocks = [block["text"] for block in content
+                   if isinstance(block, dict) and block.get("type") == "text"
+                   and isinstance(block.get("text"), str)]
+    reported_types = []
+    raw_prefix = "Content type "
+    raw_suffix = " cannot be simplified to markdown, but here is the raw content:"
+    for block in text_blocks:
+        first_line = block.partition("\n")[0]
+        if first_line.startswith(raw_prefix) and first_line.endswith(raw_suffix):
+            reported_types.append(first_line[len(raw_prefix):-len(raw_suffix)])
+    reported_types = sorted(set(reported_types))
+    outcome = result.get("outcome")
+    mcp_source_failure = False
+    if profile["adapter"] == "mcp_fetch" and not representative and isinstance(reply, dict):
+        mcp_source_failure = (
+            (outcome == "provider_error" and reply.get("isError") is True and bool(text_blocks))
+            or (outcome == "unsupported_capability" and reply.get("isError") is False
+                and bool(reported_types) and metadata.get("representation") == "raw_tool_text")
+        )
     empty_search = (not representative and profile["adapter"] == "crossref"
-                    and result.get("outcome") == "empty")
-    check("outcome", result.get("outcome") == "ok" or empty_search,
-          f"Observed outcome: {result.get('outcome')}")
-    check("representation", all(metadata.get(k) == v for k, v in catalog.items()),
+                    and outcome == "empty")
+    check("outcome", outcome == "ok" or empty_search or mcp_source_failure,
+          f"Observed outcome: {outcome}")
+    representation_matches = all(metadata.get(k) == v for k, v in catalog.items())
+    if mcp_source_failure and outcome == "unsupported_capability":
+        representation_matches = (
+            metadata.get("provider") == catalog["provider"]
+            and metadata.get("transport") == catalog["transport"]
+            and metadata.get("representation") == "raw_tool_text"
+        )
+    check("representation", representation_matches,
           "Provider, transport and output representation match the configured adapter")
-    check("completeness", not any(metadata.get(k) for k in ("capture_truncated", "capture_incomplete")),
+    check("completeness", mcp_source_failure or not any(
+        metadata.get(k) for k in ("capture_truncated", "capture_incomplete")),
           "Captured response is complete")
     capture = result.get("capture") or {}
     try:
@@ -212,11 +259,16 @@ def _inspect_retrieval(profile, result, params, *, representative=True):
                      and sha256_hex(raw) == capture["sha256"] == result.get("capture_sha256"))
     except (KeyError, TypeError, ValueError):
         raw, integrity = b"", False
-    check("capture-integrity", integrity and bool(raw), "Captured bytes match declared length and SHA-256")
+    check("capture-integrity", integrity and (bool(raw) or mcp_source_failure),
+          "Captured bytes match declared length and SHA-256")
     sources = result.get("sources")
-    check("usable-output", (result.get("text") == "" and sources == []) if empty_search else (
+    usable_output = ((result.get("text") == "" and sources == []) if empty_search else (
         isinstance(result.get("text"), str) and bool(result["text"].strip())
-        and isinstance(sources, list) and bool(sources)),
+        and isinstance(sources, list) and bool(sources)))
+    if mcp_source_failure:
+        usable_output = (isinstance(result.get("text"), str)
+                         and bool(result["text"].strip()) and sources == [])
+    check("usable-output", usable_output,
         "A no-match query has empty text and source locators" if empty_search else "Output contains text and source locators")
     if profile["adapter"] == "crossref":
         schema_identity = {"schema_version": metadata.get("schema_version")}
@@ -252,18 +304,37 @@ def _inspect_retrieval(profile, result, params, *, representative=True):
         # Artifact bodies canonically order JSON keys. Bind schema semantics;
         # the adapter's wire-order digest remains in the raw execution record.
         digest = sha256_hex(canonical_bytes(schema)) if schema else None
+        wire_json = metadata.get("tool_schema_wire_json")
+        try:
+            wire_schema = json.loads(wire_json) if isinstance(wire_json, str) else None
+            wire_digest = sha256_hex(wire_json.encode("utf-8")) if wire_schema is not None else None
+            wire_schema_matches = canonical_bytes(wire_schema) == canonical_bytes(schema)
+        except (TypeError, ValueError):
+            wire_digest, wire_schema_matches = None, False
         schema_identity["tool_schema_sha256"] = digest
+        schema_properties = schema.get("properties") if isinstance(schema, dict) else None
+        property_types = {"url": "string", "max_length": "integer",
+                          "start_index": "integer", "raw": "boolean"}
+        schema_shape_valid = (
+            isinstance(schema, dict) and schema.get("type") == "object"
+            and isinstance(schema_properties, dict)
+            and all(isinstance(schema_properties.get(name), dict)
+                    and schema_properties[name].get("type") == value_type
+                    for name, value_type in property_types.items())
+            and isinstance(schema.get("required"), list)
+            and "url" in schema["required"]
+        )
         calls = [item for item in request_map.values() if item["method"] == "tools/call"]
         expected = {"name": "fetch", "arguments": {"url": params["url"], "max_length": params["max_length"], "start_index": 0, "raw": False}}
-        reply = result.get("raw_response", {})
-        blocks = reply.get("content", []) if isinstance(reply, dict) else []
-        joined = "\n".join(block["text"] for block in blocks if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str))
+        reply = reply if isinstance(reply, dict) else {}
+        blocks = reply.get("content", [])
+        joined = "\n".join(text_blocks)
         check("mcp-protocol", metadata.get("protocol_version") in retrieval.SUPPORTED_PROTOCOL_VERSIONS
               and isinstance(metadata.get("server_info"), dict) and metadata["server_info"].get("name") == "mcp-fetch"
               and bool(metadata["server_info"].get("version")) and digest is not None
               and bool(re.fullmatch(r"[0-9a-f]{64}", str(metadata.get("tool_schema_sha256", ""))))
-              and isinstance(schema, dict) and isinstance(schema.get("properties"), dict)
-              and {"url", "max_length", "start_index", "raw"}.issubset(schema["properties"])
+              and schema_shape_valid and wire_schema_matches
+              and metadata.get("tool_schema_sha256") == wire_digest
               and initialized.get("protocolVersion") == metadata["protocol_version"]
               and initialized.get("serverInfo") == metadata["server_info"]
               and "tools" in initialized.get("capabilities", {}) and bool(listed)
@@ -272,12 +343,209 @@ def _inspect_retrieval(profile, result, params, *, representative=True):
         check("mcp-execution", len(calls) == 1 and calls[0].get("params") == expected
               and response_map.get(calls[0]["id"], {}).get("result") == reply and metadata.get("command") == profile["client"]["command"],
               "Recorded tools/call matches the exact configured command and request")
-        check("mcp-output", bool(blocks) and len(blocks) == sum(isinstance(b, dict) and b.get("type") == "text" for b in blocks)
+        source_failure_output = (
+            mcp_source_failure and joined == result.get("text") and raw == joined.encode()
+            and reported_types == metadata.get("reported_media_types", [])
+            and response_map.get(calls[0]["id"], {}).get("result") == reply if len(calls) == 1 else False
+        )
+        if outcome == "provider_error":
+            source_failure_output = (source_failure_output and reply.get("isError") is True
+                                     and result.get("error") == joined and sources == [])
+        elif outcome == "unsupported_capability":
+            source_failure_output = (source_failure_output and reply.get("isError") is False
+                                     and bool(reported_types) and sources == []
+                                     and metadata.get("representation") == "raw_tool_text")
+        check("mcp-output", source_failure_output if mcp_source_failure else (
+              bool(blocks) and len(blocks) == sum(isinstance(b, dict) and b.get("type") == "text" for b in blocks)
               and not reply.get("isError") and joined == result.get("text") and raw == joined.encode()
               and not metadata.get("reported_media_types") and isinstance(sources, list)
-              and sources == [{"source_url": params["url"], "representation": "extracted_text"}],
+              and sources == [{"source_url": params["url"], "representation": "extracted_text"}]),
               "Complete extracted text and source locator match the captured tool response")
     return checks, schema_identity
+
+
+def _inspect_pdf_retrieval(profile, result, params):
+    """Recheck the downloaded bytes and reproduce Poppler extraction independently."""
+    checks = []
+
+    def check(name, condition, detail):
+        checks.append({"check_id": name, "outcome": "passed" if condition else "failed", "result": detail})
+
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    capture = result.get("capture") if isinstance(result.get("capture"), dict) else {}
+    source = metadata.get("pdf_extraction") if isinstance(metadata.get("pdf_extraction"), dict) else {}
+    try:
+        text_capture = base64.b64decode(capture["body"], validate=True)
+        text_capture_valid = (capture.get("encoding") == "base64" and type(capture.get("bytes")) is int
+                              and capture["bytes"] == len(text_capture)
+                              and text_capture == result.get("text", "").encode("utf-8")
+                              and sha256_hex(text_capture) == capture.get("sha256") == result.get("capture_sha256"))
+    except (KeyError, TypeError, ValueError):
+        text_capture, text_capture_valid = b"", False
+    source_capture = source.get("source_capture") if isinstance(source.get("source_capture"), dict) else {}
+    try:
+        raw = base64.b64decode(source_capture["body"], validate=True)
+        source_capture_valid = (source_capture.get("encoding") == "base64"
+            and type(source_capture.get("bytes")) is int and source_capture["bytes"] == len(raw)
+            and sha256_hex(raw) == source_capture.get("sha256"))
+    except (KeyError, TypeError, ValueError):
+        raw, source_capture_valid = b"", False
+    network_failure_without_response = (source.get("http_status") is None
+        and result.get("outcome") in {"provider_error", "timeout", "unsupported_capability",
+                                       "robots_denied", "robots_unavailable"}
+        and not source_capture and source.get("download_bytes") == 0 and source.get("source_sha256") is None)
+    check("capture-integrity", text_capture_valid,
+          "The extracted-text capture matches the exact returned text")
+    check("pdf-source-capture-integrity", source_capture_valid or network_failure_without_response,
+          "Downloaded PDF or source-error bytes match their recorded length and SHA-256")
+    check("pdf-request", source.get("request_url") == params.get("url")
+          and result.get("source_url") == params.get("url")
+          and metadata.get("adapter_version") == retrieval.ADAPTER_VERSION,
+          "PDF retrieval is bound to the exact requested URL and adapter version")
+    expected_byte_limit = pdf_text.pdf_capture_budget(
+        profile["client"]["result_max_bytes"], params["max_length"],
+        profile["client"]["pdf_max_bytes"])
+    check("pdf-result-budget", source.get("result_max_bytes") == profile["client"]["result_max_bytes"]
+          and source.get("effective_byte_limit") == expected_byte_limit
+          and len(raw) <= expected_byte_limit,
+          "PDF capture stays within the configured worker IPC result budget")
+    robots_checks = source.get("robots_checks")
+    robots_trace_shape = (isinstance(robots_checks, list) and bool(robots_checks)
+        and all(isinstance(item, dict) and item.get("outcome") in {
+            "allowed", "robots_denied", "robots_unavailable"}
+            and isinstance(item.get("robots_url"), str)
+            and urlsplit(item["robots_url"]).path == "/robots.txt"
+            for item in robots_checks))
+    robots_allows_source = robots_trace_shape and all(
+        item["outcome"] == "allowed" for item in robots_checks)
+    robots_withheld_source = (robots_trace_shape
+        and result.get("outcome") in {"robots_denied", "robots_unavailable"}
+        and any(item["outcome"] == result.get("outcome") for item in robots_checks)
+        and source.get("http_status") is None and source.get("final_url") is None
+        and source.get("download_bytes") == 0 and not source_capture)
+    robots_preflight_stop = (not robots_checks and source.get("http_status") is None
+        and source.get("final_url") is None and source.get("download_bytes") == 0
+        and not source_capture and result.get("outcome") == "unsupported_capability")
+    check("pdf-robots-policy", robots_allows_source or robots_withheld_source or robots_preflight_stop,
+          "The source was fetched only after every checked origin allowed it, or retrieval stopped before content access")
+    check("pdf-representation", metadata.get("provider") == "scholarly-pdf"
+          and metadata.get("transport") == "http_pdf"
+          and metadata.get("representation") == "pdf_extracted_text",
+          "The report identifies direct PDF acquisition rather than MCP text")
+    final_url_valid = (isinstance(source.get("final_url"), str)
+        and urlsplit(source["final_url"]).scheme in {"http", "https"})
+    check("pdf-source-identity", source.get("download_bytes") == len(raw)
+          and source.get("source_sha256") == source_capture.get("sha256")
+          and (final_url_valid or network_failure_without_response),
+          "Final source URL, original byte count and PDF hash are recorded")
+
+    parser = source.get("parser")
+    parser_ok = False
+    if isinstance(parser, dict):
+        observed_parser = pdf_text.parser_identity(parser.get("path"))
+        parser_ok = (observed_parser == parser and parser.get("name") == pdf_text.PARSER_NAME)
+    unavailable_parser = (parser is None and result.get("outcome") == "unsupported_capability"
+                         and result.get("error") == "Poppler pdftotext is not installed or could not be identified")
+    check("pdf-parser-identity", parser_ok or unavailable_parser,
+          "Poppler identity matches, or its absence is explicitly recorded as a source-level limitation")
+
+    status = source.get("http_status")
+    outcome = result.get("outcome")
+    expected_errors = {401: "auth_required", 403: "access_denied", 404: "not_found", 429: "rate_limited"}
+    if status == 200 and source.get("download_truncated") is True:
+        check("pdf-media-and-signature", source.get("content_type") in {
+            "application/pdf", "application/x-pdf", "application/octet-stream"}
+              and source.get("download_truncated") is True,
+              "A byte-limited PDF is retained only as an incomplete source attempt")
+        check("pdf-extraction-reproducible", outcome == "partial" and not result.get("sources"),
+              "A byte-limited PDF is never promoted as complete extracted evidence")
+        check("pdf-extraction-complete", outcome == "partial" and not result.get("sources"),
+              "The configured byte limit is explicit and no incomplete text is promoted")
+        check("pdf-source-output", not result.get("sources"),
+              "No evidence locator is published for a byte-limited PDF")
+    elif status == 200 and source.get("download_incomplete") is True:
+        check("pdf-media-and-signature", raw[:1024].find(b"%PDF-") >= 0
+              and source.get("download_incomplete") is True,
+              "An interrupted PDF transfer is retained as an incomplete source attempt")
+        check("pdf-extraction-reproducible", outcome in {"provider_error", "timeout"}
+              and not result.get("sources"),
+              "An interrupted transfer is not interpreted as extracted source text")
+        check("pdf-extraction-complete", outcome in {"provider_error", "timeout"}
+              and not result.get("sources"),
+              "The interrupted transfer is explicit and no incomplete text is promoted")
+        check("pdf-source-output", not result.get("sources"),
+              "No evidence locator is published for an interrupted PDF transfer")
+    elif status == 200 and raw:
+        media_type = source.get("content_type")
+        pdf_signature = raw[:1024].find(b"%PDF-") >= 0
+        valid_pdf = media_type in {"application/pdf", "application/x-pdf", "application/octet-stream"} and pdf_signature
+        rejected_source = (not valid_pdf and outcome in {"unsupported_capability", "parse_error"}
+                           and not result.get("sources"))
+        check("pdf-media-and-signature", valid_pdf or rejected_source,
+              "The response is a PDF, or a non-PDF/malformed source is explicitly rejected")
+        if parser_ok and valid_pdf:
+            reproduced = pdf_text.extract_pdf_text(
+                raw, max_chars=params["max_length"], timeout=profile["client"]["timeout"],
+                executable=parser["path"])
+            exact_text = (result.get("text") == reproduced.get("text")
+                          and source.get("text_sha256") == reproduced["metadata"].get("text_sha256"))
+            check("pdf-extraction-reproducible", reproduced["outcome"] == outcome and exact_text,
+                  "A fresh bounded Poppler pass reproduces the recorded extracted text")
+            completeness = (
+                outcome == "ok" and not metadata.get("capture_truncated")
+                and not metadata.get("capture_incomplete")
+                and not reproduced["metadata"].get("capture_truncated")
+                or outcome == "partial" and metadata.get("capture_truncated") is True
+                and reproduced["metadata"].get("capture_truncated") is True
+                and not result.get("sources")
+                or outcome == "unsupported_capability" and not result.get("sources")
+                and not metadata.get("capture_incomplete")
+            )
+            check("pdf-extraction-complete", completeness,
+                  "Complete text is distinguished from a reproducibly bounded partial or unavailable text layer")
+        elif rejected_source:
+            check("pdf-extraction-reproducible", outcome in {"unsupported_capability", "parse_error"},
+                  "The non-PDF or malformed response is not represented as scientific text")
+            check("pdf-extraction-complete", not metadata.get("capture_truncated")
+                  and not metadata.get("capture_incomplete"),
+                  "The source rejection is based on a complete bounded response")
+        else:
+            check("pdf-extraction-reproducible", False,
+                  "A successful PDF response must have an independently verifiable parser")
+            check("pdf-extraction-complete", False,
+                  "PDF parser identity is required before evidence can be accepted")
+        if outcome == "ok":
+            expected_source = [{"source_url": source.get("final_url"),
+                                "representation": "pdf_extracted_text"}]
+            check("pdf-source-output", bool(result.get("text", "").strip())
+                  and result.get("sources") == expected_source,
+                  "Only complete extracted text is exposed as a source locator")
+        else:
+            check("pdf-source-output", not result.get("sources"),
+                  "Incomplete, empty or unparseable PDF text is not published as evidence")
+    elif status in expected_errors:
+        check("pdf-http-outcome", outcome == expected_errors[status] and not result.get("sources"),
+              "A source-specific HTTP denial or limit is recorded without being treated as extracted evidence")
+    elif status is None:
+        check("pdf-http-outcome", outcome in {"provider_error", "timeout", "unsupported_capability",
+                                               "robots_denied", "robots_unavailable"}
+              and not result.get("sources") and source.get("request_url") == params.get("url"),
+              "A failed request or unavailable parser is retained as a source-level outcome")
+    else:
+        check("pdf-http-outcome", outcome == "provider_error" and not result.get("sources"),
+              "Unexpected HTTP statuses remain explicit source failures")
+
+    probe = source.get("mcp_probe")
+    if probe is not None:
+        check("pdf-mcp-detection", isinstance(probe, dict)
+              and probe.get("outcome") == "unsupported_capability"
+              and "application/pdf" in probe.get("reported_media_types", [])
+              and isinstance(probe.get("capture_sha256"), str)
+              and bool(re.fullmatch(r"[0-9a-f]{64}", probe["capture_sha256"]))
+              and isinstance(probe.get("tool_schema_sha256"), str)
+              and bool(re.fullmatch(r"[0-9a-f]{64}", probe["tool_schema_sha256"])),
+              "MCP identified a raw PDF representation before the parser fallback")
+    return checks, None
 
 
 def _inspect_openalex(profile, result, params, *, representative=True):

@@ -185,7 +185,10 @@ def _role(
         "independent_review": True,
         "activation": "on_demand",
         "quota": quota or {
-            "max_calls": 1, "max_input_tokens": 12000,
+            # One ordinary response plus one bounded JSON-only repair when a
+            # provider truncates or malforms the response. Normal work still
+            # consumes one call; the second slot is not a standing worker.
+            "max_calls": 2, "max_input_tokens": 12000,
             "max_output_tokens": 4000, "max_seconds": 900,
         },
         "internal_role_aliases": list(aliases),
@@ -967,11 +970,13 @@ class DepartmentRuntime:
         # generation while the logical artifact retains its version history.
         stable = {key: body[key] for key in (
             "schema_version", "id", "kind", "owner", "objective", "why",
-            "success_condition", "evidence_needed") if key in body}
+            "success_condition", "evidence_needed", "target_stage_id",
+            "target_stage_kind", "repair_priority") if key in body}
         digest = hashlib.sha256(canonical_bytes(stable)).hexdigest()[:20]
         return f"department-{department}-{order_id}-{digest}"
 
-    def propose(self, proposal, *, source_stage_id=None, source_event_id=None, note_ref=None):
+    def propose(self, proposal, *, source_stage_id=None, source_event_id=None,
+                note_ref=None, controller_metadata=None):
         """Publish and queue one validated autonomous departmental work order."""
         value = validate_work_order(proposal)
         department, charter = self._charter_for_owner(value["owner"], value["kind"])
@@ -997,6 +1002,14 @@ class DepartmentRuntime:
             "state": "proposed",
             "created_at": now_iso(),
         }
+        # These fields are Composer routing metadata, not part of the public
+        # department work-order schema. Persisting them on the immutable
+        # ledger keeps the dashboard and resume path aligned with the exact
+        # stage the work order will execute.
+        if isinstance(controller_metadata, dict):
+            for key in ("target_stage_id", "target_stage_kind", "repair_priority"):
+                if key in controller_metadata:
+                    body[key] = deepcopy(controller_metadata[key])
         previous_body = {}
         same_generation = False
         if previous is not None:
@@ -1006,7 +1019,8 @@ class DepartmentRuntime:
                 previous_body = {}
             substantive = (
                 "schema_version", "id", "kind", "owner", "objective", "why",
-                "success_condition", "evidence_needed",
+                "success_condition", "evidence_needed", "target_stage_id",
+                "target_stage_kind", "repair_priority",
             )
             same_generation = all(previous_body.get(key) == body.get(key) for key in substantive)
             if same_generation:
@@ -1205,7 +1219,10 @@ class DepartmentRuntime:
             proposal = {key: request.get(key) for key in (
                 "id", "kind", "owner", "objective", "why", "success_condition", "evidence_needed")}
             proposal["schema_version"] = WORK_ORDER_SCHEMA_VERSION
-            result = self.propose(proposal, source_stage_id=request.get("source_stage_id"))
+            result = self.propose(
+                proposal, source_stage_id=request.get("source_stage_id"),
+                controller_metadata=request,
+            )
             task = self.tasks.get(result["task_id"])
             if task["state"] in {"blocked", "paused"}:
                 task = self.tasks.transition(
@@ -1232,7 +1249,10 @@ class DepartmentRuntime:
                 "id", "kind", "owner", "objective", "why", "success_condition", "evidence_needed")}
             proposal["schema_version"] = WORK_ORDER_SCHEMA_VERSION
             try:
-                result = self.propose(proposal, source_stage_id=request.get("source_stage_id"))
+                result = self.propose(
+                    proposal, source_stage_id=request.get("source_stage_id"),
+                    controller_metadata=request,
+                )
                 task = self.tasks.get(result["task_id"])
                 if task["state"] in {"queued", "running"}:
                     task = self.tasks.transition(result["task_id"], "paused", actor, reason=reason)
@@ -1259,7 +1279,10 @@ class DepartmentRuntime:
             proposal = {key: request.get(key) for key in (
                 "id", "kind", "owner", "objective", "why", "success_condition", "evidence_needed")}
             proposal["schema_version"] = WORK_ORDER_SCHEMA_VERSION
-            result = self.propose(proposal, source_stage_id=request.get("source_stage_id"))
+            result = self.propose(
+                proposal, source_stage_id=request.get("source_stage_id"),
+                controller_metadata=request,
+            )
             task_id = result["task_id"]
             task = self.tasks.get(task_id)
             if outcome in {"completed", "accepted", "candidate_needs_review"}:

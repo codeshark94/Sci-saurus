@@ -116,7 +116,7 @@ class ForwardProgressTests(unittest.TestCase):
             finally:
                 runner.close()
 
-    def test_composer_admission_releases_downstream_with_visible_debt(self):
+    def test_composer_repair_order_keeps_downstream_closed_until_input_is_valid(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
             workflow = self._workflow(root)
@@ -144,22 +144,22 @@ class ForwardProgressTests(unittest.TestCase):
             try:
                 result = runner.run()
                 self.assertGreaterEqual(attempted.count("survey"), 2)
-                self.assertIn("experiment", attempted)
-                # The first pass must finish the dependent stage before the
-                # bounded backfill cycle reopens the failed survey scope.
+                self.assertNotIn("experiment", attempted)
+                # A scientific repair order must be executed before the
+                # dependent stage is admitted.  The bounded test workflow
+                # exhausts its one continuation cycle, so it stops with the
+                # survey order visible rather than fabricating experiment
+                # input from the failed survey response.
                 self.assertEqual(runner.continuation_cycles, 1)
-                self.assertGreaterEqual(attempted.count("experiment"), 2)
-                self.assertEqual(runner.continuation_pending_stage_ids, set())
-                self.assertEqual(result["status"], "candidate_needs_review")
+                self.assertEqual(runner.continuation_pending_stage_ids,
+                                 {"survey", "experiment"})
+                self.assertEqual(result["status"], "blocked")
                 survey = runner.context["survey"]
-                self.assertEqual(survey["status"], "candidate_needs_review")
-                self.assertTrue(survey["forward_progress"])
-                self.assertTrue(Path(survey["forward_progress_path"]).is_file())
-                self.assertEqual(survey["composer_decision"], "advance_with_findings")
-                self.assertFalse(survey["failure_debt"]["release_blocking"])
-                self.assertFalse(survey["release_blocking"])
-                self.assertTrue(survey["backfill_required"])
-                self.assertTrue(any(
+                self.assertEqual(survey["status"], "research_expansion_required")
+                self.assertTrue(survey["research_requests"])
+                self.assertEqual(
+                    survey["research_requests"][0]["target_stage_id"], "survey")
+                self.assertFalse(any(
                     item.get("action") == "forward_provisional_stage"
                     for item in runner.department_activity
                 ))

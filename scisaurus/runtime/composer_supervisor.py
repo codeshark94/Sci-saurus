@@ -16,6 +16,11 @@ from pathlib import Path
 import sqlite3
 import time
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - macOS/Linux are the supported runtime
+    fcntl = None
+
 from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.composer import ComposerRunner
 
@@ -24,6 +29,7 @@ TERMINAL_STATUSES = frozenset({"completed", "candidate_needs_review"})
 STOP_REASONS = frozenset({
     "hard_deadline", "required_stage_window_does_not_fit_remaining_deadline",
     "provider_configuration", "missing_stage_input", "stage_quota_exhausted",
+    "workflow_validation",
 })
 SUPERVISOR_SCHEMA_VERSION = "composer-supervisor-3"
 DEFAULT_WATCHDOG_SECONDS = 300.0
@@ -110,10 +116,37 @@ class ComposerSupervisor:
         self.restart_count = 0
         self.last_fingerprint = None
         self.identical_exit_count = 0
+        self._project_lock = None
 
     @property
     def project_root(self):
         return Path(self.workflow["project_id"]).resolve()
+
+    def _acquire_project_lock(self):
+        """Prevent two supervisors from mutating one Composer ledger."""
+        if fcntl is None:
+            return
+        lock_path = self.project_root / "state" / "supervisor.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError) as exc:
+            handle.close()
+            raise ValidationError(
+                f"Composer workflow is already supervised: {self.workflow.get('id')}"
+            ) from exc
+        self._project_lock = handle
+
+    def _release_project_lock(self):
+        handle = self._project_lock
+        self._project_lock = None
+        if handle is None:
+            return
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
     def _write_state(self, *, child_status, action, result=None, error=None,
                      watchdog=None):
@@ -401,6 +434,21 @@ class ComposerSupervisor:
             return f"{message.get('type', 'ComposerError')}: {message.get('error', '')}"
         return "Composer child exited without a result"
 
+    def _child_exception_result(self, message):
+        """Return a typed stop for deterministic child construction failures."""
+        error = self._child_exception_text(message)
+        exception_type = message.get("type") if isinstance(message, dict) else None
+        stop_reason = "workflow_validation" if exception_type == "ValidationError" else None
+        blocker = {"stage_id": "workflow", "reason": error}
+        if stop_reason is not None:
+            blocker.update({"stop_reason": stop_reason, "recoverable": False})
+        return {
+            "status": "blocked",
+            "stop_reason": stop_reason,
+            "remaining_seconds": self._watchdog_remaining(self._live_snapshot()),
+            "blockers": [blocker],
+        }
+
     def _run_in_process(self):
         resume = self.initial_resume or (self.project_root / "state" / "control.sqlite").is_file()
         while True:
@@ -420,9 +468,15 @@ class ComposerSupervisor:
                 result = {
                     "status": "blocked",
                     "remaining_seconds": max(
-                        0.0, float(self.workflow.get("time_policy", {}).get("hard_seconds", 0))),
+                    0.0, float(self.workflow.get("time_policy", {}).get("hard_seconds", 0))),
                     "blockers": [{"stage_id": "workflow", "reason": f"{type(exc).__name__}: {exc}"}],
                 }
+                if isinstance(exc, ValidationError):
+                    result["stop_reason"] = "workflow_validation"
+                    result["blockers"][0].update({
+                        "stop_reason": "workflow_validation",
+                        "recoverable": False,
+                    })
                 self._write_state(child_status="crashed", action="retry_after_crash", result=result,
                                   error=exc)
             self.restart_count += 1
@@ -531,7 +585,16 @@ class ComposerSupervisor:
                         "stage_signal_count": len(snapshot.get("stage_signals", [])),
                     },
                 )
-                if stale >= self.watchdog_seconds and not scheduled_wait:
+                # A provider call can legitimately have no semantic
+                # checkpoint for several minutes while its durable attempt is
+                # still leased.  The stage/deadline and provider timeout own
+                # that call; killing the child here would turn a slow valid
+                # response into a result-unknown retry.  Only the no-attempt
+                # case is a supervisor-level stall.
+                active_attempts = snapshot.get("active_attempts", [])
+                if (stale >= self.watchdog_seconds
+                        and not scheduled_wait
+                        and not active_attempts):
                     result = self._watchdog_result(snapshot, stale)
                     self._write_state(
                         child_status="watchdog_terminated",
@@ -575,7 +638,7 @@ class ComposerSupervisor:
             # foreground input.  Do not reinterpret that explicit stop as a
             # recoverable blocker: doing so leaves the supervisor alive and
             # dispatches a second Composer against the same checkpoint.
-            error = self._child_exception_text(message)
+            return self._child_exception_result(message)
         else:
             error = f"Composer child exited without a result (exitcode={child.exitcode})"
         return {
@@ -599,31 +662,41 @@ class ComposerSupervisor:
                     0.0, float(self.workflow.get("time_policy", {}).get("hard_seconds", 0))),
                 "blockers": [{"stage_id": "workflow", "reason": f"{type(exc).__name__}: {exc}"}],
             }
+            if isinstance(exc, ValidationError):
+                result["stop_reason"] = "workflow_validation"
+                result["blockers"][0].update({
+                    "stop_reason": "workflow_validation",
+                    "recoverable": False,
+                })
             self._write_state(child_status="crashed", action="retry_after_crash", result=result,
                               error=exc)
             return result
 
     def run(self):
-        if not self.process_watchdog:
-            return self._run_in_process()
-        resume = self.initial_resume or (self.project_root / "state" / "control.sqlite").is_file()
-        while True:
-            self._write_state(child_status="starting", action="dispatch", result=None)
-            result = self._run_one_process(resume)
-            self.restart_count += 1
-            fingerprint = _result_fingerprint(result)
-            if fingerprint == self.last_fingerprint:
-                self.identical_exit_count += 1
-            else:
-                self.identical_exit_count = 0
-            self.last_fingerprint = fingerprint
-            if not self._should_resume(result):
-                self._write_state(child_status=result.get("status"), action="stop", result=result)
-                return result
-            if not self._wait_before_resume(result):
-                self._write_state(child_status=result.get("status"), action="stop", result=result)
-                return result
-            resume = True
+        self._acquire_project_lock()
+        try:
+            if not self.process_watchdog:
+                return self._run_in_process()
+            resume = self.initial_resume or (self.project_root / "state" / "control.sqlite").is_file()
+            while True:
+                self._write_state(child_status="starting", action="dispatch", result=None)
+                result = self._run_one_process(resume)
+                self.restart_count += 1
+                fingerprint = _result_fingerprint(result)
+                if fingerprint == self.last_fingerprint:
+                    self.identical_exit_count += 1
+                else:
+                    self.identical_exit_count = 0
+                self.last_fingerprint = fingerprint
+                if not self._should_resume(result):
+                    self._write_state(child_status=result.get("status"), action="stop", result=result)
+                    return result
+                if not self._wait_before_resume(result):
+                    self._write_state(child_status=result.get("status"), action="stop", result=result)
+                    return result
+                resume = True
+        finally:
+            self._release_project_lock()
 
 
 def supervise_composer(workflow, *, initial_resume=False, poll_seconds=5.0,

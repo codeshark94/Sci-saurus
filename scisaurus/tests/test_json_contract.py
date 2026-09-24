@@ -13,6 +13,7 @@ class TestJSONContract(unittest.TestCase):
         for text in ('{"ok":true}', '```json\n{"ok":true}\n```',
                      'reasoning</think>{"ok":true}',
                      'reasoning</think>```json\n{"ok":true}\n```',
+                     'analysis transcript before the final answer\n{"ok":true}',
                      '{"ok":true}"}'):
             with self.subTest(text=text):
                 result = ModelResult(text, "fixture", {}, 0, "stop")
@@ -23,7 +24,7 @@ class TestJSONContract(unittest.TestCase):
         invalid = ('{"x":1,"x":2}', '{"nested":{"x":1,"x":2}}',
                    '{"x":NaN}', '{"x":Infinity}', '{"x":-Infinity}', '{"x":1e999}', '{"x":-1e999}',
                    '{"x":', '{"x":1} trailing', '[]', 'null',
-                   '// comment\n{"x":1}', '{"x":1,}')
+                   '{"x":1,}')
         for raw in invalid:
             for text in (raw, f'```json\n{raw}\n```', f'reasoning</think>{raw}'):
                 with self.subTest(text=text), self.assertRaises(ValidationError):
@@ -36,6 +37,10 @@ class TestJSONContract(unittest.TestCase):
         with self.assertRaises(ValidationError):
             ModelResult('{"x":', "fixture", {}, 0, "stop").json_object(
                 allow_missing_closers=True)
+        self.assertEqual(
+            ModelResult('// comment\n{"x":1}', "fixture", {}, 0, "stop").json_object(),
+            {"x": 1},
+        )
         for text in ('Here is JSON:\n```json\n{"x":1}\n```',
                      '```json\n{"x":1}\n```\nmore',
                      '```json\n{"x":1}\n```\n```json\n{"x":2}\n```'):

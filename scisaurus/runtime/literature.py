@@ -373,6 +373,41 @@ def normalize_work(item, *, tolerate_invalid_abstract=False, abstract_gaps=None)
             **({"authors": authors} if authors else {})}
 
 
+def preferred_full_text_url(locations):
+    """Prefer open article landing pages/XML over binary PDF locations."""
+    candidates = full_text_url_candidates(locations)
+    return candidates[0]["url"] if candidates else None
+
+
+def full_text_url_candidates(locations):
+    """Order source URLs with OA article text first and OA PDF as a bounded fallback."""
+    if not isinstance(locations, list):
+        return []
+    candidates = [location for location in locations if isinstance(location, dict)]
+    ordered_groups = (
+        [location for location in candidates if location.get("is_oa") is True],
+        [location for location in candidates if location.get("is_oa") is not True],
+    )
+    result, seen = [], set()
+    for group in ordered_groups:
+        for field in ("landing_page_url", "pdf_url"):
+            for location in group:
+                value = location.get(field)
+                if isinstance(value, str) and value.strip() and value not in seen:
+                    result.append({"url": value, "is_oa": location.get("is_oa") is True,
+                                   "kind": "pdf" if field == "pdf_url" else "landing_page"})
+                    seen.add(value)
+    return result
+
+
+def preferred_oa_pdf_url(locations):
+    """Return one openly indexed PDF URL for a single fallback attempt."""
+    for candidate in full_text_url_candidates(locations):
+        if candidate["is_oa"] and candidate["kind"] == "pdf":
+            return candidate["url"]
+    return None
+
+
 def _is_omittable_work(item):
     """Identify a provider row that cannot form a reader-facing reference.
 

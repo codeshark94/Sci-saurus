@@ -48,21 +48,99 @@ legacy `evidence_first` policy remains the default for existing workflows.
 
 `progression_policy: forward_first` is the autonomous-lab operating mode. It
 does not weaken scientific release gates or turn an error into a scientific
-result. After at most two attempts, a mechanical contract defect or actionable
-scientific hold is materialized as a `candidate_needs_review` node with a
-`composer-forward-progress-1` artifact, a failure class, and an explicit
-`failure_debt`. Once the Composer has admitted the stage, that node is
-dependency-releasable with `composer_decision: advance_with_findings`; the
-deterministic harness records the finding but cannot veto downstream dispatch.
-The candidate remains `evidence_state: unverified`, and external release still
-requires the normal evidence contract. At the end of the first graph pass, the
-debt is converted into a typed backfill work order and the affected closure is
-reopened for at most two continuation cycles. Resource fences (provider
+result. After at most two attempts, an evidence-bearing mechanical defect or
+actionable scientific hold can be materialized as a `candidate_needs_review`
+node with a `composer-forward-progress-1` artifact, a failure class, and
+explicit `failure_debt`. A generated capability that has never executed is the
+important exception: it is never carried downstream as an empty or provisional
+result. Its failure dossier opens the experiment repair loop described below.
+An observed candidate remains `evidence_state: unverified`, and external
+release still requires the normal evidence contract. Resource fences (provider
 cooldown/quota, unknown external outcome, process interruption, and the hard
 deadline) do not get guessed through: they remain paused or blocked with their
-durable reason. This prevents one malformed response or over-strict local gate
-from monopolizing the mission while preserving a precise route back to the
-missing work.
+durable reason.
+
+## Model-led executable repair
+
+An experiment capability failure is not repaired by a Composer-side special
+case or by re-running the same program with a different threshold. For a
+pre-execution authoring failure, and for a later methods hold with an observed
+result, the Composer creates a bounded repair-panel stage. The active Methods
+specialists receive the same redacted failure packet through their own role
+projections; the packet contains prior authoring and validation evidence, raw
+result identity, reviewer findings, and a repair contract.
+
+The panel records independent role reports, chief synthesis, and a separate
+adversarial verdict in the assignment ledger. Its output becomes a fresh
+capability-authoring brief with explicit root causes, required scientific
+changes, and falsifiable acceptance checks. The resulting candidate carries
+`origin: composer_model_panel` provenance and is admitted only after the normal
+static, sandbox, replay, independent-recalculation, and adversarial gates pass.
+The panel has a bounded worst-case envelope of four specialist assignments plus
+one verifier, each with one JSON repair slot; that envelope is reserved from
+the experiment-stage model quota before authoring begins.
+
+The experiment repair contract is a real execution loop, not a rejection
+counter:
+
+```text
+failure dossier + source/trace evidence
+        ↓
+Methods diagnosis and root-cause synthesis
+        ↓
+edit executor and validator together
+        ↓
+fresh sandbox + raw observations + deterministic replay
+        ↓
+independent recalculation + adversarial review
+        ├─ admitted result → downstream interpretation
+        ├─ observed hold   → scoped additional experiment
+        └─ no execution after source-repair lease
+             → changed mechanism/estimand/design/measurement axis
+```
+
+Each cycle stores the failure gate, failed source or observation, reviewer
+feedback, repair axis, acceptance checks, and attempt lineage. A source-level
+repair lease is bounded per capability lineage, but exhausting it does not
+forward an unexecuted experiment or discard the research question. Composer
+issues a typed `additional_experiment` order owned by
+`methods.validation`, changes the design axis, and continues while the mission,
+stage, provider, and deadline fences permit it. A JSON output patch, a renamed
+threshold, or a zero/endpoint substituted for an undefined estimand is not a
+repair.
+
+## Failure analysis before retry
+
+Every non-resource stage failure now creates a
+`composer-failure-recovery-1` dossier before the scheduler considers another
+attempt. The dossier binds the exact stage attempt, error, output/run record,
+bounded project inventory, specialist reports, and (for experiments) the
+executor and validator source hashes and contents. It also contains a typed
+repair order with target, operation, instruction, and falsifiable acceptance
+check. The default experiment order is:
+
+```text
+inspect result + source → independently recalculate estimands
+        → edit executor/validator source → fresh replay + independent review
+```
+
+The Composer stores that order as a scoped departmental work order and reopens
+the affected closure. It does not replay an unchanged scientific stage first.
+Resource fences (provider reset, quota, deadline, or unknown external outcome)
+also receive a lightweight immutable dossier for accounting and resume
+diagnostics, but they never create a scientific repair order or consume a
+scientific repair call. For an experiment, the next capability-authoring brief includes the
+failure dossier and retained program snapshot; a fresh capability revision must
+pass the full sandbox, replay, recalculation, and adversarial gates before it
+can replace the failed attempt.
+
+Malformed or truncated model responses are a third category. They are recorded
+as `model_contract`, then repaired in place with the configured fallback route,
+a compact schema-only prompt, and a bounded output budget. This route may retry
+the stage contract once, but it never opens a scientific continuation or asks
+the topic planner to invent new work for a formatting failure. Only a failed
+scientific check (or an experiment that produced inspectable observations) can
+open a scientific repair order.
 
 Completed specialist assignments and checked survey responses are retained by
 their exact input, role, contract and model configuration. Successful siblings
@@ -448,11 +526,14 @@ For a score-3 research paper, the Composer binds or monotonically upgrades a
 contract requiring at least
 two conditions, a declared control, two comparisons, an uncertainty statement,
 an effect-size statement, a sensitivity analysis, raw-data provenance, and
-three figure assets. The experiment first emits a pre-analysis design, then
-the program's analysis summary is checked against that design before the
-results package is accepted. A replayable package that lacks these components
-creates Methods work orders and is held at research admission; the writer is
-never asked to manufacture the missing scientific content.
+three figure assets. The experiment first emits a pre-analysis design and
+adopts a replayable result only after deterministic and independent checks.
+The package then records a `quality_admission` decision: missing or incomplete
+analysis becomes a scoped Methods work order, while the paper admission gate
+still blocks release. This prevents a reader-facing analysis omission from
+burning capability-authoring retries or being mistaken for an experimental
+failure; the writer is never asked to manufacture the missing scientific
+content.
 
 When the deterministic floors and quality contract both pass, a separate
 pre-composition scientific red-team runs before the writer. The Methods,

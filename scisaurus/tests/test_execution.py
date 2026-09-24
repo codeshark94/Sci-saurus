@@ -14,8 +14,8 @@ import unittest
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.store import ArtifactStore
-from scisaurus.runtime.config import validate_config
-from scisaurus.runtime.execution import ExecutionRuntime
+from scisaurus.runtime.config import MIN_WORKER_RESULT_BYTES, validate_config
+from scisaurus.runtime.execution import ExecutionRuntime, _ResultFile
 from scisaurus.tests.test_runner import config
 
 
@@ -67,6 +67,22 @@ def provider_exhaustion_worker(kind, params, channel):
 
 
 class TestExecutionRuntime(unittest.TestCase):
+    def test_worker_result_limit_always_fits_its_own_overflow_envelope(self):
+        path = self.root / "result.json"
+        with self.assertRaisesRegex(ValueError, "minimum failure envelope"):
+            _ResultFile(path, MIN_WORKER_RESULT_BYTES - 1)
+        channel = _ResultFile(path, MIN_WORKER_RESULT_BYTES)
+        channel.put({"ok": True, "result": {"text": "x" * 1000}})
+        result = channel.read()
+        self.assertEqual(path.stat().st_size, MIN_WORKER_RESULT_BYTES)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["outcome_known"])
+
+        invalid = config()
+        invalid["limits"]["max_result_bytes"] = MIN_WORKER_RESULT_BYTES - 1
+        with self.assertRaisesRegex(ValidationError, "minimum worker IPC failure envelope"):
+            validate_config(invalid)
+
     def test_crash_created_empty_scaffold_is_initialized_as_a_fresh_run(self):
         value = validate_config(config())
         run_dir = self.root / "empty-scaffold"

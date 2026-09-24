@@ -5,7 +5,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from scisaurus.runtime.models import ModelResult, estimate_input_tokens
+from scisaurus.runtime.models import ModelCallError, ModelResult, estimate_input_tokens
 from scisaurus.runtime.specialists import (
     SPECIALIST_SYSTEM, VERIFIER_SYSTEM, SpecialistDispatcher,
     build_specialist_prompt, build_verifier_prompt,
@@ -389,6 +389,35 @@ class SpecialistDispatcherTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    def test_specialist_repairs_provider_truncation_once_when_quota_has_repair_slot(self):
+        model = {
+            "protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+            "model": "fallback", "timeout_seconds": 5.0,
+            "max_output_tokens": 100, "context_window_tokens": 4096,
+            "max_input_tokens": 2048,
+        }
+        assignment = {
+            "assigned_role": "methods.methodologist", "role_id": "methodologist",
+            "model_role": "methods.methodologist", "execution_kind": "model",
+            "stage_id": "repair", "stage_kind": "experiment",
+            "quota": {"max_calls": 2, "max_input_tokens": 1000,
+                      "max_output_tokens": 100, "max_seconds": 5},
+            "_prompt": json.dumps({"objective": "bounded repair"}),
+        }
+        truncated = ModelResult('{"decision":"repair"', "fake", {"model_calls": 1}, 0.01, "length", 1)
+        complete = ModelResult(json.dumps({
+            "decision": "repair", "summary": "repaired", "findings": [],
+            "evidence_gaps": [], "requested_actions": [],
+        }), "fake", {"model_calls": 1}, 0.01, "stop", 1)
+        with patch("scisaurus.runtime.specialists.ModelClient") as client:
+            client.return_value.complete.side_effect = [truncated, complete]
+            result = SpecialistDispatcher(
+                model, max_parallel=1, deadline=time.monotonic() + 10,
+            ).dispatch([assignment], {"objective": "bounded repair"})[0]
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["validation_retries"], 1)
+        self.assertEqual(result["usage"]["model_calls"], 2)
+
     def test_provider_429_reroutes_same_assignment_to_healthy_qwen(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), _ProviderFallbackHandler)
         server.lock = threading.Lock()
@@ -443,6 +472,47 @@ class SpecialistDispatcherTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_provider_500_reroutes_within_shared_ollama_capacity_pool(self):
+        model = {
+            "protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+            "model": "fallback", "timeout_seconds": 5.0,
+            "max_output_tokens": 100, "context_window_tokens": 4096,
+            "max_input_tokens": 2048, "role_routes": {
+                "review.arbiter": [
+                    {"id": "ollama-glm", "pool": "ollama", "model": "glm"},
+                    {"id": "ollama-deepseek", "pool": "ollama", "model": "deepseek"},
+                ],
+            },
+        }
+        assignment = {
+            "assigned_role": "research.adversarial-reviewer",
+            "role_id": "adversarial-reviewer", "model_role": "review.arbiter",
+            "execution_kind": "review", "stage_id": "experiment",
+            "stage_kind": "experiment", "quota": {
+                "max_calls": 1, "max_input_tokens": 1000,
+                "max_output_tokens": 100, "max_seconds": 5,
+            },
+            "_prompt": json.dumps({"stage": "experiment"}),
+        }
+        success = ModelResult(json.dumps({
+            "decision": "accept", "rationale": "healthy fallback",
+            "critical_findings": [], "repair_scope": [],
+        }), "deepseek", {"model_calls": 1, "input_tokens": 10,
+                          "output_tokens": 5}, 0.01, "stop", 1)
+        with patch("scisaurus.runtime.specialists.ModelClient") as client:
+            client.return_value.complete.side_effect = [
+                ModelCallError("transient server error", outcome_known=False,
+                               status_code=500, attempts=1),
+                success,
+            ]
+            result = SpecialistDispatcher(
+                model, provider_pools={"ollama": {"max_concurrent": 3, "base_urls": []}},
+                max_parallel=1, deadline=time.monotonic() + 10,
+            ).dispatch([assignment], {"objective": "test"}, verifier=True)[0]
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["route_id"], "ollama-deepseek")
+        self.assertEqual(result["provider_retries"], 1)
 
 
 if __name__ == "__main__":

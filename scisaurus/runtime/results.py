@@ -9,7 +9,7 @@ import re
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.research_quality import (
-    check_analysis_contract,
+    evaluate_result_package_quality,
     validate_analysis,
     validate_quality_contract,
 )
@@ -65,12 +65,17 @@ def _core(value, *, asset_version, base_dir):
         _identifier(metric["id"], "metric id")
         for key in ("unit", "conditions", "source", "presentation"):
             _text(metric[key], f"metric {key}")
-        if (isinstance(metric["value"], bool) or not isinstance(metric["value"], (str, int, float))
-                or isinstance(metric["value"], float) and not math.isfinite(metric["value"])):
+        # ``None`` is a first-class censored/undefined estimand. It must stay
+        # explicit in the result package; callers may not replace it with a
+        # boundary or zero merely to satisfy a numeric transport contract.
+        if (metric["value"] is not None
+                and (isinstance(metric["value"], bool)
+                     or not isinstance(metric["value"], (str, int, float))
+                     or isinstance(metric["value"], float) and not math.isfinite(metric["value"]))):
             raise ValidationError(
-                f"metric value must be an exact finite JSON scalar: metrics[{index}] "
+                f"metric value must be an exact finite JSON scalar or explicit null: metrics[{index}] "
                 f"id={metric['id']!r} has {metric['value']!r}; check estimator assumptions and "
-                "input variation, and never replace an undefined estimate with an invented number")
+                "retain censoring/undefined status and never replace it with an invented number")
         reserve_id(metric["id"], f"metrics[{index}]")
         metric_ids.add(metric["id"])
     for index, finding in enumerate(value["findings"]):
@@ -125,7 +130,7 @@ def validate_results_package(value, *, base_dir=None):
         asset_version = 1
     elif schema == "results-package-2":
         required = core | {"study_type", "question", "hypothesis", "provenance", "validation"}
-        allowed = required | {"analysis", "quality_contract"}
+        allowed = required | {"analysis", "quality_contract", "quality_admission"}
         if (set(value) - allowed) or not required.issubset(value):
             raise ValidationError(
                 f"results package requires {sorted(required)} and permits analysis, quality_contract")
@@ -179,15 +184,21 @@ def validate_results_package(value, *, base_dir=None):
             validate_analysis(value["analysis"])
         if "quality_contract" in value:
             validate_quality_contract(value["quality_contract"], study_type=value["study_type"])
-            if "analysis" not in value:
-                raise ValidationError("results quality_contract requires analysis")
-            figures = sum(1 for asset in value["assets"]
-                          if asset.get("role") == "figure")
-            deficits = check_analysis_contract(value["analysis"], value["quality_contract"],
-                                               figure_count=figures)
-            if deficits:
-                raise ValidationError(
-                    "results quality contract is not satisfied: "
-                    + ", ".join(item["field"] for item in deficits))
+            # The package validator checks the declared contract and the
+            # analysis schema, but does not turn a publication-quality deficit
+            # into an execution failure.  ``quality_admission`` is the durable
+            # decision surface; the paper gate recomputes it before release.
+            # This distinction lets valid raw observations reach interpretation
+            # while still making missing analyses an explicit research work
+            # order rather than silently treating them as publication-ready.
+            if "quality_admission" in value:
+                admission = value["quality_admission"]
+                expected = evaluate_result_package_quality(
+                    {key: item for key, item in value.items()
+                     if key != "quality_admission"})
+                if canonical_bytes(admission) != canonical_bytes(expected):
+                    raise ValidationError("results quality_admission does not match the declared package")
+        elif "quality_admission" in value:
+            raise ValidationError("results quality_admission requires quality_contract")
     canonical_bytes(value)
     return value

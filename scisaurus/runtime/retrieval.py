@@ -22,11 +22,13 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from http.client import HTTPException, IncompleteRead
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode, urljoin, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+from urllib.robotparser import RobotFileParser
 
+from scisaurus.runtime import pdf_text
 
-ADAPTER_VERSION = "3"
+ADAPTER_VERSION = "4"
 MCP_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = {MCP_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"}
 CROSSREF_TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
@@ -34,6 +36,164 @@ SAFE_PROCESS_ENV = {
     "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT",
     "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "LANG", "LC_ALL",
 }
+PDF_USER_AGENT = "Sci-saurus/0.8 (scholarly source retrieval)"
+ROBOTS_MAX_BYTES = 512 * 1024
+MAX_HTTP_REDIRECTS = 5
+REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
+
+
+def _open_http(request, *, timeout):
+    """Open one HTTP response without crossing an unchecked redirect."""
+    opener = build_opener(_NoRedirect())
+    try:
+        return opener.open(request, timeout=timeout)
+    except HTTPError as response:
+        return response
+
+
+def _http_status(response):
+    return getattr(response, "status", getattr(response, "code", None))
+
+
+def _redirect_record(from_url, to_url, status):
+    def stamp(value):
+        return {"prefix": value[:256],
+                "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest()}
+    return {"from": stamp(from_url), "to": stamp(to_url), "status": status}
+
+
+def _bounded_http_body(response, *, byte_limit, deadline, body=None):
+    body = body if body is not None else bytearray()
+    while len(body) <= byte_limit:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("HTTP response exceeded its total request deadline")
+        read_size = min(65536, byte_limit + 1 - len(body))
+        reader = getattr(response, "read1", response.read)
+        _set_response_read_timeout(response, remaining)
+        chunk = reader(read_size)
+        if not chunk:
+            return bytes(body), False
+        body.extend(chunk)
+    return bytes(body), True
+
+
+def _robots_policy(url, *, deadline, cache):
+    """Fetch and apply one origin's robots rules; uncertain policies fail closed."""
+    parsed = urlsplit(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    port = parsed.port
+    default_port = 443 if parsed.scheme.casefold() == "https" else 80
+    key = (parsed.scheme.casefold(), parsed.hostname.casefold(),
+           None if port in (None, default_port) else port)
+    if key in cache:
+        cached = cache[key]
+        policy = dict(cached["policy"])
+        parser = cached.get("parser")
+        if parser is not None:
+            allowed = parser.can_fetch(PDF_USER_AGENT, url)
+            policy["outcome"] = "allowed" if allowed else "robots_denied"
+            if not allowed:
+                policy["reason"] = "Robots policy disallows this PDF URL"
+        return policy
+    initial_url = origin + "/robots.txt"
+    current_url, redirects = initial_url, []
+    policy = None
+    parser = None
+    for redirect_count in range(MAX_HTTP_REDIRECTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            policy = {"outcome": "robots_unavailable", "robots_url": initial_url,
+                      "status": None, "reason": "Robots policy request exceeded its deadline"}
+            break
+        try:
+            response = _open_http(Request(current_url, headers={"User-Agent": PDF_USER_AGENT}),
+                                  timeout=remaining)
+        except (OSError, URLError, HTTPException, IncompleteRead, TimeoutError) as exc:
+            policy = {"outcome": "robots_unavailable", "robots_url": initial_url,
+                      "status": None, "reason": f"Robots policy could not be fetched: {type(exc).__name__}"}
+            break
+        with response:
+            status = _http_status(response)
+            headers = response.headers
+            if status in REDIRECT_STATUSES:
+                location = headers.get("Location") if hasattr(headers, "get") else None
+                if not isinstance(location, str) or not location.strip() or redirect_count >= MAX_HTTP_REDIRECTS:
+                    policy = {"outcome": "robots_unavailable", "robots_url": initial_url,
+                              "status": status, "reason": "Robots policy redirect is invalid or exceeds five hops",
+                              "redirects": redirects}
+                    break
+                next_url = urljoin(current_url, location)
+                try:
+                    _url(next_url)
+                except ValueError:
+                    policy = {"outcome": "robots_unavailable", "robots_url": initial_url,
+                              "status": status, "reason": "Robots policy redirect is not HTTP(S)",
+                              "redirects": redirects}
+                    break
+                redirects.append(_redirect_record(current_url, next_url, status))
+                current_url = next_url
+                continue
+            if status is not None and 200 <= status < 300:
+                try:
+                    body, truncated = _bounded_http_body(
+                        response, byte_limit=ROBOTS_MAX_BYTES, deadline=deadline)
+                except (OSError, URLError, HTTPException, IncompleteRead, TimeoutError) as exc:
+                    policy = {"outcome": "robots_unavailable", "robots_url": initial_url,
+                              "final_url_sha256": hashlib.sha256(current_url.encode("utf-8")).hexdigest(),
+                              "status": status,
+                              "reason": f"Robots policy body could not be read: {type(exc).__name__}",
+                              "redirects": redirects}
+                    break
+                if truncated:
+                    policy = {"outcome": "robots_unavailable", "robots_url": initial_url,
+                              "final_url_sha256": hashlib.sha256(current_url.encode("utf-8")).hexdigest(),
+                              "status": status, "bytes": len(body),
+                              "sha256": hashlib.sha256(body).hexdigest(),
+                              "reason": "Robots policy exceeds the 512 KiB parser limit",
+                              "redirects": redirects}
+                    break
+                parser = RobotFileParser(initial_url)
+                parser.parse(body.decode("utf-8-sig", errors="replace").splitlines())
+                allowed = parser.can_fetch(PDF_USER_AGENT, url)
+                policy = {"outcome": "allowed" if allowed else "robots_denied",
+                          "robots_url": initial_url,
+                          "final_url_sha256": hashlib.sha256(current_url.encode("utf-8")).hexdigest(),
+                          "status": status, "bytes": len(body),
+                          "sha256": hashlib.sha256(body).hexdigest(), "redirects": redirects}
+                if not allowed:
+                    policy["reason"] = "Robots policy disallows this PDF URL"
+                break
+            if status in {404, 410}:
+                policy = {"outcome": "allowed", "robots_url": initial_url,
+                          "final_url_sha256": hashlib.sha256(current_url.encode("utf-8")).hexdigest(),
+                          "status": status,
+                          "bytes": 0, "redirects": redirects,
+                          "reason": "Origin has no robots policy file"}
+            elif status in {401, 403, 429}:
+                policy = {"outcome": "robots_denied", "robots_url": initial_url,
+                          "final_url_sha256": hashlib.sha256(current_url.encode("utf-8")).hexdigest(),
+                          "status": status,
+                          "redirects": redirects,
+                          "reason": "Robots policy access was denied or rate limited"}
+            else:
+                policy = {"outcome": "robots_unavailable", "robots_url": initial_url,
+                          "final_url_sha256": hashlib.sha256(current_url.encode("utf-8")).hexdigest(),
+                          "status": status,
+                          "redirects": redirects,
+                          "reason": "Robots policy is unavailable; retrieval is withheld"}
+            break
+    if policy is None:
+        policy = {"outcome": "robots_unavailable", "robots_url": initial_url,
+                  "status": None, "redirects": redirects,
+                  "reason": "Robots policy could not be resolved"}
+    cache[key] = {"policy": dict(policy), "parser": parser}
+    return policy
 
 
 def _now() -> str:
@@ -57,6 +217,10 @@ def _url(url: str) -> str:
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("source URL must be HTTP(S) without embedded credentials")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("source URL must contain a valid port") from exc
     return url
 
 
@@ -65,6 +229,17 @@ def _capture(body: bytes, media_type: str) -> dict:
         "encoding": "base64", "body": base64.b64encode(body).decode("ascii"),
         "sha256": hashlib.sha256(body).hexdigest(), "bytes": len(body), "media_type": media_type,
     }
+
+
+def _set_response_read_timeout(response, timeout):
+    """Apply the remaining total request budget to urllib's active socket."""
+    file_pointer = getattr(response, "fp", None)
+    candidates = (file_pointer, getattr(file_pointer, "raw", None))
+    for candidate in candidates:
+        sock = getattr(candidate, "_sock", None)
+        if sock is not None and callable(getattr(sock, "settimeout", None)):
+            sock.settimeout(timeout)
+            return
 
 
 def _result(provider: str, transport: str, source_url: str) -> dict:
@@ -461,7 +636,7 @@ class _StdioMCP:
 
 
 class MCPFetchClient:
-    """Run the configured MCP Fetch server and retain exact tool output provenance.
+    """Fetch scholarly text through MCP, with bounded Poppler PDF extraction.
 
     Set ``own_process_group=False`` only inside a supervisor that owns and reaps
     the enclosing process group after every invocation, including normal exits.
@@ -470,8 +645,14 @@ class MCPFetchClient:
     def __init__(
         self, command: list[str], *, timeout: float = 30, max_bytes: int = 1_048_576,
         env: dict | None = None, own_process_group: bool = True, cwd: str | None = None,
+        pdf_max_bytes: int = pdf_text.DEFAULT_MAX_PDF_BYTES,
+        result_max_bytes: int = pdf_text.DEFAULT_RESULT_MAX_BYTES,
     ):
         _limits(timeout, max_bytes)
+        if type(pdf_max_bytes) is not int or not 1 <= pdf_max_bytes <= pdf_text.MAX_PDF_BYTES:
+            raise ValueError(f"pdf_max_bytes must be between 1 and {pdf_text.MAX_PDF_BYTES}")
+        if type(result_max_bytes) is not int or result_max_bytes < 1:
+            raise ValueError("result_max_bytes must be a positive integer")
         if not isinstance(command, list) or not command or any(not isinstance(v, str) or not v for v in command):
             raise ValueError("MCP command must be an executable and an explicit argument list")
         if env is not None and (not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in env.items())):
@@ -483,11 +664,209 @@ class MCPFetchClient:
         self.command, self.timeout, self.max_bytes, self.env = list(command), timeout, max_bytes, env
         self.own_process_group = own_process_group
         self.cwd = cwd
+        self.pdf_max_bytes = pdf_max_bytes
+        self.result_max_bytes = result_max_bytes
+
+    @staticmethod
+    def _is_pdf_url(url):
+        return urlsplit(url).path.casefold().endswith(".pdf")
+
+    def _fetch_pdf(self, url, *, max_length, mcp_probe=None):
+        """Retrieve one source as PDF bytes and return verified local text extraction."""
+        result = _result("scholarly-pdf", "http_pdf", url)
+        result["metadata"].update({
+            "adapter_version": ADAPTER_VERSION,
+            "representation": "pdf_extracted_text",
+            "capture_truncated": False,
+            "capture_incomplete": False,
+        })
+        result["capture"] = _capture(b"", "text/plain; charset=utf-8")
+        result["capture_sha256"] = result["capture"]["sha256"]
+        extractor = pdf_text.parser_identity()
+        record = {
+            "request_url": url,
+            "final_url": None,
+            "http_status": None,
+            "content_type": None,
+            "content_length": None,
+            "download_bytes": 0,
+            "source_sha256": None,
+            "parser": extractor,
+            "mcp_probe": mcp_probe,
+        }
+        byte_limit = pdf_text.pdf_capture_budget(
+            self.result_max_bytes, max_length, self.pdf_max_bytes)
+        record.update(result_max_bytes=self.result_max_bytes, effective_byte_limit=byte_limit)
+        result["metadata"]["pdf_extraction"] = record
+        if byte_limit < 1:
+            result.update(outcome="unsupported_capability",
+                          error="PDF and extracted text cannot fit the configured worker result limit")
+            result["gaps"].append("The PDF was not requested because the bounded result envelope is too small.")
+            return result
+        if extractor is None:
+            record["parser_missing"] = True
+            result.update(outcome="unsupported_capability",
+                          error="Poppler pdftotext is not installed or could not be identified")
+            result["gaps"].append("PDF text extraction is unavailable; no source bytes were requested.")
+            return result
+
+        response = None
+        body = bytearray()
+        deadline = time.monotonic() + float(self.timeout)
+        robots_cache = {}
+        redirects = []
+        try:
+            current_url = url
+            record["robots_checks"] = []
+            for redirect_count in range(MAX_HTTP_REDIRECTS + 1):
+                policy = _robots_policy(current_url, deadline=deadline, cache=robots_cache)
+                record["robots_checks"].append(policy)
+                if policy["outcome"] != "allowed":
+                    result.update(outcome=policy["outcome"],
+                                  error=policy.get("reason", "Robots policy withheld PDF retrieval"))
+                    result["gaps"].append("PDF retrieval was withheld by robots policy or an unavailable policy check.")
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("PDF response exceeded its request deadline")
+                request = Request(current_url, headers={
+                    "User-Agent": PDF_USER_AGENT,
+                    "Accept": "application/pdf, application/octet-stream;q=0.8",
+                })
+                response = _open_http(request, timeout=remaining)
+                status = _http_status(response)
+                headers = response.headers
+                if status in REDIRECT_STATUSES:
+                    location = headers.get("Location") if hasattr(headers, "get") else None
+                    if (not isinstance(location, str) or not location.strip()
+                            or redirect_count >= MAX_HTTP_REDIRECTS):
+                        result.update(outcome="provider_error",
+                                      error="PDF redirect is invalid or exceeds five hops")
+                        record["redirects"] = redirects
+                        response.close()
+                        response = None
+                        break
+                    next_url = urljoin(current_url, location)
+                    try:
+                        _url(next_url)
+                    except ValueError:
+                        result.update(outcome="provider_error",
+                                      error="PDF redirect target is not an authorized HTTP(S) URL")
+                        record["redirects"] = redirects
+                        response.close()
+                        response = None
+                        break
+                    redirects.append(_redirect_record(current_url, next_url, status))
+                    response.close()
+                    response = None
+                    current_url = next_url
+                    continue
+
+                with response:
+                    final_url = _url(response.geturl())
+                    content_type = (headers.get_content_type() if hasattr(headers, "get_content_type")
+                                    else str(headers.get("Content-Type", "")).split(";", 1)[0].strip().lower())
+                    content_length = headers.get("Content-Length")
+                    try:
+                        content_length = int(content_length) if content_length is not None else None
+                    except (TypeError, ValueError):
+                        content_length = None
+                    record.update({
+                        "final_url": final_url,
+                        "http_status": status,
+                        "content_type": content_type or None,
+                        "content_length": content_length,
+                        "redirects": redirects,
+                        "headers": {key.lower(): value for key, value in headers.items()
+                                    if key.lower() in {"content-type", "content-length", "last-modified", "etag"}},
+                    })
+                    response_byte_limit = byte_limit if status == 200 else min(byte_limit, 65536)
+                    if content_length is not None and content_length > response_byte_limit:
+                        result.update(outcome="partial", error="PDF response exceeds the configured byte limit")
+                        result["metadata"]["capture_truncated"] = True
+                        record["download_truncated"] = True
+                    else:
+                        _, truncated = _bounded_http_body(
+                            response, byte_limit=response_byte_limit, deadline=deadline, body=body)
+                        if truncated:
+                            del body[response_byte_limit:]
+                            result.update(outcome="partial", error="PDF response exceeds the configured byte limit")
+                            result["metadata"]["capture_truncated"] = True
+                            record["download_truncated"] = True
+                response = None
+                break
+
+            captured = bytes(body)
+            media_type = record["content_type"] or "application/octet-stream"
+            result["capture"] = _capture(captured, media_type)
+            result["capture_sha256"] = result["capture"]["sha256"]
+            status = record.get("http_status")
+            final_url = record.get("final_url")
+            if status is not None or captured:
+                record["source_capture"] = dict(result["capture"])
+                record.update(download_bytes=len(captured), source_sha256=result["capture_sha256"])
+            if status != 200:
+                if status is not None:
+                    result["outcome"] = {
+                        401: "auth_required", 403: "access_denied", 404: "not_found", 429: "rate_limited",
+                    }.get(status, "provider_error")
+                    result["error"] = f"PDF source returned HTTP {status}"
+            elif result.get("outcome") == "partial":
+                result["sources"] = []
+            elif media_type not in {"application/pdf", "application/x-pdf", "application/octet-stream"}:
+                result.update(outcome="unsupported_capability",
+                              error=f"PDF URL returned non-PDF media type {media_type}")
+            else:
+                extraction_timeout = deadline - time.monotonic()
+                if extraction_timeout <= 0:
+                    raise TimeoutError("PDF extraction exceeded the source request deadline")
+                extraction = pdf_text.extract_pdf_text(
+                    captured, max_chars=max_length, timeout=extraction_timeout, executable=extractor["path"])
+                result.update(outcome=extraction["outcome"], text=extraction["text"])
+                result["metadata"].update(
+                    capture_truncated=extraction["metadata"].get("capture_truncated", False),
+                    capture_incomplete=extraction["metadata"].get("capture_incomplete", False))
+                record["text_sha256"] = extraction["metadata"].get("text_sha256")
+                record["output_bytes"] = extraction["metadata"].get("output_bytes")
+                record["parser_returncode"] = extraction["metadata"].get("parser_returncode")
+                record["parser_stderr"] = extraction["metadata"].get("parser_stderr")
+                if extraction.get("error"):
+                    result["error"] = extraction["error"]
+                if extraction["outcome"] == "ok":
+                    result["sources"] = [{"source_url": final_url,
+                                           "representation": "pdf_extracted_text"}]
+                else:
+                    result["gaps"].append(extraction.get("error") or "PDF text extraction did not complete")
+        except (OSError, URLError, TimeoutError, HTTPException, IncompleteRead) as exc:
+            result["outcome"] = "timeout" if isinstance(exc, TimeoutError) else "provider_error"
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            result["gaps"].append("The PDF source did not return a complete HTTP response.")
+            captured = bytes(body)
+            record["download_incomplete"] = True
+            result["metadata"]["capture_incomplete"] = True
+            if captured:
+                media_type = record["content_type"] or "application/octet-stream"
+                result["capture"] = _capture(captured, media_type)
+                result["capture_sha256"] = result["capture"]["sha256"]
+                record["source_capture"] = dict(result["capture"])
+                record.update(download_bytes=len(captured), source_sha256=result["capture_sha256"])
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except OSError:
+                    pass
+        text_capture = _capture(result.get("text", "").encode("utf-8"), "text/plain; charset=utf-8")
+        result["capture"] = text_capture
+        result["capture_sha256"] = text_capture["sha256"]
+        return result
 
     def fetch(self, url: str, *, max_length: int = 20000, start_index: int = 0, raw: bool = False) -> dict:
         _url(url)
         if type(max_length) is not int or not 0 < max_length < 1_000_000 or type(start_index) is not int or start_index < 0 or type(raw) is not bool:
             raise ValueError("fetch requires bounded max_length, nonnegative start_index, and a Boolean raw flag")
+        if not raw and self._is_pdf_url(url):
+            return self._fetch_pdf(url, max_length=max_length)
         result = _result("mcp-fetch", "mcp_stdio", url)
         result["metadata"].update({
             "command": self.command, "representation": "unclassified",
@@ -530,7 +909,11 @@ class MCPFetchClient:
                     or not {"url", "max_length", "start_index", "raw"}.issubset(schema["properties"])
                 ):
                     raise _RetrievalFailure("unsupported_capability", "Advertised fetch input schema is incompatible")
-                result["metadata"]["tool_schema_sha256"] = hashlib.sha256(_json_bytes(schema)).hexdigest()
+                schema_wire = _json_bytes(schema)
+                result["metadata"].update({
+                    "tool_schema_sha256": hashlib.sha256(schema_wire).hexdigest(),
+                    "tool_schema_wire_json": schema_wire.decode("utf-8"),
+                })
                 reply = session.request("tools/call", {"name": "fetch", "arguments": {
                     "url": url, "max_length": max_length, "start_index": start_index, "raw": raw,
                 }})
@@ -587,4 +970,18 @@ class MCPFetchClient:
                 "output_bytes": session.bytes_read, "stderr_tail": session.stderr.decode("utf-8", errors="replace"),
                 "unparsed_stdout_tail": session.unparsed_stdout.decode("utf-8", errors="replace"),
             })
+        reported = result.get("metadata", {}).get("reported_media_types", [])
+        if (not raw and result.get("outcome") == "unsupported_capability"
+                and any(str(value).split(";", 1)[0].strip().lower() in {
+                    "application/pdf", "application/x-pdf"} for value in reported)):
+            probe = {
+                "outcome": result["outcome"],
+                "capture_sha256": result.get("capture_sha256"),
+                "capture_bytes": (result.get("capture") or {}).get("bytes"),
+                "reported_media_types": result["metadata"].get("reported_media_types", []),
+                "protocol_version": result["metadata"].get("protocol_version"),
+                "server_info": result["metadata"].get("server_info"),
+                "tool_schema_sha256": result["metadata"].get("tool_schema_sha256"),
+            }
+            return self._fetch_pdf(url, max_length=max_length, mcp_probe=probe)
         return result

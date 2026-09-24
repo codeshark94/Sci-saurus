@@ -65,15 +65,25 @@ def expand_evidence(value, catalog, sources, *, windows=None):
                  window=(windows or {}).get(proof["source_ref"]))
         lookup[identifier] = proof
 
-    def visit(item):
+    def visit(item, *, evidence_selection=False):
         if isinstance(item, dict):
             if "evidence_id" in item:
                 if set(item) != {"evidence_id"} or not isinstance(item["evidence_id"], str) or item["evidence_id"] not in lookup:
                     raise ValidationError("evidence selection must identify exactly one supplied evidence ID")
                 return deepcopy(lookup[item["evidence_id"]])
-            return {key: visit(child) for key, child in item.items()}
+            return {
+                key: visit(child, evidence_selection=(key == "evidence"))
+                for key, child in item.items()
+            }
         if isinstance(item, list):
-            return [visit(child) for child in item]
+            return [visit(child, evidence_selection=evidence_selection) for child in item]
+        if evidence_selection and isinstance(item, str) and item in lookup:
+            # Some JSON-constrained providers emit the supplied evidence ID
+            # directly in an evidence array instead of wrapping it in
+            # ``{"evidence_id": ...}``.  The ID is still checked against the
+            # immutable catalog above; wrapping this transport variant adds no
+            # scientific content and keeps the downstream validator strict.
+            return deepcopy(lookup[item])
         return item
 
     return visit(value)

@@ -468,7 +468,7 @@ def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, det
                 "design, analysis, and interpretation."
             ),
         })
-    return {
+    body = {
         "stage": {
             "id": stage.get("id"),
             "kind": stage.get("kind"),
@@ -480,6 +480,16 @@ def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, det
         ],
         "verifier_contract": contract,
     }
+    if (stage_packet.get("repair_panel") is True
+            and isinstance(stage_packet.get("capability_repair_packet"), dict)):
+        body["capability_repair_packet"] = _bounded_value(
+            stage_packet["capability_repair_packet"],
+            max_depth=6, max_keys=48, max_items=16, max_text=2200)
+        body["verifier_contract"]["repair_panel_rule"] = (
+            "Judge whether the proposed repair addresses the supplied root cause and changes the failed "
+            "mechanism. A complete executable and independently recalculable acceptance check are required."
+        )
+    return body
 
 
 _TOPIC_REVIEW_CANDIDATE_KEYS = (
@@ -597,6 +607,16 @@ def build_specialist_prompt(assignment, stage_packet):
     for field in ("draft", "manuscript", "manuscript_source"):
         if field in projected:
             projected[field] = _manuscript_units_projection(projected[field])
+    # A capability-repair panel is deliberately different from ordinary
+    # preflight: every methods role must inspect the same bounded failure
+    # evidence, while retaining its own contract and independent verdict.
+    # Keep this packet out of normal stage prompts so a repair trace cannot
+    # silently widen unrelated assignments.
+    if stage_packet.get("repair_panel") is True:
+        repair_packet = stage_packet.get("capability_repair_packet")
+        if isinstance(repair_packet, dict):
+            projected["capability_repair_packet"] = _bounded_value(
+                repair_packet, max_depth=6, max_keys=48, max_items=16, max_text=2600)
     envelope = {
         "assignment": {
             "assigned_role": assignment.get("assigned_role"),
@@ -623,6 +643,16 @@ def build_specialist_prompt(assignment, stage_packet):
             "requested_actions": ["bounded next action, if any"],
         },
     }
+    if stage_packet.get("repair_panel") is True:
+        envelope["shared_stage_context"]["repair_panel_contract"] = {
+            "purpose": "diagnose the failed executable and specify a materially different repair",
+            "required_findings": [
+                "root cause tied to supplied evidence",
+                "required scientific or executable change",
+                "acceptance check that can falsify the repair",
+            ],
+            "prohibited_action": "threshold relabeling or cosmetic edits that preserve the failed mechanism",
+        }
     quota = assignment.get("quota") if isinstance(assignment.get("quota"), dict) else {}
     return _json_with_budget(
         envelope, system=SPECIALIST_SYSTEM,
@@ -731,6 +761,34 @@ def _verifier_repair_prompt(prompt, error, previous_text, *, max_input_tokens):
     return prompt
 
 
+def _specialist_repair_prompt(prompt, error, previous_text, *, max_input_tokens):
+    """Add one bounded JSON-only repair for a truncated specialist response."""
+    instruction = (
+        "The previous specialist response was invalid or truncated. Return exactly one complete JSON object "
+        "with only decision, summary, findings, evidence_gaps, and requested_actions. Do not emit markdown, "
+        "analysis, or commentary. Keep summary under 500 characters and each array to at most three concise "
+        "items. Preserve uncertainty and report only evidence present in the packet."
+    )
+    try:
+        payload = json.loads(prompt)
+    except (TypeError, ValueError):
+        payload = {"specialist_packet": prompt}
+    if not isinstance(payload, dict):
+        payload = {"specialist_packet": prompt}
+    payload["repair_instruction"] = instruction
+    payload["validation_error"] = str(error)[:500]
+    if isinstance(previous_text, str) and previous_text:
+        payload["previous_response_excerpt"] = previous_text[:2200]
+    candidate = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if estimate_input_tokens(SPECIALIST_SYSTEM, candidate) <= max_input_tokens:
+        return candidate
+    payload.pop("previous_response_excerpt", None)
+    candidate = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if estimate_input_tokens(SPECIALIST_SYSTEM, candidate) <= max_input_tokens:
+        return candidate
+    return prompt
+
+
 class SpecialistDispatcher:
     """Dispatch a finite pool while respecting route and budget capacity."""
 
@@ -802,6 +860,36 @@ class SpecialistDispatcher:
                    if base_url in {str(url).rstrip("/") for url in entry.get("base_urls", [])}]
         return matches[0] if len(matches) == 1 else None
 
+    @staticmethod
+    def _cooldown_key(route_id, route, pool):
+        """Return the quota/quarantine key without changing capacity sharing.
+
+        A provider pool is a concurrency budget.  It is not necessarily a
+        model-quota boundary: Ollama can serve several model routes through
+        one endpoint, and one route may fail while another remains usable.
+        Keep the shared pool for active-call accounting, but quarantine the
+        concrete route that produced the provider failure.
+        """
+        if isinstance(route, dict):
+            declared = route.get("cooldown_pool")
+            if isinstance(declared, str) and declared.strip():
+                return declared.strip()
+        if isinstance(route_id, str) and route_id.strip():
+            return route_id.strip()
+        return pool or "unpooled"
+
+    def cooldown_keys(self):
+        """Return durable route cooldown keys known to this dispatcher."""
+        keys = set()
+        roles = self.model_config.get("role_routes", {})
+        if isinstance(roles, dict):
+            for role in roles:
+                for route_id, declared_pool, route in self._routes(role):
+                    pool = declared_pool or self._pool_for(
+                        route, self._effective_route(route, role))
+                    keys.add(self._cooldown_key(route_id, route, pool))
+        return keys
+
     def _reserve_route(self, role, *, system, prompt, quota):
         routes = self._routes(role)
         cursor = self.route_cursors.get(role, 0)
@@ -825,7 +913,8 @@ class SpecialistDispatcher:
                         context_errors.append(context_error)
                         continue
                     pool = self._pool_for(route, effective) or "unpooled"
-                    cooldown_until = self.provider_cooldowns.get(pool, 0.0)
+                    cooldown_key = self._cooldown_key(route_id, route, pool)
+                    cooldown_until = self.provider_cooldowns.get(cooldown_key, 0.0)
                     now = time.monotonic()
                     if cooldown_until > now:
                         cooldown_wait = True
@@ -833,7 +922,7 @@ class SpecialistDispatcher:
                             next_cooldown, cooldown_until)
                         continue
                     if cooldown_until:
-                        self.provider_cooldowns.pop(pool, None)
+                        self.provider_cooldowns.pop(cooldown_key, None)
                     entry = self.provider_pools.get(pool)
                     if entry is None:
                         entry = {"max_concurrent": self.max_parallel, "base_urls": []}
@@ -849,6 +938,7 @@ class SpecialistDispatcher:
                         "route_id": route_id,
                         "pool": pool if pool != "unpooled" else None,
                         "pool_key": pool,
+                        "cooldown_key": cooldown_key,
                         "config": effective,
                     }
                 if not capacity_wait and cooldown_wait:
@@ -871,12 +961,31 @@ class SpecialistDispatcher:
                     wait_for = min(wait_for, max(0.01, next_cooldown - time.monotonic()))
                 self.condition.wait(timeout=wait_for)
 
-    def _mark_provider_cooldown(self, pool, error):
-        """Quarantine a provider after a known route-level failure."""
-        if not isinstance(pool, str) or not pool:
+    def _mark_provider_cooldown(self, route, error):
+        """Quarantine one route after a known provider failure.
+
+        5xx responses are transient route failures and receive only a short
+        quarantine.  A missing Retry-After on a 500 must never turn into a
+        stage-length cooldown for every model sharing the endpoint.
+        """
+        if not isinstance(route, dict):
             return
+        pool = route.get("pool_key", route.get("pool"))
+        cooldown_key = route.get("cooldown_key") or self._cooldown_key(
+            route.get("route_id"), route, pool)
+        if not isinstance(cooldown_key, str) or not cooldown_key:
+            return
+        status_code = getattr(error, "status_code", None)
         delay = getattr(error, "retry_after_seconds", None)
-        if type(delay) in (int, float) and math.isfinite(delay) and delay > 0:
+        if status_code in {500, 502, 503, 504}:
+            # Do not inherit an unbounded stage deadline for a transient
+            # server failure.  A provider-supplied retry hint is still
+            # honored, but capped so another route can take over promptly.
+            if type(delay) not in (int, float) or not math.isfinite(delay) or delay <= 0:
+                delay = 15.0
+            delay = min(60.0, max(1.0, float(delay)))
+            until = time.monotonic() + delay
+        elif type(delay) in (int, float) and math.isfinite(delay) and delay > 0:
             until = time.monotonic() + float(delay)
         elif self.deadline is not None:
             until = self.deadline
@@ -884,15 +993,19 @@ class SpecialistDispatcher:
             # A dispatcher without a hard deadline still needs a finite
             # quarantine; callers can submit a later bounded assignment.
             until = time.monotonic() + 60.0
-        self.provider_cooldowns[pool] = max(until, self.provider_cooldowns.get(pool, 0.0))
+        self.provider_cooldowns[cooldown_key] = max(
+            until, self.provider_cooldowns.get(cooldown_key, 0.0))
 
     @staticmethod
     def _provider_route_failure(error):
         return getattr(error, "status_code", None) in {408, 425, 429, 500, 502, 503, 504}
 
-    def _provider_retry_limit(self, role):
-        pools = {pool for _route_id, pool, _route in self._routes(role) if pool}
-        return max(0, len(pools) - 1) if pools else max(0, len(self._routes(role)) - 1)
+    def _provider_retry_limit(self, role, *, allow_same_pool=False):
+        routes = self._routes(role)
+        if allow_same_pool:
+            return max(0, len(routes) - 1)
+        pools = {pool for _route_id, pool, _route in routes if pool}
+        return max(0, len(pools) - 1) if pools else max(0, len(routes) - 1)
 
     def _release_route(self, route):
         pool = route.get("pool_key", route.get("pool"))
@@ -936,9 +1049,8 @@ class SpecialistDispatcher:
         # not an unbounded provider retry.  Provider failures are a separate
         # technical concern: a 429/5xx from one route must not consume the
         # scientific assignment when another configured pool is healthy.
-        retry_limit = 1 if verifier and type(quota.get("max_calls")) is int \
+        retry_limit = 1 if type(quota.get("max_calls")) is int \
             and quota["max_calls"] >= 2 else 0
-        provider_retry_limit = self._provider_retry_limit(model_role)
         validation_retries = 0
         provider_retries = 0
         accumulated_usage = {}
@@ -950,9 +1062,16 @@ class SpecialistDispatcher:
             route = None
             response_received = False
             try:
-                current_prompt = prompt if validation_retries == 0 else _verifier_repair_prompt(
-                    prompt, last_validation_error, previous_text,
-                    max_input_tokens=max_input_tokens)
+                if validation_retries == 0:
+                    current_prompt = prompt
+                elif verifier:
+                    current_prompt = _verifier_repair_prompt(
+                        prompt, last_validation_error, previous_text,
+                        max_input_tokens=max_input_tokens)
+                else:
+                    current_prompt = _specialist_repair_prompt(
+                        prompt, last_validation_error, previous_text,
+                        max_input_tokens=max_input_tokens)
                 route = self._reserve_route(model_role, system=system, prompt=current_prompt, quota=quota)
                 config = deepcopy(route["config"])
                 if isinstance(quota.get("max_output_tokens"), int):
@@ -1026,8 +1145,13 @@ class SpecialistDispatcher:
                 continue
             except ModelCallError as exc:
                 if self._provider_route_failure(exc):
-                    self._mark_provider_cooldown(route.get("pool_key") if route else None, exc)
+                    self._mark_provider_cooldown(route, exc)
+                provider_retry_limit = (
+                    self._provider_retry_limit(model_role, allow_same_pool=True)
+                    if route is not None and self._provider_route_failure(exc) else 0
+                )
                 if (self._provider_route_failure(exc)
+                        and route is not None
                         and provider_retries < provider_retry_limit):
                     provider_retries += 1
                     retry_history.append({

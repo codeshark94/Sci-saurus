@@ -11,6 +11,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import math
+import re
 import time
 
 from scisaurus.core.errors import ValidationError
@@ -52,6 +53,43 @@ def _public_text(value, name):
         names = ", ".join(sorted({item["kind"] for item in leaks}))
         raise ValidationError(f"{name} exposes control-plane vocabulary: {names}")
     return value
+
+
+def _generated_string_list(value):
+    """Repair only unambiguous list serialization mistakes from a model.
+
+    The interpretation contract is intentionally strict, but a compatible
+    model will occasionally serialize a one-item list as a string or join
+    several items with line breaks/semicolons.  Splitting only explicit list
+    separators preserves the model's words while avoiding a semantic rewrite
+    of prose that happens to contain commas.  Values with any other shape are
+    left untouched so validation still rejects them.
+    """
+    if isinstance(value, list):
+        if not all(isinstance(item, str) and item.strip() for item in value):
+            return value
+        return list(dict.fromkeys(item.strip() for item in value))
+    if not isinstance(value, str) or not value.strip():
+        return value
+    parts = [part.strip(" \t-*\u2022") for part in re.split(r"\r?\n+|;", value)
+             if part.strip(" \t-*\u2022")]
+    return parts or [value.strip()]
+
+
+def _normalize_generated_interpretation(value):
+    """Apply bounded, loss-preserving repairs before schema validation."""
+    if not isinstance(value, dict):
+        return value
+    normalized = deepcopy(value)
+    experiments = normalized.get("discriminating_experiments")
+    if isinstance(experiments, list):
+        for experiment in experiments:
+            if not isinstance(experiment, dict):
+                continue
+            for key in ("predictions", "required_measurements"):
+                if key in experiment:
+                    experiment[key] = _generated_string_list(experiment[key])
+    return normalized
 
 
 def validate_interpretation(value, *, evidence_ids=None):
@@ -234,11 +272,19 @@ class ScientificInterpretationRunner:
                 if result.finish_reason != "stop":
                     raise ValidationError("scientific interpretation did not finish normally")
                 parsed = result.json_object()
-                interpretation = parsed
+                interpretation = _normalize_generated_interpretation(parsed)
                 validate_interpretation(interpretation, evidence_ids=evidence_ids)
             except ValidationError as exc:
                 last_error = exc
                 if attempt + 1 >= max_attempts:
+                    # The stage may fail before returning a result envelope.
+                    # Preserve the calls already spent so Composer accounting
+                    # and the repair dossier cannot report a false zero.
+                    exc.usage = deepcopy(total_usage)
+                    exc.model_diagnostics = {
+                        "attempts": attempt + 1,
+                        "last_validation_error": str(exc),
+                    }
                     raise
                 feedback = {"error": str(exc), "previous_response": parsed if parsed is not None else result.text}
                 continue

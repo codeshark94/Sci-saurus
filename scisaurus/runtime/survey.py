@@ -22,7 +22,8 @@ from scisaurus.runtime.bibliographic_identity import reconcile_result
 from scisaurus.runtime.models import ModelResult, estimate_input_tokens
 from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
 from scisaurus.runtime.literature import (
-    SEARCH_SYNTAX, ProviderCooldownError, provider_cooldown_seconds,
+    SEARCH_SYNTAX, ProviderCooldownError, preferred_full_text_url, preferred_oa_pdf_url,
+    provider_cooldown_seconds,
 )
 from scisaurus.runtime.operations import OperationsCell
 from scisaurus.runtime.scores import exact, identifier
@@ -36,6 +37,19 @@ from scisaurus.runtime.time_policy import TimePolicy
 
 def normalized(text):
     return " ".join(re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold()))
+
+
+def _has_section_heading(text, marker):
+    expected = normalized(marker)
+    if not expected:
+        return False
+    for line in text.splitlines():
+        candidate = re.sub(r"^\s*#{1,6}\s*", "", line).strip()
+        candidate = re.sub(r"^\d+(?:\.\d+)*[.)]?\s+", "", candidate)
+        candidate = candidate.strip(" -*_`")
+        if normalized(candidate) == expected:
+            return True
+    return False
 
 
 _SEARCH_STOP_WORDS = frozenset({
@@ -603,6 +617,15 @@ class SurveyRunner(ExecutionRuntime):
                 "Return only the final JSON object using the required fields and enums. "
                 "Keep explanations concise; omit analysis transcripts, preambles and repeated input. "
                 "Preserve the evidence contract; use supplied evidence IDs when available.")
+        if assignment.get("phase") == "gap_assessment":
+            # Gap assessment is an aggregate decision over a large packet.  A
+            # contract repair does not need to replay source windows, retrieval
+            # logs, and the prior transcript: the evidence catalog already
+            # contains the exact selectable spans and their owning work IDs.
+            # Keeping the repair packet small prevents the verifier from
+            # spending its output budget narrating the input instead of
+            # returning the required object.
+            assignment = self._compact_gap_repair_assignment(assignment)
         limit = self._map_input_limit(job["actor"])
         if limit is None or estimate_input_tokens(SYSTEM, json.dumps(assignment, ensure_ascii=False)) <= limit:
             return assignment
@@ -624,10 +647,130 @@ class SurveyRunner(ExecutionRuntime):
             raise ModelWorkBlocked(f"{job['name']} repair contract cannot fit its configured input budget")
         return assignment
 
+    @staticmethod
+    def _assessment_evidence_ids(proofs, catalog):
+        """Project map evidence to the stable IDs available to a repair call."""
+        if not isinstance(proofs, list):
+            return []
+        ids = []
+        for proof in proofs:
+            if not isinstance(proof, dict):
+                continue
+            matches = [item for item in catalog if (
+                item.get("work_id") == proof.get("work_id")
+                and item.get("source_ref") == proof.get("source_ref")
+                and item.get("quote") == proof.get("quote"))]
+            if len(matches) == 1 and matches[0].get("evidence_id") not in ids:
+                ids.append(matches[0]["evidence_id"])
+        return ids
+
+    def _compact_gap_repair_assignment(self, assignment):
+        """Build a bounded, evidence-addressable packet for gap repairs.
+
+        The initial assessment may legitimately include many source windows.
+        Replaying that packet after a transport or cross-citation failure is
+        counterproductive: it gives a reasoning-heavy model thousands of
+        irrelevant tokens to restate.  This projection retains the question,
+        coverage limits, claim index, exact evidence catalog, and validation
+        contract while removing source bodies and prior model prose.
+        """
+        catalog = [deepcopy(item) for item in assignment.get("evidence_catalog", [])
+                   if isinstance(item, dict) and isinstance(item.get("evidence_id"), str)]
+        map_body = assignment.get("map") if isinstance(assignment.get("map"), dict) else {}
+        entries = []
+        for entry in map_body.get("entries", []):
+            if not isinstance(entry, dict) or not isinstance(entry.get("work_id"), str):
+                continue
+            projected = {
+                "work_id": entry["work_id"],
+                "inclusion": entry.get("inclusion"),
+                "reason": str(entry.get("reason") or "")[:320],
+                "evidence_by_field": {},
+            }
+            for field in MAP_FIELDS:
+                statement = entry.get(field)
+                if not isinstance(statement, dict) or statement.get("text") is None:
+                    continue
+                ids = self._assessment_evidence_ids(statement.get("evidence"), catalog)
+                projected["evidence_by_field"][field] = ids
+            entries.append(projected)
+        relationships = []
+        for relation in map_body.get("relationships", []):
+            if not isinstance(relation, dict):
+                continue
+            claim = relation.get("claim") if isinstance(relation.get("claim"), dict) else {}
+            relationships.append({
+                "source": relation.get("source"), "target": relation.get("target"),
+                "kind": relation.get("kind"),
+                "evidence_ids": self._assessment_evidence_ids(claim.get("evidence"), catalog),
+            })
+        coverage = self._compact_assessment_coverage(assignment.get("coverage", {}))
+        # Search rows and source windows are useful bounds, but their detailed
+        # payload is not needed to choose a same-work evidence ID.
+        coverage["searches"] = [
+            {key: row.get(key) for key in ("request", "outcome", "provider", "has_more")
+             if key in row}
+            for row in coverage.get("searches", []) if isinstance(row, dict)
+        ]
+        sources = [
+            {key: source.get(key) for key in (
+                "source_ref", "work_id", "representation", "identity_verified", "available_chars")
+             if key in source}
+            for source in assignment.get("sources", [])
+            if isinstance(source, dict)
+        ]
+        feedback = assignment.get("validation_feedback")
+        if isinstance(feedback, dict):
+            feedback = {key: deepcopy(value) for key, value in feedback.items()
+                        if key not in {"previous_response", "previous_response_excerpt"}}
+            if "previous_response" in assignment.get("validation_feedback", {}):
+                feedback["previous_response_omitted"] = True
+        return {
+            "assignment": assignment.get("assignment"),
+            "phase": "gap_assessment",
+            "question": deepcopy(assignment.get("question")),
+            "gap": deepcopy(assignment.get("gap")),
+            "nomination_ref": assignment.get("nomination_ref"),
+            "survey_ref": assignment.get("survey_ref"),
+            "prerequisite_survey_ref": assignment.get("prerequisite_survey_ref"),
+            "claim_index": {"entries": entries, "relationships": relationships},
+            "coverage": coverage,
+            "sources": sources,
+            "verified_full_text_refs": deepcopy(assignment.get("verified_full_text_refs", [])),
+            "evidence_catalog": catalog,
+            "required_checks": deepcopy(assignment.get("required_checks", [])),
+            "allowed_check_outcomes": deepcopy(assignment.get("allowed_check_outcomes", [])),
+            "instructions": (
+                "Return exactly one compact JSON object and nothing else; do not emit analysis, "
+                "a preamble, markdown, or a transcript. Use only evidence_id values from "
+                "evidence_catalog. Every comparison's evidence_id must have the same work_id "
+                "as that comparison; if no same-work evidence is available, omit it or use "
+                "relationship=uncertain with evidence=[]. Run each required check exactly once. "
+                "Use insufficient_evidence whenever a decision-critical comparison or verified "
+                "full text is unavailable. Keep rationale and check results concise."
+            ),
+            **({"validation_feedback": feedback} if feedback else {}),
+            **({"resume_boundary": assignment["resume_boundary"]}
+               if "resume_boundary" in assignment else {}),
+            **({"_contract_repair_boundary": assignment["_contract_repair_boundary"]}
+               if "_contract_repair_boundary" in assignment else {}),
+        }
+
+    @staticmethod
+    def _is_contract_failure(state):
+        """Return whether a retained blocker is safe for one scoped model repair."""
+        if not isinstance(state, dict):
+            return False
+        text = " ".join(str(state.get(key, "")) for key in ("error", "feedback")).casefold()
+        return any(marker in text for marker in (
+            "valid json", "evidence contract", "generation length",
+            "did not finish normally", "unknown or duplicate required check",
+        ))
+
     def _models_checked(self, jobs, *, stage="production", task_kind="production"):
         """Retain checked siblings and bound repairs of each exact assignment."""
         cache = ModelWorkCache(self.store, self._publish)
-        pending, results, keys, states = [], {}, {}, {}
+        pending, results, keys, states, feedback = [], {}, {}, {}, {}
         def abstain(job, state):
             handler = job.get("on_exhausted")
             if not handler or not state.get("feedback") or "did not satisfy its evidence contract" not in state.get("error", ""):
@@ -693,14 +836,55 @@ class SurveyRunner(ExecutionRuntime):
                     continue
                 if abstain(job, retained):
                     continue
+                # A Composer retry may reopen a stage while retaining the
+                # same durable runner.  Do not replay an exhausted model-work
+                # key forever: give this exact resume session one fresh cache
+                # identity and a compact repair packet.  A second blocker on
+                # that identity remains terminal for the session and is then
+                # visible to the Composer's scoped recovery policy.
+                if (isinstance(self.resume_session, dict)
+                        and isinstance(self.resume_session.get("session"), int)
+                        and job["assignment"].get("phase") == "gap_assessment"
+                        and self._is_contract_failure(retained)
+                        and "_contract_repair_boundary" not in job["assignment"]):
+                    repair_assignment = deepcopy(job["assignment"])
+                    repair_assignment["_contract_repair_boundary"] = (
+                        f"model-contract-repair-{self.resume_session['session']}")
+                    job["assignment"] = repair_assignment
+                    repair_key = cache.key(
+                        scope=f"survey:{job['name']}", role=job["actor"],
+                        system=SYSTEM, prompt=job["assignment"], model=model)
+                    keys[job["name"]] = repair_key
+                    repair_retained = cache.get(repair_key)
+                    if repair_retained and repair_retained.get("status") in {"succeeded", "abstained"}:
+                        value = deepcopy(repair_retained["value"])
+                        try:
+                            if job.get("normalizer"):
+                                value = job["normalizer"](value)
+                            job["validator"](value)
+                        except (ValidationError, TypeError, ValueError, KeyError) as exc:
+                            raise ModelWorkBlocked(
+                                f"{job['name']} retained repair failed validation: {exc}") from exc
+                        if job.get("on_valid"):
+                            job["on_valid"](value, repair_retained["execution_ref"])
+                        results[job["name"]] = (value, repair_retained["execution_ref"])
+                        continue
+                    if repair_retained and repair_retained.get("status") == "blocked":
+                        if abstain(job, repair_retained):
+                            continue
+                        raise ModelWorkBlocked(repair_retained["error"])
+                    states[job["name"]] = repair_retained or {}
+                    pending.append(job)
+                    feedback[job["name"]] = recovery or retained.get("feedback")
+                    continue
                 raise ModelWorkBlocked(retained["error"])
             states[job["name"]] = retained or {}
             pending.append(job)
         if not pending:
             return results
-        feedback = {job["name"]: retained for job in pending
-                    if (retained := states[job["name"]].get("feedback") or
-                        self._retained_validation_feedback(job["name"], job["assignment"])) is not None}
+        feedback.update({job["name"]: retained for job in pending
+                         if (retained := states[job["name"]].get("feedback") or
+                             self._retained_validation_feedback(job["name"], job["assignment"])) is not None})
         rounds = range(self.config["limits"]["max_rounds"])
         # A multi-provider run uses a small rolling dispatch buffer.  The
         # execution runtime already backfills a returned slot immediately;
@@ -749,9 +933,11 @@ class SurveyRunner(ExecutionRuntime):
                         value = {"raw_text": result.text}
                     proposal = self._publish(f"kb/model-proposals/{task_id}", "note", value, actor, subjects=[execution])
                     try:
-                        if result.finish_reason != "stop":
+                        transport_recovered = False
+                        if result.finish_reason not in {"stop", "length"}:
                             raise ValidationError(f"model generation did not finish normally: {result.finish_reason}")
                         value = result.json_object(allow_missing_closers=True)
+                        transport_recovered = result.finish_reason == "length"
                         if job.get("normalizer"):
                             value = job["normalizer"](value)
                         job["validator"](value)
@@ -776,6 +962,7 @@ class SurveyRunner(ExecutionRuntime):
                     self._ensure_active()
                     cache.put(keys[job["name"]], {
                         "status": "succeeded", "value": value, "execution_ref": execution,
+                        "transport_recovered": transport_recovered,
                     }, subjects=[execution])
                     if job.get("on_valid"):
                         job["on_valid"](value, execution)
@@ -836,6 +1023,7 @@ class SurveyRunner(ExecutionRuntime):
                 continue
             client = deepcopy(definition["client"])
             if definition["adapter"] == "mcp_fetch":
+                client["result_max_bytes"] = self.config["limits"]["max_result_bytes"]
                 client.update(cwd=str(self.operations.workspace_dir(definition["id"])), own_process_group=False)
             if self.resume_session:
                 self.operations.reconcile_interrupted(definition["id"], resume_ref=self.resume_session["artifact_ref"])
@@ -1295,7 +1483,13 @@ class SurveyRunner(ExecutionRuntime):
     def _full_texts(self):
         if "full_text" not in self.bindings:
             return
-        routes = [(route, False) for route in self.score["full_text_sources"]]
+        routes = []
+        for configured in self.score["full_text_sources"]:
+            route = deepcopy(configured)
+            wid = self.aliases.get(route["work_id"], route["work_id"])
+            fallback = preferred_oa_pdf_url(self.works.get(wid, {}).get("locations"))
+            route["fallback_urls"] = [fallback] if fallback and fallback != route["url"] else []
+            routes.append((route, False))
         selected_ids = self._analysis_selection()
         analysis_limit = self.bounds.get("max_analyzed_works", self.bounds["max_works"])
         auto_full_text_limit = min(
@@ -1314,20 +1508,19 @@ class SurveyRunner(ExecutionRuntime):
                 work = self.works[wid]
                 if not isinstance(wid, str) or wid in known:
                     continue
-                locations = work.get("locations") or []
-                location = next((item for item in locations if isinstance(item, dict)
-                                 and (item.get("pdf_url") or item.get("landing_page_url"))), None)
-                url = ((location.get("pdf_url") or location.get("landing_page_url")) if location else None)
+                url = preferred_full_text_url(work.get("locations"))
                 url = url or work.get("source_url")
                 if not isinstance(url, str) or not url.strip():
                     doi = work.get("doi")
                     url = "https://doi.org/" + doi if isinstance(doi, str) and doi.strip() else None
                 if not isinstance(url, str) or not url.strip():
                     continue
+                pdf_fallback = preferred_oa_pdf_url(work.get("locations"))
                 routes.append(({
                     "work_id": wid,
                     "title": work.get("title") or wid,
                     "url": url,
+                    "fallback_urls": [pdf_fallback] if pdf_fallback and pdf_fallback != url else [],
                     "section_markers": ["Introduction"],
                 }, True))
                 known.add(wid)
@@ -1346,57 +1539,83 @@ class SurveyRunner(ExecutionRuntime):
                 self.gaps.append({"kind": "full_text_limit", "work_id": wid})
                 break
             self.full_text_attempted.add(wid)
-            self._record(f"command/source-attempts/full-text/{wid}", "note", {
-                "work_id": wid, "url": route["url"], "status": "reserved",
-                "scope": "bounded full-text acquisition; outcome is recorded by the execution task",
-            }, "command.controller", subjects=[self.work_records[wid]["artifact_ref"]])
-            try:
-                self._wait_provider("full_text")
-                result, execution = self.operations.run(self.bindings["full_text"],
-                    {"url": route["url"], "max_length": self.bounds["max_text_chars"]}, self._call,
-                    operator="research.full-text-reader")
-            except Exception as exc:
-                self._ensure_active()
-                self.gaps.append({"kind": "full_text_failure", "work_id": wid, "reason": str(exc)})
-                self.bindings.pop("full_text", None)
-                # Operations deliberately degrades a capability after a bad
-                # workload.  If more bounded routes remain, re-probe and
-                # re-bind the same pinned capability before trying the next
-                # source; one paywalled or malformed landing page should not
-                # discard otherwise reachable open literature.
-                if index + 1 >= len(routes):
-                    break
+            candidate_urls = list(dict.fromkeys([route["url"], *route.get("fallback_urls", [])]))[:2]
+            verified_source = None
+            unverified_source = None
+            for source_index, source_url in enumerate(candidate_urls):
+                self._record(f"command/source-attempts/full-text/{wid}-{source_index + 1}", "note", {
+                    "work_id": wid, "url": source_url, "status": "reserved",
+                    "route": "primary" if source_index == 0 else "open_access_pdf_fallback",
+                    "scope": "One bounded source attempt; access denials are retained without bypass.",
+                }, "command.controller", subjects=[self.work_records[wid]["artifact_ref"]])
                 try:
-                    capability_id = self.score["full_text"]["id"]
-                    state = self.operations.ensure_ready(
-                        capability_id, self._call,
-                        operator="research.full-text-reader.recovery",
-                        verifier="operations.verifier.full-text-recovery",
-                        purpose="Recover the verified full-text route after a bounded workload failure",
-                    )
-                    if state.get("state") != "ready":
-                        break
-                    self.bindings["full_text"] = state["binding"]
-                    self.operations.idle(capability_id)
-                except Exception as recovery_exc:
+                    self._wait_provider("full_text")
+                    result, execution = self.operations.run(self.bindings["full_text"],
+                        {"url": source_url, "max_length": self.bounds["max_text_chars"]}, self._call,
+                        operator="research.full-text-reader")
+                except Exception as exc:
                     self._ensure_active()
-                    self.gaps.append({"kind": "full_text_recovery_failure", "work_id": wid,
-                                      "reason": str(recovery_exc)})
+                    self.gaps.append({"kind": "full_text_failure", "work_id": wid,
+                                      "source_url": source_url, "reason": str(exc)})
+                    self.bindings.pop("full_text", None)
+                    try:
+                        capability_id = self.score["full_text"]["id"]
+                        state = self.operations.ensure_ready(
+                            capability_id, self._call,
+                            operator="research.full-text-reader.recovery",
+                            verifier="operations.verifier.full-text-recovery",
+                            purpose="Recover the text-fetch capability after a bounded source attempt",
+                        )
+                        if state.get("state") != "ready":
+                            break
+                        self.bindings["full_text"] = state["binding"]
+                        self.operations.idle(capability_id)
+                    except Exception as recovery_exc:
+                        self._ensure_active()
+                        self.gaps.append({"kind": "full_text_recovery_failure", "work_id": wid,
+                                          "reason": str(recovery_exc)})
+                        break
+                    continue
+                if result.get("outcome") != "ok":
+                    self.gaps.append({
+                        "kind": "full_text_failure", "work_id": wid, "source_url": source_url,
+                        "outcome": result.get("outcome"),
+                        "reason": result.get("error") or "Source did not yield complete extracted text",
+                    })
+                    if result.get("outcome") in {
+                            "access_denied", "auth_required", "rate_limited", "robots_denied",
+                            "robots_unavailable", "provider_error"}:
+                        break
+                    continue
+                text = result["text"]
+                title_match = (normalized(self.works[wid]["title"]) == normalized(route["title"])
+                               and normalized(route["title"]) in normalized(text))
+                section_markers = route["section_markers"]
+                body_markers = [marker for marker in section_markers
+                                if normalized(marker) not in {"abstract", "summary"}]
+                sections_match = bool(body_markers) and all(
+                    _has_section_heading(text, marker) for marker in section_markers)
+                complete = not any(result["metadata"].get(key)
+                                   for key in ("capture_truncated", "capture_incomplete"))
+                source_body = {"work_id": wid,
+                    "representation": "full_text" if title_match and sections_match and complete else "unverified_text",
+                    "text": text, "url": source_url, "execution_ref": execution,
+                    "identity_verified": bool(title_match and sections_match and complete),
+                    "identity_checks": {"title_match": title_match,
+                                        "section_markers": section_markers if sections_match else []}}
+                if source_body["identity_verified"]:
+                    verified_source = source_body
                     break
+                self.gaps.append({"kind": "full_text_identity_or_scope", "work_id": wid,
+                                  "source_url": source_url})
+                unverified_source = source_body
+            body = verified_source or unverified_source
+            if body is None:
                 continue
-            text = result["text"]
-            title_match = normalized(self.works[wid]["title"]) == normalized(route["title"]) and normalized(route["title"]) in normalized(text)
-            sections_match = all(normalized(marker) in normalized(text) for marker in route["section_markers"])
-            verified = title_match and sections_match and not any(result["metadata"].get(key) for key in ("capture_truncated", "capture_incomplete"))
-            body = {"work_id": wid, "representation": "full_text" if verified else "unverified_text",
-                    "text": text, "url": route["url"], "execution_ref": execution, "identity_verified": verified,
-                    "identity_checks": {"title_match": title_match, "section_markers": route["section_markers"] if sections_match else []}}
             record = self._publish(f"kb/full-text/{wid}", "source_capture", body, "methods.source-verifier",
                                    subjects=[execution, self.work_records[wid]["artifact_ref"]])
             self.source_records[f"full_text/{wid}"] = record
             self.source_docs[record["artifact_ref"]] = body
-            if not verified:
-                self.gaps.append({"kind": "full_text_identity_or_scope", "work_id": wid})
             self._update_register()
 
     def _reconcile_identities(self):
@@ -2997,6 +3216,23 @@ class SurveyRunner(ExecutionRuntime):
                 "Eligibility requires meaningful, testable distinction, no prior solution or unresolved comparison, and adequate search coverage. "
                 "It authorizes an experiment under the stated scope, never publication-ready novelty. Do not force a positive finding to finish the task."
         }
+        if (self.resume_session
+                and "gap_assessment" in self.resume_session.get("reopened_scopes", [])):
+            # A Composer continuation is an explicit new assessment attempt.
+            # Keep the accepted survey and source catalogue, but give the
+            # model-work cache a new assignment identity so a previous
+            # evidence-contract failure cannot be replayed forever without a
+            # call.  The boundary is transport metadata only; it does not
+            # change the scientific question or evidence set.
+            session = self.resume_session.get("session")
+            if type(session) is int and session >= 1:
+                assessment_assignment["resume_boundary"] = f"gap-assessment-resume-{session}"
+            assessment_assignment["instructions"] += (
+                " Each comparison is independently scoped: for a comparison with work_id=W, "
+                "every evidence item in that comparison must resolve to the same W. "
+                "If the supplied evidence belongs to another work or cannot be mapped unambiguously, "
+                "omit that comparison or mark it uncertain with an empty evidence list; never cross-cite."
+            )
         assessment_assignment = self._fit_assessment_assignment(assessment_assignment)
         assessment_sources = assessment_assignment["sources"]
         assessment_source_lookup = {source["source_ref"]: self.source_docs[source["source_ref"]]
@@ -3013,6 +3249,10 @@ class SurveyRunner(ExecutionRuntime):
                 normalize_check_envelope(value, GAP_CHECKS),
                 assessment_assignment["evidence_catalog"], self.source_docs,
                 windows=windows), assessment_sources),
+            # This is a compact decision envelope, not a prose generation
+            # task.  A small output cap prevents a provider from spending the
+            # entire response on analysis text and returning no JSON object.
+            model_overrides={"max_output_tokens": 2048, "temperature": 0.0},
             stage="integrated_review", task_kind="verification")
         record = self._publish("kb/gap-assessments/current", "note", {
             "survey_ref": self.survey_ref, "nomination_ref": self.nomination_record["artifact_ref"],

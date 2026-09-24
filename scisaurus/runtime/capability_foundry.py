@@ -44,6 +44,9 @@ SYSTEM = (
     "You are the program-authoring specialist for an autonomous research laboratory. "
     "You write ONE deterministic, seeded experiment program and ONE independently authored "
     "validator that recalculates the declared outcomes from the recorded observations alone. "
+    "Independence means a separate implementation of the same declared estimand, not a different "
+    "statistical convention or a silently changed target. If a repair changes an estimator, update "
+    "the intent, executor, and validator together and state the new convention explicitly. "
     "Never use the network, subprocesses, eval/exec, or open(); use only json, math, statistics, "
     "hashlib, pathlib, sys, itertools, functools, random, collections, dataclasses, typing, "
     "decimal, fractions, re, time, os, numpy and matplotlib. "
@@ -296,7 +299,9 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
                                 "{'configured_input','candidate','candidate_sha256'} (or 'primary_outcomes') "
                                 "from stdin and writes {'schema_version':'experiment-validation-1',"
                                 "'study_id','candidate_sha256','decision','checks','metric_recalculations',"
-                                "'limitations'}; decision 'accepted' only when every recalculation matches; "
+                                "'limitations'}; a censored/undefined metric is represented by matching null "
+                                "reported_value and recalculated_value, never by an invented boundary or zero; "
+                                "decision 'accepted' only when every recalculation matches; "
                                 "when the input is exactly {'readiness_probe':true}, return exactly "
                                 "{'status':'ready'} without running a scientific validation",
             "experiment_intent": {
@@ -322,7 +327,10 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
         "configured_input": test_input,
         "optional_intent_fields": {"quality_contract": {
             "requirement": "Required for novel_research; optional for exploratory and validation studies. "
-                           "If supplied, the executor must also produce a matching analysis summary.",
+                           "It is a downstream substantive-analysis floor, not a pre-execution response-format gate. "
+                           "The executor may omit the reader-facing analysis summary when it can still emit valid "
+                           "procedures, observations, metrics, findings, limitations and assets; the controller "
+                           "records a quality-admission work order after replay and independent recalculation.",
             "example": default_research_quality_contract(),
         }},
         "stdin_examples": {
@@ -361,9 +369,9 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             "checks": [{"id": "unique_identifier", "outcome": "passed|failed",
                         "evidence": "nonempty description of the observed check"}],
             "metric_recalculations": [{"metric_id": "exact primary outcome id",
-                "reported_value": "exact finite candidate metric value",
-                "recalculated_value": "finite value independently recomputed from observations",
-                "tolerance": "nonnegative finite number", "matches": "boolean matching the numerical comparison"}],
+                "reported_value": "exact candidate metric value, or null for an explicitly censored/undefined estimand",
+                "recalculated_value": "finite value independently recomputed from observations, or matching null",
+                "tolerance": "nonnegative finite number", "matches": "boolean; matching nulls are reproducible censoring"}],
             "limitations": ["bounded limitations of this recalculation"],
         },
         "experiment_intent_example": {
@@ -411,11 +419,33 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             "is estimable. If the design cannot estimate it, revise the design or declare finite diagnostic "
             "outcomes such as degeneracy counts with an explicitly limited conclusion. Never present an "
             "undefined correlation as zero or as evidence that a hypothesized effect is absent",
+            "A metric value may be JSON null only when the estimator is explicitly censored or undefined and the "
+            "finding/presentation states the reason. The validator must reproduce the same null status. Never map "
+            "censoring or undefinedness to zero, a grid endpoint, NaN, or Infinity.",
             "the validator must not import or copy the executor source",
             "the validator must recompute every declared primary_outcome from observations only",
             "every observation row must carry a replicate index and the raw values used for the metrics",
             "for every primary metric, define one explicit formula and interpolation convention in the method; "
-            "the executor and independently written validator must implement that same declared formula from raw observations",
+            "the executor and independently written validator must implement that same declared formula from raw observations. "
+            "Independent code may use a different algorithm or ordering, but it must not substitute a different "
+            "estimand: for example, nearest-rank cannot validate a linear-interpolation percentile, and a different "
+            "percentile, trim rule, normalization, threshold direction, baseline, or aggregation cannot be used "
+            "for the primary metric. Put any sensitivity convention in a separately labelled secondary diagnostic, "
+            "never in trace_consistent or the primary metric recalculation.",
+            "When the question is about a dynamical or mechanistic transition, the primary response must be produced "
+            "by integrating or otherwise evaluating the declared state evolution across the intervention grid; "
+            "do not call a closed-form threshold or a parameter substituted into an answer a measured transition. "
+            "If an analytic comparator is useful, keep it as a separately labelled comparator and retain the simulated response.",
+            "A crossing estimator must return an explicit censored or undefined status when no interior crossing exists. "
+            "A primary metric may carry JSON null for that status when its finding/presentation records the reason. "
+            "Never replace a no-crossing, first-grid, or last-grid result with an endpoint, zero, NaN, or Infinity.",
+            "If the observed grid is censored at a boundary but the research question or hypothesis claims an interior "
+            "transition, do not manufacture an onset or merely alter the validator. Repair the scientific design by "
+            "changing the intervention grid, dynamics, or explicitly measurable estimand, and revise the intent and "
+            "both programs together; otherwise preserve the null as a bounded negative result.",
+            "If repair evidence reports constant observations, a boundary fallback, a dimension mismatch, or a "
+            "declared intervention that does not enter the dynamics, discard that method and author a materially "
+            "different executable design. Changing only a threshold or relabelling the same algebraic output is not repair.",
             "the validator must emit one metric_recalculations row for every declared primary outcome, including "
             "reported_value, recalculated_value, tolerance, and matches",
             "Every primary outcome must be sensitive to at least one declared intervention or stochastic draw when the "
@@ -673,24 +703,52 @@ class CapabilityFoundry:
 
     def generate(self, brief, *, test_input=None, required_intent=None, client=None,
                  work_cache=None, on_progress=None, deadline=None,
-                 model_call_budget=None):
+                 model_call_budget=None, repair_provenance=None):
         if model_call_budget is not None and (
                 type(model_call_budget) is not int or model_call_budget < 1):
             raise ValidationError("foundry model_call_budget must be a positive integer when supplied")
         self.deadline = deadline
+        author_role = "research.experiment-author"
+        author_route_configs = []
         if client is None:
             model_config = self._model_config_for_role(
-                "research.experiment-author", self.author_max_output_tokens)
+                author_role, self.author_max_output_tokens)
             model_config["timeout_seconds"] = min(
                 float(model_config["timeout_seconds"]), float(self.model_timeout_seconds))
-            client = ModelClient(**model_config)
+            author_route_configs.append(model_config)
+            # Keep a malformed response from consuming the whole authoring
+            # lease on one model.  Fallbacks are instantiated lazily and only
+            # after a transport/schema defect; scientific gate failures stay
+            # on the current route so the Composer's methods repair path keeps
+            # its meaning.
+            for alternative in self.model_config.get("role_model_fallbacks", {}).get(
+                    author_role, []):
+                fallback_model = deepcopy_config(self.model_config)
+                fallback_model.setdefault("role_models", {})[author_role] = deepcopy_config(alternative)
+                fallback_config = resolve_model_config(fallback_model, role=author_role)
+                requested = max(int(fallback_config["max_output_tokens"]), int(self.author_max_output_tokens))
+                window = fallback_config.get("context_window_tokens")
+                input_limit = fallback_config.get("max_input_tokens")
+                if type(window) is int:
+                    available = window - (input_limit if type(input_limit) is int else 1024)
+                    if available <= 0:
+                        continue
+                    requested = min(requested, available)
+                fallback_config["max_output_tokens"] = requested
+                fallback_config["timeout_seconds"] = min(
+                    float(fallback_config["timeout_seconds"]), float(self.model_timeout_seconds))
+                if not all(
+                        fallback_config.get(key) == author_route_configs[0].get(key)
+                        for key in ("base_url", "model", "auth_env")):
+                    author_route_configs.append(fallback_config)
+            client = ModelClient(**author_route_configs[0])
         runtime = self._runtime()
         configured_input = test_input if test_input is not None else {"probe": True}
         base_prompt = candidate_prompt(brief, self.runtime_packages, configured_input,
             required_intent=required_intent, runtime_version=runtime["python"])
         key = None
         state = {"status": "pending", "attempts": 0, "usage": {}, "requests": [],
-                 "repair_gate_counts": {},
+                 "repair_gate_counts": {}, "repair_ledger": [],
                  "assignment": base_prompt}
         if work_cache is not None:
             contract = hashlib.sha256()
@@ -699,7 +757,9 @@ class CapabilityFoundry:
                          "program_admission.py", "program_gates.py", "program_sandbox.py"):
                 contract.update((Path(__file__).parent / name).read_bytes())
             key = work_cache.key(scope="experiment-capability", role="research.experiment-author",
-                system=SYSTEM, prompt={"assignment": base_prompt, "validation_contract": contract.hexdigest()},
+                system=SYSTEM, prompt={"assignment": base_prompt,
+                    "validation_contract": contract.hexdigest(),
+                    "repair_provenance": repair_provenance},
                 model={name: value for name, value in self.model_config.items() if name != "timeout_seconds"})
             state = work_cache.get(key) or state
             state.pop("cache_ref", None)
@@ -757,11 +817,53 @@ class CapabilityFoundry:
                             state.setdefault("scientific_reviews", {})[identity] = deepcopy_config(review)
                     break
 
+        author_route_index = state.get("author_route_index", 0)
+        if type(author_route_index) is not int or author_route_index < 0:
+            author_route_index = 0
+        if author_route_configs:
+            author_route_index = min(author_route_index, len(author_route_configs) - 1)
+            state["author_route_index"] = author_route_index
+            if author_route_index:
+                client = ModelClient(**author_route_configs[author_route_index])
+
         def save(phase):
             if work_cache is not None:
                 work_cache.put(key, state)
             if on_progress is not None:
                 on_progress(phase, deepcopy_config(state))
+
+        def repair_exhausted_error():
+            """Return a structured blocker for Composer's experiment repair loop."""
+            error = ModelWorkBlocked(state["error"])
+            error.failure_class = "experiment_capability_repair"
+            exhausted = state.get("repair_budget_exhausted")
+            exhausted = exhausted if isinstance(exhausted, dict) else {}
+            error.repair_gate = exhausted.get("gate")
+            error.repair_attempts = exhausted.get("failures", 0)
+            error.repair_ledger = deepcopy_config(state.get("repair_ledger", [])[-8:])
+            error.repair_feedback = deepcopy_config({
+                "gate": error.repair_gate,
+                "feedback": state.get("feedback"),
+                "validation_context": state.get("validation_context", {}),
+                "validation_feedback": state.get("validation_feedback", {}),
+            })
+            return error
+
+        def switch_author_route(reason):
+            """Move once to the next author route for format-only failures."""
+            nonlocal client, author_route_index
+            if not author_route_configs or author_route_index + 1 >= len(author_route_configs):
+                return False
+            author_route_index += 1
+            client = ModelClient(**author_route_configs[author_route_index])
+            state["author_route_index"] = author_route_index
+            state.setdefault("route_events", []).append({
+                "from": author_route_configs[author_route_index - 1].get("model"),
+                "to": author_route_configs[author_route_index].get("model"),
+                "reason": str(reason)[:800],
+            })
+            save("author_format_route_fallback")
+            return True
 
         state["repair_gate_counts"] = _seed_repair_gate_counts(state)
         if model_call_budget is not None:
@@ -900,7 +1002,7 @@ class CapabilityFoundry:
             return result
 
         if state["status"] == "blocked":
-            raise ModelWorkBlocked(state["error"])
+            raise repair_exhausted_error()
         if state["status"] == "succeeded":
             descriptor = Path(state["outcome"]["registration"]["descriptor_path"])
             if (not descriptor.is_file() or hashlib.sha256(descriptor.read_bytes()).hexdigest()
@@ -946,6 +1048,23 @@ class CapabilityFoundry:
                     "previous_attempt": last_attempt,
                     "observed_failure_context": state.get("validation_context", {}),
                     "validation_feedback": state.get("validation_feedback", {}),
+                    "repair_protocol": {
+                        "sequence": [
+                            "diagnose the first invalid scientific assumption from the exact trace",
+                            "edit the executor and validator source when the mechanism or estimand is wrong",
+                            "rerun in a fresh sandbox and preserve raw observations",
+                            "independently recalculate every primary outcome before review",
+                        ],
+                        "must_change": [
+                            "the failed mechanism, estimand, design, or measurement",
+                            "the validator convention when it disagrees with the declared executor convention",
+                        ],
+                        "must_not_do": [
+                            "patch result JSON instead of source",
+                            "hide undefined values with zero, NaN, or endpoint fallback",
+                            "return an unchanged candidate with a renamed threshold",
+                        ],
+                    },
                     "instructions": "Fix only the reported failure. Never call open(), eval(), exec(), "
                                     "compile(), input() or __import__(); use Path.write_bytes for files.",
                 }
@@ -1004,6 +1123,10 @@ class CapabilityFoundry:
                 save("validation_failed")
                 if repeated:
                     raise ModelWorkBlocked(state["error"])
+                if switch_author_route(feedback):
+                    # The fallback gets the canonical assignment again.  A
+                    # malformed response is not scientific repair evidence.
+                    feedback = None
                 continue
             attempt_value = document = candidate_fingerprint = None
             try:
@@ -1061,7 +1184,9 @@ class CapabilityFoundry:
                 if first.timed_out or first.truncated or first.returncode != 0:
                     raise ValidationError(
                         f"executor failed in the sandbox (status={first.returncode}, "
-                        f"timeout={first.timed_out}, truncated={first.truncated}): "
+                        f"timeout={first.timed_out}, truncated={first.truncated}, "
+                        f"stdout_bytes={len(first.stdout)}, stderr_bytes={len(first.stderr)}, "
+                        f"mode={first.mode}): "
                         + first.stderr.decode("utf-8", "replace")[-1200:])
                 try:
                     document = json.loads(first.stdout)
@@ -1088,6 +1213,14 @@ class CapabilityFoundry:
                         src, self._validator_input(data, attempt_value["experiment_intent"])),
                     readiness=lambda: validator_probe,
                     review=review_program)
+                if isinstance(repair_provenance, dict):
+                    # The provenance is controller-owned and records which
+                    # model-led repair panel authorised this new candidate.
+                    # It is added only after all executable and independent
+                    # validation gates pass, so it cannot make an invalid
+                    # program look admitted.
+                    admission["repair_provenance"] = deepcopy_config(
+                        repair_provenance)
                 if deadline is not None and time.monotonic() >= deadline:
                     raise CapabilityDeadlineError("capability admission reached its mission deadline")
                 registration = register_capability(
@@ -1143,6 +1276,16 @@ class CapabilityFoundry:
                     last_attempt=last_attempt,
                     error=f"capability foundry did not admit a program: {feedback}")
                 gate = _repair_gate(exc)
+                state.setdefault("repair_ledger", []).append({
+                    "attempt": attempt + 1,
+                    "gate": gate,
+                    "candidate_sha256": candidate_fingerprint,
+                    "error": feedback[:4000],
+                    "validation_context": deepcopy_config(state.get("validation_context", {})),
+                    "validation_feedback": deepcopy_config(state.get("validation_feedback", {})),
+                    "next_action": "source_level_repair_then_fresh_replay",
+                })
+                state["repair_ledger"] = state["repair_ledger"][-12:]
                 if gate:
                     counts = state["repair_gate_counts"]
                     counts[gate] = counts.get(gate, 0) + 1
@@ -1158,15 +1301,22 @@ class CapabilityFoundry:
                             "limit": REPAIR_GATE_LIMIT,
                         }
                         save("repair_budget_exhausted")
-                        raise ModelWorkBlocked(state["error"]) from exc
+                        raise repair_exhausted_error() from exc
                 save("validation_failed")
                 if repeated:
                     raise ModelWorkBlocked(state["error"]) from exc
+                format_envelope = (
+                    candidate_fingerprint is None
+                    and (attempt_value is None
+                         or not ATTEMPT_FIELDS.issubset(attempt_value))
+                )
+                if format_envelope and switch_author_route(feedback):
+                    feedback = None
                 continue
         state.update(status="blocked", error=(
             f"capability foundry did not admit a program in {state['attempts']} attempts: {last_error}"))
         save("exhausted")
-        raise ModelWorkBlocked(state["error"])
+        raise repair_exhausted_error()
 
     @staticmethod
     def _review(candidate, document, verdict):

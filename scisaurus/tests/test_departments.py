@@ -301,6 +301,27 @@ class DepartmentRuntimeTests(unittest.TestCase):
         self.assertEqual(replay["work_order_ref"], completed_head["artifact_ref"])
         self.assertNotEqual(running_ref, completed_head["artifact_ref"])
 
+    def test_scoped_repair_metadata_is_persisted_without_expanding_public_schema(self):
+        request = {
+            "id": "argument-repair",
+            "kind": "interpretation_expansion",
+            "owner": "strategy.interpretation",
+            "objective": "Repair the reviewed claim-evidence graph.",
+            "why": "The argument adjudicator found a scoped scientific debt.",
+            "success_condition": "The revised argument passes independent adjudication.",
+            "evidence_needed": "Fresh evidence links and the prior argument.",
+            "target_stage_id": "argument",
+            "target_stage_kind": "argument",
+            "repair_priority": "immediate",
+        }
+        active = self.runtime.activate_work_orders([request])[0]
+        body = json.loads(self.store.read_body(self.store.head(
+            "command/departments/strategy/work-orders/argument-repair")["body_hash"]))
+        self.assertEqual(body["target_stage_id"], "argument")
+        self.assertEqual(body["target_stage_kind"], "argument")
+        self.assertEqual(body["repair_priority"], "immediate")
+        self.assertEqual(self.tasks.get(active["task_id"])["state"], "running")
+
     def test_retire_superseded_work_orders_removes_old_generation_from_live_backlog(self):
         first = self.runtime.activate_work_orders([{
             "id": "old-order", "kind": "literature_expansion", "owner": "research.intelligence",

@@ -218,6 +218,48 @@ class ManuscriptDraftContractTests(unittest.TestCase):
         self.assertLess(audit["selected"]["estimated_input_tokens"], 56000)
         self.assertIn("reference_cards", json.loads(prompt))
 
+    def test_writer_context_projection_compacts_verbose_scientific_fields(self):
+        runner = PaperPipelineRunner.__new__(PaperPipelineRunner)
+        runner.packet = {
+            "writer_contract": {
+                "required_exact_content": [
+                    {"unit_id": f"unit-{index}", "text": "important evidence " * 500}
+                    for index in range(40)
+                ],
+            },
+            "literature_evidence": [
+                {"id": f"evidence-{index}", "claim": "claim " * 500,
+                 "evidence": "evidence " * 500, "source_ref": f"source-{index}"}
+                for index in range(80)
+            ],
+            "scientific_interpretation": {
+                "research_question": "Does X change Y?",
+                "result_patterns": [{"id": f"pattern-{index}", "pattern": "pattern " * 500}
+                                     for index in range(12)],
+            },
+            "research_argument": {
+                "research_question": "Does X change Y?",
+                "hypotheses": [{"id": f"hypothesis-{index}", "statement": "mechanism " * 500}
+                               for index in range(8)],
+            },
+            "reference_cards": [{"source_ref": f"source-{index}", "work_id": f"W{index}",
+                                 "title": f"Work {index}", "abstract": "abstract" * 1800}
+                                for index in range(80)],
+        }
+        runner.paper_config = {"references": []}
+        runner.model_config = {
+            "base_url": "http://127.0.0.1:1/v1", "protocol": "openai_compatible",
+            "model": "writer", "timeout_seconds": 2, "max_output_tokens": 8192,
+            "context_window_tokens": 65536, "max_input_tokens": 56000,
+        }
+        prompt, audit = runner._writer_context_projection(
+            {"writer_output_contract": {"schema_version": "manuscript-draft-2"}},
+            "s" * 3500,
+        )
+        self.assertLessEqual(audit["selected"]["estimated_input_tokens"], 56000)
+        self.assertEqual(audit["selected"]["mode"], "bounded_scientific_compaction")
+        self.assertIn("writer context bounded", prompt)
+
     def test_claim_citation_binding_projects_literature_to_claim_unit(self):
         draft = {"schema_version": "manuscript-draft-2", "title": "A paper", "citation": "markers",
                  "sections": [{"id": "introduction", "title": "Introduction", "units": [

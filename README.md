@@ -52,14 +52,18 @@ becomes non-linear through retained candidate branches and evidence-triggered
 reopenings rather than by bypassing those dependencies.
 
 Autonomous missions can use `progression_policy: forward_first`: after a
-bounded attempt budget, an actionable mechanical or scientific blocker becomes
-a clearly marked `candidate_needs_review` node with a failure-debt artifact and
-a deferred backfill order. The graph can continue to downstream work, then
-return to that debt at a bounded continuation cycle. In this policy the
-Composer, not the deterministic harness, authorizes dependency release; the
-candidate remains visibly unverified and cannot be treated as accepted
-evidence or an external release. Provider quotas, cooldowns, unknown calls,
-and the hard mission deadline still stop safely.
+bounded attempt budget, an evidence-bearing mechanical or scientific blocker
+can become a clearly marked `candidate_needs_review` node with a failure-debt
+artifact and a deferred backfill order. A generated capability that never
+executed is not eligible for that provisional handoff: Composer opens the
+experiment repair loop, changes the design axis after an exhausted source-
+repair lease, and reruns the code and validator in a fresh namespace. The
+graph can continue to downstream work only with an observed, explicitly
+unverified candidate, then return to its debt. In this policy the Composer, not
+the deterministic harness, authorizes dependency release; the candidate remains
+visibly unverified and cannot be treated as accepted evidence or an external
+release. Provider quotas, cooldowns, unknown calls, and the hard mission
+deadline still stop safely.
 
 The same runtime can also produce bounded reports, guides, JSON artifacts, and
 Python source units. A scientific result is never inferred from a model response
@@ -72,6 +76,29 @@ argument stage then writes an evidence-bound defense ledger that separates
 observations, inferences, provisional explanations, limitations, and future
 tests. Missing evidence remains a research request; it cannot be repaired by
 confident prose.
+
+Executable failures follow the same control loop. When an experiment capability
+is rejected before execution, or an observed result produces a methods hold,
+Composer activates a bounded Methods repair panel. The methodologist,
+statistical reviewer, reproducibility reviewer, analysis reviewer, and an
+independent adversary inspect the failure packet; their root causes, required
+changes, and falsifiable acceptance checks become the next capability-authoring
+brief. The new program must pass independent recalculation and admission gates
+before it can run. A repair is therefore authored by the project runtime from
+the recorded evidence, not supplied as a hardcoded experiment patch.
+
+For any scientific stage failure, the runtime first writes a failure dossier and
+issues a concrete repair order. Experiment orders inspect the result and both
+programs, independently recalculate the estimand, edit the source-level
+mechanism, and run a fresh replay/review. Provider, quota, deadline, and
+unknown-call failures remain resource recovery events rather than scientific
+retries.
+
+Malformed or truncated model output is tracked separately as `model_contract`:
+the same stage gets one compact, schema-only repair through its configured
+fallback route. It cannot create a topic pivot or consume a scientific repair
+cycle. Only an evidence-bearing scientific failure can issue an additional
+experiment or source-level program repair order.
 
 Licensed under the [MIT License](LICENSE).
 
@@ -179,9 +206,10 @@ and [Agent, Department, and Stage Flow](docs/16-agent-department-flow.md).
 | **Immutable artifacts** | Content-addressed versions, provenance, adoption checks, scoped edit grants, and change sets |
 | **Independent review** | Field-level critiques, rebuttals, adjudication, verification closure, and adversarial gates |
 | **Bounded specialist execution** | Role contracts, temporary assignments, per-stage quotas, artifact namespaces, chief synthesis, and independent verdicts |
-| **Literature survey** | OpenAlex discovery, source capture, identity reconciliation, exact source spans, citation maps, counter-search, and gap assessment |
+| **Literature survey** | OpenAlex discovery, verified HTML/XML and bounded open-access PDF text capture (Poppler), identity reconciliation, exact source spans, citation maps, counter-search, and gap assessment |
 | **Topic feasibility admission** | Machine-checked execution mode, input provenance/readiness, data boundary, dependencies, network access, API/model estimates, and experiment deadline before a topic enters the survey |
 | **Scientific experiments** | Frozen methods and seeds, deterministic replay, independent recalculation, raw observations, figures, and result-package review |
+| **Model-led capability repair** | Upper-methods repair panel, bounded redesign brief, fresh capability authoring, provenance, independent admission, and scoped rerun |
 | **Paper pipeline** | Frozen storyline, claim/evidence index, bibliography, figures, LaTeX, rendered PDF, and release manifest |
 | **Research program and defense ledger** | Candidate branches with conditional paper outcomes, retained alternatives, posture-separated argumentation, and reviewer-visible weak points |
 | **Resume and time policy** | Checkpoints, deadline-aware replanning, unknown-call reconciliation, retained failures, and scoped repair |
@@ -228,7 +256,7 @@ before using live providers.
 ## Guardrails that matter
 
 - **Human authority is explicit.** The Principal owns mission scope and final release.
-- **Scientific recovery is autonomous.** A hold, rejected direction, or missing typed repair order produces a cycle-specific work order, changes the strategy, and reopens only the affected closure. In `forward_first`, an actionable blocker is carried as non-gating failure debt after Composer admission so the rest of the graph can move; the debt becomes a bounded backfill order after the first pass. Human input is not the normal next step.
+- **Scientific recovery is autonomous.** A hold, rejected direction, or missing typed repair order produces a cycle-specific work order, changes the strategy, and reopens only the affected closure. Experiment failures run through diagnosis, source edits to executor and validator, fresh replay, independent recalculation, and adversarial review; an exhausted source-repair lease changes the experiment design axis instead of forwarding an unexecuted result. Human input is not the normal next step.
 - **Only real fences stop autonomous progress.** Topic intake retries share one bounded intake envelope, and every deliberate continuation pivot receives its own bounded envelope. Provider/account limits, API policy, worker capacity, and the mission deadline remain independently reserved and recorded; a historical pivot cannot exhaust the budget of a newly admitted direction.
 - **Resource fences are not scientific decisions.** A resettable provider/API cooldown is waited out and retried automatically in autonomous mode; exhausted quotas, worker capacity, and the mission deadline remain hard resource boundaries recorded in the checkpoint, never scientific conclusions.
 - **Failure is not success.** A timeout, provider block, malformed response, or rejected review remains visible and scoped.

@@ -29,7 +29,7 @@ from scisaurus.runtime.operations import OperationsCell
 from scisaurus.runtime.results import validate_results_package
 from scisaurus.runtime.research_quality import (
     build_research_design,
-    check_analysis_contract,
+    evaluate_result_package_quality,
     validate_analysis,
 )
 from scisaurus.runtime.scores import exact, identifier, output_path
@@ -114,17 +114,14 @@ def validate_program_output(value, experiment):
             raise ValidationError("experiment output omits a required asset")
     if "analysis" in value:
         validate_analysis(value["analysis"])
-    quality_contract = experiment.get("quality_contract")
-    if quality_contract is not None:
-        analysis = value.get("analysis")
-        if analysis is None:
-            raise ValidationError("experiment quality contract requires an analysis summary")
-        deficits = check_analysis_contract(
-            analysis, quality_contract,
-            figure_count=sum(1 for asset in value["assets"] if asset.get("role") == "figure"))
-        if deficits:
-            fields = ", ".join(item["field"] for item in deficits)
-            raise ValidationError(f"experiment quality contract is not satisfied: {fields}")
+    # The executable result is admitted on reproducibility and independent
+    # recalculation first.  A quality contract is a substantive publication
+    # floor, not a pre-execution response-format gate: an author may omit the
+    # reader-facing analysis ledger even when it has emitted valid raw data.
+    # ``_package`` records the resulting quality admission and the paper
+    # pipeline turns any deficit into a scoped Methods work order.  This keeps
+    # a real scientific failure blocking while preventing a missing summary
+    # field from burning the capability repair budget.
     canonical_bytes(value)
     return value
 
@@ -164,13 +161,23 @@ def validate_deterministic_validation(value, experiment, candidate_sha256):
         metric_ids.add(metric["metric_id"])
         reported = metric["reported_value"]
         recalculated = metric["recalculated_value"]
-        if (type(reported) not in (int, float) or not math.isfinite(reported)
-                or type(recalculated) not in (int, float) or not math.isfinite(recalculated)):
-            raise ValidationError("metric recalculation values must be finite numbers")
+        reported_is_number = type(reported) in (int, float) and math.isfinite(reported)
+        recalculated_is_number = (
+            type(recalculated) in (int, float) and math.isfinite(recalculated))
+        if (reported is not None and not reported_is_number) or (
+                recalculated is not None and not recalculated_is_number):
+            raise ValidationError(
+                "metric recalculation values must be finite numbers or matching explicit nulls")
         if (type(metric["tolerance"]) not in (int, float)
                 or not math.isfinite(metric["tolerance"]) or metric["tolerance"] < 0):
             raise ValidationError("metric recalculation tolerance is invalid")
-        observed_match = abs(float(reported) - float(recalculated)) <= float(metric["tolerance"])
+        if reported is None or recalculated is None:
+            # A censored/undefined estimand is reproducible only when the
+            # independent validator reaches the same undefined status. Never
+            # coerce it to a boundary value or zero for arithmetic comparison.
+            observed_match = reported is None and recalculated is None
+        else:
+            observed_match = abs(float(reported) - float(recalculated)) <= float(metric["tolerance"])
         if metric["matches"] is not observed_match:
             raise ValidationError("metric recalculation match flag contradicts its values")
     configured_metric_ids = {item["id"] for item in experiment["primary_outcomes"]}
@@ -612,6 +619,7 @@ class ExperimentRunner(ExecutionRuntime):
             package["quality_contract"] = deepcopy(self.experiment["quality_contract"])
             if "analysis" in candidate:
                 package["analysis"] = deepcopy(candidate["analysis"])
+            package["quality_admission"] = evaluate_result_package_quality(package)
         validate_results_package(package, base_dir=package_dir)
         path = package_dir / "results-package.json"
         path.write_bytes(canonical_bytes(package))

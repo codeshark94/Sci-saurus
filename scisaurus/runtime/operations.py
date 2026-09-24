@@ -369,6 +369,11 @@ class OperationsCell:
             result, ref = executor(task_id, get_adapter(profile["adapter"]).dispatch_kind, params, actor=operator, task_kind=get_adapter(profile["adapter"]).task_kind)
             execution = self._execution(task_id, params, result, ref, operator, profile["adapter"])
             checks, schema = self._inspect(profile, result, params, representative=False)
+            if (schema is None and isinstance(result.get("metadata"), dict)
+                    and isinstance(result["metadata"].get("pdf_extraction"), dict)):
+                # The verified MCP schema remains the capability baseline; direct PDF
+                # work is separately bound to the parser executable in profile identity.
+                schema = binding["schema_identity"]
             self.authorize(binding)
             if not all(check["outcome"] == "passed" for check in checks) or schema != binding["schema_identity"]:
                 raise ValidationError(

@@ -1,8 +1,10 @@
 """Transport fixtures test failures; live providers are exercised separately."""
 
 import base64
+from email.message import Message
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -15,7 +17,62 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from scisaurus.runtime.retrieval import CrossrefClient, MCPFetchClient
+from scisaurus.runtime.retrieval import CrossrefClient, MCPFetchClient, _robots_policy
+from scisaurus.runtime.pdf_text import pdf_capture_budget
+
+
+def minimal_pdf(text="Parser fixture text"):
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    lines = text.splitlines() or [text]
+    escaped = [line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)").encode("ascii")
+               for line in lines]
+    content = b"BT /F1 12 Tf 72 720 Td " + b" Tj 0 -16 Td ".join(
+        b"(" + line + b")" for line in escaped) + b" Tj ET"
+    objects.append(b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream")
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for index, obj in enumerate(objects, 1):
+        offsets.append(len(pdf))
+        pdf.extend(f"{index} 0 obj\n".encode() + obj + b"\nendobj\n")
+    xref = len(pdf)
+    pdf.extend(f"xref\n0 {len(offsets)}\n0000000000 65535 f \n".encode())
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010} 00000 n \n".encode())
+    pdf.extend(f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    return bytes(pdf)
+
+
+class FixturePDFResponse:
+    def __init__(self, body, *, url, status=200, content_type="application/pdf"):
+        self.body = io.BytesIO(body)
+        self.status = status
+        self.headers = Message()
+        self.headers["Content-Type"] = content_type
+        self.headers["Content-Length"] = str(len(body))
+        self.url = url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def geturl(self):
+        return self.url
+
+    def read(self, size=-1):
+        return self.body.read(size)
+
+    def read1(self, size=-1):
+        return self.body.read(size)
+
+    def close(self):
+        self.body.close()
 
 
 class CrossrefFixture(BaseHTTPRequestHandler):
@@ -180,7 +237,9 @@ for line in sys.stdin:
         else:
             result = {'tools': [{'name': 'other' if mode == 'missing' else 'fetch',
                       'inputSchema': {'type': 'object', 'properties': {
-                          name: {} for name in ('url', 'max_length', 'start_index', 'raw')}}}]}
+                          'url': {'type': 'string'}, 'max_length': {'type': 'integer'},
+                          'start_index': {'type': 'integer'}, 'raw': {'type': 'boolean'}},
+                          'required': ['url']}}]}
     elif method == 'tools/call':
         if mode == 'hang':
             time.sleep(30)
@@ -259,13 +318,56 @@ class TestMCPRetrieval(unittest.TestCase):
         self.assertIsNotNone(result["metadata"]["process_returncode"])
         self.assertEqual(result["sources"], [])
 
-    def test_raw_server_representation_is_not_promoted_to_extracted_text(self):
-        result = self.client("pdf").fetch("https://example.org/source")
+    def test_raw_pdf_from_mcp_is_fetched_and_parsed_with_source_provenance(self):
+        url = "https://example.org/source"
+        pdf = minimal_pdf()
+        robots = FixturePDFResponse(b"User-agent: *\nAllow: /\n",
+                                    url="https://example.org/robots.txt", content_type="text/plain")
+        response = FixturePDFResponse(pdf, url=url)
+        with patch("scisaurus.runtime.retrieval._open_http", side_effect=[robots, response]):
+            result = self.client("pdf").fetch(url, max_length=1000)
+        self.assertEqual(result["outcome"], "ok")
+        self.assertEqual(result["metadata"]["representation"], "pdf_extracted_text")
+        self.assertEqual(result["metadata"]["pdf_extraction"]["mcp_probe"]["reported_media_types"], ["application/pdf"])
+        self.assertIn("Parser fixture text", result["text"])
+        self.assertEqual(base64.b64decode(result["metadata"]["pdf_extraction"]["source_capture"]["body"]), pdf)
+        self.assertEqual(base64.b64decode(result["capture"]["body"]).decode(), result["text"])
+        self.assertEqual(result["sources"], [{"source_url": url, "representation": "pdf_extracted_text"}])
+
+    def test_pdf_capture_is_bounded_by_worker_result_envelope(self):
+        url = "https://example.org/large.pdf"
+        pdf = minimal_pdf() + b" " * 600_000
+        client = self.client("ok", result_max_bytes=300_000)
+        with patch("scisaurus.runtime.retrieval._open_http") as fetch:
+            result = client.fetch(url, max_length=25_000)
+        fetch.assert_not_called()
         self.assertEqual(result["outcome"], "unsupported_capability")
-        self.assertEqual(result["metadata"]["representation"], "raw_tool_text")
-        self.assertEqual(result["metadata"]["reported_media_types"], ["application/pdf"])
+        self.assertEqual(result["metadata"]["pdf_extraction"]["effective_byte_limit"], 0)
+        self.assertIn("worker result limit", result["error"])
+        self.assertLess(len(json.dumps({"ok": True, "result": result}).encode()), 300_000)
+
+    def test_pdf_over_effective_limit_is_a_bounded_source_gap(self):
+        url = "https://example.org/large.pdf"
+        pdf = minimal_pdf() + b" " * 1_500_000
+        robots = FixturePDFResponse(b"User-agent: *\nAllow: /\n",
+                                    url="https://example.org/robots.txt", content_type="text/plain")
+        response = FixturePDFResponse(pdf, url=url)
+        client = self.client("ok", result_max_bytes=2_000_000)
+        with patch("scisaurus.runtime.retrieval._open_http", side_effect=[robots, response]):
+            result = client.fetch(url, max_length=10_000)
+        self.assertEqual(result["outcome"], "partial")
         self.assertEqual(result["sources"], [])
-        self.assertIn("%PDF-1.4", base64.b64decode(result["capture"]["body"]).decode())
+        record = result["metadata"]["pdf_extraction"]
+        self.assertLess(record["effective_byte_limit"], len(pdf))
+        self.assertTrue(result["metadata"]["capture_truncated"])
+        self.assertLess(len(json.dumps({"ok": True, "result": result}).encode()), 2_000_000)
+
+    def test_pdf_base64_budget_rounding_never_exceeds_reserved_bytes(self):
+        for result_limit in range(300_000, 300_016):
+            with self.subTest(result_limit=result_limit):
+                effective = pdf_capture_budget(result_limit, 1, 10_000)
+                available = result_limit - 12 - 262_144
+                self.assertLessEqual(len(base64.b64encode(b"x" * effective)), available)
 
     def test_output_and_process_lifetime_are_bounded(self):
         overflow = self.client("flood", max_bytes=4096).fetch("https://example.org/source")
@@ -325,15 +427,61 @@ class TestMCPRetrieval(unittest.TestCase):
 
 
 class BinarySourceFixture(BaseHTTPRequestHandler):
+    requests = []
+    host_requests = []
+    robots_disallow = None
+    robots_disallow_by_port = {}
+    robots_status = 200
+    redirect_target = "/paper.pdf"
+
     def log_message(self, *_):
         pass
 
     def do_GET(self):
+        type(self).requests.append(self.path)
+        type(self).host_requests.append(f"{self.headers.get('Host')}{self.path}")
         if self.path == "/robots.txt":
-            body, media_type = b"User-agent: *\nAllow: /\n", "text/plain"
-        else:
-            body = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF"
-            media_type = "application/pdf"
+            if type(self).robots_status != 200:
+                self.send_response(type(self).robots_status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            disallow = type(self).robots_disallow_by_port.get(
+                self.server.server_port, type(self).robots_disallow) or ""
+            body = f"User-agent: *\nDisallow: {disallow}\n".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/slow.pdf":
+            body = minimal_pdf("Slow PDF fixture")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body[:12])
+            self.wfile.flush()
+            time.sleep(0.3)
+            try:
+                self.wfile.write(body[12:])
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        if self.path == "/denied.pdf":
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path == "/redirect.pdf":
+            self.send_response(302)
+            self.send_header("Location", type(self).redirect_target)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = minimal_pdf("Official server PDF fixture")
+        media_type = "application/pdf"
         self.send_response(200)
         self.send_header("Content-Type", media_type)
         self.send_header("Content-Length", str(len(body)))
@@ -342,7 +490,138 @@ class BinarySourceFixture(BaseHTTPRequestHandler):
 
 
 class TestOfficialMCPFetch(unittest.TestCase):
-    def test_official_server_pdf_response_requires_a_pdf_extractor(self):
+    def test_robots_cache_normalizes_default_port_and_rechecks_path(self):
+        cache = {}
+        response = FixturePDFResponse(
+            b"User-agent: *\nDisallow: /blocked\n",
+            url="https://example.org/robots.txt", content_type="text/plain")
+        with patch("scisaurus.runtime.retrieval._open_http", return_value=response) as open_http:
+            allowed = _robots_policy("https://example.org/allowed.pdf",
+                                     deadline=time.monotonic() + 2, cache=cache)
+            denied = _robots_policy("https://EXAMPLE.org:443/blocked.pdf",
+                                    deadline=time.monotonic() + 2, cache=cache)
+        self.assertEqual(allowed["outcome"], "allowed")
+        self.assertEqual(denied["outcome"], "robots_denied")
+        self.assertEqual(open_http.call_count, 1)
+
+    def test_unavailable_robots_policy_fails_closed(self):
+        BinarySourceFixture.requests = []
+        BinarySourceFixture.robots_status = 503
+        server = ThreadingHTTPServer(("127.0.0.1", 0), BinarySourceFixture)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = MCPFetchClient(["/usr/bin/true"], timeout=2).fetch(
+                f"http://127.0.0.1:{server.server_port}/paper.pdf")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+            BinarySourceFixture.robots_status = 200
+        self.assertEqual(result["outcome"], "robots_unavailable")
+        self.assertEqual(BinarySourceFixture.requests, ["/robots.txt"])
+
+    def test_pdf_redirect_target_has_its_own_robots_check(self):
+        BinarySourceFixture.requests = []
+        BinarySourceFixture.robots_disallow = "/paper.pdf"
+        server = ThreadingHTTPServer(("127.0.0.1", 0), BinarySourceFixture)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = MCPFetchClient(["/usr/bin/true"], timeout=2).fetch(
+                f"http://127.0.0.1:{server.server_port}/redirect.pdf")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+            BinarySourceFixture.robots_disallow = None
+        self.assertEqual(result["outcome"], "robots_denied")
+        self.assertEqual(BinarySourceFixture.requests, ["/robots.txt", "/redirect.pdf"])
+        self.assertEqual(len(result["metadata"]["pdf_extraction"]["robots_checks"]), 2)
+
+    def test_cross_origin_pdf_redirect_fetches_target_robots_before_target(self):
+        BinarySourceFixture.requests = []
+        BinarySourceFixture.host_requests = []
+        primary = ThreadingHTTPServer(("127.0.0.1", 0), BinarySourceFixture)
+        target = ThreadingHTTPServer(("127.0.0.1", 0), BinarySourceFixture)
+        BinarySourceFixture.robots_disallow = None
+        BinarySourceFixture.robots_disallow_by_port = {target.server_port: "/paper.pdf"}
+        BinarySourceFixture.redirect_target = f"http://127.0.0.1:{target.server_port}/paper.pdf"
+        servers = (primary, target)
+        threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in servers]
+        for thread in threads:
+            thread.start()
+        try:
+            result = MCPFetchClient(["/usr/bin/true"], timeout=2).fetch(
+                f"http://127.0.0.1:{primary.server_port}/redirect.pdf")
+        finally:
+            for server in servers:
+                server.shutdown()
+                server.server_close()
+            for thread in threads:
+                thread.join()
+            BinarySourceFixture.robots_disallow_by_port = {}
+            BinarySourceFixture.redirect_target = "/paper.pdf"
+        self.assertEqual(result["outcome"], "robots_denied")
+        self.assertEqual(BinarySourceFixture.host_requests, [
+            f"127.0.0.1:{primary.server_port}/robots.txt",
+            f"127.0.0.1:{primary.server_port}/redirect.pdf",
+            f"127.0.0.1:{target.server_port}/robots.txt",
+        ])
+        self.assertEqual([item["outcome"] for item in
+                          result["metadata"]["pdf_extraction"]["robots_checks"]],
+                         ["allowed", "robots_denied"])
+
+    def test_robots_disallow_prevents_pdf_request(self):
+        BinarySourceFixture.requests = []
+        BinarySourceFixture.robots_disallow = "/paper.pdf"
+        server = ThreadingHTTPServer(("127.0.0.1", 0), BinarySourceFixture)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = MCPFetchClient(["/usr/bin/true"], timeout=2).fetch(
+                f"http://127.0.0.1:{server.server_port}/paper.pdf")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+            BinarySourceFixture.robots_disallow = None
+        self.assertEqual(result["outcome"], "robots_denied")
+        self.assertEqual(BinarySourceFixture.requests, ["/robots.txt"])
+        self.assertEqual(result["metadata"]["pdf_extraction"]["robots_checks"][0]["outcome"], "robots_denied")
+
+    def test_http_access_denial_remains_explicit_after_robots_allow(self):
+        BinarySourceFixture.requests = []
+        server = ThreadingHTTPServer(("127.0.0.1", 0), BinarySourceFixture)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = MCPFetchClient(["/usr/bin/true"], timeout=2).fetch(
+                f"http://127.0.0.1:{server.server_port}/denied.pdf")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        self.assertEqual(result["outcome"], "access_denied")
+        self.assertEqual(BinarySourceFixture.requests, ["/robots.txt", "/denied.pdf"])
+
+    def test_pdf_response_reads_obey_one_total_deadline(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), BinarySourceFixture)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        started = time.monotonic()
+        try:
+            result = MCPFetchClient(["/usr/bin/true"], timeout=0.1).fetch(
+                f"http://127.0.0.1:{server.server_port}/slow.pdf")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        self.assertEqual(result["outcome"], "timeout")
+        self.assertLess(time.monotonic() - started, 0.8)
+        self.assertTrue(result["metadata"]["capture_incomplete"])
+
+    def test_official_server_pdf_url_is_extracted_locally(self):
         python = Path(__file__).absolute().parents[2] / ".venv" / "bin" / "python"
         if not python.exists():
             if importlib.util.find_spec("mcp_server_fetch") is None:
@@ -359,12 +638,15 @@ class TestOfficialMCPFetch(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join()
-        self.assertEqual(result["metadata"]["server_info"]["name"], "mcp-fetch")
-        self.assertEqual(result["outcome"], "unsupported_capability")
-        self.assertEqual(result["metadata"]["representation"], "raw_tool_text")
-        self.assertEqual(result["metadata"]["reported_media_types"], ["application/pdf"])
-        self.assertEqual(result["sources"], [])
-        self.assertIn("%PDF-1.4", result["text"])
+        self.assertEqual(result["outcome"], "ok", result.get("error"))
+        self.assertEqual(result["metadata"]["representation"], "pdf_extracted_text")
+        self.assertEqual(result["metadata"]["transport"], "http_pdf")
+        self.assertIn("Official server PDF fixture", result["text"])
+        self.assertEqual(result["metadata"]["pdf_extraction"]["http_status"], 200)
+        self.assertEqual(result["metadata"]["pdf_extraction"]["source_sha256"],
+                         result["metadata"]["pdf_extraction"]["source_capture"]["sha256"])
+        self.assertEqual(base64.b64decode(result["capture"]["body"]).decode(), result["text"])
+        self.assertEqual(result["sources"][0]["representation"], "pdf_extracted_text")
 
 
 if __name__ == "__main__":

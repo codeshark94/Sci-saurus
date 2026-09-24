@@ -94,6 +94,7 @@ class TestPrivateRouting(unittest.TestCase):
     def test_evidence_integrators_use_ollama_high_context_without_bulk_spillover(self):
         config = self.config(self.env())
         high_roles = {
+            "research.experiment-author",
             "research.gap-proposer",
             "methods.novelty-challenger",
             "methods.novelty-verifier",
