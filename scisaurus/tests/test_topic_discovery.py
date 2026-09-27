@@ -13,6 +13,8 @@ from scisaurus.runtime.literature import ProviderCooldownError
 from scisaurus.runtime.models import ModelCallError, ModelResult, estimate_input_tokens
 from scisaurus.runtime.topic_discovery import (
     MAX_BOUNDED_TOPIC_ATTEMPTS,
+    MAX_CONSECUTIVE_REFINEMENT_CONTRACT_REJECTIONS,
+    MAX_CONSECUTIVE_TOPIC_NOVELTY_REJECTIONS,
     SYSTEM,
     PORTFOLIO_DIMENSIONS,
     SCHEMA_VERSION,
@@ -45,12 +47,16 @@ from scisaurus.runtime.topic_discovery import (
     _repair_feasibility_input_duplicates,
     _repair_feasibility_input_kinds,
     _repair_feasibility_input_statuses,
-    _strip_topic_controller_metadata,
+    _strip_noncontract_topic_fields,
+    _repair_case_only_topic_candidate_ids,
+    _resource_plan_from_feasibility,
     _materialize_seed_bindings,
     _materialize_seed_domains,
     _materialize_topic_objective,
     _normalise_topic_model_response,
+    _single_topic_candidate_response,
     _portfolio_shape_plan,
+    _record_attempt_selection,
     _repair_executable_selection,
     _repair_foundry_selection,
     _repair_topic_novelty_selection,
@@ -325,6 +331,40 @@ class PortfolioRepairModel(FakeModel):
         return result
 
 
+class SingleCandidateThenPortfolioModel(FakeModel):
+    calls = []
+
+    def complete(self, *, system, prompt, images=None):
+        payload = json.loads(prompt)
+        type(self).calls.append(payload.get("assignment"))
+        result = super().complete(system=system, prompt=prompt, images=images)
+        package_value = json.loads(result.text)
+        if payload.get("assignment") == "free_topic_discovery":
+            return ModelResult(
+                text=json.dumps(package_value["candidates"][0]), model="fake",
+                usage=result.usage, elapsed_seconds=result.elapsed_seconds,
+                finish_reason="stop")
+        if payload.get("assignment") == "complete_topic_portfolio":
+            package_value["candidates"][0] = deepcopy(
+                payload["portfolio_completion"]["candidate_to_preserve"])
+            return ModelResult(
+                text=json.dumps(package_value), model="fake",
+                usage=result.usage, elapsed_seconds=result.elapsed_seconds,
+                finish_reason="stop")
+        return result
+
+
+class RepeatedInvalidTopicResponseModel(FakeModel):
+    calls = 0
+
+    def complete(self, *, system, prompt, images=None):
+        type(self).calls += 1
+        return ModelResult(
+            text='{"not": "a topic package"}', model="fake",
+            usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+            elapsed_seconds=0.01, finish_reason="stop")
+
+
 class MaturityModel:
     """Return a thin first proposal, then a substantively refined proposal."""
 
@@ -374,13 +414,33 @@ class MaturityModel:
                 elapsed_seconds=0.01, finish_reason="stop")
         objective = payload["principal_objective"]
         value = package(objective)
+        refinement = payload.get("refinement_context") or {}
+        salvage_plan = (payload.get("salvage_plan")
+                        or refinement.get("salvage_plan"))
+        if isinstance(salvage_plan, dict):
+            active_branch = salvage_plan.get("active_branch")
+            if (salvage_plan.get("mode") == "salvage"
+                    and isinstance(active_branch, dict)
+                    and active_branch.get("id") == "mechanism-observable"):
+                value["candidates"][1].update({
+                    "mechanism": "mechanism-specific response under controlled regimes",
+                    "measurement": "replicate-level response contrast across regimes",
+                })
         if payload.get("assignment") == "refine_topic_discovery":
-            value["candidates"][1]["title"] = "Mechanism-sensitive outcome stability"
-            value["candidates"][1]["research_question"] = (
+            candidate = value["candidates"][1]
+            candidate["title"] = "Mechanism-sensitive outcome stability"
+            candidate["research_question"] = (
                 "Does mechanism 1 change the measured outcome across clean and contaminated regimes, "
                 "and which regime separates the competing explanations?")
-            value["candidates"][1]["scope"] = (
-                "Public data and a reproducible local experiment spanning clean and contaminated regimes.")
+            refinement = payload.get("refinement_context") or {}
+            salvage_plan = refinement.get("salvage_plan")
+            candidate.update({
+                "mechanism": "mechanism-specific response under controlled regimes",
+                "measurement": "replicate-level response contrast across regimes",
+            })
+            if not isinstance(salvage_plan, dict):
+                candidate["scope"] = (
+                    "Public data and a reproducible local experiment spanning clean and contaminated regimes.")
         return ModelResult(text=json.dumps(value), model="fake",
                            usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
                            elapsed_seconds=0.01, finish_reason="stop")
@@ -595,22 +655,23 @@ class RefinementValidationRepairModel(FakeModel):
         if payload.get("assignment") == "repair_selected_topic_candidate":
             type(self).refinement_calls += 1
             candidate = dict(payload["parent_candidate"])
-            candidate["research_question"] = (
-                "Does the changed mechanism alter the observed transition under a bounded comparison?"
-            )
-            if type(self).refinement_calls > 1:
-                candidate.update(payload["required_shape"])
-                target_seed = next(
-                    seed for seed in payload["frontier_seeds"]
-                    if seed["id"] == payload["target_frontier_seed_id"])
-                candidate.update({
-                    "domain": target_seed["domain"],
-                    "frontier_seed_id": target_seed["id"],
-                    "prior_work_ids": [payload["target_seed_records"][0]["work_id"]],
-                    "scope": "A bounded transition comparison across supplied records.",
-                    "mechanism": target_seed["mechanism"],
-                    "measurement": target_seed["unit_of_analysis"],
-                })
+            candidate.update(payload["required_shape"])
+            target_seed = next(
+                seed for seed in payload["frontier_seeds"]
+                if seed["id"] == payload["target_frontier_seed_id"])
+            candidate.update({
+                "domain": target_seed["domain"],
+                "frontier_seed_id": target_seed["id"],
+                "prior_work_ids": [payload["target_seed_records"][0]["work_id"]],
+                "title": f"{target_seed['domain']} changed boundary",
+                "research_question": (
+                    f"Does {target_seed['mechanism']} alter the bounded observable "
+                    f"for {target_seed['unit_of_analysis']}?"
+                ),
+                "scope": "A bounded transition comparison across supplied records.",
+                "mechanism": target_seed["mechanism"],
+                "measurement": target_seed["unit_of_analysis"],
+            })
             return ModelResult(
                 text=json.dumps({"candidate": candidate}), model="fake",
                 usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
@@ -638,6 +699,25 @@ class RefinementValidationRepairModel(FakeModel):
 
 
 class TopicDiscoveryTests(unittest.TestCase):
+    def test_salvage_scope_validation_errors_are_contract_not_scientific_rejections(self):
+        self.assertEqual(
+            _topic_validation_rejection_type(
+                "topic salvage branch evidence-boundary must materially change at least two "
+                "of its assigned dimensions: evidence_mode, research_form, scope, comparison_type"),
+            "refinement_contract",
+        )
+        self.assertEqual(
+            _topic_validation_rejection_type(
+                "topic salvage branch evidence-boundary changed dimensions outside its assigned "
+                "repair scope: mechanism, theory_target"),
+            "refinement_contract",
+        )
+        self.assertEqual(
+            _topic_validation_rejection_type(
+                "topic salvage branch mechanism-observable must preserve the parent's phenomenon"),
+            "refinement",
+        )
+
     def test_topic_response_adapter_recovers_wrappers_and_non_stop_content(self):
         value = package("objective")
         raw = "preface\n```json\n" + json.dumps(
@@ -669,6 +749,96 @@ class TopicDiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "valid JSON"):
             _normalise_topic_model_response(result)
 
+    def test_single_candidate_response_is_only_a_completion_seed(self):
+        candidate = package("objective")["candidates"][0]
+        self.assertEqual(_single_topic_candidate_response(candidate), candidate)
+        self.assertEqual(
+            _single_topic_candidate_response({"candidate": candidate}), candidate)
+        self.assertIsNone(_single_topic_candidate_response(package("objective")))
+        self.assertIsNone(_single_topic_candidate_response({
+            **candidate, "unrecognized_metadata": "not a candidate field",
+        }))
+
+    def test_runner_completes_candidate_only_response_without_inventing_portfolio_members(self):
+        SingleCandidateThenPortfolioModel.calls = []
+        with patch("scisaurus.runtime.topic_discovery.ModelClient",
+                   SingleCandidateThenPortfolioModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+            }).run("Choose a feasible research direction", candidate_count=3,
+                   bibliography=False, maturity_review_rounds=0, max_attempts=4)
+        self.assertEqual(SingleCandidateThenPortfolioModel.calls, [
+            "free_topic_discovery", "complete_topic_portfolio",
+        ])
+        self.assertEqual(len(result["candidates"]), 3)
+        self.assertEqual(result["candidates"][0]["id"], "direction_0")
+        self.assertEqual(result["candidate_attempt_trace"][0]["response_shape"],
+                         "single_candidate")
+        self.assertEqual(result["candidate_attempt_trace"][0]["status"], "rejected")
+
+    def test_runner_stops_after_byte_identical_invalid_topic_response(self):
+        RepeatedInvalidTopicResponseModel.calls = 0
+        with patch("scisaurus.runtime.topic_discovery.ModelClient",
+                   RepeatedInvalidTopicResponseModel):
+            with self.assertRaisesRegex(
+                    ValidationError, "byte-identical rejected response") as raised:
+                TopicDiscoveryRunner({
+                    "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                    "timeout_seconds": 1, "max_output_tokens": 4096,
+                }).run("Choose a feasible research direction", candidate_count=3,
+                       bibliography=False, maturity_review_rounds=0, max_attempts=8)
+        self.assertEqual(RepeatedInvalidTopicResponseModel.calls, 2)
+        self.assertEqual(raised.exception.candidate_attempt_trace[-1]["status"],
+                         "repeated_response")
+        previous_error = raised.exception.candidate_attempt_trace[-1][
+            "previous_validation_error"]
+        self.assertIn("topic discovery package keys do not match", previous_error)
+        self.assertIn(f"previous validation failure: {previous_error}",
+                      str(raised.exception))
+        self.assertEqual(
+            raised.exception.topic_response_repair["previous_validation_error"],
+            previous_error)
+
+    def test_repeated_response_keeps_its_validation_error_across_provider_error(self):
+        class InterruptedRepeatedResponseModel(FakeModel):
+            calls = 0
+
+            def complete(self, *, system, prompt, images=None):
+                type(self).calls += 1
+                if type(self).calls == 2:
+                    raise ModelCallError(
+                        "temporary provider interruption", outcome_known=False,
+                        attempts=1, elapsed_seconds=0.01)
+                return ModelResult(
+                    text='{"not": "a topic package"}', model="fake",
+                    usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                    elapsed_seconds=0.01, finish_reason="stop")
+
+        with patch("scisaurus.runtime.topic_discovery.ModelClient",
+                   InterruptedRepeatedResponseModel):
+            with self.assertRaisesRegex(
+                    ValidationError, "byte-identical rejected response") as raised:
+                TopicDiscoveryRunner({
+                    "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                    "timeout_seconds": 1, "max_output_tokens": 4096,
+                }).run("Choose a feasible research direction", candidate_count=3,
+                       bibliography=False, maturity_review_rounds=0, max_attempts=4)
+        previous_error = raised.exception.topic_response_repair["previous_validation_error"]
+        self.assertIn("topic discovery package keys do not match", previous_error)
+        self.assertNotIn("temporary provider interruption", previous_error)
+
+    def test_topic_package_shape_error_names_missing_and_unexpected_fields(self):
+        missing = package("objective")
+        missing.pop("selected_id")
+        with self.assertRaisesRegex(ValidationError, "missing=.*selected_id"):
+            validate_topic_package(missing)
+
+        unexpected = package("objective")
+        unexpected["commentary"] = "not part of the scientific package"
+        with self.assertRaisesRegex(ValidationError, "unexpected=.*commentary"):
+            validate_topic_package(unexpected)
+
     def test_config_and_package_contracts(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -687,6 +857,14 @@ class TopicDiscoveryTests(unittest.TestCase):
             self.assertEqual(validate_topic_stage_config(config), config)
             value = package("Choose a feasible research direction")
             self.assertEqual(validate_topic_package(value, objective=value["objective"], candidate_count=3), value)
+
+    def test_topic_package_accepts_immutable_operational_principal_objective(self):
+        objective = (
+            "Run an autonomous research workflow under explicit evidence, capability, and "
+            "human-release gates; select a testable question, validate it, and produce a paper.")
+        value = package(objective)
+        self.assertEqual(
+            validate_topic_package(value, objective=objective, candidate_count=3), value)
 
     def test_frontier_seed_scaffolding_is_not_checked_as_reader_prose(self):
         plan = frontier_plan()
@@ -827,6 +1005,108 @@ class TopicDiscoveryTests(unittest.TestCase):
                 "topic_id": "old_direction", "signature": topic_signature(prior),
             }]})
 
+    def test_parent_refinement_checks_sibling_questions_without_rejecting_shared_shape(self):
+        topic_id = "direction_mhd_hall_scaling"
+        parent = {
+            "id": topic_id, "title": "Hall reconnection rate scaling",
+            "domain": "Magnetohydrodynamics",
+            "research_question": "Does the normalized reconnection rate plateau across ion and electron inertial scales?",
+            "research_form": "theory_simulation",
+            "evidence_mode": "analytical_derivation",
+            "comparison_type": "mechanism_ablation",
+        }
+        rejected_sibling = {
+            **parent,
+            "title": "Whistler-term ablation and reconnection rate scaling",
+            "research_question": (
+                "Does removing the whistler dispersive term change the normalized Hall-MHD "
+                "reconnection rate across the ion-to-electron scale sweep?"),
+            "research_form": "experimental_design",
+            "comparison_type": "scaling_transition",
+        }
+        adjacent_refinement = {
+            **parent,
+            "title": "Guide-field control of electron heating partition",
+            "research_question": (
+                "In collisionless magnetotail reconnection, how does guide-field strength "
+                "shift the partition of released magnetic energy between ion and electron heating?"),
+            "research_form": "experimental_design",
+            "comparison_type": "model_selection",
+        }
+        history = {"entries": [
+            {"topic_id": topic_id, **parent, "signature": topic_signature(parent)},
+            {"topic_id": topic_id, **rejected_sibling,
+             "signature": topic_signature(rejected_sibling)},
+        ]}
+        self.assertTrue(validate_topic_novelty(
+            adjacent_refinement, history, lineage_topic_id=topic_id))
+        with self.assertRaisesRegex(ValidationError, "too similar"):
+            validate_topic_novelty(
+                rejected_sibling, history, lineage_topic_id=topic_id)
+        with self.assertRaisesRegex(ValidationError, "too similar"):
+            validate_topic_novelty(adjacent_refinement, history)
+
+    def test_parent_refinement_ignores_unrelated_projects_portfolio_shape(self):
+        topic_id = "direction_mhd_hall_scaling"
+        candidate = {
+            "id": topic_id,
+            "title": "Guide-field control of electron heating partition",
+            "domain": "Magnetohydrodynamics",
+            "research_question": (
+                "In collisionless magnetotail reconnection, how does guide-field strength "
+                "shift the partition of released magnetic energy between ion and electron heating?"),
+            "research_form": "experimental_design",
+            "evidence_mode": "analytical_derivation",
+            "comparison_type": "model_selection",
+        }
+        unrelated_project = {
+            "id": "direction_other_mhd",
+            "title": "A distinct MHD question",
+            "domain": "Magnetohydrodynamics",
+            "research_question": (
+                "How does boundary curvature alter instability onset in a driven plasma sheet?"),
+            "research_form": "experimental_design",
+            "evidence_mode": "analytical_derivation",
+            "comparison_type": "model_selection",
+        }
+        history = {"entries": [{
+            "topic_id": unrelated_project["id"],
+            **unrelated_project,
+            "signature": topic_signature(unrelated_project),
+        }]}
+
+        with self.assertRaisesRegex(ValidationError, "too similar"):
+            validate_topic_novelty(candidate, history)
+        self.assertTrue(validate_topic_novelty(
+            candidate, history, lineage_topic_id=topic_id))
+
+    def test_parent_phenomenon_identity_normalizes_plural_and_requires_setting(self):
+        parent = {
+            "id": "direction_mhd_hall_scaling",
+            "phenomenon": "Fast reconnection rates in planetary magnetotails",
+            "research_question": "Does the reconnection rate saturate in planetary magnetotails?",
+        }
+        candidate = {
+            **parent,
+            "research_question": (
+                "In a Harris current sheet, does the normalized reconnection rate change "
+                "across the ion-to-electron inertial scale boundary?"),
+        }
+        with self.assertRaisesRegex(ValidationError, "no longer addresses the parent's phenomenon"):
+            validate_topic_refinement(
+                parent, candidate,
+                salvage_plan=topic_salvage_plan(force_structural_pivot=True),
+                salvage_anchor=parent,
+            )
+        candidate["research_question"] = (
+            "In planetary magnetotail reconnection, does the fast reconnection rate change "
+            "across the ion-to-electron inertial scale boundary?")
+        validate_topic_refinement(
+            parent, candidate,
+            salvage_plan=topic_salvage_plan(force_structural_pivot=True),
+            salvage_anchor=parent,
+        )
+
     def test_saturated_history_allows_a_cold_question_to_reuse_an_archetype(self):
         forms = ("theory_simulation", "observational_reanalysis", "experimental_design",
                  "methodological_benchmark")
@@ -895,6 +1175,147 @@ class TopicDiscoveryTests(unittest.TestCase):
         changed = validate_topic_refinement(parent, child, require_structural_pivot=True)
         self.assertEqual(changed, ["research_question", "research_form", "evidence_mode"])
 
+    def test_parent_identity_violation_is_a_rejected_refinement_not_a_format_error(self):
+        error = ValidationError(
+            "topic salvage branch structural_pivot must preserve the parent's phenomenon")
+        trace = [{
+            "status": "refinement_rejected",
+            "rejection_type": "refinement",
+            "error": str(error),
+        }]
+
+        self.assertEqual(_topic_validation_rejection_type(error), "refinement")
+        self.assertEqual(
+            _topic_retry_reason(error, trace, []),
+            "scientific_candidate_rejected",
+        )
+
+    def test_salvage_anchor_survives_local_reparenting_during_repair(self):
+        original = package("Choose a feasible research direction")["candidates"][1]
+        original["phenomenon"] = "Ionotropic receptor desensitization"
+        local_parent = {
+            **original,
+            "phenomenon": "Exciton transport coherence",
+            "research_question": "A locally revised but unrelated question.",
+        }
+        child = {
+            **local_parent,
+            "research_question": "A further polished unrelated question.",
+            "research_form": "scaling_boundary",
+            "evidence_mode": "analytical_derivation",
+        }
+        with self.assertRaisesRegex(ValidationError, "must preserve the parent's phenomenon"):
+            validate_topic_refinement(
+                local_parent, child,
+                require_structural_pivot=True,
+                salvage_plan=topic_salvage_plan(force_structural_pivot=True),
+                salvage_anchor=original,
+            )
+
+    def test_salvage_refinement_preserves_phenomenon_while_strengthening_design(self):
+        value = package("Choose a feasible research direction")
+        parent = value["candidates"][0]
+        parent["phenomenon"] = "nitrogen methane frost sublimation gradients"
+        parent["mechanism"] = "coupled frost and clathrate thermodynamics"
+        parent["measurement"] = "surface temperature"
+        child = {
+            **parent,
+            "research_question": "For nitrogen-methane frost, does a bounded surface-temperature window separate frost and clathrate predictions?",
+            "mechanism": "temperature-dependent phase-transition competition",
+            "measurement": "N2/CH4 ratio over the supported temperature interval",
+        }
+        salvage = topic_salvage_plan()
+        validate_topic_refinement(
+            parent, child, salvage_plan=salvage)
+
+        unrelated_question = {
+            **child,
+            "research_question": "Does glutamate receptor cavity selectivity change across membrane conditions?",
+        }
+        with self.assertRaisesRegex(
+                ValidationError, "research question no longer addresses the parent's phenomenon"):
+            validate_topic_refinement(parent, unrelated_question, salvage_plan=salvage)
+
+        unrelated_scope_change = {**child, "domain": "plant receptor pharmacology"}
+        with self.assertRaisesRegex(ValidationError, "outside its assigned repair scope"):
+            validate_topic_refinement(
+                parent, unrelated_scope_change, salvage_plan=salvage)
+
+        baseline_plan = topic_salvage_plan(["mechanism-observable"])
+        baseline_refinement = {
+            **parent,
+            "research_question": "Does the nitrogen-methane frost-versus-clathrate ordering reverse across the supported temperature range?",
+            "comparison": "phase-transition ordering across bounded temperature bins",
+            "data_regime": "published N2/CH4 measurements within the documented temperature window",
+            "disconfirmation_test": "the ordering remains unchanged across all supported bins",
+        }
+        validate_topic_refinement(
+            parent, baseline_refinement, salvage_plan=baseline_plan)
+
+        mechanism_plan = topic_salvage_plan()
+        mechanism_parent = {
+            **parent,
+            "phenomenon": "nitrogen-methane frost sublimation gradients",
+            "research_question": (
+                "In nitrogen-methane frost sublimation, does coupled frost/clathrate "
+                "thermodynamics create a surface temperature gradient?"),
+            "mechanism": "coupled frost and clathrate thermodynamics",
+            "measurement": "surface temperature",
+        }
+        mechanism_refinement = {
+            **mechanism_parent,
+            "research_question": (
+                "In nitrogen-methane frost sublimation, does phase-transition competition "
+                "change the replicate-level N2/CH4 contrast across bounded temperature bins?"),
+            "mechanism": "temperature-dependent phase-transition competition",
+            "measurement": "replicate-level N2/CH4 ratio across temperature bins",
+            "theory_target": "the boundary where frost and clathrate predictions diverge",
+            "comparison_type": "scaling_transition",
+            "comparison": "phase-transition ordering across bounded temperature bins",
+            "data_regime": "published N2/CH4 measurements within the documented temperature window",
+            "scope": "the supported nitrogen-methane frost regime only",
+            "disconfirmation_test": "the ordering remains unchanged across all supported bins",
+        }
+        validate_topic_refinement(
+            mechanism_parent, mechanism_refinement, salvage_plan=mechanism_plan)
+
+        dependent_only = {
+            **mechanism_parent,
+            "research_question": (
+                "In nitrogen-methane frost sublimation, does the temperature window "
+                "separate frost and clathrate predictions?"),
+            "comparison": "phase-transition ordering across bounded bins",
+            "data_regime": "published N2/CH4 measurements",
+            "scope": "the supported nitrogen-methane frost regime only",
+            "disconfirmation_test": "the ordering remains unchanged across all supported bins",
+        }
+        with self.assertRaisesRegex(ValidationError, "must materially change at least two"):
+            validate_topic_refinement(
+                mechanism_parent, dependent_only, salvage_plan=mechanism_plan)
+
+        child["phenomenon"] = "plant glutamate receptor cavity selectivity"
+        for plan in (
+                salvage,
+                topic_salvage_plan([
+                    "mechanism-observable", "comparison-baseline", "evidence-boundary",
+                ]),
+                topic_salvage_plan(force_structural_pivot=True)):
+            with self.assertRaisesRegex(ValidationError, "must preserve the parent's phenomenon"):
+                validate_topic_refinement(
+                    parent, child, salvage_plan=plan)
+
+        evidence_authorized = {
+            **salvage,
+            "phenomenon_change_authorized": True,
+            "phenomenon_change_evidence_ref": "artifact:survey/refuting-evidence@1",
+            "phenomenon_change_rationale": "The source set directly refutes the parent phenomenon.",
+        }
+        with self.assertRaisesRegex(ValidationError, "must preserve the parent's phenomenon"):
+            validate_topic_refinement(
+                parent, child, salvage_plan=evidence_authorized)
+        with self.assertRaisesRegex(ValidationError, "must preserve the parent's phenomenon"):
+            validate_topic_refinement(parent, child, salvage_anchor=parent)
+
     def test_salvage_plan_advances_bounded_repairs_before_structural_pivot(self):
         first = topic_salvage_plan()
         self.assertEqual(first["mode"], "salvage")
@@ -933,9 +1354,80 @@ class TopicDiscoveryTests(unittest.TestCase):
             payload["refinement_context"]["salvage_plan"]["active_branch"]["id"],
             "mechanism-observable",
         )
+        self.assertIn(
+            "scope",
+            payload["refinement_context"]["salvage_plan"]["active_branch"][
+                "dependent_dimensions"],
+        )
         self.assertTrue(any(
             "bounded salvage branch" in item for item in payload["constraints"]
         ))
+        self.assertTrue(any(
+            "dependent fields when needed" in item for item in payload["constraints"]
+        ))
+        self.assertTrue(any(
+            "Preserve the parent's phenomenon field" in item
+            for item in payload["constraints"]
+        ))
+
+    def test_salvage_plan_without_parent_fails_before_model_dispatch(self):
+        MaturityModel.calls = []
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", MaturityModel):
+            with self.assertRaisesRegex(
+                    ValidationError, "requires its parent_topic anchor"):
+                TopicDiscoveryRunner({
+                    "base_url": "http://example.invalid", "model": "fake",
+                    "protocol": "ollama", "timeout_seconds": 1,
+                    "max_output_tokens": 4096,
+                }).run(
+                    "Choose a feasible research direction", candidate_count=3,
+                    bibliography=False,
+                    refinement_context={"salvage_plan": topic_salvage_plan()},
+                    maturity_review_rounds=0, max_attempts=3,
+                )
+        self.assertEqual(MaturityModel.calls, [])
+
+    def test_identical_branch_response_is_stopped_after_one_repair_attempt(self):
+        class IdenticalSalvageResponseModel:
+            calls = 0
+
+            def __init__(self, **config):
+                self.config = config
+
+            def complete(self, *, system, prompt, images=None):
+                type(self).calls += 1
+                payload = json.loads(prompt)
+                response = package(payload["principal_objective"])
+                return ModelResult(
+                    text=json.dumps(response), model="fake",
+                    usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                    elapsed_seconds=0.01, finish_reason="stop")
+
+        parent = package("Choose a feasible research direction")["candidates"][1]
+        context = {
+            "mode": "refinement", "cycle": 2,
+            "parent_topic_id": parent["id"], "parent_topic": parent,
+            "salvage_plan": topic_salvage_plan(),
+        }
+        with patch("scisaurus.runtime.topic_discovery.ModelClient",
+                   IdenticalSalvageResponseModel):
+            with self.assertRaises(ValidationError) as caught:
+                TopicDiscoveryRunner({
+                    "base_url": "http://example.invalid", "model": "fake",
+                    "protocol": "ollama", "timeout_seconds": 1,
+                    "max_output_tokens": 4096,
+                }).run(
+                    "Choose a feasible research direction", candidate_count=3,
+                    bibliography=False, refinement_context=context,
+                    maturity_review_rounds=0, max_attempts=5,
+                )
+        self.assertEqual(IdenticalSalvageResponseModel.calls, 2)
+        self.assertEqual(
+            caught.exception.candidate_attempt_trace[-1]["status"],
+            "repeated_response")
+        self.assertIn(
+            "previous_validation_error",
+            caught.exception.candidate_attempt_trace[-1])
 
     def test_runner_records_salvage_branch_in_topic_evolution(self):
         MaturityModel.calls = []
@@ -949,15 +1441,19 @@ class TopicDiscoveryTests(unittest.TestCase):
             "reason": "survey repair",
             "salvage_plan": topic_salvage_plan(),
         }
-        with patch("scisaurus.runtime.topic_discovery.ModelClient", MaturityModel):
-            result = TopicDiscoveryRunner({
-                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
-                "timeout_seconds": 1, "max_output_tokens": 4096,
-            }).run(
-                "Choose a feasible research direction", candidate_count=3,
-                bibliography=False, refinement_context=refinement_context,
-                maturity_review_rounds=0, max_attempts=2,
-            )
+        with patch("scisaurus.runtime.topic_discovery.validate_topic_refinement",
+                   wraps=validate_topic_refinement) as refinement_validator:
+            with patch("scisaurus.runtime.topic_discovery.ModelClient", MaturityModel):
+                result = TopicDiscoveryRunner({
+                    "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                    "timeout_seconds": 1, "max_output_tokens": 4096,
+                }).run(
+                    "Choose a feasible research direction", candidate_count=3,
+                    bibliography=False, refinement_context=refinement_context,
+                    maturity_review_rounds=0, max_attempts=2,
+                )
+        self.assertEqual(
+            refinement_validator.call_args.kwargs["salvage_anchor"], parent)
         salvage = result["topic_evolution"]["salvage"]
         self.assertEqual(salvage["branch_id"], "mechanism-observable")
         self.assertEqual(salvage["attempted_branch_ids"], ["mechanism-observable"])
@@ -965,6 +1461,36 @@ class TopicDiscoveryTests(unittest.TestCase):
             salvage["remaining_branch_ids"],
             ["comparison-baseline", "evidence-boundary"],
         )
+
+    def test_response_contract_only_is_not_recorded_as_scientific_refinement(self):
+        MaturityModel.calls = []
+        MaturityModel.review_count = 0
+        parent_package = package("Choose a feasible research direction")
+        parent = next(item for item in parent_package["candidates"]
+                      if item["id"] == parent_package["selected_id"])
+        context = {
+            "mode": "response_contract_repair",
+            "cycle": 9,
+            "parent_topic_id": parent["id"],
+            "parent_topic": parent,
+            "response_contract_repair": {
+                "validation_error": "The previous response omitted the required package keys.",
+            },
+        }
+
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", MaturityModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+            }).run(
+                "Choose a feasible research direction", candidate_count=3,
+                bibliography=False, refinement_context=context,
+                maturity_review_rounds=0, max_attempts=1,
+            )
+
+        self.assertEqual(result["topic"]["id"], parent["id"])
+        self.assertEqual(result["topic_evolution"]["mode"], "response_contract_repair")
+        self.assertEqual(result["topic_evolution"]["changed_dimensions"], [])
 
     def test_refinement_shape_plan_moves_the_parent_slot(self):
         initial = _portfolio_shape_plan(4, seed=123456)
@@ -990,6 +1516,725 @@ class TopicDiscoveryTests(unittest.TestCase):
             len({item["evidence_mode"] for item in repaired}), 3)
         self.assertEqual(
             len({item["comparison_type"] for item in repaired}), 3)
+
+    def test_topic_pivot_prompt_carries_prior_response_contract_failure(self):
+        parent = package("Choose a feasible research direction")["candidates"][1]
+        diagnostic = "topic candidate search query is not anchored to its scientific direction"
+        payload = json.loads(topic_prompt(
+            "Choose a feasible research direction", 3,
+            refinement_context={
+                "mode": "refinement", "cycle": 3,
+                "parent_topic_id": parent["id"], "parent_topic": parent,
+                "work_orders": [{
+                    "id": "pivot-1", "kind": "topic_refinement",
+                    "objective": "Generate a materially different computational research question.",
+                    "success_condition": "The new question is source-grounded and executable.",
+                }],
+                "response_contract_repair": {"validation_error": diagnostic},
+            },
+        ))
+        self.assertEqual(
+            payload["refinement_context"]["work_orders"][0]["objective"],
+            "Generate a materially different computational research question.",
+        )
+        self.assertEqual(
+            payload["refinement_context"]["response_contract_repair"]["validation_error"],
+            diagnostic,
+        )
+        self.assertTrue(any(diagnostic in item for item in payload["constraints"]))
+        self.assertTrue(any(
+            "response-contract recovery" in item for item in payload["constraints"]
+        ))
+        self.assertTrue(any(
+            "directly satisfy the assigned topic work order" in item
+            for item in payload["constraints"]
+        ))
+
+    def test_parent_refinement_reuses_parent_seed_and_evidence(self):
+        class CaptureModel:
+            prompt = None
+
+            def __init__(self, **config):
+                self.config = config
+
+            def complete(self, *, system, prompt, images=None):
+                type(self).prompt = prompt
+                return ModelResult(
+                    text="{}", model="fake",
+                    usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 5},
+                    elapsed_seconds=0.01, finish_reason="stop")
+
+        parent = package("Choose a feasible research direction")["candidates"][1]
+        parent.update({
+            "id": "direction_mhd_hall_scaling",
+            "title": "Hall-Induced Reconnection Rate Scaling Boundary",
+            "domain": "Magnetohydrodynamics",
+            "phenomenon": "Fast reconnection rates in planetary magnetotails",
+            "mechanism": "Hall effect from decoupled ion/electron motions",
+            "frontier_seed_id": "frontier_1",
+            "search_queries": [
+                "collisionless reconnection rate d_i/d_e scaling",
+                "Hall effect reconnection saturation boundary",
+            ],
+        })
+        parent_work = {
+            "work_id": "W_PARENT", "title": "Collisionless magnetic reconnection",
+            "abstract": "Observations of Hall signatures in magnetotail reconnection.",
+            "frontier_seed_id": "selected_direction", "year": 2022,
+        }
+        other_frontier_work = {
+            "work_id": "W_OTHER", "title": "An unrelated optogenetics study",
+            "abstract": "Synaptic photostimulation timing.",
+            "frontier_seed_id": "frontier_3", "year": 2023,
+        }
+        refinement = {
+            "mode": "refinement", "cycle": 448,
+            "parent_topic_id": parent["id"], "parent_topic": parent,
+            "objective": "Refine the reconnection question within its retained phenomenon.",
+            "parent_evidence": {
+                "frontier_seed_plan": {
+                    "schema_version": "topic-frontier-seeds-1",
+                    "seeds": [
+                        {"id": "frontier_1", "domain": parent["domain"],
+                         "phenomenon": parent["phenomenon"],
+                         "mechanism": parent["mechanism"],
+                         "unit_of_analysis": parent["scope"],
+                         "search_queries": parent["search_queries"]},
+                        {"id": "frontier_3", "domain": "Optogenetics",
+                         "phenomenon": "Temporal precision of synaptic potentials",
+                         "mechanism": "Opsin kinetics", "unit_of_analysis": "waveform",
+                         "search_queries": ["opsin kinetics synaptic timing"]},
+                    ],
+                },
+                "recent_papers": [parent_work, other_frontier_work],
+                "candidate_prior_work": [parent_work],
+            },
+            "work_orders": [{
+                "id": "refine-parent", "kind": "topic_refinement",
+                "objective": "Refine the reconnection question within its retained phenomenon.",
+            }],
+            "salvage_plan": topic_salvage_plan(force_structural_pivot=True),
+        }
+        runner = TopicDiscoveryRunner({
+            "base_url": "http://example.invalid", "model": "fake",
+            "protocol": "ollama", "timeout_seconds": 1,
+            "max_output_tokens": 4096,
+        })
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", CaptureModel), \
+                patch.object(TopicDiscoveryRunner, "_generate_frontier_seed_plan",
+                             side_effect=AssertionError("unrelated seed portfolio regenerated")), \
+                patch.object(TopicDiscoveryRunner, "_recent_paper_sample",
+                             side_effect=AssertionError("cached parent evidence ignored")):
+            with self.assertRaises(ValidationError):
+                runner.run(
+                    "Refine the reconnection question within its retained phenomenon.",
+                    candidate_count=4, max_attempts=1, bibliography=False,
+                    sampling_seed=123, refinement_context=refinement,
+                )
+        payload = json.loads(CaptureModel.prompt)
+        self.assertEqual(payload["assignment"], "repair_selected_topic_candidate")
+        self.assertEqual([item["id"] for item in payload["frontier_seeds"]], ["frontier_1"])
+        self.assertEqual(
+            {item["work_id"] for item in payload["target_seed_records"]}, {"W_PARENT"})
+        self.assertTrue(all(
+            item["frontier_seed_id"] == "frontier_1"
+            for item in payload["target_seed_records"]))
+        self.assertEqual(
+            payload["parent_candidate"]["phenomenon"], parent["phenomenon"])
+        self.assertEqual(
+            payload["composer_repair_context"]["work_orders"][0]["objective"],
+            refinement["work_orders"][0]["objective"],
+        )
+        self.assertTrue(any(
+            "phenomenon field identical" in item for item in payload["constraints"]))
+
+    def test_parent_refinement_admits_one_grounded_candidate_without_portfolio_restart(self):
+        class DirectCandidateModel:
+            calls = 0
+            prompt = None
+
+            def __init__(self, **config):
+                self.config = config
+
+            def complete(self, *, system, prompt, images=None):
+                type(self).calls += 1
+                type(self).prompt = prompt
+                payload = json.loads(prompt)
+                self.asserted_assignment = payload.get("assignment")
+                candidate = deepcopy(payload["parent_candidate"])
+                candidate.update(payload["required_shape"])
+                candidate.update({
+                    "title": "Hall-mediated magnetotail reconnection boundary",
+                    "research_question": (
+                        "In planetary magnetotail reconnection, does Hall-mediated flux transfer "
+                        "change across the electron-to-ion inertial scale boundary?"),
+                    "phenomenon": payload["parent_candidate"]["phenomenon"],
+                    "mechanism": "Hall-mediated electron-ion decoupling at the reconnection layer",
+                    "measurement": "Measure normalized reconnection rate at the retained inertial-scale boundary.",
+                    "frontier_seed_id": payload["target_frontier_seed_id"],
+                })
+                return ModelResult(
+                    text=json.dumps(candidate), model="fake",
+                    usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                    elapsed_seconds=0.01, finish_reason="stop")
+
+        parent = package("Choose a feasible research direction")["candidates"][1]
+        parent.update({
+            "id": "direction_mhd_hall_scaling",
+            "title": "Hall-Induced Reconnection Rate Scaling Boundary",
+            "domain": "Magnetohydrodynamics",
+            "phenomenon": "Fast reconnection rates in planetary magnetotails",
+            "mechanism": "Hall effect from decoupled ion/electron motions",
+            "frontier_seed_id": "frontier_1",
+            "prior_work_ids": ["W_PARENT"],
+            "search_queries": [
+                "collisionless reconnection rate d_i/d_e scaling",
+                "Hall effect reconnection saturation boundary",
+                "planetary magnetotail reconnection rate",
+            ],
+        })
+        parent_work = {
+            "work_id": "W_PARENT", "title": "Collisionless magnetic reconnection",
+            "abstract": "Hall signatures in planetary magnetotail reconnection rates.",
+            "frontier_seed_id": "selected_direction", "year": 2022,
+        }
+        refinement = {
+            "mode": "refinement", "cycle": 449,
+            "parent_topic_id": parent["id"], "parent_topic": parent,
+            "reason": "The literature gap needs a sharper measurable boundary.",
+            "parent_evidence": {
+                "frontier_seed_plan": {
+                    "schema_version": "topic-frontier-seeds-1",
+                    "seeds": [{
+                        "id": "frontier_1", "domain": parent["domain"],
+                        "phenomenon": parent["phenomenon"],
+                        "mechanism": parent["mechanism"],
+                        "unit_of_analysis": parent["scope"],
+                        "search_queries": parent["search_queries"],
+                    }],
+                },
+                "recent_papers": [parent_work],
+                "candidate_prior_work": [parent_work],
+            },
+            "work_orders": [{
+                "id": "refine-parent", "kind": "topic_refinement",
+                "objective": "Quantify the reconnection boundary without changing magnetotail phenomena.",
+                "success_condition": "An explicit boundary and rate observable enter survey.",
+                "evidence_needed": "Use the retained Hall-reconnection paper W_PARENT.",
+            }],
+            "rejected_directions": [{
+                "title": "Previously rejected rate ablation",
+                "research_question": "Does ablating the Hall term change the reconnection rate?",
+                "rejection_reason": "This estimand repeats the prior rate comparison.",
+            }],
+            "salvage_plan": topic_salvage_plan(),
+        }
+        DirectCandidateModel.calls = 0
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", DirectCandidateModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake",
+                "protocol": "ollama", "timeout_seconds": 1,
+                "max_output_tokens": 4096,
+            }).run(
+                "Quantify the reconnection boundary without changing magnetotail phenomena.",
+                candidate_count=4, max_attempts=1, bibliography=False,
+                sampling_seed=123, refinement_context=refinement,
+            )
+        self.assertEqual(DirectCandidateModel.calls, 1)
+        prompt = json.loads(DirectCandidateModel.prompt)
+        self.assertEqual(prompt["assignment"], "repair_selected_topic_candidate")
+        self.assertEqual(
+            prompt["composer_repair_context"]["rejected_directions"],
+            refinement["rejected_directions"],
+        )
+        self.assertTrue(any(
+            "hard negative examples" in item for item in prompt["constraints"]))
+        self.assertEqual(len(result["candidates"]), 1)
+        self.assertEqual(result["topic"]["id"], parent["id"])
+        self.assertEqual(result["topic"]["phenomenon"], parent["phenomenon"])
+        self.assertEqual(result["topic"]["research_form"], parent["research_form"])
+        self.assertEqual(result["topic"]["evidence_mode"], parent["evidence_mode"])
+        self.assertEqual(result["topic"]["comparison_type"], prompt["required_shape"]["comparison_type"])
+        self.assertEqual(result["topic_evolution"]["mode"], "refinement")
+        self.assertTrue(result["topic_evolution"]["changed_dimensions"])
+
+        class NoCallModel:
+            def __init__(self, **config):
+                raise AssertionError("unbounded portfolio fallback must not call a model")
+
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", NoCallModel), \
+                patch("scisaurus.runtime.topic_discovery._refinement_target_seed",
+                      return_value=None), \
+                patch.object(TopicDiscoveryRunner, "_recent_paper_sample",
+                             return_value=([parent_work], 123, [])):
+            with self.assertRaisesRegex(
+                    ValidationError, "bounded single-candidate topic refinement cannot proceed"):
+                TopicDiscoveryRunner({
+                    "base_url": "http://example.invalid", "model": "fake",
+                    "protocol": "ollama", "timeout_seconds": 1,
+                    "max_output_tokens": 4096,
+                }).run(
+                    "Quantify the reconnection boundary without changing magnetotail phenomena.",
+                    candidate_count=4, max_attempts=1, bibliography=False,
+                    sampling_seed=123, refinement_context=refinement,
+                )
+
+    def test_parent_refinement_retries_recorded_novelty_rejection_with_local_negative_memory(self):
+        class NoveltyThenDistinctCandidateModel:
+            calls = []
+            prompts = []
+
+            def __init__(self, **config):
+                self.config = config
+
+            def complete(self, *, system, prompt, images=None):
+                payload = json.loads(prompt)
+                type(self).calls.append(payload.get("assignment"))
+                type(self).prompts.append(payload)
+                candidate = deepcopy(payload["parent_candidate"])
+                candidate.update(payload["required_shape"])
+                is_repair = len(type(self).calls) > 1
+                candidate.update({
+                    "title": (
+                        "Guide-field control of magnetotail reconnection-rate plateau"
+                        if is_repair else "Hall-mediated magnetotail reconnection flux transfer"),
+                    "research_question": (
+                        "In planetary magnetotail reconnection, how does guide-field strength "
+                        "shift the fast reconnection-rate plateau between low and high guide-field regimes?"
+                        if is_repair else
+                        "In planetary magnetotail reconnection, does Hall-mediated flux transfer "
+                        "change across the electron-to-ion inertial scale boundary?"),
+                    "phenomenon": payload["parent_candidate"]["phenomenon"],
+                    "mechanism": (
+                        "Guide-field strength shifts the fast reconnection-rate plateau"
+                        if is_repair else "Hall-mediated electron-ion decoupling"),
+                    "measurement": "Measure normalized fast reconnection rate across the stated boundary.",
+                    "frontier_seed_id": payload["target_frontier_seed_id"],
+                    "prior_work_ids": ["W_PARENT"],
+                    "search_queries": [
+                        "planetary magnetotail reconnection rate boundary",
+                        "guide-field reconnection rate plateau",
+                        "magnetotail fast reconnection observations",
+                    ],
+                })
+                return ModelResult(
+                    text=json.dumps({"candidate": candidate}), model="fake",
+                    usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                    elapsed_seconds=0.01, finish_reason="stop")
+
+        parent = package("Choose a feasible research direction")["candidates"][1]
+        parent.update({
+            "id": "direction_mhd_hall_scaling",
+            "title": "Hall-Induced Reconnection Rate Scaling Boundary",
+            "domain": "Magnetohydrodynamics",
+            "phenomenon": "Fast reconnection rates in planetary magnetotails",
+            "mechanism": "Hall effect from decoupled ion/electron motions",
+            "frontier_seed_id": "frontier_1",
+            "prior_work_ids": ["W_PARENT"],
+            "search_queries": [
+                "collisionless reconnection rate d_i/d_e scaling",
+                "Hall effect reconnection saturation boundary",
+            ],
+        })
+        parent_work = {
+            "work_id": "W_PARENT", "title": "Collisionless magnetic reconnection",
+            "abstract": "Hall signatures in planetary magnetotail reconnection rates.",
+            "frontier_seed_id": "selected_direction", "year": 2022,
+        }
+        rejected = deepcopy(parent)
+        rejected.update({
+            "id": "direction_rejected_hall_flux",
+            "title": "Hall-mediated magnetotail reconnection flux transfer",
+            "research_question": (
+                "In planetary magnetotail reconnection, does Hall-mediated flux transfer "
+                "change across the electron-to-ion inertial scale boundary?"),
+        })
+        refinement = {
+            "mode": "refinement", "cycle": 550,
+            "parent_topic_id": parent["id"], "parent_topic": parent,
+            "reason": "Continue the retained reconnection phenomenon after a novelty rejection.",
+            "parent_evidence": {
+                "frontier_seed_plan": {
+                    "schema_version": "topic-frontier-seeds-1",
+                    "seeds": [{
+                        "id": "frontier_1", "domain": parent["domain"],
+                        "phenomenon": parent["phenomenon"],
+                        "mechanism": parent["mechanism"],
+                        "unit_of_analysis": parent["scope"],
+                        "search_queries": parent["search_queries"],
+                    }],
+                },
+                "recent_papers": [parent_work],
+                "candidate_prior_work": [parent_work],
+            },
+            "work_orders": [{
+                "id": "refine-parent", "kind": "topic_refinement",
+                "objective": "Refine the reconnection boundary without abandoning the parent phenomenon.",
+                "success_condition": "Produce a distinct, measurable reconnection-rate comparison.",
+            }],
+        }
+        runtime_context = {"topic_history": {"entries": [{
+            "topic_id": rejected["id"], **rejected,
+            "signature": topic_signature(rejected),
+        }]}}
+        NoveltyThenDistinctCandidateModel.calls = []
+        NoveltyThenDistinctCandidateModel.prompts = []
+
+        with patch("scisaurus.runtime.topic_discovery.ModelClient",
+                   NoveltyThenDistinctCandidateModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake",
+                "protocol": "ollama", "timeout_seconds": 1,
+                "max_output_tokens": 4096,
+            }).run(
+                "Refine the reconnection question within its retained phenomenon.",
+                candidate_count=4, max_attempts=3, bibliography=False,
+                sampling_seed=123, refinement_context=refinement,
+                runtime_context=runtime_context, maturity_review_rounds=0,
+            )
+
+        self.assertEqual(NoveltyThenDistinctCandidateModel.calls, [
+            "repair_selected_topic_candidate", "repair_selected_topic_candidate",
+        ])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["topic"]["id"], parent["id"])
+        self.assertEqual(result["topic"]["phenomenon"], parent["phenomenon"])
+        self.assertEqual(result["candidate_attempt_trace"][0]["rejection_type"], "novelty")
+        self.assertEqual(result["candidate_attempt_trace"][0]["status"], "rejected")
+        self.assertEqual(result["candidate_attempt_trace"][1]["status"], "admitted")
+        self.assertEqual(result["usage"]["model_calls"], 2)
+        rejected_directions = NoveltyThenDistinctCandidateModel.prompts[1][
+            "composer_repair_context"]["rejected_directions"]
+        self.assertTrue(any(
+            item.get("research_question") == rejected["research_question"]
+            and "too similar" in item.get("rejection_reason", "")
+            for item in rejected_directions
+        ))
+        self.assertTrue(any(
+            "hard negative examples" in item
+            for item in NoveltyThenDistinctCandidateModel.prompts[1]["constraints"]
+        ))
+
+    def test_distinct_novelty_rejections_return_control_after_one_local_repair(self):
+        class RepeatedNoveltyModel:
+            calls = 0
+
+            def __init__(self, **config):
+                self.config = config
+
+            def complete(self, *, system, prompt, images=None):
+                payload = json.loads(prompt)
+                type(self).calls += 1
+                value = package(payload["principal_objective"])
+                value["selected_id"] = (
+                    "direction_0" if type(self).calls == 1 else "direction_2")
+                value["selection_rationale"] += f" proposal {type(self).calls}"
+                return ModelResult(
+                    text=json.dumps(value), model="fake",
+                    usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                    elapsed_seconds=0.01, finish_reason="stop")
+
+        initial = package("Choose a feasible research direction")
+        history = {"entries": [{
+            "topic_id": item["id"], "title": item["title"],
+            "domain": item["domain"], "research_question": item["research_question"],
+            "signature": topic_signature(item),
+        } for item in initial["candidates"]]}
+        RepeatedNoveltyModel.calls = 0
+
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", RepeatedNoveltyModel):
+            with self.assertRaises(ValidationError) as caught:
+                TopicDiscoveryRunner({
+                    "base_url": "http://example.invalid", "model": "fake",
+                    "protocol": "ollama", "timeout_seconds": 1,
+                    "max_output_tokens": 4096,
+                }).run(
+                    "Choose a feasible research direction", candidate_count=3,
+                    max_attempts=8, bibliography=False,
+                    runtime_context={"topic_history": history},
+                    maturity_review_rounds=0,
+                )
+
+        self.assertEqual(
+            RepeatedNoveltyModel.calls, MAX_CONSECUTIVE_TOPIC_NOVELTY_REJECTIONS)
+        trace = caught.exception.candidate_attempt_trace
+        self.assertEqual(len(trace), MAX_CONSECUTIVE_TOPIC_NOVELTY_REJECTIONS)
+        self.assertTrue(all(item.get("rejection_type") == "novelty" for item in trace))
+        selected_ids = [item["selected_topic"]["id"] for item in trace]
+        self.assertEqual(selected_ids, ["direction_0", "direction_2"])
+        self.assertEqual(
+            {item["topic_id"] for item in caught.exception.rejected_topic_history},
+            set(selected_ids),
+        )
+        self.assertEqual(caught.exception.topic_budget["usage"]["model_calls"], 2)
+
+    def test_non_novelty_failure_resets_the_novelty_rejection_streak(self):
+        class InterleavedRejectionModel:
+            calls = 0
+
+            def __init__(self, **config):
+                self.config = config
+
+            def complete(self, *, system, prompt, images=None):
+                payload = json.loads(prompt)
+                type(self).calls += 1
+                if type(self).calls == 2:
+                    response = "not valid JSON"
+                else:
+                    value = package(payload["principal_objective"])
+                    value["selected_id"] = (
+                        "direction_0" if type(self).calls == 1 else "direction_2")
+                    value["selection_rationale"] += f" proposal {type(self).calls}"
+                    response = json.dumps(value)
+                return ModelResult(
+                    text=response, model="fake",
+                    usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                    elapsed_seconds=0.01, finish_reason="stop")
+
+        initial = package("Choose a feasible research direction")
+        history = {"entries": [{
+            "topic_id": item["id"], "title": item["title"],
+            "domain": item["domain"], "research_question": item["research_question"],
+            "signature": topic_signature(item),
+        } for item in initial["candidates"]]}
+        InterleavedRejectionModel.calls = 0
+
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", InterleavedRejectionModel):
+            with self.assertRaises(ValidationError) as caught:
+                TopicDiscoveryRunner({
+                    "base_url": "http://example.invalid", "model": "fake",
+                    "protocol": "ollama", "timeout_seconds": 1,
+                    "max_output_tokens": 4096,
+                }).run(
+                    "Choose a feasible research direction", candidate_count=3,
+                    max_attempts=3, bibliography=False,
+                    runtime_context={"topic_history": history},
+                    maturity_review_rounds=0,
+                )
+
+        self.assertEqual(InterleavedRejectionModel.calls, 3)
+        trace = caught.exception.candidate_attempt_trace
+        self.assertEqual([item.get("rejection_type") for item in trace],
+                         ["novelty", None, "novelty"])
+        self.assertEqual(caught.exception.topic_budget["usage"]["model_calls"], 3)
+
+    def test_salvage_scope_violation_is_repaired_in_place_without_poisoning_topic_history(self):
+        class ScopeRepairModel:
+            calls = 0
+            prompts = []
+            always_invalid = False
+
+            def __init__(self, **config):
+                self.config = config
+
+            def complete(self, *, system, prompt, images=None):
+                payload = json.loads(prompt)
+                type(self).calls += 1
+                type(self).prompts.append(payload)
+                candidate = deepcopy(payload["parent_candidate"])
+                candidate.update(payload["required_shape"])
+                candidate.update({
+                    "title": "Boundary-resolved magnetotail reconnection evidence",
+                    "research_question": (
+                        "Within fast reconnection rates in planetary magnetotails, does the "
+                        "documented observation boundary separate normalized-rate predictions?"),
+                    "phenomenon": payload["parent_candidate"]["phenomenon"],
+                    "scope": "Only the documented planetary magnetotail fast-rate interval.",
+                    "frontier_seed_id": payload["target_frontier_seed_id"],
+                    "prior_work_ids": ["W_PARENT"],
+                    "search_queries": [
+                        "planetary magnetotail fast reconnection rates",
+                        "magnetotail rate observation boundary",
+                        "collisionless reconnection rate measurements",
+                    ],
+                })
+                if type(self).always_invalid or type(self).calls == 1:
+                    candidate["mechanism"] = (
+                        f"an unrequested kinetic instability mechanism {type(self).calls}")
+                    candidate["theory_target"] = (
+                        f"an unrelated instability threshold {type(self).calls}")
+                else:
+                    candidate["mechanism"] = payload["parent_candidate"]["mechanism"]
+                    candidate["theory_target"] = payload["parent_candidate"]["theory_target"]
+                return ModelResult(
+                    text=json.dumps({"candidate": candidate}), model="fake",
+                    usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                    elapsed_seconds=0.01, finish_reason="stop")
+
+        parent = package("Choose a feasible research direction")["candidates"][1]
+        parent.update({
+            "id": "direction_mhd_hall_scaling",
+            "title": "Hall-Induced Reconnection Rate Scaling Boundary",
+            "domain": "Magnetohydrodynamics",
+            "research_question": (
+                "In fast reconnection rates in planetary magnetotails, how does the Hall effect "
+                "shape the normalized reconnection rate across the inertial-scale boundary?"),
+            "phenomenon": "Fast reconnection rates in planetary magnetotails",
+            "mechanism": "Hall effect from decoupled ion/electron motions",
+            "theory_target": "the normalized rate boundary across ion inertial scales",
+            "scope": "Planetary magnetotail reconnection across ion inertial scales.",
+            "frontier_seed_id": "frontier_1",
+            "prior_work_ids": ["W_PARENT"],
+            "search_queries": [
+                "collisionless reconnection rate inertial scales",
+                "Hall effect planetary magnetotail reconnection",
+                "fast reconnection rate measurements",
+            ],
+        })
+        parent_work = {
+            "work_id": "W_PARENT", "title": "Collisionless magnetic reconnection",
+            "abstract": "Hall signatures in planetary magnetotail reconnection rates.",
+            "frontier_seed_id": "frontier_1", "year": 2022,
+        }
+        refinement = {
+            "mode": "refinement", "cycle": 576,
+            "parent_topic_id": parent["id"], "parent_topic": parent,
+            "reason": "Repair the supported evidence boundary without abandoning the phenomenon.",
+            "parent_evidence": {
+                "frontier_seed_plan": {
+                    "schema_version": "topic-frontier-seeds-1",
+                    "seeds": [{
+                        "id": "frontier_1", "domain": parent["domain"],
+                        "phenomenon": parent["phenomenon"],
+                        "mechanism": parent["mechanism"],
+                        "unit_of_analysis": parent["scope"],
+                        "search_queries": parent["search_queries"],
+                    }],
+                },
+                "recent_papers": [parent_work],
+                "candidate_prior_work": [parent_work],
+            },
+            "work_orders": [{
+                "id": "refine-parent", "kind": "topic_refinement",
+                "objective": "Make the evidence boundary independently testable.",
+                "success_condition": "Retain the phenomenon and isolate the observation boundary.",
+            }],
+            "salvage_plan": topic_salvage_plan([
+                "mechanism-observable", "comparison-baseline",
+            ]),
+        }
+        ScopeRepairModel.calls = 0
+        ScopeRepairModel.prompts = []
+
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", ScopeRepairModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake",
+                "protocol": "ollama", "timeout_seconds": 1,
+                "max_output_tokens": 4096,
+            }).run(
+                "Refine the planetary magnetotail reconnection evidence boundary.",
+                candidate_count=4, max_attempts=3, bibliography=False,
+                sampling_seed=123, refinement_context=refinement,
+                maturity_review_rounds=0,
+            )
+
+        self.assertEqual(ScopeRepairModel.calls, 2)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["topic"]["phenomenon"], parent["phenomenon"])
+        self.assertEqual(result["candidate_attempt_trace"][0]["rejection_type"],
+                         "refinement_contract")
+        self.assertNotIn(parent["id"], {
+            item.get("topic_id") for item in result["rejected_topic_history"]
+        })
+        repair_prompt = ScopeRepairModel.prompts[1]
+        self.assertIn("outside its assigned repair scope", repair_prompt["validation_error"])
+        self.assertIn("not a scientific rejection", repair_prompt["repair_instruction"])
+
+        ScopeRepairModel.calls = 0
+        ScopeRepairModel.prompts = []
+        ScopeRepairModel.always_invalid = True
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", ScopeRepairModel):
+            with self.assertRaises(ValidationError) as exhausted:
+                TopicDiscoveryRunner({
+                    "base_url": "http://example.invalid", "model": "fake",
+                    "protocol": "ollama", "timeout_seconds": 1,
+                    "max_output_tokens": 4096,
+                }).run(
+                    "Refine the planetary magnetotail reconnection evidence boundary.",
+                    candidate_count=4, max_attempts=8, bibliography=False,
+                    sampling_seed=123, refinement_context=refinement,
+                    maturity_review_rounds=0,
+                )
+        self.assertEqual(ScopeRepairModel.calls,
+                         MAX_CONSECUTIVE_REFINEMENT_CONTRACT_REJECTIONS)
+        self.assertTrue(all(
+            item.get("rejection_type") == "refinement_contract"
+            for item in exhausted.exception.candidate_attempt_trace))
+        self.assertEqual(exhausted.exception.rejected_topic_history, [])
+
+    def test_response_contract_only_prompt_preserves_the_scientific_direction(self):
+        parent = package("Choose a feasible research direction")["candidates"][1]
+        diagnostic = "topic candidate prior_work_ids cite records outside supplied evidence"
+        payload = json.loads(topic_prompt(
+            "Choose a feasible research direction", 3,
+            refinement_context={
+                "mode": "response_contract_repair",
+                "parent_topic_id": parent["id"],
+                "parent_topic": parent,
+                "response_contract_repair": {"validation_error": diagnostic},
+            },
+        ))
+        self.assertEqual(payload["refinement_shape"], {})
+        self.assertTrue(any(
+            "not a scientific topic selection or pivot" in item
+            for item in payload["constraints"]
+        ))
+        self.assertTrue(any(
+            diagnostic in item for item in payload["constraints"]
+        ))
+        self.assertFalse(any(
+            "selected candidate must change at least one" in item
+            for item in payload["constraints"]
+        ))
+
+    def test_response_contract_recovery_starts_on_configured_fallback_route(self):
+        class RouteCaptureModel:
+            models = []
+
+            def __init__(self, **config):
+                self.config = config
+                type(self).models.append(config["model"])
+
+            def complete(self, *, system, prompt, images=None):
+                return ModelResult(
+                    text='{"not": "a topic package"}',
+                    model=self.config["model"],
+                    usage={"model_calls": 1, "input_tokens": 1, "output_tokens": 1},
+                    elapsed_seconds=0.01, finish_reason="stop")
+
+        RouteCaptureModel.models = []
+        config = {
+            "base_url": "http://primary.invalid", "model": "primary", "protocol": "ollama",
+            "role_models": {
+                "topic_discovery": {
+                    "base_url": "http://primary.invalid", "model": "primary", "protocol": "ollama",
+                },
+            },
+            "role_model_fallbacks": {
+                "topic_discovery": [
+                    {
+                        "base_url": "http://fallback.invalid", "model": "fallback", "protocol": "ollama",
+                    },
+                    {
+                        "base_url": "http://last-fallback.invalid", "model": "last-fallback", "protocol": "ollama",
+                    },
+                ],
+            },
+        }
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", RouteCaptureModel), \
+                patch("scisaurus.runtime.topic_discovery.model_call_budget_available",
+                      side_effect=lambda route: route["model"] != "last-fallback"):
+            with self.assertRaises(ValidationError):
+                TopicDiscoveryRunner(config).run(
+                    "Choose a feasible research direction", candidate_count=3,
+                    bibliography=False, maturity_review_rounds=0, max_attempts=1,
+                    refinement_context={
+                        "response_contract_repair": {
+                            "validation_error": "topic candidate package is invalid",
+                        },
+                    },
+                )
+        self.assertEqual(RouteCaptureModel.models, ["fallback"])
 
     def test_foundry_shape_plan_and_selection_repair_keep_one_executable_member(self):
         context = {
@@ -1542,6 +2787,30 @@ class TopicDiscoveryTests(unittest.TestCase):
         }))
         self.assertEqual(result["source_challenge"]["decision"], "admit_to_survey")
 
+    def test_source_challenge_never_falls_back_to_rewriting_the_whole_portfolio(self):
+        SourceChallengeRefinementModel.calls = []
+        SourceChallengeRefinementModel.payloads = []
+        SourceChallengeRefinementModel.challenge_count = 0
+        with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", FakeOpenAlex), \
+                patch("scisaurus.runtime.topic_discovery.ModelClient",
+                      SourceChallengeRefinementModel), \
+                patch("scisaurus.runtime.topic_discovery._refinement_target_seed",
+                      return_value=None):
+            with self.assertRaisesRegex(
+                    ValidationError,
+                    "bounded single-candidate topic refinement cannot proceed"):
+                TopicDiscoveryRunner({
+                    "base_url": "http://example.invalid", "model": "fake",
+                    "protocol": "ollama", "timeout_seconds": 1,
+                    "max_output_tokens": 4096,
+                }).run(
+                    "Choose a feasible research direction", candidate_count=3,
+                    max_attempts=2, maturity_review_rounds=0,
+                )
+        self.assertEqual(SourceChallengeRefinementModel.challenge_count, 1)
+        self.assertNotIn(
+            "repair_selected_topic_candidate", SourceChallengeRefinementModel.calls)
+
     def test_runner_repairs_refinement_against_the_rejected_package(self):
         RefinementValidationRepairModel.challenge_calls = 0
         RefinementValidationRepairModel.refinement_calls = 0
@@ -1555,8 +2824,12 @@ class TopicDiscoveryTests(unittest.TestCase):
                    max_attempts=3, maturity_review_rounds=0)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["selected_id"], result["topic"]["id"])
-        self.assertEqual(result["selected_id"], "direction_0")
         self.assertEqual(RefinementValidationRepairModel.refinement_calls, 1)
+        candidate_repair = next(
+            item for item in RefinementValidationRepairModel.payloads
+            if item.get("assignment") == "repair_selected_topic_candidate")
+        self.assertEqual(
+            result["selected_id"], candidate_repair["candidate_id_to_copy_exactly"])
         repair = [
             item for item in RefinementValidationRepairModel.payloads
             if item.get("assignment") == "refine_topic_discovery"
@@ -1871,6 +3144,77 @@ class TopicDiscoveryTests(unittest.TestCase):
             for item in repairs
         ))
 
+    def test_empty_resource_plan_is_derived_from_declared_feasibility_without_model_call(self):
+        value = package("Choose a feasible research direction")
+        candidate = value["candidates"][1]
+        candidate["resource_plan"] = "  "
+        candidate["feasibility_plan"] = foundry_feasibility_plan(
+            evidence_inputs=[{
+                "kind": "analytical_parameters",
+                "status": "available",
+                "source": "bounded analytic parameters supplied by the study",
+            }],
+            required_executables=["python3"],
+            required_packages=["numpy"],
+            estimated_compute_seconds=300,
+            estimated_api_requests=0,
+            network_access=False,
+        )
+        runner = TopicDiscoveryRunner({
+            "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+            "timeout_seconds": 1, "max_output_tokens": 4096,
+        })
+        with patch.object(runner, "_client", side_effect=AssertionError(
+                "a declared resource plan should not need a model repair")):
+            repairs = runner._repair_missing_topic_fields(
+                value, deadline=None, budget=TopicBudget(None, {}),
+                require_feasibility_plan=True,
+            )
+
+        self.assertIn("bounded analytic parameters supplied by the study", candidate["resource_plan"])
+        self.assertIn("python3, numpy", candidate["resource_plan"])
+        self.assertIn("300 seconds", candidate["resource_plan"])
+        self.assertIn("Network access is not required", candidate["resource_plan"])
+        self.assertTrue(any(
+            item.get("field") == "resource_plan"
+            and item.get("source") == "feasibility_plan_projection"
+            for item in repairs
+        ))
+
+    def test_runner_does_not_regenerate_portfolio_for_empty_resource_plan(self):
+        class EmptyResourcePlanModel(FakeModel):
+            assignments = []
+
+            def complete(self, *, system, prompt, images=None):
+                payload = json.loads(prompt)
+                type(self).assignments.append(payload.get("assignment"))
+                result = super().complete(system=system, prompt=prompt, images=images)
+                if payload.get("assignment") != "free_topic_discovery":
+                    return result
+                value = json.loads(result.text)
+                for candidate in value["candidates"]:
+                    candidate["resource_plan"] = ""
+                    candidate["feasibility_plan"] = foundry_feasibility_plan()
+                return ModelResult(
+                    text=json.dumps(value), model="fake", usage=result.usage,
+                    elapsed_seconds=result.elapsed_seconds,
+                    finish_reason=result.finish_reason,
+                )
+
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", EmptyResourcePlanModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                "timeout_seconds": 1, "max_output_tokens": 4096,
+            }).run("Choose a feasible research direction", candidate_count=3,
+                   bibliography=False, max_attempts=1)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(EmptyResourcePlanModel.assignments, ["free_topic_discovery"])
+        self.assertTrue(all(
+            "seeded synthetic input generated by the pinned experiment" in item["resource_plan"]
+            for item in result["candidates"]
+        ))
+
     def test_runner_repairs_only_a_missing_title(self):
         objective = "Choose a feasible research direction"
         MissingTitleModel.assignments = []
@@ -1898,13 +3242,14 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertGreater(client.timeout_seconds, 0)
         self.assertLessEqual(client.timeout_seconds, 5)
 
-    def test_topic_client_has_a_bounded_provider_call_timeout(self):
+    def test_topic_client_respects_route_timeout_within_stage_deadline(self):
         runner = TopicDiscoveryRunner({
             "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
             "timeout_seconds": 1800, "max_output_tokens": 4096,
         })
         client = runner._client("topic_discovery", deadline=time.monotonic() + 1200)
-        self.assertLessEqual(client.timeout_seconds, 300)
+        self.assertGreater(client.timeout_seconds, 300)
+        self.assertLessEqual(client.timeout_seconds, 1200)
 
     def test_grounded_portfolio_rejects_invented_sources_and_seed_collapse(self):
         value = package("Choose a feasible research direction")
@@ -2129,24 +3474,60 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(repairs[0]["field"], "feasibility")
         self.assertIn("bounded experiment baseline", value["candidates"][0]["feasibility"])
 
-    def test_echoed_topic_artifact_metadata_is_discarded_without_relaxing_package_shape(self):
+    def test_noncontract_topic_fields_are_discarded_without_relaxing_candidate_validation(self):
         value = package("Choose a feasible research direction")
         value.update({
             "status": "completed",
             "topic": deepcopy(value["candidates"][1]),
             "question": value["candidates"][1]["research_question"],
             "budget": {"model_calls": 3},
+            "commentary": "unrequested envelope text",
+            "diagnostics": {"source": "model-wrapper"},
         })
-        repairs = _strip_topic_controller_metadata(value)
+        repairs = _strip_noncontract_topic_fields(value)
         self.assertEqual(set(value), {
             "schema_version", "objective", "candidates", "selected_id",
             "selection_rationale",
         })
         self.assertEqual(
             {item["field"] for item in repairs},
-            {"status", "topic", "question", "budget"},
+            {"status", "topic", "question", "budget", "commentary", "diagnostics"},
+        )
+        self.assertIn(
+            {"field": "commentary", "source": "discarded_noncontract_top_level_field"},
+            repairs,
         )
         validate_topic_package(value, objective=value["objective"], candidate_count=3)
+
+    def test_case_only_candidate_id_mismatch_is_normalized_losslessly(self):
+        value = package("Choose a feasible research direction")
+        value["candidates"][1]["id"] = "Direction_Boron_pH_Benchmark"
+        value["selected_id"] = "Direction_Boron_pH_Benchmark"
+
+        repairs = _repair_case_only_topic_candidate_ids(value)
+
+        self.assertEqual(value["candidates"][1]["id"], "direction_boron_ph_benchmark")
+        self.assertEqual(value["selected_id"], "direction_boron_ph_benchmark")
+        self.assertEqual(len(repairs), 1)
+        self.assertEqual(repairs[0]["source"], "case_only_identifier_normalization")
+
+    def test_case_only_candidate_id_normalization_does_not_merge_candidates(self):
+        value = package("Choose a feasible research direction")
+        value["candidates"][0]["id"] = "Direction_1"
+
+        repairs = _repair_case_only_topic_candidate_ids(value)
+
+        self.assertEqual(repairs, [])
+        self.assertEqual(value["candidates"][0]["id"], "Direction_1")
+
+    def test_non_ascii_candidate_id_is_not_casefolded_into_a_different_id(self):
+        value = package("Choose a feasible research direction")
+        value["candidates"][0]["id"] = "direction_K"
+
+        repairs = _repair_case_only_topic_candidate_ids(value)
+
+        self.assertEqual(repairs, [])
+        self.assertEqual(value["candidates"][0]["id"], "direction_K")
 
     def test_feasibility_input_label_is_repaired_from_declared_self_contained_inputs(self):
         value = package("Choose a feasible research direction")
@@ -2426,6 +3807,139 @@ class TopicDiscoveryTests(unittest.TestCase):
         repair = _repair_topic_novelty_selection(value, {"entries": [prior]})
         self.assertEqual(repair["from_selected_id"], "direction_0")
         self.assertEqual(value["selected_id"], "direction_1")
+
+    def test_post_foundry_reselection_cannot_restore_a_rejected_topic(self):
+        value = package("Choose a feasible research direction")
+        value["candidates"][0].update({
+            "title": "Published Albedo Change in Polar Terrain",
+            "domain": "planetary science",
+            "research_question": "How does seasonal frost loss alter measured albedo across polar terrain?",
+            "evidence_mode": "published_observations",
+        })
+        value["candidates"][1]["evidence_mode"] = "synthetic_simulation"
+        value["candidates"][2].update({
+            "title": "Dispersal-driven recovery after disturbance",
+            "domain": "landscape ecology",
+            "research_question": "How does habitat dispersal alter recovery time after a disturbance pulse?",
+            "evidence_mode": "synthetic_simulation",
+        })
+        value["candidates"][2].pop("capability_requirements")
+        value["selected_id"] = "direction_0"
+        prior_candidate = value["candidates"][1]
+        history = {"entries": [{
+            "topic_id": prior_candidate["id"],
+            "title": prior_candidate["title"],
+            "domain": prior_candidate["domain"],
+            "research_question": prior_candidate["research_question"],
+            "signature": topic_signature(prior_candidate),
+        }]}
+        context = {
+            "capability_foundry": {
+                "enabled": True,
+                "allowed_evidence_modes": ["synthetic_simulation"],
+            },
+            "executables": {"python3": True},
+            "configured_stage_kinds": ["experiment"],
+        }
+
+        self.assertIsNone(_repair_topic_novelty_selection(
+            value, history, runtime_context=context))
+        foundry_repair = _repair_foundry_selection(value, context)
+        self.assertEqual(foundry_repair["to_selected_id"], "direction_1")
+
+        novelty_repair = _repair_topic_novelty_selection(
+            value, history, runtime_context=context)
+        self.assertEqual(novelty_repair["from_selected_id"], "direction_1")
+        self.assertEqual(novelty_repair["to_selected_id"], "direction_2")
+        self.assertEqual(
+            value["candidates"][2]["capability_requirements"],
+            {"executables": ["python3"], "python_packages": [], "stage_kinds": ["experiment"]},
+        )
+        trace = {"selected_id": "direction_0", "selected_topic": {"id": "direction_0"}}
+        _record_attempt_selection(trace, value)
+        self.assertEqual(trace["selected_id"], "direction_2")
+        self.assertEqual(trace["selected_topic"]["id"], "direction_2")
+        self.assertTrue(validate_topic_package(value, topic_history=history))
+
+    def test_runner_revalidates_novelty_after_foundry_reselection(self):
+        class FoundryReselectionModel(FakeModel):
+            def complete(self, *, system, prompt, images=None):
+                payload = json.loads(prompt)
+                if payload.get("assignment") != "free_topic_discovery":
+                    return super().complete(system=system, prompt=prompt, images=images)
+                value = package(payload["principal_objective"])
+                for candidate in value["candidates"]:
+                    candidate["feasibility_plan"] = foundry_feasibility_plan()
+                    candidate.pop("capability_requirements")
+                value["selected_id"] = "direction_0"
+                value["candidates"][0].update({
+                    "title": "Published Albedo Change in Polar Terrain",
+                    "domain": "planetary science",
+                    "research_question": (
+                        "How does seasonal frost loss alter measured albedo across polar terrain?"),
+                    "evidence_mode": "published_observations",
+                })
+                value["candidates"][1]["evidence_mode"] = "synthetic_simulation"
+                value["candidates"][2].update({
+                    "title": "Dispersal-driven recovery after disturbance",
+                    "domain": "landscape ecology",
+                    "research_question": (
+                        "How does habitat dispersal alter recovery time after a disturbance pulse?"),
+                    "evidence_mode": "synthetic_simulation",
+                })
+                return ModelResult(
+                    text=json.dumps(value), model="fake",
+                    usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                    elapsed_seconds=0.01, finish_reason="stop")
+
+        repeated = package("Choose a feasible research direction")["candidates"][1]
+        history = {"entries": [{
+            "topic_id": repeated["id"], "title": repeated["title"],
+            "domain": repeated["domain"],
+            "research_question": repeated["research_question"],
+            "signature": topic_signature(repeated),
+        }]}
+        runtime_context = {
+            "capability_foundry": {
+                "enabled": True,
+                "allowed_evidence_modes": ["synthetic_simulation"],
+            },
+            "research_feasibility": {
+                "execution_modes": ["foundry"],
+                "allowed_input_kinds": ["synthetic", "analytical_parameters"],
+                "allowed_data_access": ["closed_world"],
+                "network_access": False,
+                "undeclared_data": False,
+                "max_external_requests": 0,
+                "max_model_calls": 0,
+                "max_experiment_seconds": 900,
+                "available_executables": ["python3"],
+                "available_packages": ["numpy"],
+            },
+            "executables": {"python3": True},
+            "python_packages": {"numpy": True},
+            "configured_stage_kinds": ["experiment"],
+            "topic_history": history,
+        }
+
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", FoundryReselectionModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake",
+                "protocol": "ollama", "timeout_seconds": 1,
+                "max_output_tokens": 4096,
+            }).run(
+                "Choose a feasible research direction", candidate_count=3,
+                bibliography=False, max_attempts=1, runtime_context=runtime_context)
+
+        attempt = result["candidate_attempt_trace"][0]
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["selected_id"], "direction_2")
+        self.assertEqual(attempt["post_repair_novelty_selection_repair"]["from_selected_id"],
+                         "direction_1")
+        self.assertEqual(attempt["post_repair_novelty_selection_repair"]["to_selected_id"],
+                         "direction_2")
+        self.assertEqual(attempt["selected_topic"]["id"], "direction_2")
+        self.assertEqual(attempt["status"], "admitted")
 
     def test_excluded_selection_switches_to_an_unseen_portfolio_member(self):
         value = package("Choose a feasible research direction")

@@ -129,8 +129,8 @@ The v2 stage admission additionally records:
 
 | Field | Purpose |
 |---|---|
-| `required_agents` | Concrete specialist appointments required by the route |
-| `active_agents` | Specialists actually activated for this attempt |
+| `required_agents` | Specialist appointments available to the route |
+| `active_agents` | Specialists actually activated for this attempt; empty when the stage runner already owns the remaining scoped work |
 | `verifier_agent` | Independent adversarial appointment; never the chief |
 | `assignment_ids` / `assignment_task_ids` | Role-isolated durable task identities |
 | `assignment_plan_ref` | Quota/deadline/input-projection reservation artifact |

@@ -162,8 +162,8 @@ def validate_results_package(value, *, base_dir=None):
         validation = value["validation"]
         _exact(validation, {"decision", "deterministic_validation_ref", "model_review_refs", "assessment_ref"},
                "results validation")
-        if validation["decision"] not in {"accepted", "accepted_with_limitations"}:
-            raise ValidationError("results package requires an accepted validation decision")
+        if validation["decision"] not in {"accepted", "accepted_with_limitations", "rejected"}:
+            raise ValidationError("results package validation decision is invalid")
         _ref(validation["deterministic_validation_ref"], "deterministic validation ref")
         _ref(validation["assessment_ref"], "result assessment ref")
         if (not isinstance(validation["model_review_refs"], list) or len(validation["model_review_refs"]) < 2

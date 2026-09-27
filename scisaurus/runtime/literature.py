@@ -374,13 +374,13 @@ def normalize_work(item, *, tolerate_invalid_abstract=False, abstract_gaps=None)
 
 
 def preferred_full_text_url(locations):
-    """Prefer open article landing pages/XML over binary PDF locations."""
+    """Prefer an openly indexed PDF when local PDF extraction is available."""
     candidates = full_text_url_candidates(locations)
     return candidates[0]["url"] if candidates else None
 
 
 def full_text_url_candidates(locations):
-    """Order source URLs with OA article text first and OA PDF as a bounded fallback."""
+    """Order OA PDFs before landing pages, retaining provenance for each route."""
     if not isinstance(locations, list):
         return []
     candidates = [location for location in locations if isinstance(location, dict)]
@@ -389,8 +389,10 @@ def full_text_url_candidates(locations):
         [location for location in candidates if location.get("is_oa") is not True],
     )
     result, seen = [], set()
-    for group in ordered_groups:
-        for field in ("landing_page_url", "pdf_url"):
+    for group_index, group in enumerate(ordered_groups):
+        fields = ("pdf_url", "landing_page_url") if group_index == 0 else (
+            "landing_page_url", "pdf_url")
+        for field in fields:
             for location in group:
                 value = location.get(field)
                 if isinstance(value, str) and value.strip() and value not in seen:

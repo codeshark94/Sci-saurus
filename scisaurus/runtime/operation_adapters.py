@@ -166,7 +166,16 @@ def _openalex_arguments(arguments):
 
 
 def _mcp_arguments(arguments):
-    arguments = _retrieval_arguments(arguments, {"url", "max_length"}, "max_length", 999999)
+    if not isinstance(arguments, dict) or set(arguments) - {"url", "max_length", "source_kind"}:
+        raise ValidationError("Capability arguments require url, max_length, and optional source_kind")
+    base = _retrieval_arguments(
+        {key: value for key, value in arguments.items() if key != "source_kind"},
+        {"url", "max_length"}, "max_length", 999999,
+    )
+    source_kind = arguments.get("source_kind", "auto")
+    if not isinstance(source_kind, str) or source_kind not in {"auto", "pdf"}:
+        raise ValidationError("source_kind must be auto or pdf")
+    arguments = {**base, "source_kind": source_kind}
     _http_url(arguments["url"])
     return arguments
 
@@ -232,7 +241,10 @@ def _inspect_retrieval(profile, result, params, *, representative=True):
     mcp_source_failure = False
     if profile["adapter"] == "mcp_fetch" and not representative and isinstance(reply, dict):
         mcp_source_failure = (
-            (outcome == "provider_error" and reply.get("isError") is True and bool(text_blocks))
+            (outcome in {"provider_error", "access_denied", "auth_required", "not_found",
+                         "rate_limited", "robots_denied", "robots_unavailable", "timeout"}
+             and reply.get("isError") is True and bool(text_blocks)
+             and retrieval._mcp_error_outcome("\n".join(text_blocks)) == outcome)
             or (outcome == "unsupported_capability" and reply.get("isError") is False
                 and bool(reported_types) and metadata.get("representation") == "raw_tool_text")
         )
@@ -348,9 +360,10 @@ def _inspect_retrieval(profile, result, params, *, representative=True):
             and reported_types == metadata.get("reported_media_types", [])
             and response_map.get(calls[0]["id"], {}).get("result") == reply if len(calls) == 1 else False
         )
-        if outcome == "provider_error":
+        if mcp_source_failure and outcome != "unsupported_capability":
             source_failure_output = (source_failure_output and reply.get("isError") is True
-                                     and result.get("error") == joined and sources == [])
+                                     and result.get("error") == joined and sources == []
+                                     and retrieval._mcp_error_outcome(joined) == outcome)
         elif outcome == "unsupported_capability":
             source_failure_output = (source_failure_output and reply.get("isError") is False
                                      and bool(reported_types) and sources == []

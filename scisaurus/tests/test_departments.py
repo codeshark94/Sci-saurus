@@ -134,6 +134,16 @@ class DepartmentRuntimeTests(unittest.TestCase):
         self.assertEqual(verdict["verifier_agent"], "research.adversarial-reviewer")
         self.assertEqual(self.runtime.snapshot()["active_assignments"], [])
 
+    def test_stage_can_dispatch_only_its_internal_runner_and_verifier(self):
+        plan = self.runtime.begin_stage(
+            "survey-gap-only", "survey", attempt_number=1,
+            deadline_seconds=30, active_role_ids=[],
+        )
+        self.assertEqual(plan["active_agents"], [])
+        self.assertEqual(len(plan["assignments"]), 1)
+        self.assertEqual(plan["assignments"][0]["assignment_phase"], "verifier")
+        self.assertEqual(plan["verifier_agent"], "research.adversarial-reviewer")
+
     def test_stage_failure_preserves_known_specialist_outcomes(self):
         self.runtime.begin_stage(
             "survey", "survey", attempt_number=3,
@@ -208,6 +218,119 @@ class DepartmentRuntimeTests(unittest.TestCase):
         self.assertEqual(assignment["attempt_state"], "result_unknown")
         self.assertEqual(assignment["task_state"], "blocked")
         self.assertEqual(self.runtime.snapshot()["active_assignments"], [])
+
+    def test_interrupted_specialist_with_durable_report_is_recovered_as_succeeded(self):
+        plan = self.runtime.begin_stage(
+            "survey", "survey", attempt_number=313, deadline_seconds=20,
+            active_role_ids=["search-strategist"],
+        )
+        assignment = next(
+            row for row in plan["assignments"]
+            if row["assignment_phase"] == "specialist")
+        report = {
+            "status": "succeeded",
+            "execution_mode": "model",
+            "assigned_role": assignment["assigned_role"],
+            "role_id": assignment["role_id"],
+            "usage": {"model_calls": 1, "input_tokens": 1808, "output_tokens": 405},
+            "response": {
+                "decision": "repair", "summary": "Evidence inputs are missing.",
+                "findings": ["The stated analytic expression is absent."],
+                "evidence_gaps": [], "requested_actions": [],
+            },
+        }
+        self.store.publish_artifact(
+            logical_id=f"{assignment['assignment_logical_id']}/execution",
+            artifact_type="report", author=assignment["assigned_role"],
+            body=json.dumps({
+                "schema_version": "specialist-execution-1",
+                "project_id": str(self.root),
+                "stage_id": "survey", "stage_kind": "survey",
+                "attempt_number": 313,
+                "assigned_role": assignment["assigned_role"],
+                "role_id": assignment["role_id"],
+                "assignment_id": assignment["assignment_id"],
+                "task_id": assignment["task_id"],
+                "input_ref": assignment["input_ref"],
+                "input_digest": "packet-digest",
+                "report": report,
+            }, sort_keys=True).encode(),
+            media_type="application/json",
+        )
+        interrupted_attempt = self.tasks.get_attempt(assignment["attempt_id"])
+        self.assertIsNotNone(
+            self.runtime._durable_execution_report({
+                **interrupted_attempt["payload"], "task_id": assignment["task_id"],
+            }))
+
+        reconciled = self.runtime.reconcile_interrupted_assignments()
+
+        self.assertEqual(reconciled[0]["outcome"], "succeeded")
+        self.assertEqual(reconciled[0]["accounting"], "durable_execution_result_recovered")
+        attempt = self.tasks.get_attempt(assignment["attempt_id"])
+        self.assertEqual(attempt["state"], "succeeded")
+        self.assertEqual(attempt["usage"]["actual"]["model_calls"], 1)
+        self.assertEqual(self.tasks.get(assignment["task_id"])["state"], "blocked")
+        verifier = next(
+            item for item in plan["assignments"]
+            if item["assignment_phase"] == "verifier")
+        self.assertEqual(self.tasks.get(verifier["task_id"])["state"], "blocked")
+        self.assertEqual(self.runtime.snapshot()["active_assignments"], [])
+
+    def test_settled_attempt_does_not_leave_interrupted_assignment_running(self):
+        plan = self.runtime.begin_stage(
+            "experiment", "experiment", attempt_number=315, deadline_seconds=20,
+            active_role_ids=["methodologist"],
+        )
+        assignment = next(
+            row for row in plan["assignments"]
+            if row["assignment_phase"] == "specialist")
+        self.tasks.finish_attempt(
+            assignment["attempt_id"], "succeeded", usage={"model_calls": 1})
+
+        reconciled = self.runtime.reconcile_interrupted_assignments()
+
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(reconciled[0]["outcome"], "succeeded")
+        self.assertEqual(reconciled[0]["task_state"], "blocked")
+        self.assertEqual(self.tasks.get(assignment["task_id"])["state"], "blocked")
+        self.assertEqual(
+            self.tasks.get_attempt(assignment["attempt_id"])["state"], "succeeded")
+        self.assertEqual(self.runtime.snapshot()["active_assignments"], [])
+        verifier = next(
+            row for row in plan["assignments"]
+            if row["assignment_phase"] == "verifier")
+        self.assertEqual(self.tasks.get(verifier["task_id"])["state"], "blocked")
+
+    def test_interrupted_assignment_rejects_mismatched_durable_report_identity(self):
+        plan = self.runtime.begin_stage(
+            "survey", "survey", attempt_number=314, deadline_seconds=20,
+            active_role_ids=["search-strategist"],
+        )
+        assignment = next(
+            row for row in plan["assignments"]
+            if row["assignment_phase"] == "specialist")
+        self.store.publish_artifact(
+            logical_id=f"{assignment['assignment_logical_id']}/execution",
+            artifact_type="report", author=assignment["assigned_role"],
+            body=json.dumps({
+                "schema_version": "specialist-execution-1",
+                "project_id": str(self.root),
+                "stage_id": "survey", "stage_kind": "survey",
+                "attempt_number": 314,
+                "assigned_role": assignment["assigned_role"],
+                "role_id": assignment["role_id"],
+                "assignment_id": "wrong-assignment",
+                "task_id": assignment["task_id"],
+                "report": {"status": "succeeded", "usage": {"model_calls": 1}},
+            }, sort_keys=True).encode(),
+            media_type="application/json",
+        )
+
+        reconciled = self.runtime.reconcile_interrupted_assignments()
+
+        self.assertEqual(reconciled[0]["outcome"], "result_unknown")
+        self.assertEqual(self.tasks.get_attempt(assignment["attempt_id"])["state"], "result_unknown")
 
     def test_invalid_quota_is_rejected_before_any_role_is_admitted(self):
         with self.assertRaises(ValidationError):

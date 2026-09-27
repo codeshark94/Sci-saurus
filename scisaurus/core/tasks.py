@@ -109,6 +109,16 @@ class TaskManager:
                 raise NotFoundError(f"unknown task: {task_id}")
             if task["state"] not in {"queued", "running"}:
                 raise StateError(f"task {task_id} not dispatchable (state={task['state']})")
+            active = conn.execute(
+                "SELECT attempt_id, state FROM attempts WHERE task_id = ? "
+                "AND state IN ('started', 'result_unknown') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if active is not None:
+                raise StateError(
+                    f"task {task_id} already has unresolved attempt "
+                    f"{active['attempt_id']} (state={active['state']})"
+                )
             fence_row = conn.execute(
                 "SELECT COALESCE(MAX(lease_fence), 0) AS f FROM attempts"
             ).fetchone()
@@ -142,9 +152,12 @@ class TaskManager:
             )
         return fence
 
-    def finish_attempt(self, attempt_id: str, outcome: str, *, usage: dict | None = None) -> None:
+    def finish_attempt(self, attempt_id: str, outcome: str, *, usage: dict | None = None,
+                       accounting: str | None = None) -> None:
         if outcome not in {"succeeded", "failed", "cancelled"}:
             raise ValidationError(f"finish outcome must be succeeded|failed|cancelled: {outcome!r}")
+        if accounting is not None and (not isinstance(accounting, str) or not accounting.strip()):
+            raise ValidationError("attempt accounting note must be a nonempty string")
         with self.control.tx() as conn:
             row = conn.execute(
                 "SELECT state, usage_json FROM attempts WHERE attempt_id = ?", (attempt_id,)
@@ -156,6 +169,8 @@ class TaskManager:
             merged = json.loads(row["usage_json"])
             if usage:
                 merged["actual"] = usage
+            if accounting is not None:
+                merged["accounting"] = accounting
             conn.execute(
                 "UPDATE attempts SET state = ?, finished_at = ?, usage_json = ?"
                 " WHERE attempt_id = ?",
@@ -168,7 +183,8 @@ class TaskManager:
                 conn,
                 actor="system",
                 event_type="attempt.finished",
-                payload={"attempt_id": attempt_id, "task_id": task_id, "outcome": outcome},
+                payload={"attempt_id": attempt_id, "task_id": task_id, "outcome": outcome,
+                         **({"accounting": accounting} if accounting is not None else {})},
             )
 
     def reconcile_unknown(self, attempt_id: str, actor: str) -> dict:

@@ -1,6 +1,7 @@
 """Survey integration against local HTTP/stdio fixtures and simulated model workers."""
 from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,13 +20,18 @@ from scisaurus.core.source_spans import bind, expand_evidence
 from scisaurus.core.surveys import ABSTENTION_REASONS, SurveyGate
 from scisaurus.runtime.execution import SYSTEM, _invoke_worker
 from scisaurus.runtime.literature import ProviderCooldownError
+from scisaurus.runtime.model_work import ModelWorkCache
+from scisaurus.runtime.model_work import ModelWorkBlocked
 from scisaurus.runtime.models import estimate_input_tokens
 from scisaurus.runtime.survey import (SurveyRunner, apply_scoped_map_repair,
                                       normalize_map_relationships,
+                                      normalize_map_worker_response,
                                       overlay_post_checkpoint_relationships)
 from scisaurus.runtime.survey_config import validate_survey_config
 from scisaurus.runtime.survey_records import (GAP_CHECKS, MAP_FIELDS, SURVEY_CHECKS,
-                                               normalize_check_envelope, validate_assessment, validate_map)
+                                               normalize_check_envelope,
+                                               normalize_gap_assessment_envelope,
+                                               validate_assessment, validate_map)
 from scisaurus.runtime.time_policy import STAGES
 from scisaurus.tests.test_retrieval import minimal_pdf
 
@@ -77,7 +83,22 @@ class SurveyHTTPFixture(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if path.path in {"/paper.pdf", "/fallback.pdf"}:
+        if path.path == "/mcp-denied":
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path.path == "/article":
+            body = (b"<html><body><article><h1>Recall study W401</h1>"
+                    b"<p>Methods and results describe recall timing and a fixed observation budget.</p>"
+                    b"</article></body></html>")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path.path in {"/paper.pdf", "/fallback.pdf", "/paper-download"}:
             body = minimal_pdf(
                 "Recall study W401\nIntroduction\nMethods\nRecall timing is examined.\n"
                 "Results\nThis prior method solves delayed recall.")
@@ -205,6 +226,25 @@ def simulated_survey_worker(kind, params, channel):
         value = {"checks": check_rows(SURVEY_CHECKS), "rationale": "The map preserves unknown facts and bounded coverage."}
         if mode == "survey-fails":
             value["checks"][1].update(outcome="failed", result="The independent fixture review rejects source fidelity.")
+        elif (mode == "survey-coverage-insufficient"
+              or mode.startswith("survey-coverage-insufficient-")):
+            value["checks"][1].update(
+                outcome="insufficient_evidence",
+                method="Coverage is incomplete because some full texts and one identity are unresolved.",
+                result="Retained assertions match their captured abstracts; missing full text limits corpus coverage.",
+            )
+            failed_check = mode.removeprefix("survey-coverage-insufficient-")
+            if failed_check in {"coverage-accounting", "map-support"}:
+                failed = next(row for row in value["checks"]
+                              if row["check_id"] == failed_check)
+                failed.update(outcome="failed", result="The fixture requires this gate to remain blocking.")
+        elif (mode == "survey-review-fails-second"
+              and assignment.get("survey_ref", "").endswith("@2")
+              and not assignment.get("resume_boundary")):
+            value["checks"][2].update(
+                outcome="failed",
+                result="The second version has a deliberately unsupported included claim.",
+            )
     elif phase == "work_review":
         if mode == "review-malformed" and assignment["entry"]["work_id"] == "W101":
             value = {"checks": [{"check_id": "duplicate-check", "outcome": "passed",
@@ -262,9 +302,15 @@ for line in sys.stdin:
             'start_index': {'type': 'integer'}, 'raw': {'type': 'boolean'}}, 'required': ['url']}}]}
     elif method == 'tools/call':
         text = 'Recall study W401\nMethods\nRecall timing is examined. The observation budget is fixed.\nResults\nThis prior method solves delayed recall.'
-        unavailable = message['params']['arguments']['url'].endswith('/unavailable')
-        raw = 'Content type text/html cannot be simplified to markdown, but here is the raw content:\nFixture route unavailable.'
-        result = {'content': [{'type': 'text', 'text': raw if unavailable else text}], 'isError': False}
+        url = message['params']['arguments']['url']
+        if url.endswith('/transport-error'):
+            result = {'content': [{'type': 'text', 'text': 'Temporary fetch transport failure.'}], 'isError': True}
+        elif url.endswith('/mcp-denied'):
+            result = {'content': [{'type': 'text', 'text': f'Failed to fetch {url} - status code 403'}], 'isError': True}
+        else:
+            unavailable = url.endswith('/unavailable')
+            raw = 'Content type text/html cannot be simplified to markdown, but here is the raw content:\nFixture route unavailable.'
+            result = {'content': [{'type': 'text', 'text': raw if unavailable else text}], 'isError': False}
     else:
         raise AssertionError(method)
     print(json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}), flush=True)
@@ -334,6 +380,97 @@ class TestSurveyRunner(unittest.TestCase):
                          ["source-fidelity", "coverage-accounting", "map-support"])
         incomplete = {"checks": rows[:2], "rationale": "bounded"}
         self.assertIs(normalize_check_envelope(incomplete, SURVEY_CHECKS), incomplete)
+
+    def test_gap_assessment_aliases_are_canonicalized_conservatively(self):
+        value = {
+            "status": "supported",
+            "answer": "The available abstracts do not establish the proposed distinction.",
+            "uncertainty": "full-text evidence is unavailable",
+            "comparisons": [{
+                "work_id": "W1", "relationship": "closest_prior_work",
+                "note": "The source is related but does not test the proposed threshold.",
+                "evidence": [{"evidence_id": "ev-1", "role": "support",
+                              "note": "captured source", "work_id": "W1"}],
+            }],
+            "checks": [{
+                "name": check_id,
+                "outcome": "insufficient_evidence" if check_id == "full-text-support" else "passed",
+                "rationale": f"Assessment for {check_id}.",
+            } for check_id in GAP_CHECKS],
+            "evidence": [{"evidence_id": "ev-1", "role": "primary", "note": "catalog pointer"}],
+        }
+
+        normalized = normalize_gap_assessment_envelope(value)
+
+        self.assertEqual(normalized["state"], "insufficient_evidence")
+        self.assertIn("Uncertainty: full-text evidence is unavailable", normalized["rationale"])
+        self.assertEqual([row["check_id"] for row in normalized["checks"]], list(GAP_CHECKS))
+        self.assertTrue(all(set(row) == {"check_id", "outcome", "method", "result"}
+                            for row in normalized["checks"]))
+        self.assertEqual(normalized["comparisons"][0]["relationship"], "uncertain")
+        self.assertEqual(normalized["comparisons"][0]["statement"], value["comparisons"][0]["note"])
+        self.assertEqual(normalized["comparisons"][0]["evidence"], [{"evidence_id": "ev-1"}])
+        self.assertEqual(normalized["evidence"], [{"evidence_id": "ev-1"}])
+        self.assertNotIn("check_id", value["checks"][0])
+
+    def test_gap_assessment_cross_work_citation_becomes_uncertain_without_retry(self):
+        catalog = [
+            {"evidence_id": "ev-w1", "work_id": "W1", "source_ref": "source-w1"},
+            {"evidence_id": "ev-w2", "work_id": "W2", "source_ref": "source-w2"},
+        ]
+        value = {
+            "state": "eligible_for_experiment",
+            "rationale": "The proposed comparison appears novel.",
+            "comparisons": [{
+                "work_id": "W1", "relationship": "partial",
+                "statement": "This work partially addresses the mechanism.",
+                "evidence": ["ev-w2"],
+            }],
+            "checks": [{
+                "check_id": check_id, "outcome": "passed",
+                "method": "Compared the displayed source record.",
+                "result": "No direct solution was identified.",
+            } for check_id in GAP_CHECKS],
+            "evidence": [{"evidence_id": "ev-w2"}],
+        }
+
+        normalized = normalize_gap_assessment_envelope(
+            value, evidence_catalog=catalog,
+            verified_full_text_refs={"source-w2"},
+            known_work_ids={"W1", "W2"},
+        )
+
+        self.assertEqual(normalized["state"], "insufficient_evidence")
+        self.assertEqual(normalized["comparisons"], [{
+            "work_id": "W1", "relationship": "uncertain",
+            "statement": "The supplied source evidence does not resolve this work's relationship to the nominated gap.",
+            "evidence": [],
+        }])
+
+    def test_gap_assessment_missing_or_duplicate_checks_are_explicitly_unresolved(self):
+        normalized = normalize_gap_assessment_envelope({
+            "status": "supported",
+            "comparisons": [],
+            "checks": [{
+                "check_id": "coverage-accounting", "outcome": "passed",
+                "method": "m", "result": "r",
+            }, {
+                "check_id": "coverage-accounting", "outcome": "passed",
+                "method": "m2", "result": "r2",
+            }],
+        }, known_work_ids=set())
+        self.assertEqual(normalized["state"], "insufficient_evidence")
+        self.assertEqual([row["check_id"] for row in normalized["checks"]], list(GAP_CHECKS))
+        self.assertTrue(all(row["outcome"] == "insufficient_evidence"
+                            for row in normalized["checks"]))
+
+    def test_gap_assessment_alias_normalizer_marks_malformed_checks_unresolved(self):
+        malformed = {"status": "supported", "checks": [{"name": [], "outcome": "passed"}]}
+        normalized = normalize_gap_assessment_envelope(malformed)
+        self.assertEqual([row["check_id"] for row in normalized["checks"]], list(GAP_CHECKS))
+        self.assertTrue(all(row["outcome"] == "insufficient_evidence"
+                            for row in normalized["checks"]))
+        self.assertEqual(normalized["state"], "insufficient_evidence")
 
     def test_balanced_query_limit_preserves_capacity_for_independent_families(self):
         from scisaurus.runtime.survey import SurveyRunner
@@ -526,8 +663,15 @@ class TestSurveyRunner(unittest.TestCase):
                 runner._fit_assessment_assignment(assignment)
 
     def test_gap_evidence_ids_are_replayed_by_runtime_and_acceptance_gate(self):
-        result = self.runtime(survey_config(self.endpoint, "catalog-evidence")).run()
+        runner = self.runtime(survey_config(self.endpoint, "catalog-evidence"))
+        self.addCleanup(runner.control.close)
+        with patch.object(runner, "_model_checked", wraps=runner._model_checked) as checked:
+            result = runner.run()
         self.assertEqual(result["status"], "completed", result.get("error"))
+        gap_calls = [call for call in checked.call_args_list
+                     if call.args and call.args[0] == "gap-assessment"]
+        self.assertEqual(len(gap_calls), 1)
+        self.assertEqual(gap_calls[0].kwargs.get("model_overrides"), {"temperature": 0.0})
         control, store = self.open_store()
         record = store.head("kb/gap-assessments/current")
         body = json.loads(store.read_body(record["body_hash"]))
@@ -638,6 +782,41 @@ class TestSurveyRunner(unittest.TestCase):
             "gap-assessment", {**assignment, "survey_ref": "artifact:kb/surveys/current@2"}))
         runner.control.close()
 
+    def test_resume_revalidates_parsed_gap_answer_across_transport_boundary_without_call(self):
+        runner = self.runtime()
+        base = {"phase": "gap_assessment", "survey_ref": "artifact:kb/surveys/current@1",
+                "question": "Does the bounded model explain the transition?"}
+        prior_assignment = {**base, "resume_boundary": "gap-assessment-resume-1"}
+        current_assignment = {**base, "resume_boundary": "gap-assessment-resume-2"}
+        prior_response = {"state": "insufficient_evidence", "evidence": []}
+        context = runner._publish("command/contexts/survey-gap-assessment-retained", "note", {
+            "client": {"model": "fixture"},
+            "prompt": json.dumps(prior_assignment),
+        }, "methods.novelty-verifier")
+        execution = runner._publish("command/executions/survey-gap-assessment-retained", "report", {
+            "text": json.dumps(prior_response),
+        }, "methods.novelty-verifier", subjects=[context["artifact_ref"]])
+        proposal = runner._publish("kb/model-proposals/survey-gap-assessment-retained", "note",
+            prior_response, "methods.novelty-verifier", subjects=[execution["artifact_ref"]])
+        runner._publish("command/validation/survey-gap-assessment-retained", "note", {
+            "error": "old transport shape failed before normalization",
+        }, "command.controller", subjects=[proposal["artifact_ref"]])
+        runner.resume_session = {"session": 2}
+        job = {
+            "name": "gap-assessment", "actor": "methods.novelty-verifier",
+            "assignment": current_assignment,
+            "validator": lambda value: self.assertEqual(
+                value, {"state": "insufficient_evidence", "evidence": []}),
+        }
+
+        with patch.object(runner, "_call_batch",
+                          side_effect=AssertionError("retained answer should avoid provider call")):
+            result = runner._models_checked([job])["gap-assessment"]
+
+        self.assertEqual(result[0], prior_response)
+        self.assertEqual(result[1], execution["artifact_ref"])
+        runner.control.close()
+
     def test_focused_semantic_repair_changes_only_failed_field_and_work(self):
         config = survey_config(self.endpoint)
         config["model"]["model"] = "semantic-repair"
@@ -679,7 +858,7 @@ class TestSurveyRunner(unittest.TestCase):
         config["limits"]["max_rounds"] = 2
         result = self.runtime(config).run()
         self.assertEqual(result["status"], "completed", result)
-        _, store = self.open_store()
+        control, store = self.open_store()
         entry = json.loads(store.read_body(store.head("kb/work-analyses/W101")["body_hash"]))
         self.assertEqual(entry["inclusion"], "uncertain")
         self.assertTrue(all(entry[field]["text"] is None for field in MAP_FIELDS))
@@ -715,7 +894,7 @@ class TestSurveyRunner(unittest.TestCase):
             resumed._review_work_claims()
         self.assertIsNotNone(resumed.store.head("kb/work-exclusions/W101"))
 
-    def test_semantic_repair_rejects_an_ungranted_field_change(self):
+    def test_semantic_repair_ignores_and_records_an_ungranted_field_change(self):
         config = survey_config(self.endpoint)
         config["model"]["model"] = "semantic-unscoped"
         config["limits"]["max_rounds"] = 2
@@ -726,9 +905,17 @@ class TestSurveyRunner(unittest.TestCase):
         current = json.loads(store.read_body(store.head("kb/work-analyses/W101")["body_hash"]))
         self.assertEqual({k: v for k, v in first.items() if k != "reason"},
                          {k: v for k, v in current.items() if k != "reason"})
-        self.assertIn("does not resolve", current["reason"])
-        self.assertIn("ungranted entry field", json.loads(store.read_body(
-            store.head("command/survey-abstentions/W101")["body_hash"]))["reason"])
+        self.assertEqual(current["reason"], "The study examines recall timing.")
+        self.assertEqual(current["finding"], first["finding"])
+        refs = store.control._conn.execute(
+            "SELECT artifact_ref FROM artifacts WHERE logical_id LIKE ?",
+            ("command/map-projections/W101-%",),
+        ).fetchall()
+        projections = [json.loads(store.read_body(store.get(row["artifact_ref"])["body_hash"]))
+                       for row in refs]
+        self.assertTrue(any(issue["kind"] == "ungranted_entry_field_ignored"
+                            and issue["field"] == "finding"
+                            for projection in projections for issue in projection["issues"]))
 
     def test_revision_waves_reserve_review_for_previously_repaired_work(self):
         config = survey_config(self.endpoint, "semantic-many")
@@ -834,7 +1021,7 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(nomination["survey_ref"], nomination["prerequisite_survey_ref"])
         self.assertNotEqual(nomination["survey_ref"], result["survey_ref"])
 
-    def test_parallel_mapping_repairs_only_failed_work_and_preserves_valid_versions(self):
+    def test_parallel_mapping_with_invalid_quote_does_not_retry_or_rewrite_siblings(self):
         config = survey_config(self.endpoint, "map-repair")
         config["limits"]["max_rounds"] = 2
         before_retry = []
@@ -850,17 +1037,14 @@ class TestSurveyRunner(unittest.TestCase):
         with patch.object(SurveyRunner, "_checkpoint", inspect_retry):
             result = self.runtime(config).run()
         self.assertEqual(result["status"], "completed", result["error"])
-        self.assertEqual(len(before_retry), 1)
+        self.assertEqual(before_retry, [])
         control, store = self.open_store()
         maps = [(record, prompt) for record, prompt in self.model_contexts(control, store) if prompt["phase"] == "map"]
         counts = {wid: sum(prompt["requested_work_ids"] == [wid] for _, prompt in maps)
                   for wid in ("W101", "W201", "W102", "W301", "W401")}
-        self.assertEqual(counts, {"W101": 2, "W201": 1, "W102": 1, "W301": 1, "W401": 1})
-        retried = next(prompt for _, prompt in maps if "validation_feedback" in prompt)
-        self.assertEqual(retried["requested_work_ids"], ["W101"])
-        self.assertIn("W101", retried["validation_feedback"]["error"])
-        for wid, ref in before_retry[0].items():
-            self.assertEqual(store.head("kb/work-analyses/" + wid)["artifact_ref"], ref)
+        self.assertEqual(counts, {"W101": 1, "W201": 1, "W102": 1, "W301": 1, "W401": 1})
+        self.assertFalse(any("validation_feedback" in prompt for _, prompt in maps))
+        for wid in ("W201", "W102", "W301"):
             self.assertEqual(store.versions("kb/work-analyses/" + wid), [1])
         timings = []
         for record, _ in maps[:2]:
@@ -870,7 +1054,7 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertNotEqual(timings[0]["pid"], timings[1]["pid"])
         self.assertGreater(min(row["finished"] for row in timings) - max(row["started"] for row in timings), 0.1)
         production = [decision for decision in result["time_decisions"] if decision["stage"] == "production"]
-        self.assertEqual([(row["task_count"], row["pending_review_count"]) for row in production[:3]], [(2, 0), (2, 1), (1, 3)])
+        self.assertEqual([(row["task_count"], row["pending_review_count"]) for row in production[:3]], [(2, 0), (2, 2), (1, 0)])
         self.assertTrue(all(row["worker_slots"] == 2 and row["reserved_review_seconds"] > 0 for row in production))
 
     def test_multi_provider_mapping_uses_a_bounded_rolling_dispatch_window(self):
@@ -910,7 +1094,7 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(set(result), {f"job-{index}" for index in range(5)})
         self.assertEqual(batches, [(4, 2), (1, 2)])
 
-    def test_exhausted_work_repair_keeps_other_valid_work_artifacts(self):
+    def test_unsupported_map_claim_is_withdrawn_without_retry_or_sibling_rewrites(self):
         config = survey_config(self.endpoint, "map-reject")
         config["limits"]["max_rounds"] = 2
         result = self.runtime(config).run()
@@ -922,8 +1106,12 @@ class TestSurveyRunner(unittest.TestCase):
         for wid in ("W201", "W102", "W301"):
             self.assertEqual(store.versions("kb/work-analyses/" + wid), [1])
         maps = [prompt for _, prompt in self.model_contexts(control, store) if prompt["phase"] == "map"]
-        self.assertEqual(sum(prompt["requested_work_ids"] == ["W101"] for prompt in maps), 2)
-        self.assertEqual(len(maps), 6)
+        self.assertEqual(sum(prompt["requested_work_ids"] == ["W101"] for prompt in maps), 1)
+        self.assertEqual(len(maps), 5)
+        decision = json.loads(store.read_body(
+            store.head("command/survey-abstentions/W101")["body_hash"]))
+        self.assertEqual(decision["scope"], "unverified_map")
+        self.assertIsNotNone(decision["execution_ref"])
 
     def test_updated_target_rechecks_its_directed_relationship_owner(self):
         SurveyHTTPFixture.refresh_target = True
@@ -951,10 +1139,18 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(result["status"], "completed", result["error"])
         _, store = self.open_store()
         self.assertEqual(store.versions("kb/work-analyses/W101"), [1])
-        self.assertIn("unchanged work W101", json.loads(store.read_body(
-            store.head("command/survey-abstentions/W101")["body_hash"]))["reason"])
+        refs = store.control._conn.execute(
+            "SELECT artifact_ref FROM artifacts WHERE logical_id LIKE ?",
+            ("command/map-projections/W101-%",),
+        ).fetchall()
+        projections = [json.loads(store.read_body(store.get(row["artifact_ref"])["body_hash"]))
+                       for row in refs]
+        self.assertTrue(any(issue["kind"] == "ungranted_entry_field_ignored"
+                            and issue["field"] == "reason"
+                            for projection in projections for issue in projection["issues"]))
         mapped = json.loads(store.read_body(store.head("kb/literature-map")["body_hash"]))
-        self.assertEqual(mapped["relationship_refs"], [])
+        self.assertEqual(len(mapped["relationship_refs"]), 1)
+        self.assertEqual(store.versions("kb/relationships/W101-W102-compares"), [1, 2])
 
     def test_fabricated_quote_never_reaches_survey_acceptance(self):
         result = self.runtime(survey_config(self.endpoint, "forged-quote")).run()
@@ -1080,8 +1276,11 @@ class TestSurveyRunner(unittest.TestCase):
             if prompt["phase"] == "gap_assessment"
         )
         self.assertEqual(assessment["resume_boundary"], "gap-assessment-resume-1")
-        self.assertIn("every evidence item in that comparison must resolve to the same W",
-                      assessment["instructions"])
+        self.assertIn("same work_id", assessment["instructions"])
+        self.assertIn("claim_index", assessment)
+        self.assertNotIn("map", assessment)
+        self.assertTrue(all("text" in source and "window" in source
+                            for source in assessment["sources"]))
 
     def test_acceptance_retry_reuses_exact_survey_and_completed_review(self):
         runner = self.runtime()
@@ -1098,6 +1297,109 @@ class TestSurveyRunner(unittest.TestCase):
             runner._accept_survey()
         self.assertEqual(runner.survey_ref, survey_ref)
         self.assertEqual(runner.store.accepted("kb/surveys/current")["artifact_ref"], survey_ref)
+        review_prompt = next(
+            prompt for _, prompt in self.model_contexts(runner.control, runner.store)
+            if prompt.get("phase") == "survey_review"
+        )
+        self.assertIn("Do not require any captured source to answer",
+                      review_prompt["review_contract"]["source_fidelity_scope"])
+        self.assertIn("Use insufficient_evidence for source-fidelity only",
+                      review_prompt["instructions"])
+
+    def test_incomplete_coverage_does_not_discard_an_auditable_survey_map(self):
+        result = self.runtime(
+            survey_config(self.endpoint, "survey-coverage-insufficient")).run()
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        self.assertTrue(result["survey_current"])
+        self.assertEqual(result["gap_state"], "insufficient_evidence")
+        control, store = self.open_store()
+        accepted = store.accepted("kb/surveys/current")
+        self.assertEqual(accepted["artifact_ref"], result["survey_ref"])
+        review_rows = control._conn.execute(
+            "SELECT artifact_ref FROM artifacts WHERE logical_id LIKE 'kb/survey-reviews/%' "
+            "ORDER BY created_at DESC LIMIT 1").fetchone()
+        review = json.loads(store.read_body(store.get(review_rows[0])["body_hash"]))
+        self.assertEqual(review["verification_kind"], "deterministic_aggregate")
+        self.assertEqual(
+            {item["check_id"]: item["outcome"] for item in review["checks"]},
+            {check_id: "passed" for check_id in SURVEY_CHECKS},
+        )
+        assessment_prompt_count = sum(
+            prompt.get("phase") == "survey_review"
+            for _, prompt in self.model_contexts(control, store))
+        deterministic_count = control._conn.execute(
+            "SELECT COUNT(*) FROM artifacts "
+            "WHERE logical_id LIKE 'command/survey-review-deterministic/%'").fetchone()[0]
+        self.assertEqual(assessment_prompt_count, 2)
+        self.assertEqual(deterministic_count, assessment_prompt_count)
+
+    def test_incomplete_coverage_fallback_still_requires_accounting_and_map_support(self):
+        for failed_check in ("coverage-accounting", "map-support"):
+            with self.subTest(failed_check=failed_check):
+                run_root = self.root / failed_check
+                runner = SurveyRunner(
+                    run_root,
+                    survey_config(self.endpoint, f"survey-coverage-insufficient-{failed_check}"),
+                )
+                runner.worker_target = simulated_survey_worker
+                result = runner.run()
+                self.assertEqual(result["status"], "blocked")
+                self.assertFalse(result["survey_current"])
+                control = ControlStore(run_root)
+                deterministic_count = control._conn.execute(
+                    "SELECT COUNT(*) FROM artifacts "
+                    "WHERE logical_id LIKE 'command/survey-review-deterministic/%'"
+                ).fetchone()[0]
+                control.close()
+                self.assertEqual(deterministic_count, 0)
+
+    def test_deterministic_aggregate_review_keeps_conflicted_included_source_blocking(self):
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        runner._initialize()
+        runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        runner.identity_records["W101"] = runner._record(
+            "kb/identity-fixture/W101", "note",
+            {"work_id": "W101", "status": "conflicted"},
+            "methods.identity-verifier")
+        packet = runner._survey_review_packet()
+        with self.assertRaisesRegex(ModelWorkBlocked, "conflicted bibliographic identity"):
+            runner._deterministic_survey_review(
+                packet, "artifact:kb/surveys/current@1",
+                ValidationError("incomplete aggregate source-fidelity review"))
+
+    def test_integrated_review_resume_reuses_map_without_retrieval(self):
+        config = survey_config(self.endpoint, "survey-review-fails-second")
+        first = self.runtime(config).run()
+        self.assertEqual(first["status"], "blocked")
+        self.assertIn("survey review did not pass every required check", first["error"])
+        self.assertFalse(first["survey_current"])
+        request_count_before_resume = len(SurveyHTTPFixture.requests)
+        policy = {
+            "additional_seconds": 40,
+            "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+            "source_changes": {"mode": "reopen", "reopen_scopes": ["integrated_review"]},
+        }
+        resumed = self.runtime(config, resume_policy=policy)
+        with patch.object(resumed, "_search", side_effect=AssertionError("search repeated")), \
+                patch.object(resumed, "_bibliographic_call",
+                             side_effect=AssertionError("bibliography retrieval repeated")), \
+                patch.object(resumed, "_full_texts", side_effect=AssertionError("full-text retrieval repeated")):
+            result = resumed.run()
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        self.assertTrue(result["survey_current"])
+        resume_requests = SurveyHTTPFixture.requests[request_count_before_resume:]
+        self.assertTrue(
+            all(request["query"].get("search") == ["readiness"] for request in resume_requests),
+            msg=f"integrated-review resume made non-readiness literature requests: {resume_requests!r}",
+        )
+        control, store = self.open_store()
+        prompts = [prompt for _, prompt in self.model_contexts(control, store)
+                   if prompt.get("phase") == "survey_review"]
+        resumed_prompt = next(prompt for prompt in prompts if prompt.get("resume_boundary"))
+        self.assertEqual(resumed_prompt["resume_boundary"], "survey-review-resume-1")
 
     def test_aggregate_review_separates_screening_accounting_from_scientific_answers(self):
         runner = self.runtime()
@@ -1161,23 +1463,20 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(resumed.full_text_attempted, {"W101", "W102"})
         self.assertEqual(resumed.expanded, {"W101"})
 
-    def test_cached_exhausted_map_becomes_abstention_without_new_calls(self):
-        from scisaurus.runtime.model_work import ModelWorkBlocked
+    def test_cached_unsupported_map_is_abstained_without_repeated_calls(self):
         runner = self.runtime(survey_config(self.endpoint, "map-reject"))
         self.addCleanup(runner.control.close)
         runner._initialize(); runner._setup()
         runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
         basis = [runner.work_records["W101"]["artifact_ref"], *runner.source_docs]
         job = runner._map_job("W101", basis)
-        handler = job.pop("on_exhausted")
-        with self.assertRaises(ModelWorkBlocked):
-            runner._models_checked([job])
-        job["on_exhausted"] = handler
+        runner._models_checked([job])
+        self.assertEqual(runner._body(runner.analysis_records["W101"])["inclusion"], "uncertain")
         with patch.object(runner, "_call_batch") as call:
             runner._models_checked([job])
             runner._models_checked([job])
         call.assert_not_called()
-        self.assertEqual(runner._body(runner.analysis_records["W101"])["finding"]["text"], None)
+        self.assertEqual(runner._body(runner.analysis_records["W101"])["problem"]["text"], None)
 
     def test_failed_independent_survey_review_prevents_gap_nomination(self):
         config = survey_config(self.endpoint, "survey-fails")
@@ -1195,9 +1494,16 @@ class TestSurveyRunner(unittest.TestCase):
 
     def test_abstract_only_decisive_result_cannot_be_adopted(self):
         result = self.runtime(survey_config(self.endpoint, "abstract-refutes")).run()
-        self.assertEqual(result["status"], "blocked")
-        self.assertIn("full", result["error"].lower())
-        self.assertIsNone(result["assessment_ref"])
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        control, store = self.open_store()
+        assessment = json.loads(store.read_body(
+            store.head("kb/gap-assessments/current")["body_hash"]))
+        self.assertEqual(assessment["state"], "insufficient_evidence")
+        self.assertTrue(all(row["relationship"] == "uncertain"
+                            for row in assessment["comparisons"]))
+        contexts = [prompt for _, prompt in self.model_contexts(control, store)
+                    if prompt["phase"] == "gap_assessment"]
+        self.assertEqual(len(contexts), 1)
 
     def test_hard_infeasible_stages_dispatch_nothing(self):
         config = survey_config(self.endpoint)
@@ -1364,7 +1670,7 @@ class TestSurveyRunner(unittest.TestCase):
     def test_accessible_openalex_pdf_fallback_is_extracted_and_verified(self):
         SurveyHTTPFixture.locations_by_work = {"W401": [{
             "is_oa": True,
-            "landing_page_url": "https://example.org/unavailable",
+            "landing_page_url": "https://example.org/registered-article",
             "pdf_url": f"http://127.0.0.1:{self.server.server_port}/paper.pdf",
         }]}
         config = self.full_text_config("fulltext-refutes", source_url="https://example.org/unavailable")
@@ -1390,14 +1696,109 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertEqual(gaps[0]["source_url"], "https://example.org/unavailable")
 
+    def test_registered_openalex_pdf_uses_poppler_even_without_pdf_suffix(self):
+        landing_page = "https://example.org/W401"
+        pdf_url = f"http://127.0.0.1:{self.server.server_port}/paper-download"
+        SurveyHTTPFixture.locations_by_work = {"W401": [{
+            "is_oa": True, "landing_page_url": landing_page, "pdf_url": pdf_url,
+        }]}
+        config = self.full_text_config("fulltext-refutes", source_url=landing_page)
+        config["survey"]["full_text_sources"][0]["route_policy"] = "auto"
+        result = self.runtime(config).run()
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        self.assertEqual(result["coverage"]["verified_full_texts"], 1)
+        self.assertIn("/paper-download", [item["path"] for item in SurveyHTTPFixture.requests])
+        _, store = self.open_store()
+        capture = json.loads(store.read_body(store.head("kb/full-text/W401")["body_hash"]))
+        self.assertEqual(capture["url"], pdf_url)
+        execution = json.loads(store.read_body(store.get(capture["execution_ref"])["body_hash"]))
+        self.assertEqual(execution["metadata"]["representation"], "pdf_extracted_text")
+        self.assertEqual(execution["metadata"]["pdf_extraction"]["parser"]["name"], "poppler-pdftotext")
+
+    def test_legacy_route_without_policy_preserves_registered_landing_url(self):
+        landing_page = "https://example.org/registered-article"
+        pdf_url = f"http://127.0.0.1:{self.server.server_port}/paper-download"
+        SurveyHTTPFixture.locations_by_work = {"W401": [{
+            "is_oa": True, "landing_page_url": landing_page, "pdf_url": pdf_url,
+        }]}
+        config = self.full_text_config("fulltext-refutes", source_url=landing_page)
+        result = self.runtime(config).run()
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        self.assertEqual(result["coverage"]["verified_full_texts"], 1)
+        self.assertNotIn("/paper-download", [item["path"] for item in SurveyHTTPFixture.requests])
+        _, store = self.open_store()
+        capture = json.loads(store.read_body(store.head("kb/full-text/W401")["body_hash"]))
+        self.assertEqual(capture["url"], landing_page)
+
+    def test_installed_mcp_fetch_403_is_typed_without_pdf_fallback(self):
+        server_spec = importlib.util.find_spec("mcp_server_fetch")
+        if server_spec is None or not server_spec.origin:
+            self.skipTest("Official MCP Fetch package is not installed in this Python environment")
+        SurveyHTTPFixture.locations_by_work = {"W401": [{
+            "is_oa": True,
+            "landing_page_url": "https://example.org/registered-article",
+            "pdf_url": f"http://127.0.0.1:{self.server.server_port}/paper.pdf",
+        }]}
+        config = self.full_text_config(
+            "pass", source_url=f"http://127.0.0.1:{self.server.server_port}/mcp-denied")
+        fetch = config["survey"]["full_text"]
+        fetch["client"]["command"] = [sys.executable, "-m", "mcp_server_fetch"]
+        fetch["environment_files"] = [server_spec.origin]
+        fetch["representative"] = {
+            "url": f"http://127.0.0.1:{self.server.server_port}/article",
+            "max_length": 10000,
+        }
+        result = self.runtime(config).run()
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        self.assertEqual(result["coverage"]["verified_full_texts"], 0)
+        requested_paths = [item["path"] for item in SurveyHTTPFixture.requests]
+        self.assertIn("/mcp-denied", requested_paths)
+        self.assertNotIn("/paper.pdf", requested_paths)
+        failure = next(item for item in result["coverage"]["access_and_limit_gaps"]
+                       if item.get("kind") == "full_text_failure")
+        self.assertEqual(failure["outcome"], "access_denied")
+        self.assertIn("status code 403", failure["reason"])
+
+    def test_transient_mcp_error_uses_bounded_openalex_pdf_fallback(self):
+        SurveyHTTPFixture.locations_by_work = {"W401": [{
+            "is_oa": True,
+            "landing_page_url": "https://example.org/registered-article",
+            "pdf_url": f"http://127.0.0.1:{self.server.server_port}/paper.pdf",
+        }]}
+        config = self.full_text_config("fulltext-refutes", source_url="https://example.org/transport-error")
+        result = self.runtime(config).run()
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        self.assertEqual(result["coverage"]["verified_full_texts"], 1)
+        self.assertIn("/paper.pdf", [item["path"] for item in SurveyHTTPFixture.requests])
+        _, store = self.open_store()
+        capture = json.loads(store.read_body(store.head("kb/full-text/W401")["body_hash"]))
+        self.assertTrue(capture["url"].endswith("/paper.pdf"))
+
+    def test_mcp_http_denial_is_typed_and_does_not_fall_through_to_openalex_pdf(self):
+        SurveyHTTPFixture.locations_by_work = {"W401": [{
+            "is_oa": True,
+            "landing_page_url": "https://example.org/registered-article",
+            "pdf_url": f"http://127.0.0.1:{self.server.server_port}/paper.pdf",
+        }]}
+        config = self.full_text_config("pass", source_url="https://example.org/mcp-denied")
+        result = self.runtime(config).run()
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        self.assertEqual(result["coverage"]["verified_full_texts"], 0)
+        self.assertNotIn("/paper.pdf", [item["path"] for item in SurveyHTTPFixture.requests])
+        failure = next(item for item in result["coverage"]["access_and_limit_gaps"]
+                       if item.get("kind") == "full_text_failure")
+        self.assertEqual(failure["outcome"], "access_denied")
+
     def test_http_denial_does_not_fall_through_to_openalex_pdf(self):
         denied_url = f"http://127.0.0.1:{self.server.server_port}/denied.pdf"
         SurveyHTTPFixture.locations_by_work = {"W401": [{
             "is_oa": True,
-            "landing_page_url": denied_url,
+            "landing_page_url": "https://example.org/registered-article",
             "pdf_url": f"http://127.0.0.1:{self.server.server_port}/paper.pdf",
         }]}
-        result = self.runtime(self.full_text_config("pass", source_url=denied_url)).run()
+        config = self.full_text_config("pass", source_url=denied_url)
+        config["survey"]["full_text_sources"][0]["route_policy"] = "exact"
+        result = self.runtime(config).run()
         self.assertEqual(result["status"], "completed", result["error"])
         self.assertEqual(result["coverage"]["verified_full_texts"], 0)
         self.assertIn("/robots.txt", [item["path"] for item in SurveyHTTPFixture.requests])
@@ -1412,7 +1813,8 @@ class TestSurveyRunner(unittest.TestCase):
         fallback_url = f"http://127.0.0.1:{self.server.server_port}/fallback.pdf"
         SurveyHTTPFixture.robots_disallow = "/paper.pdf"
         SurveyHTTPFixture.locations_by_work = {"W401": [{
-            "is_oa": True, "landing_page_url": primary_url, "pdf_url": fallback_url,
+            "is_oa": True, "landing_page_url": "https://example.org/registered-article",
+            "pdf_url": fallback_url,
         }]}
         result = self.runtime(self.full_text_config("pass", source_url=primary_url)).run()
         self.assertEqual(result["status"], "completed", result["error"])
@@ -1896,6 +2298,113 @@ class TestSurveyContracts(unittest.TestCase):
             validate_map(value, ["W101"], {"W101", "W102"}, sources)
         claim["evidence"].append({"work_id": "W102", "source_ref": "source-two", "quote": "Recall timing is examined."})
         validate_map(value, ["W101"], {"W101", "W102"}, sources)
+
+    def test_map_projection_keeps_exact_claims_and_abstains_on_bad_quotes(self):
+        source_one = "The measured period increased by ten percent."
+        source_two = "The basal control differed across the sample."
+        displayed = [
+            {"source_ref": "source-one", "work_id": "W101", "text": source_one,
+             "window": {"start": 0, "end": len(source_one)}},
+            {"source_ref": "source-two", "work_id": "W102", "text": source_two,
+             "window": {"start": 0, "end": len(source_two)}},
+        ]
+        value = {
+            "entries": [{
+                "work_id": "W101", "inclusion": "included", "reason": "A bounded measurement is reported.",
+                "problem": {"text": "The measured period increased.", "evidence": [{
+                    "work_id": "W101", "source_ref": "source-one",
+                    "quote": "The measured period increased", "decoration": "ignored",
+                }]},
+                "approach": {"text": "Unsupported wording.", "evidence": [{
+                    "work_id": "W101", "source_ref": "source-one", "quote": "not in source",
+                }]},
+                "finding": {"text": "Cross-work citation.", "evidence": [{
+                    "work_id": "W102", "source_ref": "source-two",
+                    "quote": "The basal control differed",
+                }]},
+                "limitations": {"text": None, "evidence": []}, "extra": "ignored",
+            }],
+            "relationships": [
+                {"source": "W101", "target": "W102", "kind": "related",
+                 "claim": "Uncited relation."},
+                {"source": "W101", "target": "W102", "kind": "compares",
+                 "claim": {"text": "The conditions differ.", "evidence": [
+                     {"work_id": "W101", "source_ref": "source-one",
+                      "quote": "The measured period increased"},
+                     {"work_id": "W102", "source_ref": "source-two",
+                      "quote": "The basal control differed"},
+                 ]}},
+            ],
+        }
+
+        normalized = normalize_map_worker_response(
+            value, work_id="W101", all_work_ids={"W101", "W102"},
+            sources=displayed,
+            windows={row["source_ref"]: row["window"] for row in displayed},
+        )
+
+        entry = normalized["entries"][0]
+        self.assertEqual(entry["problem"]["text"], "The measured period increased.")
+        self.assertEqual(entry["problem"]["evidence"][0]["start"], 0)
+        self.assertEqual(entry["approach"], {"text": None, "evidence": []})
+        self.assertEqual(entry["finding"], {"text": None, "evidence": []})
+        self.assertEqual(len(normalized["relationships"]), 1)
+        validate_map(
+            normalized, ["W101"], {"W101", "W102"},
+            {row["source_ref"]: row for row in displayed}, require_spans=True,
+        )
+
+    def test_scoped_map_projection_discards_ungranted_fields_and_relations(self):
+        source_one = "The measured period increased by ten percent."
+        source_two = "The basal control differed across the sample."
+        displayed = [
+            {"source_ref": "source-one", "work_id": "W101", "text": source_one,
+             "window": {"start": 0, "end": len(source_one)}},
+            {"source_ref": "source-two", "work_id": "W102", "text": source_two,
+             "window": {"start": 0, "end": len(source_two)}},
+        ]
+        previous = {"work_id": "W101", "inclusion": "included", "reason": "Prior screening.",
+                    **{field: {"text": None, "evidence": []} for field in MAP_FIELDS}}
+        feedback = {"entry_fields": ["finding"], "relationship_targets": ["W102"]}
+        response = {
+            "entry_updates": {"W101": {
+                "finding": {"text": "The measured period increased.", "evidence": [{
+                    "work_id": "W101", "source_ref": "source-one",
+                    "quote": "The measured period increased",
+                }]},
+                "reason": "ungranted edit",
+            }, "W999": {"reason": "other work"}},
+            "relationships": [
+                {"source": "W101", "target": "W999", "kind": "related",
+                 "claim": {"text": "ungranted", "evidence": []}},
+                {"source": "W101", "target": "W102", "kind": "compares",
+                 "claim": {"text": "The conditions differ.", "evidence": [
+                     {"work_id": "W101", "source_ref": "source-one",
+                      "quote": "The measured period increased"},
+                     {"work_id": "W102", "source_ref": "source-two",
+                      "quote": "The basal control differed"},
+                 ]}},
+            ],
+        }
+
+        normalized = normalize_map_worker_response(
+            response, work_id="W101", all_work_ids={"W101", "W102"},
+            sources=displayed,
+            windows={row["source_ref"]: row["window"] for row in displayed},
+            review_feedback=feedback,
+        )
+        repaired = apply_scoped_map_repair(
+            "W101", previous, [], feedback, normalized,
+            reject_ungranted_changes=True,
+        )
+
+        self.assertEqual(set(normalized["entry_updates"]), {"finding"})
+        self.assertEqual(repaired["entries"][0]["reason"], "Prior screening.")
+        self.assertEqual([row["target"] for row in repaired["relationships"]], ["W102"])
+        validate_map(
+            repaired, ["W101"], {"W101", "W102"},
+            {row["source_ref"]: row for row in displayed}, require_spans=True,
+        )
 
     def test_flat_relationship_statement_is_canonicalized_without_dropping_evidence(self):
         entry = {"work_id": "W101", "inclusion": "included", "reason": "The source examines recall timing.",

@@ -4,10 +4,13 @@ import unittest
 import json
 from pathlib import Path
 import tempfile
+import time
 from unittest.mock import Mock, patch
 
 from scisaurus.core.errors import ValidationError
-from scisaurus.runtime.models import ModelResult
+from scisaurus.runtime.models import (
+    ModelCallError, ModelResult, clear_model_provider_cooldown,
+)
 from scisaurus.runtime.paper_pipeline import (
     bind_claim_citations,
     compress_reader_surface,
@@ -28,6 +31,117 @@ class ManuscriptDraftContractTests(unittest.TestCase):
         return {"schema_version": "manuscript-draft-2", "title": "A paper", "citation": "markers",
                 "sections": [{"id": "intro", "title": "Introduction",
                               "units": [{"id": "intro_p1", "kind": "paragraph", "text": "A sentence."}]}]}
+
+    def test_writer_client_inherits_route_timeout_and_respects_explicit_bounds(self):
+        runner = PaperPipelineRunner.__new__(PaperPipelineRunner)
+        runner.model_config = {
+            "base_url": "http://example.invalid/v1", "protocol": "openai_compatible",
+            "model": "writer", "timeout_seconds": 1800, "max_output_tokens": 8192,
+            "context_window_tokens": 262144, "max_input_tokens": 245760,
+        }
+        runner.model_call_timeout_seconds = None
+        deadline = time.monotonic() + 1200
+
+        self.assertAlmostEqual(runner._client(deadline=deadline).timeout_seconds, 1200, delta=0.1)
+        runner.model_call_timeout_seconds = 600
+        self.assertEqual(runner._client(deadline=deadline).timeout_seconds, 600)
+
+    def test_surgical_repair_uses_local_route_only_after_known_cloud_429(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cloud = {
+                "protocol": "openai_compatible", "base_url": "http://cloud.test/v1",
+                "model": "deepseek-cloud", "auth_env": None,
+                "context_window_tokens": 32768, "max_input_tokens": 30000,
+                "max_output_tokens": 4096, "timeout_seconds": 20,
+            }
+            clear_model_provider_cooldown(cloud)
+            model = {
+                **cloud,
+                "role_routes": {"editorial.surgical-editor": [{
+                    "id": "surgical-cloud", "pool": "cloud", **cloud,
+                }]},
+                "provider_cooldown_fallback": {
+                    "id": "ollama-local-cooldown-recovery", "pool": "ollama",
+                    "protocol": "openai_compatible", "base_url": "http://local.test/v1",
+                    "model": "gemma-local", "auth_env": None,
+                    "context_window_tokens": 32768, "max_input_tokens": 30000,
+                    "max_output_tokens": 4096, "timeout_seconds": 20,
+                    "provider_quota_scope": "ollama-local",
+                },
+            }
+            runner = PaperPipelineRunner.__new__(PaperPipelineRunner)
+            runner.model_config = model
+            runner.paper_config = {"document_type": "review", "references": []}
+            runner.packet = {}
+            runner.research_argument = {
+                "research_question": "Does control produce a stable shear response?",
+                "primary_argument": {
+                    "thesis": "The control produces a stable shear response.",
+                },
+                "observed_patterns": [{
+                    "id": "pattern_control",
+                    "observation": "The control produces a stable shear response.",
+                    "implication": "The stable shear response identifies the bounded control result.",
+                }],
+            }
+            runner.output = Path(directory)
+            runner.repair_round = 0
+            runner.repair_max_output_tokens = 128
+            runner.review_reasoning_effort = "none"
+            runner.model_call_timeout_seconds = 10
+            runner.deadline = time.monotonic() + 10
+            runner.model_concurrency = 1
+            runner.repair_failures = []
+            draft = {"schema_version": "manuscript-draft-2", "title": "A bounded result",
+                     "citation": "No citations.", "sections": [{
+                         "id": "introduction", "title": "Introduction", "units": [{
+                             "id": "intro_p1", "kind": "paragraph",
+                             "text": "The control produces a stable shear response.",
+                         }],
+                     }]}
+            package = {
+                "reviews": [{"findings": [{
+                    "id": "finding_control", "protected": ["intro_p1"],
+                    "location": "intro_p1", "summary": "Clarify the result.",
+                }]}],
+                "synthesis": {"required_repairs": [{"finding_id": "finding_control"}]},
+            }
+            calls = []
+
+            class StubClient:
+                def __init__(self, **route):
+                    self.route = route
+
+                def complete(self, *, system, prompt, images=None):
+                    calls.append(self.route["model"])
+                    if self.route["model"] == "deepseek-cloud":
+                        raise ModelCallError(
+                            "known quota response", outcome_known=True,
+                            status_code=429, attempts=1,
+                        )
+                    return ModelResult(
+                        text=json.dumps({"replacements": [{
+                            "unit_id": "intro_p1",
+                            "text": "The control produces a stable shear response.",
+                        }]}),
+                        model="gemma-local", usage={"model_calls": 1},
+                        elapsed_seconds=0.01, finish_reason="stop",
+                    )
+
+            with patch("scisaurus.runtime.paper_pipeline.ModelClient", StubClient):
+                repaired, replacements, result = runner._repair(draft, package)
+
+            self.assertEqual(calls, ["deepseek-cloud", "gemma-local"])
+            self.assertEqual(
+                replacements["intro_p1"],
+                "The control produces a stable shear response.",
+            )
+            self.assertEqual(repaired["sections"][0]["units"][0]["id"], "intro_p1")
+            self.assertEqual(result.usage["model_calls"], 1)
+            attempt = json.loads((Path(directory) /
+                                  "repair-round-1-batch-1-attempt-1.json").read_text())
+            self.assertEqual([item["model"] for item in attempt["provider_route_history"]],
+                             ["deepseek-cloud", "gemma-local"])
 
     def test_accepts_structured_draft(self):
         self.assertEqual(validate_manuscript_draft(self.draft())["title"], "A paper")
@@ -258,6 +372,26 @@ class ManuscriptDraftContractTests(unittest.TestCase):
         )
         self.assertLessEqual(audit["selected"]["estimated_input_tokens"], 56000)
         self.assertEqual(audit["selected"]["mode"], "bounded_scientific_compaction")
+        self.assertIn("writer context bounded", prompt)
+
+    def test_writer_context_projection_reaches_deeper_compaction_before_blocking(self):
+        runner = PaperPipelineRunner.__new__(PaperPipelineRunner)
+        runner.packet = {"research_argument": {"research_question": "Does X change Y?"}}
+        runner.paper_config = {"references": []}
+        runner.model_config = {
+            "base_url": "http://127.0.0.1:1/v1", "protocol": "openai_compatible",
+            "model": "writer", "timeout_seconds": 2, "max_output_tokens": 8192,
+            "context_window_tokens": 65536, "max_input_tokens": 56000,
+        }
+        verbose_payload = {
+            "reviewer_notes": {f"note-{index}": "x" * 600 for index in range(500)}
+        }
+
+        prompt, audit = runner._writer_context_projection(verbose_payload, "s" * 3500)
+
+        self.assertEqual(audit["selected"]["mode"], "bounded_scientific_compaction")
+        self.assertLessEqual(audit["selected"]["estimated_input_tokens"], 56000)
+        self.assertLessEqual(audit["selected"]["max_string_chars"], 320)
         self.assertIn("writer context bounded", prompt)
 
     def test_claim_citation_binding_projects_literature_to_claim_unit(self):

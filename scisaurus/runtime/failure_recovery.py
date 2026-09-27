@@ -13,6 +13,7 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
+import re
 
 from scisaurus.core.schema import canonical_bytes
 
@@ -31,7 +32,8 @@ _OPERATIONAL_MARKERS = (
 )
 _MODEL_CONTRACT_MARKERS = (
     "invalid json", "malformed json",
-    "response contract", "output contract", "model output",
+    "response contract", "output contract", "model output must contain",
+    "model output omitted",
     "did not finish normally", "finish_reason", "research argument review",
     "research argument was not accepted",
 )
@@ -43,7 +45,8 @@ _EXPERIMENT_PROGRAM_MARKERS = (
     # response failure until an executable program actually exists.
     "executor failed in the sandbox", "program validator",
     "program admission", "independent recalculation", "results-package",
-    "result package",
+    "result package", "adversarial review rejected the candidate program",
+    "adversarial_review repair budget exhausted",
 )
 
 
@@ -99,6 +102,27 @@ def classify_failure(stage_kind, error, stage_result=None):
     if stage_kind == "experiment" and any(
             marker in text for marker in _EXPERIMENT_PROGRAM_MARKERS):
         return "experiment_failure"
+    repair_gate = getattr(error, "repair_gate", None)
+    if (stage_kind == "experiment"
+            and getattr(error, "failure_class", None) == "experiment_capability_repair"
+            and isinstance(repair_gate, str)
+            and repair_gate in {
+                "adversarial_review", "independent_recalculation",
+                "deterministic_replay", "validator_readiness", "static_scan",
+            }):
+        # A bounded foundry rejection is not a response-format defect when its
+        # typed gate is judging the generated program or its scientific result.
+        return "experiment_failure"
+    if (stage_kind == "topic_discovery"
+            and getattr(error, "retryable_topic_intake", False)):
+        # TopicDiscoveryRunner uses a bounded local envelope for proposal and
+        # review attempts.  Its exhaustion is actionable Composer work, not a
+        # provider quota fence; preserve the distinction from real model/API
+        # budget failures, which never carry this typed retry marker.
+        if getattr(error, "topic_retry_reason", None) == "intake_contract_failure":
+            return "model_contract"
+        if getattr(error, "topic_retry_reason", None) == "scientific_candidate_rejected":
+            return "scientific_review"
     if (error_type in {
             "ProviderCooldownError", "ProviderConfigurationError", "QuotaExceededError",
             "ComposerHardDeadlineExceeded", "ComposerLateStageResult",
@@ -129,7 +153,8 @@ def classify_failure(stage_kind, error, stage_result=None):
     if stage_kind == "experiment":
         if any(marker in text for marker in (
                 "executor", "validator", "replay", "result package", "results-package",
-                "assessment", "estimator", "metric", "observation", "experiment",
+                "assessment", "estimator", "metric", "experiment observation",
+                "observation output", "experiment",
                 "research-quality", "independent recalculation", "program",
         )):
             return "experiment_failure"
@@ -216,7 +241,8 @@ def _error_diagnostics(error):
     diagnostics = {}
     for attribute in (
             "research_argument", "research_review", "research_feedback",
-            "research_response", "review", "required_repairs"):
+            "research_response", "review", "required_repairs",
+            "model_diagnostics", "topic_response_repair"):
         value = getattr(error, attribute, None)
         if value is not None:
             diagnostics[attribute] = _bounded(value, max_depth=7, max_items=24,
@@ -229,7 +255,124 @@ def _error_diagnostics(error):
     return diagnostics
 
 
-def _review_directives(specialist_reports, diagnostics):
+def failure_evidence_lineage_conflicts(value, *, attempt_number=None,
+                                       input_sha256=None, dossier_ref=None,
+                                       stage_id=None):
+    """Identify explicit attempt, dossier, or digest conflicts in repair evidence."""
+    foreign_attempts = set()
+    foreign_stage_ids = set()
+    foreign_dossier_refs = set()
+    mismatched_input_digest = False
+    attempt_reference = re.compile(
+        r"\b(?:stage\s+|experiment\s+|failure\s+)?attempt"
+        r"(?:[\s_-]*#?[\s_-]*)(\d+)\b",
+        re.IGNORECASE,
+    )
+    dossier_attempt_reference = re.compile(
+        r"(?:stage|experiment)[^\n]*?attempt[-_ ](\d+)", re.IGNORECASE)
+    digest_reference = re.compile(
+        r"\b(?:failure[\s_-]*)?input[\s_-]*sha256"
+        r"\s*[:=]\s*[\"'`]?([0-9a-f]{64})\b",
+        re.IGNORECASE,
+    )
+    ignored_text_fields = {
+        "artifactref", "artifactrefs", "assignmentid", "attemptid",
+        "bodyhash", "cachebodyhash", "cacheref", "createdat",
+        "eventid", "finishedat", "manifesthash", "projectdir",
+        "requestid", "roleid", "sourceintegrity", "sourcesha256",
+        "startedat", "taskid", "updatedat", "usage",
+    }
+
+    def check_lineage(lineage):
+        nonlocal mismatched_input_digest
+        if not isinstance(lineage, dict):
+            return
+        for key in ("stage_id", "failure_stage_id"):
+            value_stage = lineage.get(key)
+            if (isinstance(value_stage, str) and isinstance(stage_id, str)
+                    and value_stage != stage_id):
+                foreign_stage_ids.add(value_stage)
+        for key in ("stage_attempt_number", "attempt_number", "failure_attempt_number"):
+            value_attempt = lineage.get(key)
+            if (type(value_attempt) is int and type(attempt_number) is int
+                    and value_attempt != attempt_number):
+                foreign_attempts.add(value_attempt)
+        for key in ("failure_dossier_ref", "dossier_ref"):
+            value_ref = lineage.get(key)
+            if not isinstance(value_ref, str):
+                continue
+            if isinstance(dossier_ref, str) and value_ref != dossier_ref:
+                foreign_dossier_refs.add(value_ref)
+            elif dossier_ref is None and type(attempt_number) is int:
+                ref_attempt = dossier_attempt_reference.search(value_ref)
+                if ref_attempt and int(ref_attempt.group(1)) != attempt_number:
+                    foreign_attempts.add(int(ref_attempt.group(1)))
+        for key in ("failure_input_sha256", "failure_dossier_input_sha256",
+                    "dossier_input_sha256"):
+            value_digest = lineage.get(key)
+            if (isinstance(value_digest, str) and isinstance(input_sha256, str)
+                    and value_digest != input_sha256):
+                mismatched_input_digest = True
+
+    def visit(item):
+        nonlocal mismatched_input_digest
+        if isinstance(item, dict):
+            for key in ("failure_lineage", "failure_recovery"):
+                check_lineage(item.get(key))
+            for key, child in item.items():
+                normalized = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+                if normalized in ignored_text_fields or normalized in {
+                        "failurelineage", "failurerecovery"}:
+                    continue
+                if normalized in {"stageattemptnumber", "failureattemptnumber"}:
+                    if (type(child) is int and type(attempt_number) is int
+                            and child != attempt_number):
+                        foreign_attempts.add(child)
+                    continue
+                if normalized in {
+                        "failureinputsha256", "failuredossierinputsha256",
+                        "dossierinputsha256"}:
+                    if (isinstance(child, str) and isinstance(input_sha256, str)
+                            and child != input_sha256):
+                        mismatched_input_digest = True
+                    continue
+                if normalized in {"failuredossierref", "dossierref"}:
+                    if isinstance(child, str):
+                        if isinstance(dossier_ref, str) and child != dossier_ref:
+                            foreign_dossier_refs.add(child)
+                        elif dossier_ref is None and type(attempt_number) is int:
+                            ref_attempt = dossier_attempt_reference.search(child)
+                            if ref_attempt and int(ref_attempt.group(1)) != attempt_number:
+                                foreign_attempts.add(int(ref_attempt.group(1)))
+                    continue
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+        elif isinstance(item, str):
+            for match in attempt_reference.finditer(item):
+                referenced_attempt = int(match.group(1))
+                if (type(attempt_number) is int
+                        and referenced_attempt != attempt_number):
+                    foreign_attempts.add(referenced_attempt)
+            for match in digest_reference.finditer(item):
+                if (isinstance(input_sha256, str)
+                        and match.group(1).casefold() != input_sha256.casefold()):
+                    mismatched_input_digest = True
+
+    visit(value)
+    return {
+        "conflicts": bool(foreign_attempts or foreign_stage_ids or foreign_dossier_refs
+                          or mismatched_input_digest),
+        "foreign_attempt_numbers": sorted(foreign_attempts),
+        "foreign_stage_id_count": len(foreign_stage_ids),
+        "foreign_dossier_ref_count": len(foreign_dossier_refs),
+        "mismatched_input_digest": mismatched_input_digest,
+    }
+
+
+def _review_directives(specialist_reports, diagnostics, *, attempt_number=None,
+                       stage_id=None):
     """Flatten bounded reviewer findings into executable, evidence-linked directions."""
     directives = []
     seen = set()
@@ -250,6 +393,10 @@ def _review_directives(specialist_reports, diagnostics):
     for report in specialist_reports or []:
         if not isinstance(report, dict):
             continue
+        if failure_evidence_lineage_conflicts(
+                report, attempt_number=attempt_number,
+                stage_id=stage_id)["conflicts"]:
+            continue
         source = report.get("assigned_role") or report.get("role_id") or "specialist"
         response = report.get("response") if isinstance(report.get("response"), dict) else report
         for key in ("critical_findings", "required_repairs", "requested_actions",
@@ -260,7 +407,10 @@ def _review_directives(specialist_reports, diagnostics):
                     add(source, key, value)
 
     review = diagnostics.get("research_review") if isinstance(diagnostics, dict) else None
-    if isinstance(review, dict):
+    if (isinstance(review, dict)
+            and not failure_evidence_lineage_conflicts(
+                review, attempt_number=attempt_number,
+                stage_id=stage_id)["conflicts"]):
         for key in ("required_repairs", "checks"):
             values = review.get(key)
             if isinstance(values, list):
@@ -433,14 +583,37 @@ def build_repair_commands(stage_kind, failure_class, *, stage_result=None,
 
 def build_failure_dossier(*, stage, attempt_stage, error, stage_result=None,
                           specialist_reports=None, verifier=None,
-                          program_snapshot=None, attempt_number=None):
+                          program_snapshot=None, foundry_work_snapshot=None,
+                          attempt_number=None):
     """Build an immutable, bounded failure dossier for the Composer ledger."""
     stage_kind = stage.get("kind") if isinstance(stage, dict) else None
     failure_class = classify_failure(stage_kind, error, stage_result)
     project_dir = (attempt_stage or {}).get("project_dir") if isinstance(attempt_stage, dict) else None
     specialist_reports = specialist_reports or []
     diagnostics = _error_diagnostics(error)
-    directives = _review_directives(specialist_reports, diagnostics)
+    resolved_attempt_number = (
+        attempt_number if attempt_number is not None else
+        ((attempt_stage or {}).get("attempt_number")
+         if isinstance(attempt_stage, dict) else None)
+    )
+    rejected_review_count = sum(
+        1 for report in specialist_reports
+        if isinstance(report, dict) and failure_evidence_lineage_conflicts(
+            report, attempt_number=resolved_attempt_number,
+            stage_id=stage.get("id") if isinstance(stage, dict) else None,
+        )["conflicts"]
+    )
+    diagnostic_review = diagnostics.get("research_review")
+    rejected_diagnostic_review = (
+        isinstance(diagnostic_review, dict)
+        and failure_evidence_lineage_conflicts(
+            diagnostic_review, attempt_number=resolved_attempt_number,
+            stage_id=stage.get("id") if isinstance(stage, dict) else None,
+        )["conflicts"]
+    )
+    directives = _review_directives(
+        specialist_reports, diagnostics, attempt_number=resolved_attempt_number,
+        stage_id=stage.get("id") if isinstance(stage, dict) else None)
     commands = build_repair_commands(
         stage_kind, failure_class, stage_result=stage_result,
         program_snapshot=program_snapshot, error_text=str(error),
@@ -451,11 +624,7 @@ def build_failure_dossier(*, stage, attempt_stage, error, stage_result=None,
         "schema_version": SCHEMA_VERSION,
         "stage_id": stage.get("id") if isinstance(stage, dict) else None,
         "stage_kind": stage_kind,
-        "attempt_number": (
-            attempt_number if attempt_number is not None else
-            ((attempt_stage or {}).get("attempt_number")
-             if isinstance(attempt_stage, dict) else None)
-        ),
+        "attempt_number": resolved_attempt_number,
         "project_dir": str(Path(project_dir).resolve()) if project_dir else None,
         "failure_class": failure_class,
         "recoverable": failure_class not in {"resource_fence"},
@@ -463,10 +632,20 @@ def build_failure_dossier(*, stage, attempt_stage, error, stage_result=None,
         "observed_result": observed,
         "project_inventory": inventory_project(project_dir),
         "program_snapshot": _bounded(program_snapshot or [], max_depth=5, max_items=8, max_text=18000),
+        "foundry_work_snapshot": _bounded(
+            foundry_work_snapshot or {}, max_depth=7, max_items=24, max_text=18000),
         "specialist_reports": _bounded(specialist_reports, max_depth=6, max_items=8, max_text=2200),
         "verifier": _bounded(verifier or {}, max_depth=6, max_items=8, max_text=2200),
         "model_diagnostics": diagnostics,
         "review_directives": directives,
+        "repair_directive_provenance": {
+            "excluded_cross_lineage_specialist_report_count": rejected_review_count,
+            "excluded_cross_lineage_diagnostic_review": rejected_diagnostic_review,
+            "policy": (
+                "Cross-attempt or cross-stage review content remains in the audit record but is "
+                "not promoted to this attempt's executable repair directives."
+            ),
+        },
         "repair_commands": commands,
         "acceptance_checks": [item["acceptance_check"] for item in commands],
         "next_action": (

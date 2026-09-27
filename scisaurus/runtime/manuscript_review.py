@@ -19,7 +19,12 @@ import threading
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.models import ModelCallError, ModelClient, ModelResult, model_context_error, resolve_model_config
+from scisaurus.runtime.models import (
+    ModelClient, ModelContextBudgetError, ModelResult,
+    complete_with_role_fallbacks, effective_model_timeout,
+    model_context_budget, model_context_error, model_route_candidates,
+    resolve_model_config,
+)
 
 
 REVIEW_SCHEMA_VERSION = "manuscript-review-2"
@@ -788,7 +793,7 @@ class ManuscriptReviewRunner:
     def __init__(self, model, *, reviewers=None, max_workers=3,
                  deadline_seconds=DEFAULT_DEADLINE_SECONDS,
                  max_output_tokens=None, reasoning_effort="xhigh",
-                 call_timeout_seconds=300.0, inter_request_interval_seconds=0.5,
+                 call_timeout_seconds=None, inter_request_interval_seconds=0.5,
                  arbiter_enabled=False, retained_work_dir=None):
         self.model_config = deepcopy(model)
         self.retained_work_dir = Path(retained_work_dir).resolve() if retained_work_dir else None
@@ -819,23 +824,24 @@ class ManuscriptReviewRunner:
             raise ValidationError("review max_output_tokens must be a positive integer when supplied")
         if reasoning_effort not in {"none", "low", "medium", "high", "xhigh"}:
             raise ValidationError("review reasoning_effort is unsupported")
-        if (type(call_timeout_seconds) not in (int, float)
-                or not math.isfinite(call_timeout_seconds) or call_timeout_seconds <= 0):
-            raise ValidationError("review call timeout must be finite and positive")
+        if (call_timeout_seconds is not None
+                and (type(call_timeout_seconds) not in (int, float)
+                     or not math.isfinite(call_timeout_seconds) or call_timeout_seconds <= 0)):
+            raise ValidationError("review call timeout must be finite and positive when supplied")
         if (type(inter_request_interval_seconds) not in (int, float)
                 or not math.isfinite(inter_request_interval_seconds)
                 or inter_request_interval_seconds < 0):
             raise ValidationError("review inter-request interval must be finite and non-negative")
         self.max_output_tokens = max_output_tokens
         self.reasoning_effort = reasoning_effort
-        self.call_timeout_seconds = float(call_timeout_seconds)
+        self.call_timeout_seconds = (
+            float(call_timeout_seconds) if call_timeout_seconds is not None else None)
         self.inter_request_interval_seconds = float(inter_request_interval_seconds)
         if type(arbiter_enabled) is not bool:
             raise ValidationError("arbiter_enabled must be boolean")
         self.arbiter_enabled = arbiter_enabled
         self._pace_lock = threading.Lock()
         self._next_dispatch = 0.0
-        self._provider_pauses = {}
 
     @staticmethod
     def _remaining(deadline):
@@ -850,19 +856,62 @@ class ManuscriptReviewRunner:
     def _bounded_model_config(cls, model_config, deadline, *, call_timeout_seconds):
         config = deepcopy(model_config)
         remaining = cls._remaining(deadline)
+        timeout_bounds = []
         if remaining is not None:
-            # Keep the provider call inside the batch deadline.  A small
-            # floor leaves urllib enough time to create and close a request;
-            # calls that cannot receive that minimum budget are rejected
-            # before another retry is started.
             if remaining < 0.2:
                 raise ValidationError("manuscript review deadline exceeded")
-            config["timeout_seconds"] = min(float(config["timeout_seconds"]), remaining,
-                                             float(call_timeout_seconds))
-        else:
-            config["timeout_seconds"] = min(float(config["timeout_seconds"]),
-                                             float(call_timeout_seconds))
+            timeout_bounds.append(remaining)
+        if call_timeout_seconds is not None:
+            timeout_bounds.append(call_timeout_seconds)
+        config["timeout_seconds"] = effective_model_timeout(
+            config.get("timeout_seconds"), *timeout_bounds)
         return config
+
+    def _candidate_configs(self, role, prompt, *, images=None, deadline=None):
+        candidates = []
+        first_context_error = None
+        for config in model_route_candidates(self.model_config, role=role):
+            bounded = self._bounded_model_config(
+                config, deadline, call_timeout_seconds=self.call_timeout_seconds)
+            if self.max_output_tokens is not None:
+                bounded["max_output_tokens"] = min(
+                    bounded.get("max_output_tokens", self.max_output_tokens),
+                    self.max_output_tokens)
+            if bounded.get("protocol") == "openai_compatible":
+                bounded["reasoning_effort"] = self.reasoning_effort
+            bounded["max_retries"] = 0
+            error = model_context_error(
+                bounded, system=SYSTEM, prompt=prompt,
+                image_count=len(images or []))
+            if error:
+                if first_context_error is None:
+                    budget = model_context_budget(
+                        bounded, system=SYSTEM, prompt=prompt,
+                        image_count=len(images or []))
+                    first_context_error = ModelContextBudgetError(
+                        error, model=budget["model"],
+                        estimated_input_tokens=budget["estimated_input_tokens"],
+                        allowed_input_tokens=budget["allowed_input_tokens"],
+                        context_window_tokens=budget["context_window_tokens"],
+                        max_input_tokens=budget["max_input_tokens"],
+                        max_output_tokens=budget["max_output_tokens"],
+                        image_count=len(images or []))
+                continue
+            candidates.append(bounded)
+        if not candidates:
+            if first_context_error is not None:
+                raise first_context_error
+            raise ValidationError(f"no model route is configured for {role}")
+        return candidates
+
+    def _complete_role(self, role, prompt, *, images=None, deadline=None):
+        candidates = self._candidate_configs(
+            role, prompt, images=images, deadline=deadline)
+        return complete_with_role_fallbacks(
+            self.model_config, role=role, system=SYSTEM, prompt=prompt,
+            images=images, deadline=deadline, candidate_configs=candidates,
+            client_factory=ModelClient,
+        )
 
     def _pace(self, deadline):
         """Space provider dispatches without holding a worker slot forever."""
@@ -912,30 +961,12 @@ class ManuscriptReviewRunner:
                     },
                 }, ensure_ascii=False, sort_keys=True)
             self._pace(deadline)
-            config = self._bounded_model_config(self.model_config, deadline,
-                                                call_timeout_seconds=self.call_timeout_seconds)
-            if self.max_output_tokens is not None:
-                config["max_output_tokens"] = min(config.get("max_output_tokens", self.max_output_tokens),
-                                                   self.max_output_tokens)
-            if config.get("protocol") == "openai_compatible":
-                config["reasoning_effort"] = self.reasoning_effort
+            role = ("editorial.visual-integrator" if reviewer["id"] == "editorial_compression" and images
+                    else f"review.{reviewer['id']}")
             try:
-                role = ("editorial.visual-integrator" if reviewer["id"] == "editorial_compression" and images
-                        else f"review.{reviewer['id']}")
-                config = resolve_model_config(config, role=role)
-                provider = config.get("base_url", "").rstrip("/")
-                with self._pace_lock:
-                    pause = self._provider_pauses.get(provider)
-                if pause:
-                    raise ModelCallError("review provider is cooling down", outcome_known=True, status_code=429,
-                        retry_after_seconds=max(0.1, pause - time.monotonic()))
-                result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt, images=images)
+                result, provider_route_history = self._complete_role(
+                    role, prompt, images=images, deadline=deadline)
             except Exception as exc:
-                if isinstance(exc, ModelCallError) and exc.status_code == 429:
-                    with self._pace_lock:
-                        self._provider_pauses[config.get("base_url", "").rstrip("/")] = (
-                            time.monotonic() + exc.retry_after_seconds if exc.retry_after_seconds
-                            else deadline or time.monotonic() + self.call_timeout_seconds)
                 # Preserve the transport failure at the review boundary.  A
                 # later Composer resume can distinguish a provider failure
                 # from an invalid review object without weakening the review
@@ -944,11 +975,14 @@ class ManuscriptReviewRunner:
                     artifact_dir.mkdir(parents=True, exist_ok=True)
                     (artifact_dir / f"review-{reviewer['id']}-attempt-{attempt + 1}-failure.json").write_bytes(
                         canonical_bytes({"attempt": attempt + 1, "reviewer_id": reviewer["id"],
-                                         "error": f"{type(exc).__name__}: {exc}"}))
+                                         "error": f"{type(exc).__name__}: {exc}",
+                                         "provider_route_history": getattr(
+                                             exc, "route_history", [])}))
                 raise
             attempt_record = {"attempt": attempt + 1, "reviewer_id": reviewer["id"],
                               "finish_reason": result.finish_reason, "response": result.text,
-                              "usage": result.usage}
+                              "usage": result.usage,
+                              "provider_route_history": provider_route_history}
             if artifact_dir is not None:
                 artifact_dir.mkdir(parents=True, exist_ok=True)
                 (artifact_dir / f"review-{reviewer['id']}-attempt-{attempt + 1}.json").write_bytes(
@@ -1009,25 +1043,22 @@ class ManuscriptReviewRunner:
                     ),
                 }, ensure_ascii=False, sort_keys=True)
             self._pace(deadline)
-            config = self._bounded_model_config(self.model_config, deadline,
-                                                call_timeout_seconds=self.call_timeout_seconds)
-            if self.max_output_tokens is not None:
-                config["max_output_tokens"] = min(config.get("max_output_tokens", self.max_output_tokens),
-                                                   self.max_output_tokens)
-            if config.get("protocol") == "openai_compatible":
-                config["reasoning_effort"] = self.reasoning_effort
             try:
-                config = resolve_model_config(config, role="review.arbiter")
-                result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt)
+                result, provider_route_history = self._complete_role(
+                    "review.arbiter", prompt, deadline=deadline)
             except Exception as exc:
                 if artifact_dir is not None:
                     (artifact_dir / f"arbitration-attempt-{attempt + 1}-failure.json").write_bytes(
-                        canonical_bytes({"attempt": attempt + 1, "error": f"{type(exc).__name__}: {exc}"}))
+                        canonical_bytes({"attempt": attempt + 1,
+                                        "error": f"{type(exc).__name__}: {exc}",
+                                        "provider_route_history": getattr(
+                                            exc, "route_history", [])}))
                 raise
             if artifact_dir is not None:
                 (artifact_dir / f"arbitration-attempt-{attempt + 1}.json").write_bytes(
                     canonical_bytes({"attempt": attempt + 1, "finish_reason": result.finish_reason,
-                                     "response": result.text, "usage": result.usage}))
+                                     "response": result.text, "usage": result.usage,
+                                     "provider_route_history": provider_route_history}))
             elapsed += result.elapsed_seconds
             for key in usage:
                 usage[key] += result.usage.get(key, 0)
@@ -1115,19 +1146,13 @@ class ManuscriptReviewRunner:
                     },
                 }, ensure_ascii=False, sort_keys=True)
             self._pace(deadline)
-            config = self._bounded_model_config(self.model_config, deadline,
-                                                call_timeout_seconds=self.call_timeout_seconds)
-            if self.max_output_tokens is not None:
-                config["max_output_tokens"] = min(config.get("max_output_tokens", self.max_output_tokens),
-                                                   self.max_output_tokens)
-            if config.get("protocol") == "openai_compatible":
-                config["reasoning_effort"] = self.reasoning_effort
-            config = resolve_model_config(config, role="review.synthesizer")
-            result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt, images=images)
+            result, provider_route_history = self._complete_role(
+                "review.synthesizer", prompt, images=images, deadline=deadline)
             if artifact_dir is not None:
                 (artifact_dir / f"synthesis-attempt-{attempt + 1}.json").write_bytes(
                     canonical_bytes({"attempt": attempt + 1, "finish_reason": result.finish_reason,
-                                     "response": result.text, "usage": result.usage}))
+                                     "response": result.text, "usage": result.usage,
+                                     "provider_route_history": provider_route_history}))
             elapsed += result.elapsed_seconds
             for key in usage:
                 usage[key] += result.usage.get(key, 0)

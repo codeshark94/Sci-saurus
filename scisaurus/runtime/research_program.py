@@ -1,10 +1,11 @@
-"""A bounded research program built from an admitted topic portfolio.
+"""A bounded research program built from an admitted topic proposal.
 
-Topic discovery already produces several candidate directions.  This module
-turns that portfolio into an explicit, human-readable decision surface: every
-candidate has a plan, conditional paper outcomes, a kill condition, and a
-status.  The selected direction is only a routing decision; survey and
-experiment evidence still decide whether it is promoted, revised, or stopped.
+Topic discovery produces several candidate directions during exploration and
+may produce one parent-preserving candidate during a scoped refinement. This
+module turns either result into an explicit decision surface: every candidate
+has a plan, conditional paper outcomes, a kill condition, and a status. The
+selected direction is only a routing decision; survey and experiment evidence
+still decide whether it is promoted, revised, or stopped.
 """
 from __future__ import annotations
 
@@ -82,8 +83,8 @@ def validate_research_program(value):
     _strings(value["selection_criteria"], "research program selection_criteria", minimum=2, maximum=8)
 
     branches = value["branches"]
-    if not isinstance(branches, list) or not 3 <= len(branches) <= 8:
-        raise ValidationError("research program requires three to eight branches")
+    if not isinstance(branches, list) or not 1 <= len(branches) <= 8:
+        raise ValidationError("research program requires one to eight branches")
     branch_ids = set()
     selected = []
     for branch in branches:
@@ -200,9 +201,9 @@ def _branch_outcomes(candidate):
 def build_research_program(topic_package):
     """Materialize a program from an already validated topic package.
 
-    No new provider call is made here.  The candidate portfolio is copied
-    into isolated branches and receives only generic, explicit decision rules;
-    scientific details remain those supplied by the topic stage.
+    No new provider call is made here. Candidates are copied into isolated
+    branches and receive only generic, explicit decision rules; scientific
+    details remain those supplied by the topic stage.
     """
     if not isinstance(topic_package, dict):
         raise ValidationError("topic package must be an object")
@@ -210,6 +211,30 @@ def build_research_program(topic_package):
                for key in ("schema_version", "objective", "candidates", "selected_id", "selection_rationale")}
     if package.get("schema_version") != "topic-discovery-1":
         raise ValidationError("research program requires a topic-discovery-1 package")
+    evolution = topic_package.get("topic_evolution")
+    package_contract = (evolution.get("package_contract")
+                        if isinstance(evolution, dict) else None)
+    if (package_contract is not None
+            and package_contract != "single_candidate_parent_refinement"):
+        raise ValidationError("topic package refinement contract is unsupported")
+    single_candidate_refinement = (
+        package_contract == "single_candidate_parent_refinement")
+    candidate_records = package.get("candidates")
+    candidate_records = candidate_records if isinstance(candidate_records, list) else []
+    selected_candidate = next(
+        (candidate for candidate in candidate_records
+         if isinstance(candidate, dict)
+         and candidate.get("id") == package.get("selected_id")),
+        None,
+    )
+    if single_candidate_refinement:
+        parent_topic_id = evolution.get("parent_topic_id")
+        if (not isinstance(parent_topic_id, str)
+                or selected_candidate is None
+                or selected_candidate.get("id") != parent_topic_id
+                or len(candidate_records) != 1):
+            raise ValidationError(
+                "single-candidate topic refinement must preserve exactly its parent topic")
     # Reuse the topic contract as the input gate, while allowing the caller to
     # pass the richer Composer result around it.  Runtime topic admission
     # validates the selected candidate's executable plan; retained branches
@@ -222,7 +247,13 @@ def build_research_program(topic_package):
     for candidate in validation_package.get("candidates", []):
         if candidate.get("id") != validation_package.get("selected_id"):
             candidate.pop("feasibility_plan", None)
-    validate_topic_package(validation_package, objective=validation_package.get("objective"))
+    validate_topic_package(
+        validation_package,
+        objective=validation_package.get("objective"),
+        candidate_count=1 if single_candidate_refinement else None,
+        single_candidate_refinement=single_candidate_refinement,
+        refinement_parent=(selected_candidate if single_candidate_refinement else None),
+    )
 
     candidates = package["candidates"]
     selected_id = package["selected_id"]
@@ -264,6 +295,28 @@ def build_research_program(topic_package):
             "status": "selected" if candidate["id"] == selected_id else "retained",
         })
 
+    decision_log = []
+    retained_ids = [item["id"] for item in branches if item["id"] != selected_id]
+    if retained_ids:
+        decision_log.append({
+            "id": "portfolio-retained",
+            "action": "retain_alternatives",
+            "branch_ids": retained_ids,
+            "rationale": "Every admitted candidate remains available for a scoped follow-up; unselected branches are not treated as disproven.",
+        })
+    else:
+        decision_log.append({
+            "id": "refinement-lineage",
+            "action": "continue_selected_lineage",
+            "branch_ids": [selected_id],
+            "rationale": "A parent-preserving refinement supplies one supported branch; alternatives are not fabricated.",
+        })
+    decision_log.append({
+        "id": "selection-provisional",
+        "action": "route_selected_branch",
+        "branch_ids": [selected_id],
+        "rationale": "The topic stage's recorded selection rationale chooses the first survey route, but does not establish truth, novelty, or publication eligibility.",
+    })
     program = {
         "schema_version": SCHEMA_VERSION,
         "theme": selected["domain"],
@@ -277,20 +330,7 @@ def build_research_program(topic_package):
             "Prefer a branch whose proposed comparison can produce interpretable positive, null, or boundary outcomes.",
             "Treat the selected branch as provisional until the survey, experiment, interpretation, and adversarial review agree.",
         ],
-        "decision_log": [
-            {
-                "id": "portfolio-retained",
-                "action": "retain_alternatives",
-                "branch_ids": [item["id"] for item in branches if item["id"] != selected_id],
-                "rationale": "Every admitted candidate remains available for a scoped follow-up; unselected branches are not treated as disproven.",
-            },
-            {
-                "id": "selection-provisional",
-                "action": "route_selected_branch",
-                "branch_ids": [selected_id],
-                "rationale": "The topic stage's recorded selection rationale chooses the first survey route, but does not establish truth, novelty, or publication eligibility.",
-            },
-        ],
+        "decision_log": decision_log,
     }
     validate_research_program(program)
     return program

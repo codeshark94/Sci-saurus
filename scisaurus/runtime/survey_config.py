@@ -123,7 +123,17 @@ def validate_survey_config(value):
         raise ValidationError("full_text_sources must be an explicit list")
     seen = set()
     for source in survey["full_text_sources"]:
-        exact(source, {"work_id", "title", "url", "section_markers"}, "full text source")
+        source_fields = {"work_id", "title", "url", "section_markers"}
+        if not isinstance(source, dict) or set(source) not in (
+                source_fields, source_fields | {"route_policy"}):
+            raise ValidationError(
+                "full text source requires work_id, title, url, section_markers, "
+                "and optional route_policy")
+        # Hand-authored and legacy routes are exact unless their owner opts
+        # into Composer-managed URL resolution.
+        route_policy = source.get("route_policy", "exact")
+        if not isinstance(route_policy, str) or route_policy not in {"auto", "exact"}:
+            raise ValidationError("full text route_policy must be auto or exact")
         work_id(source["work_id"])
         _text(source["title"], "full text title")
         _strings(source["section_markers"], "section_markers")

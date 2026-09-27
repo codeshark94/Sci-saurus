@@ -16,7 +16,9 @@ from scisaurus.core.source_spans import (bind as bind_source_spans, expand_evide
                                         validate as validate_source_span)
 from scisaurus.runtime.bibliographic_identity import normalize_doi, reconcile_result
 from scisaurus.runtime.operation_adapters import get_adapter
-from scisaurus.runtime.survey_records import normalize_check_envelope
+from scisaurus.runtime.survey_records import (
+    normalize_check_envelope, normalize_gap_assessment_envelope,
+)
 
 
 SURVEY_CHECKS = frozenset({"coverage-accounting", "source-fidelity", "map-support"})
@@ -25,6 +27,7 @@ ABSTENTION_REASONS = {
     "source_unavailable": "The catalog record is relevant by metadata, but no abstract or verified full text was available, so substantive content could not be assessed.",
     "deep_analysis_budget": "This catalog record is deferred by the declared deep-analysis budget. No substantive claim is admitted; targeted follow-up may expand this scope.",
     "contract_exhausted": "The bounded extraction did not produce a valid evidence contract; substantive claims remain unknown.",
+    "unverified_map": "The captured source did not support a verifiable map claim, so this work remains uncertain.",
     "screening_unresolved": "The captured evidence does not resolve the screening rationale.",
     "review_exhausted": "Focused review remains unresolved after bounded revision. This work is not admitted as support for scientific assertions; its prior analysis and review remain retained.",
 }
@@ -543,6 +546,14 @@ class SurveyGate:
                 or prompt.get("gap") != {key: nomination[key] for key in ("id", "statement")}):
             raise ValidationError("assessment dispatch must bind the exact nomination and gap statement")
         if survey["schema_version"] == "literature-survey-3":
+            works = {}
+            for ref in survey["work_refs"]:
+                _, raw = self._artifact(ref)
+                work = self._json(raw, "survey work")
+                work_id = self._text(work.get("work_id"), "survey work_id")
+                if work_id in works:
+                    raise ValidationError("survey work identities must be unique")
+                works[work_id] = work
             source_values, windows = {}, {}
             supplied = prompt.get("sources")
             if not isinstance(supplied, list):
@@ -560,6 +571,12 @@ class SurveyGate:
                     raise ValidationError("assessment dispatch source window is not an exact captured slice")
                 source_values[context["source_ref"]] = source
                 windows[context["source_ref"]] = window
+            reply = normalize_gap_assessment_envelope(
+                reply,
+                evidence_catalog=prompt.get("evidence_catalog", []),
+                verified_full_text_refs=prompt.get("verified_full_text_refs", []),
+                known_work_ids=set(works),
+            )
             reply = expand_evidence(reply, prompt.get("evidence_catalog", []), source_values, windows=windows)
             # A model may copy a sentence from the abstract while attaching
             # the same work's full-text reference (or the inverse).  The
@@ -598,14 +615,15 @@ class SurveyGate:
             raise ValidationError("assessment check IDs are missing, duplicated, or unknown")
         if decisive and not evidence:
             raise ValidationError("decisive gap assessment requires full-text evidence")
-        works = {}
-        for ref in survey["work_refs"]:
-            _, raw = self._artifact(ref)
-            work = self._json(raw, "survey work")
-            work_id = self._text(work.get("work_id"), "survey work_id")
-            if work_id in works:
-                raise ValidationError("survey work identities must be unique")
-            works[work_id] = work
+        if survey["schema_version"] != "literature-survey-3":
+            works = {}
+            for ref in survey["work_refs"]:
+                _, raw = self._artifact(ref)
+                work = self._json(raw, "survey work")
+                work_id = self._text(work.get("work_id"), "survey work_id")
+                if work_id in works:
+                    raise ValidationError("survey work identities must be unique")
+                works[work_id] = work
         self._evidence(evidence, works, survey, full_text=decisive)
         comparisons, seen = body["comparisons"], set()
         for comparison in comparisons:
@@ -755,7 +773,8 @@ class SurveyGate:
         except (KeyError, TypeError, ValueError):
             valid = False
         if not valid:
-            raise ValidationError("extracted-text capture bytes do not match the execution integrity record")
+            raise ValidationError(
+                "full-text extracted-text capture bytes do not match the execution integrity record")
         if (metadata.get("representation") == "extracted_text"
                 and metadata.get("provider") == "mcp-fetch" and metadata.get("transport") == "mcp_stdio"):
             return

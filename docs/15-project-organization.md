@@ -63,8 +63,8 @@ The organization snapshot separates:
 | Projection | Meaning |
 |---|---|
 | `role_pool` / `agents` | Eligible appointments and their contracts |
-| `required_agents` | Roles the stage route declares as necessary |
-| `active_assignments` | Queued, running, or review-pending role tasks currently admitted |
+| `required_agents` | Specialist roles available to the stage route; the producer may own a narrower task internally |
+| `active_assignments` | Queued, running, or review-pending role tasks actually admitted; may be empty when no separate specialist adds work |
 | `assignment_counts` / `agent_activity` | Durable role-task lifecycle and outcomes |
 | `verifier_agent` | Independent adversarial appointment for the stage |
 

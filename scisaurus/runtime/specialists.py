@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 import json
 import math
+import re
 import threading
 import time
 
@@ -20,10 +21,17 @@ from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.models import (
     ModelCallError,
     ModelClient,
+    admit_model_provider_call,
+    effective_model_timeout,
     estimate_input_tokens,
+    clear_model_provider_cooldown,
     model_call_budget_available,
     model_context_error,
-    resolve_model_config,
+    model_provider_cooldown_remaining,
+    model_provider_quota_scope,
+    record_model_provider_cooldown,
+    is_local_qwen_route, role_config_for, role_routes_for, resolve_model_config,
+    with_runtime_cooldown_fallback,
 )
 
 
@@ -47,12 +55,28 @@ VERIFIER_SYSTEM = (
 
 
 DEFAULT_PROVIDER_CAPACITY = {"ollama": 3, "qwen": 1}
-# A role quota bounds the whole assignment.  A single transport request must
-# be shorter so one slow local/cloud route cannot consume the assignment and
-# leave the rest of the pool waiting indefinitely.
-SPECIALIST_MODEL_CALL_TIMEOUT_SECONDS = 300.0
 _SENSITIVE_KEY_PARTS = (
     "api_key", "apikey", "authorization", "credential", "password", "secret", "token",
+)
+_SECRET_ASSIGNMENT_PREFIX = (
+    r"(?i)(\b[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|"
+    r"CLIENT[_-]?SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTHORIZATION|SECRET)"
+    r"[A-Z0-9_]*\b(?:[\"']?\s*\])?[\"']?\s*[:=]\s*)"
+)
+_SECRET_TEXT_PATTERNS = (
+    (re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/-]{8,}={0,2}"), r"\1[redacted]"),
+    (re.compile(r"(?i)(\bbasic\s+)[A-Za-z0-9+/]{8,}={0,2}"), r"\1[redacted]"),
+    (re.compile(_SECRET_ASSIGNMENT_PREFIX + r'"[^"\r\n]{8,}"'), r'\1"[redacted]"'),
+    (re.compile(_SECRET_ASSIGNMENT_PREFIX + r"'[^'\r\n]{8,}'"), r"\1'[redacted]'"),
+    (re.compile(
+        _SECRET_ASSIGNMENT_PREFIX + r"[^\s,;\"'#{}\[\]]{8,}"), r"\1[redacted]"),
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "[redacted]"),
+    (re.compile(r"\b(?:sk-(?:proj-)?|gh[pousr]_|xox[baprs]-)[A-Za-z0-9_-]{20,}\b"), "[redacted]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"), "[redacted]"),
+    (re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s@]+@"), r"\1[redacted]@"),
+    (re.compile(
+        r"(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"),
+        "[redacted private key]"),
 )
 
 
@@ -61,15 +85,25 @@ def _safe_key(key):
     return not any(part in lowered for part in _SENSITIVE_KEY_PARTS)
 
 
+def redact_sensitive_text(value):
+    """Remove common credential values embedded in otherwise safe text."""
+    if not isinstance(value, str):
+        return value
+    for pattern, replacement in _SECRET_TEXT_PATTERNS:
+        value = pattern.sub(replacement, value)
+    return value
+
+
 def _safe_value(value, *, depth=0):
     """Bound and redact prompt data before it reaches an external model."""
-    if depth > 5:
+    if depth > 8:
         # Preserve scalar evidence leaves even when they sit below a bounded
         # envelope. Deep containers still collapse, so this does not reopen a
         # route to an unbounded stage dump; it only prevents identifiers and
         # short scientific values from becoming indistinguishable from absent
         # evidence.
         if isinstance(value, str):
+            value = redact_sensitive_text(value)
             return value if len(value) <= 8000 else value[:8000] + "...[truncated]"
         if isinstance(value, (int, float, bool)) or value is None:
             return value
@@ -92,10 +126,11 @@ def _safe_value(value, *, depth=0):
         return [_safe_value(item, depth=depth + 1) for item in value[:40]] + (
             ["[truncated_items]"] if len(value) > 40 else [])
     if isinstance(value, str):
+        value = redact_sensitive_text(value)
         return value if len(value) <= 8000 else value[:8000] + "...[truncated]"
     if isinstance(value, (int, float, bool)) or value is None:
         return value
-    return str(value)[:8000]
+    return redact_sensitive_text(str(value))[:8000]
 
 
 def _json(value, *, limit=70000):
@@ -134,6 +169,15 @@ def _bounded_value(value, *, depth=0, max_depth=5, max_keys=64, max_items=24,
             if str(key) in {"role_routes", "role_models", "role_model_fallbacks"}:
                 output[key] = "[configuration omitted]"
                 continue
+            if str(key) == "source_chunks" and isinstance(item, list):
+                output[key] = [
+                    redact_sensitive_text(chunk)
+                    for chunk in item[:max_items]
+                    if isinstance(chunk, str) and len(chunk) <= 7000
+                ]
+                if len(item) > max_items:
+                    output["[truncated_items]"] = True
+                continue
             output[key] = _bounded_value(
                 item, depth=depth + 1, max_depth=max_depth, max_keys=max_keys,
                 max_items=max_items, max_text=max_text)
@@ -147,10 +191,11 @@ def _bounded_value(value, *, depth=0, max_depth=5, max_keys=64, max_items=24,
             output.append("[truncated_items]")
         return output
     if isinstance(value, str):
+        value = redact_sensitive_text(value)
         return value if len(value) <= max_text else value[:max_text] + "...[truncated]"
     if isinstance(value, (int, float, bool)) or value is None:
         return value
-    return str(value)[:max_text]
+    return redact_sensitive_text(str(value))[:max_text]
 
 
 def _json_with_budget(value, *, system, max_input_tokens=None):
@@ -163,12 +208,15 @@ def _json_with_budget(value, *, system, max_input_tokens=None):
     projections = (
         # Keep the scientific record shape while reducing breadth and text.
         # Lowering depth erased every manuscript unit and evidence leaf.
-        (7, 64, 24, 4000),
-        (7, 48, 18, 3000),
-        (7, 36, 12, 2200),
-        (7, 28, 10, 1600),
-        (7, 20, 8, 1000),
-        (7, 14, 5, 600),
+        (9, 64, 24, 4000),
+        (9, 48, 18, 3000),
+        (9, 36, 12, 2200),
+        (9, 28, 10, 1600),
+        (9, 20, 8, 1000),
+        (9, 14, 5, 600),
+        (9, 64, 3, 400),
+        (9, 64, 2, 250),
+        (9, 64, 1, 120),
     )
     for max_depth, max_keys, max_items, max_text in projections:
         projected = _bounded_value(
@@ -177,15 +225,21 @@ def _json_with_budget(value, *, system, max_input_tokens=None):
         body = json.dumps(projected, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if estimate_input_tokens(system, body) <= max_input_tokens:
             return body
-    # The assignment contracts in the organization are all large enough for
-    # this minimal valid envelope. Keep a valid object even if a custom role
-    # supplies an unusually small quota; ModelClient will report the exact
-    # contract violation rather than receiving malformed JSON.
-    return json.dumps({
-        "bounded_context": _bounded_value(
-            value, max_depth=2, max_keys=8, max_items=3, max_text=300),
-        "context_projection": "Further detail was omitted to respect the role input quota.",
-    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    # A syntactically valid prompt is not necessarily a meaningful prompt.
+    # The old depth-2 fallback erased every declared scientific input while
+    # still dispatching the assignment, allowing an uninformed specialist to
+    # appear successful. If the role contract cannot fit even after bounded
+    # reduction, fail before dispatch so the Composer records a real contract
+    # blocker instead of laundering an empty review as evidence.
+    smallest = _bounded_value(
+        value, max_depth=9, max_keys=64, max_items=1, max_text=120)
+    smallest_body = json.dumps(
+        smallest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    estimated = estimate_input_tokens(system, smallest_body)
+    raise ValidationError(
+        "specialist input projection cannot preserve its declared fields within quota "
+        f"(estimated minimum {estimated}, limit {max_input_tokens})"
+    )
 
 
 _VERIFIER_OMIT_KEYS = frozenset({
@@ -320,6 +374,211 @@ def _verifier_topic(value, *, max_items, text_limit):
         else:
             output[key] = _verifier_text(item, limit=text_limit) if not isinstance(item, (dict, list)) \
                 else _verifier_record(item, text_limit=text_limit)
+    return output
+
+
+def _verifier_repair_packet(value, *, detail="full"):
+    """Project a repair dossier once, excluding duplicated code and failure dumps."""
+    if not isinstance(value, dict):
+        return _verifier_record(value)
+    if detail == "full":
+        item_limit, text_limit, source_limit = 6, 900, 5200
+    elif detail == "compact":
+        item_limit, text_limit, source_limit = 4, 650, 3200
+    elif detail == "minimal":
+        item_limit, text_limit, source_limit = 3, 420, 1800
+    else:
+        item_limit, text_limit, source_limit = 2, 240, 900
+
+    def text(item, limit=text_limit):
+        return _verifier_text(item, limit=limit)
+
+    def compact_records(items, keys, *, count=item_limit, limit=text_limit):
+        if isinstance(items, dict):
+            items = [items]
+        if not isinstance(items, list):
+            return []
+        output = []
+        for item in items[:count]:
+            if isinstance(item, dict):
+                if not keys:
+                    output.append(_verifier_record(
+                        item, text_limit=limit, nested_limit=min(4, count)))
+                    continue
+                record = {
+                    key: text(item[key], limit)
+                    for key in keys if key in item and _safe_key(key)
+                    and not isinstance(item[key], (dict, list))
+                }
+                for key in keys:
+                    if key not in item or not _safe_key(key) or key in record:
+                        continue
+                    nested = item[key]
+                    if isinstance(nested, list):
+                        record[key] = [text(child, limit) for child in nested[:count]]
+                    elif isinstance(nested, dict):
+                        record[key] = {
+                            str(child_key): text(child, limit)
+                            for child_key, child in list(nested.items())[:8]
+                            if _safe_key(child_key) and not isinstance(child, (dict, list))
+                        }
+                output.append(record)
+            else:
+                output.append(text(item, limit))
+        return output
+
+    failure = value.get("failure") if isinstance(value.get("failure"), dict) else {}
+    failure_debt = failure.get("failure_debt") if isinstance(failure.get("failure_debt"), dict) else {}
+    recovery = value.get("failure_recovery") if isinstance(value.get("failure_recovery"), dict) else {}
+    foundry = value.get("prior_foundry_work") if isinstance(value.get("prior_foundry_work"), dict) else {}
+    validation_feedback = foundry.get("validation_feedback")
+    validation_feedback = validation_feedback if isinstance(validation_feedback, dict) else {}
+    validation_context = foundry.get("validation_context")
+    validation_context = validation_context if isinstance(validation_context, dict) else {}
+
+    output = {
+        key: value[key] for key in (
+            "schema_version", "stage_id", "continuation_cycle", "input_sha256")
+        if key in value and not isinstance(value[key], (dict, list))
+    }
+    if isinstance(value.get("topic"), dict):
+        output["topic"] = _verifier_topic(
+            value["topic"], max_items=item_limit, text_limit=text_limit)
+    output["failure"] = {
+        "error": text(failure.get("error"), max(text_limit * 2, 1200)),
+        "prior_status": text(failure.get("prior_status"), 160),
+        "review_status": text(failure.get("review_status"), 160),
+        # failure_debt.error is a byte-for-byte repeat of failure.error in
+        # Composer's dossier. Keep its lineage metadata, not the duplicate dump.
+        "failure_debt": {
+            key: text(failure_debt[key], 240)
+            for key in ("attempts", "failure_class", "failure_dossier_ref",
+                        "kind", "next_action", "release_blocking", "stage_id")
+            if key in failure_debt and not isinstance(failure_debt[key], (dict, list))
+        },
+    }
+    if recovery:
+        output["failure_recovery"] = {
+            key: text(recovery[key], 240)
+            for key in ("schema_version", "failure_class", "recovery_mode",
+                        "requires_capability_repair", "dossier_ref", "input_sha256")
+            if key in recovery and not isinstance(recovery[key], (dict, list))
+        }
+        for key in ("acceptance_checks", "repair_commands", "review_directives"):
+            if key in recovery:
+                output["failure_recovery"][key] = compact_records(
+                    recovery[key], ("id", "kind", "source", "operation", "target",
+                                    "instruction", "text", "acceptance_check"),
+                    count=item_limit, limit=text_limit)
+
+    observed = value.get("observed_result")
+    if isinstance(observed, dict):
+        output["observed_result"] = {
+            key: text(item, 240) for key, item in observed.items()
+            if _safe_key(key) and not isinstance(item, (dict, list))
+        }
+        for key in ("execution_refs", "model_review_refs"):
+            if isinstance(observed.get(key), list):
+                output["observed_result"][key] = [
+                    text(item, 240) for item in observed[key][:item_limit]
+                ]
+
+    feedback = {}
+    for key in ("gate", "decision"):
+        if key in validation_feedback:
+            feedback[key] = text(validation_feedback[key], 240)
+    for key in ("failed_checks", "findings", "metric_mismatches"):
+        if key in validation_feedback:
+            feedback[key] = compact_records(
+                validation_feedback[key], ("id", "gate", "outcome", "evidence",
+                                           "finding", "metric_id", "reported_value",
+                                           "recalculated_value", "tolerance", "matches"),
+                count=item_limit, limit=text_limit)
+    context = {}
+    for key in ("observation_count", "sampled_observation_count", "metrics",
+                "numeric_observation_fields"):
+        if key in validation_context:
+            context[key] = _bounded_value(
+                validation_context[key], max_depth=3, max_keys=12,
+                max_items=item_limit, max_text=text_limit)
+    if foundry:
+        output["prior_foundry_work"] = {
+            key: text(foundry[key], 240)
+            for key in ("status", "attempts", "repair_gate_counts")
+            if key in foundry and not isinstance(foundry[key], (dict, list))
+        }
+        if context:
+            output["prior_foundry_work"]["validation_context"] = context
+        if feedback:
+            output["prior_foundry_work"]["validation_feedback"] = feedback
+        intent = (foundry.get("last_attempt", {}).get("experiment_intent")
+                  if isinstance(foundry.get("last_attempt"), dict) else None)
+        if isinstance(intent, dict):
+            output["prior_foundry_work"]["experiment_intent"] = _bounded_value(
+                intent, max_depth=3, max_keys=12, max_items=item_limit,
+                max_text=text_limit)
+
+    snapshots = value.get("program_snapshot")
+    if isinstance(snapshots, list):
+        output["program_snapshot"] = []
+        for item in snapshots[:item_limit]:
+            if not isinstance(item, dict):
+                continue
+            record = {
+                key: item[key] for key in ("path", "sha256", "size_bytes", "source_truncated")
+                if key in item and not isinstance(item[key], (dict, list))
+            }
+            if isinstance(item.get("source"), str):
+                record["source"] = text(item["source"], source_limit)
+            output["program_snapshot"].append(record)
+
+    reviews = value.get("prior_specialist_reviews")
+    if isinstance(reviews, list):
+        output["prior_specialist_reviews"] = []
+        for report in reviews[:item_limit]:
+            if not isinstance(report, dict):
+                continue
+            record = {
+                key: text(report[key], 240 if key in {"role_id", "assigned_role"} else text_limit)
+                for key in ("role_id", "assigned_role", "status", "decision", "summary")
+                if key in report and not isinstance(report[key], (dict, list))
+            }
+            for key in ("findings", "requested_actions"):
+                if key in report:
+                    record[key] = compact_records(
+                        report[key], (), count=2, limit=text_limit)
+            output["prior_specialist_reviews"].append(record)
+
+    verifier = value.get("prior_verifier")
+    if isinstance(verifier, dict):
+        output["prior_verifier"] = {
+            key: text(verifier[key], 240)
+            for key in ("status", "decision")
+            if key in verifier and not isinstance(verifier[key], (dict, list))
+        }
+        for key in ("critical_findings", "repair_scope"):
+            if key in verifier:
+                output["prior_verifier"][key] = compact_records(
+                    verifier[key], (), count=item_limit, limit=text_limit)
+
+    for key in ("experiment_repair_plan", "experiment_repair_history"):
+        if value.get(key) is not None:
+            output[key] = _bounded_value(
+                value[key], max_depth=4, max_keys=16,
+                max_items=item_limit, max_text=text_limit)
+    contract = value.get("repair_contract")
+    if isinstance(contract, dict):
+        output["repair_contract"] = {
+            key: [text(item, text_limit) for item in contract[key][:item_limit]]
+            for key in ("must_preserve", "must_change", "must_prove", "prohibited")
+            if isinstance(contract.get(key), list)
+        }
+    for key in ("root_causes", "required_changes", "acceptance_checks", "repair_commands"):
+        if isinstance(value.get(key), list):
+            output[key] = compact_records(
+                value[key], ("id", "kind", "source", "operation", "target",
+                             "instruction", "text", "acceptance_check"),
+                count=item_limit, limit=text_limit)
     return output
 
 
@@ -482,9 +741,8 @@ def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, det
     }
     if (stage_packet.get("repair_panel") is True
             and isinstance(stage_packet.get("capability_repair_packet"), dict)):
-        body["capability_repair_packet"] = _bounded_value(
-            stage_packet["capability_repair_packet"],
-            max_depth=6, max_keys=48, max_items=16, max_text=2200)
+        body["capability_repair_packet"] = _verifier_repair_packet(
+            stage_packet["capability_repair_packet"], detail=detail)
         body["verifier_contract"]["repair_panel_rule"] = (
             "Judge whether the proposed repair addresses the supplied root cause and changes the failed "
             "mechanism. A complete executable and independently recalculable acceptance check are required."
@@ -662,7 +920,7 @@ def build_specialist_prompt(assignment, stage_packet):
 def build_verifier_prompt(stage, stage_packet, specialist_reports, chief_result,
                           *, max_input_tokens=None):
     """Create a verifier-only packet; producer prompts never receive this path."""
-    details = ("full", "compact", "minimal")
+    details = ("full", "compact", "minimal", "focused")
     for detail in details:
         envelope = _verifier_body(
             stage, stage_packet, specialist_reports, chief_result, detail=detail)
@@ -671,17 +929,16 @@ def build_verifier_prompt(stage, stage_packet, specialist_reports, chief_result,
             return body
         if estimate_input_tokens(VERIFIER_SYSTEM, body) <= max_input_tokens:
             return body
-    # The compact verifier schema is intentionally flat and should fit the
-    # organization contract. This final envelope remains valid for a custom
-    # role with an unusually small input quota and never hides evidence in a
-    # generic depth-based ``[truncated]`` marker.
-    envelope = _verifier_body(
-        stage, stage_packet, specialist_reports[:1], chief_result, detail="minimal")
-    for report in envelope["specialist_reports"]:
-        report["response"]["findings"] = []
-        report["response"]["evidence_gaps"] = []
-        report["response"]["requested_actions"] = []
-    return json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    # Never dispatch a syntactically valid but over-budget verifier packet.
+    # The previous fallback removed specialist findings yet retained an
+    # oversized repair dossier, so the provider preflight failed before a
+    # single verifier call. The compact projections above preserve the
+    # decision-bearing evidence while enforcing the actual role quota.
+    estimated = estimate_input_tokens(VERIFIER_SYSTEM, body)
+    raise ValidationError(
+        "verifier evidence projection exceeds its input quota "
+        f"(estimated minimum {estimated}, limit {max_input_tokens})"
+    )
 
 
 def _normalise_report(result):
@@ -798,14 +1055,16 @@ class SpecialistDispatcher:
             raise ValidationError("specialist model config must be an object")
         if type(max_parallel) is not int or max_parallel < 1:
             raise ValidationError("specialist max_parallel must be a positive integer")
-        self.model_config = deepcopy(model_config)
+        self.model_config = deepcopy(with_runtime_cooldown_fallback(model_config))
         self.max_parallel = max_parallel
         self.deadline = deadline
         self.on_progress = on_progress or (lambda event: None)
         self.condition = threading.Condition()
         self.active = {}
         self.route_cursors = {}
+        self.failed_known_429_routes = set()
         self.provider_cooldowns = provider_cooldowns if provider_cooldowns is not None else {}
+        self.provider_429_routes = set()
         self.provider_pools = deepcopy(provider_pools or {})
         self._ensure_provider_pools()
 
@@ -813,7 +1072,12 @@ class SpecialistDispatcher:
         routes_by_role = self.model_config.get("role_routes", {})
         if not isinstance(routes_by_role, dict):
             routes_by_role = {}
-        for routes in routes_by_role.values():
+        route_groups = [role_routes_for(self.model_config, role)
+                        for role in routes_by_role]
+        cooldown_fallback = self.model_config.get("provider_cooldown_fallback")
+        if isinstance(cooldown_fallback, dict):
+            route_groups.append([cooldown_fallback])
+        for routes in route_groups:
             if not isinstance(routes, list):
                 continue
             for route in routes:
@@ -844,13 +1108,70 @@ class SpecialistDispatcher:
         effective = resolve_model_config(effective, role=role)
         return effective
 
-    def _routes(self, role):
-        configured = self.model_config.get("role_routes", {})
-        routes = configured.get(role, []) if isinstance(configured, dict) else []
+    def _routes(self, role, *, include_fallbacks=False,
+                include_cooldown_fallback=False):
+        routes = role_routes_for(self.model_config, role)
         if routes:
-            return [(route.get("id", f"route-{index}"), route.get("pool"), route)
-                    for index, route in enumerate(routes)]
-        return [(f"default-{role}", None, None)]
+            primary = [(route.get("id", f"route-{index}"), route.get("pool"), route)
+                       for index, route in enumerate(routes)]
+        else:
+            primary = [(f"default-{role}", None, None)]
+        if not include_fallbacks:
+            return primary
+
+        seen = {
+            self._route_identity(role, route)
+            for _route_id, _pool, route in primary
+        }
+        recovery = []
+        role_fallbacks = self.model_config.get("role_model_fallbacks", {})
+        alternatives = role_config_for(role_fallbacks, role, [])
+        cooldown_fallback = self.model_config.get("provider_cooldown_fallback")
+        if include_cooldown_fallback and isinstance(cooldown_fallback, dict):
+            alternatives = [*alternatives, cooldown_fallback]
+        for index, alternative in enumerate(alternatives):
+            if not isinstance(alternative, dict):
+                continue
+            candidate = {key: value for key, value in self.model_config.items()
+                         if key not in {"role_models", "role_model_fallbacks",
+                                        "role_routes", "role_profiles",
+                                        "provider_cooldown_fallback"}}
+            candidate.update({key: value for key, value in alternative.items()
+                              if key not in {"id", "pool"}})
+            if is_local_qwen_route(candidate):
+                continue
+            effective = self._effective_route(alternative, role)
+            identity = (effective.get("protocol"), effective.get("base_url"),
+                        effective.get("model"), effective.get("auth_env"))
+            if identity in seen or not model_call_budget_available(effective):
+                continue
+            seen.add(identity)
+            route_id = alternative.get("id") or (
+                f"recovery-{role}-{index}-{effective.get('model', 'model')}"
+            )
+            route = {"id": route_id, **deepcopy(alternative)}
+            pool = alternative.get("pool") or self._pool_for(route, effective)
+            if pool:
+                route["pool"] = pool
+            recovery.append((route_id, pool, route))
+        return primary + recovery
+
+    def _route_identity(self, role, route):
+        effective = self._effective_route(route, role)
+        return (effective.get("protocol"), effective.get("base_url"),
+                effective.get("model"), effective.get("auth_env"))
+
+    def _all_primary_routes_cooling(self, role):
+        routes = self._routes(role)
+        now = time.monotonic()
+        for route_id, declared_pool, route in routes:
+            effective = self._effective_route(route, role)
+            pool = declared_pool or self._pool_for(route, effective)
+            key = self._cooldown_key(route_id, route, pool)
+            if (self.provider_cooldowns.get(key, 0.0) <= now
+                    and model_provider_cooldown_remaining(effective) <= 0):
+                return False
+        return bool(routes)
 
     def _pool_for(self, route, effective):
         if route and route.get("pool"):
@@ -859,6 +1180,32 @@ class SpecialistDispatcher:
         matches = [name for name, entry in self.provider_pools.items()
                    if base_url in {str(url).rstrip("/") for url in entry.get("base_urls", [])}]
         return matches[0] if len(matches) == 1 else None
+
+    def input_limit_for_role(self, role, requested_limit=None):
+        """Let an Ollama role use its route's context allowance.
+
+        Department quotas are ceilings, not a reason to truncate a prompt below
+        the configured provider window. Other provider pools retain their
+        declared role limit and each route still enforces its own model window.
+        """
+        limit = requested_limit if type(requested_limit) is int and requested_limit > 0 else 12000
+        for _route_id, declared_pool, route in self._routes(
+                role, include_fallbacks=True, include_cooldown_fallback=True):
+            effective = self._effective_route(route, role)
+            pool = declared_pool or self._pool_for(route, effective)
+            if pool != "ollama":
+                continue
+            window = effective.get("context_window_tokens")
+            route_limit = effective.get("max_input_tokens")
+            if type(window) is int:
+                output_limit = effective.get("max_output_tokens")
+                if type(output_limit) is not int or output_limit < 0:
+                    output_limit = 0
+                available = window - output_limit
+                route_limit = min(route_limit, available) if type(route_limit) is int else available
+            if type(route_limit) is int and route_limit > 0:
+                limit = max(limit, route_limit)
+        return limit
 
     @staticmethod
     def _cooldown_key(route_id, route, pool):
@@ -884,14 +1231,21 @@ class SpecialistDispatcher:
         roles = self.model_config.get("role_routes", {})
         if isinstance(roles, dict):
             for role in roles:
-                for route_id, declared_pool, route in self._routes(role):
+                for route_id, declared_pool, route in self._routes(
+                        role, include_fallbacks=True,
+                        include_cooldown_fallback=True):
                     pool = declared_pool or self._pool_for(
                         route, self._effective_route(route, role))
                     keys.add(self._cooldown_key(route_id, route, pool))
         return keys
 
-    def _reserve_route(self, role, *, system, prompt, quota):
-        routes = self._routes(role)
+    def _reserve_route(self, role, *, system, prompt, quota,
+                       include_fallbacks=False, include_cooldown_fallback=False,
+                       excluded_quota_scopes=None):
+        routes = self._routes(
+            role, include_fallbacks=include_fallbacks,
+            include_cooldown_fallback=include_cooldown_fallback)
+        excluded_quota_scopes = set(excluded_quota_scopes or ())
         cursor = self.route_cursors.get(role, 0)
         while True:
             if self.deadline is not None and time.monotonic() >= self.deadline:
@@ -908,6 +1262,8 @@ class SpecialistDispatcher:
                     for field in ("max_input_tokens", "max_output_tokens"):
                         if type(quota.get(field)) is int:
                             effective[field] = min(effective.get(field) or quota[field], quota[field])
+                    if model_provider_quota_scope(effective) in excluded_quota_scopes:
+                        continue
                     context_error = model_context_error(effective, system=system, prompt=prompt)
                     if context_error:
                         context_errors.append(context_error)
@@ -932,6 +1288,14 @@ class SpecialistDispatcher:
                         continue
                     if not model_call_budget_available(effective):
                         continue
+                    cooldown_generation, shared_cooldown = (
+                        admit_model_provider_call(effective))
+                    if cooldown_generation is None:
+                        cooldown_wait = True
+                        shared_until = time.monotonic() + shared_cooldown
+                        next_cooldown = shared_until if next_cooldown is None else min(
+                            next_cooldown, shared_until)
+                        continue
                     self.active[pool] = self.active.get(pool, 0) + 1
                     self.route_cursors[role] = (index + 1) % len(routes)
                     return {
@@ -939,6 +1303,7 @@ class SpecialistDispatcher:
                         "pool": pool if pool != "unpooled" else None,
                         "pool_key": pool,
                         "cooldown_key": cooldown_key,
+                        "cooldown_generation": cooldown_generation,
                         "config": effective,
                     }
                 if not capacity_wait and cooldown_wait:
@@ -997,11 +1362,45 @@ class SpecialistDispatcher:
             until, self.provider_cooldowns.get(cooldown_key, 0.0))
 
     @staticmethod
+    def _provider_route_identity(config):
+        return tuple(config.get(key) for key in (
+            "protocol", "base_url", "model", "auth_env"))
+
+    def _record_shared_quota_failure(self, role, route, error):
+        if (not isinstance(route, dict)
+                or getattr(error, "status_code", None) != 429
+                or not getattr(error, "outcome_known", False)):
+            return
+        config = route.get("config")
+        if not isinstance(config, dict):
+            return
+        scope = model_provider_quota_scope(config)
+        retry_after = getattr(error, "retry_after_seconds", None)
+        if getattr(error, "provider_error_kind", None) == "quota_exhausted":
+            record_model_provider_cooldown(scope, retry_after_seconds=retry_after)
+            return
+
+        failed_route = (scope, self._provider_route_identity(config))
+        self.provider_429_routes.add(failed_route)
+        configured_routes = set()
+        for _route_id, _pool, candidate in self._routes(role, include_fallbacks=True):
+            candidate_config = self._effective_route(candidate, role)
+            if model_provider_quota_scope(candidate_config) == scope:
+                configured_routes.add((scope, self._provider_route_identity(candidate_config)))
+        if (len(configured_routes) == 1
+                or (len(configured_routes) > 1
+                    and configured_routes.issubset(self.provider_429_routes))):
+            record_model_provider_cooldown(scope, retry_after_seconds=retry_after)
+
+    @staticmethod
     def _provider_route_failure(error):
         return getattr(error, "status_code", None) in {408, 425, 429, 500, 502, 503, 504}
 
-    def _provider_retry_limit(self, role, *, allow_same_pool=False):
-        routes = self._routes(role)
+    def _provider_retry_limit(self, role, *, allow_same_pool=False,
+                              include_cooldown_fallback=False):
+        routes = self._routes(
+            role, include_fallbacks=True,
+            include_cooldown_fallback=include_cooldown_fallback)
         if allow_same_pool:
             return max(0, len(routes) - 1)
         pools = {pool for _route_id, pool, _route in routes if pool}
@@ -1019,7 +1418,7 @@ class SpecialistDispatcher:
         assigned_role = assignment.get("assigned_role") or assignment.get("agent")
         model_role = assignment.get("model_role") or assigned_role
         execution_kind = assignment.get("execution_kind", "model")
-        quota = assignment.get("quota") if isinstance(assignment.get("quota"), dict) else {}
+        quota = deepcopy(assignment.get("quota")) if isinstance(assignment.get("quota"), dict) else {}
         started = time.monotonic()
         if execution_kind in {"deterministic", "service"}:
             output_path = packet.get("stage_result", {}).get("output_path") if isinstance(
@@ -1043,8 +1442,9 @@ class SpecialistDispatcher:
         if not isinstance(prompt, str):
             prompt = build_specialist_prompt(assignment, packet)
         system = VERIFIER_SYSTEM if verifier else SPECIALIST_SYSTEM
-        max_input_tokens = quota.get("max_input_tokens") if isinstance(
-            quota.get("max_input_tokens"), int) else 12000
+        max_input_tokens = self.input_limit_for_role(
+            model_role, quota.get("max_input_tokens"))
+        quota["max_input_tokens"] = max_input_tokens
         # A verifier's second attempt is an explicit bounded repair/fallback,
         # not an unbounded provider retry.  Provider failures are a separate
         # technical concern: a 429/5xx from one route must not consume the
@@ -1055,6 +1455,9 @@ class SpecialistDispatcher:
         provider_retries = 0
         accumulated_usage = {}
         retry_history = []
+        failed_primary_routes = set()
+        exhausted_quota_scopes = set()
+        pre_dispatch_recovery_attempted = False
         previous_text = None
         last_validation_error = None
         report = None
@@ -1072,7 +1475,49 @@ class SpecialistDispatcher:
                     current_prompt = _specialist_repair_prompt(
                         prompt, last_validation_error, previous_text,
                         max_input_tokens=max_input_tokens)
-                route = self._reserve_route(model_role, system=system, prompt=current_prompt, quota=quota)
+                primary_routes = self._routes(model_role)
+                primary_route_ids = {route_id for route_id, _pool, _route in primary_routes}
+                configured_routes = self._routes(model_role, include_fallbacks=True)
+                routes_with_cooldown = self._routes(
+                    model_role, include_fallbacks=True,
+                    include_cooldown_fallback=True)
+                has_regular_recovery = len(configured_routes) > len(primary_routes)
+                has_cooldown_recovery = len(routes_with_cooldown) > len(configured_routes)
+                configured_scope_routes = {}
+                for _route_id, _pool, configured_route in configured_routes:
+                    configured_config = self._effective_route(
+                        configured_route, model_role)
+                    configured_scope = model_provider_quota_scope(configured_config)
+                    configured_scope_routes.setdefault(configured_scope, set()).add(
+                        self._provider_route_identity(configured_config))
+                fully_429_scopes = {
+                    scope for scope, identities in configured_scope_routes.items()
+                    if identities and all(
+                        (scope, identity) in self.failed_known_429_routes
+                        for identity in identities)
+                }
+                quota_scopes_blocked = bool(primary_routes) and all(
+                    (scope := model_provider_quota_scope(
+                        self._effective_route(route, model_role))) in exhausted_quota_scopes
+                    or model_provider_cooldown_remaining(scope) > 0
+                    or scope in fully_429_scopes
+                    for _route_id, _pool, route in primary_routes
+                )
+                regular_recovery_ready = (
+                    primary_route_ids.issubset(failed_primary_routes)
+                    or self._all_primary_routes_cooling(model_role)
+                )
+                use_recovery = (
+                    (regular_recovery_ready and has_regular_recovery)
+                    or (quota_scopes_blocked and has_cooldown_recovery)
+                )
+                route = self._reserve_route(
+                    model_role, system=system, prompt=current_prompt, quota=quota,
+                    include_fallbacks=use_recovery,
+                    include_cooldown_fallback=(
+                        quota_scopes_blocked and has_cooldown_recovery),
+                    excluded_quota_scopes=exhausted_quota_scopes,
+                )
                 config = deepcopy(route["config"])
                 if isinstance(quota.get("max_output_tokens"), int):
                     config["max_output_tokens"] = min(
@@ -1083,28 +1528,24 @@ class SpecialistDispatcher:
                     config["max_input_tokens"] = min(configured, quota["max_input_tokens"]) \
                         if isinstance(configured, int) else quota["max_input_tokens"]
                 config["max_retries"] = 0
+                timeout_bounds = []
                 if self.deadline is not None:
                     remaining = self.deadline - time.monotonic()
                     if remaining <= 0.2:
                         raise ModelCallError(
                             "specialist stage deadline exceeded before provider call",
                             outcome_known=True)
-                    config["timeout_seconds"] = min(
-                        float(config.get("timeout_seconds", remaining)), remaining)
+                    timeout_bounds.append(remaining)
                 # A provider request is part of the role's bounded assignment,
-                # not of the whole stage deadline.  Without this clamp a
-                # route configured with a generous 30-minute transport timeout
-                # could occupy one of the three Ollama slots for the entire
-                # stage while the assignment quota promised a 15-minute
-                # maximum.  The dispatcher must be able to release the slot
-                # and let the Composer retry or pivot the scoped work order.
+                # not of the whole stage deadline. Respect the assignment's
+                # explicit wall-time allocation; a global transport cap must
+                # not shorten the route or assignment policy.
                 role_seconds = quota.get("max_seconds")
                 if (type(role_seconds) in (int, float)
                         and math.isfinite(role_seconds) and role_seconds > 0):
-                    config["timeout_seconds"] = min(
-                        float(config["timeout_seconds"]), float(role_seconds))
-                config["timeout_seconds"] = min(
-                    float(config["timeout_seconds"]), SPECIALIST_MODEL_CALL_TIMEOUT_SECONDS)
+                    timeout_bounds.append(float(role_seconds))
+                config["timeout_seconds"] = effective_model_timeout(
+                    config.get("timeout_seconds"), *timeout_bounds)
                 self.on_progress({"event": "dispatched", "role": assigned_role,
                                   "role_id": assignment.get("role_id"),
                                   "task_id": assignment.get("task_id"),
@@ -1112,12 +1553,17 @@ class SpecialistDispatcher:
                                   "model_role": model_role, "route_id": route["route_id"],
                                   "provider_pool": route["pool"], "model": config.get("model"),
                                   "base_url": config.get("base_url"),
+                                  "context_window_tokens": config.get("context_window_tokens"),
+                                  "max_input_tokens": config.get("max_input_tokens"),
                                   "cache_prompt": config.get("cache_prompt"),
                                   "execution_mode": "model",
                                   "dispatch_attempt": validation_retries + provider_retries + 1,
                                   "provider_retry_count": provider_retries,
                                   "validation_retry_count": validation_retries})
+                cooldown_generation = route["cooldown_generation"]
                 result = ModelClient(**config).complete(system=system, prompt=current_prompt)
+                clear_model_provider_cooldown(
+                    config, expected_generation=cooldown_generation)
                 response_received = True
                 for key, value in result.usage.items():
                     if type(value) is int and value >= 0:
@@ -1133,6 +1579,8 @@ class SpecialistDispatcher:
                     "assigned_role": assigned_role, "role_id": assignment.get("role_id"),
                     "model_role": model_role, "model": result.model,
                     "route_id": route["route_id"], "provider_pool": route["pool"],
+                    "context_window_tokens": config.get("context_window_tokens"),
+                    "max_input_tokens": config.get("max_input_tokens"),
                     "response": normalized, "usage": deepcopy(accumulated_usage),
                     "elapsed_seconds": time.monotonic() - started,
                     "request_attempts": sum(
@@ -1146,8 +1594,71 @@ class SpecialistDispatcher:
             except ModelCallError as exc:
                 if self._provider_route_failure(exc):
                     self._mark_provider_cooldown(route, exc)
+                    self._record_shared_quota_failure(model_role, route, exc)
+                    if (route is None and exc.status_code == 429
+                            and exc.outcome_known
+                            and not pre_dispatch_recovery_attempted
+                            and has_cooldown_recovery):
+                        scopes_blocked_now = bool(primary_routes) and all(
+                            model_provider_quota_scope(self._effective_route(
+                                candidate, model_role)) in exhausted_quota_scopes
+                            or model_provider_cooldown_remaining(
+                                self._effective_route(candidate, model_role)) > 0
+                            or model_provider_quota_scope(self._effective_route(
+                                candidate, model_role)) in fully_429_scopes
+                            for _route_id, _pool, candidate in primary_routes
+                        )
+                        if scopes_blocked_now:
+                            pre_dispatch_recovery_attempted = True
+                            retry_history.append({
+                                "kind": "provider_cooldown_admission",
+                                "attempt": len(retry_history) + 1,
+                                "status_code": exc.status_code,
+                                "error": str(exc)[:1000],
+                                "request_attempts": 0,
+                            })
+                            self.on_progress({
+                                "event": "provider_cooldown_recovery",
+                                "role": assigned_role,
+                                "role_id": assignment.get("role_id"),
+                                "model_role": model_role,
+                                "status_code": exc.status_code,
+                                "dispatch_attempt": validation_retries + provider_retries + 1,
+                            })
+                            continue
+                    if (route is not None and exc.status_code == 429
+                            and exc.outcome_known):
+                        route_config = route.get("config", {})
+                        scope = model_provider_quota_scope(route_config)
+                        self.failed_known_429_routes.add((
+                            scope, self._provider_route_identity(route_config)))
+                    if route is not None:
+                        if route["route_id"] in {
+                                route_id for route_id, _pool, _declared in self._routes(model_role)}:
+                            failed_primary_routes.add(route["route_id"])
+                        if (exc.status_code == 429 and exc.outcome_known
+                                and exc.provider_error_kind == "quota_exhausted"):
+                            exhausted_quota_scopes.add(
+                                model_provider_quota_scope(route.get("config", {})))
+                    fully_429_scopes = {
+                        scope for scope, identities in configured_scope_routes.items()
+                        if identities and all(
+                            (scope, identity) in self.failed_known_429_routes
+                            for identity in identities)
+                    }
                 provider_retry_limit = (
-                    self._provider_retry_limit(model_role, allow_same_pool=True)
+                    self._provider_retry_limit(
+                        model_role, allow_same_pool=True,
+                        include_cooldown_fallback=bool(route) and bool(primary_routes)
+                        and all(
+                            model_provider_quota_scope(self._effective_route(
+                                candidate, model_role)) in exhausted_quota_scopes
+                            or model_provider_cooldown_remaining(
+                                self._effective_route(candidate, model_role)) > 0
+                            or model_provider_quota_scope(self._effective_route(
+                                candidate, model_role)) in fully_429_scopes
+                            for _route_id, _pool, candidate in primary_routes),
+                    )
                     if route is not None and self._provider_route_failure(exc) else 0
                 )
                 if (self._provider_route_failure(exc)

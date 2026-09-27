@@ -14,7 +14,7 @@ from scisaurus.runtime.capability_registry import (
     TRANSACTION_SCHEMA, experiment_program_payload, load_registry, register_capability,
 )
 from scisaurus.runtime.program_admission import SCHEMA_VERSION, validate_program_candidate
-from scisaurus.runtime.program_gates import admit_program_candidate
+from scisaurus.runtime.program_gates import ProgramGateRejected, admit_program_candidate
 from scisaurus.runtime.program_sandbox import (
     _macho_dependency_paths, run_sandboxed, sandbox_profile, sandbox_status,
 )
@@ -172,12 +172,14 @@ class GateTests(unittest.TestCase):
         payload = json.dumps(document).encode()
         return lambda _: Result(payload)
 
-    def _validate(self, decision=None, matches=True):
+    def _validate(self, decision=None, matches=True, check_passed=None):
         def validate(data):
             request = json.loads(data)
             reported = request["candidate"]["metrics"][0]["value"]
             observed_decision = decision or ("accepted" if matches else "rejected")
-            check_outcome = "passed" if observed_decision == "accepted" else "failed"
+            check_outcome = (
+                "passed" if (check_passed if check_passed is not None
+                             else observed_decision == "accepted") else "failed")
             verdict = {
                 "schema_version": "experiment-validation-1", "study_id": "generated_study",
                 "candidate_sha256": request["candidate_sha256"], "decision": observed_decision,
@@ -204,6 +206,23 @@ class GateTests(unittest.TestCase):
                                            "test_vector_digest", "independent_recalculation",
                                            "adversarial_review"])
         self.assertEqual(record["independent_recalculation"]["metrics"], 1)
+
+    def test_validator_admission_receives_exact_executor_configured_input(self):
+        document = output_document()
+        value = candidate()
+        configured_input = {"dataset_revision": "fixture-7", "threshold": 0.25}
+        value["test_vector"]["input"] = experiment_program_payload(INTENT, configured_input)
+        value["test_vector"]["expected_output_sha256"] = expected_digest(document)
+        observed = []
+        validator = self._validate()
+
+        def capture_validator(data):
+            observed.append(json.loads(data)["configured_input"])
+            return validator(data)
+
+        admit_program_candidate(value, execute=self._execute(document),
+                                validate=capture_validator)
+        self.assertEqual(observed, [configured_input])
 
     def test_non_deterministic_replay_is_rejected(self):
         state = {"index": 0}
@@ -236,9 +255,25 @@ class GateTests(unittest.TestCase):
         payload = json.dumps(document).encode()
         value = candidate()
         value["test_vector"]["expected_output_sha256"] = expected_digest(document)
-        with self.assertRaisesRegex(ValidationError, "contradicts"):
+        with self.assertRaises(ProgramGateRejected) as raised:
             admit_program_candidate(value, execute=lambda _: Result(payload),
                                     validate=self._validate(decision="accepted", matches=False))
+        self.assertIn("contradicts", str(raised.exception))
+        self.assertEqual(raised.exception.feedback["expected_decision"], "rejected")
+        self.assertEqual(raised.exception.feedback["metric_mismatches"][0]["metric_id"],
+                         "tail_error")
+
+    def test_failed_check_produces_targeted_validator_repair_feedback(self):
+        document = output_document()
+        payload = json.dumps(document).encode()
+        value = candidate()
+        value["test_vector"]["expected_output_sha256"] = expected_digest(document)
+        with self.assertRaises(ProgramGateRejected) as raised:
+            admit_program_candidate(value, execute=lambda _: Result(payload),
+                                    validate=self._validate(matches=True, check_passed=False))
+        self.assertEqual(raised.exception.feedback["expected_decision"], "rejected")
+        self.assertEqual(raised.exception.feedback["failed_checks"][0]["id"], "row_arithmetic")
+        self.assertIn("derive", raised.exception.feedback["validation_error"])
 
     def test_blocking_review_finding_is_rejected(self):
         document = output_document()
@@ -282,6 +317,7 @@ class RegistryTests(unittest.TestCase):
             command = descriptor["experiment"]["execution"]["client"]["command"]
             self.assertTrue(Path(command[1]).is_file())
             self.assertEqual(descriptor["experiment"]["execution"]["input"], {"probe": True})
+            self.assertEqual(descriptor["experiment"]["validation"]["input"], {"probe": True})
             self.assertEqual(descriptor["experiment"]["execution"]["representative"]["input"],
                              value["test_vector"]["input"])
             self.assertTrue(descriptor["experiment"]["execution"]["client"]["sandbox_required"])

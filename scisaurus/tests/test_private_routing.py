@@ -4,6 +4,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from scisaurus.runtime.models import is_local_qwen_route
+
 
 PRIVATE_ROOT = Path(__file__).resolve().parents[2] / "local-private"
 if str(PRIVATE_ROOT) not in sys.path:
@@ -11,9 +13,10 @@ if str(PRIVATE_ROOT) not in sys.path:
 
 PRIVATE_ROUTING_MODULE = PRIVATE_ROOT / "role_routing.py"
 if PRIVATE_ROUTING_MODULE.is_file():
-    from role_routing import routed_model_config  # noqa: E402
+    from role_routing import provider_pools, routed_model_config  # noqa: E402
 else:
     routed_model_config = None
+    provider_pools = None
 
 
 @unittest.skipUnless(PRIVATE_ROUTING_MODULE.is_file(),
@@ -87,9 +90,56 @@ class TestPrivateRouting(unittest.TestCase):
             "ollama-qwen-bulk", "ollama-gemma-bulk", "ollama-deepseek",
         ])
         self.assertTrue(all(route["base_url"] == "http://127.0.0.1:11434/v1" for route in routes))
+        self.assertTrue(all(
+            route["context_window_tokens"] == 262144
+            and route["max_input_tokens"] == 245760
+            for route in routes))
         self.assertNotIn("qwen", {
             route["pool"] for route_list in config["role_routes"].values() for route in route_list
         })
+
+    def test_local_qwen_cooldown_recovery_is_removed(self):
+        values = self.env(
+            SCISAURUS_OLLAMA_ONLY="1",
+            SCISAURUS_OLLAMA_COOLDOWN_FALLBACK_MODEL="qwen3.8:27b-mlx",
+        )
+        config = self.config(values)
+        self.assertNotIn("provider_cooldown_fallback", config)
+        default_config = self.config(self.env(SCISAURUS_OLLAMA_ONLY="1"))
+        self.assertNotIn("provider_cooldown_fallback", default_config)
+
+    def test_local_qwen_is_removed_from_every_generated_role_route(self):
+        for endpoint in (
+                "http://127.0.0.1:11434/v1", "http://127.1:11434/v1",
+                "http://0.0.0.0:11434/v1", "http://localhost.localdomain:11434/v1"):
+            with self.subTest(endpoint=endpoint):
+                config = self.config(self.env(
+                    SCISAURUS_QWEN_BASE_URL=endpoint,
+                    SCISAURUS_QWEN_MODEL="qwen3.8:27b-mlx",
+                ))
+                self.assertTrue(all(
+                    not is_local_qwen_route(route)
+                    for route in config["role_models"].values()
+                ))
+                self.assertTrue(all(
+                    not is_local_qwen_route(route)
+                    for routes in config["role_routes"].values()
+                    for route in routes
+                ))
+                self.assertNotIn("qwen", provider_pools({}, config))
+                self.assertEqual(
+                    config["role_models"]["research.cataloger"]["model"],
+                    "gemma4:31b-cloud",
+                )
+                self.assertEqual(
+                    [route["model"] for route in config["role_routes"]["research.literature-mapper"]],
+                    ["gemma4:31b-cloud", "deepseek-v4.1-flash:cloud"],
+                )
+
+    def test_cooldown_fallback_requires_ollama_only_policy(self):
+        with self.assertRaisesRegex(ValueError, "requires SCISAURUS_OLLAMA_ONLY"):
+            self.config(self.env(
+                SCISAURUS_OLLAMA_COOLDOWN_FALLBACK_MODEL="qwen3.8:27b-mlx"))
 
     def test_evidence_integrators_use_ollama_high_context_without_bulk_spillover(self):
         config = self.config(self.env())
@@ -107,23 +157,46 @@ class TestPrivateRouting(unittest.TestCase):
                 selected = config["role_models"][role]
                 self.assertIn(selected["model"], {
                     "deepseek-v4.1-flash:cloud", "glm-5.3-flash:cloud"})
-                self.assertEqual(selected["context_window_tokens"], 131072)
-                self.assertEqual(selected["max_input_tokens"], 112000)
+                self.assertEqual(selected["context_window_tokens"], 262144)
+                self.assertEqual(selected["max_input_tokens"], 245760)
                 routes = config["role_routes"][role]
                 self.assertEqual([route["pool"] for route in routes[:2]], ["ollama", "ollama"])
                 self.assertEqual(
                     {route["model"] for route in routes[:2]},
                     {"deepseek-v4.1-flash:cloud", "glm-5.3-flash:cloud"})
                 self.assertTrue(all(
-                    route["context_window_tokens"] == 131072
-                    and route["max_input_tokens"] == 112000
+                    route["context_window_tokens"] == 262144
+                    and route["max_input_tokens"] == 245760
                     for route in routes[:2]))
                 self.assertNotIn("qwen-bulk", {route["id"] for route in routes})
 
         bulk = config["role_routes"]["research.literature-mapper"]
         self.assertEqual([route["id"] for route in bulk], [
             "qwen-bulk", "ollama-gemma-bulk", "ollama-deepseek"])
-        self.assertTrue(all(route["context_window_tokens"] == 65536 for route in bulk))
+        self.assertEqual(
+            [(route["context_window_tokens"], route["max_input_tokens"]) for route in bulk],
+            [(65536, 56000), (262144, 245760), (262144, 245760)],
+        )
+
+    def test_interpretation_and_argument_keep_ollama_recovery_route_after_flash_peers(self):
+        config = self.config(self.env(SCISAURUS_OLLAMA_ONLY="1"))
+        for role in ("strategy.interpretation", "strategy.argument"):
+            with self.subTest(role=role):
+                fallbacks = config["role_model_fallbacks"][role]
+                self.assertEqual(
+                    [route["model"] for route in fallbacks],
+                    ["glm-5.3-flash:cloud", "gemma4:31b-cloud"],
+                )
+                self.assertTrue(all(route["base_url"] == "http://127.0.0.1:11434/v1"
+                                    and route.get("auth_env") is None
+                                    and route["context_window_tokens"] == 262144
+                                    and route["max_input_tokens"] == 245760
+                                    for route in fallbacks))
+        reviewer = config["role_model_fallbacks"]["strategy.argument-reviewer"]
+        self.assertEqual(
+            [route["model"] for route in reviewer],
+            ["deepseek-v4.1-flash:cloud", "gemma4:31b-cloud"],
+        )
 
     def test_high_context_profile_can_be_tuned_independently(self):
         config = self.config(self.env(
@@ -136,6 +209,21 @@ class TestPrivateRouting(unittest.TestCase):
             config["role_models"]["review.synthesizer"]["max_input_tokens"], 90000)
         self.assertEqual(
             config["role_models"]["research.literature-mapper"]["context_window_tokens"], 65536)
+        self.assertEqual(
+            config["role_routes"]["review.synthesizer"][0]["context_window_tokens"], 98304)
+        self.assertEqual(
+            config["role_routes"]["research.literature-mapper"][1]["context_window_tokens"],
+            262144)
+
+    def test_ollama_context_window_override_keeps_input_inside_window(self):
+        config = self.config(self.env(
+            SCISAURUS_OLLAMA_HIGH_CONTEXT_WINDOW_TOKENS="98304",
+        ))
+        self.assertEqual(
+            config["role_models"]["review.synthesizer"]["context_window_tokens"], 98304)
+        self.assertLessEqual(
+            config["role_models"]["review.synthesizer"]["max_input_tokens"] + 8192,
+            98304)
 
     def test_kimi_and_full_glm_share_one_twenty_call_budget(self):
         with tempfile.TemporaryDirectory() as directory:

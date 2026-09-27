@@ -164,7 +164,7 @@ class TestSurveyConfig(unittest.TestCase):
                     validate_survey_config(value)
 
     def test_full_text_mapping_requires_safe_url_markers_and_capability(self):
-        for mutation in ("no-capability", "duplicate", "url", "markers", "identity"):
+        for mutation in ("no-capability", "duplicate", "url", "markers", "identity", "route-policy"):
             with self.subTest(mutation=mutation):
                 value = survey_config()
                 source = value["survey"]["full_text_sources"][0]
@@ -176,6 +176,8 @@ class TestSurveyConfig(unittest.TestCase):
                     source["url"] = "https://name:password@example.org/paper"
                 elif mutation == "markers":
                     source["section_markers"] = []
+                elif mutation == "route-policy":
+                    source["route_policy"] = "silent-fallback"
                 else:
                     source["work_id"] = "not-an-openalex-work"
                 with self.assertRaises(ValidationError):

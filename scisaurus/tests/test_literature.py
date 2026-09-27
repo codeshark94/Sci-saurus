@@ -21,7 +21,8 @@ from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.tasks import TaskManager
 from scisaurus.runtime.literature import (
-    DEFAULT_ENDPOINT, MAX_REQUEST_URL_BYTES, OpenAlexClient, _retry_after_seconds, request_url,
+    DEFAULT_ENDPOINT, MAX_REQUEST_URL_BYTES, OpenAlexClient, _retry_after_seconds,
+    full_text_url_candidates, preferred_full_text_url, request_url,
 )
 from scisaurus.runtime.operation_adapters import get_adapter
 from scisaurus.runtime.operations import OperationsCell
@@ -37,6 +38,29 @@ def work_fixture(identity="W123"):
                            "is_oa": True, "version": "acceptedVersion"}],
             "has_fulltext": True, "has_content": {"pdf": True},
             "content_urls": {"pdf": "https://content.openalex.org/works/W123.pdf"}}
+
+
+class FullTextRouteSelectionTests(unittest.TestCase):
+    def test_openalex_oa_pdf_is_selected_before_landing_page(self):
+        locations = [{
+            "is_oa": True,
+            "landing_page_url": "https://doi.org/10.1234/example",
+            "pdf_url": "https://publisher.example/articlepdf/10.1234/example",
+        }]
+        candidates = full_text_url_candidates(locations)
+        self.assertEqual(candidates[0], {
+            "url": "https://publisher.example/articlepdf/10.1234/example",
+            "is_oa": True, "kind": "pdf",
+        })
+        self.assertEqual(preferred_full_text_url(locations), candidates[0]["url"])
+
+    def test_non_oa_pdf_does_not_outrank_registered_oa_landing_page(self):
+        locations = [
+            {"is_oa": True, "landing_page_url": "https://open.example/article", "pdf_url": None},
+            {"is_oa": False, "landing_page_url": "https://publisher.example/article",
+             "pdf_url": "https://publisher.example/article.pdf"},
+        ]
+        self.assertEqual(preferred_full_text_url(locations), "https://open.example/article")
 
 
 class RecordedOpenAlexExecutor:

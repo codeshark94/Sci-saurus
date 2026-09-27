@@ -22,6 +22,25 @@ SCHEMA_VERSION = "0.8"
 GENESIS_HASH = hashlib.sha256(b"scisaurus-genesis-v0.8").hexdigest()
 
 _REF_RE = re.compile(r"^artifact:([A-Za-z0-9_.\-]+)/([A-Za-z0-9_./\-]+)@([1-9][0-9]*)$")
+_ARTIFACT_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def safe_artifact_component(value: str) -> str:
+    """Return a stable single path component for an external logical key.
+
+    ArtifactRef path components intentionally have a restricted alphabet.
+    Preserve already-valid names; encode other identifiers as a readable slug
+    plus a digest so punctuation cannot break references or collide after
+    normalization.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("artifact component source must be a nonempty string")
+    value = value.strip()
+    if value not in {".", ".."} and _ARTIFACT_COMPONENT_RE.fullmatch(value):
+        return value
+    readable = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip(".-") or "item"
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    return f"{readable[:96]}-{digest}"
 
 MESSAGE_TYPES = frozenset({"request", "review", "data", "critique", "decision"})
 

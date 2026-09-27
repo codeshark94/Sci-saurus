@@ -1,4 +1,6 @@
 """Evidence-bound literature statements and scoped map updates."""
+from copy import deepcopy
+
 from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.config import _text
 from scisaurus.runtime.scores import exact
@@ -22,14 +24,14 @@ def normalize_check_envelope(value, required):
     if not isinstance(value, dict) or not isinstance(value.get("checks"), list):
         return value
     required = tuple(required)
-    required_ids = set(required)
+    required_ids = frozenset(required)
     rows = value["checks"]
     counts = {}
     for row in rows:
         if not isinstance(row, dict):
             return value
         check_id = row.get("check_id")
-        if check_id in required_ids:
+        if isinstance(check_id, str) and check_id in required_ids:
             counts[check_id] = counts.get(check_id, 0) + 1
     if set(counts) != required_ids or any(count != 1 for count in counts.values()):
         return value
@@ -38,7 +40,291 @@ def normalize_check_envelope(value, required):
     # IDs as a set, while replay compares the completed envelope byte-for-byte
     # at the list level; reordering here would turn a valid response into a
     # false mismatch when the caller supplied a different but valid order.
-    projected["checks"] = [row for row in rows if row.get("check_id") in required_ids]
+    projected["checks"] = [row for row in rows
+                            if isinstance(row.get("check_id"), str)
+                            and row["check_id"] in required_ids]
+    return projected
+
+
+def normalize_gap_assessment_envelope(value, *, evidence_catalog=None,
+                                     verified_full_text_refs=None,
+                                     known_work_ids=None):
+    """Canonicalize unambiguous response aliases without relaxing evidence gates.
+
+    Normalize transport aliases and turn unreadable evidence selections into
+    explicit uncertainty. No malformed or cross-work citation can become a
+    positive finding; every normalized result still passes the strict
+    assessment validator.
+    """
+    if not isinstance(value, dict):
+        return value
+    evidence_by_id = {}
+    duplicate_ids = set()
+    if isinstance(evidence_catalog, list):
+        for item in evidence_catalog:
+            if (not isinstance(item, dict)
+                    or not isinstance(item.get("evidence_id"), str)
+                    or not isinstance(item.get("work_id"), str)
+                    or not isinstance(item.get("source_ref"), str)):
+                continue
+            evidence_id = item["evidence_id"]
+            if evidence_id in evidence_by_id:
+                duplicate_ids.add(evidence_id)
+            else:
+                evidence_by_id[evidence_id] = item
+    for evidence_id in duplicate_ids:
+        evidence_by_id.pop(evidence_id, None)
+    verified_full_text_refs = set(
+        item for item in verified_full_text_refs
+        if isinstance(item, str)
+    ) if isinstance(verified_full_text_refs, (list, tuple, set)) else set()
+
+    raw_checks = value.get("checks")
+    checks = []
+    if isinstance(raw_checks, list):
+        for item in raw_checks:
+            if not isinstance(item, dict):
+                checks.append(item)
+                continue
+            row = deepcopy(item)
+            aliases = [row[key] for key in ("check", "name")
+                       if isinstance(row.get(key), str)]
+            check_id = row.get("check_id")
+            if check_id is None and aliases and len(set(aliases)) == 1:
+                check_id = aliases[0]
+            if isinstance(check_id, str):
+                row["check_id"] = check_id
+            rationale = row.get("rationale")
+            if isinstance(rationale, str):
+                row.setdefault(
+                    "method",
+                    "Checked the cited source evidence against the retained survey map and coverage.",
+                )
+                row.setdefault("result", rationale)
+            checks.append({key: row[key] for key in ("check_id", "outcome", "method", "result")
+                           if key in row})
+    check_rows = {}
+    for row in checks:
+        if isinstance(row, dict) and row.get("check_id") in GAP_CHECKS:
+            check_rows.setdefault(row["check_id"], []).append(row)
+    checks = []
+    for check_id in GAP_CHECKS:
+        candidates = check_rows.get(check_id, [])
+        if len(candidates) == 1:
+            row = candidates[0]
+            outcome = row.get("outcome")
+            method, result = row.get("method"), row.get("result")
+            if (isinstance(outcome, str)
+                    and outcome in {"passed", "failed", "insufficient_evidence", "check_failed"}
+                    and isinstance(method, str) and method.strip()
+                    and isinstance(result, str) and result.strip()):
+                checks.append({"check_id": check_id, "outcome": outcome,
+                               "method": method.strip(), "result": result.strip()})
+                continue
+        checks.append({
+            "check_id": check_id,
+            "outcome": "insufficient_evidence",
+            "method": "The submitted gap-assessment check could not be read unambiguously.",
+            "result": "Its evidence or result was missing, duplicated, or malformed, so this check remains unresolved.",
+        })
+
+    outcomes = [row.get("outcome") for row in checks if isinstance(row, dict)]
+    check_ids = [row.get("check_id") for row in checks if isinstance(row, dict)]
+    checks_complete = (len(checks) == len(GAP_CHECKS)
+                       and set(check_ids) == set(GAP_CHECKS)
+                       and len(set(check_ids)) == len(GAP_CHECKS))
+
+    state = value.get("state")
+    valid_states = ("refuted_by_prior_work", "insufficient_evidence", "eligible_for_experiment")
+    if state not in valid_states:
+        status = value.get("status")
+        if status in valid_states:
+            state = status
+        elif status == "supported":
+            state = ("eligible_for_experiment"
+                     if checks_complete and outcomes and all(outcome == "passed" for outcome in outcomes)
+                     else "insufficient_evidence")
+        else:
+            state = "insufficient_evidence"
+    if (state in {"refuted_by_prior_work", "eligible_for_experiment"}
+            and any(outcome != "passed" for outcome in outcomes)):
+        state = "insufficient_evidence"
+
+    rationale = value.get("rationale")
+    if not isinstance(rationale, str):
+        rationale = value.get("answer")
+    if isinstance(rationale, str):
+        uncertainty = value.get("uncertainty")
+        if (isinstance(uncertainty, str) and uncertainty.strip()
+                and uncertainty.casefold() not in {"none", "low", "no material uncertainty"}
+                and uncertainty not in rationale):
+            rationale = f"{rationale}\nUncertainty: {uncertainty}"
+    else:
+        rationale = "The supplied survey evidence did not support a decisive assessment; unresolved checks and source limits are retained explicitly."
+
+    def evidence_selections(items):
+        if not isinstance(items, list):
+            return items
+        selections = []
+        for item in items:
+            if isinstance(item, dict) and isinstance(item.get("evidence_id"), str):
+                selections.append({"evidence_id": item["evidence_id"]})
+            elif isinstance(item, str) and item in evidence_by_id:
+                selections.append({"evidence_id": item})
+            elif (isinstance(item, dict)
+                  and all(isinstance(item.get(key), str)
+                          for key in ("work_id", "source_ref", "quote"))):
+                selections.append({key: item[key] for key in (
+                    "work_id", "source_ref", "quote", "start", "end", "quote_sha256"
+                ) if key in item})
+            else:
+                selections.append(item)
+        return selections
+
+    comparisons = value.get("comparisons")
+    if isinstance(comparisons, list):
+        projected = []
+        comparison_index_by_work = {}
+        known_work_ids = (set(known_work_ids) if known_work_ids is not None else None)
+        for item in comparisons:
+            if not isinstance(item, dict):
+                continue
+            work_id = item.get("work_id")
+            if (not isinstance(work_id, str)
+                    or (known_work_ids is not None and work_id not in known_work_ids)):
+                continue
+            statement = item.get("statement")
+            if not isinstance(statement, str):
+                statement = item.get("note")
+            if not isinstance(statement, str) or not statement.strip():
+                statement = "The supplied evidence does not resolve this work's relationship to the nominated gap."
+            raw_relationship = item.get("relationship")
+            relationship = (raw_relationship if isinstance(raw_relationship, str)
+                            and raw_relationship in {
+                "solves", "partial", "different", "uncertain"
+            } else "uncertain")
+            raw_evidence = item.get("evidence")
+            comparison_evidence = evidence_selections(raw_evidence)
+            if not isinstance(comparison_evidence, list):
+                comparison_evidence = []
+            evidence_is_unresolved = (
+                not isinstance(raw_evidence, list)
+                or (relationship != "uncertain" and not comparison_evidence)
+            )
+            if isinstance(evidence_catalog, list):
+                for proof in comparison_evidence:
+                    if isinstance(proof, dict) and isinstance(proof.get("evidence_id"), str):
+                        catalog_item = evidence_by_id.get(proof["evidence_id"])
+                        if catalog_item is None or catalog_item.get("work_id") != work_id:
+                            evidence_is_unresolved = True
+                            break
+                    elif (not isinstance(proof, dict)
+                          or proof.get("work_id") != work_id):
+                        evidence_is_unresolved = True
+                        break
+            if evidence_is_unresolved:
+                normalized = {
+                    "work_id": work_id,
+                    "relationship": "uncertain",
+                    "statement": (
+                        "The supplied source evidence does not resolve this work's relationship "
+                        "to the nominated gap."
+                    ),
+                    "evidence": [],
+                }
+            else:
+                normalized = {
+                    "work_id": work_id,
+                    "relationship": relationship,
+                    "statement": statement.strip(),
+                    "evidence": comparison_evidence,
+                }
+            if work_id in comparison_index_by_work:
+                projected[comparison_index_by_work[work_id]] = {
+                    "work_id": work_id,
+                    "relationship": "uncertain",
+                    "statement": "Duplicate comparison rows could not be reconciled without choosing between conflicting assessments.",
+                    "evidence": [],
+                }
+                continue
+            comparison_index_by_work[work_id] = len(projected)
+            projected.append(normalized)
+        comparisons = projected
+
+    evidence = evidence_selections(value.get("evidence"))
+    if not isinstance(evidence, list):
+        evidence = []
+    if isinstance(evidence_catalog, list):
+        evidence = [item for item in evidence
+                    if not (isinstance(item, dict)
+                            and isinstance(item.get("evidence_id"), str)
+                            and item["evidence_id"] not in evidence_by_id)]
+
+    has_verified_full_text = any(
+        isinstance(item, dict)
+        and ((isinstance(item.get("evidence_id"), str)
+              and (catalog_item := evidence_by_id.get(item["evidence_id"])) is not None
+              and catalog_item.get("source_ref") in verified_full_text_refs)
+             or (isinstance(item.get("source_ref"), str)
+                 and item["source_ref"] in verified_full_text_refs))
+        for item in evidence if isinstance(evidence, list)
+    )
+
+    def comparison_has_verified_full_text(item):
+        for proof in item.get("evidence", []):
+            if not isinstance(proof, dict):
+                continue
+            evidence_id = proof.get("evidence_id")
+            catalog_item = evidence_by_id.get(evidence_id) if isinstance(evidence_id, str) else None
+            source_ref = (catalog_item.get("source_ref") if catalog_item is not None
+                          else proof.get("source_ref"))
+            proof_work_id = (catalog_item.get("work_id") if catalog_item is not None
+                             else proof.get("work_id"))
+            if (isinstance(source_ref, str) and source_ref in verified_full_text_refs
+                    and proof_work_id == item.get("work_id")):
+                return True
+        return False
+
+    if isinstance(comparisons, list):
+        for index, item in enumerate(comparisons):
+            if (isinstance(item, dict) and item.get("relationship") == "solves"
+                    and not comparison_has_verified_full_text(item)):
+                comparisons[index] = {
+                    "work_id": item["work_id"],
+                    "relationship": "uncertain",
+                    "statement": (
+                        "The abstract-level evidence does not establish that this work solves "
+                        "the nominated problem; verified full text is required."
+                    ),
+                    "evidence": [],
+                }
+
+    if state in {"refuted_by_prior_work", "eligible_for_experiment"}:
+        if not has_verified_full_text:
+            state = "insufficient_evidence"
+        elif (state == "eligible_for_experiment"
+              and isinstance(comparisons, list)
+              and (not comparisons or any(item.get("relationship") in {"uncertain", "solves"}
+                      or not comparison_has_verified_full_text(item)
+                      for item in comparisons if isinstance(item, dict)))):
+            state = "insufficient_evidence"
+        elif (state == "refuted_by_prior_work"
+              and isinstance(comparisons, list)
+              and not any(item.get("relationship") == "solves"
+                          and comparison_has_verified_full_text(item)
+                          for item in comparisons if isinstance(item, dict))):
+            state = "insufficient_evidence"
+    projected = {}
+    if state is not None:
+        projected["state"] = state
+    if isinstance(rationale, str):
+        projected["rationale"] = rationale
+    if isinstance(comparisons, list):
+        projected["comparisons"] = comparisons
+    if isinstance(checks, list):
+        projected["checks"] = checks
+    if isinstance(evidence, list):
+        projected["evidence"] = evidence
     return projected
 
 

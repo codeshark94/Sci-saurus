@@ -115,6 +115,116 @@ class ResearchRedTeamTests(unittest.TestCase):
         self.assertTrue(package["research_requests"][0]["id"].startswith("redteam_mechanisms_"))
         self.assertEqual(package["research_requests"][0]["kind"], "additional_experiment")
 
+    def test_oversized_critical_evidence_fails_before_parallel_model_dispatch(self):
+        model = {
+            **MODEL, "context_window_tokens": 4096,
+            "max_input_tokens": 2000, "max_output_tokens": 512,
+        }
+        received = []
+
+        class BoundedClient(_FakeModelClient):
+            def complete(self, *, system, prompt, images=None):
+                assignment = json.loads(prompt)
+                received.append(assignment)
+                return super().complete(system=system, prompt=prompt, images=images)
+
+        packet = {
+            "research_question": "Does X change Y?",
+            "results_package": {
+                "schema_version": "results-package-2",
+                "findings": [{"id": "finding-1", "statement": "x" * 20000}],
+            },
+            "scientific_interpretation": {}, "research_argument": {},
+            "paper_evidence": [], "paper_claims": [], "references": [],
+        }
+        _FakeModelClient.decisions = {}
+        with patch("scisaurus.runtime.research_redteam.ModelClient", BoundedClient):
+            with self.assertRaises(ValidationError) as raised:
+                ResearchRedTeamRunner(
+                    model, deadline_seconds=10, max_attempts=1,
+                ).run(packet)
+        self.assertEqual(received, [])
+        self.assertGreater(
+            raised.exception.input_projection["critical_omissions"], 0)
+        self.assertIn("critical scientific evidence", str(raised.exception))
+
+    def test_one_low_context_reviewer_blocks_every_peer_before_dispatch(self):
+        model = {
+            **MODEL,
+            "role_models": {
+                "review.methods": {
+                    "context_window_tokens": 4096,
+                    "max_input_tokens": 512,
+                    "max_output_tokens": 512,
+                },
+                "review.human_scientist": {
+                    "context_window_tokens": 32768,
+                    "max_input_tokens": 24000,
+                    "max_output_tokens": 512,
+                },
+                "review.journal_editor": {
+                    "context_window_tokens": 32768,
+                    "max_input_tokens": 24000,
+                    "max_output_tokens": 512,
+                },
+            },
+        }
+        dispatched = []
+
+        class CountingClient(_FakeModelClient):
+            def complete(self, *, system, prompt, images=None):
+                dispatched.append(json.loads(prompt)["reviewer"]["id"])
+                return super().complete(system=system, prompt=prompt, images=images)
+
+        packet = {
+            "research_question": "Does X change Y?",
+            "results_package": {
+                "findings": [{"id": "finding-1", "statement": "evidence " * 3000}],
+            },
+            "scientific_interpretation": {}, "research_argument": {},
+            "paper_evidence": [], "paper_claims": [], "references": [],
+        }
+        with patch("scisaurus.runtime.research_redteam.ModelClient", CountingClient):
+            with self.assertRaises(ValidationError) as raised:
+                ResearchRedTeamRunner(
+                    model, deadline_seconds=10, max_attempts=1,
+                ).run(packet)
+        self.assertEqual(dispatched, [])
+        self.assertEqual(raised.exception.usage["model_calls"], 0)
+        self.assertEqual(
+            raised.exception.model_diagnostics["preflight"],
+            "failed_before_any_reviewer_dispatch",
+        )
+        self.assertIn(
+            "methods",
+            [item["reviewer_id"] for item in
+             raised.exception.model_diagnostics["reviewer_failures"]],
+        )
+
+    def test_partial_parallel_review_failure_retains_successful_sibling_usage(self):
+        class OneFailureClient(_FakeModelClient):
+            def complete(self, *, system, prompt, images=None):
+                reviewer_id = json.loads(prompt)["reviewer"]["id"]
+                if reviewer_id == "methods":
+                    error = ValidationError("review route failed after dispatch")
+                    error.usage = {
+                        "model_calls": 1, "input_tokens": 5, "output_tokens": 2,
+                    }
+                    raise error
+                return super().complete(system=system, prompt=prompt, images=images)
+
+        with patch("scisaurus.runtime.research_redteam.ModelClient", OneFailureClient):
+            with self.assertRaises(ValidationError) as raised:
+                ResearchRedTeamRunner(MODEL, deadline_seconds=10, max_attempts=1).run(
+                    {"research_question": "Does X change Y?", "results_package": {},
+                     "scientific_interpretation": {}, "research_argument": {},
+                     "paper_evidence": [], "paper_claims": [], "references": []})
+        self.assertEqual(raised.exception.usage["model_calls"], 3)
+        self.assertEqual(raised.exception.usage["input_tokens"], 25)
+        self.assertEqual(raised.exception.usage["output_tokens"], 42)
+        self.assertEqual(raised.exception.model_diagnostics["reviewer_failures"][0]["reviewer_id"],
+                         "methods")
+
     def test_accepting_review_cannot_hide_a_failed_check(self):
         value = _review("methods")
         value["checks"][0]["outcome"] = "failed"

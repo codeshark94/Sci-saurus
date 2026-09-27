@@ -21,7 +21,9 @@ from scisaurus.core.schema import canonical_bytes, sha256_hex
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.surveys import SurveyGate
 from scisaurus.runtime.execution import ExecutionRuntime, _invoke_worker
-from scisaurus.runtime.capability_registry import experiment_program_payload
+from scisaurus.runtime.capability_registry import (
+    experiment_program_payload, experiment_validation_payload,
+)
 from scisaurus.runtime.config import configured_worker_slots
 from scisaurus.runtime.experiment_config import ASSET_MEDIA_TYPES, validate_experiment_config
 from scisaurus.runtime.models import ModelResult
@@ -38,6 +40,68 @@ from scisaurus.runtime.time_policy import TimePolicy
 
 REVIEW_CHECKS = {"method_alignment", "calculation_trace", "inference_scope", "limitation_coverage"}
 REVIEW_DECISIONS = {"accepted", "accepted_with_limitations", "rejected"}
+_NONFINITE_NUMERIC_TOKEN = re.compile(
+    r"(?<![\w.])(?P<sign>[+-]?)(?P<value>nan|inf(?:inity)?)(?!\w)",
+    re.IGNORECASE)
+_NONFINITE_VALUE_CONTEXT = re.compile(
+    r"(?:[=<>]\s*|\b(?:value|result|measurement|estimate|outcome|metric)"
+    r"(?:\s*[:=]|\s+(?:is|was|equals?|reported\s+as|returned\s+as))\s*)$",
+    re.IGNORECASE)
+_NONFINITE_UNDEFINED_SUFFIX = re.compile(
+    r"\s*[\(\[]\s*(?:undefined|censored|unavailable|not\s+(?:finite|defined))\b",
+    re.IGNORECASE)
+_NONFINITE_NEGATION = re.compile(
+    r"\b(?:not|never|no|without|cannot|can['’]t|didn['’]?t|doesn['’]?t|"
+    r"isn['’]?t|wasn['’]?t|failed\s+to)\b", re.IGNORECASE)
+_NONFINITE_NEGATED_PREFIX = re.compile(
+    r"\b(?:not|never|no|without|cannot|can['’]t|didn['’]?t|doesn['’]?t|"
+    r"isn['’]?t|wasn['’]?t|aren['’]?t|weren['’]?t)\s*$", re.IGNORECASE)
+
+
+def _contains_nonfinite_numeric_marker(text, *, metric_id, unit=None):
+    """Identify non-finite placeholders without matching prose about infinity."""
+    metric_words = [word for word in re.split(r"[_-]+", metric_id) if word]
+    metric_label = r"[\s_-]+".join(re.escape(word) for word in metric_words)
+    metric_context = re.compile(
+        r"\b" + metric_label + r"(?P<qualifiers>(?:\s+[\w'’-]+){0,8})\s+"
+        r"(?:is|was|equals?|reported(?:\s+as)?|reports?|returned(?:\s+as)?|returns?|"
+        r"produced|produces|yielded|yields|generated|generates|emitted|emits)\s*$",
+        re.IGNORECASE)
+    metric_header_context = re.compile(
+        r"\b" + metric_label + r"(?:\s+[\w-]+){0,3}\s*:\s*$", re.IGNORECASE)
+    metric_change_context = re.compile(
+        r"\b" + metric_label + r"(?:\s+[\w-]+){0,3}\s+"
+        r"(?:shift|change|increase|decrease|move)\w*\s+by\s*$", re.IGNORECASE)
+    for match in _NONFINITE_NUMERIC_TOKEN.finditer(text):
+        before, after = text[:match.start()], text[match.end():]
+        if _NONFINITE_NEGATED_PREFIX.search(before):
+            continue
+        if (not before.strip()
+                and not after.strip(" \t\r\n.,;:!?)]}")):
+            return True
+        value_context = _NONFINITE_VALUE_CONTEXT.search(before)
+        metric_value_context = metric_context.search(before)
+        if metric_value_context:
+            recent_qualifiers = " ".join(
+                metric_value_context.group("qualifiers").split()[-3:])
+            if _NONFINITE_NEGATION.search(recent_qualifiers):
+                continue
+        metric_header = metric_header_context.search(before)
+        metric_change = metric_change_context.search(before)
+        unit_match = (re.match(r"\s*" + re.escape(unit) + r"(?!\w)", after, re.IGNORECASE)
+                      if unit else None)
+        unit_follows = unit_match is not None
+        unit_tail = after[unit_match.end():] if unit_match else ""
+        unit_ends_value = unit_follows and not unit_tail.strip(
+            " \t\r\n.,;:!?)]}")
+        if (_NONFINITE_UNDEFINED_SUFFIX.match(after)
+                and (not before.strip() or value_context or metric_value_context or metric_header)):
+            return True
+        if value_context or metric_value_context or metric_change:
+            return True
+        if unit_ends_value or (metric_header and not after.strip(" \t\r\n.,;:!?)]}")):
+            return True
+    return False
 
 
 def _text(value, name):
@@ -65,9 +129,20 @@ def validate_program_output(value, experiment):
     if value["study_id"] != experiment["id"] or value["revision"] != experiment["revision"]:
         raise ValidationError("experiment program output does not match the frozen study identity")
     observations = value["observations"]
-    if (not isinstance(observations, list) or len(observations) < experiment["run_count"]
-            or len(observations) > experiment["max_observations"]):
-        raise ValidationError("experiment observations violate the configured count bounds")
+    if not isinstance(observations, list):
+        raise ValidationError("experiment observations must be a list of rows")
+    observation_count = len(observations)
+    if observation_count < experiment["run_count"]:
+        raise ValidationError(
+            f"experiment emitted {observation_count} observation rows, fewer than "
+            f"configured minimum run_count={experiment['run_count']} rows")
+    if observation_count > experiment["max_observations"]:
+        raise ValidationError(
+            f"experiment emitted {observation_count} observation rows but "
+            f"max_observations={experiment['max_observations']}; max_observations is "
+            "the total row ceiling across all conditions and replicates, so it must cover "
+            "the complete planned row count, or the design must be reduced without "
+            "changing its scientific question")
     for observation in observations:
         if not isinstance(observation, dict):
             raise ValidationError("every experiment observation must be an object")
@@ -104,6 +179,36 @@ def validate_program_output(value, experiment):
         raise ValidationError("experiment output omits a configured primary outcome")
     if any(observed[key]["unit"] != contract["unit"] for key, contract in configured.items()):
         raise ValidationError("experiment output changes a configured primary outcome unit")
+    null_primary = {
+        metric_id for metric_id in configured
+        if observed[metric_id]["value"] is None
+    }
+    if len(null_primary) == len(configured):
+        raise ValidationError(
+            "all declared primary outcomes are null; the experiment has no estimable "
+            "primary result. Repair the parameter range or add a scientifically meaningful "
+            "non-null outcome derived from the observations; preserve censored values as null "
+            "and never substitute zero or a grid boundary")
+    null_metrics = {metric["id"]: metric for metric in value["metrics"]
+                    if metric["value"] is None}
+    for metric_id, metric in null_metrics.items():
+        if any(_contains_nonfinite_numeric_marker(
+                metric[field], metric_id=metric_id, unit=metric["unit"])
+               for field in ("conditions", "presentation")):
+            raise ValidationError(
+                f"metric {metric_id!r} uses a non-finite numeric marker for an explicitly undefined "
+                "outcome; keep the value null and state only its supported censoring or "
+                "undefinedness reason")
+    for finding in value["findings"]:
+        linked_null_metrics = [null_metrics[metric_id] for metric_id in finding["metric_ids"]
+                               if metric_id in null_metrics]
+        if any(_contains_nonfinite_numeric_marker(
+                finding["statement"], metric_id=metric["id"], unit=metric["unit"])
+               for metric in linked_null_metrics):
+            raise ValidationError(
+                f"finding {finding['id']!r} uses a non-finite numeric marker for an undefined "
+                "outcome; keep the metric null and state only its supported censoring or "
+                "undefinedness reason")
     if not set(experiment["limitations"]).issubset(value["limitations"]):
         raise ValidationError("experiment output omits a frozen design limitation")
 
@@ -182,16 +287,30 @@ def validate_deterministic_validation(value, experiment, candidate_sha256):
             raise ValidationError("metric recalculation match flag contradicts its values")
     configured_metric_ids = {item["id"] for item in experiment["primary_outcomes"]}
     if metric_ids != configured_metric_ids:
+        missing = sorted(configured_metric_ids - metric_ids)
+        unexpected = sorted(metric_ids - configured_metric_ids)
         raise ValidationError(
-            "deterministic validation must recalculate exactly the primary outcomes")
+            "deterministic validation must recalculate exactly the primary outcomes; "
+            f"missing metric_ids={missing}; unexpected metric_ids={unexpected}; "
+            f"expected metric_ids={sorted(configured_metric_ids)}; "
+            f"observed metric_ids={sorted(metric_ids)}")
     if not isinstance(value["limitations"], list):
         raise ValidationError("deterministic validation limitations must be a list")
     for limitation in value["limitations"]:
         _text(limitation, "deterministic validation limitation")
     passed = (all(check["outcome"] == "passed" for check in value["checks"])
               and all(item["matches"] for item in recalculations))
-    if value["decision"] != ("accepted" if passed else "rejected"):
-        raise ValidationError("deterministic validation decision contradicts its checks")
+    expected_decision = "accepted" if passed else "rejected"
+    if value["decision"] != expected_decision:
+        failed_checks = [item["id"] for item in value["checks"]
+                         if item["outcome"] != "passed"]
+        mismatched_metrics = [item["metric_id"] for item in recalculations
+                              if item["matches"] is not True]
+        raise ValidationError(
+            "deterministic validation decision contradicts its checks: derived "
+            f"decision={expected_decision}, observed={value['decision']}; "
+            f"failed_checks={failed_checks[:8]}, "
+            f"mismatched_metrics={mismatched_metrics[:8]}")
     return value
 
 
@@ -242,11 +361,28 @@ def validate_model_review(value, reviewer_id, finding_ids):
         raise ValidationError("experiment review limitations must be a list")
     for limitation in value["limitations"]:
         _text(limitation, "experiment review limitation")
-    if value["decision"] != "rejected" and (
-            any(check["outcome"] != "passed" for check in value["checks"])
-            or any(item["outcome"] != "supported" for item in assessments)):
-        raise ValidationError("an accepted experiment review cannot retain a failed check or unsupported finding")
     return value
+
+
+def reconcile_model_review_disposition(value):
+    """Make the review disposition consistent with its recorded evidence."""
+    adverse_checks = [
+        item["check_id"] for item in value["checks"] if item["outcome"] != "passed"]
+    adverse_findings = [
+        {"finding_id": item["finding_id"], "outcome": item["outcome"]}
+        for item in value["finding_assessments"] if item["outcome"] != "supported"]
+    if value["decision"] == "rejected" or not (adverse_checks or adverse_findings):
+        return value
+    return {
+        **value,
+        "decision": "rejected",
+        "reported_decision": value["decision"],
+        "decision_reconciliation": {
+            "rule": "adverse_review_evidence_requires_rejection",
+            "adverse_checks": adverse_checks,
+            "adverse_findings": adverse_findings,
+        },
+    }
 
 
 def validate_assessment(value, study_id, evidence_refs, review_outcomes, finding_ids, expected_limitations):
@@ -443,9 +579,9 @@ class ExperimentRunner(ExecutionRuntime):
         decision = self.time_policy.admit("unit_review", task_count=1)
         if not decision["allowed"]:
             raise ValidationError(f"time admission deferred deterministic validation: {decision['reason']}")
-        payload = {"configured_input": self.experiment["validation"]["input"], "candidate": candidate,
-                   "candidate_sha256": candidate_sha256,
-                   "primary_outcomes": self.experiment["primary_outcomes"]}
+        payload = experiment_validation_payload(
+            self.experiment, self.experiment["validation"]["input"],
+            candidate, candidate_sha256)
         started = time.monotonic()
         result, execution_ref = self.operations.run(self.bindings["validation"], {"input": payload}, self._call,
             operator="methods.independent-calculator")
@@ -474,7 +610,7 @@ class ExperimentRunner(ExecutionRuntime):
                 "Inspect the summarized output and every attached figure. Return exactly reviewer_id, decision, checks, finding_assessments, limitations. "
                 "Copy reviewer.id as reviewer_id. Execute each required check exactly once as {check_id,outcome,evidence}; outcomes are passed, failed, or insufficient_evidence. "
                 "Assess each finding exactly once as {finding_id,outcome,rationale}; outcomes are supported, overstated, or insufficient_evidence. "
-                "Decision is accepted, accepted_with_limitations, or rejected. An accepted decision requires all checks passed and all findings supported. "
+                "Decision is accepted, accepted_with_limitations, or rejected. Both accepted decisions require every check passed and every finding supported. Use accepted_with_limitations only for limitations that do not contradict a check or finding outcome. If any check is failed or insufficient_evidence, or any finding is overstated or insufficient_evidence, choose rejected and preserve those outcomes; never soften adverse evidence to make the decision acceptable. "
                 "Treat program numbers as observations only after the independent recalculation passes. Check method-contract alignment, calculation trace, inference scope, and limitation coverage. "
                 "Do not infer general scientific truth, novelty, or external validity from one finite computational study. Preserve negative and mixed results." )}
 
@@ -541,6 +677,7 @@ class ExperimentRunner(ExecutionRuntime):
         reviews = []
         for reviewer, job in zip(self.experiment["reviewers"], jobs):
             value, execution_ref = values[job["name"]]
+            value = reconcile_model_review_disposition(value)
             record = self._publish(f"methods/experiment-reviews/{reviewer['id']}", "verification", {
                 **value, "execution_ref": execution_ref}, job["actor"],
                 subjects=[execution_ref, *evidence_refs])
@@ -554,26 +691,63 @@ class ExperimentRunner(ExecutionRuntime):
                          *[item["artifact_ref"] for item in self.asset_records]]
         outcomes = [{"reviewer_id": value["reviewer_id"], "decision": value["decision"]} for value in reviews]
         finding_ids = {item["id"] for item in candidate["findings"]}
-        assignment = {"phase": "experiment_result_assessment", "study_id": self.experiment["id"],
-            "question": self.experiment["research_question"], "hypothesis": self.experiment["hypothesis"],
-            "metrics": candidate["metrics"], "findings": candidate["findings"],
-            "design_limitations": self.experiment["limitations"], "program_limitations": candidate["limitations"],
-            "independent_reviews": reviews, "evidence_refs_exact": evidence_refs,
-            "reviewer_outcomes_exact": outcomes,
-            "instructions": (
-                "Reconcile the exact reviews without changing measured values. Return an experiment-assessment-1 object with exactly schema_version, study_id, decision, summary, evidence_refs, reviewer_outcomes, accepted_findings, limitations. "
-                "Copy the exact evidence_refs and reviewer_outcomes in order. Decision is accepted, accepted_with_limitations, or rejected. "
-                "Accept a finding only when every supplied review marks it supported. An accepted result must list every finding ID. "
-                "Copy program_limitations exactly as limitations, in the same order and wording; reviewers may assess them but the arbiter cannot rewrite the result package. "
-                "State what the finite study shows without claiming novelty or external validity." )}
-        job = {"name": "final-assessment", "actor": "methods.experiment-arbiter", "assignment": assignment,
-               "validator": lambda value: validate_assessment(
-                   value, self.experiment["id"], evidence_refs, outcomes, finding_ids, candidate["limitations"])}
-        value, execution_ref = self._model_checked([job], images=images, stage="integrated_review")["final-assessment"]
+        rejected_reviews = [item for item in reviews if item["decision"] == "rejected"]
+        if rejected_reviews:
+            # A model arbiter can repeatedly soften an independent rejection,
+            # then consume its bounded retries failing the same deterministic
+            # gate. Reconcile the disposition from the validated reviews.
+            # Package-level rejection means no finding is admitted as a
+            # verified claim; raw observations remain available separately.
+            rejection_reasons = []
+            for review in rejected_reviews:
+                reasons = [f"{item['check_id']}={item['outcome']}"
+                           for item in review["checks"] if item["outcome"] != "passed"]
+                reasons.extend(
+                    f"finding {item['finding_id']}={item['outcome']}"
+                    for item in review["finding_assessments"] if item["outcome"] != "supported")
+                rejection_reasons.append(
+                    f"{review['reviewer_id']}: {', '.join(reasons) or 'review disposition rejected'}")
+            value = {
+                "schema_version": "experiment-assessment-1",
+                "study_id": self.experiment["id"],
+                "decision": "rejected",
+                "summary": (
+                    "The experiment completed its declared replay and deterministic checks, but independent "
+                    "scientific review rejected the result package: " + "; ".join(rejection_reasons) + ". "
+                    "No findings are admitted as verified claims. Raw observations and review evidence are "
+                    "retained for interpretation and targeted repair."
+                ),
+                "evidence_refs": evidence_refs,
+                "reviewer_outcomes": outcomes,
+                "accepted_findings": [],
+                "limitations": list(candidate["limitations"]),
+            }
+            value = validate_assessment(value, self.experiment["id"], evidence_refs, outcomes,
+                                        finding_ids, candidate["limitations"])
+            execution_ref = None
+            decision_basis = "deterministic_review_reconciliation"
+        else:
+            assignment = {"phase": "experiment_result_assessment", "study_id": self.experiment["id"],
+                "question": self.experiment["research_question"], "hypothesis": self.experiment["hypothesis"],
+                "metrics": candidate["metrics"], "findings": candidate["findings"],
+                "design_limitations": self.experiment["limitations"], "program_limitations": candidate["limitations"],
+                "independent_reviews": reviews, "evidence_refs_exact": evidence_refs,
+                "reviewer_outcomes_exact": outcomes,
+                "instructions": (
+                    "Reconcile the exact reviews without changing measured values. Return an experiment-assessment-1 object with exactly schema_version, study_id, decision, summary, evidence_refs, reviewer_outcomes, accepted_findings, limitations. "
+                    "Copy the exact evidence_refs and reviewer_outcomes in order. Decision is accepted, accepted_with_limitations, or rejected. "
+                    "Accept a finding only when every supplied review marks it supported. An accepted result must list every finding ID. "
+                    "Copy program_limitations exactly as limitations, in the same order and wording; reviewers may assess them but the arbiter cannot rewrite the result package. "
+                    "State what the finite study shows without claiming novelty or external validity." )}
+            job = {"name": "final-assessment", "actor": "methods.experiment-arbiter", "assignment": assignment,
+                   "validator": lambda value: validate_assessment(
+                       value, self.experiment["id"], evidence_refs, outcomes, finding_ids, candidate["limitations"])}
+            value, execution_ref = self._model_checked([job], images=images, stage="integrated_review")["final-assessment"]
+            decision_basis = "model_arbiter"
         record = self._publish("methods/experiment-assessment", "verification", {
-            **value, "execution_ref": execution_ref}, job["actor"], subjects=[execution_ref, *evidence_refs])
-        if value["decision"] == "rejected":
-            raise ValidationError("independent experiment assessment rejected the result")
+            **value, "execution_ref": execution_ref, "decision_basis": decision_basis},
+            "methods.experiment-arbiter",
+            subjects=[*([execution_ref] if isinstance(execution_ref, str) else []), *evidence_refs])
         return value, record
 
     def _package(self, candidate, candidate_sha256, validation_record, validator_execution_ref,
@@ -627,12 +801,13 @@ class ExperimentRunner(ExecutionRuntime):
             "methods.result-integrator", subjects=[self.score_ref, *self.execution_refs,
                 raw_record["artifact_ref"], validation_record["artifact_ref"], assessment_record["artifact_ref"],
                 *[item["artifact_ref"] for item in self.asset_records]])
-        adopted = self.store.adopt(record["artifact_id"], target_version=record["version"],
-                                   expected_accepted_version=None, actor="command.controller")
-        self.incumbent = adopted["artifact_ref"]
-        self.time_policy.mark_first_verified_result(self.incumbent)
-        self.verified_changes.append({"kind": "accepted_experiment_results", "ref": self.incumbent,
-                                      "assessment_ref": assessment_record["artifact_ref"]})
+        if assessment["decision"] != "rejected":
+            adopted = self.store.adopt(record["artifact_id"], target_version=record["version"],
+                                       expected_accepted_version=None, actor="command.controller")
+            self.incumbent = adopted["artifact_ref"]
+            self.time_policy.mark_first_verified_result(self.incumbent)
+            self.verified_changes.append({"kind": "accepted_experiment_results", "ref": self.incumbent,
+                                          "assessment_ref": assessment_record["artifact_ref"]})
         return package, path
 
     def run(self):
@@ -676,7 +851,57 @@ class ExperimentRunner(ExecutionRuntime):
                 assessment, assessment_record = self._assess(candidate, validation_record, reviews, images)
                 package, package_path = self._package(candidate, candidate_sha256, validation_record,
                                                       validator_execution_ref, assessment, assessment_record)
-                status = "completed"
+                quality = package.get("quality_admission")
+                requests = [deepcopy(item) for item in self.research_expansion_requests
+                            if isinstance(item, dict)]
+                if isinstance(quality, dict):
+                    requests.extend(deepcopy(item) for item in quality.get("expansion_requests", [])
+                                    if isinstance(item, dict))
+                if assessment.get("decision") == "rejected":
+                    repair_id = "repair_rejected_experiment_result"
+                    repair = next((item for item in requests if item.get("id") == repair_id), None)
+                    if repair is None:
+                        repair = {"id": repair_id, "kind": "additional_experiment",
+                                  "owner": "methods.validation"}
+                        requests.append(repair)
+                    repair.update({
+                        "objective": (
+                            "Repair the rejected experiment on its current research direction. Use the independent "
+                            "review findings to fix the implementation or comparison; if the broad inference is "
+                            "unsupported, narrow the claim to the strongest result the existing evidence supports "
+                            "and rerun only the necessary analysis. Do not replace the phenomenon with an unrelated topic."),
+                        "why": (
+                            "The independent assessment rejected this package, so none of its findings may be used "
+                            "as verified paper evidence. The raw observations, executable sources, and review "
+                            "findings are retained for a targeted Methods repair."),
+                        "success_condition": (
+                            "A fresh, reproducible result addresses each blocking review finding, or the manuscript "
+                            "claim is narrowed to what the observed data actually establish; an independent "
+                            "assessment records the resulting disposition and limitations."),
+                        "evidence_needed": (
+                            "Independent reviewer findings, current executor and validator sources, raw observations, "
+                            "targeted repaired or narrowed analysis, deterministic replay, and a fresh result package. "
+                            f"Assessment={assessment_record.get('artifact_ref')}; package={package_path}."),
+                    })
+                unique_requests = {}
+                for item in requests:
+                    request_id = item.get("id")
+                    if isinstance(request_id, str):
+                        unique_requests[request_id] = item
+                self.research_expansion_requests = list(unique_requests.values())
+                quality_repair_required = (
+                    isinstance(quality, dict)
+                    and quality.get("decision") == "research_expansion_required"
+                )
+                if assessment.get("decision") == "rejected" or quality_repair_required:
+                    status = "research_expansion_required"
+                    error = (
+                        "experiment assessment rejected the result; targeted Methods repair required"
+                        if assessment.get("decision") == "rejected"
+                        else "experiment result has scoped research-quality debt requiring Methods work"
+                    )
+                else:
+                    status = "completed"
         except (Exception, KeyboardInterrupt) as exc:
             error = f"{type(exc).__name__}: {exc}"
             self.blockers.append({"reason": error})
@@ -712,7 +937,14 @@ class ExperimentRunner(ExecutionRuntime):
         lines = [f"# {self.experiment['research_question']}", "",
                  f"Run status: **{result['status']}**.", ""]
         if package is not None:
-            lines += ["## Result", ""]
+            if package["validation"]["decision"] == "rejected":
+                lines += ["## Rejected result package", "",
+                          "Independent assessment: **rejected**.", "",
+                          "No findings from this package are admitted as verified claims. Raw observations and review evidence are retained for interpretation and targeted repair.", "",
+                          "### Candidate findings (not verified)", ""]
+            else:
+                lines += ["## Result", "",
+                          f"Independent assessment: **{package['validation']['decision']}**.", ""]
             for finding in package["findings"]:
                 lines.append(f"- {finding['statement']}")
             lines += ["", "## Metrics", ""]

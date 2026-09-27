@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import hashlib
 import json
+import math
 import multiprocessing
 import os
 from pathlib import Path
@@ -23,8 +25,12 @@ from scisaurus.core.store import ArtifactStore
 from scisaurus.core.tasks import TaskManager
 from scisaurus.review.issues import IssueManager
 from scisaurus.runtime.models import (
-    ModelCallError, ModelClient, ModelResult, model_call_budget_available,
-    model_context_error, resolve_model_config,
+    DEFAULT_MODEL_RATE_LIMIT_COOLDOWN_SECONDS,
+    ModelCallError, ModelClient, ModelResult, effective_model_timeout,
+    model_call_budget_available,
+    is_local_qwen_route, model_context_error, model_provider_quota_scope,
+    role_routes_for, resolve_model_config,
+    with_runtime_cooldown_fallback,
 )
 from scisaurus.runtime.literature import ProviderCooldownError
 from scisaurus.runtime.config import MIN_WORKER_RESULT_BYTES, WORKER_RESULT_TOO_LARGE
@@ -46,11 +52,6 @@ SYSTEM = (
 
 
 _NO_PROVIDER_CAPACITY = object()
-# A worker operation is still retriable at the Composer stage level.  It must
-# not inherit a 30-minute route timeout and monopolize a bounded provider pool
-# while the outer control plane believes the stage is making progress.
-MODEL_OPERATION_TIMEOUT_SECONDS = 300.0
-
 
 class _ProviderContextBlock:
     """A task cannot fit any currently usable route's declared context budget."""
@@ -110,7 +111,10 @@ def _invoke_worker(kind, params, channel):
             result = CrossrefClient(**params["client"]).search(params["query"], limit=params["limit"])
         elif kind == "fetch":
             from scisaurus.runtime.retrieval import MCPFetchClient
-            result = MCPFetchClient(**params["client"]).fetch(params["url"], max_length=params["max_length"])
+            result = MCPFetchClient(**params["client"]).fetch(
+                params["url"], max_length=params["max_length"],
+                source_kind=params.get("source_kind", "auto"),
+            )
         elif kind == "program":
             from scisaurus.runtime.programs import LocalProgramClient
             result = LocalProgramClient(**params["client"]).run(params["input"])
@@ -169,6 +173,10 @@ class ExecutionRuntime:
 
     def __init__(self, project_dir, config, *, worker_target, on_progress=None,
                  resume_policy=None, repository_root=None):
+        if isinstance(config.get("model"), dict):
+            configured_model = with_runtime_cooldown_fallback(config["model"])
+            if configured_model is not config["model"]:
+                config = {**config, "model": configured_model}
         self.config = config
         self.worker_target = worker_target
         self.dir = Path(project_dir).resolve()
@@ -218,14 +226,9 @@ class ExecutionRuntime:
         # healthy alternate route instead of repeatedly hammering the dead
         # pool.
         self.provider_cooldowns = {}
+        self.provider_cooldown_fallback_allowed = {}
+        self._loaded_provider_cooldown_scopes = set()
         self.model_calls_dispatched = 0
-        for pool in self.provider_pools:
-            record = self.store.head(f"command/provider-cooldowns/{pool}")
-            if record:
-                body = json.loads(self.store.read_body(record["body_hash"]))
-                remaining = body["not_before_epoch"] - time.time()
-                if remaining > 0:
-                    self.provider_cooldowns[pool] = time.monotonic() + remaining
         self.cancelled = False
         self.cancellation_reason = None
         self.sources = []
@@ -311,11 +314,19 @@ class ExecutionRuntime:
         """Preserve backpressure across runner and Composer boundaries."""
         limited = [failure for failure in failures if failure.get("status_code") == 429]
         if limited:
-            delay = max(float(failure.get("retry_after_seconds") or
-                              max(0.1, self.deadline - time.monotonic())) for failure in limited)
+            provider_delays = [
+                float(failure["retry_after_seconds"])
+                for failure in limited
+                if type(failure.get("retry_after_seconds")) in (int, float)
+                and math.isfinite(failure["retry_after_seconds"])
+                and failure["retry_after_seconds"] > 0
+            ]
+            delay = max(provider_delays, default=DEFAULT_MODEL_RATE_LIMIT_COOLDOWN_SECONDS)
             raise ProviderCooldownError(
                 context + ": " + "; ".join(failure["error"] for failure in limited),
-                retry_after_seconds=delay, rate_limit={"provider": "model", "status_code": 429})
+                retry_after_seconds=delay,
+                rate_limit={"provider": "model", "status_code": 429,
+                            "retry_after_known": bool(provider_delays)})
         raise ValidationError(context + ": " + "; ".join(failure["error"] for failure in failures))
 
     def _call_batch(self, specs, *, max_parallel=None):
@@ -564,21 +575,187 @@ class ExecutionRuntime:
         return model_context_error(effective, system=SYSTEM, prompt=prompt,
                                    image_count=image_count)
 
+    def _provider_cooldown_fallback_route(self, spec):
+        params = spec.get("params", {})
+        client = params.get("_routing_client") or params.get("client")
+        if not isinstance(client, dict):
+            return None
+        fallback = client.get("provider_cooldown_fallback")
+        if not isinstance(fallback, dict):
+            return None
+        pool_name = fallback.get("pool")
+        pool = self.provider_pools.get(pool_name)
+        if not isinstance(pool_name, str) or pool is None:
+            return None
+        effective = {key: value for key, value in fallback.items()
+                     if key not in {"id", "pool"}}
+        if is_local_qwen_route(effective):
+            return None
+        role = params.get("role") or spec.get("actor")
+        routing_client = params.get("_routing_client") or client
+        role_config = self._base_model_config(spec)
+        candidates = role_routes_for(routing_client, role)
+        source_scopes = {model_provider_quota_scope(role_config)}
+        if isinstance(client, dict):
+            source_scopes.add(model_provider_quota_scope(client))
+        current = params.get("client")
+        if isinstance(current, dict):
+            source_scopes.add(model_provider_quota_scope(current))
+            for field in ("max_input_tokens", "max_output_tokens", "timeout_seconds",
+                          "max_request_bytes", "max_response_bytes", "max_image_bytes",
+                          "output_format", "reasoning_effort"):
+                value = current.get(field)
+                if value is None:
+                    continue
+                if field in {"max_input_tokens", "max_output_tokens", "timeout_seconds",
+                             "max_request_bytes", "max_response_bytes", "max_image_bytes"}:
+                    fallback_value = effective.get(field)
+                    if (type(value) in (int, float) and type(fallback_value) in (int, float)
+                            and value > 0 and fallback_value > 0):
+                        value = min(value, fallback_value)
+                effective[field] = value
+            if (model_provider_quota_scope(effective)
+                    == model_provider_quota_scope(current)):
+                return None
+
+        for route in candidates if isinstance(candidates, list) else []:
+            if not isinstance(route, dict):
+                continue
+            route_config = {key: value for key, value in routing_client.items()
+                            if key not in {"role_models", "role_model_fallbacks",
+                                           "role_routes", "role_profiles"}}
+            route_config.update({key: value for key, value in route.items()
+                                 if key not in {"id", "pool"}})
+            source_scopes.add(model_provider_quota_scope(
+                resolve_model_config(route_config, role=role)))
+        fallback_scope = model_provider_quota_scope(effective)
+        if fallback_scope in source_scopes:
+            return None
+        self._load_provider_cooldown(fallback_scope)
+        fallback_until, _fallback_allowed = self._provider_cooldown_state(
+            fallback_scope)
+        if fallback_until > time.monotonic():
+            return None
+
+        ceilings = {"max_input_tokens": [], "max_output_tokens": []}
+        for field in ceilings:
+            value = role_config.get(field)
+            if type(value) is int and value > 0:
+                ceilings[field].append(value)
+        if isinstance(current, dict):
+            for field in ceilings:
+                value = current.get(field)
+                if type(value) is int and value > 0:
+                    ceilings[field].append(value)
+        for route in candidates if isinstance(candidates, list) else []:
+            if not isinstance(route, dict):
+                continue
+            route_config = {key: value for key, value in routing_client.items()
+                            if key not in {"role_models", "role_model_fallbacks",
+                                           "role_routes", "role_profiles"}}
+            route_config.update({key: value for key, value in route.items()
+                                 if key not in {"id", "pool"}})
+            route_config = resolve_model_config(route_config, role=role)
+            scope = model_provider_quota_scope(route_config)
+            self._load_provider_cooldown(scope)
+            until, _allowed = self._provider_cooldown_state(scope)
+            if until <= time.monotonic():
+                continue
+            for field in ceilings:
+                value = route_config.get(field)
+                if type(value) is int and value > 0:
+                    ceilings[field].append(value)
+        for field, bounds in ceilings.items():
+            fallback_value = effective.get(field)
+            valid_bounds = [value for value in bounds
+                            if type(value) is int and value > 0]
+            if type(fallback_value) is int and fallback_value > 0:
+                valid_bounds.append(fallback_value)
+            if valid_bounds:
+                effective[field] = min(valid_bounds)
+        effective["max_retries"] = 0
+        route_id = fallback.get("id") or "provider-cooldown-fallback"
+        return {"id": route_id, "pool": pool_name, "_effective": effective}
+
+    def _load_provider_cooldown(self, quota_scope):
+        if quota_scope in self._loaded_provider_cooldown_scopes:
+            return
+        self._loaded_provider_cooldown_scopes.add(quota_scope)
+        record = self.store.head(self._provider_cooldown_artifact_id(quota_scope))
+        if not record:
+            return
+        body = json.loads(self.store.read_body(record["body_hash"]))
+        if body.get("quota_scope") != quota_scope:
+            return
+        not_before = body.get("not_before_epoch")
+        if type(not_before) not in (int, float) or not math.isfinite(not_before):
+            return
+        remaining = not_before - time.time()
+        if remaining <= 0:
+            return
+        self.provider_cooldowns[quota_scope] = time.monotonic() + remaining
+        fallback_basis = body.get("fallback_basis")
+        eligible_basis = (
+            isinstance(fallback_basis, dict)
+            and fallback_basis.get("status_code") == 429
+            and fallback_basis.get("outcome_known") is True
+        )
+        self.provider_cooldown_fallback_allowed[quota_scope] = (
+            body.get("fallback_eligible") is True
+            and eligible_basis
+            and body.get("quota_scope") == quota_scope
+        )
+
+    @staticmethod
+    def _provider_cooldown_artifact_id(quota_scope):
+        digest = hashlib.sha256(quota_scope.encode("utf-8")).hexdigest()
+        return f"command/provider-quota-cooldowns/{digest}"
+
+    def _provider_cooldown_state(self, quota_scope):
+        self._load_provider_cooldown(quota_scope)
+        scope_until = self.provider_cooldowns.get(quota_scope, 0.0)
+        fallback_allowed = self.provider_cooldown_fallback_allowed.get(
+            quota_scope, False)
+        if scope_until <= time.monotonic():
+            self.provider_cooldowns.pop(quota_scope, None)
+            self.provider_cooldown_fallback_allowed.pop(quota_scope, None)
+            return 0.0, False
+        return scope_until, fallback_allowed
+
     def _provider_route(self, spec):
         """Select one route with pool capacity and a fitting context budget."""
         if spec["kind"] != "model" or not self.provider_pools:
             return None
+        override = spec.get("_provider_route_override")
+        if isinstance(override, dict):
+            effective = override.get("_effective")
+            if not isinstance(effective, dict):
+                effective = dict(self._base_model_config(spec))
+                effective.update({key: value for key, value in override.items()
+                                  if key not in {"id", "pool"}})
+            if is_local_qwen_route(effective):
+                spec = dict(spec)
+                spec.pop("_provider_route_override", None)
+            else:
+                pool_name = override.get("pool")
+                pool = self.provider_pools.get(pool_name)
+                if pool is None:
+                    raise ValidationError(
+                        f"model route {override.get('id')} references an unknown provider pool: {pool_name}")
+                if self.provider_active[pool_name] >= pool["max_concurrent"]:
+                    return _NO_PROVIDER_CAPACITY
+                return override
         params = spec["params"]
         client = params.get("_routing_client") or params.get("client")
         if not isinstance(client, dict):
             raise ValidationError("model operation requires a client object")
         role = params.get("role") or spec["actor"]
-        routes_by_role = client.get("role_routes", {})
-        routes = routes_by_role.get(role, []) if isinstance(routes_by_role, dict) else []
+        routes = role_routes_for(client, role)
         if routes:
             cursor = self.provider_route_cursors.get(role, 0) % len(routes)
             capacity_blocked = False
             cooldown_blocked = False
+            fallback_ready = False
             budget_blocked = False
             context_errors = []
             for offset in range(len(routes)):
@@ -589,16 +766,17 @@ class ExecutionRuntime:
                 if pool is None:
                     raise ValidationError(
                         f"model route {route['id']} references an unknown provider pool: {pool_name}")
-                cooldown_until = self.provider_cooldowns.get(pool_name, 0.0)
+                effective = self._route_model_config(spec, route)
+                quota_scope = model_provider_quota_scope(effective)
+                cooldown_until, fallback_allowed = self._provider_cooldown_state(
+                    quota_scope)
                 if cooldown_until > time.monotonic():
                     cooldown_blocked = True
+                    fallback_ready = fallback_ready or fallback_allowed
                     continue
-                if cooldown_until:
-                    self.provider_cooldowns.pop(pool_name, None)
                 if self.provider_active[pool_name] >= pool["max_concurrent"]:
                     capacity_blocked = True
                     continue
-                effective = self._route_model_config(spec, route)
                 if not model_call_budget_available(effective):
                     budget_blocked = True
                     continue
@@ -611,6 +789,17 @@ class ExecutionRuntime:
             # A full route may become usable later, so do not convert a
             # temporary pool-capacity wait into a permanent task failure.
             if capacity_blocked or cooldown_blocked:
+                if cooldown_blocked and not capacity_blocked and fallback_ready:
+                    recovery_route = self._provider_cooldown_fallback_route(spec)
+                    if recovery_route is not None:
+                        recovery_pool = self.provider_pools[recovery_route["pool"]]
+                        if self.provider_active[recovery_route["pool"]] < recovery_pool["max_concurrent"]:
+                            context_error = self._model_context_error(
+                                spec, recovery_route["_effective"])
+                            if context_error:
+                                return _ProviderContextBlock(
+                                    f"{recovery_route['id']}: {context_error}")
+                            return recovery_route
                 return _NO_PROVIDER_CAPACITY
             if context_errors:
                 return _ProviderContextBlock(
@@ -629,7 +818,21 @@ class ExecutionRuntime:
         if not matches:
             return None
         pool_name = matches[0]
-        if self.provider_cooldowns.get(pool_name, 0.0) > time.monotonic():
+        quota_scope = model_provider_quota_scope(effective)
+        cooldown_until, fallback_allowed = self._provider_cooldown_state(quota_scope)
+        if cooldown_until > time.monotonic():
+            recovery_route = (
+                self._provider_cooldown_fallback_route(spec)
+                if fallback_allowed else None
+            )
+            if recovery_route is not None:
+                recovery_pool = self.provider_pools[recovery_route["pool"]]
+                if self.provider_active[recovery_route["pool"]] < recovery_pool["max_concurrent"]:
+                    context_error = self._model_context_error(spec, recovery_route["_effective"])
+                    if context_error:
+                        return _ProviderContextBlock(
+                            f"{recovery_route['id']}: {context_error}")
+                    return recovery_route
             return _NO_PROVIDER_CAPACITY
         if self.provider_active[pool_name] >= self.provider_pools[pool_name]["max_concurrent"]:
             return _NO_PROVIDER_CAPACITY
@@ -644,34 +847,63 @@ class ExecutionRuntime:
         params = spec["params"]
         client = params.get("_routing_client") or params.get("client") or {}
         role = params.get("role") or spec["actor"]
-        routes = client.get("role_routes", {}).get(role, [])
-        pools = ({route["pool"] for route in routes} if routes else {
-            name for name, pool in self.provider_pools.items()
-            if self._provider_url(self._base_model_config(spec).get("base_url")) in
-               {self._provider_url(url) for url in pool["base_urls"]}})
+        routes = role_routes_for(client, role)
         now = time.monotonic()
-        return [self.provider_cooldowns[name] - now for name in pools
-                if self.provider_cooldowns.get(name, 0) > now]
+        route_configs = [self._route_model_config(spec, route) for route in routes]
+        if not route_configs:
+            route_configs = [self._base_model_config(spec)]
+        delays = []
+        for index, route_config in enumerate(route_configs):
+            if routes:
+                pool_names = [routes[index].get("pool")]
+            else:
+                base_url = self._provider_url(route_config.get("base_url"))
+                pool_names = [name for name, pool in self.provider_pools.items()
+                              if base_url in {self._provider_url(url)
+                                              for url in pool["base_urls"]}]
+            scope = model_provider_quota_scope(route_config)
+            for pool_name in pool_names:
+                until, _allowed = self._provider_cooldown_state(scope)
+                if until > now:
+                    delays.append(until - now)
+        return delays
 
-    def _mark_provider_cooldown(self, pool_name, message):
+    def _mark_provider_cooldown(self, pool_name, message, config):
         """Quarantine a provider after a known rate-limit response.
 
-        A missing Retry-After is treated as a run-scoped quota exhaustion.  It
-        is safer to spend the remaining assignment on a live alternate route
-        than to redispatch the same provider once per retry tick.
+        A server-provided reset is authoritative. When the response omits one,
+        use a bounded route cooldown; the Composer owns the longer retry
+        schedule and must not inherit an invented mission-long provider ban.
         """
         if not isinstance(pool_name, str) or not pool_name:
             return
+        if not isinstance(config, dict):
+            return
+        quota_scope = model_provider_quota_scope(config)
         delay = message.get("retry_after_seconds")
-        if type(delay) not in (int, float) or delay <= 0:
-            until = self.deadline
-        else:
-            until = time.monotonic() + float(delay)
-        self.provider_cooldowns[pool_name] = max(
-            until, self.provider_cooldowns.get(pool_name, 0.0))
-        self._publish(f"command/provider-cooldowns/{pool_name}", "note", {
-            "pool": pool_name, "status_code": message.get("status_code"),
-            "not_before_epoch": time.time() + max(0, self.provider_cooldowns[pool_name] - time.monotonic()),
+        if (type(delay) not in (int, float) or not math.isfinite(delay)
+                or delay <= 0):
+            delay = DEFAULT_MODEL_RATE_LIMIT_COOLDOWN_SECONDS
+        until = time.monotonic() + float(delay)
+        previous_until = self.provider_cooldowns.get(quota_scope, 0.0)
+        previous_eligible = (
+            previous_until > time.monotonic()
+            and self.provider_cooldown_fallback_allowed.get(quota_scope, False)
+        )
+        self.provider_cooldowns[quota_scope] = max(until, previous_until)
+        status_code = message.get("status_code")
+        newly_eligible = (
+            status_code == 429 and message.get("outcome_known") is True
+        )
+        fallback_eligible = newly_eligible or previous_eligible
+        self.provider_cooldown_fallback_allowed[quota_scope] = fallback_eligible
+        self._publish(self._provider_cooldown_artifact_id(quota_scope), "note", {
+            "pool": pool_name, "quota_scope": quota_scope,
+            "status_code": message.get("status_code"),
+            "fallback_eligible": fallback_eligible,
+            "fallback_basis": ({"status_code": 429, "outcome_known": True}
+                               if fallback_eligible else None),
+            "not_before_epoch": time.time() + max(0, self.provider_cooldowns[quota_scope] - time.monotonic()),
         }, "command.controller")
 
     @staticmethod
@@ -684,24 +916,40 @@ class ExecutionRuntime:
         if spec["kind"] != "model" or not self._provider_route_failure(message):
             return None
         pool_name = spec["params"].get("provider_pool")
+        current = spec["params"].get("client")
         if pool_name:
-            self._mark_provider_cooldown(pool_name, message)
+            self._mark_provider_cooldown(pool_name, message, current)
         role = spec["params"].get("role") or spec["actor"]
         client = spec["params"].get("_routing_client") or spec["params"].get("client")
-        routes = client.get("role_routes", {}).get(role, []) if isinstance(client, dict) else []
+        routes = role_routes_for(client, role)
         if not routes:
             configured = self.config.get("model", {}).get("role_routes", {})
-            routes = configured.get(role, []) if isinstance(configured, dict) else []
+            routes = role_routes_for({"role_routes": configured}, role)
         route_count = len(routes) if isinstance(routes, list) else 0
         retry_count = int(spec.get("_provider_retry_count", 0) or 0)
-        if route_count < 2 or retry_count >= route_count - 1:
-            return None
-        # A different model in the same account pool is not an independent
-        # route around that pool's rate limit.
-        if not any(route.get("pool") != pool_name for route in routes):
-            return None
+        current = spec["params"].get("client")
+        current_scope = (model_provider_quota_scope(current)
+                         if isinstance(current, dict) else None)
+        has_independent_route = False
+        for route in routes:
+            route_config = dict(client) if isinstance(client, dict) else {}
+            route_config.update({key: value for key, value in route.items()
+                                 if key not in {"id", "pool"}})
+            if model_provider_quota_scope(route_config) != current_scope:
+                has_independent_route = True
+                break
+        recovery_route = None
+        if route_count >= 2 and retry_count < route_count - 1 and has_independent_route:
+            retry_count += 1
+        else:
+            if (message.get("status_code") == 429
+                    and message.get("outcome_known") is True
+                    and retry_count < route_count + 1):
+                recovery_route = self._provider_cooldown_fallback_route(spec)
+            if recovery_route is None:
+                return None
+            retry_count += 1
         logical_task_id = spec.get("_logical_task_id", spec["task_id"])
-        retry_count += 1
         retry = dict(spec)
         retry["task_id"] = f"{logical_task_id}-provider-retry-{retry_count}"
         retry["reservation_id"] = f"{spec.get('reservation_id', logical_task_id)}-provider-retry-{retry_count}"
@@ -709,6 +957,8 @@ class ExecutionRuntime:
         retry["_provider_retry_count"] = retry_count
         retry["params"] = dict(spec["params"])
         retry["params"]["provider_retry_of"] = logical_task_id
+        if recovery_route is not None:
+            retry["_provider_route_override"] = recovery_route
         return retry
 
     def _finalize_logical_task(self, logical_task_id, task_id, outcome):
@@ -787,10 +1037,19 @@ class ExecutionRuntime:
             entry["spec"] = spec
         if spec["kind"] == "model":
             client = dict(spec["params"]["client"])
-            configured_timeout = client.get("timeout_seconds")
-            client["timeout_seconds"] = min(
-                float(configured_timeout), MODEL_OPERATION_TIMEOUT_SECONDS)
+            if "base_url" not in client or "model" not in client:
+                inherited = dict(self.config.get("model") or {})
+                inherited.update(client)
+                client = inherited
+            role = spec["params"].get("role") or actor
+            client = resolve_model_config(
+                client, role=role,
+                overrides=spec["params"].get("sampling_overrides"),
+            )
+            client["timeout_seconds"] = effective_model_timeout(
+                client.get("timeout_seconds"), max(0.001, self.deadline - time.monotonic()))
             spec["params"] = dict(spec["params"])
+            spec["params"]["role"] = role
             spec["params"]["client"] = client
             entry["spec"] = spec
         self.tasks.create(task_id, spec["task_kind"],

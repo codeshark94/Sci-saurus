@@ -1,11 +1,12 @@
 """Bounded calls to explicitly configured Ollama or compatible GPU servers."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.utils import parsedate_to_datetime
 import base64
 import hashlib
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -24,10 +25,16 @@ from scisaurus.core.schema import json_object
 SAMPLING_FIELDS = frozenset({
     "temperature", "top_p", "seed", "presence_penalty", "frequency_penalty",
 })
+DEFAULT_MODEL_RATE_LIMIT_COOLDOWN_SECONDS = 60.0
+MAX_MODEL_RATE_LIMIT_COOLDOWN_SECONDS = 6 * 60 * 60
+_MODEL_PROVIDER_COOLDOWN_LOCK = threading.Lock()
+_MODEL_PROVIDER_COOLDOWNS = {}
+_MODEL_PROVIDER_COOLDOWN_GENERATIONS = {}
 OLLAMA_SAMPLING_FIELDS = frozenset({"temperature", "top_p", "seed"})
 MODEL_CONFIG_FIELDS = frozenset({
     "base_url", "model", "protocol", "timeout_seconds", "max_output_tokens",
     "context_window_tokens", "max_input_tokens",
+    "provider_quota_scope",
     "auth_env", "max_response_bytes", "reasoning_effort", "output_format",
     "max_image_bytes", "max_request_bytes", "max_retries", "retry_backoff_seconds",
     "cache_prompt", "model_call_budget_path", "model_call_budget_key",
@@ -37,6 +44,99 @@ ROLE_ROUTE_FIELDS = frozenset({"id", "pool"}) | MODEL_CONFIG_FIELDS
 MODEL_CALL_BUDGET_FIELDS = frozenset({
     "model_call_budget_path", "model_call_budget_key", "model_call_budget_limit",
 })
+
+
+def is_local_qwen_route(config):
+    """Identify Qwen models routed to this host's loopback inference server."""
+    if not isinstance(config, dict):
+        return False
+    model = config.get("model")
+    base_url = config.get("base_url")
+    if not isinstance(model, str) or "qwen" not in model.casefold():
+        return False
+    if not isinstance(base_url, str):
+        return False
+    hostname = urllib.parse.urlsplit(base_url).hostname
+    if not hostname:
+        return False
+    hostname = hostname.rstrip(".").casefold()
+    if (hostname in {"localhost", "localhost.localdomain"}
+            or hostname.endswith((".localhost", ".localhost.localdomain"))):
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            address = ipaddress.ip_address(socket.inet_aton(hostname))
+        except OSError:
+            try:
+                resolved = socket.getaddrinfo(
+                    hostname, None, type=socket.SOCK_STREAM)
+            except OSError:
+                return False
+            return any(
+                _is_local_inference_address(record[4][0])
+                for record in resolved
+                if len(record) > 4 and record[4]
+            )
+    return _is_local_inference_address(address)
+
+
+def _is_local_inference_address(value):
+    try:
+        address = ipaddress.ip_address(value)
+    except (TypeError, ValueError):
+        return False
+    if address.is_loopback or address.is_unspecified:
+        return True
+    mapped_ipv4 = getattr(address, "ipv4_mapped", None)
+    return bool(mapped_ipv4 and (mapped_ipv4.is_loopback or mapped_ipv4.is_unspecified))
+
+
+def _reject_local_qwen_peer(model, peer_address):
+    if (isinstance(model, str) and "qwen" in model.casefold()
+            and _is_local_inference_address(peer_address)):
+        raise ValidationError("local Qwen model routes are disabled")
+
+
+def role_config_for(mapping, role, default=None):
+    """Resolve the most specific exact or dotted-parent role configuration."""
+    if not isinstance(mapping, dict) or not isinstance(role, str):
+        return default
+    if role in mapping:
+        return mapping[role]
+    parents = [key for key in mapping
+               if isinstance(key, str) and role.startswith(f"{key}.")]
+    if not parents:
+        return default
+    return mapping[max(parents, key=len)]
+
+
+def role_routes_for(model, role):
+    """Return inherited role routes after excluding local Qwen inference."""
+    if not isinstance(model, dict):
+        return []
+    routes = role_config_for(model.get("role_routes"), role, [])
+    if not isinstance(routes, list):
+        return []
+    base = {key: value for key, value in model.items()
+            if key not in {"role_models", "role_model_fallbacks", "role_routes",
+                           "role_profiles", "provider_cooldown_fallback"}}
+    safe = []
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        candidate = dict(base)
+        candidate.update({key: value for key, value in route.items()
+                          if key not in {"id", "pool"}})
+        if not is_local_qwen_route(candidate):
+            safe.append(route)
+    return safe
+
+
+def reject_local_qwen_route(config):
+    if is_local_qwen_route(config):
+        raise ValidationError("local Qwen model routes are disabled")
 # This is deliberately a conservative, tokenizer-independent preflight.  The
 # runtime does not install a tokenizer for every configured provider, so it
 # reserves three UTF-8 bytes per input token plus a small chat-template margin.
@@ -45,6 +145,42 @@ MODEL_CALL_BUDGET_FIELDS = frozenset({
 CONTEXT_ESTIMATOR_BYTES_PER_TOKEN = 3
 CONTEXT_ESTIMATOR_OVERHEAD_TOKENS = 128
 IMAGE_CONTEXT_TOKEN_RESERVE = 4096
+
+
+def effective_model_timeout(configured_timeout, *deadline_bounds):
+    """Use the model route's timeout, bounded only by explicit task deadlines.
+
+    A transport timeout configured for a route is the provider-specific limit.
+    Callers may additionally bound it by a stage, mission, or assignment
+    deadline.  A global fixed cap here would silently override those policies
+    and turn slow-but-live generations into unknown outcomes.
+    """
+    values = [configured_timeout, *[item for item in deadline_bounds if item is not None]]
+    if any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+           for value in values):
+        raise ValidationError("model request timeout bounds must be finite and positive")
+    return min(float(value) for value in values)
+
+
+def normalize_generated_string_list(value):
+    """Repair only explicit, loss-preserving string-list serialization.
+
+    Structured model responses sometimes encode one list item as a scalar or
+    join list items with newlines/semicolons. Commas are deliberately not
+    separators because they commonly occur inside prose. Invalid shapes are
+    returned unchanged for the caller's schema validator to reject.
+    """
+    if isinstance(value, list):
+        if not all(isinstance(item, str) and item.strip() for item in value):
+            return value
+        return list(dict.fromkeys(item.strip() for item in value))
+    if not isinstance(value, str) or not value.strip():
+        return value
+    parts = [part.strip(" \t-*\u2022") for part in re.split(r"\r?\n+|;", value)
+             if part.strip(" \t-*\u2022")]
+    return list(dict.fromkeys(parts or [value.strip()]))
+
+
 # OpenAI-compatible providers commonly expose ``seed`` as a signed int64.
 # Keep internally derived seeds inside that wire-level contract so a valid
 # exploration hash cannot become a provider-side 400.
@@ -299,6 +435,12 @@ def _validate_role_models(role_models):
         if "auth_env" in selected and selected["auth_env"] is not None and (
                 not isinstance(selected["auth_env"], str) or not selected["auth_env"]):
             raise ValidationError(f"model.role_models.{role_name}.auth_env is invalid")
+        if "provider_quota_scope" in selected and (
+                not isinstance(selected["provider_quota_scope"], str)
+                or not selected["provider_quota_scope"].strip()
+                or len(selected["provider_quota_scope"]) > 160):
+            raise ValidationError(
+                f"model.role_models.{role_name}.provider_quota_scope is invalid")
         if "cache_prompt" in selected and type(selected["cache_prompt"]) is not bool:
             raise ValidationError(f"model.role_models.{role_name}.cache_prompt must be boolean")
         _validate_model_call_budget(
@@ -312,7 +454,7 @@ def _validate_role_models(role_models):
 
 
 def _validate_role_model_fallbacks(fallbacks):
-    """Validate model alternatives used when a named model cap is exhausted."""
+    """Validate explicit per-role model alternatives for bounded failover."""
     if not isinstance(fallbacks, dict):
         raise ValidationError("model.role_model_fallbacks must be an object")
     for role_name, alternatives in fallbacks.items():
@@ -477,6 +619,25 @@ def resolve_model_config(model, *, role=None, overrides=None):
     _validate_role_models(role_models)
     role_model_fallbacks = base.pop("role_model_fallbacks", {})
     _validate_role_model_fallbacks(role_model_fallbacks)
+    provider_cooldown_fallback = base.pop("provider_cooldown_fallback", None)
+    if provider_cooldown_fallback is not None:
+        if not isinstance(provider_cooldown_fallback, dict):
+            raise ValidationError("model.provider_cooldown_fallback must be an object")
+        fallback_model = {
+            key: value for key, value in provider_cooldown_fallback.items()
+            if key not in {"id", "pool"}
+        }
+        _validate_role_models({"provider_cooldown_fallback": fallback_model})
+        pool = provider_cooldown_fallback.get("pool")
+        if pool is not None and (not isinstance(pool, str) or not pool.strip()):
+            raise ValidationError("model.provider_cooldown_fallback.pool is invalid")
+        route_id = provider_cooldown_fallback.get("id")
+        if route_id is not None and (not isinstance(route_id, str) or not route_id.strip()):
+            raise ValidationError("model.provider_cooldown_fallback.id is invalid")
+        fallback_route = dict(base)
+        fallback_route.update(fallback_model)
+        if is_local_qwen_route(fallback_route):
+            provider_cooldown_fallback = None
     role_routes = base.pop("role_routes", {})
     _validate_role_routes(role_routes)
     profiles = base.pop("role_profiles", {})
@@ -490,14 +651,25 @@ def resolve_model_config(model, *, role=None, overrides=None):
     _validate_sampling_options(global_sampling, name="model sampling options")
     if overrides is not None:
         _validate_sampling_options(overrides, name="sampling overrides")
-    selected_model = role_models.get(role) if role is not None else None
-    if selected_model is not None and not model_call_budget_available(selected_model):
-        alternatives = role_model_fallbacks.get(role, [])
-        selected_model = next(
-            (alternative for alternative in alternatives
-             if model_call_budget_available(alternative)),
-            selected_model,
-        )
+    selected_model = role_config_for(role_models, role)
+    alternatives = role_config_for(role_model_fallbacks, role, [])
+
+    def resolved_selection(candidate):
+        resolved = dict(base)
+        if isinstance(candidate, dict):
+            resolved.update(candidate)
+        return resolved
+
+    def safe_alternative():
+        return next((alternative for alternative in alternatives
+                     if model_call_budget_available(alternative)
+                     and not is_local_qwen_route(resolved_selection(alternative))), None)
+
+    if (selected_model is not None
+            and is_local_qwen_route(resolved_selection(selected_model))):
+        selected_model = safe_alternative()
+    elif selected_model is not None and not model_call_budget_available(selected_model):
+        selected_model = safe_alternative() or selected_model
     selected_sampling = {}
     if selected_model is not None:
         selected_model = dict(selected_model)
@@ -515,7 +687,439 @@ def resolve_model_config(model, *, role=None, overrides=None):
         sampling.update(overrides)
     _validate_sampling_options(sampling)
     base.update(sampling)
+    reject_local_qwen_route(base)
     return base
+
+
+def with_runtime_cooldown_fallback(model, *, env=None):
+    """Attach an owner-configured local model as an emergency-only route.
+
+    The environment opt-in is separate from normal role routing: healthy
+    cloud routes remain the normal assignments, while a known quota failure
+    may use the configured local model. Explicit per-run fallbacks take
+    precedence.
+    """
+    if not isinstance(model, dict):
+        return model
+    explicit_fallback = model.get("provider_cooldown_fallback")
+    if isinstance(explicit_fallback, dict):
+        effective_fallback = dict(model)
+        effective_fallback.update(explicit_fallback)
+        if is_local_qwen_route(effective_fallback):
+            model = dict(model)
+            model.pop("provider_cooldown_fallback", None)
+    values = os.environ if env is None else env
+    fallback_model = values.get("SCISAURUS_OLLAMA_COOLDOWN_FALLBACK_MODEL")
+    if not isinstance(fallback_model, str) or not fallback_model.strip():
+        return model
+    if model.get("provider_cooldown_fallback") is not None:
+        return model
+    if str(values.get("SCISAURUS_OLLAMA_ONLY", "")).casefold() not in {
+            "1", "true", "yes", "on"}:
+        raise ValidationError(
+            "SCISAURUS_OLLAMA_COOLDOWN_FALLBACK_MODEL requires SCISAURUS_OLLAMA_ONLY")
+
+    configured_base = str(values.get("SCISAURUS_OLLAMA_BASE_URL") or "").rstrip("/")
+    model_base = str(model.get("base_url") or "").rstrip("/")
+    if not model_base or (configured_base and model_base != configured_base):
+        return model
+    fallback_base = str(
+        values.get("SCISAURUS_OLLAMA_QWEN_BASE_URL") or configured_base or model_base
+    ).rstrip("/")
+    if not fallback_base:
+        return model
+    if is_local_qwen_route({"model": fallback_model.strip(), "base_url": fallback_base}):
+        return model
+
+    def positive_int(value):
+        return value if type(value) is int and value > 0 else None
+
+    context_window = positive_int(model.get("context_window_tokens"))
+    max_output = positive_int(model.get("max_output_tokens"))
+    max_input = positive_int(model.get("max_input_tokens"))
+    if context_window is not None and max_output is not None:
+        available_input = context_window - max_output
+        if available_input <= 0:
+            return model
+        max_input = min(max_input, available_input) if max_input is not None else available_input
+
+    fallback = {
+        "id": "ollama-local-cooldown-recovery",
+        "pool": "ollama",
+        "protocol": model.get("protocol", "openai_compatible"),
+        "base_url": fallback_base,
+        "model": fallback_model.strip(),
+        "auth_env": None,
+        "provider_quota_scope": "ollama-local",
+        "max_retries": 0,
+    }
+    for field, value in (
+            ("context_window_tokens", context_window),
+            ("max_input_tokens", max_input),
+            ("max_output_tokens", max_output),
+            ("timeout_seconds", model.get("timeout_seconds")),
+            ("max_request_bytes", model.get("max_request_bytes")),
+            ("max_response_bytes", model.get("max_response_bytes")),
+            ("max_image_bytes", model.get("max_image_bytes")),
+            ("output_format", model.get("output_format")),
+            ("reasoning_effort", model.get("reasoning_effort"))):
+        if value is not None:
+            fallback[field] = value
+    configured = dict(model)
+    configured["provider_cooldown_fallback"] = fallback
+    return configured
+
+
+def model_route_candidates(model, *, role, prefer_fallback=False,
+                           include_cooldown_fallback=False):
+    """Resolve a role's primary route and configured model fallbacks.
+
+    Fallbacks are explicit per-role alternatives. They are not consulted for
+    ordinary validation failures; callers may use them after a provider
+    rejects a request before returning any model output.
+    """
+    model = with_runtime_cooldown_fallback(model)
+    if not isinstance(role, str) or not role.strip():
+        raise ValidationError("model route role must be a nonempty string")
+    primary = resolve_model_config(model, role=role)
+    regular_candidates = [primary]
+    seen = {(primary.get("protocol"), primary.get("base_url"),
+             primary.get("model"), primary.get("auth_env"))}
+
+    def append_alternative(alternative, destination):
+        if not isinstance(alternative, dict):
+            return
+        if is_local_qwen_route({**model, **alternative}):
+            return
+        routed = dict(model)
+        role_models = dict(routed.get("role_models", {}))
+        role_models[role] = {
+            key: value for key, value in alternative.items()
+            if key not in {"id", "pool"}
+        }
+        routed["role_models"] = role_models
+        role_fallbacks = dict(routed.get("role_model_fallbacks", {}))
+        role_fallbacks.pop(role, None)
+        routed["role_model_fallbacks"] = role_fallbacks
+        role_routes = dict(routed.get("role_routes", {}))
+        role_routes.pop(role, None)
+        routed["role_routes"] = role_routes
+        candidate = resolve_model_config(routed, role=role)
+        identity = (candidate.get("protocol"), candidate.get("base_url"),
+                    candidate.get("model"), candidate.get("auth_env"))
+        if identity in seen or not model_call_budget_available(candidate):
+            return
+        seen.add(identity)
+        destination.append(candidate)
+
+    fallbacks = model.get("role_model_fallbacks", {}) if isinstance(model, dict) else {}
+    alternatives = role_config_for(fallbacks, role, [])
+    for alternative in alternatives:
+        append_alternative(alternative, regular_candidates)
+
+    cooldown_candidates = []
+    if include_cooldown_fallback:
+        append_alternative(model.get("provider_cooldown_fallback"), cooldown_candidates)
+    if prefer_fallback and len(regular_candidates) > 1:
+        regular_candidates = regular_candidates[1:] + regular_candidates[:1]
+    # A cooldown-only route is opt-in so context selection cannot accidentally
+    # make it the first or only candidate before an ordinary provider 429.
+    return regular_candidates + cooldown_candidates
+
+
+def model_provider_quota_scope(config):
+    """Identify which configured route alternatives share a provider quota."""
+    if not isinstance(config, dict):
+        return "unknown-provider"
+    explicit = config.get("provider_quota_scope")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    return "|".join(str(config.get(key) or "") for key in (
+        "protocol", "base_url", "auth_env"))
+
+
+def record_model_provider_cooldown(config, *, retry_after_seconds=None):
+    """Open a process-wide provider circuit after an exhausted quota scope."""
+    scope = (config if isinstance(config, str)
+             else model_provider_quota_scope(config))
+    now = time.monotonic()
+    with _MODEL_PROVIDER_COOLDOWN_LOCK:
+        previous = _MODEL_PROVIDER_COOLDOWNS.get(scope)
+        previous_until, previous_failures = (
+            previous[:2] if previous else (0.0, 0))
+        failures = previous_failures + 1
+        delay = DEFAULT_MODEL_RATE_LIMIT_COOLDOWN_SECONDS * (
+            2 ** min(failures - 1, 16))
+        if (type(retry_after_seconds) in (int, float)
+                and math.isfinite(retry_after_seconds)
+                and retry_after_seconds > 0):
+            delay = max(delay, float(retry_after_seconds))
+        delay = min(MAX_MODEL_RATE_LIMIT_COOLDOWN_SECONDS, delay)
+        until = max(previous_until, now + delay)
+        generation = _MODEL_PROVIDER_COOLDOWN_GENERATIONS.get(scope, 0) + 1
+        _MODEL_PROVIDER_COOLDOWN_GENERATIONS[scope] = generation
+        _MODEL_PROVIDER_COOLDOWNS[scope] = (until, failures, generation)
+        return max(0.0, until - now)
+
+
+def model_provider_cooldown_remaining(config):
+    """Return the remaining process-wide cooldown for a provider quota scope."""
+    return model_provider_cooldown_snapshot(config)[0]
+
+
+def model_provider_cooldown_snapshot(config):
+    """Atomically read a quota scope's remaining cooldown and generation."""
+    scope = (config if isinstance(config, str)
+             else model_provider_quota_scope(config))
+    now = time.monotonic()
+    with _MODEL_PROVIDER_COOLDOWN_LOCK:
+        state = _MODEL_PROVIDER_COOLDOWNS.get(scope)
+        remaining = max(0.0, state[0] - now) if state is not None else 0.0
+        generation = _MODEL_PROVIDER_COOLDOWN_GENERATIONS.get(scope, 0)
+        return remaining, generation
+
+
+def admit_model_provider_call(config):
+    """Atomically admit one request unless its quota circuit is open.
+
+    The returned generation belongs to the admission point. A circuit opened
+    afterward treats this request as already in flight and cannot be cleared
+    by its eventual success.
+    """
+    scope = (config if isinstance(config, str)
+             else model_provider_quota_scope(config))
+    now = time.monotonic()
+    with _MODEL_PROVIDER_COOLDOWN_LOCK:
+        state = _MODEL_PROVIDER_COOLDOWNS.get(scope)
+        remaining = max(0.0, state[0] - now) if state is not None else 0.0
+        generation = _MODEL_PROVIDER_COOLDOWN_GENERATIONS.get(scope, 0)
+        if remaining > 0:
+            return None, remaining
+        return generation, 0.0
+
+
+def model_provider_cooldown_generation(config):
+    """Return a token for detecting a circuit opened during an in-flight call."""
+    return model_provider_cooldown_snapshot(config)[1]
+
+
+def clear_model_provider_cooldown(config, *, expected_generation=None):
+    """Clear only the circuit observed by a successful request, if requested."""
+    scope = (config if isinstance(config, str)
+             else model_provider_quota_scope(config))
+    with _MODEL_PROVIDER_COOLDOWN_LOCK:
+        if (expected_generation is not None
+                and _MODEL_PROVIDER_COOLDOWN_GENERATIONS.get(scope, 0)
+                != expected_generation):
+            return False
+        _MODEL_PROVIDER_COOLDOWNS.pop(scope, None)
+        return True
+
+
+def complete_with_role_fallbacks(model, *, role, system, prompt, images=None,
+                                 deadline=None, prefer_fallback=False,
+                                 output_token_cap=None, client_factory=None,
+                                 candidate_configs=None):
+    """Try configured routes only after a known pre-generation HTTP 429.
+
+    Rate limits are an availability failure, not a scientific result. A
+    configured alternative can therefore receive the same immutable prompt
+    without spending a content-repair attempt. Unknown outcomes and all other
+    errors remain on the ordinary failure path.
+    """
+    regular_candidates = model_route_candidates(
+        model, role=role, prefer_fallback=prefer_fallback)
+    all_candidates = model_route_candidates(
+        model, role=role, prefer_fallback=prefer_fallback,
+        include_cooldown_fallback=True)
+    cooldown_candidates = all_candidates[len(regular_candidates):]
+    cooldown_identities = {
+        tuple(candidate.get(key) for key in (
+            "protocol", "base_url", "model", "auth_env"))
+        for candidate in cooldown_candidates
+    }
+    if candidate_configs is None:
+        candidates = [dict(candidate) for candidate in regular_candidates]
+    else:
+        if not isinstance(candidate_configs, list) or not candidate_configs:
+            raise ValidationError("candidate_configs must be a nonempty route list")
+        candidates = []
+        seen_candidates = set()
+        for candidate in candidate_configs:
+            if not isinstance(candidate, dict):
+                raise ValidationError("candidate_configs entries must be route objects")
+            identity = tuple(candidate.get(key) for key in (
+                "protocol", "base_url", "model", "auth_env"))
+            if (identity in cooldown_identities or identity in seen_candidates
+                    or not model_call_budget_available(candidate)):
+                continue
+            seen_candidates.add(identity)
+            candidates.append(dict(candidate))
+        if not candidates:
+            raise ModelCallError("no configured model route is available", outcome_known=True)
+    for cooldown_candidate in cooldown_candidates:
+        identity = tuple(cooldown_candidate.get(key) for key in (
+            "protocol", "base_url", "model", "auth_env"))
+        if identity in {tuple(candidate.get(key) for key in (
+                "protocol", "base_url", "model", "auth_env"))
+                for candidate in candidates}:
+            continue
+        bounded = dict(cooldown_candidate)
+        if candidates:
+            # Respect the role-specific caps chosen by context projection and
+            # review policy while retaining the fallback's own context window.
+            preferred = candidates[0]
+            for field in ("max_input_tokens", "max_output_tokens", "reasoning_effort"):
+                if field in preferred:
+                    bounded[field] = preferred[field]
+            if type(output_token_cap) is int and output_token_cap > 0:
+                bounded["max_output_tokens"] = min(
+                    int(bounded["max_output_tokens"]), output_token_cap)
+            timeout_bounds = [
+                value for value in (
+                    bounded.get("timeout_seconds"),
+                    preferred.get("timeout_seconds"),
+                )
+                if type(value) in (int, float) and math.isfinite(value) and value > 0
+            ]
+            if timeout_bounds:
+                bounded["timeout_seconds"] = min(timeout_bounds)
+        bounded["max_retries"] = 0
+        if (model_call_budget_available(bounded)
+                and model_context_error(
+                    bounded, system=system, prompt=prompt,
+                    image_count=len(images or [])) is None):
+            candidates.append(bounded)
+    if not candidates:
+        raise ModelCallError("no configured model route is available", outcome_known=True)
+    make_client = client_factory or ModelClient
+    route_history = []
+    failed_request_attempts = 0
+    retry_after_hints = []
+    last_error = None
+    exhausted_quota_scopes = set()
+    failed_429s_by_scope = {}
+    candidate_count_by_scope = {}
+    for candidate in candidates:
+        scope = model_provider_quota_scope(candidate)
+        candidate_count_by_scope[scope] = candidate_count_by_scope.get(scope, 0) + 1
+    cooldown_skips = 0
+    longest_cooldown = 0.0
+    for index, config in enumerate(candidates):
+        bounded = dict(config)
+        quota_scope = model_provider_quota_scope(bounded)
+        global_cooldown = model_provider_cooldown_remaining(quota_scope)
+        if quota_scope in exhausted_quota_scopes or global_cooldown > 0:
+            cooldown_skips += 1
+            longest_cooldown = max(longest_cooldown, global_cooldown)
+            continue
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.2:
+                raise ModelCallError(
+                    "model route failover reached the stage deadline",
+                    outcome_known=True, attempts=failed_request_attempts,
+                )
+            bounded["timeout_seconds"] = min(
+                float(bounded["timeout_seconds"]), remaining)
+        if type(output_token_cap) is int and output_token_cap > 0:
+            bounded["max_output_tokens"] = min(
+                int(bounded["max_output_tokens"]), output_token_cap)
+        route_name = "primary" if index == 0 else f"fallback-{index}"
+        cooldown_generation, admission_wait = admit_model_provider_call(quota_scope)
+        if cooldown_generation is None:
+            cooldown_skips += 1
+            longest_cooldown = max(longest_cooldown, admission_wait)
+            continue
+        try:
+            result = make_client(**bounded).complete(
+                system=system, prompt=prompt, images=images)
+        except ModelCallError as exc:
+            route_history.append({
+                "route": route_name,
+                "model": bounded.get("model"),
+                "status_code": exc.status_code,
+                "provider_error_kind": exc.provider_error_kind,
+                "request_attempts": exc.attempts,
+            })
+            failed_request_attempts += exc.attempts
+            if (type(exc.retry_after_seconds) in (int, float)
+                    and math.isfinite(exc.retry_after_seconds)
+                    and exc.retry_after_seconds > 0):
+                retry_after_hints.append(float(exc.retry_after_seconds))
+            last_error = exc
+            if (exc.status_code == 429 and exc.outcome_known):
+                failed_429s_by_scope[quota_scope] = (
+                    failed_429s_by_scope.get(quota_scope, 0) + 1)
+                if (exc.provider_error_kind == "quota_exhausted"
+                        or candidate_count_by_scope.get(quota_scope, 0) == 1
+                        or (candidate_count_by_scope.get(quota_scope, 0) > 1
+                            and failed_429s_by_scope[quota_scope]
+                            >= candidate_count_by_scope[quota_scope])):
+                    record_model_provider_cooldown(
+                        quota_scope,
+                        retry_after_seconds=max(retry_after_hints, default=0.0),
+                    )
+            if (exc.status_code != 429 or not exc.outcome_known
+                    or index + 1 >= len(candidates)):
+                exc.attempts = failed_request_attempts
+                exc.route_history = route_history
+                if retry_after_hints:
+                    exc.retry_after_seconds = max(retry_after_hints)
+                if (len(route_history) > 1
+                        or any(entry.get("provider_error_kind") for entry in route_history)):
+                    summary = ", ".join(
+                        f"{entry['model']}={entry['status_code']}"
+                        + (f"[{entry['provider_error_kind']}]"
+                           if entry.get("provider_error_kind") else "")
+                        for entry in route_history
+                    )
+                    exc.args = (f"{exc}: configured model routes tried: {summary}",)
+                raise
+            if exc.provider_error_kind == "quota_exhausted":
+                exhausted_quota_scopes.add(quota_scope)
+                has_independent_route = any(
+                    model_provider_quota_scope(candidate) not in exhausted_quota_scopes
+                    for candidate in candidates[index + 1:]
+                )
+                if not has_independent_route:
+                    exc.attempts = failed_request_attempts
+                    exc.route_history = route_history
+                    if retry_after_hints:
+                        exc.retry_after_seconds = max(retry_after_hints)
+                    if len(route_history) > 1:
+                        summary = ", ".join(
+                            f"{entry['model']}={entry['status_code']}"
+                            + (f"[{entry['provider_error_kind']}]"
+                               if entry.get("provider_error_kind") else "")
+                            for entry in route_history
+                        )
+                        exc.args = (f"{exc}: configured model routes tried: {summary}",)
+                    raise
+            continue
+        route_history.append({
+            "route": route_name,
+            "model": bounded.get("model"),
+            "status_code": 200,
+            "request_attempts": result.request_attempts,
+        })
+        clear_model_provider_cooldown(
+            quota_scope, expected_generation=cooldown_generation)
+        if failed_request_attempts:
+            result = replace(
+                result,
+                request_attempts=result.request_attempts + failed_request_attempts,
+            )
+        return result, route_history
+    if last_error is not None:
+        raise last_error
+    if cooldown_skips:
+        raise ModelCallError(
+            "all configured model routes are inside a provider cooldown",
+            outcome_known=True, attempts=0, status_code=429,
+            retry_after_seconds=longest_cooldown,
+        )
+    raise ModelCallError("no configured model route is available", outcome_known=True)
 
 
 class ModelCallError(RuntimeError):
@@ -528,7 +1132,7 @@ class ModelCallError(RuntimeError):
     """
     def __init__(self, message, *, outcome_known=False, attempts=0,
                  elapsed_seconds=None, status_code=None,
-                 retry_after_seconds=None):
+                 retry_after_seconds=None, provider_error_kind=None):
         super().__init__(message)
         self.outcome_known = outcome_known
         self.attempts = attempts if type(attempts) is int and attempts >= 0 else 0
@@ -545,6 +1149,11 @@ class ModelCallError(RuntimeError):
             if type(retry_after_seconds) in (int, float)
             and math.isfinite(retry_after_seconds) and retry_after_seconds >= 0
             else None
+        )
+        self.provider_error_kind = (
+            provider_error_kind if provider_error_kind in {
+                "quota_exhausted", "rate_limited", "model_unavailable",
+            } else None
         )
 
 
@@ -573,9 +1182,10 @@ class ModelContextBudgetError(ValidationError):
 
 class _ProviderHTTPError(RuntimeError):
     """A provider response with an HTTP status other than 200."""
-    def __init__(self, code, retry_after=None):
+    def __init__(self, code, retry_after=None, provider_error_kind=None):
         super().__init__(f"model HTTP request failed with status {code}")
         self.code = code
+        self.provider_error_kind = provider_error_kind
         try:
             delay = float(retry_after)
         except (TypeError, ValueError):
@@ -584,6 +1194,38 @@ class _ProviderHTTPError(RuntimeError):
             except (TypeError, ValueError, OverflowError):
                 delay = None
         self.retry_after = max(0.0, delay) if delay is not None and math.isfinite(delay) else None
+
+
+def _provider_http_error_kind(body):
+    """Classify a bounded provider error body without retaining its contents."""
+    if not isinstance(body, (bytes, bytearray)):
+        return None
+    try:
+        value = json.loads(bytes(body[:8192]).decode("utf-8", errors="replace"))
+    except (TypeError, ValueError):
+        value = bytes(body[:8192]).decode("utf-8", errors="replace")
+    if isinstance(value, dict):
+        error = value.get("error", value)
+        if isinstance(error, dict):
+            fields = (error.get("code"), error.get("type"), error.get("message"),
+                      error.get("detail"))
+        else:
+            fields = (error,)
+        text = " ".join(str(field) for field in fields if field is not None).casefold()
+    else:
+        text = str(value).casefold()
+    if any(marker in text for marker in (
+            "insufficient_quota", "insufficient quota", "quota exceeded",
+            "quota_exceeded", "weekly limit", "daily limit", "credits exhausted",
+            "credit balance", "billing limit", "out of cloud credits")):
+        return "quota_exhausted"
+    if any(marker in text for marker in (
+            "rate limit", "rate_limit", "too many requests", "throttl",
+            "overload", "temporarily busy")):
+        return "rate_limited"
+    if any(marker in text for marker in ("model not found", "unknown model", "model unavailable")):
+        return "model_unavailable"
+    return None
 
 
 @dataclass(frozen=True)
@@ -639,6 +1281,7 @@ class ModelClient:
                  seed: int | None = None, presence_penalty: float | None = None,
                  frequency_penalty: float | None = None,
                  cache_prompt: bool | None = None,
+                 provider_quota_scope: str | None = None,
                  model_call_budget_path: str | None = None,
                  model_call_budget_key: str | None = None,
                  model_call_budget_limit: int | None = None):
@@ -653,6 +1296,7 @@ class ModelClient:
             raise ValidationError("model protocol must be ollama or openai_compatible")
         if not isinstance(model, str) or not model.strip() or model == "runtime_required":
             raise ValidationError("an explicit model name is required")
+        reject_local_qwen_route({"base_url": base_url, "model": model})
         if type(max_output_tokens) is not int or max_output_tokens <= 0:
             raise ValidationError("max_output_tokens must be a positive integer")
         _validate_context_policy({
@@ -684,6 +1328,11 @@ class ModelClient:
             raise ValidationError("output_format must be json_object when configured")
         if cache_prompt is not None and type(cache_prompt) is not bool:
             raise ValidationError("cache_prompt must be boolean when configured")
+        if provider_quota_scope is not None and (
+                not isinstance(provider_quota_scope, str)
+                or not provider_quota_scope.strip()
+                or len(provider_quota_scope) > 160):
+            raise ValidationError("provider_quota_scope must be a nonempty string")
         _validate_model_call_budget({
             "model_call_budget_path": model_call_budget_path,
             "model_call_budget_key": model_call_budget_key,
@@ -744,6 +1393,9 @@ class ModelClient:
         return body, media_type
 
     def complete(self, *, system: str, prompt: str, images=None) -> ModelResult:
+        request_model = self.model
+        request_base_url = self.base_url
+        reject_local_qwen_route({"base_url": request_base_url, "model": request_model})
         if not isinstance(system, str) or not isinstance(prompt, str):
             raise ValidationError("model system and prompt content must be strings")
         images = [] if images is None else images
@@ -752,7 +1404,7 @@ class ModelClient:
         if images and self.protocol != "openai_compatible":
             raise ValidationError("multimodal image input requires the openai_compatible protocol")
         context_config = {
-            "model": self.model, "max_output_tokens": self.max_output_tokens,
+            "model": request_model, "max_output_tokens": self.max_output_tokens,
             "context_window_tokens": self.context_window_tokens,
             "max_input_tokens": self.max_input_tokens,
         }
@@ -783,7 +1435,7 @@ class ModelClient:
                 "url": f"data:{media_type};base64,{encoded}"}})
         user_content = parts if images else prompt
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user_content}]
-        body = {"model": self.model, "messages": messages, "stream": False}
+        body = {"model": request_model, "messages": messages, "stream": False}
         sampling = {
             key: value for key, value in {
                 "temperature": self.temperature, "top_p": self.top_p, "seed": self.seed,
@@ -828,7 +1480,7 @@ class ModelClient:
         wire = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
         if len(wire) > self.max_request_bytes:
             raise ValidationError("model request exceeds the configured byte limit")
-        parsed_base = urllib.parse.urlsplit(self.base_url)
+        parsed_base = urllib.parse.urlsplit(request_base_url)
         connection_type = (http.client.HTTPSConnection
                            if parsed_base.scheme == "https" else http.client.HTTPConnection)
         request_path = parsed_base.path.rstrip("/") + path
@@ -844,12 +1496,13 @@ class ModelClient:
         parsed = None
 
         def failure(message, *, outcome_known=False, status_code=None,
-                    retry_after_seconds=None):
+                    retry_after_seconds=None, provider_error_kind=None):
             return ModelCallError(
                 message, outcome_known=outcome_known, attempts=attempts_made,
                 elapsed_seconds=time.monotonic() - started,
                 status_code=status_code,
                 retry_after_seconds=retry_after_seconds,
+                provider_error_kind=provider_error_kind,
             )
 
         while True:
@@ -893,6 +1546,10 @@ class ModelClient:
                     max(0.01, deadline - time.monotonic()), expire_request)
                 timeout_timer.daemon = True
                 timeout_timer.start()
+                connection.connect()
+                if "qwen" in request_model.casefold():
+                    peer = connection.sock.getpeername()[0]
+                    _reject_local_qwen_peer(request_model, peer)
                 connection.request("POST", request_path, wire,
                                    headers={**headers, "Connection": "close"})
                 response = connection.getresponse()
@@ -902,7 +1559,16 @@ class ModelClient:
                         "model endpoint redirected; configure the final endpoint explicitly",
                         outcome_known=True)
                 if code != 200:
-                    raise _ProviderHTTPError(code, response.getheader("Retry-After"))
+                    error_body = b""
+                    try:
+                        read_error = getattr(response, "read1", response.read)
+                        error_body = read_error(8192)
+                    except (AttributeError, OSError, TimeoutError, ValueError):
+                        pass
+                    raise _ProviderHTTPError(
+                        code, response.getheader("Retry-After"),
+                        provider_error_kind=_provider_http_error_kind(error_body),
+                    )
                 # ``HTTPResponse.read(n)`` can legally wait for the full
                 # requested amount (or for EOF) when a provider sends a
                 # response in small chunks.  ``read1`` returns one currently
@@ -951,14 +1617,16 @@ class ModelClient:
                         raise failure(f"model HTTP request failed with status {code}",
                                       outcome_known=400 <= code < 500,
                                       status_code=code,
-                                      retry_after_seconds=retry_after) from None
+                                      retry_after_seconds=retry_after,
+                                      provider_error_kind=exc.provider_error_kind) from None
                     time.sleep(delay)
                     attempt += 1
                     continue
                 raise failure(f"model HTTP request failed with status {code}",
                               outcome_known=400 <= code < 500,
                               status_code=code,
-                              retry_after_seconds=retry_after) from None
+                              retry_after_seconds=retry_after,
+                              provider_error_kind=exc.provider_error_kind) from None
             except ModelCallError as exc:
                 raise failure(
                     str(exc), outcome_known=exc.outcome_known,

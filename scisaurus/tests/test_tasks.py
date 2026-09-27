@@ -51,6 +51,19 @@ class TestTaskLifecycle(unittest.TestCase):
         task = self.tm.get("t-2")
         self.assertEqual(task["state"], "blocked")
 
+    def test_task_cannot_start_a_second_attempt_while_one_is_unresolved(self):
+        self.tm.create("t-duplicate", "production", {"objective": "run once"}, "composer")
+        self.tm.admit("t-duplicate", "composer")
+        self.tm.start_attempt(
+            "t-duplicate", "a-first", owner="worker-1", lease_ttl_seconds=30)
+        with self.assertRaisesRegex(StateError, "already has unresolved attempt"):
+            self.tm.start_attempt(
+                "t-duplicate", "a-overlap", owner="worker-2", lease_ttl_seconds=30)
+        self.tm.finish_attempt("a-first", "failed")
+        self.tm.start_attempt(
+            "t-duplicate", "a-retry", owner="worker-1", lease_ttl_seconds=30)
+        self.assertEqual(self.tm.get_attempt("a-retry")["state"], "started")
+
     def test_illegal_transition_rejected(self):
         self.tm.create("t-3", "review", {"objective": "x"}, "composer")
         with self.assertRaises(Exception):

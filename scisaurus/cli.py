@@ -278,10 +278,9 @@ def main(argv=None) -> int:
             on_progress = lambda state: print(_composer_progress_line(state), flush=True)
             if args.watch:
                 from scisaurus.runtime.composer_supervisor import supervise_composer
-                if args.extend_deadline_seconds is not None:
-                    raise ValidationError("--extend-deadline-seconds cannot be combined with --watch")
                 result = supervise_composer(
                     workflow, initial_resume=args.resume,
+                    initial_additional_seconds=args.extend_deadline_seconds,
                     poll_seconds=args.watch_interval, on_progress=on_progress)
             else:
                 result = ComposerRunner(workflow, resume=args.resume,

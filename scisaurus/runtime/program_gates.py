@@ -21,6 +21,9 @@ import json
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
+from scisaurus.runtime.capability_registry import (
+    experiment_validation_payload, program_validator_configured_input,
+)
 from scisaurus.runtime.experiment import (
     bind_deterministic_validation, validate_deterministic_validation,
     validate_program_output,
@@ -33,16 +36,18 @@ ADMISSION_SCHEMA = "method-program-admission-1"
 class ProgramGateRejected(ValidationError):
     """Keep failed evidence independent of bounded human-readable errors."""
 
-    def __init__(self, message, record, *, gate):
+    def __init__(self, message, record, *, gate, details=None):
         self.feedback = {
             "gate": gate,
             "decision": record.get("decision", record.get("status")),
             "failed_checks": [item for item in record.get("checks", [])
-                              if isinstance(item, dict) and item.get("outcome") != "passed"],
+                                  if isinstance(item, dict) and item.get("outcome") != "passed"],
             "findings": record.get("findings", []),
             "metric_mismatches": [item for item in record.get("metric_recalculations", [])
                                   if isinstance(item, dict) and item.get("matches") is not True],
         }
+        if isinstance(details, dict):
+            self.feedback.update(details)
         super().__init__(message + ": " + json.dumps(self.feedback, ensure_ascii=False)[:2400])
 
 
@@ -115,16 +120,35 @@ def admit_program_candidate(candidate, *, execute, validate, readiness=None, rev
             or document.get("revision") != candidate["revision"]):
         raise ValidationError("program output does not match the candidate study identity")
     document = validate_program_output(document, candidate["experiment_intent"])
-    verdict_result = validate(canonical_bytes({
-        "configured_input": {}, "candidate": document, "candidate_sha256": digests[0],
-        "primary_outcomes": candidate["experiment_intent"]["primary_outcomes"],
-    }))
+    configured_input = program_validator_configured_input(candidate)
+    verdict_result = validate(canonical_bytes(experiment_validation_payload(
+        candidate["experiment_intent"], configured_input, document, digests[0])))
     if getattr(verdict_result, "mode", None) != "sandbox-exec":
         raise ValidationError(
             "program validator requires the deny-by-default sandbox-exec boundary")
     verdict = _parse_json_output(verdict_result, "program validator")
-    verdict = validate_deterministic_validation(
-        verdict, candidate["experiment_intent"], digests[0])
+    try:
+        verdict = validate_deterministic_validation(
+            verdict, candidate["experiment_intent"], digests[0])
+    except ValidationError as exc:
+        if "deterministic validation decision contradicts its checks" not in str(exc):
+            raise
+        expected_decision = (
+            "accepted"
+            if all(item.get("outcome") == "passed" for item in verdict.get("checks", []))
+            and all(item.get("matches") is True
+                    for item in verdict.get("metric_recalculations", []))
+            else "rejected"
+        )
+        raise ProgramGateRejected(
+            "independent recalculation decision contradicts its evidence",
+            verdict,
+            gate="independent_recalculation",
+            details={
+                "expected_decision": expected_decision,
+                "validation_error": str(exc),
+            },
+        ) from exc
     if verdict.get("decision") != "accepted":
         raise ProgramGateRejected("independent recalculation did not accept the candidate", verdict,
                                   gate="independent_recalculation")

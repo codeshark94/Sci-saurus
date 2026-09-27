@@ -87,6 +87,19 @@ class MissingStageClient(FakeClient):
 
 
 class ManuscriptReviewTests(unittest.TestCase):
+    def test_review_request_uses_route_timeout_bounded_by_review_deadline(self):
+        model = {"base_url": "http://example.invalid/v1", "model": "reviewer",
+                 "protocol": "openai_compatible", "timeout_seconds": 1800,
+                 "max_output_tokens": 1024}
+        deadline = time.monotonic() + 1200
+        bounded = ManuscriptReviewRunner._bounded_model_config(
+            model, deadline, call_timeout_seconds=None)
+        self.assertAlmostEqual(bounded["timeout_seconds"], 1200, delta=0.1)
+
+        bounded = ManuscriptReviewRunner._bounded_model_config(
+            model, deadline, call_timeout_seconds=600)
+        self.assertEqual(bounded["timeout_seconds"], 600)
+
     def test_review_accepts_provider_xhigh_reasoning_effort(self):
         runner = ManuscriptReviewRunner({"base_url": "http://example.invalid", "model": "fake",
                                          "protocol": "openai_compatible", "timeout_seconds": 1,

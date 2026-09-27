@@ -39,6 +39,27 @@ class ResearchQualityTests(unittest.TestCase):
         self.assertEqual(result["decision"], "proceed")
         self.assertEqual(result["deficits"], [])
 
+    def test_rejected_scientific_result_is_not_admitted_despite_complete_analysis(self):
+        package = {
+            "quality_contract": default_research_quality_contract(),
+            "analysis": self._analysis(),
+            "assets": [{"id": f"figure_{index}", "role": "figure"} for index in range(3)],
+            "validation": {"decision": "rejected"},
+        }
+
+        rejected = evaluate_result_package_quality(
+            package, minimum_contract=default_research_quality_contract())
+
+        self.assertEqual(rejected["decision"], "research_expansion_required")
+        self.assertEqual([item["field"] for item in rejected["deficits"]], ["validation.decision"])
+        self.assertEqual(rejected["expansion_requests"][0]["id"], "repair_rejected_experiment_result")
+        self.assertEqual(rejected["expansion_requests"][0]["kind"], "additional_experiment")
+
+        package["validation"]["decision"] = "accepted_with_limitations"
+        admitted = evaluate_result_package_quality(
+            package, minimum_contract=default_research_quality_contract())
+        self.assertEqual(admitted["decision"], "proceed")
+
     def test_missing_display_and_sensitivity_are_separate_requests(self):
         contract = default_research_quality_contract()
         analysis = self._analysis()

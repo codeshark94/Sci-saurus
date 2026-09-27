@@ -19,17 +19,21 @@ from scisaurus.core.surveys import (ABSTENTION_REASONS, RELATIONSHIP_SEMANTICS, 
 from scisaurus.runtime.execution import SYSTEM, ExecutionRuntime, _invoke_worker
 from scisaurus.runtime.config import configured_worker_slots
 from scisaurus.runtime.bibliographic_identity import reconcile_result
-from scisaurus.runtime.models import ModelResult, estimate_input_tokens
+from scisaurus.runtime.models import (
+    ModelResult, estimate_input_tokens, is_local_qwen_route,
+    role_config_for, role_routes_for,
+)
 from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
 from scisaurus.runtime.literature import (
-    SEARCH_SYNTAX, ProviderCooldownError, preferred_full_text_url, preferred_oa_pdf_url,
-    provider_cooldown_seconds,
+    SEARCH_SYNTAX, ProviderCooldownError, full_text_url_candidates,
+    preferred_oa_pdf_url, provider_cooldown_seconds,
 )
 from scisaurus.runtime.operations import OperationsCell
 from scisaurus.runtime.scores import exact, identifier
 from scisaurus.runtime.survey_config import validate_survey_config, search_query
 from scisaurus.runtime.survey_records import (
-    MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, normalize_check_envelope, validate_map,
+    MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, normalize_check_envelope,
+    normalize_gap_assessment_envelope, validate_map,
     validate_survey_review, validate_assessment, validate_work_review,
 )
 from scisaurus.runtime.time_policy import TimePolicy
@@ -149,6 +153,175 @@ def normalize_map_relationships(value):
             relationships.append(relation)
     normalized["relationships"] = relationships
     return normalized
+
+
+def normalize_map_worker_response(value, *, work_id, all_work_ids, sources,
+                                 windows, entry_editable=True, previous=None,
+                                 review_feedback=None, projection_issues=None):
+    """Project a worker response onto one safe map assignment.
+
+    Map relationships are optional and statement fields can be unknown. A
+    malformed optional relation is therefore dropped, while a field whose
+    quotation cannot be bound to the displayed source window becomes an
+    explicit unknown. This preserves independently verifiable work without
+    admitting unsupported claims or paying for a whole-assignment retry.
+    """
+    null_statement = {"text": None, "evidence": []}
+    issues = projection_issues if isinstance(projection_issues, list) else None
+
+    def report_issue(kind, **details):
+        if issues is not None:
+            issues.append({"kind": kind, "work_id": work_id, **details})
+
+    source_lookup = {item["source_ref"]: item for item in sources
+                     if isinstance(item, dict)
+                     and isinstance(item.get("source_ref"), str)}
+
+    def safe_statement(raw, *, required_work_ids=(), field="statement"):
+        if not isinstance(raw, dict):
+            if raw is not None:
+                report_issue("malformed_statement_withdrawn", field=field)
+            return deepcopy(null_statement)
+        text = raw.get("text")
+        proofs = raw.get("evidence")
+        if not isinstance(text, str) or not text.strip() or not isinstance(proofs, list) or not proofs:
+            if text is not None or proofs not in ([], None):
+                report_issue("unbound_statement_withdrawn", field=field)
+            return deepcopy(null_statement)
+        projected = []
+        cited_work_ids = set()
+        for proof in proofs:
+            if (not isinstance(proof, dict)
+                    or not all(isinstance(proof.get(key), str) and proof[key]
+                               for key in ("work_id", "source_ref", "quote"))):
+                report_issue("malformed_citation_withdrawn", field=field)
+                return deepcopy(null_statement)
+            source = source_lookup.get(proof["source_ref"])
+            if (source is None or proof["work_id"] not in all_work_ids
+                    or source.get("work_id") != proof["work_id"]):
+                report_issue("unbound_citation_withdrawn", field=field)
+                return deepcopy(null_statement)
+            cited_work_ids.add(proof["work_id"])
+            projected.append({key: proof[key] for key in (
+                "work_id", "source_ref", "quote", "start", "end", "quote_sha256"
+            ) if key in proof})
+        if not set(required_work_ids).issubset(cited_work_ids):
+            report_issue("wrong_work_citation_withdrawn", field=field)
+            return deepcopy(null_statement)
+        try:
+            bound = bind_source_spans(
+                {"evidence": projected},
+                {ref: source for ref, source in ((item["source_ref"], item)
+                                                  for item in sources)},
+                windows=windows,
+            )
+        except (ValidationError, KeyError, TypeError, ValueError):
+            report_issue("source_span_not_verified", field=field)
+            return deepcopy(null_statement)
+        return {"text": text.strip(), "evidence": bound["evidence"]}
+
+    def safe_relationships(raw_relations, *, allowed_targets=None):
+        if not isinstance(raw_relations, list):
+            return []
+        allowed_targets = ({target for target in allowed_targets if isinstance(target, str)}
+                           if allowed_targets is not None else None)
+        output, seen = [], set()
+        for relation in raw_relations:
+            if not isinstance(relation, dict):
+                continue
+            source, target, kind = (relation.get("source"), relation.get("target"),
+                                    relation.get("kind"))
+            if (source != work_id or not isinstance(target, str)
+                    or target not in all_work_ids or target == work_id
+                    or (allowed_targets is not None and target not in allowed_targets)
+                    or not isinstance(kind, str)
+                    or kind not in {"extends", "contradicts", "compares", "related"}):
+                report_issue("ungranted_relationship_dropped")
+                continue
+            key = (source, target, kind)
+            if key in seen:
+                continue
+            claim = safe_statement(relation.get("claim"),
+                                   required_work_ids=(source, target),
+                                   field="relationship")
+            if claim["text"] is None:
+                report_issue("unsupported_relationship_dropped", target=target, relation_kind=kind)
+                continue
+            seen.add(key)
+            output.append({"source": source, "target": target,
+                           "kind": kind, "claim": claim})
+        return output
+
+    value = normalize_map_relationships(value)
+    if review_feedback is not None:
+        raw_updates = value.get("entry_updates") if isinstance(value, dict) else None
+        if isinstance(raw_updates, dict) and isinstance(raw_updates.get(work_id), dict):
+            raw_updates = raw_updates[work_id]
+        if not isinstance(raw_updates, dict):
+            report_issue("malformed_scoped_update_ignored")
+            raw_updates = {}
+        granted = set(review_feedback.get("entry_fields", []))
+        for field in set(raw_updates) - granted:
+            report_issue("ungranted_entry_field_ignored", field=str(field))
+        updates = {}
+        fallback_reason = (
+            "The captured source text did not support a verifiable screening rationale."
+        )
+        for field in review_feedback.get("entry_fields", []):
+            raw = raw_updates.get(field)
+            if field == "inclusion":
+                updates[field] = (raw if isinstance(raw, str)
+                                  and raw in {"included", "excluded", "uncertain"}
+                                  else "uncertain")
+            elif field == "reason":
+                updates[field] = raw.strip() if isinstance(raw, str) and raw.strip() else fallback_reason
+            elif field in MAP_FIELDS:
+                updates[field] = safe_statement(
+                    raw, required_work_ids=(work_id,), field=field)
+        targets = review_feedback.get("relationship_targets", [])
+        raw_relations = value.get("relationships", []) if isinstance(value, dict) else []
+        return {"entry_updates": updates,
+                "relationships": safe_relationships(raw_relations, allowed_targets=targets)}
+
+    entry_rows = value.get("entries") if isinstance(value, dict) else None
+    matches = [row for row in entry_rows if isinstance(row, dict)
+               and row.get("work_id") == work_id] if isinstance(entry_rows, list) else []
+    raw_entry = matches[0] if len(matches) == 1 else {}
+    if len(matches) != 1:
+        report_issue("assigned_entry_missing_or_duplicated")
+    if not entry_editable and isinstance(previous, dict):
+        changed_fields = [key for key in set(raw_entry) | set(previous)
+                          if raw_entry.get(key) != previous.get(key)]
+        for field in sorted(changed_fields):
+            report_issue("ungranted_entry_field_ignored", field=str(field))
+        entry = deepcopy(previous)
+    else:
+        allowed_entry_fields = {"work_id", "inclusion", "reason", *MAP_FIELDS}
+        for field in set(raw_entry) - allowed_entry_fields:
+            report_issue("ungranted_entry_field_ignored", field=str(field))
+        entry = {
+            "work_id": work_id,
+            "inclusion": (raw_entry.get("inclusion")
+                          if isinstance(raw_entry.get("inclusion"), str)
+                          and raw_entry["inclusion"] in {"included", "excluded", "uncertain"}
+                          else "uncertain"),
+            "reason": (raw_entry.get("reason").strip()
+                       if isinstance(raw_entry.get("reason"), str)
+                       and raw_entry["reason"].strip()
+                       else "The captured source text did not support a verifiable screening rationale."),
+        }
+        for field in MAP_FIELDS:
+            entry[field] = safe_statement(
+                raw_entry.get(field), required_work_ids=(work_id,), field=field)
+    raw_relations = value.get("relationships", []) if isinstance(value, dict) else []
+    relationships = safe_relationships(raw_relations)
+    if (entry_editable and entry["inclusion"] == "included"
+            and all(entry[field]["text"] is None for field in MAP_FIELDS)
+            and not relationships):
+        entry["inclusion"] = "uncertain"
+        entry["reason"] = ABSTENTION_REASONS["unverified_map"]
+        report_issue("claimless_screening_withdrawn")
+    return {"entries": [entry], "relationships": relationships}
 
 
 def overlay_post_checkpoint_relationships(relationships, checkpoint_created_at, candidates):
@@ -594,7 +767,14 @@ class SurveyRunner(ExecutionRuntime):
                 prior_assignment.pop("validation_feedback", None)
             except (IndexError, KeyError, TypeError, ValueError):
                 continue
-            if canonical_bytes(prior_assignment) == canonical_bytes(assignment):
+            current_assignment = deepcopy(assignment)
+            # These fields create a new transport/cache boundary, not a new
+            # scientific assignment.  Ignoring them lets the corrected
+            # normalizer revalidate the already-paid response after resume.
+            for candidate in (prior_assignment, current_assignment):
+                candidate.pop("resume_boundary", None)
+                candidate.pop("_contract_repair_boundary", None)
+            if canonical_bytes(prior_assignment) == canonical_bytes(current_assignment):
                 return {"error": error, "previous_response": previous_response,
                     "finish_reason": validation_body.get("finish_reason", "stop"),
                     "execution_ref": execution["artifact_ref"],
@@ -712,12 +892,22 @@ class SurveyRunner(ExecutionRuntime):
              if key in row}
             for row in coverage.get("searches", []) if isinstance(row, dict)
         ]
+        cited_source_refs = {
+            item.get("source_ref") for item in catalog
+            if isinstance(item.get("source_ref"), str)
+        }
+        cited_source_refs.update(
+            ref for ref in assignment.get("verified_full_text_refs", [])
+            if isinstance(ref, str)
+        )
         sources = [
             {key: source.get(key) for key in (
-                "source_ref", "work_id", "representation", "identity_verified", "available_chars")
+                "source_ref", "work_id", "representation", "identity_verified",
+                "available_chars", "window", "text")
              if key in source}
             for source in assignment.get("sources", [])
             if isinstance(source, dict)
+            and source.get("source_ref") in cited_source_refs
         ]
         feedback = assignment.get("validation_feedback")
         if isinstance(feedback, dict):
@@ -782,6 +972,45 @@ class SurveyRunner(ExecutionRuntime):
                 "error": state["error"], "repair_attempts": state.get("repair_attempts", 0)})
             results[job["name"]] = (value, execution)
             return True
+
+        def recover_retained_response(job, retained_feedback):
+            """Adopt a prior parsed answer if the current strict validator accepts it."""
+            if not isinstance(retained_feedback, dict):
+                return None
+            previous = retained_feedback.get("previous_response")
+            execution_ref = retained_feedback.get("execution_ref")
+            if not isinstance(execution_ref, str):
+                return None
+            try:
+                if isinstance(previous, dict):
+                    raw_text = previous.get("raw_text")
+                    recovered = (ModelResult(
+                        text=raw_text, model="retained", usage={},
+                        elapsed_seconds=0.0, finish_reason="stop",
+                    ).json_object(allow_missing_closers=True)
+                        if isinstance(raw_text, str) else deepcopy(previous))
+                elif isinstance(previous, str):
+                    recovered = ModelResult(
+                        text=previous, model="retained", usage={},
+                        elapsed_seconds=0.0, finish_reason="stop",
+                    ).json_object(allow_missing_closers=True)
+                else:
+                    return None
+                if job.get("normalizer"):
+                    recovered = job["normalizer"](recovered)
+                job["validator"](recovered)
+            except (ValidationError, TypeError, ValueError, KeyError):
+                return None
+            if job.get("on_valid"):
+                job["on_valid"](recovered, execution_ref)
+            cache.put(keys[job["name"]], {
+                "status": "succeeded", "value": recovered,
+                "execution_ref": execution_ref,
+                "recovered_from_retained_execution": True,
+            }, subjects=[execution_ref])
+            results[job["name"]] = (recovered, execution_ref)
+            return recovered
+
         for job in jobs:
             model = {**self.config["model"], **job.get("model_overrides", {})}
             key = cache.key(scope=f"survey:{job['name']}", role=job["actor"],
@@ -799,6 +1028,19 @@ class SurveyRunner(ExecutionRuntime):
                         job["on_valid"](value, retained["execution_ref"])
                     results[job["name"]] = (value, retained["execution_ref"])
                     continue
+            if retained is None and self.resume_session:
+                retained_feedback = self._retained_validation_feedback(
+                    job["name"], job["assignment"])
+                if recover_retained_response(job, retained_feedback) is not None:
+                    continue
+                if retained_feedback is not None:
+                    # A changed transport boundary is eligible for one fresh
+                    # scoped repair only after the retained answer fails the
+                    # current normalizer/validator.
+                    states[job["name"]] = {"feedback": retained_feedback}
+                    feedback[job["name"]] = retained_feedback
+                    pending.append(job)
+                    continue
             if retained and retained.get("status") == "blocked":
                 # A provider can return a semantically complete JSON object
                 # with a duplicated outer closing tail.  If the immutable
@@ -809,30 +1051,7 @@ class SurveyRunner(ExecutionRuntime):
                 retained_feedback = self._retained_validation_feedback(
                     job["name"], job["assignment"])
                 recovery = retained_feedback or retained.get("feedback")
-                previous = recovery.get("previous_response") if recovery else None
-                raw_previous = (previous.get("raw_text")
-                                if isinstance(previous, dict) else previous)
-                execution_ref = recovery.get("execution_ref") if recovery else None
-                recovered = None
-                if isinstance(raw_previous, str) and execution_ref:
-                    try:
-                        recovered = ModelResult(
-                            text=raw_previous, model="retained", usage={},
-                            elapsed_seconds=0.0, finish_reason="stop",
-                        ).json_object(allow_missing_closers=True)
-                        if job.get("normalizer"):
-                            recovered = job["normalizer"](recovered)
-                        job["validator"](recovered)
-                    except (ValidationError, TypeError, ValueError, KeyError):
-                        recovered = None
-                if recovered is not None:
-                    job["on_valid"](recovered, execution_ref) if job.get("on_valid") else None
-                    cache.put(keys[job["name"]], {
-                        "status": "succeeded", "value": recovered,
-                        "execution_ref": execution_ref,
-                        "recovered_from_retained_execution": True,
-                    }, subjects=[execution_ref])
-                    results[job["name"]] = (recovered, execution_ref)
+                if recover_retained_response(job, recovery) is not None:
                     continue
                 if abstain(job, retained):
                     continue
@@ -1487,7 +1706,22 @@ class SurveyRunner(ExecutionRuntime):
         for configured in self.score["full_text_sources"]:
             route = deepcopy(configured)
             wid = self.aliases.get(route["work_id"], route["work_id"])
-            fallback = preferred_oa_pdf_url(self.works.get(wid, {}).get("locations"))
+            locations = self.works.get(wid, {}).get("locations", [])
+            candidates = full_text_url_candidates(locations)
+            registered = next((item for item in candidates if item["url"] == route["url"]), None)
+            open_pdf = next((item for item in candidates
+                             if item["is_oa"] and item["kind"] == "pdf"), None)
+            # Exact routes preserve a caller-selected locator; auto routes
+            # resolve a registered landing page to a registered OA PDF.
+            if (route.get("route_policy", "exact") == "auto" and registered
+                    and registered["kind"] == "landing_page" and open_pdf):
+                route["url"] = open_pdf["url"]
+                route["source_kind"] = "pdf"
+            elif registered and registered["kind"] == "pdf":
+                route["source_kind"] = "pdf"
+            else:
+                route["source_kind"] = "auto"
+            fallback = preferred_oa_pdf_url(locations)
             route["fallback_urls"] = [fallback] if fallback and fallback != route["url"] else []
             routes.append((route, False))
         selected_ids = self._analysis_selection()
@@ -1508,7 +1742,9 @@ class SurveyRunner(ExecutionRuntime):
                 work = self.works[wid]
                 if not isinstance(wid, str) or wid in known:
                     continue
-                url = preferred_full_text_url(work.get("locations"))
+                candidates = full_text_url_candidates(work.get("locations"))
+                preferred = candidates[0] if candidates else None
+                url = preferred["url"] if preferred else None
                 url = url or work.get("source_url")
                 if not isinstance(url, str) or not url.strip():
                     doi = work.get("doi")
@@ -1520,6 +1756,8 @@ class SurveyRunner(ExecutionRuntime):
                     "work_id": wid,
                     "title": work.get("title") or wid,
                     "url": url,
+                    "route_policy": "auto",
+                    "source_kind": "pdf" if preferred and preferred["kind"] == "pdf" else "auto",
                     "fallback_urls": [pdf_fallback] if pdf_fallback and pdf_fallback != url else [],
                     "section_markers": ["Introduction"],
                 }, True))
@@ -1528,9 +1766,8 @@ class SurveyRunner(ExecutionRuntime):
                     break
         for index, (route, auto_discovered) in enumerate(routes):
             wid = self.aliases.get(route["work_id"], route["work_id"])
-            # Explicit routes are user-authored evidence requests. Automatic
-            # routes are only a second-pass deep-analysis surface; never spend
-            # the full-text budget on the long-tailed catalog.
+            # Automatic routes are only a second-pass deep-analysis surface;
+            # never spend the full-text budget on the long-tailed catalog.
             if auto_discovered and wid not in selected_ids:
                 continue
             if wid not in self.works or wid in self.full_text_attempted:
@@ -1539,19 +1776,23 @@ class SurveyRunner(ExecutionRuntime):
                 self.gaps.append({"kind": "full_text_limit", "work_id": wid})
                 break
             self.full_text_attempted.add(wid)
-            candidate_urls = list(dict.fromkeys([route["url"], *route.get("fallback_urls", [])]))[:2]
+            candidate_sources = [(route["url"], route.get("source_kind", "auto"))]
+            candidate_sources.extend((url, "pdf") for url in route.get("fallback_urls", []))
+            candidate_sources = list(dict.fromkeys(candidate_sources))[:2]
             verified_source = None
             unverified_source = None
-            for source_index, source_url in enumerate(candidate_urls):
+            for source_index, (source_url, source_kind) in enumerate(candidate_sources):
                 self._record(f"command/source-attempts/full-text/{wid}-{source_index + 1}", "note", {
                     "work_id": wid, "url": source_url, "status": "reserved",
+                    "source_kind": source_kind,
                     "route": "primary" if source_index == 0 else "open_access_pdf_fallback",
                     "scope": "One bounded source attempt; access denials are retained without bypass.",
                 }, "command.controller", subjects=[self.work_records[wid]["artifact_ref"]])
                 try:
                     self._wait_provider("full_text")
                     result, execution = self.operations.run(self.bindings["full_text"],
-                        {"url": source_url, "max_length": self.bounds["max_text_chars"]}, self._call,
+                        {"url": source_url, "max_length": self.bounds["max_text_chars"],
+                         "source_kind": source_kind}, self._call,
                         operator="research.full-text-reader")
                 except Exception as exc:
                     self._ensure_active()
@@ -1584,7 +1825,7 @@ class SurveyRunner(ExecutionRuntime):
                     })
                     if result.get("outcome") in {
                             "access_denied", "auth_required", "rate_limited", "robots_denied",
-                            "robots_unavailable", "provider_error"}:
+                            "robots_unavailable"}:
                         break
                     continue
                 text = result["text"]
@@ -1803,6 +2044,8 @@ class SurveyRunner(ExecutionRuntime):
             effective = dict(base)
             if isinstance(overrides, dict):
                 effective.update(overrides)
+            if is_local_qwen_route(effective):
+                return
             window = effective.get("context_window_tokens")
             input_limit = effective.get("max_input_tokens")
             output_limit = effective.get("max_output_tokens")
@@ -1814,11 +2057,10 @@ class SurveyRunner(ExecutionRuntime):
                 candidates.append(allowed)
 
         role_models = base.get("role_models", {})
-        selected = role_models.get(role) if isinstance(role_models, dict) else None
+        selected = role_config_for(role_models, role)
         fallbacks = base.get("role_model_fallbacks", {})
-        role_fallbacks = fallbacks.get(role, []) if isinstance(fallbacks, dict) else []
-        routes_by_role = base.get("role_routes", {})
-        routes = routes_by_role.get(role, []) if isinstance(routes_by_role, dict) else []
+        role_fallbacks = role_config_for(fallbacks, role, [])
+        routes = role_routes_for(base, role)
 
         # An explicit role selection is the admission contract for that role.
         # The global model is only a candidate when no role-specific model,
@@ -2464,6 +2706,7 @@ class SurveyRunner(ExecutionRuntime):
         assignment = self._fit_map_assignment(assignment, owner_id=wid)
         sources = assignment["sources"]
         own_sources = [source for source in sources if source["work_id"] == wid]
+        projection_issues = []
 
         # A catalog-only record cannot support substantive prose.  Asking a
         # model to restate that negative evidence repeatedly creates a
@@ -2501,10 +2744,19 @@ class SurveyRunner(ExecutionRuntime):
             }
 
         def normalize(value):
+            projection_issues.clear()
             value = normalize_map_relationships(value)
             if not own_sources:
                 return source_less_value(value)
-            return self._bind_visible_spans(value, sources)
+            windows = {source["source_ref"]: source["window"]
+                       for source in sources if isinstance(source.get("window"), dict)}
+            return normalize_map_worker_response(
+                value, work_id=wid, all_work_ids=set(self.works),
+                sources=sources, windows=windows,
+                entry_editable=entry_editable, previous=previous,
+                review_feedback=review_feedback,
+                projection_issues=projection_issues,
+            )
 
         effective = {}
         def validate(value):
@@ -2542,6 +2794,29 @@ class SurveyRunner(ExecutionRuntime):
                 record = self._record(f"kb/relationships/{key}", "note", relationship,
                     "research.literature-mapper", subjects=[execution, *[proof["source_ref"] for proof in relationship["claim"]["evidence"]]])
                 self.relationships[key] = {**relationship, "artifact_ref": record["artifact_ref"]}
+            projection_ref = None
+            if projection_issues:
+                execution_key = hashlib.sha256(execution.encode("utf-8")).hexdigest()[:20]
+                projection = self._record(
+                    f"command/map-projections/{wid}-{execution_key}", "decision_note", {
+                        "work_id": wid,
+                        "execution_ref": execution,
+                        "outcome": "unsupported or ungranted response content was excluded",
+                        "issues": deepcopy(projection_issues),
+                    }, "command.controller", subjects=[execution, *basis])
+                projection_ref = projection["artifact_ref"]
+            if (entry["inclusion"] == "uncertain"
+                    and entry["reason"] == ABSTENTION_REASONS["unverified_map"]
+                    and all(entry[field]["text"] is None for field in MAP_FIELDS)):
+                entry_hash = hashlib.sha256(canonical_bytes(entry)).hexdigest()
+                self._record(f"command/survey-abstentions/{wid}", "note", {
+                    "work_id": wid,
+                    "reason": entry["reason"],
+                    "scope": "unverified_map",
+                    "entry_sha256": entry_hash,
+                    "execution_ref": execution,
+                    "projection_ref": projection_ref,
+                }, "command.controller", subjects=[execution, *([projection_ref] if projection_ref else [])])
 
         def abstain(state):
             null = {"text": None, "evidence": []}
@@ -2764,10 +3039,11 @@ class SurveyRunner(ExecutionRuntime):
             "review_contract": {
                 "decision": "Whether the retained evidence map faithfully represents the captured sources and its disclosed limitations.",
                 "upstream_checks": "Focused reviewers check individual claims and exact source spans; the acceptance gate replays their pinned executions and validates spans independently.",
-                "downstream_decisions": "Gap nomination and counter-search assess novelty; experiments test the research question; manuscript peer review judges the final contribution.",
-                "question_status": "A research question is not an established claim or a required survey conclusion. Its answer remains undecided by this acceptance decision.",
-                "non_assertions": "Excluded, deferred, and null fields do not assert scientific support. Missing support for an absent assertion is not a source-fidelity failure.",
-                "failure_basis": "Identify a specific unsupported assertion, inconsistent accounting, misrepresented source, or missing focused review. Report incomplete coverage honestly without requiring exhaustive retrieval or an answer to the research question. The map and source lists are claim-bearing projections; their omitted counts are explicit in map.projection and the full inventory counts are in coverage and deterministic_integrity. The deterministic_integrity block is computed from the full survey state; do not invent a missing map entry or relationship endpoint that contradicts it.",
+            "downstream_decisions": "Gap nomination and counter-search assess novelty; experiments test the research question; manuscript peer review judges the final contribution.",
+            "question_status": "A research question is not an established claim or a required survey conclusion. Its answer remains undecided by this acceptance decision.",
+            "source_fidelity_scope": "Assess whether each assertion actually retained in the map is accurately represented by its cited source and focused review. Do not require any captured source to answer or directly address the research question. If the question remains unanswered, record that as an unresolved gap or coverage limitation for downstream gap nomination and counter-search; it is not source-fidelity insufficiency when all retained assertions are supported.",
+            "non_assertions": "Excluded, deferred, and null fields do not assert scientific support. Missing support for an absent assertion is not a source-fidelity failure.",
+            "failure_basis": "Identify a specific unsupported assertion, inconsistent accounting, misrepresented source, or missing focused review. Mark source-fidelity insufficient only when support for a retained assertion cannot be determined from its cited source and focused review, not because the research question lacks a direct answer in the corpus. Report incomplete coverage honestly without requiring exhaustive retrieval or an answer to the research question. The map and source lists are claim-bearing projections; their omitted counts are explicit in map.projection and the full inventory counts are in coverage and deterministic_integrity. The deterministic_integrity block is computed from the full survey state; do not invent a missing map entry or relationship endpoint that contradicts it.",
             },
             "deterministic_integrity": deterministic_integrity,
             "projection": projection,
@@ -2801,6 +3077,14 @@ class SurveyRunner(ExecutionRuntime):
         relationships = packet["map"]["relationships"]
         sources = packet["sources"]
         source_refs = {source.get("source_ref") for source in sources}
+        conflicted_identity_ids = set()
+        for work_id, record in self.identity_records.items():
+            try:
+                identity = self._body(record)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if identity.get("status") == "conflicted":
+                conflicted_identity_ids.add(work_id)
         focused = {review.get("work_id"): review
                    for review in packet["focused_review_summary"]}
         coverage_errors = []
@@ -2821,6 +3105,10 @@ class SurveyRunner(ExecutionRuntime):
         for entry in entries:
             work_id = entry.get("work_id")
             has_claim = False
+            if (entry.get("inclusion") == "included"
+                    and work_id in conflicted_identity_ids):
+                support_errors.append(
+                    f"{work_id} is included in the map despite a conflicted bibliographic identity")
             for field in MAP_FIELDS:
                 statement = entry.get(field) or {}
                 if statement.get("text") is None:
@@ -2869,8 +3157,9 @@ class SurveyRunner(ExecutionRuntime):
         ]
         value = {"checks": checks,
                  "rationale": (
-                     "Deterministic aggregate admission was used after the model review envelope failed; "
-                     "the retained per-work reviews and exact evidence references were replayed without a new provider call."
+                     "Controller-recomputed counts, source bindings, identity status, and pinned per-work reviews "
+                     "were used to resolve the aggregate decision without another provider call. Incomplete "
+                     "coverage remains disclosed and does not invalidate otherwise supported map claims."
                  )}
         validate_survey_review(value)
         execution = self._record(
@@ -3080,7 +3369,7 @@ class SurveyRunner(ExecutionRuntime):
                 "Outcomes passed/failed/insufficient_evidence/check_failed. Passing approves a faithful bounded survey, not novelty or exhaustive coverage. "
                 "Check accurate coverage/accounting, faithful quotations and source scope, and support for every asserted map claim. "
                 "The question is a hypothesis for later investigation, not a claim that this survey must prove or disprove. "
-                "A lack of an answer to it is not a failed map-support check. Use the explicit count_definitions rather than equating different counters. The deterministic_integrity block is a controller-computed checksum of the exact packet: treat its endpoint and count booleans as authoritative for packet accounting, and do not report a missing map entry when the corresponding boolean is true. "
+                "A lack of an answer to it is not a failed map-support check or source-fidelity failure when all retained map assertions are supported. Source-fidelity assesses the truth and scope of existing assertions, not whether this corpus answers the research question; an unanswered question belongs to downstream gap nomination and counter-search. Use insufficient_evidence for source-fidelity only when support for a retained assertion itself cannot be determined from its cited source and focused review. Use the explicit count_definitions rather than equating different counters. The deterministic_integrity block is a controller-computed checksum of the exact packet: treat its endpoint and count booleans as authoritative for packet accounting, and do not report a missing map entry when the corresponding boolean is true. "
                 "The focused-review summary records independent exact-span checks; use it as the primary support for map claims. "
                 "The sources list is an inventory only and intentionally contains no source body or image bytes; do not infer text that is not represented. "
                 "Do not require the aggregate packet to repeat source bytes already checked by the pinned focused reviews. "
@@ -3090,6 +3379,19 @@ class SurveyRunner(ExecutionRuntime):
                 "fail unsupported chronology or superiority inferred from it. The map entries and sources are deliberate claim-bearing projections; use their projection counts and deterministic_integrity rather than recounting omitted rows. "
                 "Keep each method/result to one short sentence and rationale under 120 words; cite specific problems instead of enumerating the corpus."
         }
+        if (self.resume_session
+                and "integrated_review" in self.resume_session.get("reopened_scopes", [])):
+            session = self.resume_session.get("session")
+            if type(session) is int and session >= 1:
+                review_assignment["resume_boundary"] = f"survey-review-resume-{session}"
+            review_assignment["instructions"] += (
+                " This is a focused re-review of the same retained map, not a new literature search. "
+                "Do not treat missing full text, incomplete pagination, or an unresolved question as "
+                "a source-fidelity failure when every included assertion remains supported by its "
+                "captured source and pinned focused review. Report a concrete unsupported assertion, "
+                "identity conflict in an included work, or accounting inconsistency if one exists; "
+                "otherwise pass the map and retain corpus limits as explicit coverage limitations."
+            )
         deterministic_review = False
         try:
             value, execution = self._model_checked(
@@ -3111,6 +3413,31 @@ class SurveyRunner(ExecutionRuntime):
             value, execution = self._deterministic_survey_review(
                 review_packet, bundle["artifact_ref"], exc)
             deterministic_review = True
+        if not deterministic_review:
+            outcomes = {
+                row.get("check_id"): row.get("outcome")
+                for row in value.get("checks", [])
+                if isinstance(row, dict)
+            } if isinstance(value, dict) and isinstance(value.get("checks"), list) else {}
+            if (outcomes.get("coverage-accounting") == "passed"
+                    and outcomes.get("map-support") == "passed"
+                    and outcomes.get("source-fidelity") == "insufficient_evidence"):
+                source_fidelity = next(
+                    row for row in value["checks"]
+                    if row.get("check_id") == "source-fidelity")
+                limitation = "; ".join(
+                    str(source_fidelity.get(key) or "")
+                    for key in ("method", "result")
+                )[:2048]
+                value, execution = self._deterministic_survey_review(
+                    review_packet,
+                    bundle["artifact_ref"],
+                    ValidationError(
+                        "aggregate reviewer marked source fidelity insufficient while "
+                        "coverage accounting and claim-level map support passed: " + limitation
+                    ),
+                )
+                deterministic_review = True
         review_body = {"survey_ref": bundle["artifact_ref"], "execution_ref": execution, **value}
         if deterministic_review:
             review_body["verification_kind"] = "deterministic_aggregate"
@@ -3183,6 +3510,10 @@ class SurveyRunner(ExecutionRuntime):
 
     def _assess(self):
         assessment_sources = self._assessment_source_context()
+        resume_gap_assessment = bool(
+            self.resume_session
+            and "gap_assessment" in self.resume_session.get("reopened_scopes", [])
+        )
         assessment_assignment = {
             "assignment": "Independently determine the status of the nominated gap using the current accepted survey and targeted counter-search.",
             "phase": "gap_assessment", "question": self.score["question"], "gap": self.nomination,
@@ -3216,8 +3547,7 @@ class SurveyRunner(ExecutionRuntime):
                 "Eligibility requires meaningful, testable distinction, no prior solution or unresolved comparison, and adequate search coverage. "
                 "It authorizes an experiment under the stated scope, never publication-ready novelty. Do not force a positive finding to finish the task."
         }
-        if (self.resume_session
-                and "gap_assessment" in self.resume_session.get("reopened_scopes", [])):
+        if resume_gap_assessment:
             # A Composer continuation is an explicit new assessment attempt.
             # Keep the accepted survey and source catalogue, but give the
             # model-work cache a new assignment identity so a previous
@@ -3238,7 +3568,15 @@ class SurveyRunner(ExecutionRuntime):
         assessment_source_lookup = {source["source_ref"]: self.source_docs[source["source_ref"]]
                                     for source in assessment_sources}
         windows = {source["source_ref"]: source["window"] for source in assessment_sources}
+        assessment_evidence_catalog = deepcopy(assessment_assignment["evidence_catalog"])
         verified_full_text_refs = assessment_assignment["verified_full_text_refs"]
+        if resume_gap_assessment:
+            # A resumed assessment is a repair of the decision, not a new
+            # literature pass. Reuse the same evidence IDs and claim index,
+            # but omit repeated source windows and retrieval detail from the
+            # model prompt. Validation still uses the full retained captures
+            # and exact source windows assembled above.
+            assessment_assignment = self._compact_gap_repair_assignment(assessment_assignment)
         def validate_gap_assessment(value):
             validate_assessment(value, assessment_source_lookup, self.works,
                                 require_spans=True, windows=windows)
@@ -3246,13 +3584,19 @@ class SurveyRunner(ExecutionRuntime):
         value, execution = self._model_checked("gap-assessment", "methods.novelty-verifier",
             assessment_assignment, validate_gap_assessment,
             normalizer=lambda value: self._bind_assessment_spans(expand_evidence(
-                normalize_check_envelope(value, GAP_CHECKS),
-                assessment_assignment["evidence_catalog"], self.source_docs,
+                normalize_gap_assessment_envelope(
+                    value, evidence_catalog=assessment_evidence_catalog,
+                    verified_full_text_refs=verified_full_text_refs,
+                    known_work_ids=set(self.works)),
+                assessment_evidence_catalog, self.source_docs,
                 windows=windows), assessment_sources),
-            # This is a compact decision envelope, not a prose generation
-            # task.  A small output cap prevents a provider from spending the
-            # entire response on analysis text and returning no JSON object.
-            model_overrides={"max_output_tokens": 2048, "temperature": 0.0},
+            # Keep the configured output budget for this evidence-heavy
+            # decision. A 2k override caused reasoning-oriented models to hit
+            # finish_reason=length before emitting the required JSON object;
+            # the subsequent schema repair inherited the same cap and failed
+            # identically. Temperature remains deterministic without shrinking
+            # the actual response envelope.
+            model_overrides={"temperature": 0.0},
             stage="integrated_review", task_kind="verification")
         record = self._publish("kb/gap-assessments/current", "note", {
             "survey_ref": self.survey_ref, "nomination_ref": self.nomination_record["artifact_ref"],

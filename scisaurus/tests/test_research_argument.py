@@ -1,15 +1,18 @@
 """Contracts for the pre-composition scientific argument stage."""
 
 import json
+import hashlib
 import unittest
 from unittest.mock import patch
 
 from scisaurus.core.errors import ValidationError
+from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.models import ModelResult
 from scisaurus.runtime.research_argument import (
     ArgumentAdjudicator,
     ResearchArgumentRunner,
     _normalise_argument_candidate,
+    argument_response_repair_prompt,
     argument_evidence_packet,
     argument_prompt,
     validate_argument_review,
@@ -96,6 +99,56 @@ class ResearchArgumentTests(unittest.TestCase):
             "Run a threshold sensitivity sweep.",
         )
 
+    def test_adjudication_repairs_reach_the_next_argument_generation(self):
+        review = {
+            "schema_version": "research-argument-review-1",
+            "decision": "revise",
+            "checks": [{
+                "id": "mechanisms", "outcome": "failed",
+                "evidence": "The causal mechanism is not identified by the supplied comparison.",
+            }],
+            "required_repairs": [{
+                "id": "mechanism", "target": "primary_argument",
+                "problem": "The text claims a causal mechanism from an observational contrast.",
+                "repair": "Narrow the claim to an association and identify the missing causal test.",
+                "verification": "The revised thesis is bounded by the actual design.",
+            }],
+            "rationale": "The evidence supports the association but not the mechanism.",
+        }
+        payload = json.loads(argument_prompt(
+            {"evidence_ids": ["e1"], "scientific_follow_up": []},
+            validation_feedback={
+                "error": "Independent adjudication requested a targeted argument revision.",
+                "previous_response": argument(),
+                "adjudication": review,
+            },
+        ))
+
+        repair = payload["repair_request"]
+        self.assertEqual(repair["adjudication"], review)
+        self.assertIn("every failed check", repair["instructions"])
+        self.assertIn("a format error", repair["instructions"])
+
+    def test_argument_contract_repair_keeps_the_adjudication_repairs(self):
+        review = {
+            "decision": "revise",
+            "checks": [{"id": "evidence", "outcome": "failed",
+                        "evidence": "The current evidence does not identify causality."}],
+            "required_repairs": [{
+                "id": "bound-claim", "target": "primary_argument.thesis",
+                "problem": "The thesis asserts a causal mechanism from an observational comparison.",
+                "repair": "Narrow the thesis to the observed association.",
+                "verification": "The revised thesis makes no causal claim.",
+            }],
+        }
+        prompt = json.loads(argument_response_repair_prompt(
+            {"evidence_ids": ["e1"]}, previous_response="partial JSON",
+            validation_error="missing required field",
+            validation_feedback={"adjudication": review},
+        ))
+        self.assertEqual(prompt["repair_request"]["adjudication"], review)
+        self.assertIn("every failed check", prompt["repair_request"]["instructions"])
+
     def test_argument_normalizer_only_repairs_unambiguous_provider_formatting(self):
         candidate = {"argument": argument()}
         candidate["argument"]["figure_plan"][0]["kind"] = "plot"
@@ -105,6 +158,28 @@ class ResearchArgumentTests(unittest.TestCase):
                                    asset_ids={"figure_metric", "figure_split"})
         self.assertEqual(normalized["figure_plan"][0]["kind"], "figure")
         self.assertTrue(any(item["action"] == "unwrap_provider_envelope" for item in changes))
+
+    def test_argument_normalizer_repairs_explicit_pattern_id_list_serialization(self):
+        value = argument()
+        value["hypotheses"][0]["explains_pattern_ids"] = "metric_divergence; metric_divergence"
+        value["hypotheses"][1]["explains_pattern_ids"] = "- split_heterogeneity"
+
+        normalized, changes = _normalise_argument_candidate(value)
+
+        validate_research_argument(normalized, evidence_ids={"e1", "e2", "e3"})
+        self.assertEqual(normalized["hypotheses"][0]["explains_pattern_ids"], ["metric_divergence"])
+        self.assertEqual(normalized["hypotheses"][1]["explains_pattern_ids"], ["split_heterogeneity"])
+        self.assertEqual(
+            [item["field"] for item in changes if item["action"] == "normalize_generated_string_list"],
+            ["hypotheses[0].explains_pattern_ids", "hypotheses[1].explains_pattern_ids"],
+        )
+
+    def test_argument_normalizer_does_not_split_comma_separated_pattern_prose(self):
+        value = argument()
+        value["hypotheses"][0]["explains_pattern_ids"] = "metric_divergence, split_heterogeneity"
+        with self.assertRaisesRegex(ValidationError, "unknown observed pattern"):
+            normalized, _ = _normalise_argument_candidate(value)
+            validate_research_argument(normalized, evidence_ids={"e1", "e2", "e3"})
 
     def test_requires_competing_hypotheses_and_figure_jobs(self):
         validate_research_argument(argument(), evidence_ids={"e1", "e2", "e3"})
@@ -150,6 +225,19 @@ class ResearchArgumentTests(unittest.TestCase):
         self.assertEqual(normalized["hypotheses"][1]["evidence_ids"], ["e3"])
         self.assertTrue(any(item["action"] == "restore_existing_evidence_links"
                             and item["source"] == "observed_pattern" for item in changes))
+
+    def test_argument_normalizer_maps_unsupported_to_unresolved_without_promoting_claim(self):
+        value = argument()
+        value["hypotheses"][1]["status"] = "unsupported"
+        normalized, changes = _normalise_argument_candidate(
+            value, available_evidence_ids={"e1", "e2", "e3"})
+        validate_research_argument(normalized, evidence_ids={"e1", "e2", "e3"})
+        self.assertEqual(normalized["hypotheses"][1]["status"], "unresolved")
+        self.assertTrue(any(
+            item["action"] == "normalize_conservative_status"
+            and item["from"] == "unsupported" and item["to"] == "unresolved"
+            for item in changes
+        ))
 
     def test_rejects_single_hypothesis(self):
         value = argument()
@@ -261,6 +349,111 @@ class ResearchArgumentTests(unittest.TestCase):
         self.assertEqual(result["model_calls"], 2)
         self.assertEqual(TruncatedClient.calls, 2)
 
+    def test_length_response_uses_compact_fallback_with_enough_output_budget(self):
+        valid = argument()
+        review = {
+            "schema_version": "research-argument-review-1", "decision": "accept",
+            "checks": [
+                {"id": "question", "outcome": "passed", "evidence": "Focused."},
+                {"id": "evidence", "outcome": "passed", "evidence": "Bound."},
+                {"id": "mechanisms", "outcome": "passed", "evidence": "Distinct."},
+                {"id": "experiments", "outcome": "passed", "evidence": "Discriminating."},
+                {"id": "figures", "outcome": "passed", "evidence": "Covered."},
+            ], "required_repairs": [], "rationale": "The map is bounded and traceable.",
+        }
+
+        class RepairClient:
+            configs = []
+            prompts = []
+
+            def __init__(self, **config):
+                self.config = config
+                self.configs.append(config)
+
+            def complete(self, *, system, prompt, images=None):
+                self.prompts.append(json.loads(prompt))
+                assignment = self.prompts[-1]["assignment"]
+                if assignment.startswith("Build a versioned"):
+                    return ModelResult(
+                        text=json.dumps({"schema_version": "research-argument-1"}),
+                        model="primary", usage={"model_calls": 1},
+                        elapsed_seconds=0.01, finish_reason="length")
+                body = review if assignment.startswith("Independently challenge") else valid
+                return ModelResult(text=json.dumps(body), model=self.config["model"],
+                                   usage={"model_calls": 1}, elapsed_seconds=0.01,
+                                   finish_reason="stop")
+
+        packet = {
+            "research_question": "Does the measured sign cross?",
+            "results_package": {
+                "findings": [{"id": "e1", "summary": "Observed result."}],
+                "metrics": [{"id": "e2", "value": 0.0}],
+                "limitations": ["Only the declared range was evaluated."],
+            },
+            "evidence_ids": ["e1", "e2", "e3"],
+            "asset_ids": ["figure_metric", "figure_split"],
+        }
+        model = {
+            "base_url": "http://example.invalid/v1", "model": "primary",
+            "protocol": "openai_compatible", "timeout_seconds": 1,
+            "max_output_tokens": 9000,
+            "role_model_fallbacks": {"strategy.argument": [{
+                "base_url": "http://example.invalid/v1", "model": "fallback",
+                "protocol": "openai_compatible", "max_output_tokens": 9000,
+            }]},
+        }
+        with patch("scisaurus.runtime.research_argument.ModelClient", RepairClient):
+            result = ResearchArgumentRunner(model).run(packet)
+
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(result["model_calls"], 3)
+        self.assertEqual(RepairClient.configs[1]["model"], "fallback")
+        self.assertEqual(RepairClient.configs[1]["max_output_tokens"], 8192)
+        repair_prompt = RepairClient.prompts[1]
+        self.assertNotIn("evidence_packet", repair_prompt)
+        self.assertIn("requires exactly", repair_prompt["validation_error"])
+        self.assertEqual(repair_prompt["grounding_summary"]["allowed_evidence_ids"],
+                         ["e1", "e2", "e3"])
+
+    def test_failed_format_repair_is_bounded_and_accounts_for_both_calls(self):
+        class AlwaysTruncatedClient:
+            calls = 0
+
+            def __init__(self, **config):
+                self.config = config
+
+            def complete(self, *, system, prompt, images=None):
+                self.__class__.calls += 1
+                return ModelResult(
+                    text=json.dumps({"schema_version": "research-argument-1"}),
+                    model=self.config["model"],
+                    usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                    elapsed_seconds=0.01, finish_reason="length",
+                )
+
+        model = {
+            "base_url": "http://example.invalid/v1", "model": "primary",
+            "protocol": "openai_compatible", "timeout_seconds": 1,
+            "max_output_tokens": 8192,
+            "role_model_fallbacks": {"strategy.argument": [{
+                "base_url": "http://example.invalid/v1", "model": "fallback",
+                "protocol": "openai_compatible", "max_output_tokens": 8192,
+            }]},
+        }
+        packet = {
+            "research_question": "Does the measured sign cross?",
+            "results_package": {"findings": [{"id": "e1"}]},
+            "evidence_ids": ["e1", "e2", "e3"],
+            "asset_ids": ["figure_metric", "figure_split"],
+        }
+        with patch("scisaurus.runtime.research_argument.ModelClient", AlwaysTruncatedClient):
+            with self.assertRaisesRegex(ValidationError, "candidate validation failed") as raised:
+                ResearchArgumentRunner(model).run(packet)
+
+        self.assertEqual(AlwaysTruncatedClient.calls, 2)
+        self.assertEqual(raised.exception.usage["model_calls"], 2)
+        self.assertEqual(raised.exception.usage["output_tokens"], 40)
+
     def test_truncated_adjudication_uses_fallback_and_bounded_repair(self):
         review = {"schema_version": "research-argument-review-1", "decision": "accept",
                   "checks": [{"id": "question", "outcome": "passed", "evidence": "Question is focused."},
@@ -272,6 +465,7 @@ class ResearchArgumentTests(unittest.TestCase):
 
         class FallbackClient:
             configs = []
+            prompts = []
             responses = [
                 ModelResult(text="{\"schema_version\":", model="primary",
                             usage={"model_calls": 1, "output_tokens": 4096},
@@ -285,6 +479,7 @@ class ResearchArgumentTests(unittest.TestCase):
                 self.configs.append(config)
 
             def complete(self, *, system, prompt, images=None):
+                self.prompts.append(prompt)
                 return self.responses.pop(0)
 
         model = {
@@ -300,16 +495,25 @@ class ResearchArgumentTests(unittest.TestCase):
                 "protocol": "openai_compatible",
             }]},
         }
+        evidence_packet = {
+            "evidence_ids": ["e1", "e2", "e3"],
+            "asset_ids": ["figure_metric", "figure_split"],
+            "argument_defense": {"claim": "The thesis is bounded.", "basis": ["e1"]},
+            "literature_evidence": [{"work_id": "W_REVIEW", "finding": "Independent evidence."}],
+        }
         with patch("scisaurus.runtime.research_argument.ModelClient", FallbackClient):
             result, usage = ArgumentAdjudicator(model).run(
-                argument(), {"evidence_ids": ["e1", "e2", "e3"],
-                              "asset_ids": ["figure_metric", "figure_split"]},
+                argument(), evidence_packet,
                 max_attempts=2)
         self.assertEqual(result["decision"], "accept")
         self.assertEqual(usage["model_calls"], 2)
         self.assertEqual(FallbackClient.configs[0]["model"], "primary")
         self.assertEqual(FallbackClient.configs[1]["model"], "fallback")
         self.assertLessEqual(FallbackClient.configs[1]["max_output_tokens"], 4096)
+        repaired_prompt = json.loads(FallbackClient.prompts[1])
+        self.assertEqual(repaired_prompt["evidence_packet"], evidence_packet)
+        self.assertEqual(repaired_prompt["argument_defense"], evidence_packet["argument_defense"])
+        self.assertIn("evidence", repaired_prompt["questions"][1].lower())
 
     def test_final_adjudication_is_preserved_when_argument_never_reaches_accept(self):
         valid = argument()
@@ -345,6 +549,53 @@ class ResearchArgumentTests(unittest.TestCase):
         self.assertEqual(str(raised.exception), "research argument adjudication requires revision")
         self.assertEqual(raised.exception.research_review["decision"], "revise")
         self.assertEqual(raised.exception.research_review["required_repairs"][0]["id"], "mechanism")
+
+    def test_generation_failure_preserves_the_review_for_the_candidate_it_describes(self):
+        valid = argument()
+        revision = {"schema_version": "research-argument-review-1", "decision": "revise",
+                    "checks": [{"id": "question", "outcome": "passed", "evidence": "Question is focused."},
+                               {"id": "evidence", "outcome": "passed", "evidence": "Observations are bound."},
+                               {"id": "mechanisms", "outcome": "failed", "evidence": "The causal bridge is unsupported."},
+                               {"id": "experiments", "outcome": "passed", "evidence": "Tests discriminate."},
+                               {"id": "figures", "outcome": "passed", "evidence": "Figure jobs are explicit."}],
+                    "required_repairs": [{"id": "mechanism", "target": "primary_argument",
+                                           "problem": "causal bridge", "repair": "downgrade the claim to association",
+                                           "verification": "link the claim to the discriminating test"}],
+                    "rationale": "The mechanism claim needs a bounded repair."}
+
+        class InvalidRevisionClient:
+            def __init__(self, **config):
+                self.config = config
+                self.argument_generations = 0
+
+            def complete(self, *, system, prompt, images=None):
+                packet = json.loads(prompt)
+                assignment = packet.get("assignment")
+                if assignment.startswith("Build a versioned scientific argument"):
+                    body = ({**valid, "unexpected_field": "must remain visible as a contract failure"}
+                            if packet.get("repair_request") else valid)
+                elif assignment == "Independently challenge the proposed research argument before manuscript composition.":
+                    body = revision
+                else:
+                    body = {**valid, "unexpected_field": "must remain visible as a contract failure"}
+                return ModelResult(text=json.dumps(body), model="fake",
+                                   usage={"model_calls": 1}, elapsed_seconds=0.01,
+                                   finish_reason="stop")
+
+        packet = {"results_package": {"findings": [{"id": "e1"}], "metrics": [{"id": "e2"}],
+                                       "limitations": ["A limitation."]},
+                  "evidence_ids": ["e1", "e2", "e3"]}
+        with patch("scisaurus.runtime.research_argument.ModelClient", InvalidRevisionClient):
+            with self.assertRaises(ValidationError) as raised:
+                ResearchArgumentRunner({"base_url": "http://example.invalid", "model": "fake",
+                                        "protocol": "openai_compatible", "timeout_seconds": 1,
+                                        "max_output_tokens": 100}).run(packet, max_attempts=2)
+        error = raised.exception
+        self.assertEqual(error.research_argument, valid)
+        self.assertEqual(error.research_review, revision)
+        self.assertEqual(error.research_feedback["adjudication"], revision)
+        self.assertEqual(error.research_review_argument_sha256,
+                         hashlib.sha256(canonical_bytes(valid)).hexdigest())
 
 
 if __name__ == "__main__":

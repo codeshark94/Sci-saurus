@@ -33,7 +33,10 @@ from scisaurus.runtime.models import (
     ModelClient,
     ModelContextBudgetError,
     ModelResult,
+    complete_with_role_fallbacks,
+    effective_model_timeout,
     model_context_budget,
+    model_route_candidates,
     resolve_model_config,
 )
 from scisaurus.runtime.research_program import validate_research_program
@@ -1155,10 +1158,10 @@ class PaperPipelineRunner:
                  release_on_review_limit=False,
                  pipeline_deadline_seconds=DEFAULT_PIPELINE_DEADLINE_SECONDS,
                  review_max_output_tokens=None, review_reasoning_effort="xhigh",
-                 review_call_timeout_seconds=300.0,
+                 review_call_timeout_seconds=None,
                  review_inter_request_interval_seconds=0.5,
                  repair_max_output_tokens=None,
-                 model_call_timeout_seconds=300.0,
+                 model_call_timeout_seconds=None,
                  model_concurrency=1,
                  review_arbiter_enabled=False,
                  argument=None, argument_review=None, initial_argument_package=None,
@@ -1202,12 +1205,15 @@ class PaperPipelineRunner:
         if review_reasoning_effort not in {"none", "low", "medium", "high", "xhigh"}:
             raise ValidationError("review_reasoning_effort is unsupported")
         for name, value in (("review_call_timeout_seconds", review_call_timeout_seconds),
-                            ("review_inter_request_interval_seconds", review_inter_request_interval_seconds),
                             ("model_call_timeout_seconds", model_call_timeout_seconds)):
-            if (type(value) not in (int, float) or not math.isfinite(value)
-                    or value < 0 or (name != "review_inter_request_interval_seconds" and value <= 0)):
-                raise ValidationError(f"{name} must be finite and positive" if name != "review_inter_request_interval_seconds"
-                                      else f"{name} must be finite and non-negative")
+            if (value is not None and
+                    (type(value) not in (int, float) or not math.isfinite(value) or value <= 0)):
+                raise ValidationError(f"{name} must be finite and positive when supplied")
+        if (type(review_inter_request_interval_seconds) not in (int, float)
+                or not math.isfinite(review_inter_request_interval_seconds)
+                or review_inter_request_interval_seconds < 0):
+            raise ValidationError(
+                "review_inter_request_interval_seconds must be finite and non-negative")
         if (repair_max_output_tokens is not None
                 and (type(repair_max_output_tokens) is not int or repair_max_output_tokens <= 0)):
             raise ValidationError("repair_max_output_tokens must be a positive integer when supplied")
@@ -1215,10 +1221,15 @@ class PaperPipelineRunner:
             raise ValidationError("model_concurrency must be a positive integer")
         self.review_max_output_tokens = review_max_output_tokens
         self.review_reasoning_effort = review_reasoning_effort
-        self.review_call_timeout_seconds = float(review_call_timeout_seconds)
+        self.review_call_timeout_seconds = (
+            float(review_call_timeout_seconds)
+            if review_call_timeout_seconds is not None else None)
         self.review_inter_request_interval_seconds = float(review_inter_request_interval_seconds)
         self.repair_max_output_tokens = repair_max_output_tokens
-        self.model_call_timeout_seconds = float(model_call_timeout_seconds)
+        self.model_call_timeout_seconds = (
+            float(model_call_timeout_seconds)
+            if model_call_timeout_seconds is not None else None)
+        self._writer_candidate_configs = []
         self.model_concurrency = model_concurrency
         if (type(argument_deadline_seconds) not in (int, float)
                 or not math.isfinite(argument_deadline_seconds) or argument_deadline_seconds <= 0):
@@ -1412,8 +1423,9 @@ class PaperPipelineRunner:
                         for review in package.get("reviews", [])))
 
     def _client(self, *, max_output_tokens=None, reasoning_effort=None, deadline=None,
-                role="editorial.writer"):
-        config = deepcopy(self.model_config)
+                role="editorial.writer", model_config=None):
+        config = deepcopy(model_config if isinstance(model_config, dict)
+                           else self.model_config)
         if max_output_tokens is not None:
             config["max_output_tokens"] = max_output_tokens
         if reasoning_effort is not None:
@@ -1421,11 +1433,52 @@ class PaperPipelineRunner:
         remaining = self._remaining() if deadline is None else deadline - time.monotonic()
         if remaining < 0.2:
             raise ValidationError("paper pipeline deadline exceeded")
-        config["timeout_seconds"] = min(float(config["timeout_seconds"]), remaining,
-                                         self.model_call_timeout_seconds)
-        return ModelClient(**resolve_model_config(config, role=role))
+        config = resolve_model_config(config, role=role)
+        config["timeout_seconds"] = effective_model_timeout(
+            config.get("timeout_seconds"), remaining, self.model_call_timeout_seconds)
+        return ModelClient(**config)
 
     def _writer_context_projection(self, payload, system):
+        routes = model_route_candidates(self.model_config, role="editorial.writer")
+        candidates = []
+        failures = []
+        for route_index, config in enumerate(routes):
+            try:
+                prompt, audit = self._writer_context_projection_for_route(
+                    payload, system, config)
+            except ModelContextBudgetError as exc:
+                failures.append(exc)
+                continue
+            candidates.append((
+                audit["projection_rank"], route_index, prompt, audit, config))
+        if not candidates:
+            if failures:
+                raise failures[-1]
+            raise ValidationError("no manuscript writer route is available")
+
+        _rank, selected_index, prompt, audit, selected_config = min(
+            candidates, key=lambda item: (item[0], item[1]))
+        fitting_routes = [
+            config for config in routes
+            if model_context_budget(config, system=system, prompt=prompt)["fits"]
+        ]
+        selected_identity = tuple(selected_config.get(key) for key in (
+            "protocol", "base_url", "model", "auth_env"))
+        self._writer_candidate_configs = [selected_config] + [
+            config for config in fitting_routes
+            if tuple(config.get(key) for key in (
+                "protocol", "base_url", "model", "auth_env")) != selected_identity
+        ]
+        audit["route_selection"] = {
+            "selected_model": selected_config.get("model"),
+            "selected_route_index": selected_index,
+            "context_fit_route_models": [config.get("model")
+                                          for config in self._writer_candidate_configs],
+            "reason": "least-compacted valid packet; configured route order breaks ties",
+        }
+        return prompt, audit
+
+    def _writer_context_projection_for_route(self, payload, system, config):
         """Fit one writer or writer-repair packet to its resolved route.
 
         The packet is reduced by scientific priority, never by an arbitrary
@@ -1434,7 +1487,6 @@ class PaperPipelineRunner:
         into the next prompt.  This makes a context overflow change the input
         contract on the next attempt instead of creating an identical retry.
         """
-        config = resolve_model_config(self.model_config, role="editorial.writer")
         candidates = (
             ("references_720", 720, True),
             ("references_480", 480, True),
@@ -1445,7 +1497,7 @@ class PaperPipelineRunner:
         )
         best_fit = None
         audit_steps = []
-        for mode, abstract_chars, include_review in candidates:
+        for projection_rank, (mode, abstract_chars, include_review) in enumerate(candidates):
             projected = project_writer_packet(
                 self.packet, self.paper_config,
                 abstract_chars=abstract_chars,
@@ -1461,10 +1513,11 @@ class PaperPipelineRunner:
                 "estimated_input_tokens": budget["estimated_input_tokens"],
                 "allowed_input_tokens": budget["allowed_input_tokens"],
                 "prompt_bytes": len(prompt.encode("utf-8")),
+                "projection_rank": projection_rank,
             }
             audit_steps.append(step)
             if budget["fits"]:
-                best_fit = (prompt, step, budget)
+                best_fit = (prompt, step, budget, projection_rank)
                 reserve = min(
                     WRITER_CONTEXT_RESERVE_TOKENS,
                     max(4_096, int(config.get("max_output_tokens", 0) or 0)),
@@ -1479,16 +1532,18 @@ class PaperPipelineRunner:
                         "selected": step,
                         "target_input_tokens": target,
                         "steps": audit_steps,
+                        "projection_rank": projection_rank,
                     }
                     return prompt, audit
         if best_fit is not None:
-            prompt, selected, budget = best_fit
+            prompt, selected, budget, projection_rank = best_fit
             return prompt, {
                 "schema_version": "paper-writer-context-projection-1",
                 "selected": selected,
                 "target_input_tokens": None,
                 "steps": audit_steps,
                 "warning": "fit within route limit but exceeded the preferred repair reserve",
+                "projection_rank": projection_rank,
             }
         # The last candidate is the smallest semantically valid packet.  Raise
         # a typed local admission result so the Composer can record the exact
@@ -1506,7 +1561,8 @@ class PaperPipelineRunner:
         # stage blocked; the full unbounded values remain in their source
         # artifacts and are available to a later targeted review.
         for level, (max_string_chars, max_list_items) in enumerate((
-                (2400, 256), (1600, 256), (1000, 192), (700, 128), (480, 96)), 1):
+                (2400, 256), (1600, 256), (1000, 192), (700, 128), (480, 96),
+                (320, 64), (240, 48), (160, 32), (96, 16)), 1):
             compacted = _bound_writer_context(
                 smallest, max_string_chars=max_string_chars,
                 max_list_items=max_list_items)
@@ -1527,6 +1583,7 @@ class PaperPipelineRunner:
                     "target_input_tokens": compact_budget["allowed_input_tokens"],
                     "steps": audit_steps,
                     "compaction_level": level,
+                    "projection_rank": len(candidates) + level,
                 }
         message = (
             f"writer context projection cannot fit {budget['estimated_input_tokens']} "
@@ -1598,10 +1655,45 @@ class PaperPipelineRunner:
                 max_attempts=self.research_redteam_max_attempts,
                 max_workers=min(self.model_concurrency, 3),
             )
-            redteam = redteam_runner.run(
-                redteam_packet,
-                artifact_dir=self.output / "research-red-team",
-            )
+            try:
+                redteam = redteam_runner.run(
+                    redteam_packet,
+                    artifact_dir=self.output / "research-red-team",
+                )
+            except Exception as exc:
+                partial_usage = getattr(exc, "usage", {})
+                if isinstance(partial_usage, dict):
+                    self.research_redteam_usage = {
+                        key: int(partial_usage.get(key, 0))
+                        for key in ("model_calls", "input_tokens", "output_tokens")
+                        if type(partial_usage.get(key, 0)) in (int, float)
+                        and partial_usage.get(key, 0) >= 0
+                    }
+                self.research_redteam = {
+                    "status": "incomplete",
+                    "usage": deepcopy(self.research_redteam_usage),
+                }
+                failure_path = self.output / "research-red-team-failure.json"
+                failure_path.write_bytes(canonical_bytes({
+                    "schema_version": "research-red-team-failure-1",
+                    "status": "incomplete",
+                    "error": f"{type(exc).__name__}: {exc}"[:2400],
+                    "failure_class": getattr(exc, "failure_class", None),
+                    "usage": deepcopy(self.research_redteam_usage),
+                    "diagnostics": deepcopy(getattr(exc, "diagnostics", [])),
+                    "model_diagnostics": deepcopy(
+                        getattr(exc, "model_diagnostics", {})),
+                    "input_path": str(redteam_input_path),
+                    "input_sha256": hashlib.sha256(
+                        canonical_bytes(redteam_packet)).hexdigest(),
+                }))
+                exc.usage = self._pipeline_usage()
+                exc.model_diagnostics = {
+                    **(exc.model_diagnostics if isinstance(
+                        getattr(exc, "model_diagnostics", None), dict) else {}),
+                    "research_red_team_artifact": str(failure_path),
+                }
+                raise
             validate_redteam_package(redteam)
             self.research_redteam = redteam
             self.research_redteam_usage = deepcopy(redteam["usage"])
@@ -2087,8 +2179,14 @@ class PaperPipelineRunner:
             })
             projection_path = self.output / f"writer-context-projection-{attempt + 1}.json"
             projection_path.write_bytes(canonical_bytes(projection_audit))
-            result = self._client(deadline=self.deadline, role="editorial.writer").complete(
-                system=system, prompt=prompt)
+            result, provider_route_history = complete_with_role_fallbacks(
+                self.model_config, role="editorial.writer", system=system,
+                prompt=prompt, deadline=self.deadline,
+                candidate_configs=self._writer_candidate_configs,
+                client_factory=lambda **route: self._client(
+                    deadline=self.deadline, role="editorial.writer",
+                    model_config=route),
+            )
             attempts.append(result)
             # Preserve every failed candidate as a durable feedback input.  A
             # later composer retry can inspect the exact contract failure
@@ -2099,6 +2197,7 @@ class PaperPipelineRunner:
                 "finish_reason": result.finish_reason,
                 "response": result.text,
                 "usage": result.usage,
+                "provider_route_history": provider_route_history,
             }))
             for key in usage:
                 usage[key] += result.usage.get(key, 0)
@@ -2132,6 +2231,7 @@ class PaperPipelineRunner:
                 "elapsed_seconds": sum(item.elapsed_seconds for item in attempts),
                 "argument_sha256": (hashlib.sha256(canonical_bytes(argument)).hexdigest()
                                     if argument is not None else None),
+                "provider_route_history": provider_route_history,
                 "draft": draft,
             }
             (self.output / "writer-response.json").write_bytes(canonical_bytes(response))
@@ -2321,15 +2421,22 @@ class PaperPipelineRunner:
                     prompt = json.dumps(retry_payload, ensure_ascii=False, sort_keys=True)
                 else:
                     prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-                result = self._client(max_output_tokens=self.repair_max_output_tokens,
-                                      reasoning_effort=self.review_reasoning_effort,
-                                      role="editorial.surgical-editor").complete(
-                    system=system, prompt=prompt)
+                result, provider_route_history = complete_with_role_fallbacks(
+                    self.model_config, role="editorial.surgical-editor",
+                    system=system, prompt=prompt, deadline=self.deadline,
+                    output_token_cap=self.repair_max_output_tokens,
+                    client_factory=lambda **route: self._client(
+                        max_output_tokens=self.repair_max_output_tokens,
+                        reasoning_effort=self.review_reasoning_effort,
+                        deadline=self.deadline,
+                        role="editorial.surgical-editor", model_config=route),
+                )
                 attempts.append(result)
                 (self.output / f"repair-round-{repair_round}-batch-{batch_index + 1}-attempt-{attempt + 1}.json").write_bytes(
                     canonical_bytes({"batch_index": batch_index, "attempt": attempt + 1,
                                      "finish_reason": result.finish_reason, "response": result.text,
-                                     "usage": result.usage}))
+                                     "usage": result.usage,
+                                     "provider_route_history": provider_route_history}))
                 if result.finish_reason != "stop":
                     last_error = ValidationError(f"manuscript repair did not finish normally: {result.finish_reason}")
                     previous = result.text
@@ -2624,7 +2731,9 @@ class PaperPipelineRunner:
                         deadline_seconds=min(self.review_deadline_seconds, self._remaining()),
                         max_output_tokens=self.review_max_output_tokens,
                         reasoning_effort=self.review_reasoning_effort,
-                        call_timeout_seconds=min(self.review_call_timeout_seconds, self._remaining()),
+                        call_timeout_seconds=(
+                            min(self.review_call_timeout_seconds, self._remaining())
+                            if self.review_call_timeout_seconds is not None else None),
                         inter_request_interval_seconds=self.review_inter_request_interval_seconds,
                         arbiter_enabled=self.review_arbiter_enabled,
                         retained_work_dir=self.retained_work_dir,

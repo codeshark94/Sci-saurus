@@ -15,7 +15,13 @@ from scisaurus.core.errors import ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.store import ArtifactStore
 from scisaurus.runtime.config import MIN_WORKER_RESULT_BYTES, validate_config
-from scisaurus.runtime.execution import ExecutionRuntime, _ResultFile
+from scisaurus.runtime.execution import (
+    ExecutionRuntime, _NO_PROVIDER_CAPACITY, _ResultFile,
+)
+from scisaurus.runtime.models import (
+    DEFAULT_MODEL_RATE_LIMIT_COOLDOWN_SECONDS, ModelClient,
+    model_provider_quota_scope, resolve_model_config,
+)
 from scisaurus.tests.test_runner import config
 
 
@@ -37,7 +43,8 @@ def execution_worker(kind, params, channel):
     result = {"text": json.dumps({"started": started, "ended": time.monotonic(), "pid": os.getpid(),
                                    "provider_pool": params.get("provider_pool"),
                                    "route_id": params.get("route_id"),
-                                   "model": params.get("client", {}).get("model")}),
+                                   "model": params.get("client", {}).get("model"),
+                                   "timeout_seconds": params.get("client", {}).get("timeout_seconds")}),
               "model": "simulated", "usage": usage, "elapsed_seconds": time.monotonic() - started,
               "finish_reason": "stop"}
     if assignment.get("malformed"):
@@ -64,6 +71,40 @@ def provider_retry_worker(kind, params, channel):
 def provider_exhaustion_worker(kind, params, channel):
     channel.put({"ok": False, "error": "all configured providers exhausted",
                  "outcome_known": True, "status_code": 429})
+
+
+def same_pool_cooldown_fallback_worker(kind, params, channel):
+    client = params.get("client", {})
+    if client.get("model") != "gemma-local":
+        channel.put({"ok": False, "error": "Ollama Cloud quota exhausted",
+                     "outcome_known": True, "status_code": 429})
+        return
+    result = {"text": json.dumps({
+        "provider_pool": params.get("provider_pool"),
+        "route_id": params.get("route_id"),
+        "model": client.get("model"),
+        "max_input_tokens": client.get("max_input_tokens"),
+        "max_output_tokens": client.get("max_output_tokens"),
+    }), "model": client.get("model"),
+              "usage": {"model_calls": 1, "input_tokens": 10, "output_tokens": 5},
+              "elapsed_seconds": 0.01, "finish_reason": "stop"}
+    channel.put({"ok": True, "result": result})
+
+
+def same_pool_independent_quota_worker(kind, params, channel):
+    client = params.get("client", {})
+    if client.get("model") == "quota-a-model":
+        channel.put({"ok": False, "error": "quota A exhausted",
+                     "outcome_known": True, "status_code": 429})
+        return
+    result = {"text": json.dumps({
+        "provider_pool": params.get("provider_pool"),
+        "route_id": params.get("route_id"),
+        "model": client.get("model"),
+    }), "model": client.get("model"),
+              "usage": {"model_calls": 1, "input_tokens": 10, "output_tokens": 5},
+              "elapsed_seconds": 0.01, "finish_reason": "stop"}
+    channel.put({"ok": True, "result": result})
 
 
 class TestExecutionRuntime(unittest.TestCase):
@@ -97,7 +138,7 @@ class TestExecutionRuntime(unittest.TestCase):
 
     def test_single_pool_rate_limit_stops_pending_dispatch_and_survives_resume(self):
         value = config()
-        value["limits"].update(concurrent_calls=2, wall_clock_seconds=20, checkpoint_seconds=1)
+        value["limits"].update(concurrent_calls=2, wall_clock_seconds=300, checkpoint_seconds=1)
         value["model"].update(base_url="http://127.0.0.1:1/v1", protocol="openai_compatible", timeout_seconds=5)
         value["limits"]["provider_pools"] = {
             "ollama": {"max_concurrent": 1, "base_urls": [value["model"]["base_url"]]}}
@@ -109,15 +150,21 @@ class TestExecutionRuntime(unittest.TestCase):
         outcomes = runtime._call_batch(specs)
         self.assertTrue(all(outcome.get("status_code") == 429 for outcome in outcomes.values()))
         self.assertEqual(runtime.control._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 1)
+        quota_scope = model_provider_quota_scope(value["model"])
+        cooldown_remaining = runtime.provider_cooldowns[quota_scope] - time.monotonic()
+        self.assertGreater(cooldown_remaining, 0)
+        self.assertLessEqual(cooldown_remaining, DEFAULT_MODEL_RATE_LIMIT_COOLDOWN_SECONDS + 1)
         runtime.control.close()
         policy = {"additional_seconds": 20, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
                   "source_changes": {"mode": "reject", "reopen_scopes": []}}
         resumed = ExecutionRuntime(run_dir, validate_config(value), worker_target=provider_exhaustion_worker,
                                    resume_policy=policy)
         self.runtimes.append(resumed)
-        self.assertGreater(resumed.provider_cooldowns["ollama"], time.monotonic())
         spec = self.spec("after-resume")
         spec["params"]["client"] = value["model"]
+        resumed_route = resumed._provider_route(spec)
+        self.assertEqual(resumed_route, _NO_PROVIDER_CAPACITY)
+        self.assertGreater(resumed.provider_cooldowns[quota_scope], time.monotonic())
         self.assertEqual(resumed._call_batch([spec])["after-resume"]["status_code"], 429)
         self.assertEqual(resumed.control._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 1)
 
@@ -192,6 +239,39 @@ class TestExecutionRuntime(unittest.TestCase):
         self.assertEqual(runtime.budget.get_window("run-window")["cumulative_usage"]["model_calls"], 3)
         self.assertTrue(runtime.control.verify_chain()[0])
 
+    def test_route_timeout_is_not_shortened_by_a_global_operation_cap(self):
+        value = config()
+        value["limits"].update(concurrent_calls=2, wall_clock_seconds=1800, checkpoint_seconds=0.05)
+        value["model"]["timeout_seconds"] = 900
+        runtime = ExecutionRuntime(self.root / "route-timeout", validate_config(value),
+                                   worker_target=execution_worker)
+        self.runtimes.append(runtime)
+        outcome = runtime._call_batch([
+            self.spec("slow-route", delay=0.01, timeout=900),
+        ])["slow-route"]
+        self.assertTrue(outcome["ok"], outcome)
+        observed = json.loads(outcome["result"]["text"])
+        self.assertEqual(observed["timeout_seconds"], 900.0)
+
+    def test_parent_timeout_uses_resolved_role_model_timeout(self):
+        value = config()
+        value["limits"].update(concurrent_calls=2, wall_clock_seconds=4, checkpoint_seconds=0.05)
+        value["model"]["timeout_seconds"] = 0.12
+        value["model"]["role_models"] = {
+            "strategy.worker": {"timeout_seconds": 0.8},
+        }
+        runtime = ExecutionRuntime(
+            self.root / "role-route-timeout", validate_config(value),
+            worker_target=execution_worker,
+        )
+        self.runtimes.append(runtime)
+        outcome = runtime._call_batch([
+            self.spec("role-timeout", delay=0.3, timeout=0.12),
+        ])["role-timeout"]
+        self.assertTrue(outcome["ok"], outcome)
+        observed = json.loads(outcome["result"]["text"])
+        self.assertEqual(observed["timeout_seconds"], 0.8)
+
     def test_failed_worker_does_not_discard_valid_siblings(self):
         for known in ("known", "unknown"):
             with self.subTest(known=known):
@@ -263,7 +343,7 @@ class TestExecutionRuntime(unittest.TestCase):
                 {"id": "ollama-route", "pool": "ollama", "base_url": "http://127.0.0.1:1/v1",
                  "protocol": "openai_compatible", "model": "ollama-model", "auth_env": None},
                 {"id": "qwen-route", "pool": "qwen", "base_url": "https://qwen.invalid/v1",
-                 "protocol": "openai_compatible", "model": "qwen-model", "auth_env": None},
+                 "protocol": "openai_compatible", "model": "route-model", "auth_env": None},
             ]
         }
         value["limits"]["provider_pools"] = {
@@ -298,6 +378,47 @@ class TestExecutionRuntime(unittest.TestCase):
         self.assertLessEqual(provider_peak("qwen"), 1)
         self.assertEqual(runtime.control._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 6)
 
+    def test_nested_reviewer_roles_inherit_safe_parent_routes(self):
+        endpoint = "http://127.0.0.1:11434/v1"
+        value = config()
+        value["model"].update(
+            base_url=endpoint, protocol="openai_compatible", model="deepseek-base",
+            role_routes={"methods.experiment-reviewer": [
+                {"id": "local-qwen", "pool": "ollama", "base_url": endpoint,
+                 "protocol": "openai_compatible", "model": "qwen3.8:27b-mlx",
+                 "auth_env": None},
+                {"id": "gemma", "pool": "ollama", "base_url": endpoint,
+                 "protocol": "openai_compatible", "model": "gemma4:31b-cloud",
+                 "auth_env": None},
+                {"id": "deepseek", "pool": "ollama", "base_url": endpoint,
+                 "protocol": "openai_compatible", "model": "deepseek-v4.1-flash:cloud",
+                 "auth_env": None},
+            ]},
+        )
+        value["limits"]["provider_pools"] = {
+            "ollama": {"max_concurrent": 3, "base_urls": [endpoint]},
+        }
+        runtime = ExecutionRuntime(
+            self.root / "nested-reviewer-routing", validate_config(value),
+            worker_target=execution_worker)
+        self.runtimes.append(runtime)
+        role = "methods.experiment-reviewer.statistical_method"
+        spec = self.spec("nested-reviewer")
+        spec["actor"] = role
+        spec["params"].update(client=value["model"], role=role)
+        spec["_provider_route_override"] = {
+            "id": "stale-local-qwen", "pool": "ollama",
+            "_effective": {
+                "protocol": "openai_compatible", "base_url": endpoint,
+                "model": "qwen3.8:27b-mlx",
+            },
+        }
+
+        selected = runtime._provider_route(spec)
+
+        self.assertEqual(selected["id"], "gemma")
+        self.assertEqual(selected["_effective"]["model"], "gemma4:31b-cloud")
+
     def test_provider_429_requeues_same_logical_task_on_healthy_route(self):
         value = config()
         value["model"].update(
@@ -305,7 +426,7 @@ class TestExecutionRuntime(unittest.TestCase):
         value["model"]["role_routes"] = {
             "strategy.worker": [
                 {"id": "qwen-route", "pool": "qwen", "base_url": "http://127.0.0.1:1/v1",
-                 "protocol": "openai_compatible", "model": "qwen-model", "auth_env": None},
+                 "protocol": "openai_compatible", "model": "route-model", "auth_env": None},
                 {"id": "gemma-route", "pool": "ollama", "base_url": "http://127.0.0.1:2/v1",
                  "protocol": "openai_compatible", "model": "gemma-model", "auth_env": None},
             ]
@@ -339,6 +460,461 @@ class TestExecutionRuntime(unittest.TestCase):
         self.assertEqual(retry_failures, 1)
         self.assertEqual(runtime.provider_active, {"qwen": 0, "ollama": 0})
 
+    def test_same_pool_cooldown_fallback_uses_configured_route_after_known_429(self):
+        value = config()
+        endpoint = "http://127.0.0.1:11434/v1"
+        value["model"].update(
+            base_url=endpoint, protocol="openai_compatible", model="cloud-model",
+            context_window_tokens=262144, max_input_tokens=245760,
+            max_output_tokens=8192,
+            role_routes={"methods.methodologist": [
+                {"id": "ollama-deepseek", "pool": "ollama", "base_url": endpoint,
+                 "protocol": "openai_compatible", "model": "deepseek-v4.1-flash:cloud",
+                 "auth_env": None, "context_window_tokens": 262144,
+                 "max_input_tokens": 1024, "max_output_tokens": 256},
+                {"id": "ollama-glm", "pool": "ollama", "base_url": endpoint,
+                 "protocol": "openai_compatible", "model": "glm-5.3-flash:cloud",
+                 "auth_env": None, "context_window_tokens": 262144,
+                 "max_input_tokens": 1024, "max_output_tokens": 256},
+            ]},
+            provider_cooldown_fallback={
+                "id": "ollama-local-cooldown-recovery", "pool": "ollama",
+                "protocol": "openai_compatible", "base_url": endpoint,
+                "model": "gemma-local", "auth_env": None,
+                "context_window_tokens": 262144, "max_input_tokens": 4096,
+                "max_output_tokens": 1024, "provider_quota_scope": "ollama-local",
+            },
+        )
+        value["limits"].update(concurrent_calls=2, max_model_calls=10,
+                               wall_clock_seconds=300, checkpoint_seconds=1)
+        value["limits"]["provider_pools"] = {
+            "ollama": {"max_concurrent": 1, "base_urls": [endpoint]}}
+        runtime = ExecutionRuntime(
+            self.root / "same-pool-cooldown-fallback", validate_config(value),
+            worker_target=same_pool_cooldown_fallback_worker)
+        self.runtimes.append(runtime)
+
+        def model_task(task_id):
+            spec = self.spec(task_id, delay=0.01)
+            spec["actor"] = "methods.methodologist"
+            spec["params"]["client"] = runtime.config["model"]
+            spec["params"]["role"] = "methods.methodologist"
+            return spec
+
+        first = runtime._call_batch([model_task("fallback-first")])
+        self.assertTrue(first["fallback-first"]["ok"])
+        first_result = json.loads(first["fallback-first"]["result"]["text"])
+        self.assertEqual(first_result["model"], "gemma-local")
+        self.assertEqual(first_result["route_id"], "ollama-local-cooldown-recovery")
+        self.assertEqual(first_result["provider_pool"], "ollama")
+        self.assertEqual(first_result["max_input_tokens"], 1024)
+        self.assertEqual(first_result["max_output_tokens"], 256)
+        self.assertEqual(runtime.tasks.get("fallback-first")["state"], "awaiting_review")
+        failed_scope = model_provider_quota_scope({
+            "protocol": "openai_compatible", "base_url": endpoint,
+            "auth_env": None,
+        })
+        self.assertGreater(runtime.provider_cooldowns[failed_scope], time.monotonic())
+
+        retry_spec = model_task("fallback-client-construction")
+        selected_route = runtime._provider_route(retry_spec)
+        effective = runtime._route_model_config(retry_spec, selected_route)
+        self.assertEqual(effective["model"], "gemma-local")
+        self.assertEqual(effective["max_input_tokens"], 1024)
+        self.assertEqual(effective["max_output_tokens"], 256)
+        self.assertNotIn("_cooldown_fallback", effective)
+        client = ModelClient(**resolve_model_config(
+            effective, role="methods.methodologist"))
+        self.assertEqual(client.model, "gemma-local")
+
+        second = runtime._call_batch([model_task("fallback-during-cooldown")])
+        self.assertTrue(second["fallback-during-cooldown"]["ok"])
+        second_result = json.loads(second["fallback-during-cooldown"]["result"]["text"])
+        self.assertEqual(second_result["model"], "gemma-local")
+        self.assertEqual(second_result["route_id"], "ollama-local-cooldown-recovery")
+        self.assertEqual(second_result["max_input_tokens"], 1024)
+        self.assertEqual(second_result["max_output_tokens"], 256)
+        self.assertEqual(runtime.tasks.get("fallback-during-cooldown")["state"], "awaiting_review")
+        self.assertEqual(runtime.provider_active, {"ollama": 0})
+
+        runtime.control.close()
+        resume_policy = {
+            "additional_seconds": 20,
+            "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+            "source_changes": {"mode": "reject", "reopen_scopes": []},
+        }
+        resumed = ExecutionRuntime(
+            self.root / "same-pool-cooldown-fallback", validate_config(value),
+            worker_target=same_pool_cooldown_fallback_worker,
+            resume_policy=resume_policy)
+        self.runtimes.append(resumed)
+        resumed_spec = model_task("fallback-after-resume")
+        resumed_spec["params"]["client"] = resumed.config["model"]
+        resumed_route = resumed._provider_route(resumed_spec)
+        self.assertEqual(resumed_route["id"], "ollama-local-cooldown-recovery")
+        self.assertEqual(resumed_route["_effective"]["model"], "gemma-local")
+
+    def test_local_qwen_cooldown_fallback_is_removed_before_dispatch(self):
+        value = config()
+        endpoint = "http://127.0.0.1:11434/v1"
+        value["model"].update(
+            base_url=endpoint, protocol="openai_compatible", model="cloud-model",
+            provider_cooldown_fallback={
+                "id": "local-qwen", "pool": "ollama",
+                "base_url": endpoint, "protocol": "openai_compatible",
+                "model": "qwen3.8:27b-mlx", "auth_env": None,
+            },
+        )
+        value["limits"]["provider_pools"] = {
+            "ollama": {"max_concurrent": 1, "base_urls": [endpoint]}}
+
+        runtime = ExecutionRuntime(
+            self.root / "local-qwen-cooldown-disabled", validate_config(value),
+            worker_target=execution_worker)
+        self.runtimes.append(runtime)
+        spec = self.spec("local-qwen-cooldown-disabled")
+        spec["actor"] = "methods.methodologist"
+        spec["params"].update(
+            client=runtime.config["model"], role="methods.methodologist")
+
+        self.assertIsNone(runtime._provider_cooldown_fallback_route(spec))
+
+    def test_cooldown_fallback_is_limited_to_known_429(self):
+        value = config()
+        endpoint = "http://127.0.0.1:11434/v1"
+        value["model"].update(
+            base_url=endpoint, protocol="openai_compatible", model="cloud-model",
+            role_routes={"methods.methodologist": [
+                {"id": "ollama-cloud", "pool": "ollama", "base_url": endpoint,
+                 "protocol": "openai_compatible", "model": "deepseek-cloud",
+                 "auth_env": None},
+            ]},
+            provider_cooldown_fallback={
+                "id": "ollama-local-cooldown-recovery", "pool": "ollama",
+                "protocol": "openai_compatible", "base_url": endpoint,
+                "model": "gemma-local", "auth_env": None,
+                "provider_quota_scope": "ollama-local",
+            },
+        )
+        value["limits"]["provider_pools"] = {
+            "ollama": {"max_concurrent": 1, "base_urls": [endpoint]}}
+        runtime = ExecutionRuntime(
+            self.root / "cooldown-fallback-classification", validate_config(value),
+            worker_target=execution_worker)
+        self.runtimes.append(runtime)
+        spec = self.spec("cooldown-fallback-classification")
+        spec["actor"] = "methods.methodologist"
+        spec["params"].update(client=runtime.config["model"], role="methods.methodologist")
+
+        route_config = runtime._base_model_config(spec)
+        runtime._mark_provider_cooldown(
+            "ollama", {"status_code": 503, "outcome_known": True}, route_config)
+        self.assertIs(runtime._provider_route(spec), _NO_PROVIDER_CAPACITY)
+
+        runtime.provider_cooldowns.clear()
+        runtime.provider_cooldown_fallback_allowed.clear()
+        spec["params"]["provider_pool"] = "ollama"
+        entry = {"spec": spec}
+        retry = runtime._provider_retry_spec(
+            entry, {"status_code": 429, "outcome_known": False,
+                    "error": "ambiguous transport outcome"})
+        self.assertIsNone(retry)
+        scope = model_provider_quota_scope(runtime._base_model_config(spec))
+        self.assertFalse(runtime.provider_cooldown_fallback_allowed[scope])
+        self.assertIs(runtime._provider_route(spec), _NO_PROVIDER_CAPACITY)
+
+        runtime.control.close()
+        resume_policy = {
+            "additional_seconds": 20,
+            "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+            "source_changes": {"mode": "reject", "reopen_scopes": []},
+        }
+        resumed = ExecutionRuntime(
+            self.root / "cooldown-fallback-classification", validate_config(value),
+            worker_target=execution_worker, resume_policy=resume_policy)
+        self.runtimes.append(resumed)
+        resumed_spec = self.spec("cooldown-fallback-classification-after-resume")
+        resumed_spec["actor"] = "methods.methodologist"
+        resumed_spec["params"].update(
+            client=resumed.config["model"], role="methods.methodologist")
+        self.assertIs(resumed._provider_route(resumed_spec), _NO_PROVIDER_CAPACITY)
+        self.assertFalse(resumed.provider_cooldown_fallback_allowed[scope])
+
+    def test_same_pool_429_retries_an_independent_quota_scope_before_qwen(self):
+        value = config()
+        endpoint = "http://127.0.0.1:11434/v1"
+        value["model"].update(
+            base_url=endpoint, protocol="openai_compatible", model="quota-a-model",
+            role_routes={"methods.methodologist": [
+                {"id": "quota-a", "pool": "ollama", "base_url": endpoint,
+                 "protocol": "openai_compatible", "model": "quota-a-model",
+                 "auth_env": None, "provider_quota_scope": "quota-a"},
+                {"id": "quota-b", "pool": "ollama", "base_url": endpoint,
+                 "protocol": "openai_compatible", "model": "quota-b-model",
+                 "auth_env": None, "provider_quota_scope": "quota-b"},
+            ]},
+            provider_cooldown_fallback={
+                "id": "ollama-local-cooldown-recovery", "pool": "ollama",
+                "protocol": "openai_compatible", "base_url": endpoint,
+                "model": "gemma-local", "auth_env": None,
+                "provider_quota_scope": "ollama-local",
+            },
+        )
+        value["limits"].update(concurrent_calls=2, max_model_calls=10,
+                               wall_clock_seconds=300, checkpoint_seconds=1)
+        value["limits"]["provider_pools"] = {
+            "ollama": {"max_concurrent": 1, "base_urls": [endpoint]}}
+        runtime = ExecutionRuntime(
+            self.root / "same-pool-independent-quota",
+            validate_config(value), worker_target=same_pool_independent_quota_worker)
+        self.runtimes.append(runtime)
+        spec = self.spec("same-pool-independent-quota")
+        spec["actor"] = "methods.methodologist"
+        spec["params"].update(
+            client=runtime.config["model"], role="methods.methodologist")
+
+        outcome = runtime._call_batch([spec])["same-pool-independent-quota"]
+        self.assertTrue(outcome["ok"])
+        result = json.loads(outcome["result"]["text"])
+        self.assertEqual(result["route_id"], "quota-b")
+        self.assertEqual(result["model"], "quota-b-model")
+        self.assertNotIn("ollama-local-cooldown-recovery", result["route_id"])
+        self.assertIn("quota-a", runtime.provider_cooldowns)
+        self.assertNotIn("quota-b", runtime.provider_cooldowns)
+
+    def test_cooldown_fallback_respects_role_models_limits_after_resume_in_pool(self):
+        value = config()
+        endpoint = "http://127.0.0.1:11434/v1"
+        value["model"].update(
+            base_url=endpoint, protocol="openai_compatible", model="cloud-default",
+            context_window_tokens=262144, max_input_tokens=245760,
+            max_output_tokens=8192,
+            role_models={"methods.methodologist": {
+                "base_url": endpoint, "protocol": "openai_compatible",
+                "model": "deepseek-cloud", "auth_env": None,
+                "provider_quota_scope": "role-cloud-account",
+                "context_window_tokens": 262144, "max_input_tokens": 1024,
+                "max_output_tokens": 256,
+            }},
+            provider_cooldown_fallback={
+                "id": "ollama-local-cooldown-recovery", "pool": "ollama",
+                "protocol": "openai_compatible", "base_url": endpoint,
+                "model": "gemma-local", "auth_env": None,
+                "provider_quota_scope": "ollama-local",
+                "context_window_tokens": 262144, "max_input_tokens": 4096,
+            },
+        )
+        value["model"].pop("max_input_tokens", None)
+        value["model"].pop("max_output_tokens", None)
+        value["model"]["max_output_tokens"] = 8192
+        value["model"]["provider_cooldown_fallback"].pop("max_input_tokens", None)
+        value["limits"].update(concurrent_calls=2, max_model_calls=10,
+                               wall_clock_seconds=300, checkpoint_seconds=1)
+        value["limits"]["provider_pools"] = {
+            "ollama": {"max_concurrent": 1, "base_urls": [endpoint]}}
+        run_dir = self.root / "role-model-cooldown-limits"
+        runtime = ExecutionRuntime(
+            run_dir, validate_config(value),
+            worker_target=same_pool_cooldown_fallback_worker)
+        self.runtimes.append(runtime)
+
+        def model_task(task_id, model_config):
+            spec = self.spec(task_id, delay=0.01)
+            spec["actor"] = "methods.methodologist"
+            spec["params"].update(
+                client=model_config, role="methods.methodologist")
+            return spec
+
+        first = runtime._call_batch([
+            model_task("role-model-fallback-first", runtime.config["model"])
+        ])
+        self.assertTrue(first["role-model-fallback-first"]["ok"])
+        first_result = json.loads(first["role-model-fallback-first"]["result"]["text"])
+        self.assertEqual(first_result["model"], "gemma-local")
+        self.assertEqual(first_result["max_input_tokens"], 1024)
+        self.assertEqual(first_result["max_output_tokens"], 256)
+
+        later = model_task("role-model-fallback-later", runtime.config["model"])
+        selected = runtime._provider_route(later)
+        self.assertEqual(selected["id"], "ollama-local-cooldown-recovery")
+        self.assertEqual(selected["_effective"]["max_input_tokens"], 1024)
+        self.assertEqual(selected["_effective"]["max_output_tokens"], 256)
+
+    def test_cooldown_fallback_cannot_reuse_resolved_or_role_route_quota_scope(self):
+        endpoint = "http://127.0.0.1:11434/v1"
+        for mode in ("role_models", "role_routes"):
+            with self.subTest(mode=mode):
+                value = config()
+                model = value["model"]
+                model.update(
+                    base_url=endpoint, protocol="openai_compatible",
+                    model="global-model", provider_quota_scope="global-scope",
+                    provider_cooldown_fallback={
+                        "id": "same-quota-recovery", "pool": "ollama",
+                        "protocol": "openai_compatible", "base_url": endpoint,
+                        "model": "different-model-same-quota", "auth_env": None,
+                        "provider_quota_scope": "role-quota-a",
+                    },
+                )
+                if mode == "role_models":
+                    model["role_models"] = {"methods.methodologist": {
+                        "base_url": endpoint, "protocol": "openai_compatible",
+                        "model": "role-model", "auth_env": None,
+                        "provider_quota_scope": "role-quota-a",
+                    }}
+                else:
+                    model["role_routes"] = {"methods.methodologist": [{
+                        "id": "role-route", "pool": "ollama",
+                        "base_url": endpoint, "protocol": "openai_compatible",
+                        "model": "role-model", "auth_env": None,
+                        "provider_quota_scope": "role-quota-a",
+                    }]}
+                value["limits"]["provider_pools"] = {
+                    "ollama": {"max_concurrent": 1, "base_urls": [endpoint]}}
+                runtime = ExecutionRuntime(
+                    self.root / f"same-quota-fallback-{mode}",
+                    validate_config(value), worker_target=execution_worker)
+                self.runtimes.append(runtime)
+                route_config = (runtime._base_model_config({
+                    "params": {"client": runtime.config["model"],
+                               "role": "methods.methodologist"},
+                    "actor": "methods.methodologist",
+                }) if mode == "role_models" else {
+                    **runtime.config["model"]["role_routes"]["methods.methodologist"][0],
+                })
+                runtime._mark_provider_cooldown(
+                    "ollama", {"status_code": 429, "outcome_known": True},
+                    route_config)
+                spec = self.spec(f"same-quota-fallback-{mode}")
+                spec["actor"] = "methods.methodologist"
+                spec["params"].update(
+                    client=runtime.config["model"], role="methods.methodologist")
+
+                selected = runtime._provider_route(spec)
+                self.assertIs(selected, _NO_PROVIDER_CAPACITY)
+
+    def test_unscoped_legacy_cooldown_does_not_select_recovery_for_other_scope(self):
+        value = config()
+        endpoint = "http://127.0.0.1:11434/v1"
+        value["model"].update(
+            base_url=endpoint, protocol="openai_compatible", model="quota-a-model",
+            role_routes={"methods.methodologist": [
+                {"id": "quota-a", "pool": "ollama", "base_url": endpoint,
+                 "protocol": "openai_compatible", "model": "quota-a-model",
+                 "auth_env": None, "provider_quota_scope": "quota-a"},
+                {"id": "quota-b", "pool": "ollama", "base_url": endpoint,
+                 "protocol": "openai_compatible", "model": "quota-b-model",
+                 "auth_env": None, "provider_quota_scope": "quota-b"},
+            ]},
+            provider_cooldown_fallback={
+                "id": "ollama-local-cooldown-recovery", "pool": "ollama",
+                "protocol": "openai_compatible", "base_url": endpoint,
+                "model": "gemma-local", "auth_env": None,
+                "provider_quota_scope": "ollama-local",
+            },
+        )
+        value["limits"]["provider_pools"] = {
+            "ollama": {"max_concurrent": 1, "base_urls": [endpoint]}}
+        run_dir = self.root / "legacy-pool-cooldown"
+        runtime = ExecutionRuntime(
+            run_dir, validate_config(value), worker_target=execution_worker)
+        self.runtimes.append(runtime)
+        runtime._publish("command/provider-cooldowns/ollama", "note", {
+            "pool": "ollama", "status_code": 429,
+            "fallback_eligible": True,
+            "not_before_epoch": time.time() + 60,
+        }, "command.controller")
+        runtime._publish("command/provider-cooldowns/scope-quota-a", "note", {
+            "pool": "scope-quota-a", "status_code": 429,
+            "fallback_eligible": True,
+            "not_before_epoch": time.time() + 60,
+        }, "command.controller")
+        runtime.control.close()
+
+        resume_policy = {
+            "additional_seconds": 20,
+            "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+            "source_changes": {"mode": "reject", "reopen_scopes": []},
+        }
+        resumed = ExecutionRuntime(
+            run_dir, validate_config(value), worker_target=execution_worker,
+            resume_policy=resume_policy)
+        self.runtimes.append(resumed)
+        spec = self.spec("legacy-pool-cooldown-resume")
+        spec["actor"] = "methods.methodologist"
+        spec["params"].update(
+            client=resumed.config["model"], role="methods.methodologist")
+
+        selected = resumed._provider_route(spec)
+        self.assertEqual(selected["id"], "quota-a")
+
+    def test_wrong_scope_cooldown_record_cannot_poison_scope_lookup(self):
+        value = config()
+        endpoint = "http://127.0.0.1:11434/v1"
+        value["model"].update(
+            base_url=endpoint, protocol="openai_compatible", model="quota-a-model",
+            role_routes={"methods.methodologist": [
+                {"id": "quota-a", "pool": "ollama", "base_url": endpoint,
+                 "protocol": "openai_compatible", "model": "quota-a-model",
+                 "auth_env": None, "provider_quota_scope": "quota-a"},
+            ]},
+        )
+        value["limits"]["provider_pools"] = {
+            "ollama": {"max_concurrent": 1, "base_urls": [endpoint]}}
+        runtime = ExecutionRuntime(
+            self.root / "wrong-scope-cooldown-note", validate_config(value),
+            worker_target=execution_worker)
+        self.runtimes.append(runtime)
+        runtime._publish(
+            runtime._provider_cooldown_artifact_id("quota-a"), "note", {
+                "pool": "ollama", "quota_scope": "quota-b",
+                "status_code": 429, "fallback_eligible": True,
+                "fallback_basis": {"status_code": 429, "outcome_known": True},
+                "not_before_epoch": time.time() + 60,
+            }, "command.controller")
+        spec = self.spec("wrong-scope-cooldown-note")
+        spec["actor"] = "methods.methodologist"
+        spec["params"].update(
+            client=runtime.config["model"], role="methods.methodologist")
+
+        selected = runtime._provider_route(spec)
+        self.assertEqual(selected["id"], "quota-a")
+        self.assertNotIn("quota-a", runtime.provider_cooldowns)
+
+    def test_scoped_cooldown_requires_known_429_basis_for_fallback(self):
+        value = config()
+        endpoint = "http://127.0.0.1:11434/v1"
+        value["model"].update(
+            base_url=endpoint, protocol="openai_compatible", model="quota-a-model",
+            role_routes={"methods.methodologist": [{
+                "id": "quota-a", "pool": "ollama", "base_url": endpoint,
+                "protocol": "openai_compatible", "model": "quota-a-model",
+                "auth_env": None, "provider_quota_scope": "quota-a",
+            }]},
+            provider_cooldown_fallback={
+                "id": "recovery", "pool": "ollama", "base_url": endpoint,
+                "protocol": "openai_compatible", "model": "gemma-local",
+                "auth_env": None, "provider_quota_scope": "quota-b",
+            },
+        )
+        value["limits"]["provider_pools"] = {
+            "ollama": {"max_concurrent": 1, "base_urls": [endpoint]}}
+        runtime = ExecutionRuntime(
+            self.root / "unproven-scoped-cooldown-note", validate_config(value),
+            worker_target=execution_worker)
+        self.runtimes.append(runtime)
+        runtime._publish(
+            runtime._provider_cooldown_artifact_id("quota-a"), "note", {
+                "pool": "ollama", "quota_scope": "quota-a",
+                "status_code": 429, "fallback_eligible": True,
+                "not_before_epoch": time.time() + 60,
+            }, "command.controller")
+
+        runtime._load_provider_cooldown("quota-a")
+
+        self.assertGreater(runtime.provider_cooldowns["quota-a"], time.monotonic())
+        self.assertFalse(runtime.provider_cooldown_fallback_allowed["quota-a"])
+
     def test_provider_route_exhaustion_returns_failure_for_original_logical_task(self):
         value = config()
         value["model"].update(
@@ -346,7 +922,7 @@ class TestExecutionRuntime(unittest.TestCase):
         value["model"]["role_routes"] = {
             "strategy.worker": [
                 {"id": "qwen-route", "pool": "qwen", "base_url": "http://127.0.0.1:1/v1",
-                 "protocol": "openai_compatible", "model": "qwen-model", "auth_env": None},
+                 "protocol": "openai_compatible", "model": "route-model", "auth_env": None},
                 {"id": "gemma-route", "pool": "ollama", "base_url": "http://127.0.0.1:2/v1",
                  "protocol": "openai_compatible", "model": "gemma-model", "auth_env": None},
             ]

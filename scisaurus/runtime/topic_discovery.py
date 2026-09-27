@@ -26,8 +26,9 @@ import uuid
 from scisaurus.core.errors import QuotaExceededError, ValidationError
 from scisaurus.core.schema import canonical_bytes, json_object
 from scisaurus.runtime.models import (
-    MAX_PROVIDER_SEED, ModelCallError, ModelClient, estimate_input_tokens,
-    model_call_budget_available, resolve_model_config,
+    MAX_PROVIDER_SEED, ModelCallError, ModelClient, effective_model_timeout,
+    estimate_input_tokens, is_local_qwen_route, model_call_budget_available,
+    role_config_for, resolve_model_config,
 )
 from scisaurus.runtime.literature import (
     OpenAlexClient, ProviderCooldownError, provider_cooldown_seconds,
@@ -49,10 +50,12 @@ TOPIC_ABSTRACT_CHARS = 1200
 # permission to run until the mission deadline; the stage budget remains the
 # hard limit on model calls, tokens, and provider requests.
 MAX_BOUNDED_TOPIC_ATTEMPTS = 12
-# A topic-stage provider request is a bounded assignment, not a lease on the
-# entire multi-hour stage.  This cap ensures a stalled Ollama route returns a
-# typed provider failure that the Composer can retry or pivot.
-TOPIC_MODEL_CALL_TIMEOUT_SECONDS = 300.0
+# A novelty rejection is actionable feedback, but repeated local proposals
+# cannot replace the Composer's choice of a different salvage direction.
+MAX_CONSECUTIVE_TOPIC_NOVELTY_REJECTIONS = 2
+# A scoped repair gets one corrected response before the Composer chooses its
+# next branch or escalates the concrete contract failure.
+MAX_CONSECUTIVE_REFINEMENT_CONTRACT_REJECTIONS = 2
 FRONTIER_SEED_SCHEMA_VERSION = "topic-frontier-seeds-1"
 SOURCE_CHALLENGE_SCHEMA_VERSION = "topic-source-challenge-2"
 FRONTIER_SEED_FIELDS = {
@@ -130,6 +133,10 @@ CANDIDATE_FIELDS = {
     "why_promising", "disconfirmation_test", "feasibility", "resource_plan",
     "capability_requirements",
 }
+TOPIC_PACKAGE_FIELDS = frozenset({
+    "schema_version", "objective", "candidates", "selected_id",
+    "selection_rationale",
+})
 # These dimensions are optional for compatibility with earlier topic packages,
 # but are part of the current research-direction contract when supplied.  The
 # prompt explicitly asks the model to vary them, so rejecting them as unknown
@@ -216,9 +223,9 @@ FEASIBILITY_DATA_ACCESS = {
 }
 
 # A completed topic artifact contains controller-owned projections beside the
-# strict intake package.  Models sometimes echo that artifact when repairing a
-# package.  These fields carry no candidate information and can be discarded
-# losslessly when the five immutable package fields are present.
+# strict intake package. Models sometimes echo that artifact when repairing a
+# package. Once the complete package is present, non-contract top-level fields
+# cannot affect candidate validation or admission and are recorded then dropped.
 TOPIC_CONTROLLER_OUTPUT_FIELDS = {
     "status", "topic", "question", "search_queries", "proposed_gap",
     "feasibility_check", "recent_papers", "frontier_seed_plan",
@@ -258,7 +265,8 @@ COMPARISON_TYPE_VALUES = (
 PORTFOLIO_DIMENSIONS = ("research_form", "evidence_mode", "comparison_type")
 REFINEMENT_COMPARE_FIELDS = (
     "research_question", "domain", "scope", "phenomenon", "mechanism", "data_regime",
-    "comparison", "measurement", "theory_target", "research_form", "evidence_mode",
+    "comparison", "measurement", "theory_target", "disconfirmation_test",
+    "research_form", "evidence_mode",
     "comparison_type", "experiment_capability_id", "frontier_seed_id",
 )
 
@@ -351,18 +359,21 @@ TOPIC_SALVAGE_BRANCHES = (
         "id": "mechanism-observable",
         "goal": "change the mechanism and primary observable while preserving the supported phenomenon",
         "change_dimensions": ("mechanism", "measurement", "theory_target", "comparison_type"),
+        "dependent_dimensions": ("comparison", "data_regime", "scope", "disconfirmation_test"),
         "preserve": "supported phenomenon and source grounding unless the evidence refutes them",
     },
     {
         "id": "comparison-baseline",
         "goal": "replace the comparator or baseline and make the competing predictions separable",
         "change_dimensions": ("comparison", "data_regime", "disconfirmation_test", "research_form"),
+        "dependent_dimensions": ("scope", "mechanism", "measurement", "theory_target"),
         "preserve": "the strongest supported mechanism and the declared execution boundary",
     },
     {
         "id": "evidence-boundary",
         "goal": "change the evidence mode and study boundary to an independently testable question",
         "change_dimensions": ("evidence_mode", "research_form", "scope", "comparison_type"),
+        "dependent_dimensions": ("comparison", "data_regime", "measurement", "disconfirmation_test"),
         "preserve": "only claims that remain supported after the new evidence boundary is applied",
     },
 )
@@ -385,9 +396,9 @@ def topic_salvage_plan(attempted_branch_ids=None, *, force_structural_pivot=Fals
 
     This is a deterministic routing projection.  It does not decide whether a
     scientific claim is true; it only prevents a rejected direction from being
-    abandoned after one failed repair or replayed indefinitely.  A forced pivot
-    is reserved for an independent source/feasibility finding that makes
-    preserving the parent direction unsafe.
+    abandoned after one failed repair or replayed indefinitely.  A forced
+    structural pivot changes the study shape in response to an independent
+    source/feasibility finding while keeping the same phenomenon in this chain.
     """
     if type(force_structural_pivot) is not bool:
         raise ValidationError("force_structural_pivot must be boolean")
@@ -592,7 +603,7 @@ _MODEL_CANDIDATE_FIELD_ALIASES = {
 
 
 _TOPIC_SEMANTIC_REJECTION_TYPES = frozenset({
-    "novelty", "source_challenge", "maturity", "feasibility",
+    "novelty", "source_challenge", "maturity", "feasibility", "refinement",
 })
 
 
@@ -635,6 +646,22 @@ def _topic_validation_rejection_type(error):
         # JSON formatting failure: retain its signature so the Composer can
         # pivot rather than spend the intake budget regenerating it unchanged.
         return "feasibility"
+    if any(marker in text for marker in (
+            "must materially change at least two of its assigned dimensions",
+            "changed dimensions outside its assigned repair scope",
+    )):
+        # These are bounded-repair contract violations, not evidence that the
+        # retained scientific direction itself is invalid.
+        return "refinement_contract"
+    if any(marker in text for marker in (
+            "topic salvage branch",
+            "current topic refinement must",
+            "topic refinement research question no longer addresses",
+            "source challenge requires a different frontier seed for this refinement",
+    )):
+        # A valid response that violates its parent-preserving scientific
+        # refinement is a rejected candidate, not a response-format failure.
+        return "refinement"
     return None
 
 
@@ -707,29 +734,29 @@ def _topic_retry_reason(error, candidate_attempt_trace, rejected_topic_history):
     return None
 
 
-def _strip_topic_controller_metadata(package):
-    """Remove only echoed controller projections from a complete package.
+def _strip_noncontract_topic_fields(package):
+    """Project a complete model response onto the topic package contract.
 
-    The model is allowed to return the strict package contract, while the
-    persisted topic artifact also contains derived fields such as ``topic``
-    and ``budget``.  If those projections are echoed during a repair, keeping
-    them makes an otherwise usable package fail an exact-key check.  Unknown
-    fields remain strict failures; this helper never relaxes the scientific
-    candidate contract.
+    Extra top-level fields are presentation/metadata, not candidate evidence.
+    Discarding them only after all five package fields exist preserves the
+    strict scientific candidate validator while preventing harmless envelope
+    text from consuming another bounded model attempt.
     """
-    required = {"schema_version", "objective", "candidates", "selected_id",
-                "selection_rationale"}
-    if not isinstance(package, dict) or not required.issubset(package):
+    if not isinstance(package, dict) or not TOPIC_PACKAGE_FIELDS.issubset(package):
         return []
-    extra = set(package) - required
-    if not extra or not extra.issubset(TOPIC_CONTROLLER_OUTPUT_FIELDS):
+    extra = set(package) - TOPIC_PACKAGE_FIELDS
+    if not extra:
         return []
     repairs = []
     for field in sorted(extra):
         package.pop(field, None)
         repairs.append({
             "field": field,
-            "source": "discarded_echoed_controller_metadata",
+            "source": (
+                "discarded_echoed_controller_metadata"
+                if field in TOPIC_CONTROLLER_OUTPUT_FIELDS
+                else "discarded_noncontract_top_level_field"
+            ),
         })
     return repairs
 
@@ -830,6 +857,12 @@ def _unwrap_topic_response(value, *, single_candidate_refinement=False):
             return {"candidate": candidate}, [{
                 "kind": "wrapper_unwrap", "wrapper": "selected_candidate",
             }]
+    if single_candidate_refinement:
+        candidate = _single_topic_candidate_response(value)
+        if candidate is not None:
+            return {"candidate": candidate}, [{
+                "kind": "single_candidate_wrap",
+            }]
     if ("candidates" in value or "candidate" in value):
         return value, []
     for key in _TOPIC_RESPONSE_WRAPPER_KEYS:
@@ -867,6 +900,28 @@ def _normalise_topic_model_response(result, *, single_candidate_refinement=False
     raise ValidationError("model output must contain valid JSON") from parse_error
 
 
+def _single_topic_candidate_response(value):
+    """Recognize a complete candidate emitted where a full portfolio is required.
+
+    This does not promote the candidate to a topic package or invent the other
+    portfolio members.  The runner uses it only as preserved input to one
+    explicit model repair that must return the ordinary, fully validated
+    package.
+    """
+    candidate = value
+    if isinstance(value, dict) and set(value) == {"candidate"}:
+        candidate = value.get("candidate")
+    if not isinstance(candidate, dict):
+        return None
+    allowed = (CANDIDATE_FIELDS | CANDIDATE_DIMENSION_FIELDS | GROUNDING_FIELDS
+               | {"experiment_capability_id", "experiment_design", "feasibility_plan"})
+    keys = set(candidate)
+    if (not LEGACY_CANDIDATE_FIELDS.issubset(keys)
+            or keys - allowed):
+        return None
+    return deepcopy(candidate)
+
+
 def _repair_known_candidate_field_aliases(package):
     """Canonicalize only explicit, lossless aliases from model JSON."""
     if not isinstance(package, dict) or not isinstance(package.get("candidates"), list):
@@ -885,6 +940,48 @@ def _repair_known_candidate_field_aliases(package):
                 "to": target,
                 "source": "known_model_field_alias",
             })
+    return repairs
+
+
+def _repair_case_only_topic_candidate_ids(package):
+    """Lowercase ASCII-only candidate IDs without changing their identity."""
+    if not isinstance(package, dict) or not isinstance(package.get("candidates"), list):
+        return []
+    candidates = package["candidates"]
+    replacements = {}
+    normalized_ids = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or not isinstance(candidate.get("id"), str):
+            continue
+        original = candidate["id"]
+        if (original.isascii()
+                and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", original)):
+            normalized = original.lower()
+        else:
+            normalized = original
+        if normalized != original:
+            replacements[original] = normalized
+        normalized_ids.append(replacements.get(original, original))
+    # Do not collapse two distinct candidate identities into one identifier.
+    if len(normalized_ids) != len(set(normalized_ids)):
+        return []
+    repairs = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        original = candidate.get("id")
+        normalized = replacements.get(original)
+        if normalized is None:
+            continue
+        candidate["id"] = normalized
+        repairs.append({
+            "candidate_id": normalized,
+            "from": original,
+            "source": "case_only_identifier_normalization",
+        })
+    selected_id = package.get("selected_id")
+    if isinstance(selected_id, str) and selected_id in replacements:
+        package["selected_id"] = replacements[selected_id]
     return repairs
 
 
@@ -1365,12 +1462,59 @@ _TOPIC_REPAIR_CONTEXT_FIELDS = (
 )
 
 
+def _resource_plan_from_feasibility(candidate):
+    """Render the declared execution inventory as a concise resource summary."""
+    plan = candidate.get("feasibility_plan") if isinstance(candidate, dict) else None
+    if not isinstance(plan, dict):
+        return None
+    clauses = []
+    evidence = plan.get("evidence_inputs")
+    sources = []
+    if isinstance(evidence, list):
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            source = item.get("source")
+            if not isinstance(source, str) or not source.strip():
+                continue
+            status = item.get("status")
+            kind = item.get("kind")
+            qualifier = " ".join(
+                value for value in (kind, status) if isinstance(value, str) and value)
+            sources.append(f"{qualifier}: {source.strip()[:110]}")
+    if sources:
+        clauses.append("Use the declared evidence inputs " + "; ".join(sources[:4]) + ".")
+    elif plan.get("experiment_input") == "self_contained":
+        clauses.append("Use the declared self-contained experiment inputs.")
+    scope = candidate.get("scope") if isinstance(candidate, dict) else None
+    if isinstance(scope, str) and scope.strip():
+        clauses.append("Study scope: " + scope.strip()[:150] + ".")
+    executables = plan.get("required_executables")
+    packages = plan.get("required_packages")
+    tools = [item.strip() for values in (executables, packages)
+             if isinstance(values, list) for item in values
+             if isinstance(item, str) and item.strip()]
+    if tools:
+        clauses.append("Tools: " + ", ".join(dict.fromkeys(tools[:8])) + ".")
+    compute = plan.get("estimated_compute_seconds")
+    if type(compute) in (int, float) and math.isfinite(compute) and compute >= 0:
+        clauses.append(f"Estimated compute: {compute:g} seconds.")
+    if type(plan.get("network_access")) is bool:
+        clauses.append("Network access is " + ("required." if plan["network_access"]
+                                                else "not required."))
+    if type(plan.get("estimated_api_requests")) is int:
+        clauses.append(f"Planned external API requests: {plan['estimated_api_requests']}.")
+    if not clauses:
+        return None
+    return " ".join(clauses)[:680].rstrip()
+
+
 def _topic_missing_field_repair_prompt(package, targets):
     """Build a field-only repair request for an otherwise intact package.
 
     The model has already supplied the scientific direction.  A repair turn
     therefore receives only the affected candidate fields and may fill only
-    the explicitly missing required text fields.  This prevents a formatting
+    the explicitly missing or empty required text fields. This prevents a formatting
     omission such as a missing title from causing a new portfolio, source
     selection, or research-shape decision.
     """
@@ -1392,13 +1536,13 @@ def _topic_missing_field_repair_prompt(package, targets):
         "output_contract": {
             "candidate_patches": [{
                 "id": "copy the exact candidate id",
-                "fields": "object containing exactly the listed missing_fields; text fields are concise strings and feasibility_plan is the exact structured object described by the topic contract",
+            "fields": "object containing exactly the listed missing_fields; every text field must be a concise nonempty string and feasibility_plan is the exact structured object described by the topic contract",
             }],
         },
         "constraints": [
             "return exactly one patch for every candidate_context item and no other candidate",
             "copy each id exactly; do not rename, reorder, or omit a candidate",
-            "fields must contain exactly the missing_fields listed for that candidate; do not return any existing field",
+            "fields must contain exactly the missing_fields listed for that candidate; do not return any valid existing field",
             "derive every repaired value only from the supplied candidate_fields; do not introduce a new domain, mechanism, dataset, result, citation, or claim of novelty",
             "keep repaired prose concise and consistent with the candidate's research form, evidence mode, comparison type, and source grounding",
             "return only the JSON object; do not echo candidate_context or add metadata",
@@ -1949,7 +2093,8 @@ def topic_refinement_dimensions(parent, candidate):
 
 def validate_topic_refinement(parent, candidate, *, require_structural_pivot=False,
                               require_frontier_seed_pivot=False,
-                              minimum_changed_dimensions=2):
+                              minimum_changed_dimensions=2, salvage_plan=None,
+                              salvage_anchor=None):
     """Require an actual, bounded change when a topic is being refined."""
     if type(require_structural_pivot) is not bool:
         raise ValidationError("require_structural_pivot must be boolean")
@@ -1957,6 +2102,8 @@ def validate_topic_refinement(parent, candidate, *, require_structural_pivot=Fal
         raise ValidationError("require_frontier_seed_pivot must be boolean")
     if type(minimum_changed_dimensions) is not int or not 1 <= minimum_changed_dimensions <= len(REFINEMENT_COMPARE_FIELDS):
         raise ValidationError("minimum_changed_dimensions is invalid")
+    if salvage_anchor is not None and not isinstance(salvage_anchor, dict):
+        raise ValidationError("salvage_anchor must be a topic object")
     changed = topic_refinement_dimensions(parent, candidate)
     if require_structural_pivot and len(changed) < minimum_changed_dimensions:
         raise ValidationError(
@@ -1972,6 +2119,74 @@ def validate_topic_refinement(parent, candidate, *, require_structural_pivot=Fal
                 or parent_seed == candidate_seed):
             raise ValidationError(
                 "source challenge requires a different frontier seed for this refinement")
+    if isinstance(salvage_plan, dict) or salvage_anchor is not None:
+        # ``parent`` may be the latest local candidate after a maturity or
+        # source-challenge repair. Keep the original Composer topic as the
+        # immutable lineage anchor so successive repairs cannot silently
+        # re-parent an unrelated phenomenon into the same refinement chain.
+        lineage_parent = salvage_anchor if salvage_anchor is not None else parent
+        parent_phenomenon = lineage_parent.get("phenomenon")
+        candidate_phenomenon = candidate.get("phenomenon")
+        if (isinstance(parent_phenomenon, str) and parent_phenomenon.strip()
+                and (not isinstance(candidate_phenomenon, str)
+                     or _refinement_value(candidate_phenomenon)
+                     != _refinement_value(parent_phenomenon))):
+            branch = (salvage_plan.get("active_branch")
+                      if isinstance(salvage_plan, dict) else None)
+            branch_id = (
+                branch.get("id") if isinstance(branch, dict)
+                else salvage_plan.get("mode", "salvage")
+                if isinstance(salvage_plan, dict) else "salvage"
+            )
+            raise ValidationError(
+                "topic salvage branch " + str(branch_id)
+                + " must preserve the parent's phenomenon. A new direction needs its own "
+                "evidence-backed decision, not a salvage rewrite. Refine the mechanism, "
+                "observable, comparator, evidence boundary, or claim scope instead")
+        identity_tokens = (
+            {_refinement_identity_token(item)
+             for item in (_topic_tokens(parent_phenomenon) - _MISSION_BOILERPLATE)}
+            if isinstance(parent_phenomenon, str) else set()
+        )
+        if len(identity_tokens) < 2:
+            identity_tokens.update(
+                _refinement_identity_token(item)
+                for item in (_topic_tokens(lineage_parent.get("research_question"))
+                             - _MISSION_BOILERPLATE))
+        candidate_question_tokens = (
+            {_refinement_identity_token(item)
+             for item in (_topic_tokens(candidate.get("research_question"))
+                          - _MISSION_BOILERPLATE)}
+        )
+        required_identity_matches = min(3, len(identity_tokens))
+        if (required_identity_matches
+                and len(identity_tokens.intersection(candidate_question_tokens))
+                < required_identity_matches):
+            raise ValidationError(
+                "topic refinement research question no longer addresses the parent's "
+                "phenomenon; retain its core scientific identity in the question itself")
+    if isinstance(salvage_plan, dict) and salvage_plan.get("mode") == "salvage":
+        active = salvage_plan.get("active_branch")
+        branch_id = active.get("id") if isinstance(active, dict) else None
+        branch_spec = next(
+            (item for item in TOPIC_SALVAGE_BRANCHES if item["id"] == branch_id), None)
+        if branch_spec is None:
+            raise ValidationError("topic salvage plan has no recognized active branch")
+        branch_dimensions = set(branch_spec["change_dimensions"])
+        dependent_dimensions = set(branch_spec.get("dependent_dimensions", ()))
+        branch_changes = set(changed).intersection(branch_dimensions)
+        if len(branch_changes) < 2:
+            raise ValidationError(
+                "topic salvage branch " + branch_id
+                + " must materially change at least two of its assigned dimensions: "
+                + ", ".join(branch_spec["change_dimensions"]))
+        unexpected_changes = (
+            set(changed) - branch_dimensions - dependent_dimensions - {"research_question"})
+        if unexpected_changes:
+            raise ValidationError(
+                "topic salvage branch " + branch_id
+                + " changed dimensions outside its assigned repair scope: "
+                + ", ".join(sorted(unexpected_changes)))
     return changed
 
 
@@ -1983,20 +2198,49 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
                            design_driven_capability_ids=None,
                            frontier_seeds=None, recent_papers=None,
                            require_grounding=False, fallback_templates=None,
-                           enforce_portfolio_diversity=False):
+                           enforce_portfolio_diversity=False,
+                           single_candidate_refinement=False,
+                           refinement_parent=None):
     """Validate a complete topic proposal before it enters the survey stage."""
-    fields = {"schema_version", "objective", "candidates", "selected_id", "selection_rationale"}
-    if not isinstance(value, dict) or set(value) != fields:
-        raise ValidationError(f"topic discovery package requires exactly {sorted(fields)}")
+    fields = TOPIC_PACKAGE_FIELDS
+    if not isinstance(value, dict):
+        raise ValidationError("topic discovery package must be a JSON object")
+    missing = fields - set(value)
+    unexpected = set(value) - fields
+    if missing or unexpected:
+        raise ValidationError(
+            "topic discovery package keys do not match; "
+            f"missing={sorted(missing)}, unexpected={sorted(unexpected)}")
     if value["schema_version"] != SCHEMA_VERSION:
         raise ValidationError("topic discovery package schema version is unsupported")
-    _text(value["objective"], "topic objective")
+    # The principal objective is trusted workflow configuration and is checked
+    # for exact preservation immediately below. It may legitimately describe
+    # the research workflow and its release gates; public-language screening
+    # applies to generated scientific prose, not this immutable boundary.
+    _text(value["objective"], "topic objective", public=False)
     if objective is not None and value["objective"] != objective:
         raise ValidationError("topic discovery package changed the Principal objective")
+    if type(single_candidate_refinement) is not bool:
+        raise ValidationError("single_candidate_refinement must be Boolean")
+    if single_candidate_refinement:
+        if (not isinstance(refinement_parent, dict)
+                or not isinstance(refinement_parent.get("id"), str)
+                or type(candidate_count) is not int or candidate_count < 1):
+            raise ValidationError(
+                "single-candidate refinement requires its parent and a bounded package size")
     candidates = value["candidates"]
-    if (not isinstance(candidates, list) or not 3 <= len(candidates) <= 8
+    minimum_candidates = (candidate_count if type(candidate_count) is int
+                          else 1 if single_candidate_refinement else 3)
+    maximum_candidates = (candidate_count if type(candidate_count) is int
+                          else 1 if single_candidate_refinement else 8)
+    if (not isinstance(candidates, list)
+            or not minimum_candidates <= len(candidates) <= maximum_candidates
             or candidate_count is not None and len(candidates) != candidate_count):
-        raise ValidationError("topic discovery requires the configured number of candidates")
+        requirement = (
+            "one refined candidate" if single_candidate_refinement
+            else "the configured candidate portfolio"
+        )
+        raise ValidationError(f"topic discovery requires {requirement}")
     ids = set()
     if type(enforce_portfolio_diversity) is not bool:
         raise ValidationError("enforce_portfolio_diversity must be boolean")
@@ -2188,12 +2432,36 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
     if value["selected_id"] not in ids:
         raise ValidationError("selected topic is not one of the candidates")
     selected = next(candidate for candidate in candidates if candidate["id"] == value["selected_id"])
+    if single_candidate_refinement and selected["id"] != refinement_parent["id"]:
+        raise ValidationError("topic refinement must preserve the parent candidate id")
+    if single_candidate_refinement:
+        excluded_topics.discard(refinement_parent["id"])
     if selected["id"] in excluded_topics:
         raise ValidationError("selected topic is excluded by the exploration history")
     if excluded_capabilities and selected.get("experiment_capability_id") in excluded_capabilities:
         raise ValidationError("selected experiment capability is excluded by the exploration history")
     if topic_history:
-        validate_topic_novelty(selected, topic_history)
+        novelty_history = topic_history
+        if single_candidate_refinement:
+            parent_fingerprint = topic_signature(refinement_parent)["fingerprint"]
+            entries = []
+            for prior in _topic_history_entries(topic_history):
+                signature = prior.get("signature")
+                if not isinstance(signature, dict):
+                    signature = topic_signature(prior)
+                if (prior.get("topic_id") == refinement_parent["id"]
+                        and signature.get("fingerprint") == parent_fingerprint):
+                    continue
+                entries.append(prior)
+            if isinstance(topic_history, dict):
+                novelty_history = {**topic_history, "entries": entries}
+            else:
+                novelty_history = entries
+        validate_topic_novelty(
+            selected, novelty_history,
+            lineage_topic_id=(refinement_parent.get("id")
+                              if single_candidate_refinement else None),
+        )
     for template in fallback_templates or []:
         if not isinstance(template, dict) or not isinstance(template.get("research_question"), str):
             continue
@@ -2224,6 +2492,18 @@ def _topic_tokens(value):
     tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9]*", text.casefold())
     return {"<number>" if token.isdigit() else token
             for token in tokens if token not in _TOPIC_STOPWORDS and len(token) > 2}
+
+
+def _refinement_identity_token(value):
+    """Normalize simple English inflections for parent-phenomenon matching."""
+    token = value if isinstance(value, str) else ""
+    if len(token) > 4 and token.endswith("ies"):
+        return token[:-3] + "y"
+    if len(token) > 5 and token.endswith(("sses", "xes", "ches", "shes", "zes")):
+        return token[:-2]
+    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
 
 
 def topic_signature(candidate):
@@ -2323,6 +2603,29 @@ def _candidate_attempt_record(package, *, attempt, status="parsed", error=None,
             for candidate in candidates):
         record["portfolio_profile"] = topic_portfolio_profile(candidates)
     return record
+
+
+def _record_attempt_selection(record, package):
+    """Keep rejection provenance aligned with the final deterministic choice."""
+    if not isinstance(record, dict) or not isinstance(package, dict):
+        return
+    selected_id = package.get("selected_id")
+    candidates = package.get("candidates")
+    if not isinstance(selected_id, str) or not isinstance(candidates, list):
+        return
+    selected = next(
+        (item for item in candidates
+         if isinstance(item, dict) and item.get("id") == selected_id),
+        None,
+    )
+    if not isinstance(selected, dict):
+        return
+    record["selected_id"] = selected_id
+    record["selected_topic"] = {
+        key: selected.get(key) for key in (
+            "id", "title", "domain", "research_question", "research_form",
+            "evidence_mode", "comparison_type", "experiment_capability_id")
+    }
 
 
 def _merge_candidate_source_records(selected, recent_papers, targeted_records,
@@ -2547,7 +2850,30 @@ def _topic_repeat_score(candidate, prior):
     return max(question_score, title_score * 0.85, content_score * 0.55)
 
 
-def validate_topic_novelty(candidate, topic_history, *, threshold=0.78):
+def _topic_refinement_repeat_score(candidate, prior):
+    """Compare sibling refinements by question content, not portfolio shape.
+
+    A scoped refinement deliberately preserves the topic identity and changes
+    its testable question. Treating a shared domain plus two shared portfolio
+    dimensions as a duplicate makes that repair impossible; the ordinary
+    portfolio-shape guard remains in force for unrelated directions.
+    """
+    current = topic_signature(candidate)
+    previous = prior.get("signature") if isinstance(prior, dict) else None
+    if not isinstance(previous, dict):
+        previous = topic_signature(prior)
+    return max(
+        _jaccard(current.get("question_tokens", []),
+                 previous.get("question_tokens", [])),
+        _jaccard(current.get("title_tokens", []),
+                 previous.get("title_tokens", [])) * 0.85,
+        _jaccard(current.get("content_tokens", []),
+                 previous.get("content_tokens", [])) * 0.55,
+    )
+
+
+def validate_topic_novelty(candidate, topic_history, *, threshold=0.78,
+                           lineage_topic_id=None):
     """Reject a selected direction that repeats a recorded project direction.
 
     History is an execution-memory guard.  It never proves novelty and it does
@@ -2557,11 +2883,24 @@ def validate_topic_novelty(candidate, topic_history, *, threshold=0.78):
     if type(threshold) not in (int, float) or not math.isfinite(threshold) or not 0 < threshold <= 1:
         raise ValidationError("topic novelty threshold must be finite and in (0, 1]")
     current_id = candidate.get("id") if isinstance(candidate, dict) else None
+    scoped_refinement = (
+        isinstance(lineage_topic_id, str)
+        and bool(lineage_topic_id)
+        and current_id == lineage_topic_id
+    )
     for prior in _topic_history_entries(topic_history):
+        same_lineage = scoped_refinement and prior.get("topic_id") == lineage_topic_id
         if (current_id and current_id == prior.get("topic_id")
-                and not _is_generated_slot_topic_id(current_id)):
+                and not _is_generated_slot_topic_id(current_id)
+                and not same_lineage):
             raise ValidationError("selected topic repeats a previously attempted direction")
-        score = _topic_repeat_score(candidate, prior)
+        # During a scoped refinement, portfolio-shape similarity is expected:
+        # the candidate must preserve the parent's phenomenon and may share
+        # its domain with unrelated projects. Compare every historical entry
+        # by its actual question/title instead, while still rejecting an exact
+        # or near-exact previously rejected formulation.
+        score = (_topic_refinement_repeat_score(candidate, prior)
+                 if scoped_refinement else _topic_repeat_score(candidate, prior))
         if score >= threshold:
             if _cold_structural_repeat_allowed(candidate, prior, topic_history):
                 continue
@@ -2571,7 +2910,7 @@ def validate_topic_novelty(candidate, topic_history, *, threshold=0.78):
 
 
 def _repair_topic_novelty_selection(package, topic_history, *, excluded_topic_ids=None,
-                                    excluded_capability_ids=None):
+                                    excluded_capability_ids=None, runtime_context=None):
     """Choose a valid portfolio member when the model selected a repeated one.
 
     The portfolio is already required to contain orthogonal candidates. If its
@@ -2592,6 +2931,28 @@ def _repair_topic_novelty_selection(package, topic_history, *, excluded_topic_id
         return None
     excluded_topics = set(excluded_topic_ids or [])
     excluded_capabilities = set(excluded_capability_ids or [])
+
+    def executable(candidate):
+        if candidate.get("id") in excluded_topics:
+            return False
+        if candidate.get("experiment_capability_id") in excluded_capabilities:
+            return False
+        foundry = (runtime_context or {}).get("capability_foundry")
+        if isinstance(foundry, dict) and foundry.get("enabled") is True:
+            allowed_modes = foundry.get("allowed_evidence_modes")
+            if (isinstance(allowed_modes, list) and allowed_modes
+                    and candidate.get("evidence_mode") not in set(allowed_modes)):
+                return False
+        if isinstance(runtime_context, dict):
+            trial = deepcopy(package)
+            trial["selected_id"] = candidate.get("id")
+            _materialize_foundry_capability_requirements(trial, runtime_context)
+            try:
+                validate_topic_feasibility(trial, runtime_context)
+            except ValidationError:
+                return False
+        return True
+
     selection_error = None
     if selected.get("id") in excluded_topics:
         selection_error = ValidationError(
@@ -2609,9 +2970,7 @@ def _repair_topic_novelty_selection(package, topic_history, *, excluded_topic_id
     for index, candidate in enumerate(package["candidates"]):
         if not isinstance(candidate, dict) or candidate.get("id") == selected_id:
             continue
-        if candidate.get("id") in excluded_topics:
-            continue
-        if candidate.get("experiment_capability_id") in excluded_capabilities:
+        if not executable(candidate):
             continue
         try:
             validate_topic_novelty(candidate, topic_history)
@@ -2622,6 +2981,7 @@ def _repair_topic_novelty_selection(package, topic_history, *, excluded_topic_id
         return None
     index, replacement = alternatives[0]
     package["selected_id"] = replacement["id"]
+    _materialize_foundry_capability_requirements(package, runtime_context)
     package["selection_rationale"] = (
         f"The portfolio selector chose {replacement['id']} after the initially selected "
         f"direction {selected_id} was rejected by the attempted-direction history guard. "
@@ -2656,6 +3016,80 @@ def _grounding_eligible_frontier_seeds(frontier_seeds, recent_papers, candidate_
     grounded = [item for item in seeds if item.get("id") in work_seed_ids]
     minimum_groups = min(3, candidate_count) if type(candidate_count) is int else 3
     return grounded if len(grounded) >= minimum_groups else seeds
+
+
+def _parent_focused_refinement_inputs(refinement_context):
+    """Reuse the selected topic's evidence instead of reseeding unrelated fields."""
+    if (not isinstance(refinement_context, dict)
+            or refinement_context.get("mode") != "refinement"):
+        return None
+    parent = refinement_context.get("parent_topic")
+    evidence = refinement_context.get("parent_evidence")
+    if not isinstance(parent, dict) or not isinstance(evidence, dict):
+        return None
+    parent_seed_id = parent.get("frontier_seed_id")
+    if not isinstance(parent_seed_id, str) or not parent_seed_id.strip():
+        parent_seed_id = "selected_direction"
+    saved_plan = evidence.get("frontier_seed_plan")
+    saved_seeds = saved_plan.get("seeds") if isinstance(saved_plan, dict) else None
+    saved_seed = next((deepcopy(item) for item in saved_seeds or []
+                       if isinstance(item, dict) and item.get("id") == parent_seed_id), {})
+    search_queries = parent.get("search_queries")
+    if not isinstance(search_queries, list) or not any(
+            isinstance(item, str) and item.strip() for item in search_queries):
+        search_queries = saved_seed.get("search_queries", [])
+    search_queries = [item.strip() for item in search_queries
+                      if isinstance(item, str) and item.strip()][:8]
+    if not search_queries:
+        search_queries = [
+            item for item in (
+                parent.get("research_question"), parent.get("title"),
+            ) if isinstance(item, str) and item.strip()
+        ][:2]
+    seed = {
+        "id": parent_seed_id,
+        "domain": parent.get("domain") or saved_seed.get("domain"),
+        "phenomenon": (parent.get("phenomenon") or parent.get("title")
+                       or saved_seed.get("phenomenon")),
+        "mechanism": (parent.get("mechanism") or parent.get("research_question")
+                      or saved_seed.get("mechanism")),
+        "unit_of_analysis": (parent.get("measurement") or parent.get("scope")
+                             or saved_seed.get("unit_of_analysis")),
+        "search_queries": search_queries,
+    }
+    if not all(isinstance(seed.get(key), str) and seed[key].strip()
+               for key in ("domain", "phenomenon", "mechanism", "unit_of_analysis")):
+        return None
+
+    records = []
+    seen_work_ids = set()
+    for label in ("candidate_prior_work", "recent_papers"):
+        source_records = evidence.get(label)
+        if not isinstance(source_records, list):
+            continue
+        for source in source_records:
+            if (not isinstance(source, dict)
+                    or not isinstance(source.get("work_id"), str)
+                    or not source["work_id"].strip()
+                    or source["work_id"] in seen_work_ids):
+                continue
+            source_seed_id = source.get("frontier_seed_id")
+            if label == "recent_papers" and source_seed_id != parent_seed_id:
+                continue
+            record = deepcopy(source)
+            if source_seed_id != parent_seed_id:
+                record["retrieved_under_seed_id"] = source_seed_id
+                record["frontier_seed_id"] = parent_seed_id
+            records.append(record)
+            seen_work_ids.add(source["work_id"])
+            if len(records) >= TOPIC_SAMPLE_LIMIT:
+                break
+        if len(records) >= TOPIC_SAMPLE_LIMIT:
+            break
+    return {
+        "schema_version": FRONTIER_SEED_SCHEMA_VERSION,
+        "seeds": [seed],
+    }, records
 
 
 def _repair_foundry_selection(package, runtime_context):
@@ -3163,7 +3597,9 @@ SYSTEM = (
     "that could distinguish competing explanations. A single fixed parameter point or a two-method toy "
     "comparison must be treated as provisional unless it tests a nontrivial mechanism, a sensitivity frontier, "
     "or a theory-versus-observation discrepancy. "
-    "When a refinement_context is supplied, preserve useful evidence but do not preserve the parent's central question automatically: "
+    "For refinement_context.mode=response_contract_repair, preserve the parent's scientific identity and valid claims; "
+    "repair only the deterministic response error and do not change the research direction. "
+    "For a substantive refinement_context, preserve useful evidence but do not preserve the parent's central question automatically: "
     "materially change at least two dimensions and prefer a different research form or comparison type. "
     "Keep scope explicit, include a way the idea could be disproved, and select one candidate only after "
     "comparing the alternatives. Use reader-facing scientific language; do not mention workflow state, "
@@ -3274,7 +3710,8 @@ def _topic_prompt_paper_projection(value):
         for key, limit in (
             ("work_id", 80), ("title", 260), ("abstract", 900),
             ("authors", 240), ("doi", 160), ("frontier_domain", 180),
-            ("frontier_seed_id", 100), ("matched_query", 260),
+            ("frontier_seed_id", 100), ("retrieved_under_seed_id", 100),
+            ("matched_query", 260),
             ("year", 12), ("source_url", 500),
         ) if value.get(key) is not None
     }
@@ -3310,6 +3747,7 @@ def _topic_prompt_candidate_projection(value):
             key: _topic_prompt_clip(selected.get(key), limit)
             for key, limit in (
                 ("id", 100), ("title", 260), ("domain", 180),
+                ("phenomenon", 700),
                 ("research_question", 900), ("research_form", 80),
                 ("evidence_mode", 80), ("comparison_type", 80),
                 ("frontier_seed_id", 100),
@@ -3388,16 +3826,41 @@ def _topic_prompt_refinement_projection(value):
         key: value.get(key) for key in (
             "mode", "cycle", "parent_topic_id", "parent_candidate_index",
             "changed_dimensions", "require_frontier_seed_pivot",
-            "rejected_frontier_seed_ids",
+            "rejected_frontier_seed_ids", "rejected_directions",
         )
         if key in value
     }
+    work_orders = value.get("work_orders")
+    if isinstance(work_orders, list):
+        result["work_orders"] = [
+            {
+                key: _topic_prompt_clip(item.get(key), 1600)
+                for key in ("id", "kind", "objective", "why", "success_condition", "evidence_needed")
+                if isinstance(item.get(key), str)
+            }
+            for item in work_orders[:3]
+            if isinstance(item, dict)
+        ]
+    rejected_directions = value.get("rejected_directions")
+    if isinstance(rejected_directions, list):
+        result["rejected_directions"] = [
+            {
+                key: _topic_prompt_clip(item.get(key), limit)
+                for key, limit in (
+                    ("title", 220), ("research_question", 520),
+                    ("rejection_reason", 520),
+                ) if isinstance(item.get(key), str)
+            }
+            for item in rejected_directions[:8]
+            if isinstance(item, dict)
+        ]
     parent = value.get("parent_topic")
     if isinstance(parent, dict):
         result["parent_topic"] = {
             key: _topic_prompt_clip(parent.get(key), limit)
             for key, limit in (
                 ("id", 100), ("title", 260), ("domain", 180),
+                ("phenomenon", 700),
                 ("research_question", 900), ("research_form", 80),
                 ("evidence_mode", 80), ("comparison_type", 80),
                 ("frontier_seed_id", 100), ("prior_work_ids", 300),
@@ -3407,6 +3870,12 @@ def _topic_prompt_refinement_projection(value):
                 ("resource_plan", 700), ("disconfirmation_test", 700),
             ) if parent.get(key) is not None
         }
+        if isinstance(parent.get("search_queries"), list):
+            result["parent_topic"]["search_queries"] = [
+                _topic_prompt_clip(item, 260)
+                for item in parent["search_queries"][:8]
+                if isinstance(item, str)
+            ]
         if isinstance(parent.get("feasibility_plan"), dict):
             result["parent_topic"]["feasibility_plan"] = deepcopy(
                 parent["feasibility_plan"])
@@ -3445,6 +3914,13 @@ def _topic_prompt_refinement_projection(value):
             for item in value["specialist_feedback"][:2]
             if isinstance(item, dict)
         ]
+    response_repair = value.get("response_contract_repair")
+    if isinstance(response_repair, dict):
+        validation_error = response_repair.get("validation_error")
+        if isinstance(validation_error, str) and validation_error.strip():
+            result["response_contract_repair"] = {
+                "validation_error": _topic_prompt_clip(validation_error, 2048),
+            }
     if value.get("reason") is not None:
         result["reason"] = _topic_prompt_clip(value.get("reason"), 1200)
     salvage_plan = value.get("salvage_plan")
@@ -3549,6 +4025,10 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
     ]
     refinement_context = _topic_prompt_refinement_projection(
         reader_projection(refinement_context)) if refinement_context else None
+    response_contract_only = (
+        isinstance(refinement_context, dict)
+        and refinement_context.get("mode") == "response_contract_repair"
+    )
     evidence_by_seed = {}
     for paper in recent_papers:
         if not isinstance(paper, dict):
@@ -3625,6 +4105,23 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "return only the JSON object with no preface, commentary, markdown, or trailing explanation",
         "candidate prose is reader-facing: do not use the words frozen, validator, accepted artifact, model calls, release candidate, or SHA-256; say prespecified or independent recalculation where scientifically appropriate",
     ]
+    if (isinstance(refinement_context, dict)
+            and refinement_context.get("mode") == "refinement"
+            and isinstance(refinement_context.get("parent_topic"), dict)):
+        parent = refinement_context["parent_topic"]
+        phenomenon = parent.get("phenomenon") or parent.get("title")
+        domain = parent.get("domain")
+        if isinstance(phenomenon, str) and phenomenon.strip():
+            constraints.append(
+                "This is a refinement of an admitted parent, not a new frontier scan. Keep every candidate "
+                "within the same physical phenomenon and system: " + phenomenon.strip()[:700]
+                + ". Change its testable boundary, mechanism, comparator, observable, evidence mode, or claim scope; "
+                "do not replace it with a different field's phenomenon."
+            )
+        if isinstance(domain, str) and domain.strip():
+            constraints.append(
+                "Keep every candidate in the parent's scientific domain: " + domain.strip()[:180] + "."
+            )
     portfolio_requirements = {
         "minimum_distinct_research_forms": min(4, candidate_count),
         "minimum_distinct_evidence_modes": min(3, candidate_count),
@@ -3754,33 +4251,67 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
                 "for the selected candidate, make the executable evidence a mechanism-specific analytic or synthetic simulation with a state variable, scaling relation, or distributional observable; do not select a generic estimator benchmark, data-fitting exercise, or confidence-interval restatement",
                 "alternatives may retain other evidence modes for portfolio diversity, but they must not be selected unless their data boundary is explicitly available in the foundry project files",
             ])
-    if refinement_context:
+    if response_contract_only:
+        constraints.extend([
+            "This assignment repairs a deterministic response-contract failure only; it is not a scientific topic selection or pivot.",
+            "Preserve the parent's phenomenon, candidate identities, research questions, and valid scientific fields. Correct only the reported validation error and any directly dependent field.",
+            "Do not change research_form, evidence_mode, comparison_type, mechanism, or the selected scientific direction to satisfy the response schema.",
+            "Return the complete package required by output_contract, keeping every candidate grounded only in its supplied frontier seed and scholarly records.",
+        ])
+        response_repair = refinement_context.get("response_contract_repair")
+        validation_error = (
+            response_repair.get("validation_error")
+            if isinstance(response_repair, dict) else None
+        )
+        if isinstance(validation_error, str) and validation_error.strip():
+            constraints.append(
+                "Exact deterministic validation error to repair: "
+                + validation_error[:2048]
+            )
+    elif refinement_context:
         constraints.extend([
             "this is a topic refinement pass, not a cosmetic rewrite: use the parent topic and the supplied survey feedback as constraints",
             "change at least two substantive dimensions and include research_form, evidence_mode, or comparison_type among changed_dimensions when the reviewer asks for refinement",
             "repair the reviewed direction when it remains viable; otherwise select another candidate from this portfolio only when that candidate is structurally independent and directly addresses the supplied feedback",
-            "do not merely retain the parent's central phenomenon with a new parameter; pivot to an orthogonal question when the parent remains too close to an existing direction",
-            "do not select a direction that the supplied evidence already refutes; if the parent is refuted, pivot to a discriminating unresolved question",
+            "do not confuse broad topical overlap with a direct prior answer; keep the parent's phenomenon during this refinement and change the question, comparator, mechanism, observable, or evidence boundary instead",
+            "do not select a direction that the supplied evidence already refutes; if the proposed mechanism or comparison is refuted, pivot to a discriminating unresolved question within the same phenomenon",
             "treat the supplied survey evidence and source spans as the reason for the redesign; do not invent a gap that is absent from them",
         ])
+        if refinement_context.get("work_orders"):
+            constraints.append(
+                "The selected candidate must directly satisfy the assigned topic work order's objective and success condition; do not merely acknowledge them in selection_rationale."
+            )
+        if refinement_context.get("rejected_directions"):
+            constraints.append(
+                "Treat refinement_context.rejected_directions as hard negative examples. Do not reuse their "
+                "research question or keep the same primary estimand/comparison while changing only a term, "
+                "threshold, title, or model label. Move to a different observable or comparison that still "
+                "tests the retained parent phenomenon."
+            )
         salvage_plan = refinement_context.get("salvage_plan")
         if isinstance(salvage_plan, dict):
             active_branch = salvage_plan.get("active_branch")
             if salvage_plan.get("mode") == "salvage" and isinstance(active_branch, dict):
                 branch_id = active_branch.get("id")
                 change_dimensions = active_branch.get("change_dimensions") or []
+                dependent_dimensions = active_branch.get("dependent_dimensions") or []
                 constraints.extend([
                     "This is a bounded salvage branch before a structural pivot. Preserve the parent's supported scientific core where the evidence allows; do not abandon it merely because the first executable formulation failed.",
+            "Preserve the parent's phenomenon field; express the refinement through the assigned mechanism, observable, comparator, evidence boundary, or claim scope.",
+            "The research_question itself must name the parent's core phenomenon; keeping the phenomenon label while asking about a different subject is not preservation.",
                     f"Implement salvage branch {branch_id!r}: {active_branch.get('goal', '')}",
                     "Make the active branch observable in the selected candidate, not only in selection_rationale.",
                     "Change at least two of the active branch dimensions: "
                     + ", ".join(str(item) for item in change_dimensions) + ".",
+                    "Update only these dependent fields when needed to keep the candidate internally consistent; they do not count as branch changes: "
+                    + ", ".join(str(item) for item in dependent_dimensions)
+                    + ". Preserve every other field.",
                     "Do not reuse an already attempted salvage branch, and do not emit a cosmetic title or threshold change as a branch.",
                 ])
             elif salvage_plan.get("mode") == "structural_pivot":
                 constraints.extend([
-                    "All permitted salvage branches are exhausted or a deterministic/source gate forced a pivot. Produce a structurally independent question and state a discriminating unresolved comparison.",
-                    "Do not present the structural pivot as a repaired version of the rejected candidate; preserve the rejection lineage and change the scientific shape materially.",
+                    "The bounded adjacent-salvage branches are exhausted or an independent source/feasibility gate forced a structural pivot. Keep the parent's phenomenon and find its closest still-testable question; a different phenomenon requires a separate evidence-backed topic decision, not a rewrite in this salvage chain.",
+                    "Preserve the rejection lineage and make the smallest evidence-justified structural change that yields a discriminating unresolved comparison.",
                 ])
         rejected_seed_ids = refinement_context.get("rejected_frontier_seed_ids")
         if (refinement_context.get("require_frontier_seed_pivot") is True
@@ -3816,6 +4347,18 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
                     "make each repair observable in phenomenon, mechanism, data_regime, comparison, measurement, theory_target, disconfirmation_test, disconfirmation_test_note, or resource_plan",
                     "when a reviewer requests quantitative executability, state the measurable variable or estimand, the scaling/equation or operational definition, the bounded comparison range or baseline, and the result that would disconfirm the direction",
                 ])
+        response_repair = refinement_context.get("response_contract_repair")
+        if isinstance(response_repair, dict):
+            constraints.extend([
+                "This pivot also has one bounded response-contract recovery. In addition to making the requested scientific pivot, correct the previous deterministic validation failure.",
+                "Return a fresh complete package matching output_contract exactly; do not repeat the rejected response verbatim or return a wrapper or partial candidate list.",
+            ])
+            validation_error = response_repair.get("validation_error")
+            if isinstance(validation_error, str) and validation_error.strip():
+                constraints.append(
+                    "Previous deterministic validation failure to correct: "
+                    + validation_error[:2048]
+                )
         if refinement_context.get("require_frontier_seed_pivot") is True:
             constraints.extend([
                 "the source challenge found weak grounding together with high prior-work risk; abandon the parent's frontier seed rather than rewriting the same direction",
@@ -3841,7 +4384,7 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
             "frontier_seed_pivot_required": bool(
                 refinement_context.get("require_frontier_seed_pivot") is True
             ) if refinement_context else False,
-        } if refinement_context else {},
+        } if refinement_context and not response_contract_only else {},
         "portfolio_requirements": portfolio_requirements,
         "portfolio_shape_plan": portfolio_shape_plan,
         "previous_candidate_directions": candidate_history,
@@ -3864,7 +4407,8 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
     }, ensure_ascii=False, sort_keys=True)
 
 
-def _refinement_target_shape(package, parent_candidate_id, runtime_context, seed=None):
+def _refinement_target_shape(package, parent_candidate_id, runtime_context, seed=None,
+                             salvage_plan=None):
     """Choose an unused research shape for a bounded single-candidate repair."""
     if not isinstance(package, dict) or not isinstance(package.get("candidates"), list):
         return None
@@ -3887,12 +4431,38 @@ def _refinement_target_shape(package, parent_candidate_id, runtime_context, seed
         item for item in (foundry.get("allowed_evidence_modes") or [])
         if item in EVIDENCE_MODE_VALUES
     } if isinstance(foundry, dict) and foundry.get("enabled") is True else set()
-    slots = _portfolio_shape_plan(len(candidates), seed)
-    slots.extend(
-        dict(zip(PORTFOLIO_DIMENSIONS, values))
-        for values in itertools.product(
-            RESEARCH_FORM_VALUES, EVIDENCE_MODE_VALUES, COMPARISON_TYPE_VALUES)
-    )
+    branch = (salvage_plan.get("active_branch")
+              if isinstance(salvage_plan, dict)
+              and salvage_plan.get("mode") == "salvage" else None)
+    if not isinstance(branch, dict):
+        slots = _portfolio_shape_plan(len(candidates), seed)
+        slots.extend(
+            dict(zip(PORTFOLIO_DIMENSIONS, values))
+            for values in itertools.product(
+                RESEARCH_FORM_VALUES, EVIDENCE_MODE_VALUES, COMPARISON_TYPE_VALUES)
+        )
+    else:
+        allowed_dimensions = set(PORTFOLIO_DIMENSIONS)
+        allowed_dimensions.intersection_update(branch.get("change_dimensions", []))
+        if not allowed_dimensions:
+            return None
+        values_by_dimension = {
+            "research_form": RESEARCH_FORM_VALUES,
+            "evidence_mode": EVIDENCE_MODE_VALUES,
+            "comparison_type": COMPARISON_TYPE_VALUES,
+        }
+        rng = Random(seed if type(seed) is int and seed >= 0 else 0)
+        dimensions = sorted(allowed_dimensions)
+        rng.shuffle(dimensions)
+        slots = []
+        for dimension in dimensions:
+            values = [value for value in values_by_dimension[dimension]
+                      if value != parent.get(dimension)]
+            rng.shuffle(values)
+            for value in values:
+                slot = {field: parent.get(field) for field in PORTFOLIO_DIMENSIONS}
+                slot[dimension] = value
+                slots.append(slot)
     for slot in slots:
         shape = tuple(slot.get(field) for field in PORTFOLIO_DIMENSIONS)
         if shape == parent_shape or shape in occupied:
@@ -4070,7 +4640,7 @@ def _topic_candidate_refinement_prompt(objective, parent_candidate, *,
         if parent_capability in design_ids:
             candidate_contract["experiment_design"] = (
                 "copy the parent's valid bounded design and change only values allowed by its template")
-    return json.dumps({
+    payload = {
         "assignment": "repair_selected_topic_candidate",
         "principal_objective": objective,
         "candidate_id_to_copy_exactly": parent_candidate.get("id"),
@@ -4097,6 +4667,7 @@ def _topic_candidate_refinement_prompt(objective, parent_candidate, *,
         "constraints": [
             "Return exactly one object with exactly one top-level key: candidate.",
             "Copy the candidate id exactly; do not create a new id and do not return package metadata.",
+            "Keep the phenomenon field identical to the parent and name its core system in the research question. Change the question's testable boundary, mechanism, comparator, observable, evidence mode, or claim scope without changing the phenomenon.",
             "Copy target_frontier_seed_id exactly and cite only target_seed_records; never invent a work id.",
             "Copy required_shape exactly; the replacement must not use the parent's research shape.",
             "Change at least one substantive scientific field in addition to the required shape: "
@@ -4108,7 +4679,16 @@ def _topic_candidate_refinement_prompt(objective, parent_candidate, *,
             "Use only literal keys listed in output_contract.candidate; omit aliases such as mechanism_boundary or disconfirmation_test_note_optional and put boundary detail in data_regime or theory_target.",
             "Return only the JSON object with no markdown or explanation.",
         ],
-    }, ensure_ascii=False, sort_keys=True)
+    }
+    retained_phenomenon = parent_candidate.get("phenomenon")
+    if isinstance(retained_phenomenon, str) and retained_phenomenon.strip():
+        payload["constraints"].insert(
+            2,
+            "Explicitly name the parent's specific system and setting in research_question: "
+            + json.dumps(retained_phenomenon.strip(), ensure_ascii=False)
+            + ". Do not replace that setting with a generic or merely convenient model system.",
+        )
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 SOURCE_CHALLENGE_SYSTEM = (
@@ -4272,19 +4852,36 @@ class TopicDiscoveryRunner:
         role_models = self.model_config.get("role_models", {})
         role_fallbacks = self.model_config.get("role_model_fallbacks", {})
         candidates = []
-        if isinstance(role_models, dict) and isinstance(role_models.get(role), dict):
-            candidates.append(deepcopy(role_models[role]))
-        if isinstance(role_fallbacks, dict) and isinstance(role_fallbacks.get(role), list):
-            candidates.extend(deepcopy(item) for item in role_fallbacks[role]
+        selected = role_config_for(role_models, role)
+        if isinstance(selected, dict):
+            candidates.append(deepcopy(selected))
+        alternatives = role_config_for(role_fallbacks, role, [])
+        if isinstance(alternatives, list):
+            candidates.extend(deepcopy(item) for item in alternatives
                               if isinstance(item, dict))
+        candidates = [candidate for candidate in candidates
+                      if not is_local_qwen_route({**self.model_config, **candidate})]
         if candidates:
             cursor = (route_index % len(candidates)
                       if route_index is not None
                       else self._route_cursors.get(role, 0))
+            if route_index is not None and route_index < 0 and len(candidates) > 1:
+                fallback_indices = list(range(1, len(candidates)))
+                start = cursor if cursor in fallback_indices else fallback_indices[0]
+                start_position = fallback_indices.index(start)
+                route_order = (
+                    fallback_indices[start_position:]
+                    + fallback_indices[:start_position]
+                    + [0]
+                )
+            else:
+                route_order = [
+                    (cursor + offset) % len(candidates)
+                    for offset in range(len(candidates))
+                ]
             selected = None
             selected_index = None
-            for offset in range(len(candidates)):
-                index = (cursor + offset) % len(candidates)
+            for index in route_order:
                 if model_call_budget_available(candidates[index]):
                     selected, selected_index = candidates[index], index
                     break
@@ -4333,8 +4930,8 @@ class TopicDiscoveryRunner:
                     or not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
                 raise ValidationError(
                     "topic discovery model config requires a finite positive timeout_seconds")
-            config["timeout_seconds"] = min(
-                float(timeout_seconds), remaining, TOPIC_MODEL_CALL_TIMEOUT_SECONDS)
+            config["timeout_seconds"] = effective_model_timeout(
+                timeout_seconds, remaining)
         return ModelClient(**config)
 
     def _repair_missing_topic_fields(self, package, *, deadline, budget,
@@ -4350,36 +4947,39 @@ class TopicDiscoveryRunner:
         if not isinstance(package, dict) or not isinstance(package.get("candidates"), list):
             return []
         selected_id = package.get("selected_id")
-        targets = [
-            {
-                "candidate_index": index,
-                "id": candidate.get("id"),
-                "candidate": candidate,
-                "missing_fields": [
-                    field for field in _TOPIC_REPAIRABLE_TEXT_FIELDS
-                    + (
-                        _TOPIC_REPAIRABLE_STRUCTURED_FIELDS
-                        if require_feasibility_plan
-                        and candidate.get("id") == selected_id
-                        else ()
-                    )
-                    if field not in candidate
-                ],
-            }
-            for index, candidate in enumerate(package["candidates"])
-            if isinstance(candidate, dict)
-            and any(field not in candidate for field in (
-                _TOPIC_REPAIRABLE_TEXT_FIELDS
-                + (
-                    _TOPIC_REPAIRABLE_STRUCTURED_FIELDS
-                    if require_feasibility_plan
+        repairs = []
+        targets = []
+        for index, candidate in enumerate(package["candidates"]):
+            if not isinstance(candidate, dict):
+                continue
+            resource_plan = candidate.get("resource_plan")
+            if not isinstance(resource_plan, str) or not resource_plan.strip():
+                derived = _resource_plan_from_feasibility(candidate)
+                if derived:
+                    candidate["resource_plan"] = derived
+                    repairs.append({
+                        "candidate_id": candidate.get("id"),
+                        "field": "resource_plan",
+                        "source": "feasibility_plan_projection",
+                    })
+            repairable_fields = [
+                field for field in _TOPIC_REPAIRABLE_TEXT_FIELDS
+                if (not isinstance(candidate.get(field), str)
+                    or not candidate[field].strip())
+            ]
+            if (require_feasibility_plan
                     and candidate.get("id") == selected_id
-                    else ()
-                )
-            ))
-        ]
+                    and not isinstance(candidate.get("feasibility_plan"), dict)):
+                repairable_fields.extend(_TOPIC_REPAIRABLE_STRUCTURED_FIELDS)
+            if repairable_fields:
+                targets.append({
+                    "candidate_index": index,
+                    "id": candidate.get("id"),
+                    "candidate": candidate,
+                    "missing_fields": repairable_fields,
+                })
         if not targets:
-            return []
+            return repairs
         client = self._client(
             "topic_discovery",
             deadline=deadline,
@@ -4467,7 +5067,6 @@ class TopicDiscoveryRunner:
             if set(by_id) != set(target_ids):
                 raise ValidationError(
                     "topic field repair did not cover every target candidate")
-            repairs = []
             repairs.extend(field_repairs)
             for candidate in targets:
                 identifier = candidate["id"]
@@ -4709,6 +5308,28 @@ class TopicDiscoveryRunner:
             raise ValidationError("topic discovery maturity_review_rounds must be between 0 and 4")
         if refinement_context is not None and not isinstance(refinement_context, dict):
             raise ValidationError("topic discovery refinement_context must be an object when supplied")
+        has_parent_refinement = (
+            isinstance(refinement_context, dict)
+            and refinement_context.get("mode") == "refinement"
+            and isinstance(refinement_context.get("parent_topic"), dict)
+        )
+        single_parent_refinement = (
+            has_parent_refinement
+            and any(
+                isinstance(order, dict)
+                and order.get("kind") == "topic_refinement"
+                for order in (
+                    refinement_context.get("work_orders")
+                    if isinstance(refinement_context.get("work_orders"), list)
+                    else []
+                )
+            )
+        )
+        if (isinstance(refinement_context, dict)
+                and isinstance(refinement_context.get("salvage_plan"), dict)
+                and not isinstance(refinement_context.get("parent_topic"), dict)):
+            raise ValidationError(
+                "topic salvage refinement requires its parent_topic anchor")
         if specialist_reports is not None and not isinstance(specialist_reports, list):
             raise ValidationError("topic discovery specialist_reports must be a list when supplied")
         deadline = time.monotonic() + self.deadline_seconds if self.deadline_seconds is not None else None
@@ -4722,6 +5343,10 @@ class TopicDiscoveryRunner:
         recent_papers = list(recent_papers or [])
         sampling_trace = []
         frontier_seed_plan = None
+        focused_refinement = _parent_focused_refinement_inputs(refinement_context)
+        if focused_refinement is not None:
+            frontier_seed_plan, focused_papers = focused_refinement
+            recent_papers = focused_papers
         if bibliography is not False and not recent_papers:
             # Do not spend a proposal call when the next literature request is
             # already fenced by the shared account ledger. The fake clients
@@ -4754,16 +5379,19 @@ class TopicDiscoveryRunner:
                         retry_after_seconds=delay,
                         rate_limit=rate_limit,
                     )
-            frontier_seed_plan = self._generate_frontier_seed_plan(
-                objective, seed_count=max(6, candidate_count), sampling_seed=sampling_seed,
-                deadline=deadline, usage=usage, budget=budget)
+            if frontier_seed_plan is None:
+                frontier_seed_plan = self._generate_frontier_seed_plan(
+                    objective, seed_count=max(6, candidate_count), sampling_seed=sampling_seed,
+                    deadline=deadline, usage=usage, budget=budget)
             recent_papers, sampling_seed, sampling_trace = self._recent_paper_sample(
                 objective, bibliography=bibliography, deadline=deadline, sampling_seed=sampling_seed,
-                frontier_seed_plan=frontier_seed_plan, budget=budget)
+                frontier_seed_plan=frontier_seed_plan, budget=budget,
+                minimum_seed_groups=1 if focused_refinement is not None else 4)
+        generation_candidate_count = 1 if single_parent_refinement else candidate_count
         candidate_frontier_seeds = _grounding_eligible_frontier_seeds(
             (frontier_seed_plan or {}).get("seeds", []),
             recent_papers,
-            candidate_count,
+            generation_candidate_count,
         )
         previous = None
         last_error = None
@@ -4771,10 +5399,10 @@ class TopicDiscoveryRunner:
         source_refinement_count = 0
         refinement_parent = (
             deepcopy(refinement_context.get("parent_topic"))
-            if isinstance(refinement_context, dict)
-            and isinstance(refinement_context.get("parent_topic"), dict)
+            if has_parent_refinement
             else None
         )
+        refinement_anchor = deepcopy(refinement_parent)
         refinement_round = 0
         maturity_reviews = []
         maturity_review_history = []
@@ -4786,6 +5414,57 @@ class TopicDiscoveryRunner:
         self._active_topic_rejections = rejected_topic_history
         refinement_base_package = None
         refinement_parent_index = None
+        if single_parent_refinement:
+            work_orders = refinement_context.get("work_orders")
+            work_orders = work_orders if isinstance(work_orders, list) else []
+            feedback = refinement_context.get("refinement_feedback")
+            refinement_feedback = deepcopy(feedback) if isinstance(feedback, dict) else {}
+            refinement_feedback.setdefault(
+                "review_type", "composer_scoped_parent_refinement")
+            if not refinement_feedback.get("rationale"):
+                refinement_feedback["rationale"] = str(
+                    refinement_context.get("reason")
+                    or "The retained topic needs a source-grounded, testable refinement.")[:2200]
+            required_changes = list(refinement_feedback.get("required_changes", []))
+            for order in work_orders[:4]:
+                if not isinstance(order, dict):
+                    continue
+                detail = " ".join(
+                    str(order.get(key) or "").strip()
+                    for key in ("objective", "success_condition", "evidence_needed")
+                    if str(order.get(key) or "").strip()
+                )
+                if detail:
+                    required_changes.append(detail[:1800])
+            survey_feedback = refinement_context.get("survey_feedback")
+            if isinstance(survey_feedback, dict):
+                gap_state = survey_feedback.get("gap_state")
+                nomination = survey_feedback.get("nomination")
+                if gap_state or nomination:
+                    required_changes.append(
+                        "Use the retained survey decision: "
+                        + json.dumps({"gap_state": gap_state, "nomination": nomination},
+                                     ensure_ascii=False, sort_keys=True)[:1800]
+                    )
+            refinement_feedback["required_changes"] = list(dict.fromkeys(
+                str(item).strip() for item in required_changes
+                if isinstance(item, str) and item.strip()
+            ))[:8]
+            refinement_base_package = {
+                "schema_version": SCHEMA_VERSION,
+                "objective": objective,
+                "candidates": [deepcopy(refinement_parent)],
+                "selected_id": refinement_parent["id"],
+                "selection_rationale": (
+                    "Retain the admitted research lineage while repairing its evidence-backed blocker."
+                ),
+            }
+            refinement_parent_index = 0
+        last_invalid_response_sha256 = None
+        last_invalid_response_error = None
+        consecutive_novelty_rejections = 0
+        consecutive_refinement_contract_rejections = 0
+        portfolio_completion_candidate = None
         attempts = itertools.count() if repair_mode == "until_deadline" else range(max_attempts)
         catalog_ids = {
             item.get("id") for item in (runtime_context or {}).get("experiment_catalog", [])
@@ -4796,7 +5475,7 @@ class TopicDiscoveryRunner:
             prompt_runtime_context = deepcopy(runtime_context or {})
             prompt_runtime_context["independent_specialist_reports"] = deepcopy(specialist_reports[:16])
         coverage_plan = _capability_coverage_plan(
-            runtime_context, candidate_count, sampling_seed)
+            runtime_context, generation_candidate_count, sampling_seed)
         if coverage_plan:
             # Preserve independent specialist feedback when the capability
             # planner is also active. Replacing this projection with the raw
@@ -4862,15 +5541,32 @@ class TopicDiscoveryRunner:
                 if isinstance(maturity_review_error, str) and maturity_review_error.strip():
                     output["maturity_review_error"] = maturity_review_error[:2048]
             if refinement_context:
-                evolution = {
-                    "mode": "refinement",
-                    "cycle": refinement_context.get("cycle"),
-                    "parent_topic_id": refinement_context.get("parent_topic_id"),
-                    "changed_dimensions": sorted(set(
+                parent_topic_id = refinement_context.get("parent_topic_id")
+                response_contract_only = (
+                    refinement_context.get("mode") == "response_contract_repair")
+                evolution_mode = (
+                    "refinement" if has_parent_refinement
+                    else "response_contract_repair"
+                    if response_contract_only and parent_topic_id == selected.get("id")
+                    else "pivot" if isinstance(parent_topic_id, str) and parent_topic_id
+                    else "frontier_selection"
+                )
+                changed_dimensions = (
+                    sorted(set(
                         list(evolution_dimensions or [])
                         + list(refinement_changed_dimensions or [])
-                    )) or refinement_context.get("changed_dimensions", []),
-                    "reason": refinement_context.get("reason"),
+                    )) or list(refinement_context.get("changed_dimensions", []))
+                    if has_parent_refinement else []
+                )
+                evolution_reason = refinement_context.get("reason")
+                if not isinstance(evolution_reason, str) or not evolution_reason.strip():
+                    evolution_reason = package.get("selection_rationale")
+                evolution = {
+                    "mode": evolution_mode,
+                    "cycle": refinement_context.get("cycle"),
+                    "parent_topic_id": parent_topic_id,
+                    "changed_dimensions": changed_dimensions,
+                    "reason": evolution_reason,
                 }
                 salvage_plan = refinement_context.get("salvage_plan")
                 if isinstance(salvage_plan, dict):
@@ -4904,6 +5600,8 @@ class TopicDiscoveryRunner:
                         "exhausted": bool(salvage_plan.get("exhausted")),
                         "forced": bool(salvage_plan.get("forced")),
                     }
+                if single_parent_refinement:
+                    evolution["package_contract"] = "single_candidate_parent_refinement"
                 output["topic_evolution"] = evolution
             return output
 
@@ -4926,12 +5624,34 @@ class TopicDiscoveryRunner:
                     "make the branch observable in the candidate, and change at least "
                     "two of these dimensions: "
                     + ", ".join(str(item) for item in active.get("change_dimensions", []))
-                    + ". Do not make a cosmetic title or threshold edit."
+                    + ". Supporting fields may change only as needed for internal consistency: "
+                    + ", ".join(str(item) for item in active.get(
+                        "dependent_dimensions", []))
+                    + ". Preserve every other field. Do not make a cosmetic title or threshold edit."
                 )
+                validation_error = str(payload.get("validation_error") or "").casefold()
+                if any(marker in validation_error for marker in (
+                        "must materially change at least two of its assigned dimensions",
+                        "changed dimensions outside its assigned repair scope",
+                )):
+                    repair = (
+                        " This is a scoped-response contract correction, not a scientific rejection. "
+                        "Keep the parent phenomenon and candidate id. Make at least two substantive "
+                        "changes among this branch's change_dimensions. Restore every field named as "
+                        "outside the assigned repair scope to its parent value unless it is explicitly "
+                        "listed as a dependent_dimension. Change dependent fields only when needed for "
+                        "consistency. Do not alter any other dimension."
+                    )
+                    payload["repair_instruction"] = (
+                        str(payload.get("repair_instruction") or "").rstrip() + repair)
             elif salvage_plan.get("mode") == "structural_pivot":
                 instruction += (
-                    " The bounded salvage ladder is exhausted or was forcibly bypassed. "
-                    "Produce a structurally independent question and retain the rejection lineage."
+                    " The bounded salvage ladder is exhausted or a major design change is required. "
+                    "Make an adjacent design pivot within the same parent phenomenon: change the "
+                    "question boundary, comparator, observable, evidence mode, or claim scope, and "
+                    "retain the rejection lineage. Ladder exhaustion alone never authorizes an "
+                    "unrelated phenomenon. A phenomenon change requires explicit refutation or "
+                    "infeasibility evidence plus its cited rationale."
                 )
             payload["refinement_instruction"] = instruction
             return payload
@@ -4962,6 +5682,8 @@ class TopicDiscoveryRunner:
                     runtime_context,
                     seed=((generation_seed + 7919) % MAX_PROVIDER_SEED
                           if generation_seed is not None else None),
+                    salvage_plan=(refinement_context.get("salvage_plan")
+                                  if isinstance(refinement_context, dict) else None),
                 )
                 target_seed = _refinement_target_seed(
                     candidate_frontier_seeds,
@@ -4992,6 +5714,44 @@ class TopicDiscoveryRunner:
                             refinement_feedback=refinement_feedback,
                         )
                     )
+                    if single_parent_refinement:
+                        projected_context = _topic_prompt_refinement_projection(
+                            refinement_context)
+                        refinement_payload["composer_repair_context"] = {
+                            key: deepcopy(projected_context[key])
+                            for key in (
+                                "reason", "work_orders", "survey_feedback",
+                                "specialist_feedback", "refinement_feedback",
+                                "rejected_directions",
+                            ) if key in projected_context
+                        }
+                        for rejected in rejected_topic_history[-8:]:
+                            projected_rejection = _topic_prompt_rejection_projection(rejected)
+                            rejected_directions = refinement_payload[
+                                "composer_repair_context"].setdefault(
+                                    "rejected_directions", [])
+                            identity = (
+                                projected_rejection.get("title"),
+                                projected_rejection.get("research_question"),
+                            )
+                            if not any(
+                                    (item.get("title"), item.get("research_question"))
+                                    == identity
+                                    for item in rejected_directions
+                                    if isinstance(item, dict)):
+                                rejected_directions.append(projected_rejection)
+                        rejected_directions = refinement_payload[
+                            "composer_repair_context"].get("rejected_directions", [])
+                        if rejected_directions:
+                            refinement_payload["composer_repair_context"][
+                                "rejected_directions"] = rejected_directions[-8:]
+                            refinement_payload["constraints"].append(
+                                "Treat composer_repair_context.rejected_directions as hard negative examples. "
+                                "Do not reuse their question or keep the same primary estimand/comparison "
+                                "while changing only a mechanism term, threshold, title, or model label. "
+                                "Move to an untried observable or comparison that still tests the retained "
+                                "parent phenomenon."
+                            )
                     if previous is not None and last_error is not None:
                         refinement_payload["previous_response"] = previous[:12000]
                         refinement_payload["validation_error"] = str(last_error)
@@ -5003,6 +5763,20 @@ class TopicDiscoveryRunner:
                     apply_salvage_prompt(refinement_payload)
                     prompt = json.dumps(
                         refinement_payload, ensure_ascii=False, sort_keys=True)
+                elif single_parent_refinement or source_refinement_count > 0:
+                    missing = []
+                    if target_shape is None:
+                        missing.append("an admissible research shape")
+                    if target_seed is None:
+                        missing.append("a frontier seed with supplied scholarly records")
+                    error = ValidationError(
+                        "bounded single-candidate topic refinement cannot proceed without "
+                        + " and ".join(missing)
+                        + "; the existing portfolio was left unchanged")
+                    error.usage = deepcopy(usage)
+                    error.candidate_attempt_trace = deepcopy(candidate_attempt_trace)
+                    error.rejected_topic_history = deepcopy(rejected_topic_history)
+                    raise error
             if refinement_feedback is not None and not single_candidate_refinement:
                 # Refinement must keep the same package contract as the first
                 # generation.  A looser prompt here makes a capable model
@@ -5117,11 +5891,39 @@ class TopicDiscoveryRunner:
                         "literally in candidate list order, and rewrite any affected candidate prose so the "
                         "research form, evidence mode, and comparison type are scientifically consistent."
                     )
+                if portfolio_completion_candidate is not None:
+                    repair_payload["assignment"] = "complete_topic_portfolio"
+                    repair_payload["portfolio_completion"] = {
+                        "candidate_count": candidate_count,
+                        "candidate_to_preserve": deepcopy(portfolio_completion_candidate),
+                        "minimum_additional_candidates": max(0, candidate_count - 1),
+                        "selected_id": portfolio_completion_candidate.get("id"),
+                        "instruction": (
+                            "The previous response was one candidate, not a complete package. "
+                            "Return the full package from output_contract. Include candidate_to_preserve "
+                            "once as one portfolio member, then generate enough genuinely distinct "
+                            "alternatives to reach candidate_count. Preserve its scientific claims; do "
+                            "not fabricate or silently repair evidence. All ordinary novelty, feasibility, "
+                            "grounding, diversity, and maturity checks still apply."),
+                    }
+                    repair_payload["repair_instruction"] = (
+                        "Complete the portfolio using portfolio_completion.candidate_to_preserve exactly "
+                        "once and provide the required number of additional candidates. Return the full "
+                        "five-key topic package only, not a candidate object or wrapper. Keep the supplied "
+                        "candidate's scientific content intact; do not claim it is selected unless "
+                        "selected_id names it. Every candidate must be fully specified and pass the "
+                        "provided output_contract. Do not invent citations or evidence.")
                 prompt = json.dumps(repair_payload, ensure_ascii=False, sort_keys=True)
             if single_candidate_refinement:
                 # A reviewer-directed repair gets the strongest declared bulk
                 # lane. Fresh proposals continue to rotate through Qwen,
                 # Gemma, and DeepSeek according to the configured cursor.
+                preferred_route_index = -1
+            elif (attempt == 0 and isinstance(refinement_context, dict)
+                    and isinstance(refinement_context.get("response_contract_repair"), dict)):
+                # A resumed contract repair starts on the configured fallback
+                # lane rather than replaying the route that produced the bad
+                # response. Later local repair calls resume ordinary rotation.
                 preferred_route_index = -1
             client = self._client(
                 "topic_discovery", seed=generation_seed, deadline=deadline,
@@ -5135,6 +5937,8 @@ class TopicDiscoveryRunner:
             except ModelCallError as exc:
                 budget.record_model_error(exc)
                 last_error = ValidationError(f"topic discovery model call failed: {exc}")
+                consecutive_novelty_rejections = 0
+                consecutive_refinement_contract_rejections = 0
                 outcome_known = bool(getattr(exc, "outcome_known", False))
                 candidate_attempt_trace.append(_candidate_attempt_record(
                     {}, attempt=attempt + 1,
@@ -5143,10 +5947,48 @@ class TopicDiscoveryRunner:
                 continue
             budget.record_model_result(result)
             previous = result.text
+            response_sha256 = hashlib.sha256(
+                result.text.encode("utf-8", errors="replace")).hexdigest()
+            if response_sha256 == last_invalid_response_sha256:
+                previous_validation_error = str(
+                    last_invalid_response_error or last_error
+                    or "unspecified topic validation failure")[:2048]
+                repeated_error = ValidationError(
+                    "topic discovery repeated the byte-identical rejected response after a repair request; "
+                    f"previous validation failure: {previous_validation_error}")
+                repeated_error.topic_response_repair = {
+                    "response_sha256": response_sha256,
+                    "previous_validation_error": previous_validation_error,
+                }
+                budget.record_validation_error(repeated_error)
+                repeated_package = (
+                    {"candidates": [deepcopy(portfolio_completion_candidate)],
+                     "selected_id": portfolio_completion_candidate.get("id")}
+                    if isinstance(portfolio_completion_candidate, dict) else {}
+                )
+                repeated_record = _candidate_attempt_record(
+                    repeated_package, attempt=attempt + 1,
+                    status="repeated_response", error=str(repeated_error),
+                    outcome_known=True)
+                repeated_record["response_sha256"] = response_sha256
+                repeated_record["previous_validation_error"] = previous_validation_error
+                candidate_attempt_trace.append(repeated_record)
+                last_error = repeated_error
+                break
+            last_invalid_response_sha256 = None
+            last_invalid_response_error = None
             attempt_record = None
+            candidate_only_response = None
             try:
                 parsed_package, response_repairs = _normalise_topic_model_response(
                     result, single_candidate_refinement=single_candidate_refinement)
+                if not single_candidate_refinement:
+                    candidate_only_response = _single_topic_candidate_response(parsed_package)
+                    if candidate_only_response is not None:
+                        portfolio_completion_candidate = deepcopy(candidate_only_response)
+                        raise ValidationError(
+                            "topic discovery returned one complete candidate where a full "
+                            f"portfolio of {candidate_count} candidates is required")
                 if single_candidate_refinement:
                     if (not isinstance(parsed_package, dict)
                             or set(parsed_package) != {"candidate"}
@@ -5173,8 +6015,9 @@ class TopicDiscoveryRunner:
                     )
                 else:
                     package = parsed_package
-                controller_metadata_repairs = _strip_topic_controller_metadata(package)
+                controller_metadata_repairs = _strip_noncontract_topic_fields(package)
                 alias_repairs = _repair_known_candidate_field_aliases(package)
+                identifier_repairs = _repair_case_only_topic_candidate_ids(package)
                 grounding_repairs = _materialize_seed_bindings(
                     package,
                     (frontier_seed_plan or {}).get("seeds", []),
@@ -5212,6 +6055,7 @@ class TopicDiscoveryRunner:
                     package, frontier_seeds=(frontier_seed_plan or {}).get("seeds", []))
                 attempt_record = _candidate_attempt_record(
                     package, attempt=attempt + 1, outcome_known=True)
+                attempt_record["response_sha256"] = response_sha256
                 if response_repairs:
                     attempt_record["response_normalization"] = response_repairs
                 if objective_normalized:
@@ -5247,6 +6091,9 @@ class TopicDiscoveryRunner:
                 if controller_metadata_repairs:
                     attempt_record.setdefault("derived_field_repairs", []).extend(
                         controller_metadata_repairs)
+                if identifier_repairs:
+                    attempt_record.setdefault("derived_field_repairs", []).extend(
+                        identifier_repairs)
                 candidate_attempt_trace.append(attempt_record)
                 validation_history = _topic_validation_history(
                     (runtime_context or {}).get("topic_history"),
@@ -5260,24 +6107,20 @@ class TopicDiscoveryRunner:
                             "topic_exclusions", {}).get("topic_ids", []),
                         excluded_capability_ids=(runtime_context or {}).get(
                             "topic_exclusions", {}).get("capability_ids", []),
+                        runtime_context=runtime_context,
                     )
                 if novelty_selection_repair is not None:
                     attempt_record["novelty_selection_repair"] = novelty_selection_repair
-                    replacement = next(
-                        candidate for candidate in package["candidates"]
-                        if candidate.get("id") == package["selected_id"]
-                    )
-                    attempt_record["selected_id"] = package["selected_id"]
-                    attempt_record["selected_topic"] = {
-                        key: replacement.get(key) for key in (
-                            "id", "title", "domain", "research_question", "research_form",
-                            "evidence_mode", "comparison_type", "experiment_capability_id")
-                    }
+                    _record_attempt_selection(attempt_record, package)
                 validate_topic_package(
                     _topic_package_for_structural_validation(package, runtime_context),
-                    objective=objective, candidate_count=candidate_count,
+                    objective=objective,
+                    candidate_count=(len(package.get("candidates", []))
+                                     if single_candidate_refinement
+                                     else candidate_count),
                     experiment_capability_ids=catalog_ids,
-                    require_capability_coverage=bool(catalog_ids),
+                    require_capability_coverage=(
+                        bool(catalog_ids) and not single_candidate_refinement),
                     excluded_capability_ids=(runtime_context or {}).get("topic_exclusions", {}).get("capability_ids", []),
                     excluded_topic_ids=(runtime_context or {}).get("topic_exclusions", {}).get("topic_ids", []),
                     topic_history=validation_history,
@@ -5287,12 +6130,17 @@ class TopicDiscoveryRunner:
                     require_grounding=frontier_seed_plan is not None,
                     fallback_templates=(runtime_context or {}).get(
                         "fallback_experiment_catalog", []),
-                    enforce_portfolio_diversity=frontier_seed_plan is not None)
+                    enforce_portfolio_diversity=(
+                        frontier_seed_plan is not None and not single_candidate_refinement),
+                    single_candidate_refinement=single_candidate_refinement,
+                    refinement_parent=refinement_parent)
+                portfolio_completion_candidate = None
                 selection_repair = _repair_foundry_selection(package, runtime_context)
                 if selection_repair is not None:
                     attempt_record["selection_repair"] = selection_repair
                 refinement_selection_repair = None
-                if frontier_seed_plan is not None and refinement_parent is not None:
+                if (frontier_seed_plan is not None and refinement_parent is not None
+                        and not single_candidate_refinement):
                     refinement_selection_repair = _repair_topic_refinement_selection(
                         package, refinement_parent, runtime_context,
                         require_frontier_seed_pivot=(
@@ -5309,18 +6157,36 @@ class TopicDiscoveryRunner:
                     package, runtime_context)
                 if executable_selection_repair is not None:
                     attempt_record["executable_selection_repair"] = executable_selection_repair
+                post_repair_novelty_selection_repair = None
+                if not single_candidate_refinement:
+                    post_repair_novelty_selection_repair = _repair_topic_novelty_selection(
+                        package,
+                        validation_history,
+                        excluded_topic_ids=(runtime_context or {}).get(
+                            "topic_exclusions", {}).get("topic_ids", []),
+                        excluded_capability_ids=(runtime_context or {}).get(
+                            "topic_exclusions", {}).get("capability_ids", []),
+                        runtime_context=runtime_context,
+                    )
+                if post_repair_novelty_selection_repair is not None:
+                    attempt_record["post_repair_novelty_selection_repair"] = (
+                        post_repair_novelty_selection_repair)
+                _record_attempt_selection(attempt_record, package)
                 if (selection_repair is not None
                         or refinement_selection_repair is not None
-                        or executable_selection_repair is not None):
+                        or executable_selection_repair is not None
+                        or post_repair_novelty_selection_repair is not None):
                     # Selection repairs mutate only selected_id and the
                     # rationale, but the final choice must cross every same
                     # package gate again before it is sent to literature or
                     # maturity review.
                     validate_topic_package(
                         _topic_package_for_structural_validation(package, runtime_context),
-                        objective=objective, candidate_count=candidate_count,
+                        objective=objective,
+                        candidate_count=1 if single_candidate_refinement else candidate_count,
                         experiment_capability_ids=catalog_ids,
-                        require_capability_coverage=bool(catalog_ids),
+                        require_capability_coverage=(
+                            bool(catalog_ids) and not single_candidate_refinement),
                         excluded_capability_ids=(runtime_context or {}).get("topic_exclusions", {}).get("capability_ids", []),
                         excluded_topic_ids=(runtime_context or {}).get("topic_exclusions", {}).get("topic_ids", []),
                         topic_history=validation_history,
@@ -5330,7 +6196,10 @@ class TopicDiscoveryRunner:
                         require_grounding=frontier_seed_plan is not None,
                         fallback_templates=(runtime_context or {}).get(
                             "fallback_experiment_catalog", []),
-                        enforce_portfolio_diversity=frontier_seed_plan is not None)
+                        enforce_portfolio_diversity=(
+                            frontier_seed_plan is not None and not single_candidate_refinement),
+                        single_candidate_refinement=single_candidate_refinement,
+                        refinement_parent=refinement_parent)
                     # Re-resolve the object after a selection mutation.  The
                     # pre-repair local reference may still point at the old
                     # candidate and would otherwise make a valid structural
@@ -5347,6 +6216,8 @@ class TopicDiscoveryRunner:
             except ValidationError as exc:
                 budget.record_validation_error(exc)
                 last_error = exc
+                last_invalid_response_sha256 = response_sha256
+                last_invalid_response_error = exc
                 rejection_type = _topic_validation_rejection_type(exc)
                 if rejection_type is not None:
                     if attempt_record is not None:
@@ -5359,25 +6230,51 @@ class TopicDiscoveryRunner:
                             rejection_type=rejection_type,
                             reason=exc,
                         )
-                if attempt_record is None:
+                if candidate_only_response is not None:
+                    partial_package = {
+                        "candidates": [candidate_only_response],
+                        "selected_id": candidate_only_response.get("id"),
+                    }
+                    attempt_record = _candidate_attempt_record(
+                        partial_package, attempt=attempt + 1,
+                        status="rejected", error=str(exc), outcome_known=True)
+                    attempt_record["response_shape"] = "single_candidate"
+                    attempt_record["response_sha256"] = response_sha256
+                    candidate_attempt_trace.append(attempt_record)
+                elif attempt_record is None:
                     candidate_attempt_trace.append(_candidate_attempt_record(
                         {}, attempt=attempt + 1, status="rejected", error=str(exc),
-                        outcome_known=True))
+                        outcome_known=True) | {"response_sha256": response_sha256})
                 else:
                     attempt_record["status"] = "rejected"
                     attempt_record["error"] = str(exc)[:2048]
-                if rejection_type in {"feasibility", "novelty"}:
-                    # No safe deterministic repair exists once the declared
-                    # execution inventory is outside the boundary, or once a
-                    # direction is already excluded by exploration history.
-                    # Either error can be raised while repairing a missing
-                    # field, before the candidate record exists, so the stop
-                    # condition must not depend on that record. A second
-                    # model turn would see the same candidate and burn the
-                    # entire local intake quota; preserve the rejection and
-                    # let the Composer sample a fresh direction. Maturity and
-                    # source-challenge feedback remain repairable because they
-                    # contain substantive changes the next turn can address.
+                if (rejection_type == "novelty"
+                        and attempt_record is not None
+                        and isinstance(attempt_record.get("selected_topic"), dict)):
+                    consecutive_novelty_rejections += 1
+                else:
+                    consecutive_novelty_rejections = 0
+                if rejection_type == "refinement_contract":
+                    consecutive_refinement_contract_rejections += 1
+                else:
+                    consecutive_refinement_contract_rejections = 0
+                if (rejection_type == "feasibility"
+                        or (rejection_type == "novelty" and attempt_record is None)):
+                    # An infeasible execution boundary cannot be repaired by
+                    # resampling the same candidate, and a novelty error raised
+                    # before a complete candidate is recorded has no reliable
+                    # scientific direction to feed back. Once a concrete
+                    # candidate exists, novelty is repairable within this
+                    # bounded intake: the next prompt receives its rejection
+                    # and the exact-response guard prevents a duplicate call.
+                    break
+                if (rejection_type == "novelty"
+                        and consecutive_novelty_rejections
+                        >= MAX_CONSECUTIVE_TOPIC_NOVELTY_REJECTIONS):
+                    break
+                if (rejection_type == "refinement_contract"
+                        and consecutive_refinement_contract_rejections
+                        >= MAX_CONSECUTIVE_REFINEMENT_CONTRACT_REJECTIONS):
                     break
                 continue
             selected = next(item for item in package["candidates"] if item["id"] == package["selected_id"])
@@ -5411,7 +6308,10 @@ class TopicDiscoveryRunner:
                     candidate_attempt_trace.append(_candidate_attempt_record(
                         {}, attempt=attempt + 1, status="rejected", error=str(exc),
                         outcome_known=True))
-                if rejection_type in {"feasibility", "novelty"}:
+                consecutive_novelty_rejections = 0
+                consecutive_refinement_contract_rejections = 0
+                if (rejection_type == "feasibility"
+                        or (rejection_type == "novelty" and attempt_record is None)):
                     break
                 continue
             portfolio_profile = (
@@ -5421,26 +6321,54 @@ class TopicDiscoveryRunner:
             try:
                 refinement_changed_dimensions = (
                     validate_topic_refinement(
-                        refinement_parent, selected,
+                        refinement_parent or refinement_anchor, selected,
                         require_structural_pivot=frontier_seed_plan is not None,
                         require_frontier_seed_pivot=(
                             isinstance(refinement_feedback, dict)
                             and refinement_feedback.get("require_frontier_seed_pivot") is True
-                        ))
-                    if refinement_parent is not None else []
+                        ),
+                        salvage_plan=(refinement_context.get("salvage_plan")
+                                      if isinstance(refinement_context, dict) else None),
+                        salvage_anchor=refinement_anchor,
+                    )
+                    if refinement_parent is not None or refinement_anchor is not None else []
                 )
+                consecutive_novelty_rejections = 0
+                consecutive_refinement_contract_rejections = 0
             except ValidationError as exc:
                 budget.record_validation_error(exc)
                 last_error = exc
+                last_invalid_response_sha256 = response_sha256
+                last_invalid_response_error = exc
                 attempt_record["status"] = "refinement_rejected"
                 attempt_record["error"] = str(exc)[:2048]
-                # Keep the rejected package for the next refinement turn.
-                # Clearing it forced the model to regenerate from the same
-                # feedback without seeing the concrete fields that failed,
-                # which repeatedly produced another one-dimension rewrite.
-                # The next prompt now contains the exact response and error
-                # while retaining the same portfolio shape plan.
+                rejection_type = _topic_validation_rejection_type(exc)
+                consecutive_novelty_rejections = 0
+                if rejection_type == "refinement_contract":
+                    consecutive_refinement_contract_rejections += 1
+                else:
+                    consecutive_refinement_contract_rejections = 0
+                if rejection_type is not None:
+                    attempt_record["rejection_type"] = rejection_type
+                    attempt_record["rejection_reason"] = str(exc)[:2048]
+                    if rejection_type in _TOPIC_SEMANTIC_REJECTION_TYPES:
+                        _remember_topic_rejection(
+                            rejected_topic_history,
+                            attempt_record.get("selected_topic"),
+                            rejection_type=rejection_type,
+                            reason=exc,
+                        )
+                # Scientific failures remain negative evidence for Composer;
+                # a salvage-scope contract error is repaired locally from its
+                # exact validation message and the anchored parent.
+                if rejection_type == "refinement":
+                    break
+                if (rejection_type == "refinement_contract"
+                        and consecutive_refinement_contract_rejections
+                        >= MAX_CONSECUTIVE_REFINEMENT_CONTRACT_REJECTIONS):
+                    break
                 continue
+            consecutive_refinement_contract_rejections = 0
             candidate_prior_work = []
             source_challenge = None
             candidate_sampling_trace = []

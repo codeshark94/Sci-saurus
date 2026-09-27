@@ -42,6 +42,46 @@ def topic_package():
 
 
 class ResearchProgramTests(unittest.TestCase):
+    def test_scoped_single_candidate_refinement_survives_program_validation(self):
+        package = topic_package()
+        selected = next(item for item in package["candidates"]
+                        if item["id"] == package["selected_id"])
+        package["candidates"] = [selected]
+        package["topic_evolution"] = {
+            "mode": "refinement",
+            "parent_topic_id": selected["id"],
+            "package_contract": "single_candidate_parent_refinement",
+        }
+
+        program = build_research_program(package)
+
+        self.assertEqual(program["selected_id"], selected["id"])
+        self.assertEqual(len(program["branches"]), 1)
+
+    def test_single_candidate_without_scoped_refinement_contract_is_rejected(self):
+        package = topic_package()
+        package["candidates"] = [
+            item for item in package["candidates"]
+            if item["id"] == package["selected_id"]
+        ]
+
+        with self.assertRaisesRegex(ValidationError, "configured candidate portfolio"):
+            build_research_program(package)
+
+    def test_scoped_single_candidate_refinement_must_match_parent_id(self):
+        package = topic_package()
+        selected = next(item for item in package["candidates"]
+                        if item["id"] == package["selected_id"])
+        package["candidates"] = [selected]
+        package["topic_evolution"] = {
+            "mode": "refinement",
+            "parent_topic_id": "different_parent",
+            "package_contract": "single_candidate_parent_refinement",
+        }
+
+        with self.assertRaisesRegex(ValidationError, "preserve exactly its parent topic"):
+            build_research_program(package)
+
     def test_unselected_malformed_feasibility_plan_does_not_block_program_materialization(self):
         package = topic_package()
         package["candidates"][0]["feasibility_plan"] = {

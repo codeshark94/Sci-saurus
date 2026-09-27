@@ -33,6 +33,9 @@ ROLE_ACTIVATIONS = frozenset({"on_demand"})
 ROLE_QUOTA_FIELDS = frozenset({
     "max_calls", "max_input_tokens", "max_output_tokens", "max_seconds",
 })
+# Per-call allowance leaves 16 Ki tokens inside a 256 Ki context window; the
+# selected provider route remains the hard ceiling and no prompt is padded.
+ROLE_INPUT_CONTEXT_ALLOWANCE = 245760
 ROLE_FIELDS = frozenset({
     "id", "label", "appointment", "execution_kind", "model_role", "system_contract",
     "input_projection", "stage_kinds", "proposal_kinds", "capability_scope",
@@ -188,7 +191,7 @@ def _role(
             # One ordinary response plus one bounded JSON-only repair when a
             # provider truncates or malforms the response. Normal work still
             # consumes one call; the second slot is not a standing worker.
-            "max_calls": 2, "max_input_tokens": 12000,
+            "max_calls": 2, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
             "max_output_tokens": 4000, "max_seconds": 900,
         },
         "internal_role_aliases": list(aliases),
@@ -268,20 +271,20 @@ DEFAULT_AGENT_ROLES = {
     "methods": [
         _role("methodologist", "Methodologist", model_role="methods.methodologist", execution_kind="model",
               stage_kinds=_METHODS_STAGES, proposal_kinds=_METHODS_PROPOSALS,
-              capability_scope=["model", "python", "statistics"], contract="Translate the question into a falsifiable design with controls, estimands, and stopping rules.",
-              projection=["research_question", "hypotheses", "method_constraints", "available_assets"], aliases=["methods.methodologist", "research.experiment-author"]),
+              capability_scope=["model", "python", "statistics"], contract="Translate the question into a falsifiable design with controls, estimands, and stopping rules; when prior failure evidence is present, make the proposed repair address its documented root cause.",
+              projection=["research_question", "hypotheses", "method_constraints", "available_assets", "failure_evidence"], aliases=["methods.methodologist", "research.experiment-author"]),
         _role("statistical-reviewer", "Statistical reviewer", model_role="review.methods", execution_kind="review",
               stage_kinds=_METHODS_STAGES, proposal_kinds=_METHODS_PROPOSALS,
-              capability_scope=["model", "statistics"], contract="Stress-test estimands, uncertainty, multiplicity, sensitivity, and interpretation of computed results.",
-              projection=["design", "raw_results", "analysis_plan", "claims"], aliases=["review.methods"]),
+              capability_scope=["model", "statistics"], contract="Stress-test estimands, uncertainty, multiplicity, sensitivity, and interpretation of computed results; distinguish missing current outputs from available historical failure evidence.",
+              projection=["design", "raw_results", "analysis_plan", "claims", "failure_evidence"], aliases=["review.methods"]),
         _role("reproducibility-reviewer", "Reproducibility reviewer", model_role="methods.reproducibility-reviewer", execution_kind="review",
               stage_kinds=_METHODS_STAGES, proposal_kinds=_METHODS_PROPOSALS,
-              capability_scope=["model", "python", "local_program"], contract="Re-run or independently recalculate the declared result from the recorded inputs and code path.",
-              projection=["execution_manifest", "input_digests", "raw_results", "analysis_code"], aliases=["methods.reproducibility-reviewer"]),
+              capability_scope=["model", "python", "local_program"], contract="Re-run or independently recalculate the declared result from recorded inputs and code; use supplied failure evidence and do not report it absent when present.",
+              projection=["execution_manifest", "input_digests", "raw_results", "analysis_code", "failure_evidence"], aliases=["methods.reproducibility-reviewer"]),
         _role("analysis-reviewer", "Analysis reviewer", model_role="methods.analysis-reviewer", execution_kind="review",
               stage_kinds=_METHODS_STAGES, proposal_kinds=_METHODS_PROPOSALS,
-              capability_scope=["model", "statistics", "python"], contract="Check that displays and derived quantities answer the question without leakage, unsupported transformations, or hidden exclusions.",
-              projection=["analysis_plan", "derived_results", "figures", "claims"], aliases=["methods.analysis-reviewer"]),
+              capability_scope=["model", "statistics", "python"], contract="Check that displays and derived quantities answer the question without leakage, unsupported transformations, or hidden exclusions; use prior failure evidence when evaluating a repair.",
+              projection=["analysis_plan", "derived_results", "figures", "claims", "failure_evidence"], aliases=["methods.analysis-reviewer"]),
         _role("control-designer", "Control designer", model_role="methods.control-designer", execution_kind="model",
               stage_kinds=_METHODS_STAGES, proposal_kinds=_METHODS_PROPOSALS,
               capability_scope=["model", "python"], contract="Design discriminating controls and alternative explanations before accepting a positive result.",
@@ -452,7 +455,7 @@ def agent_roster(charters):
             "reviewer_role_id": "adversary",
             "reviewer_agent": reviewer_agent,
             "activation": "on_demand",
-            "quota": {"max_calls": 1, "max_input_tokens": 16000,
+            "quota": {"max_calls": 1, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
                       "max_output_tokens": 6000, "max_seconds": 900},
             "internal_role_aliases": [],
             "stage_kinds": list(charter["stage_kinds"]),
@@ -476,7 +479,7 @@ def agent_roster(charters):
             "activation": "on_demand",
             # Reserve one bounded repair/fallback call for malformed model
             # output; a verifier still has only one accepted verdict.
-            "quota": {"max_calls": 2, "max_input_tokens": 16000,
+            "quota": {"max_calls": 2, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
                       "max_output_tokens": 6000, "max_seconds": 900},
             "internal_role_aliases": [],
             "stage_kinds": list(charter["stage_kinds"]),
@@ -844,7 +847,7 @@ class DepartmentRuntime:
                 "input_projection": ["objective", "stage_packet", "assignment_results", "review_verdict"],
                 "independent_review": False, "reviewer_role_id": "adversary",
                 "reviewer_agent": f"{department}.{charter['adversary']}",
-                "quota": {"max_calls": 1, "max_input_tokens": 16000,
+                "quota": {"max_calls": 1, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
                           "max_output_tokens": 6000, "max_seconds": 900},
                 "activation": "on_demand", "internal_role_aliases": [],
             }
@@ -860,7 +863,7 @@ class DepartmentRuntime:
                 "reviewer_agent": None,
                 # Reserve one bounded repair/fallback call for malformed model
                 # output; a verifier still has only one accepted verdict.
-                "quota": {"max_calls": 2, "max_input_tokens": 16000,
+                "quota": {"max_calls": 2, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
                           "max_output_tokens": 6000, "max_seconds": 900},
                 "activation": "on_demand", "internal_role_aliases": [],
             }
@@ -1419,6 +1422,64 @@ class DepartmentRuntime:
             result.append(item)
         return result
 
+    def _durable_execution_report(self, payload):
+        """Return a result only when its immutable execution artifact matches its assignment."""
+        logical = payload.get("assignment_logical_id")
+        if not isinstance(logical, str):
+            return None
+        head = self.store.head(f"{logical}/execution")
+        if head is None:
+            return None
+        try:
+            body = json.loads(self.store.read_body(head["body_hash"]))
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(body, dict) or body.get("schema_version") not in {
+                "specialist-execution-1", "specialist-verifier-execution-1"}:
+            return None
+        identity = ("stage_id", "stage_kind", "attempt_number", "assignment_id", "task_id",
+                    "role_id", "assigned_role")
+        if any(body.get(key) != payload.get(key) for key in identity):
+            return None
+        report = body.get("report")
+        if not isinstance(report, dict) or report.get("status") not in {"succeeded", "failed"}:
+            return None
+        return {
+            "report": deepcopy(report),
+            "artifact_ref": head["artifact_ref"],
+            "input_digest": body.get("input_digest"),
+            "attempt_number": body.get("attempt_number"),
+        }
+
+    def find_reusable_specialist_report(self, stage_id, role_id, *, before_attempt_number,
+                                        input_digest):
+        """Find a successful earlier result for the identical specialist packet."""
+        candidates = [
+            item for item in self._assignment_task_rows(stage_id=stage_id)
+            if item.get("assignment_phase") == "specialist"
+            and item.get("role_id") == role_id
+            and type(item.get("attempt_number")) is int
+            and item["attempt_number"] < before_attempt_number
+        ]
+        candidates.sort(key=lambda item: item["attempt_number"], reverse=True)
+        for item in candidates:
+            durable = self._durable_execution_report(item)
+            if (not isinstance(durable, dict)
+                    or durable.get("input_digest") != input_digest
+                    or durable.get("attempt_number") != item.get("attempt_number")):
+                continue
+            report = durable.get("report")
+            if not isinstance(report, dict) or report.get("status") != "succeeded":
+                continue
+            return {
+                "attempt_number": item["attempt_number"],
+                "attempt_id": item.get("attempt_id"),
+                "task_id": item["task_id"],
+                "artifact_ref": durable["artifact_ref"],
+                "report": deepcopy(report),
+            }
+        return None
+
     def _assignment_projection(self):
         rows = self._assignment_task_rows()
         counts = {department: {state: 0 for state in (
@@ -1461,7 +1522,7 @@ class DepartmentRuntime:
         return record
 
     def reconcile_interrupted_assignments(self):
-        """Mark specialist calls left in-flight by a stopped Composer unknown."""
+        """Recover durable results; mark only genuinely unobserved calls unknown."""
         rows = self.control._conn.execute(
             "SELECT attempt_id, task_id, payload_json FROM attempts WHERE state = 'started'"
         ).fetchall()
@@ -1473,6 +1534,54 @@ class DepartmentRuntime:
             except (TypeError, ValueError):
                 payload = {}
             if not isinstance(payload, dict) or not payload.get("assignment_id"):
+                continue
+            durable = self._durable_execution_report({
+                **payload, "task_id": row["task_id"],
+            })
+            report = durable.get("report") if isinstance(durable, dict) else None
+            if isinstance(report, dict):
+                outcome = report["status"]
+                report_artifact_ref = durable["artifact_ref"]
+                try:
+                    self.tasks.finish_attempt(
+                        row["attempt_id"], outcome, usage=report.get("usage", {}))
+                    task = self.tasks.get(row["task_id"])
+                    if task["state"] == "running":
+                        if outcome == "succeeded":
+                            task = self.tasks.transition(
+                                row["task_id"], "blocked", "command.composer",
+                                reason=("durable specialist result recovered; interrupted stage "
+                                        "must re-admit it before synthesis and independent review"),
+                            )
+                        else:
+                            task = self.tasks.transition(
+                                row["task_id"], "failed", "command.composer",
+                                reason="durable specialist execution report records failure",
+                            )
+                except (NotFoundError, StateError):
+                    continue
+                logical = payload.get("assignment_logical_id")
+                head = self.store.head(logical) if isinstance(logical, str) else None
+                if head is not None:
+                    body = json.loads(self.store.read_body(head["body_hash"]))
+                    body.update({
+                        "task_state": task["state"], "attempt_state": outcome,
+                        "outcome": outcome, "execution_artifact_ref": report_artifact_ref,
+                        "accounting": "durable_execution_result_recovered",
+                        "updated_at": now_iso(),
+                    })
+                    self._publish_idempotent(
+                        logical, "decision_note", body,
+                        subjects=[head["artifact_ref"], report_artifact_ref],
+                    )
+                manifest_changed = True
+                reconciled.append({
+                    "assignment_id": payload["assignment_id"],
+                    "task_id": row["task_id"], "attempt_id": row["attempt_id"],
+                    "outcome": outcome,
+                    "execution_artifact_ref": report_artifact_ref,
+                    "accounting": "durable_execution_result_recovered",
+                })
                 continue
             try:
                 result = self.tasks.reconcile_unknown(row["attempt_id"], "command.composer")
@@ -1495,6 +1604,50 @@ class DepartmentRuntime:
                                  "updated_at": now_iso()})
                     self._publish_idempotent(logical, "decision_note", body,
                                              subjects=[head["artifact_ref"]])
+        # A process can stop after an assignment attempt has durably finished
+        # but before finish_stage advances its task through review. Such rows
+        # are not live workers and cannot be completed from the attempt alone;
+        # block them for stage re-admission while preserving the attempt and
+        # its execution artifact.
+        settled_attempt_states = {"succeeded", "failed", "cancelled", "result_unknown"}
+        for item in self._assignment_task_rows():
+            if (item.get("task_state") != "running"
+                    or item.get("attempt_state") not in settled_attempt_states):
+                continue
+            task_id = item["task_id"]
+            attempt_state = item["attempt_state"]
+            try:
+                task = self.tasks.transition(
+                    task_id, "blocked", "command.composer",
+                    reason=("stage process ended after the specialist attempt settled; "
+                            "the owning stage must re-admit it before synthesis and review"),
+                )
+            except (NotFoundError, StateError, ValidationError):
+                continue
+            logical = item.get("assignment_logical_id")
+            head = self.store.head(logical) if isinstance(logical, str) else None
+            if head is not None:
+                body = json.loads(self.store.read_body(head["body_hash"]))
+                body.update({
+                    "task_state": task["state"],
+                    "attempt_state": attempt_state,
+                    "outcome": attempt_state,
+                    "accounting": "stage_interrupted_after_attempt_settled",
+                    "updated_at": now_iso(),
+                })
+                self._publish_idempotent(
+                    logical, "decision_note", body,
+                    subjects=[head["artifact_ref"]],
+                )
+            manifest_changed = True
+            reconciled.append({
+                "assignment_id": item.get("assignment_id"),
+                "task_id": task_id,
+                "attempt_id": item.get("attempt_id"),
+                "outcome": attempt_state,
+                "task_state": task["state"],
+                "accounting": "stage_interrupted_after_attempt_settled",
+            })
         # A verifier is admitted before the stage result is known but is only
         # started after chief synthesis.  If the process stopped during the
         # specialist phase, that queued verifier was never dispatched; fence
@@ -1504,14 +1657,16 @@ class DepartmentRuntime:
             if (item.get("assignment_phase") != "verifier"
                     or item.get("task_state") != "queued"):
                 continue
-            sibling_unknown = any(
+            interrupted_specialist = any(
                 sibling.get("stage_id") == item.get("stage_id")
                 and sibling.get("attempt_number") == item.get("attempt_number")
                 and sibling.get("assignment_phase") == "specialist"
-                and sibling.get("attempt_state") == "result_unknown"
+                and sibling.get("attempt_state") in {
+                    "succeeded", "failed", "result_unknown",
+                }
                 for sibling in self._assignment_task_rows()
             )
-            if not sibling_unknown:
+            if not interrupted_specialist:
                 continue
             try:
                 self.tasks.transition(
@@ -1527,7 +1682,7 @@ class DepartmentRuntime:
                 if head is not None:
                     body = json.loads(self.store.read_body(head["body_hash"]))
                     body.update({"task_state": "blocked", "attempt_state": "not_started",
-                                 "outcome": "result_unknown",
+                                 "outcome": "not_evaluated",
                                  "accounting": "not_dispatched_after_interruption",
                                  "updated_at": now_iso()})
                     self._publish_idempotent(logical, "decision_note", body,
@@ -1547,13 +1702,11 @@ class DepartmentRuntime:
         route = self.stage_route(stage_kind)
         required_ids = list(route["required_role_ids"])
         selected_ids = list(active_role_ids) if active_role_ids is not None else required_ids
-        if not selected_ids:
-            raise ValidationError("specialist active_role_ids must be a unique nonempty list")
         if any(not isinstance(role_id, str) or not _ID.fullmatch(role_id)
                for role_id in selected_ids):
             raise ValidationError("specialist active_role_ids must contain bounded role IDs")
         if len(selected_ids) != len(set(selected_ids)):
-            raise ValidationError("specialist active_role_ids must be a unique nonempty list")
+            raise ValidationError("specialist active_role_ids must be unique")
         if set(selected_ids) - set(required_ids):
             raise ValidationError("specialist active_role_ids must be a subset of required stage roles")
         if len(selected_ids) > route["max_active_agents"]:
@@ -1669,7 +1822,7 @@ class DepartmentRuntime:
             "input_ref": input_projection_ref,
             # Reserve one bounded repair/fallback call for malformed model
             # output; a verifier still has only one accepted verdict.
-            "quota": {"max_calls": 2, "max_input_tokens": 16000,
+            "quota": {"max_calls": 2, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
                       "max_output_tokens": 6000, "max_seconds": min(900, float(deadline_seconds))},
             "reserved_seconds": min(900.0, float(deadline_seconds)),
             "deadline_seconds": float(deadline_seconds), "deadline_at_epoch": deadline_at_epoch,
@@ -1784,9 +1937,17 @@ class DepartmentRuntime:
                 assignment_outcome = "not_evaluated"
             else:
                 assignment_outcome = "succeeded" if known_success else "failed"
-            execution_state = assignment_outcome
+            reused_durable_result = (
+                isinstance(specialist, dict)
+                and specialist.get("provider_call_reused") is True
+            )
+            execution_state = (
+                "reused_durable_result" if reused_durable_result else assignment_outcome
+            )
             if attempt_id and item.get("attempt_state") == "started":
-                if assignment_outcome == "result_unknown":
+                if reused_durable_result:
+                    self.tasks.finish_attempt(attempt_id, "cancelled", usage={})
+                elif assignment_outcome == "result_unknown":
                     self.tasks.reconcile_unknown(attempt_id, actor)
                 elif assignment_outcome == "not_evaluated":
                     # begin_stage reserves a task attempt before the stage

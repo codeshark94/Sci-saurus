@@ -963,6 +963,9 @@ class PaperReleaseBuilder(ManuscriptRenderer):
         manuscript, survey = self._manuscript(), self._survey()
         results_path = Path(self.config["results_package"])
         results = validate_results_package(json.loads(results_path.read_text()), base_dir=results_path.parent)
+        if (results.get("validation", {}).get("decision") == "rejected"):
+            raise ValidationError(
+                "rejected scientific results may be retained for interpretation but cannot support a paper release")
         # Keep the substantive research gate at the final assembly boundary as
         # well as in the Composer pipeline.  A caller can build a release
         # directly, so the paper builder must not let a replayable but thin

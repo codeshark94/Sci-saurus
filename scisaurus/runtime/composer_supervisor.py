@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import math
 import multiprocessing
 from pathlib import Path
 import sqlite3
@@ -35,7 +36,8 @@ SUPERVISOR_SCHEMA_VERSION = "composer-supervisor-3"
 DEFAULT_WATCHDOG_SECONDS = 300.0
 
 
-def _composer_child_entry(workflow, resume, on_progress, result_pipe):
+def _composer_child_entry(workflow, resume, on_progress, result_pipe,
+                          additional_seconds=None):
     """Run one Composer attempt in a killable process.
 
     The parent owns supervision.  A provider or a library call that ignores
@@ -45,7 +47,10 @@ def _composer_child_entry(workflow, resume, on_progress, result_pipe):
     SQLite connection with this child.
     """
     try:
-        runner = ComposerRunner(workflow, resume=resume, on_progress=on_progress)
+        runner_options = {"resume": resume, "on_progress": on_progress}
+        if additional_seconds is not None:
+            runner_options["additional_seconds"] = additional_seconds
+        runner = ComposerRunner(workflow, **runner_options)
         result_pipe.send({"kind": "result", "result": runner.run()})
     except BaseException as exc:  # the parent turns this into a typed retry
         try:
@@ -82,7 +87,18 @@ def _result_fingerprint(result):
 
 def _remaining(result):
     value = result.get("remaining_seconds") if isinstance(result, dict) else None
-    return float(value) if isinstance(value, (int, float)) else 0.0
+    value = _finite_number(value)
+    return value if value is not None else 0.0
+
+
+def _finite_number(value):
+    if type(value) not in (int, float):
+        return None
+    try:
+        value = float(value)
+    except OverflowError:
+        return None
+    return value if math.isfinite(value) else None
 
 
 def _stop_reason(result):
@@ -96,7 +112,8 @@ def _stop_reason(result):
 class ComposerSupervisor:
     """Keep a Composer process alive across recoverable child exits."""
 
-    def __init__(self, workflow, *, initial_resume=False, poll_seconds=5.0,
+    def __init__(self, workflow, *, initial_resume=False, initial_additional_seconds=None,
+                 poll_seconds=5.0,
                  on_progress=None, process_watchdog=True,
                  watchdog_seconds=DEFAULT_WATCHDOG_SECONDS):
         if not isinstance(workflow, dict):
@@ -107,8 +124,17 @@ class ComposerSupervisor:
             raise ValidationError("supervisor watchdog_seconds must be at least 30")
         if type(process_watchdog) is not bool:
             raise ValidationError("supervisor process_watchdog must be Boolean")
+        if (initial_additional_seconds is not None
+                and (type(initial_additional_seconds) not in (int, float)
+                     or not math.isfinite(initial_additional_seconds)
+                     or initial_additional_seconds <= 0)):
+            raise ValidationError(
+                "supervisor initial_additional_seconds must be finite and positive")
         self.workflow = deepcopy(workflow)
         self.initial_resume = bool(initial_resume)
+        self.initial_additional_seconds = (
+            float(initial_additional_seconds)
+            if initial_additional_seconds is not None else None)
         self.poll_seconds = float(poll_seconds)
         self.on_progress = on_progress or (lambda state: None)
         self.process_watchdog = process_watchdog
@@ -156,7 +182,7 @@ class ComposerSupervisor:
         state = {
             "schema_version": SUPERVISOR_SCHEMA_VERSION,
             "workflow_id": self.workflow.get("id"),
-            "status": "supervising",
+            "status": "stopped" if action == "stop" else "supervising",
             "child_status": child_status,
             "action": action,
             "restart_count": self.restart_count,
@@ -325,9 +351,11 @@ class ComposerSupervisor:
     def _watchdog_remaining(self, snapshot):
         progress = snapshot.get("progress", {}) if isinstance(snapshot, dict) else {}
         value = progress.get("remaining_seconds") if isinstance(progress, dict) else None
-        if isinstance(value, (int, float)):
-            return max(0.0, float(value))
-        return max(0.0, float(self.workflow.get("time_policy", {}).get("hard_seconds", 0)))
+        value = _finite_number(value)
+        if value is not None:
+            return max(0.0, value)
+        hard_seconds = _finite_number(self.workflow.get("time_policy", {}).get("hard_seconds", 0))
+        return max(0.0, hard_seconds if hard_seconds is not None else 0.0)
 
     def _watchdog_result(self, snapshot, stale_seconds):
         progress = snapshot.get("progress", {}) if isinstance(snapshot, dict) else {}
@@ -382,10 +410,96 @@ class ComposerSupervisor:
             for item in schedule.values()
         )
 
+    @staticmethod
+    def _admitted_survey_fallback_ready(result):
+        """Recognize an OpenAlex pause whose approved Crossref route is ready.
+
+        The Composer records the route change before it exits the paused child.
+        Waiting on the old provider's reset after that point only delays the
+        next resume; the durable context already selects the metadata fallback.
+        Only the current survey blocker is bypassable; historical or unrelated
+        provider cooldowns must retain their own retry schedule.
+        """
+        if not isinstance(result, dict):
+            return False
+        context = result.get("context")
+        stages = result.get("stages")
+        if not isinstance(context, dict) or not isinstance(stages, dict):
+            return False
+        if "active_blockers" in result:
+            blockers = result.get("active_blockers")
+            if not isinstance(blockers, list):
+                return False
+        else:
+            blockers = result.get("blockers", [])
+        if not isinstance(blockers, list):
+            return False
+
+        def is_openalex_cooldown(blocker):
+            if not isinstance(blocker, dict) or blocker.get("reason") != "provider_cooldown":
+                return False
+            provider_error = str(blocker.get("provider_error", "")).casefold()
+            rate_limit = blocker.get("rate_limit")
+            if isinstance(rate_limit, dict):
+                provider = rate_limit.get("provider")
+                if provider is not None and str(provider).strip():
+                    return str(provider).casefold() == "openalex"
+            return "openalex" in provider_error
+
+        openalex_blockers = [blocker for blocker in blockers if is_openalex_cooldown(blocker)]
+        if not openalex_blockers:
+            return False
+
+        fallback_stages = set()
+        for blocker in openalex_blockers:
+            stage_id = blocker.get("stage_id")
+            if not isinstance(stage_id, str):
+                continue
+            stage_context = context.get(stage_id)
+            stage = stages.get(stage_id)
+            if not isinstance(stage_context, dict) or not isinstance(stage, dict):
+                continue
+            fallback = stage_context.get("provider_fallback")
+            if not isinstance(fallback, dict):
+                continue
+            if (
+                fallback.get("status") == "admitted"
+                and fallback.get("mode") == "crossref_metadata"
+                and fallback.get("source_provider") == "openalex"
+                and stage.get("kind") == "survey"
+                and stage.get("status") in {"paused", "retrying"}
+            ):
+                fallback_stages.add(stage_id)
+        if not fallback_stages:
+            return False
+
+        now_epoch = time.time()
+        for blocker in blockers:
+            if not isinstance(blocker, dict):
+                continue
+            retry_epoch = _finite_number(blocker.get("retry_after_epoch"))
+            if retry_epoch is not None:
+                delay = max(0.0, retry_epoch - now_epoch)
+            else:
+                retry_seconds = _finite_number(blocker.get("retry_after_seconds"))
+                delay = max(0.0, retry_seconds) if retry_seconds is not None else 0.0
+            if delay <= 0:
+                continue
+            if blocker.get("stage_id") not in fallback_stages or not is_openalex_cooldown(blocker):
+                return False
+        return True
+
     def _wait_before_resume(self, result):
         remaining = _remaining(result)
         if remaining <= 0:
             return False
+        if self._admitted_survey_fallback_ready(result):
+            self._write_state(
+                child_status=result.get("status"),
+                action="resume_admitted_provider_fallback",
+                result=result,
+            )
+            return True
         # Identical blocker fingerprints back off rather than hammering the
         # same provider or stage. A changed checkpoint resets the delay.
         if self.poll_seconds == 0:
@@ -393,12 +507,34 @@ class ComposerSupervisor:
         else:
             delay = min(60.0, max(self.poll_seconds, 2.0) * (2 ** min(self.identical_exit_count - 1, 5)))
         retry_after = None
-        for blocker in result.get("blockers", []) if isinstance(result, dict) else []:
+        active_blockers = result.get("active_blockers")
+        if isinstance(active_blockers, list):
+            blockers = active_blockers
+        elif "active_blockers" not in result:
+            blockers = result.get("blockers", [])
+        else:
+            historical = result.get("blockers", [])
+            blockers = [
+                blocker for blocker in historical
+                if isinstance(blocker, dict)
+                and _finite_number(blocker.get("retry_after_epoch")) is not None
+            ] if isinstance(historical, list) else []
+        if not isinstance(blockers, list):
+            blockers = []
+        now_epoch = time.time()
+        for blocker in blockers:
             if not isinstance(blocker, dict):
                 continue
-            value = blocker.get("retry_after_seconds")
-            if isinstance(value, (int, float)) and value > 0:
-                retry_after = max(retry_after or 0.0, float(value))
+            retry_epoch = _finite_number(blocker.get("retry_after_epoch"))
+            if retry_epoch is not None:
+                value = max(0.0, retry_epoch - now_epoch)
+            else:
+                retry_seconds = _finite_number(blocker.get("retry_after_seconds"))
+                if retry_seconds is None:
+                    continue
+                value = max(0.0, retry_seconds)
+            if value > 0:
+                retry_after = max(retry_after or 0.0, value)
         if retry_after is not None:
             delay = max(delay, retry_after)
         delay = min(delay, max(0.0, remaining))
@@ -451,11 +587,15 @@ class ComposerSupervisor:
 
     def _run_in_process(self):
         resume = self.initial_resume or (self.project_root / "state" / "control.sqlite").is_file()
+        additional_seconds = self.initial_additional_seconds
         while True:
             self._write_state(child_status="starting", action="dispatch", result=None)
             try:
-                runner = ComposerRunner(
-                    self.workflow, resume=resume, on_progress=self.on_progress)
+                runner_options = {"resume": resume, "on_progress": self.on_progress}
+                if additional_seconds is not None:
+                    runner_options["additional_seconds"] = additional_seconds
+                runner = ComposerRunner(self.workflow, **runner_options)
+                additional_seconds = None
                 result = runner.run()
             except KeyboardInterrupt:
                 self._mark_interrupted_checkpoint()
@@ -532,7 +672,7 @@ class ComposerSupervisor:
                 except OSError:
                     pass
 
-    def _run_one_process(self, resume):
+    def _run_one_process(self, resume, *, additional_seconds=None):
         """Run one Composer attempt while the parent remains killable."""
         try:
             context = multiprocessing.get_context("fork")
@@ -540,11 +680,13 @@ class ComposerSupervisor:
             # The project is developed on macOS/Linux.  Keep a portable
             # fallback for runtimes without fork rather than silently losing
             # the original retry semantics.
-            return self._run_one_in_process(resume)
+            return self._run_one_in_process(
+                resume, additional_seconds=additional_seconds)
         parent_pipe, child_pipe = context.Pipe(duplex=False)
         child = context.Process(
             target=_composer_child_entry,
-            args=(self.workflow, resume, self.on_progress, child_pipe),
+            args=(self.workflow, resume, self.on_progress, child_pipe,
+                  additional_seconds),
             name=f"scisaurus-composer-{self.workflow.get('id', 'run')}",
         )
         child.start()
@@ -647,10 +789,12 @@ class ComposerSupervisor:
             "blockers": [{"stage_id": "workflow", "reason": error}],
         }
 
-    def _run_one_in_process(self, resume):
+    def _run_one_in_process(self, resume, *, additional_seconds=None):
         try:
-            runner = ComposerRunner(
-                self.workflow, resume=resume, on_progress=self.on_progress)
+            runner_options = {"resume": resume, "on_progress": self.on_progress}
+            if additional_seconds is not None:
+                runner_options["additional_seconds"] = additional_seconds
+            runner = ComposerRunner(self.workflow, **runner_options)
             return runner.run()
         except KeyboardInterrupt:
             self._write_state(child_status="interrupted", action="stop")
@@ -678,9 +822,12 @@ class ComposerSupervisor:
             if not self.process_watchdog:
                 return self._run_in_process()
             resume = self.initial_resume or (self.project_root / "state" / "control.sqlite").is_file()
+            additional_seconds = self.initial_additional_seconds
             while True:
                 self._write_state(child_status="starting", action="dispatch", result=None)
-                result = self._run_one_process(resume)
+                result = self._run_one_process(
+                    resume, additional_seconds=additional_seconds)
+                additional_seconds = None
                 self.restart_count += 1
                 fingerprint = _result_fingerprint(result)
                 if fingerprint == self.last_fingerprint:
@@ -699,12 +846,15 @@ class ComposerSupervisor:
             self._release_project_lock()
 
 
-def supervise_composer(workflow, *, initial_resume=False, poll_seconds=5.0,
+def supervise_composer(workflow, *, initial_resume=False, initial_additional_seconds=None,
+                       poll_seconds=5.0,
                        on_progress=None, process_watchdog=True,
                        watchdog_seconds=DEFAULT_WATCHDOG_SECONDS):
     """Convenience entry point used by the CLI and the local launch script."""
     return ComposerSupervisor(
-        workflow, initial_resume=initial_resume, poll_seconds=poll_seconds,
+        workflow, initial_resume=initial_resume,
+        initial_additional_seconds=initial_additional_seconds,
+        poll_seconds=poll_seconds,
         on_progress=on_progress, process_watchdog=process_watchdog,
         watchdog_seconds=watchdog_seconds,
     ).run()

@@ -466,6 +466,28 @@ class _RetrievalFailure(Exception):
         self.outcome = outcome
 
 
+def _mcp_error_outcome(message):
+    """Preserve HTTP and robots policy outcomes surfaced as MCP error text."""
+    text = message if isinstance(message, str) else str(message)
+    lowered = text.lower()
+    if "robots.txt" in lowered:
+        if "connection issue" in lowered:
+            return "robots_unavailable"
+        if ("received status 401" in lowered or "received status 403" in lowered
+                or "autonomous fetching of this page is not allowed" in lowered):
+            return "robots_denied"
+    match = re.search(r"\bstatus code\s+(\d{3})\b", text, re.IGNORECASE)
+    if not match:
+        return "provider_error"
+    return {
+        401: "auth_required",
+        403: "access_denied",
+        404: "not_found",
+        408: "timeout",
+        429: "rate_limited",
+    }.get(int(match.group(1)), "provider_error")
+
+
 class _StdioMCP:
     """One bounded MCP session; no shell and no ambient API credentials."""
 
@@ -861,11 +883,14 @@ class MCPFetchClient:
         result["capture_sha256"] = text_capture["sha256"]
         return result
 
-    def fetch(self, url: str, *, max_length: int = 20000, start_index: int = 0, raw: bool = False) -> dict:
+    def fetch(self, url: str, *, max_length: int = 20000, start_index: int = 0,
+              raw: bool = False, source_kind: str = "auto") -> dict:
         _url(url)
-        if type(max_length) is not int or not 0 < max_length < 1_000_000 or type(start_index) is not int or start_index < 0 or type(raw) is not bool:
-            raise ValueError("fetch requires bounded max_length, nonnegative start_index, and a Boolean raw flag")
-        if not raw and self._is_pdf_url(url):
+        if (type(max_length) is not int or not 0 < max_length < 1_000_000
+                or type(start_index) is not int or start_index < 0 or type(raw) is not bool
+                or not isinstance(source_kind, str) or source_kind not in {"auto", "pdf"}):
+            raise ValueError("fetch requires bounded limits, a supported source kind, and a Boolean raw flag")
+        if not raw and (source_kind == "pdf" or (source_kind == "auto" and self._is_pdf_url(url))):
             return self._fetch_pdf(url, max_length=max_length)
         result = _result("mcp-fetch", "mcp_stdio", url)
         result["metadata"].update({
@@ -944,7 +969,8 @@ class MCPFetchClient:
                     "raw_tool_text" if raw or reported_types else "extracted_text"
                 )
                 if reply.get("isError"):
-                    result["outcome"], result["error"] = "provider_error", result["text"]
+                    result["outcome"] = _mcp_error_outcome(result["text"])
+                    result["error"] = result["text"]
                 elif not text_blocks:
                     result["outcome"] = "unsupported_capability" if content else "empty"
                     result["metadata"]["representation"] = "unclassified"
@@ -960,7 +986,10 @@ class MCPFetchClient:
                     result["sources"] = [{"source_url": url, "representation": result["metadata"]["representation"]}]
                 result["gaps"].append("Capture contains MCP tool output; original HTTP bytes, final redirect URL, and response headers are not exposed by this server.")
         except _RetrievalFailure as exc:
-            result["outcome"], result["error"] = exc.outcome, str(exc)
+            result["outcome"] = (
+                _mcp_error_outcome(str(exc)) if exc.outcome == "provider_error" else exc.outcome
+            )
+            result["error"] = str(exc)
         except OSError as exc:
             result["outcome"], result["error"] = "provider_error", str(exc)
         finally:

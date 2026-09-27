@@ -143,6 +143,29 @@ def experiment_program_payload(intent, configured_input):
     }).decode())
 
 
+def experiment_validation_payload(intent, configured_input, candidate, candidate_sha256):
+    """Build the validator envelope with frozen design metadata and raw output."""
+    if not isinstance(configured_input, dict):
+        raise ValidationError("generated experiment configured_input must be an object")
+    if not isinstance(candidate, dict):
+        raise ValidationError("generated experiment candidate must be an object")
+    if not isinstance(candidate_sha256, str) or len(candidate_sha256) != 64:
+        raise ValidationError("generated experiment candidate digest is invalid")
+    try:
+        experiment = {key: intent[key] for key in PROGRAM_EXPERIMENT_FIELDS}
+    except (KeyError, TypeError) as exc:
+        raise ValidationError("generated experiment intent cannot form a validator payload") from exc
+    if intent.get("quality_contract") is not None:
+        experiment["quality_contract"] = intent["quality_contract"]
+    return deepcopy_json({
+        "configured_input": configured_input,
+        "experiment": experiment,
+        "candidate": candidate,
+        "candidate_sha256": candidate_sha256,
+        "primary_outcomes": experiment["primary_outcomes"],
+    })
+
+
 def _registered_configured_input(candidate):
     supplied = candidate["test_vector"]["input"]
     if not isinstance(supplied, dict) or set(supplied) != {"configured_input", "experiment"}:
@@ -154,6 +177,25 @@ def _registered_configured_input(candidate):
         raise ValidationError(
             "registrable program test input does not match its experiment intent")
     return expected["configured_input"]
+
+
+def program_validator_configured_input(candidate):
+    """Return the exact executor input for validator admission, if present.
+
+    Generic gate candidates may use a non-experiment test vector. Generated
+    experiment candidates use the strict executor envelope and must preserve
+    its controller-owned input unchanged for both admission and runtime.
+    """
+    test_vector = candidate.get("test_vector") if isinstance(candidate, dict) else None
+    supplied = test_vector.get("input") if isinstance(test_vector, dict) else None
+    if not isinstance(supplied, dict):
+        return {}
+    if set(supplied) == {"configured_input", "experiment"}:
+        return _registered_configured_input(candidate)
+    if "configured_input" in supplied or "experiment" in supplied:
+        raise ValidationError(
+            "experiment program test input must use the complete execution envelope")
+    return {}
 
 
 def _trial_config(experiment):
@@ -201,7 +243,7 @@ def _experiment(candidate, runtime_python, repo_root, requirements, source_root,
         ),
         "validation": _program(
             "generated_validator", runtime_python, source_root / "validator.py", repo_root,
-            requirements, 300, 5_000_000,
+            requirements, 300, 5_000_000, configured_input=configured_input,
             representative_input={"readiness_probe": True},
         ),
     }

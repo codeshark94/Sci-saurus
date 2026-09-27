@@ -251,6 +251,10 @@ def evaluate_result_package_quality(results, *, minimum_contract=None):
                                  "observed": contract["required_analyses"],
                                  "required": minimum_contract["required_analyses"],
                                  "missing": missing_requirements})
+        validation = results.get("validation")
+        if isinstance(validation, dict) and validation.get("decision") == "rejected":
+            deficits.append({"field": "validation.decision", "observed": "rejected",
+                             "required": ["accepted", "accepted_with_limitations"]})
         analysis = results.get("analysis")
         if analysis is None:
             raise ValidationError("result package requires analysis for its quality contract")
@@ -265,6 +269,17 @@ def evaluate_result_package_quality(results, *, minimum_contract=None):
     requests = []
     for deficit in deficits:
         field = deficit["field"]
+        if field == "validation.decision":
+            requests.append({
+                "id": "repair_rejected_experiment_result",
+                "kind": "additional_experiment",
+                "owner": "methods.validation",
+                "objective": "Address the independent scientific review findings and rerun or repair the affected study before publication.",
+                "why": "A rejected result package may be retained for interpretation, but its findings are not admissible as paper evidence.",
+                "success_condition": "A fresh evidence-bound assessment accepts the repaired result package, with its limitations preserved.",
+                "evidence_needed": "The reviewer findings, targeted repair or rerun outputs, and an updated independently checked result package.",
+            })
+            continue
         requests.append({
             "id": f"research_quality_{field}",
             "kind": "analysis_display" if field in {"figures", "comparisons", "uncertainty", "effect_size", "sensitivity", "ablation"} else "additional_experiment",

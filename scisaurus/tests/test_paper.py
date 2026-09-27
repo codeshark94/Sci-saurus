@@ -162,6 +162,39 @@ class PaperReleaseTests(unittest.TestCase):
         finally:
             builder.close()
 
+    def test_rejected_experiment_results_cannot_enter_a_release_candidate(self):
+        package = json.loads(self.results.read_text())
+        package.update({
+            "schema_version": "results-package-2",
+            "study_type": "exploratory",
+            "question": "Does the bounded fixture reproduce its observed metric?",
+            "hypothesis": "The frozen fixture returns its declared metric.",
+            "provenance": {
+                "score_ref": "artifact:score/fixture@1",
+                "literature_survey_ref": None,
+                "literature_assessment_ref": None,
+                "execution_refs": ["artifact:execution/first@1", "artifact:execution/replay@1"],
+                "validator_execution_ref": "artifact:execution/validator@1",
+                "execution_profile_ref": "artifact:profile/execution@1",
+                "validation_profile_ref": "artifact:profile/validation@1",
+                "replay_sha256": "a" * 64,
+            },
+            "validation": {
+                "decision": "rejected",
+                "deterministic_validation_ref": "artifact:validation/deterministic@1",
+                "model_review_refs": ["artifact:review/claims@1", "artifact:review/methods@1"],
+                "assessment_ref": "artifact:assessment/fixture@1",
+            },
+        })
+        self.results.write_text(json.dumps(package))
+        builder = PaperReleaseBuilder(self.root / "rejected-release", self.config())
+        try:
+            with self.assertRaisesRegex(ValidationError, "rejected scientific results"):
+                builder.build(compile_script=None)
+            self.assertFalse((builder.dir / "output" / "release.json").exists())
+        finally:
+            builder.close()
+
     def test_v3_claim_index_requires_and_retains_stable_literature_span(self):
         value = self.config()
         builder = PaperReleaseBuilder(self.root / "span-release", value)

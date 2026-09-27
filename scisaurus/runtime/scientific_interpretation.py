@@ -16,7 +16,9 @@ import time
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.models import ModelClient, resolve_model_config
+from scisaurus.runtime.models import (
+    ModelClient, complete_with_role_fallbacks, normalize_generated_string_list,
+)
 from scisaurus.runtime.scientific_surface import find_control_leaks
 
 
@@ -55,27 +57,6 @@ def _public_text(value, name):
     return value
 
 
-def _generated_string_list(value):
-    """Repair only unambiguous list serialization mistakes from a model.
-
-    The interpretation contract is intentionally strict, but a compatible
-    model will occasionally serialize a one-item list as a string or join
-    several items with line breaks/semicolons.  Splitting only explicit list
-    separators preserves the model's words while avoiding a semantic rewrite
-    of prose that happens to contain commas.  Values with any other shape are
-    left untouched so validation still rejects them.
-    """
-    if isinstance(value, list):
-        if not all(isinstance(item, str) and item.strip() for item in value):
-            return value
-        return list(dict.fromkeys(item.strip() for item in value))
-    if not isinstance(value, str) or not value.strip():
-        return value
-    parts = [part.strip(" \t-*\u2022") for part in re.split(r"\r?\n+|;", value)
-             if part.strip(" \t-*\u2022")]
-    return parts or [value.strip()]
-
-
 def _normalize_generated_interpretation(value):
     """Apply bounded, loss-preserving repairs before schema validation."""
     if not isinstance(value, dict):
@@ -88,7 +69,7 @@ def _normalize_generated_interpretation(value):
                 continue
             for key in ("predictions", "required_measurements"):
                 if key in experiment:
-                    experiment[key] = _generated_string_list(experiment[key])
+                    experiment[key] = normalize_generated_string_list(experiment[key])
     return normalized
 
 
@@ -253,17 +234,16 @@ class ScientificInterpretationRunner:
         total_usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
         last_error = None
         deadline = time.monotonic() + self.deadline_seconds if self.deadline_seconds is not None else None
+        route_history = []
         for attempt in range(max_attempts):
-            config = resolve_model_config(self.model_config, role="strategy.interpretation")
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.2:
-                    raise ValidationError("scientific interpretation deadline exceeded")
-                config["timeout_seconds"] = min(float(config["timeout_seconds"]), remaining)
-            client = ModelClient(**config)
-            result = client.complete(system=SYSTEM,
-                                      prompt=interpretation_prompt(evidence_packet,
-                                                                   validation_feedback=feedback))
+            if deadline is not None and deadline - time.monotonic() <= 0.2:
+                raise ValidationError("scientific interpretation deadline exceeded")
+            result, attempted_routes = complete_with_role_fallbacks(
+                self.model_config, role="strategy.interpretation", system=SYSTEM,
+                prompt=interpretation_prompt(evidence_packet, validation_feedback=feedback),
+                deadline=deadline, client_factory=ModelClient,
+            )
+            route_history.extend(attempted_routes)
             total_usage["model_calls"] += 1
             for key in ("input_tokens", "output_tokens"):
                 total_usage[key] += result.usage.get(key, 0)
@@ -293,6 +273,7 @@ class ScientificInterpretationRunner:
                 "interpretation": interpretation,
                 "model_calls": total_usage["model_calls"],
                 "usage": total_usage,
+                "provider_route_history": route_history,
                 "status": "accepted",
             }
         raise last_error or ValidationError("scientific interpretation was not accepted")

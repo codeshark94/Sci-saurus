@@ -20,6 +20,7 @@ import json
 import hashlib
 import math
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -28,17 +29,35 @@ from dataclasses import asdict
 from pathlib import Path
 
 from scisaurus.core.errors import ValidationError
-from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.capability_registry import experiment_program_payload, load_registry, register_capability
+from scisaurus.core.schema import canonical_bytes, json_object as parse_complete_json_object
+from scisaurus.runtime.capability_registry import (
+    experiment_program_payload, experiment_validation_payload,
+    load_registry, register_capability,
+)
 from scisaurus.runtime.experiment import validate_program_output
-from scisaurus.runtime.models import ModelClient, ModelResult, resolve_model_config
+from scisaurus.runtime.models import (
+    ModelClient, ModelResult, effective_model_timeout, resolve_model_config,
+)
 from scisaurus.runtime.model_work import ModelWorkBlocked
 from scisaurus.runtime.program_admission import (scan_program_source, validate_experiment_intent,
                                                 validate_program_candidate)
 from scisaurus.runtime.program_gates import (ProgramGateRejected, admit_program_candidate,
                                             validate_validator_readiness)
 from scisaurus.runtime.program_sandbox import run_sandboxed, sandbox_status
-from scisaurus.runtime.research_quality import default_research_quality_contract
+from scisaurus.runtime.research_quality import (
+    ANALYSIS_FIELDS, default_research_quality_contract,
+)
+
+
+def _sandbox_status_text(returncode):
+    if type(returncode) is not int or returncode >= 0:
+        return str(returncode)
+    signal_number = -returncode
+    try:
+        signal_name = signal.Signals(signal_number).name
+    except ValueError:
+        signal_name = f"signal {signal_number}"
+    return f"{returncode} ({signal_name})"
 
 SYSTEM = (
     "You are the program-authoring specialist for an autonomous research laboratory. "
@@ -80,7 +99,7 @@ CONFIG_FIELDS = {
     "max_attempts", "timeout_seconds",
 }
 CONFIG_OPTIONAL_FIELDS = {"model_timeout_seconds"}
-REPAIR_GATE_LIMIT = 2
+AUTHOR_REPAIR_MAX_OUTPUT_TOKENS = 8192
 
 
 def _canonical_capability_identifier(value):
@@ -274,9 +293,10 @@ def validate_foundry_config(value):
     if (type(value["timeout_seconds"]) not in (int, float)
             or not math.isfinite(value["timeout_seconds"]) or value["timeout_seconds"] <= 0):
         raise ValidationError("capability foundry timeout_seconds must be finite and positive")
-    model_timeout = value.get("model_timeout_seconds", 300.0)
-    if (type(model_timeout) not in (int, float)
-            or not math.isfinite(model_timeout) or model_timeout <= 0):
+    model_timeout = value.get("model_timeout_seconds")
+    if (model_timeout is not None and
+            (type(model_timeout) not in (int, float)
+             or not math.isfinite(model_timeout) or model_timeout <= 0)):
         raise ValidationError("capability foundry model_timeout_seconds must be finite and positive")
     try:
         model = json.loads(Path(value["model_config_path"]).read_text())
@@ -287,21 +307,48 @@ def validate_foundry_config(value):
 
 
 def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, runtime_version=None):
+    quality_contract = (
+        required_intent.get("quality_contract")
+        if isinstance(required_intent, dict) else None
+    )
+    requires_analysis = isinstance(quality_contract, dict)
+    analysis_descriptions = {
+        "conditions": (
+            "nonempty list of distinct condition names that actually occur in the emitted observations"
+        ),
+        "independent_seeds": (
+            "nonempty list of unique nonnegative seeds actually used by the experiment"
+        ),
+        "controls": "list of actual control conditions and their observed role",
+        "comparisons": "list of {id,description} objects for comparisons actually computed",
+        "uncertainty": "list of uncertainty procedures/results, or empty only when not required",
+        "effect_sizes": "list of effect-size procedures/results, or empty only when not required",
+        "sensitivity": "list of sensitivity analyses/results, or empty only when not required",
+        "ablation": "list of ablation analyses/results, or empty only when not required",
+        "raw_data": "list naming the emitted raw observations and their fields",
+    }
+    analysis_output_contract = {
+        key: analysis_descriptions[key] for key in sorted(ANALYSIS_FIELDS)
+    }
     prompt = {
         "assignment": "author_experiment_program",
         "capability_brief": brief,
         "output_contract": {
             "executor_source": "complete Python source; reads {'configured_input','experiment'} from stdin, "
                                f"writes one JSON object with exactly {list(PROGRAM_OUTPUT_FIELDS)} "
-                               "and optionally analysis; schema_version must be experiment-program-output-1; "
+                               + ("and a required analysis object matching executor_output_exact_shapes.analysis; "
+                                  if requires_analysis else "and optionally analysis; ")
+                               + "schema_version must be experiment-program-output-1; "
                                "study_id/revision must equal experiment_intent.id/revision",
             "validator_source": "complete, separately authored Python source; reads "
-                                "{'configured_input','candidate','candidate_sha256'} (or 'primary_outcomes') "
+                                "{'configured_input','experiment','candidate','candidate_sha256','primary_outcomes'} "
                                 "from stdin and writes {'schema_version':'experiment-validation-1',"
                                 "'study_id','candidate_sha256','decision','checks','metric_recalculations',"
                                 "'limitations'}; a censored/undefined metric is represented by matching null "
                                 "reported_value and recalculated_value, never by an invented boundary or zero; "
-                                "decision 'accepted' only when every recalculation matches; "
+                                "derive decision deterministically: 'accepted' iff every check outcome is "
+                                "'passed' AND every metric_recalculations item has matches=true; otherwise "
+                                "'rejected'. Metric agreement alone does not override a failed check; "
                                 "when the input is exactly {'readiness_probe':true}, return exactly "
                                 "{'status':'ready'} without running a scientific validation",
             "experiment_intent": {
@@ -309,7 +356,7 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
                 "study_type": "one of novel_research|replication|methods_validation|exploratory",
                 "domain": "text", "research_question": "text", "hypothesis": "text", "method": "text",
                 "parameters": {}, "seed": "non-negative integer",
-                "run_count": "positive integer == number of replicate observations per condition",
+                "run_count": "positive integer minimum number of observation rows across the whole experiment",
                 "stopping_rule": "text",
                 "primary_outcomes": [{"id": "identifier", "definition": "text", "unit": "text",
                                       "direction": "higher|lower|descriptive", "threshold": None}],
@@ -318,7 +365,7 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
                 "reviewers": [{"id": "identifier", "focus": "text"}, {"id": "identifier", "focus": "text"}],
                 "stage_seconds": {"setup": 60, "supervision": 30, "production": 90,
                                   "unit_review": 60, "integrated_review": 180, "reassessment": 90},
-                "max_observations": "integer >= run_count",
+                "max_observations": "integer cap on total observation rows across every condition and replicate",
                 "max_asset_bytes": "positive integer",
             },
         },
@@ -326,11 +373,8 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             {"name": name, "version": version} for name, version in runtime_packages]},
         "configured_input": test_input,
         "optional_intent_fields": {"quality_contract": {
-            "requirement": "Required for novel_research; optional for exploratory and validation studies. "
-                           "It is a downstream substantive-analysis floor, not a pre-execution response-format gate. "
-                           "The executor may omit the reader-facing analysis summary when it can still emit valid "
-                           "procedures, observations, metrics, findings, limitations and assets; the controller "
-                           "records a quality-admission work order after replay and independent recalculation.",
+            "requirement": "Optional only when it is not supplied in required_intent_fields. "
+                           "When supplied, preserve it exactly and make the executor emit the matching analysis summary.",
             "example": default_research_quality_contract(),
         }},
         "stdin_examples": {
@@ -343,6 +387,8 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             },
             "validator_receives": {
                 "configured_input": {},
+                "experiment": {"id": "the frozen experiment intent", "parameters": {},
+                               "run_count": 100, "primary_outcomes": []},
                 "candidate": "the exact JSON object the executor printed",
                 "candidate_sha256": "sha256 of the executor's stdout bytes",
                 "primary_outcomes": "the declared primary_outcomes list",
@@ -394,11 +440,14 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
         "constraints": [
             "Both programs execute directly under Python with __name__ == '__main__'; invoke the entry point "
             "at module level or under that exact guard so each stdin request produces stdout JSON.",
-            "read the executor's experiment metadata from request['experiment'], never from configured_input.experiment",
+            "the executor and validator receive the same controller-owned, frozen experiment intent at "
+            "request['experiment']; read design parameters from that top-level field, never from "
+            "configured_input.experiment",
             "The controller owns the actual runtime and configured_input; do not return or invent them. "
             "Copy study_type and outcome direction from their exact permitted values; never invent classification labels",
-            "the validator must read request['candidate'], request['candidate_sha256'] and request['primary_outcomes'] "
-            "from the top level; it must not expect an 'experiment' key",
+            "the validator must read request['experiment'], request['candidate'], request['candidate_sha256'] and "
+            "request['primary_outcomes'] from the top level; configured_input remains the exact configured input "
+            "and does not contain experiment metadata",
             "the validator must implement the exact {'readiness_probe': true} handshake by returning "
             "exactly {'status': 'ready'}; this handshake proves launchability only and never accepts data",
             "the engine must be fully deterministic: one seed, no clock, no unordered iteration",
@@ -422,9 +471,17 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             "A metric value may be JSON null only when the estimator is explicitly censored or undefined and the "
             "finding/presentation states the reason. The validator must reproduce the same null status. Never map "
             "censoring or undefinedness to zero, a grid endpoint, NaN, or Infinity.",
+            "A candidate is not an estimable experiment when every declared primary outcome is null: matching nulls "
+            "prove reproducibility, not an observed primary result. Repair the parameter domain or declare a finite, "
+            "scientifically meaningful outcome computed from raw observations; preserve individually censored outcomes "
+            "as null. Do not encode a null metric using a non-finite numeric placeholder such as NaN, Inf, or "
+            "Infinity in its conditions, presentation, or linked finding; ordinary scientific prose about a "
+            "mathematical limit at infinity is not a numeric result. State only the supported censoring or "
+            "undefinedness reason.",
             "the validator must not import or copy the executor source",
             "the validator must recompute every declared primary_outcome from observations only",
             "every observation row must carry a replicate index and the raw values used for the metrics",
+            "run_count is only a minimum total-row check; it does not certify per-condition replication. Declare the condition grid and replicate allocation in the method and parameters, and emit the planned rows for each combination. Derive max_observations from the complete planned row count across all conditions and replicates, not merely run_count; choose the smallest practical bound that covers the design",
             "for every primary metric, define one explicit formula and interpolation convention in the method; "
             "the executor and independently written validator must implement that same declared formula from raw observations. "
             "Independent code may use a different algorithm or ordering, but it must not substitute a different "
@@ -467,6 +524,31 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
         prompt["constraints"].append(
             "copy every supplied required_intent_fields value exactly into experiment_intent; do not broaden, "
             "rename, paraphrase, or substitute the admitted scientific question")
+        if type(required_intent.get("revision")) is int:
+            prompt["output_contract"]["experiment_intent"]["revision"] = required_intent["revision"]
+            prompt["constraints"].append(
+                "experiment_intent.revision is controller-owned metadata; copy its supplied value exactly "
+                "and never increment it")
+        if requires_analysis:
+            prompt["output_contract"]["experiment_intent"]["quality_contract"] = deepcopy_config(
+                quality_contract)
+            prompt["executor_output_exact_shapes"]["analysis"] = analysis_output_contract
+            prompt["constraints"].extend([
+                "The supplied quality_contract is frozen in this novel-research intent. The executor MUST "
+                "emit a top-level analysis object with exactly the fields in "
+                "executor_output_exact_shapes.analysis; omitting analysis is an admission failure.",
+                "analysis.conditions must list actual observed conditions and meet "
+                f"minimum_conditions={quality_contract.get('minimum_conditions')}; do not invent labels.",
+                "analysis.independent_seeds must list the distinct seeds actually executed and meet "
+                f"minimum_independent_seeds={quality_contract.get('minimum_independent_seeds')}; "
+                "replicates under one seed are not independent seeds.",
+                "analysis.controls and analysis.comparisons must describe computed evidence and meet "
+                f"minimum_controls={quality_contract.get('minimum_controls')} and "
+                f"minimum_comparisons={quality_contract.get('minimum_comparisons')}.",
+                "For every required analysis kind, include a nonempty, result-grounded entry in its "
+                "corresponding analysis list; leave an unrequired kind empty rather than fabricate it. "
+                "analysis.raw_data must identify the actual raw observations emitted.",
+            ])
     return prompt
 
 
@@ -497,8 +579,8 @@ def apply_authoring_patch(previous, response):
             merge(result, {name: value})
             continue
         if isinstance(value, str):
-            result[name] = value
-            continue
+            raise ValidationError(
+                f"{name} repair must use compact exact source edits; complete source replacement is not accepted")
         if (not isinstance(value, dict) or set(value) != {"edits"}
                 or not isinstance(value["edits"], list) or not value["edits"]
                 or not isinstance(result.get(name), str)):
@@ -509,9 +591,33 @@ def apply_authoring_patch(previous, response):
                     or not isinstance(edit["old"], str) or not edit["old"]
                     or not isinstance(edit["new"], str)):
                 raise ValidationError(f"{name} edit requires nonempty old text and string new text")
-            start = source.find(edit["old"])
-            if start < 0 or source.find(edit["old"], start + 1) >= 0:
-                raise ValidationError(f"{name} edit old text must match exactly once; match is missing or ambiguous")
+            positions = []
+            cursor = 0
+            while len(positions) < 4:
+                position = source.find(edit["old"], cursor)
+                if position < 0:
+                    break
+                positions.append(position)
+                cursor = position + 1
+            if len(positions) != 1:
+                locations = []
+                for position in positions[:3]:
+                    line_number = source.count("\n", 0, position) + 1
+                    context_start = max(0, position - 64)
+                    context_end = min(len(source), position + len(edit["old"]) + 64)
+                    context = source[context_start:context_end]
+                    if len(context) > 320:
+                        context = context[:160] + " ... " + context[-160:]
+                    locations.append(f"line {line_number}: {context!r}")
+                observed = ("0" if not positions else
+                            f"{len(positions)} or more" if len(positions) == 4 else str(len(positions)))
+                old_preview = edit["old"][:240]
+                if len(edit["old"]) > len(old_preview):
+                    old_preview += " ..."
+                raise ValidationError(
+                    f"{name} edit old text must match exactly once; observed {observed} occurrences "
+                    f"in current source of {len(source)} characters; "
+                    f"requested_old_prefix={old_preview!r}; match_locations={locations}")
             source = source.replace(edit["old"], edit["new"], 1)
         result[name] = source
     return result
@@ -554,14 +660,32 @@ def validate_program_review(value):
         raise ValidationError(
             "scientific program review checks must be a list containing exactly: "
             + ", ".join(sorted(PROGRAM_REVIEW_CHECKS)))
-    malformed = [index for index, item in enumerate(checks)
-                 if (not isinstance(item, dict)
-                     or set(item) != {"id", "outcome", "evidence"}
-                     or not isinstance(item.get("id"), str)
-                     or not isinstance(item.get("outcome"), str)
-                     or item.get("outcome") not in {"passed", "failed"}
-                     or not isinstance(item.get("evidence"), str)
-                     or not item["evidence"].strip())]
+    required_check_fields = frozenset({"id", "outcome", "evidence"})
+    diagnostic_check_fields = frozenset({
+        "id", "outcome", "evidence", "severity", "finding", "required_change",
+    })
+    malformed = []
+    for index, item in enumerate(checks):
+        if not isinstance(item, dict):
+            malformed.append(index)
+            continue
+        fields = frozenset(item)
+        has_diagnostics = fields == diagnostic_check_fields
+        if (fields not in {required_check_fields, diagnostic_check_fields}
+                or not isinstance(item.get("id"), str)
+                or not isinstance(item.get("outcome"), str)
+                or item.get("outcome") not in {"passed", "failed"}
+                or not isinstance(item.get("evidence"), str)
+                or not item["evidence"].strip()
+                or (has_diagnostics and (
+                    not isinstance(item.get("severity"), str)
+                    or item.get("severity") not in {"blocking", "warning"}
+                    or not isinstance(item.get("finding"), str)
+                    or not item["finding"].strip()
+                    or not isinstance(item.get("required_change"), str)
+                    or not item["required_change"].strip()
+                ))):
+            malformed.append(index)
     ids = [item.get("id") for item in checks if isinstance(item, dict)]
     string_ids = [item for item in ids if isinstance(item, str)]
     missing = sorted(PROGRAM_REVIEW_CHECKS - set(string_ids))
@@ -588,8 +712,11 @@ def validate_program_review(value):
             or any(not isinstance(item.get(key), str) or not item[key].strip()
                    for key in ("finding", "evidence", "required_change")) for item in findings)):
         raise ValidationError("scientific program review findings must cite evidence and a scoped repair")
-    rejected = any(item["outcome"] == "failed" for item in checks) or any(
-        item["severity"] == "blocking" for item in findings)
+    rejected = (
+        any(item["outcome"] == "failed" for item in checks)
+        or any(item.get("severity") == "blocking" for item in checks)
+        or any(item["severity"] == "blocking" for item in findings)
+    )
     if value["status"] != ("rejected" if rejected else "admitted"):
         raise ValidationError("scientific program review status contradicts its checks")
     return value
@@ -598,7 +725,7 @@ def validate_program_review(value):
 class CapabilityFoundry:
     def __init__(self, model_config, *, runtime_python, workspace_root, registry_root, repo_root,
                  requirements_file, runtime_packages, max_attempts=4, timeout_seconds=900.0,
-                 model_timeout_seconds=300.0, reviewer_client=None,
+                 model_timeout_seconds=None, reviewer_client=None,
                  author_max_output_tokens=24000, reviewer_max_output_tokens=12000):
         self.model_config = deepcopy_config(model_config)
         self.runtime_python = Path(runtime_python)
@@ -619,8 +746,9 @@ class CapabilityFoundry:
         if (type(timeout_seconds) not in (int, float)
                 or not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
             raise ValidationError("foundry timeout_seconds must be finite and positive")
-        if (type(model_timeout_seconds) not in (int, float)
-                or not math.isfinite(model_timeout_seconds) or model_timeout_seconds <= 0):
+        if (model_timeout_seconds is not None
+                and (type(model_timeout_seconds) not in (int, float)
+                     or not math.isfinite(model_timeout_seconds) or model_timeout_seconds <= 0)):
             raise ValidationError("foundry model_timeout_seconds must be finite and positive")
         for name, value in (("author_max_output_tokens", author_max_output_tokens),
                             ("reviewer_max_output_tokens", reviewer_max_output_tokens)):
@@ -635,17 +763,38 @@ class CapabilityFoundry:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
 
     def _model_config_for_role(self, role, output_limit):
-        """Give source authoring enough room without changing ordinary roles."""
+        """Allocate a route's context ceiling to the requested output budget."""
         config = resolve_model_config(self.model_config, role=role)
+        self._reserve_output_capacity(config, output_limit, role=role)
+        timeout_bounds = []
+        if self.model_timeout_seconds is not None:
+            timeout_bounds.append(self.model_timeout_seconds)
+        if self.deadline is not None:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0.2:
+                raise CapabilityDeadlineError("capability model has no request window remaining")
+            timeout_bounds.append(remaining)
+        config["timeout_seconds"] = effective_model_timeout(
+            config.get("timeout_seconds"), *timeout_bounds)
+        return config
+
+    @staticmethod
+    def _reserve_output_capacity(config, output_limit, *, role):
         requested = max(int(config["max_output_tokens"]), int(output_limit))
         window = config.get("context_window_tokens")
         input_limit = config.get("max_input_tokens")
         if type(window) is int:
-            available = window - (input_limit if type(input_limit) is int else 1024)
-            if available <= 0:
+            requested = min(requested, window - 1024)
+            input_ceiling = window - requested
+            if input_ceiling <= 0:
                 raise ValidationError(
-                    f"foundry {role} route leaves no output context after its input reservation")
-            requested = min(requested, available)
+                    f"foundry {role} route leaves no input context after its output reservation")
+            if type(input_limit) is int and input_limit > input_ceiling:
+                # The configured max_input_tokens was reserving the full
+                # intake ceiling even when this role needs a larger answer.
+                # Rebalance the static ceiling; the exact prompt is still
+                # checked against this route before dispatch.
+                config["max_input_tokens"] = input_ceiling
         config["max_output_tokens"] = requested
         return config
 
@@ -680,13 +829,14 @@ class CapabilityFoundry:
 
     @staticmethod
     def _validator_input(data, intent):
-        """Add the declared outcomes exactly as ExperimentRunner does."""
+        """Build the shared immutable validator envelope from the test vector."""
         try:
             payload = json.loads(data)
         except (ValueError, TypeError):
             return data
-        payload["primary_outcomes"] = intent["primary_outcomes"]
-        return canonical_bytes(payload)
+        return canonical_bytes(experiment_validation_payload(
+            intent, payload["configured_input"], payload["candidate"],
+            payload["candidate_sha256"]))
 
     def _execute(self, source, payload):
         timeout = self.timeout_seconds
@@ -713,8 +863,6 @@ class CapabilityFoundry:
         if client is None:
             model_config = self._model_config_for_role(
                 author_role, self.author_max_output_tokens)
-            model_config["timeout_seconds"] = min(
-                float(model_config["timeout_seconds"]), float(self.model_timeout_seconds))
             author_route_configs.append(model_config)
             # Keep a malformed response from consuming the whole authoring
             # lease on one model.  Fallbacks are instantiated lazily and only
@@ -726,17 +874,23 @@ class CapabilityFoundry:
                 fallback_model = deepcopy_config(self.model_config)
                 fallback_model.setdefault("role_models", {})[author_role] = deepcopy_config(alternative)
                 fallback_config = resolve_model_config(fallback_model, role=author_role)
-                requested = max(int(fallback_config["max_output_tokens"]), int(self.author_max_output_tokens))
-                window = fallback_config.get("context_window_tokens")
-                input_limit = fallback_config.get("max_input_tokens")
-                if type(window) is int:
-                    available = window - (input_limit if type(input_limit) is int else 1024)
-                    if available <= 0:
-                        continue
-                    requested = min(requested, available)
-                fallback_config["max_output_tokens"] = requested
-                fallback_config["timeout_seconds"] = min(
-                    float(fallback_config["timeout_seconds"]), float(self.model_timeout_seconds))
+                try:
+                    self._reserve_output_capacity(
+                        fallback_config, self.author_max_output_tokens,
+                        role=author_role)
+                except ValidationError:
+                    continue
+                timeout_bounds = []
+                if self.model_timeout_seconds is not None:
+                    timeout_bounds.append(self.model_timeout_seconds)
+                if self.deadline is not None:
+                    remaining = self.deadline - time.monotonic()
+                    if remaining <= 0.2:
+                        raise CapabilityDeadlineError(
+                            "capability fallback model has no request window remaining")
+                    timeout_bounds.append(remaining)
+                fallback_config["timeout_seconds"] = effective_model_timeout(
+                    fallback_config.get("timeout_seconds"), *timeout_bounds)
                 if not all(
                         fallback_config.get(key) == author_route_configs[0].get(key)
                         for key in ("base_url", "model", "auth_env")):
@@ -847,6 +1001,11 @@ class CapabilityFoundry:
                 "validation_context": state.get("validation_context", {}),
                 "validation_feedback": state.get("validation_feedback", {}),
             })
+            error.model_diagnostics = {
+                "author_responses": deepcopy_config(
+                    state.get("model_diagnostics", [])[-8:]),
+            }
+            error.usage = deepcopy_config(state.get("usage", {}))
             return error
 
         def switch_author_route(reason):
@@ -864,6 +1023,29 @@ class CapabilityFoundry:
             })
             save("author_format_route_fallback")
             return True
+
+        def prepare_author_format_retry(reason, prior_feedback):
+            """Retry an invalid envelope without discarding an active repair."""
+            nonlocal feedback
+            switched = switch_author_route(reason)
+            has_repair_base = (
+                isinstance(state.get("last_attempt"), dict)
+                and ATTEMPT_FIELDS.issubset(state["last_attempt"])
+            )
+            feedback = prior_feedback if prior_feedback is not None and has_repair_base else None
+            state["feedback"] = feedback
+            state["format_repair"] = {
+                "previous_error": str(reason)[:1200],
+                "instructions": (
+                    "The previous response was incomplete or not valid JSON. Preserve the existing "
+                    "scientific repair request and return only one complete JSON object matching the "
+                    "output contract; no markdown, prose, or analysis. When the contract requests "
+                    "updates, omit unchanged fields and use compact exact source edits instead of "
+                    "rewriting complete programs."
+                ),
+            }
+            save("author_format_repair_ready")
+            return switched
 
         state["repair_gate_counts"] = _seed_repair_gate_counts(state)
         if model_call_budget is not None:
@@ -950,14 +1132,31 @@ class CapabilityFoundry:
                             "foundry reviewer route leaves no output context after its input reservation")
                     configured_limit = min(configured_limit, available)
                 config["max_output_tokens"] = configured_limit
-                config["timeout_seconds"] = min(float(config["timeout_seconds"]), self.model_timeout_seconds)
+                timeout_bounds = []
+                if self.model_timeout_seconds is not None:
+                    timeout_bounds.append(self.model_timeout_seconds)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.2:
+                        raise CapabilityDeadlineError(
+                            "independent program review reached its mission deadline")
+                    timeout_bounds.append(remaining)
+                config["timeout_seconds"] = effective_model_timeout(
+                    config.get("timeout_seconds"), *timeout_bounds)
                 reviewer = ModelClient(**config)
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise CapabilityDeadlineError("independent program review reached its mission deadline")
-                if hasattr(reviewer, "timeout_seconds"):
-                    reviewer.timeout_seconds = min(reviewer.timeout_seconds, remaining)
+            if hasattr(reviewer, "timeout_seconds"):
+                timeout_bounds = []
+                if self.model_timeout_seconds is not None:
+                    timeout_bounds.append(self.model_timeout_seconds)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.2:
+                        raise CapabilityDeadlineError(
+                            "independent program review reached its mission deadline")
+                    timeout_bounds.append(remaining)
+                if timeout_bounds:
+                    reviewer.timeout_seconds = effective_model_timeout(
+                        reviewer.timeout_seconds, *timeout_bounds)
             ensure_model_call_budget()
             prompt = {"assignment": "independent_scientific_program_review",
                 "research_assignment": brief,
@@ -1001,6 +1200,29 @@ class CapabilityFoundry:
             save("scientific_review_response")
             return result
 
+        if state["status"] == "blocked" and isinstance(
+                state.get("repair_budget_exhausted"), dict):
+            ledger = state.get("repair_ledger", [])
+            latest = ledger[-1] if isinstance(ledger, list) and ledger else None
+            repeated_diagnostic = (
+                isinstance(latest, dict)
+                and any(
+                    isinstance(previous, dict)
+                    and previous.get("gate") == latest.get("gate")
+                    and previous.get("candidate_sha256") == latest.get("candidate_sha256")
+                    and previous.get("error") == latest.get("error")
+                    for previous in ledger[:-1]
+                )
+            )
+            if (not repeated_diagnostic
+                    and type(state.get("attempts")) is int
+                    and state["attempts"] < self.max_attempts
+                    and isinstance(state.get("last_attempt"), dict)
+                    and ATTEMPT_FIELDS.issubset(state["last_attempt"])):
+                state["legacy_repair_budget_exhausted"] = deepcopy_config(
+                    state.pop("repair_budget_exhausted"))
+                state.update(status="repairing", error=None)
+                save("repair_policy_migrated")
         if state["status"] == "blocked":
             raise repair_exhausted_error()
         if state["status"] == "succeeded":
@@ -1017,30 +1239,13 @@ class CapabilityFoundry:
                 error="process exited before the provider result was recorded")
             state["status"] = "repairing"
             save("reconciled")
-        exhausted_gate = next(
-            (gate for gate, count in state["repair_gate_counts"].items()
-             if type(count) is int and count >= REPAIR_GATE_LIMIT),
-            None,
-        )
-        if exhausted_gate is not None:
-            state["status"] = "blocked"
-            state["error"] = (
-                f"capability foundry {exhausted_gate} repair budget exhausted after "
-                f"{state['repair_gate_counts'][exhausted_gate]} failures; change the scientific framing "
-                f"instead of repeatedly repairing the same gate: {state.get('feedback', '')[:2400]}")
-            state["repair_budget_exhausted"] = {
-                "gate": exhausted_gate,
-                "failures": state["repair_gate_counts"][exhausted_gate],
-                "limit": REPAIR_GATE_LIMIT,
-            }
-            save("repair_budget_exhausted")
-            raise ModelWorkBlocked(state["error"])
         feedback = state.get("feedback")
         last_error = feedback
         last_attempt = state.get("last_attempt")
         buffered = ModelResult(**state["last_response"]) if state["status"] == "response_received" else None
         first_attempt = state["attempts"] - (1 if buffered else 0)
         for attempt in range(first_attempt, self.max_attempts):
+            attempt_feedback = feedback
             prompt_value = deepcopy_config(base_prompt)
             if feedback is not None:
                 prompt_value["repair_request"] = {
@@ -1070,8 +1275,8 @@ class CapabilityFoundry:
                 }
                 if isinstance(last_attempt, dict) and ATTEMPT_FIELDS.issubset(last_attempt):
                     prompt_value["output_contract"] = {"updates": {
-                        "executor_source": "optional {'edits': [{'old': 'exact unique existing text', 'new': 'replacement text'}]} or complete replacement source",
-                        "validator_source": "optional {'edits': [{'old': 'exact unique existing text', 'new': 'replacement text'}]} or complete replacement source",
+                        "executor_source": "optional {'edits': [{'old': 'exact unique existing text', 'new': 'replacement text'}]}; complete source replacement is not accepted",
+                        "validator_source": "optional {'edits': [{'old': 'exact unique existing text', 'new': 'replacement text'}]}; complete source replacement is not accepted",
                         "experiment_intent": "optional JSON merge patch: include only changed fields; null deletes an object field; arrays replace whole arrays",
                     }}
                     prompt_value["repair_request"]["instructions"] += (
@@ -1080,21 +1285,39 @@ class CapabilityFoundry:
                         "For an enum error, update only that intent field to one of the supplied allowed values. "
                         "For source fixes prefer exact edits to rewriting entire programs. Each old text must match "
                         "exactly once in the current source; edits apply in order, and empty new text deletes it. "
-                        "Include enough surrounding code to make matches unique. The assembled source still passes every gate.")
+                        "Include enough surrounding code to make matches unique. If an edit is rejected as missing "
+                        "or ambiguous, do not repeat it unchanged: for ambiguous matches, use the reported locations "
+                        "to correct the excerpt; for a missing match, inspect the current source in the candidate and "
+                        "use its exact text. Never return an entire source file. The assembled source still "
+                        "passes every gate.")
+            if isinstance(state.get("format_repair"), dict):
+                prompt_value["format_repair"] = deepcopy_config(state["format_repair"])
             prompt = json.dumps(prompt_value, ensure_ascii=False, sort_keys=True)
             seed_replay = buffered is not None and state.pop("seed_replay_pending", False)
             if buffered is not None:
                 result, buffered = buffered, None
             else:
+                if (author_route_configs and isinstance(last_attempt, dict)
+                        and ATTEMPT_FIELDS.issubset(last_attempt)
+                        and type(getattr(client, "max_output_tokens", None)) is int):
+                    client.max_output_tokens = min(
+                        client.max_output_tokens, AUTHOR_REPAIR_MAX_OUTPUT_TOKENS)
+                timeout_bounds = []
+                if self.model_timeout_seconds is not None:
+                    timeout_bounds.append(self.model_timeout_seconds)
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise CapabilityDeadlineError("capability authoring reached its mission deadline")
-                    if hasattr(client, "timeout_seconds"):
-                        client.timeout_seconds = min(client.timeout_seconds, remaining)
+                    if remaining <= 0.2:
+                        raise CapabilityDeadlineError(
+                            "capability authoring reached its mission deadline")
+                    timeout_bounds.append(remaining)
+                if timeout_bounds and hasattr(client, "timeout_seconds"):
+                    client.timeout_seconds = effective_model_timeout(
+                        client.timeout_seconds, *timeout_bounds)
                 ensure_model_call_budget()
                 state["attempts"] = attempt + 1
                 request = {"attempt": attempt + 1, "role": "research.experiment-author", "status": "started", "prompt": prompt,
+                           "max_output_tokens": getattr(client, "max_output_tokens", None),
                            "usage": {"model_calls": 1}}
                 state["requests"].append(request)
                 state["usage"]["model_calls"] = state["usage"].get("model_calls", 0) + 1
@@ -1111,8 +1334,69 @@ class CapabilityFoundry:
                 state.update(status="response_received", last_response=asdict(result),
                              response_base=deepcopy_config(last_attempt))
                 save("response_received")
+            attempt_value = None
             if result.finish_reason != "stop":
-                last_error = ValidationError("program author did not finish normally")
+                if result.finish_reason == "length":
+                    try:
+                        # A token-limit finish can still contain a complete
+                        # envelope. It may proceed only through the ordinary
+                        # schema, sandbox, and independent admission gates.
+                        attempt_value = parse_complete_json_object(
+                            result.text, "program author response", model_envelope=False)
+                    except ValidationError as parse_error:
+                        diagnostic = {
+                            "attempt": attempt + 1,
+                            "role": author_role,
+                            "model": result.model,
+                            "finish_reason": result.finish_reason,
+                            "response_chars": len(result.text),
+                            "response_sha256": hashlib.sha256(
+                                result.text.encode("utf-8")).hexdigest(),
+                            "response_tail": result.text[-6000:],
+                            "usage": deepcopy_config(result.usage),
+                            "parse_error": str(parse_error)[:1200],
+                            "outcome": "incomplete_response",
+                        }
+                        diagnostics = state.setdefault("model_diagnostics", [])
+                        diagnostics.append(diagnostic)
+                        state["model_diagnostics"] = diagnostics[-12:]
+                        last_error = ValidationError(
+                            f"program author response was incomplete "
+                            f"(finish_reason={result.finish_reason}): {parse_error}")
+                    else:
+                        diagnostic = {
+                            "attempt": attempt + 1,
+                            "role": author_role,
+                            "model": result.model,
+                            "finish_reason": result.finish_reason,
+                            "response_chars": len(result.text),
+                            "response_sha256": hashlib.sha256(
+                                result.text.encode("utf-8")).hexdigest(),
+                            "usage": deepcopy_config(result.usage),
+                            "outcome": "complete_json_requires_full_program_gates",
+                        }
+                        diagnostics = state.setdefault("model_diagnostics", [])
+                        diagnostics.append(diagnostic)
+                        state["model_diagnostics"] = diagnostics[-12:]
+                else:
+                    diagnostic = {
+                        "attempt": attempt + 1,
+                        "role": author_role,
+                        "model": result.model,
+                        "finish_reason": result.finish_reason,
+                        "response_chars": len(result.text),
+                        "response_sha256": hashlib.sha256(
+                            result.text.encode("utf-8")).hexdigest(),
+                        "usage": deepcopy_config(result.usage),
+                        "outcome": "inadmissible_finish_reason",
+                    }
+                    diagnostics = state.setdefault("model_diagnostics", [])
+                    diagnostics.append(diagnostic)
+                    state["model_diagnostics"] = diagnostics[-12:]
+                    last_error = ValidationError(
+                        f"program author finish_reason={result.finish_reason} is not admissible; "
+                        "only stop and a complete length response can enter program gates")
+            if result.finish_reason != "stop" and attempt_value is None:
                 failures = state.setdefault("validation_errors", [])
                 repeated = str(last_error) in failures or str(last_error) == feedback
                 feedback = str(last_error)
@@ -1122,19 +1406,18 @@ class CapabilityFoundry:
                     error=f"capability foundry did not admit a program: {feedback}")
                 save("validation_failed")
                 if repeated:
-                    raise ModelWorkBlocked(state["error"])
-                if switch_author_route(feedback):
-                    # The fallback gets the canonical assignment again.  A
-                    # malformed response is not scientific repair evidence.
-                    feedback = None
+                    raise repair_exhausted_error()
+                prepare_author_format_retry(last_error, attempt_feedback)
                 continue
-            attempt_value = document = candidate_fingerprint = None
+            document = candidate_fingerprint = None
             try:
                 # A provider may stop after emitting a complete inner object
                 # but omit only the outermost closing brace.  Recover that
                 # transport defect locally; all authoring, sandbox, and
                 # admission gates still run on the recovered object.
-                attempt_value = result.json_object(allow_missing_closers=True)
+                if attempt_value is None:
+                    attempt_value = result.json_object(allow_missing_closers=True)
+                state.pop("format_repair", None)
                 if "updates" in attempt_value:
                     attempt_value = apply_authoring_patch(state.get("response_base", last_attempt), attempt_value)
                 if (not ATTEMPT_FIELDS.issubset(attempt_value)
@@ -1149,6 +1432,17 @@ class CapabilityFoundry:
                 attempt_value = {**attempt_value, "runtime": runtime, "test_input": configured_input}
                 if required_intent:
                     intent = attempt_value.get("experiment_intent")
+                    if (isinstance(intent, dict)
+                            and type(required_intent.get("revision")) is int
+                            and intent.get("revision") != required_intent["revision"]):
+                        received_revision = intent.get("revision")
+                        intent["revision"] = required_intent["revision"]
+                        state.setdefault("normalizations", []).append({
+                            "attempt": attempt + 1,
+                            "kind": "controller_owned_intent_revision",
+                            "required": required_intent["revision"],
+                            "received": received_revision,
+                        })
                     if not isinstance(intent, dict) or any(
                             intent.get(key) != value for key, value in required_intent.items()):
                         differences = {key: {"required": value, "received": intent.get(key) if isinstance(intent, dict) else None}
@@ -1183,7 +1477,7 @@ class CapabilityFoundry:
                     raise CapabilityDeadlineError("capability sandbox reached its mission deadline")
                 if first.timed_out or first.truncated or first.returncode != 0:
                     raise ValidationError(
-                        f"executor failed in the sandbox (status={first.returncode}, "
+                        f"executor failed in the sandbox (status={_sandbox_status_text(first.returncode)}, "
                         f"timeout={first.timed_out}, truncated={first.truncated}, "
                         f"stdout_bytes={len(first.stdout)}, stderr_bytes={len(first.stderr)}, "
                         f"mode={first.mode}): "
@@ -1289,29 +1583,16 @@ class CapabilityFoundry:
                 if gate:
                     counts = state["repair_gate_counts"]
                     counts[gate] = counts.get(gate, 0) + 1
-                    if counts[gate] >= REPAIR_GATE_LIMIT:
-                        state["status"] = "blocked"
-                        state["error"] = (
-                            f"capability foundry {gate} repair budget exhausted after "
-                            f"{counts[gate]} failures; change the scientific framing "
-                            f"instead of repeatedly repairing the same gate: {feedback[:2400]}")
-                        state["repair_budget_exhausted"] = {
-                            "gate": gate,
-                            "failures": counts[gate],
-                            "limit": REPAIR_GATE_LIMIT,
-                        }
-                        save("repair_budget_exhausted")
-                        raise repair_exhausted_error() from exc
                 save("validation_failed")
                 if repeated:
-                    raise ModelWorkBlocked(state["error"]) from exc
+                    raise repair_exhausted_error() from exc
                 format_envelope = (
                     candidate_fingerprint is None
                     and (attempt_value is None
                          or not ATTEMPT_FIELDS.issubset(attempt_value))
                 )
-                if format_envelope and switch_author_route(feedback):
-                    feedback = None
+                if format_envelope:
+                    prepare_author_format_retry(last_error, attempt_feedback)
                 continue
         state.update(status="blocked", error=(
             f"capability foundry did not admit a program in {state['attempts']} attempts: {last_error}"))

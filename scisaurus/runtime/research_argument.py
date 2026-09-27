@@ -18,7 +18,9 @@ import time
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.models import ModelClient, resolve_model_config
+from scisaurus.runtime.models import (
+    ModelClient, complete_with_role_fallbacks, normalize_generated_string_list,
+)
 from scisaurus.runtime.scientific_surface import find_control_leaks
 
 
@@ -29,47 +31,6 @@ HYPOTHESIS_STATUSES = {"candidate", "supported", "disfavored", "unresolved"}
 FIGURE_KINDS = {"figure", "table"}
 REVIEW_DECISIONS = {"accept", "revise", "insufficient_evidence"}
 REVIEW_OUTCOMES = {"passed", "failed", "insufficient_evidence"}
-
-
-def _repair_model_config(model, *, role, use_fallback=False):
-    """Resolve a bounded response-repair route without replaying the primary call.
-
-    A provider response that is truncated or fails the JSON contract is a
-    model-interface defect, not evidence that the scientific argument changed.
-    Prefer the first configured route with a different model for that repair and
-    cap the response so the repair prompt cannot consume another full review
-    budget.  The fallback is explicit here because the normal resolver only
-    switches routes when a durable call quota is exhausted.
-    """
-    selected_model = None
-    if use_fallback:
-        fallbacks = model.get("role_model_fallbacks", {}) if isinstance(model, dict) else {}
-        candidates = fallbacks.get(role, []) if isinstance(fallbacks, dict) else []
-        primary = (model.get("role_models", {}).get(role, {}).get("model")
-                   if isinstance(model, dict) and isinstance(model.get("role_models"), dict)
-                   and isinstance(model["role_models"].get(role), dict) else
-                   model.get("model") if isinstance(model, dict) else None)
-        for candidate in candidates:
-            if not isinstance(candidate, dict) or not candidate.get("model"):
-                continue
-            if candidate.get("model") == primary:
-                continue
-            selected_model = deepcopy(candidate)
-            break
-    if selected_model is None:
-        config = resolve_model_config(model, role=role)
-    else:
-        routed = deepcopy(model)
-        routed["role_models"] = deepcopy(routed.get("role_models", {}))
-        routed["role_models"][role] = selected_model
-        # The repair route is already selected. Do not silently bounce it back
-        # to the primary route because of a second quota lookup.
-        routed["role_model_fallbacks"] = {}
-        config = resolve_model_config(routed, role=role)
-    if use_fallback:
-        configured_limit = config.get("max_output_tokens", 4096)
-        config["max_output_tokens"] = min(int(configured_limit), 4096)
-    return config
 
 
 def _text(value, name, *, public=True):
@@ -405,6 +366,107 @@ SYSTEM = (
 )
 
 
+def _argument_output_contract(*, min_figures, min_tables, min_experiments):
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "observed_patterns": "list of {id,observation,implication,evidence_ids}; at least two",
+        "hypotheses": "list of {id,statement,mechanism,status,predictions,counterevidence,discriminating_test,evidence_ids,explains_pattern_ids}; at least two; status must be exactly candidate, supported, disfavored, or unresolved",
+        "primary_argument": "{thesis,primary_hypothesis_id,rationale,scope_boundary}",
+        "discriminating_experiments": "list of {id,question,design,controls,predictions,measurements,tests_hypothesis_ids}",
+        "figure_plan": "list of {id,kind,asset_id,purpose,supports,source_refs,readout,placement}; every observed pattern covered; every figure asset_id must be copied from evidence_packet.asset_ids and table asset_id may be null",
+        "limitations": "nonempty list of limitations that materially affect interpretation",
+        "response_size": (
+            "Keep prose fields to one or two concise sentences. Include only the result patterns, "
+            "competing explanations, tests, and visuals needed to make the argument auditable; "
+            "do not repeat the full evidence packet."
+        ),
+        "minimums": {"figures": min_figures, "tables": min_tables,
+                     "experiments": min_experiments},
+    }
+
+
+def _argument_repair_summary(evidence_packet):
+    """Keep the fallback prompt grounded without replaying the full packet."""
+    def records(value, keys, limit=12):
+        if not isinstance(value, list):
+            return []
+        compact = []
+        for item in value[:limit]:
+            if not isinstance(item, dict):
+                compact.append(str(item)[:500])
+                continue
+            compact.append({key: (str(item[key])[:700] if isinstance(item[key], str)
+                                  else deepcopy(item[key]))
+                            for key in keys if key in item})
+        return compact
+
+    results = evidence_packet.get("results_package")
+    results = results if isinstance(results, dict) else {}
+    interpretation = evidence_packet.get("scientific_interpretation")
+    interpretation = interpretation if isinstance(interpretation, dict) else {}
+    return {
+        "research_question": evidence_packet.get("research_question"),
+        "results": {
+            key: records(results.get(key), (
+                "id", "name", "kind", "question", "summary", "finding", "description",
+                "value", "unit", "interpretation", "status", "evidence_ids", "asset_id",
+            ))
+            for key in ("procedures", "metrics", "findings", "assets")
+            if isinstance(results.get(key), list)
+        } | {"limitations": records(results.get("limitations"), ())},
+        "interpretation": {
+            key: records(interpretation.get(key), (
+                "id", "observation", "interpretation", "supporting_evidence",
+                "contradicting_evidence", "status", "prediction", "test",
+            ))
+            for key in ("result_patterns", "competing_explanations")
+            if isinstance(interpretation.get(key), list)
+        } | {"limitations": records(interpretation.get("limitations"), ())},
+        "allowed_evidence_ids": list(evidence_packet.get("evidence_ids", [])),
+        "available_asset_ids": list(evidence_packet.get("asset_ids", [])),
+        "scientific_follow_up": deepcopy(evidence_packet.get("scientific_follow_up", []))[:6],
+    }
+
+
+def argument_response_repair_prompt(evidence_packet, *, previous_response,
+                                    validation_error, min_figures=2,
+                                    min_tables=1, min_experiments=2,
+                                    validation_feedback=None):
+    """Repair one bounded response using the partial work and exact ID domain."""
+    previous = (previous_response if isinstance(previous_response, (dict, list))
+                else str(previous_response or "")[:30000])
+    payload = {
+        "assignment": "Complete the interrupted research-argument JSON response.",
+        "instruction": (
+            "Return one complete object matching output_contract. Preserve supported content and exact IDs; "
+            "repair the reported defect, keep prose concise, and do not infer absent measurements."
+        ),
+        "validation_error": str(validation_error)[:1600],
+        "partial_response": previous,
+        "grounding_summary": _argument_repair_summary(evidence_packet),
+        "output_contract": _argument_output_contract(
+            min_figures=min_figures, min_tables=min_tables,
+            min_experiments=min_experiments),
+        "evidence_id_policy": (
+            "Copy evidence_ids and source_refs only from allowed_evidence_ids. A figure asset_id must be "
+            "copied exactly from available_asset_ids; never invent an ID or filename."
+        ),
+    }
+    if isinstance(validation_feedback, dict):
+        adjudication = validation_feedback.get("adjudication")
+        if isinstance(adjudication, dict):
+            payload["repair_request"] = {
+                "adjudication": deepcopy(adjudication),
+                "instructions": (
+                    "This response is also a repair against the independent adjudication. Address every "
+                    "failed check and required repair by ID in the regenerated argument. Change the affected "
+                    "claim, evidence link, mechanism, or experiment plan as required; do not merely restate "
+                    "the review, invent missing results, or treat its scientific findings as a format error."
+                ),
+            }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
 def argument_prompt(evidence_packet, *, min_figures=2, min_tables=1, min_experiments=2,
                     validation_feedback=None):
     payload = {
@@ -427,15 +489,9 @@ def argument_prompt(evidence_packet, *, min_figures=2, min_tables=1, min_experim
             "or a null result; assign it to the hypothesis that explains why it is informative."
         ),
         "minimums": {"figures": min_figures, "tables": min_tables, "experiments": min_experiments},
-        "output_contract": {
-            "schema_version": SCHEMA_VERSION,
-            "observed_patterns": "list of {id,observation,implication,evidence_ids}; at least two",
-            "hypotheses": "list of {id,statement,mechanism,status,predictions,counterevidence,discriminating_test,evidence_ids,explains_pattern_ids}; at least two; status must be exactly candidate, supported, disfavored, or unresolved",
-            "primary_argument": "{thesis,primary_hypothesis_id,rationale,scope_boundary}",
-            "discriminating_experiments": "list of {id,question,design,controls,predictions,measurements,tests_hypothesis_ids}",
-            "figure_plan": "list of {id,kind,asset_id,purpose,supports,source_refs,readout,placement}; every observed pattern covered; every figure asset_id must be copied from evidence_packet.asset_ids and table asset_id may be null",
-            "limitations": "nonempty list of limitations that materially affect interpretation",
-        },
+        "output_contract": _argument_output_contract(
+            min_figures=min_figures, min_tables=min_tables,
+            min_experiments=min_experiments),
         "evidence_id_policy": (
             "evidence_ids and source_refs are arrays of exact IDs copied from evidence_packet.evidence_ids. "
             "Use [] only for an unresolved candidate hypothesis with no supplied support; observed patterns and "
@@ -450,11 +506,21 @@ def argument_prompt(evidence_packet, *, min_figures=2, min_tables=1, min_experim
         },
     }
     if validation_feedback is not None:
-        payload["repair_request"] = {
+        repair_request = {
             "error": str(validation_feedback.get("error", "")),
             "previous_response": validation_feedback.get("previous_response"),
             "instructions": "Repair only contract violations while preserving valid scientific content.",
         }
+        adjudication = validation_feedback.get("adjudication")
+        if isinstance(adjudication, dict):
+            repair_request["adjudication"] = deepcopy(adjudication)
+            repair_request["instructions"] = (
+                "Revise the argument against this independent adjudication. Address every failed check "
+                "and every required repair by id; change the affected claim, mechanism, evidence link, or "
+                "experiment plan as requested. Do not treat the review as a format error, merely repeat "
+                "its language, or assert that a missing result exists. Keep unresolved claims provisional."
+            )
+        payload["repair_request"] = repair_request
     follow_up = evidence_packet.get("scientific_follow_up")
     if isinstance(follow_up, list) and follow_up:
         payload["scientific_repair_order"] = {
@@ -545,6 +611,34 @@ def _normalise_argument_candidate(value, *, available_asset_ids=None, available_
     for index, hypothesis in enumerate(candidate.get("hypotheses", [])):
         if not isinstance(hypothesis, dict):
             continue
+        if "explains_pattern_ids" in hypothesis:
+            original_pattern_ids = hypothesis["explains_pattern_ids"]
+            normalized_pattern_ids = normalize_generated_string_list(original_pattern_ids)
+            if normalized_pattern_ids != original_pattern_ids:
+                hypothesis["explains_pattern_ids"] = normalized_pattern_ids
+                changes.append({
+                    "field": f"hypotheses[{index}].explains_pattern_ids",
+                    "action": "normalize_generated_string_list",
+                })
+        status = hypothesis.get("status")
+        if isinstance(status, str):
+            normalized_status = status.strip().casefold()
+            normalized_status = {
+                "unsupported": "unresolved",
+                "unproven": "unresolved",
+                "uncertain": "unresolved",
+                "undetermined": "unresolved",
+                "unknown": "unresolved",
+                "tentative": "candidate",
+            }.get(normalized_status, normalized_status)
+            if normalized_status in HYPOTHESIS_STATUSES and normalized_status != status:
+                hypothesis["status"] = normalized_status
+                changes.append({
+                    "field": f"hypotheses[{index}].status",
+                    "action": "normalize_conservative_status",
+                    "from": status,
+                    "to": normalized_status,
+                })
         if hypothesis.get("status") not in {"supported", "disfavored"}:
             continue
         refs = hypothesis.get("evidence_ids")
@@ -673,6 +767,7 @@ class ArgumentAdjudicator:
                  or deadline_seconds <= 0)):
             raise ValidationError("argument review deadline must be finite and positive")
         self.deadline_seconds = float(deadline_seconds) if deadline_seconds is not None else None
+        self.provider_route_history = []
 
     def run(self, argument, evidence_packet, *, max_attempts=3):
         if type(max_attempts) is not int or not 1 <= max_attempts <= 8:
@@ -691,19 +786,27 @@ class ArgumentAdjudicator:
             prompt = review_prompt(argument, evidence_packet,
                                    evidence_packet.get("argument_defense"))
             if previous is not None:
-                prompt = json.dumps({"assignment": "Repair invalid argument review JSON.",
-                                     "candidate_response": previous[:24000],
-                                     "validation_error": str(last_error),
-                                     "argument": argument,
-                                     "output_contract": {"exact_top_level_keys": ["schema_version", "decision", "checks", "required_repairs", "rationale"],
-                                                         "schema_version": REVIEW_SCHEMA_VERSION}}, ensure_ascii=False, sort_keys=True)
+                repair_payload = json.loads(prompt)
+                repair_payload["assignment"] = (
+                    "Repair invalid JSON in an independent argument adjudication.")
+                repair_payload["candidate_response"] = previous[:24000]
+                repair_payload["validation_error"] = str(last_error)[:1600]
+                repair_payload["repair_instruction"] = (
+                    "Return the complete adjudication contract while preserving its substantive verdict. "
+                    "Use the full supplied evidence packet and defense to ground every check; do not "
+                    "change a scientific judgment merely to satisfy the response schema or make the "
+                    "argument easier to accept."
+                )
+                prompt = json.dumps(repair_payload, ensure_ascii=False, sort_keys=True)
             repairing_response = previous is not None
-            config = _repair_model_config(
+            result, routes = complete_with_role_fallbacks(
                 self.model_config, role="strategy.argument-reviewer",
-                use_fallback=repairing_response)
-            if deadline is not None:
-                config["timeout_seconds"] = min(float(config["timeout_seconds"]), max(0.2, remaining))
-            result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt)
+                system=SYSTEM, prompt=prompt, deadline=deadline,
+                prefer_fallback=repairing_response,
+                output_token_cap=4096 if repairing_response else None,
+                client_factory=ModelClient,
+            )
+            self.provider_route_history.extend(routes)
             for key in usage:
                 usage[key] += result.usage.get(key, 0)
             if result.finish_reason != "stop":
@@ -719,7 +822,10 @@ class ArgumentAdjudicator:
                 last_error, previous = exc, result.text
                 continue
             return review, usage
-        raise last_error or ValidationError("research argument review was not accepted")
+        error = last_error or ValidationError("research argument review was not accepted")
+        error.usage = deepcopy(usage)
+        error.research_response = previous[:24000] if isinstance(previous, str) else None
+        raise error
 
 
 class ResearchArgumentRunner:
@@ -748,8 +854,10 @@ class ResearchArgumentRunner:
         argument = None
         feedback = None
         review = None
+        provider_route_history = []
         for cycle in range(max_attempts):
             previous = None
+            partial_response = None
             last_error = feedback
             generated = False
             for attempt in range(max_attempts):
@@ -757,21 +865,30 @@ class ResearchArgumentRunner:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0.2:
                         raise ValidationError("research argument deadline exceeded")
-                prompt_feedback = None
-                if previous is not None:
-                    prompt_feedback = {"error": str(last_error), "previous_response": previous}
-                elif feedback is not None:
-                    prompt_feedback = feedback
-                prompt = argument_prompt(evidence_packet, min_figures=min_figures, min_tables=min_tables,
-                                         min_experiments=min_experiments,
-                                         validation_feedback=prompt_feedback)
                 repairing_response = previous is not None
-                config = _repair_model_config(
-                    self.model_config, role="strategy.argument",
-                    use_fallback=repairing_response)
-                if deadline is not None:
-                    config["timeout_seconds"] = min(float(config["timeout_seconds"]), max(0.2, remaining))
-                result = ModelClient(**config).complete(system=SYSTEM, prompt=prompt)
+                if repairing_response:
+                    prompt = argument_response_repair_prompt(
+                        evidence_packet,
+                        previous_response=(partial_response if partial_response is not None
+                                           else previous),
+                        validation_error=last_error,
+                        min_figures=min_figures, min_tables=min_tables,
+                        min_experiments=min_experiments,
+                        validation_feedback=feedback,
+                    )
+                else:
+                    prompt = argument_prompt(
+                        evidence_packet, min_figures=min_figures, min_tables=min_tables,
+                        min_experiments=min_experiments,
+                        validation_feedback=feedback,
+                    )
+                result, routes = complete_with_role_fallbacks(
+                    self.model_config, role="strategy.argument", system=SYSTEM,
+                    prompt=prompt, deadline=deadline,
+                    prefer_fallback=repairing_response, output_token_cap=8192,
+                    client_factory=ModelClient,
+                )
+                provider_route_history.extend(routes)
                 for key in usage:
                     usage[key] += result.usage.get(key, 0)
                 if result.finish_reason != "stop":
@@ -780,45 +897,55 @@ class ResearchArgumentRunner:
                     # gateway. Recover only that unambiguous transport defect
                     # and run the ordinary semantic validator; do not accept
                     # arbitrary prefixes or silently discard scientific text.
+                    candidate = None
                     try:
-                        argument = result.json_object(allow_missing_closers=True)
-                        argument, _ = _normalise_argument_candidate(
-                            argument,
+                        candidate = result.json_object(allow_missing_closers=True)
+                        candidate, _ = _normalise_argument_candidate(
+                            candidate,
                             available_asset_ids=evidence_packet.get("asset_ids"),
                             available_assets=(evidence_packet.get("results_package") or {}).get("assets", [])
                             if isinstance(evidence_packet.get("results_package"), dict) else [],
                             available_evidence_ids=evidence_ids,
                         )
                         validate_research_argument(
-                            argument, evidence_ids=evidence_ids,
+                            candidate, evidence_ids=evidence_ids,
                             asset_ids=evidence_packet.get("asset_ids"),
                             min_figures=min_figures, min_tables=min_tables,
                             min_experiments=min_experiments)
                     except ValidationError as exc:
                         last_error = ValidationError(
                             "research argument did not finish normally: "
-                            f"{result.finish_reason}")
+                            f"{result.finish_reason}; candidate validation failed: {exc}")
                         last_error.__cause__ = exc
                         previous = result.text
+                        partial_response = candidate if isinstance(candidate, dict) else result.text
+                        if repairing_response:
+                            break
                         continue
+                    argument = candidate
                     generated = True
                     break
+                candidate = None
                 try:
-                    argument = result.json_object()
-                    argument, _ = _normalise_argument_candidate(
-                        argument,
+                    candidate = result.json_object()
+                    candidate, _ = _normalise_argument_candidate(
+                        candidate,
                         available_asset_ids=evidence_packet.get("asset_ids"),
                         available_assets=(evidence_packet.get("results_package") or {}).get("assets", [])
                         if isinstance(evidence_packet.get("results_package"), dict) else [],
                         available_evidence_ids=evidence_ids,
                     )
-                    validate_research_argument(argument, evidence_ids=evidence_ids,
+                    validate_research_argument(candidate, evidence_ids=evidence_ids,
                                                 asset_ids=evidence_packet.get("asset_ids"),
                                                 min_figures=min_figures, min_tables=min_tables,
                                                 min_experiments=min_experiments)
                 except ValidationError as exc:
                     last_error, previous = exc, result.text
+                    partial_response = candidate if isinstance(candidate, dict) else result.text
+                    if repairing_response:
+                        break
                     continue
+                argument = candidate
                 generated = True
                 break
             if not generated:
@@ -826,6 +953,12 @@ class ResearchArgumentRunner:
                 error.research_argument = deepcopy(argument)
                 error.research_response = previous[:24000] if isinstance(previous, str) else None
                 error.research_feedback = deepcopy(feedback)
+                if isinstance(review, dict) and isinstance(argument, dict):
+                    error.research_review = deepcopy(review)
+                    error.research_review_argument_sha256 = hashlib.sha256(
+                        canonical_bytes(argument)).hexdigest()
+                error.usage = deepcopy(usage)
+                error.provider_route_history = deepcopy(provider_route_history)
                 raise error
 
             from scisaurus.runtime.argument_defense import build_argument_defense
@@ -835,9 +968,23 @@ class ResearchArgumentRunner:
                                                        research_program=defense_packet.get("research_program"))
             defense_packet["argument_defense"] = argument_defense
             review_deadline = None if deadline is None else max(0.2, deadline - time.monotonic())
-            review, review_usage = ArgumentAdjudicator(self.model_config,
-                                                       deadline_seconds=review_deadline).run(
-                                                           argument, defense_packet)
+            adjudicator = ArgumentAdjudicator(
+                self.model_config, deadline_seconds=review_deadline)
+            try:
+                review, review_usage = adjudicator.run(argument, defense_packet)
+            except Exception as exc:
+                failed_review_usage = getattr(exc, "usage", {})
+                if isinstance(failed_review_usage, dict):
+                    for key in usage:
+                        usage[key] += failed_review_usage.get(key, 0)
+                exc.usage = deepcopy(usage)
+                exc.research_argument = deepcopy(argument)
+                exc.provider_route_history = deepcopy(
+                    provider_route_history + adjudicator.provider_route_history)
+                if not hasattr(exc, "research_response"):
+                    exc.research_response = None
+                raise
+            provider_route_history.extend(adjudicator.provider_route_history)
             for key in usage:
                 usage[key] += review_usage.get(key, 0)
             if review["decision"] == "accept":
@@ -867,6 +1014,7 @@ class ResearchArgumentRunner:
             "argument_defense_sha256": hashlib.sha256(canonical_bytes(argument_defense)).hexdigest(),
             "model_calls": usage["model_calls"],
             "usage": usage,
+            "provider_route_history": provider_route_history,
             "status": "accepted",
         }
 
