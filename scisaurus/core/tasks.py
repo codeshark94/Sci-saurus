@@ -256,3 +256,17 @@ class TaskManager:
         record["usage"] = json.loads(record.pop("usage_json"))
         record["payload"] = json.loads(record.pop("payload_json"))
         return record
+
+    def attempts_for_task(self, task_id: str) -> list[dict]:
+        """Return the durable attempt history for a task in creation order."""
+        rows = self.control._conn.execute(
+            "SELECT * FROM attempts WHERE task_id = ? ORDER BY created_at, attempt_id",
+            (task_id,),
+        ).fetchall()
+        records = []
+        for row in rows:
+            record = dict(row)
+            record["usage"] = json.loads(record.pop("usage_json"))
+            record["payload"] = json.loads(record.pop("payload_json"))
+            records.append(record)
+        return records

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import signal
 import sys
@@ -5,6 +6,7 @@ import tempfile
 import unittest
 import time
 from copy import deepcopy
+from dataclasses import asdict
 from importlib.metadata import version
 from pathlib import Path
 
@@ -14,16 +16,34 @@ from scisaurus.core.store import ArtifactStore
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.capability_foundry import (
     CapabilityFoundry, CapabilityDeadlineError, CapabilityModelBudgetExceeded,
+    AUTHOR_CONTINUATION_MAX_OUTPUT_TOKENS, AUTHOR_PATCH_CONTEXT_MAX_CHARS,
+    AUTHOR_PATCH_MAX_OUTPUT_TOKENS,
+    AUTHOR_PATCH_MAX_SOURCE_CHARS, AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS,
+    AUTHOR_PATCH_DUPLICATE_CONTEXT_MAX_CHARS,
+    SourceDataUnavailable, _is_repeated_repair_failure, _sandbox_failure_signature,
+    _program_gate_failure_signature,
+    _authored_candidate_sha256, _candidate_bound_value, _source_patch_context,
+    _author_response_format_failure_signature,
     _sandbox_status_text,
-    apply_authoring_patch, normalize_capability_candidate, program_failure_context,
-    candidate_prompt, PROGRAM_REVIEW_CHECKS,
+    _author_request_signature, _author_request_was_attempted,
+    _author_format_repair_instructions,
+    _author_json_prefix_state,
+    _compact_prior_blocking_issues, _retain_prior_blocking_issues,
+    _reconcile_prior_blocking_issues, _record_program_gate_feedback,
+    _validate_source_data_manifest, _validate_source_observation_binding,
+    _model_route_identity,
+    apply_authoring_patch, authoring_patch_prompt, normalize_capability_candidate,
+    program_failure_context, candidate_prompt, PROGRAM_REVIEW_CHECKS,
 )
 from unittest.mock import patch
 from scisaurus.runtime.capability_registry import load_registry
 from scisaurus.runtime.experiment import ExperimentRunner
-from scisaurus.runtime.models import ModelResult
+from scisaurus.runtime.experiment_config import ExperimentWorkOrderContractError
+from scisaurus.runtime.models import ModelCallError, ModelResult
 from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
-from scisaurus.runtime.research_quality import ANALYSIS_FIELDS, default_research_quality_contract
+from scisaurus.runtime.research_quality import (
+    ANALYSIS_FIELDS, default_research_quality_contract,
+)
 from scisaurus.tests.test_experiment import fixture_worker
 from scisaurus.tests.test_program_admission import INTENT
 
@@ -133,6 +153,37 @@ if __name__ == "__main__":
 '''
 
 
+def _add_prior_review_checks(payload, prompt):
+    try:
+        request = json.loads(prompt)
+    except (TypeError, ValueError):
+        return payload
+    if (not isinstance(request, dict)
+            or request.get("assignment") != "independent_scientific_program_review"
+            or not isinstance(payload, dict)
+            or payload.get("status") not in {"admitted", "rejected"}
+            or not isinstance(payload.get("checks"), list)):
+        return payload
+    result = deepcopy(payload)
+    check_ids = {
+        item["id"] for item in result["checks"]
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    for issue in request.get("prior_blocking_issues", []):
+        if not isinstance(issue, dict):
+            continue
+        check_id = issue.get("review_check_id")
+        if not isinstance(check_id, str) or check_id in check_ids:
+            continue
+        result["checks"].append({
+            "id": check_id,
+            "outcome": "passed" if result["status"] == "admitted" else "failed",
+            "evidence": "The revised candidate was reassessed against the recorded prior issue.",
+        })
+        check_ids.add(check_id)
+    return result
+
+
 class StubClient:
     def __init__(self, payload):
         self.payload = payload
@@ -140,10 +191,83 @@ class StubClient:
 
     def complete(self, *, system, prompt):
         self.calls += 1
-        return ModelResult(json.dumps(self.payload), "stub", {"model_calls": 1}, 0.0, "stop")
+        payload = _add_prior_review_checks(self.payload, prompt)
+        return ModelResult(json.dumps(payload), "stub", {"model_calls": 1}, 0.0, "stop")
 
 
 class CapabilityFoundryTests(unittest.TestCase):
+    def test_cloud_model_identity_matches_provider_response_alias(self):
+        self.assertEqual(
+            _model_route_identity("glm-5.3-flash:cloud"),
+            _model_route_identity("glm-5.3-flash"),
+        )
+
+    def test_empirical_foundry_gate_stops_before_any_model_call_without_source_rows(self):
+        brief = {
+            "evidence_policy": {"requires_source_data_manifest": True},
+            "topic": {"evidence_mode": "published_observations"},
+        }
+        with tempfile.TemporaryDirectory() as path:
+            foundry = self._foundry(Path(path))
+            author = StubClient(self._payload())
+            with self.assertRaises(SourceDataUnavailable):
+                foundry.generate(json.dumps(brief), client=author)
+        self.assertEqual(author.calls, 0)
+        self.assertEqual(foundry.reviewer_client.calls, 0)
+
+    def test_control_plane_recovery_order_is_rejected_before_any_model_call(self):
+        recovery = {
+            "id": "repair-format", "kind": "recovery",
+            "owner": "methods.validation", "objective": "Repair the response contract.",
+            "why": "The author response was not valid.",
+            "success_condition": "A fresh response satisfies the role schema.",
+            "evidence_needed": "The failure record and local schema validation.",
+            "repair_policy_revision": "format-policy-5",
+            "recovery_mode": "format_repair_then_rerun",
+        }
+        with tempfile.TemporaryDirectory() as path:
+            foundry = self._foundry(Path(path))
+            author = StubClient(self._payload())
+            with self.assertRaises(ExperimentWorkOrderContractError) as raised:
+                foundry.generate(
+                    "bounded comparison", test_input={"work_orders": [recovery]},
+                    client=author)
+
+        self.assertEqual(raised.exception.failure_class, "harness_bug")
+        self.assertEqual(author.calls, 0)
+        self.assertEqual(foundry.reviewer_client.calls, 0)
+
+    def test_empirical_observations_are_bound_one_to_one_to_manifest_rows(self):
+        manifest = {
+            "schema_version": "source-data-manifest-1",
+            "datasets": [{
+                "artifact_ref": "artifact:survey/source@1",
+                "source_sha256": "a" * 64,
+                "source_url": "https://doi.org/10.1234/source",
+                "source_location": "Figure 3, panel b, rows 1-2",
+                "extraction_method": "deterministic table extraction",
+                "rows": [
+                    {"row_id": "point-1", "values": {"gap_mm": 0.25, "rate_s-1": 5.1}},
+                    {"row_id": "point-2", "values": {"gap_mm": 1.0, "rate_s-1": 5.4}},
+                ],
+            }],
+        }
+        _validate_source_data_manifest(manifest)
+        _validate_source_observation_binding({"observations": [
+            {"source_record_id": "point-1",
+             "source_values": {"gap_mm": 0.25, "rate_s-1": 5.1}, "replicate": 1},
+            {"source_record_id": "point-2",
+             "source_values": {"gap_mm": 1.0, "rate_s-1": 5.4}, "replicate": 1},
+        ]}, {"source_data_manifest": manifest})
+        forged = {"observations": [
+            {"source_record_id": "point-1",
+             "source_values": {"gap_mm": 0.25, "rate_s-1": 5.1}, "replicate": 1},
+            {"source_record_id": "point-2",
+             "source_values": {"gap_mm": 3.0, "rate_s-1": 2.0}, "replicate": 1},
+        ]}
+        with self.assertRaisesRegex(ValidationError, "exact controller-supplied source row"):
+            _validate_source_observation_binding(forged, {"source_data_manifest": manifest})
+
     def test_sandbox_signal_exit_is_reported_by_name(self):
         signal_number = getattr(signal, "SIGXCPU", None)
         if signal_number is None:
@@ -159,6 +283,724 @@ class CapabilityFoundryTests(unittest.TestCase):
         return {"status": "admitted", "findings": [], "checks": [
             {"id": key, "outcome": "passed", "evidence": "Bound synthetic fixture verified."}
             for key in sorted(PROGRAM_REVIEW_CHECKS)]}
+
+    def test_authoring_repair_prompt_targets_one_blocker_and_defers_the_rest(self):
+        primary = {
+            "severity": "blocking", "finding": "The contrast is algebraic by construction.",
+            "evidence": "The down branch is the up branch times one parameter factor.",
+            "required_change": "Reframe the claim or define an independent mechanism.",
+        }
+        secondary = {
+            "severity": "blocking", "finding": "The interval is not independently checked.",
+            "evidence": "The validator reuses the executor bootstrap code.",
+            "required_change": "Recompute it independently or remove the interval claim.",
+        }
+        warning = {
+            "severity": "warning", "finding": "The null control is tautological.",
+            "evidence": "The branch term is zero in that control.",
+            "required_change": "Describe it as an implementation check.",
+        }
+        feedback = {
+            "decision": "rejected", "gate": "independent_recalculation",
+            "failed_checks": [
+                {"id": "claim_support", "outcome": "failed", "evidence": "Primary contrast is imposed."},
+                {"id": "independent_validation", "outcome": "failed", "evidence": "Interval not recomputed."},
+            ],
+            "findings": [primary, secondary, warning],
+            "metric_mismatches": [{"metric_id": "slope_diff", "reported_value": -0.05,
+                                   "recalculated_value": 0.0, "tolerance": 1e-12,
+                                   "matches": False}],
+        }
+        prompt = authoring_patch_prompt(
+            brief={"topic": {"research_question": "Compare two onset slopes."}},
+            required_intent={"primary_outcome": "slope difference"},
+            configured_input={},
+            candidate={"executor_source": "def run(): pass", "validator_source": "def check(): pass",
+                       "experiment_intent": {}},
+            feedback=("DEFERRED-FEEDBACK-LEAK-MARKER scientific candidate rejected: "
+                      + json.dumps(feedback)),
+            validation_context={}, validation_feedback=feedback,
+            format_repair={"previous_error": "Malformed response: " + json.dumps(feedback)},
+        )
+
+        repair = prompt["repair_request"]["validation_feedback"]
+        self.assertEqual(repair["findings"], [primary])
+        self.assertEqual(repair["deferred_failed_check_ids"],
+                         ["claim_support", "independent_validation"])
+        self.assertEqual(repair["repair_scope"], {
+            "policy": "one_issue_per_candidate_revision",
+            "active_issue": "blocking_finding",
+            "deferred_blocking_findings": 1,
+            "deferred_warning_findings": 1,
+            "deferred_failed_checks": 2,
+            "deferred_metric_mismatches": 1,
+        })
+        self.assertEqual(repair["deferred_failed_check_ids"],
+                         ["claim_support", "independent_validation"])
+        self.assertEqual(repair["deferred_metric_ids"], ["slope_diff"])
+        mismatch_prompt = authoring_patch_prompt(
+            brief={}, required_intent={}, configured_input={},
+            candidate={"executor_source": "x", "validator_source": "y", "experiment_intent": {}},
+            feedback="independent recalculation failed", validation_context={},
+            validation_feedback={"decision": "rejected", "gate": "independent_recalculation",
+                                 "metric_mismatches": feedback["metric_mismatches"]},
+            format_repair={},
+        )["repair_request"]["validation_feedback"]
+        self.assertEqual(mismatch_prompt["metric_mismatches"],
+                         [feedback["metric_mismatches"][0]])
+        serialized = json.dumps(prompt, ensure_ascii=False)
+        self.assertNotIn(secondary["finding"], serialized)
+        self.assertNotIn(warning["finding"], serialized)
+        self.assertNotIn("DEFERRED-FEEDBACK-LEAK-MARKER", serialized)
+        self.assertNotIn("Malformed response: " + json.dumps(feedback), serialized)
+        self.assertIn("deferred scientific findings remain recorded",
+                      prompt["format_repair"]["previous_error"])
+        self.assertIn("resolve only the single active issue", prompt["instructions"])
+        prior_issues = _compact_prior_blocking_issues(feedback)
+        self.assertEqual(len(prior_issues), 5)
+        self.assertIn("The interval is not independently checked.",
+                      json.dumps(prior_issues, ensure_ascii=False))
+        self.assertIn("prior-check-claim_support",
+                      json.dumps(prior_issues, ensure_ascii=False))
+
+        detailed_check = {
+            **feedback["failed_checks"][0], "severity": "blocking",
+            "finding": "The check's measured input is absent.",
+            "required_change": "Measure the declared input.",
+        }
+        check_only = authoring_patch_prompt(
+            brief={}, required_intent={}, configured_input={},
+            candidate={"executor_source": "x", "validator_source": "y", "experiment_intent": {}},
+            feedback="failed check", validation_context={},
+            validation_feedback={"decision": "rejected",
+                                 "failed_checks": [detailed_check, feedback["failed_checks"][1]]},
+            format_repair={},
+        )["repair_request"]["validation_feedback"]
+        self.assertEqual(check_only["failed_checks"], [detailed_check])
+        self.assertEqual(check_only["deferred_failed_check_ids"], ["independent_validation"])
+        self.assertEqual(check_only["repair_scope"]["active_issue"], "failed_check")
+
+    def test_repair_prompt_includes_only_focused_complete_source_sections(self):
+        source = (
+            "def main():\n    return measure()\n\n"
+            "def measure():\n    return 2\n\n"
+            "def unrelated():\n    return 'large irrelevant body'\n"
+        )
+        context = _source_patch_context(source, "repair measure")
+        self.assertEqual([item["name"] for item in context["sections"]], ["measure"])
+        self.assertIn("def measure()", context["sections"][0]["source"])
+        self.assertNotIn("unrelated", json.dumps(context))
+        self.assertLessEqual(
+            sum(len(item["source"]) for item in context["sections"]),
+            AUTHOR_PATCH_CONTEXT_MAX_CHARS)
+
+        prompt = authoring_patch_prompt(
+            brief={}, required_intent={}, configured_input={},
+            candidate={"executor_source": source, "validator_source": "def validate(): pass",
+                       "experiment_intent": {"id": "study"}},
+            feedback="repair measure", validation_context={},
+            validation_feedback={}, format_repair={},
+        )
+        serialized = json.dumps(prompt)
+        self.assertNotIn(source, serialized)
+        self.assertIn("Do not emit internal reasoning", prompt["instructions"])
+
+    def test_duplicate_structure_patch_removes_only_model_selected_declarations(self):
+        source = (
+            "def main():\n    return None\n\n"
+            "def measure():\n    return 1\n\n"
+            "def unrelated():\n    return 'retain me'\n\n"
+            "def measure():\n    return 2\n\n"
+            "if __name__ == '__main__':\n    main()\n\n"
+            "if __name__ == '__main__':\n    main()\n"
+        )
+        context = _source_patch_context(source, "duplicate measure definitions")
+        duplicate = next(item for item in context["duplicate_definitions"]
+                         if item["name"] == "measure")
+        self.assertEqual(len(duplicate["line_starts"]), 2)
+        self.assertEqual(len(context["entry_guard_line_starts"]), 2)
+        self.assertEqual(len(context["entry_guard_source_sections"]), 2)
+        self.assertTrue(context["entry_guard_source_complete"])
+        self.assertTrue(all("main()" in item["source"]
+                            for item in context["entry_guard_source_sections"]))
+        measure_sources = [item["source"] for item in context["duplicate_source_sections"]
+                           if item["name"] == "measure"]
+        self.assertEqual(len(measure_sources), 2)
+        self.assertTrue(context["duplicate_source_complete"])
+        self.assertLessEqual(sum(len(item["source"])
+                                 for item in context["duplicate_source_sections"]),
+                             AUTHOR_PATCH_DUPLICATE_CONTEXT_MAX_CHARS)
+        prompt = authoring_patch_prompt(
+            brief={}, required_intent={}, configured_input={},
+            candidate={"executor_source": source,
+                       "validator_source": "def validate():\n    return True\n",
+                       "experiment_intent": {}},
+            feedback="remove duplicate definitions", validation_context={},
+            validation_feedback={}, format_repair={},
+        )
+        self.assertIn("remove_duplicate_definitions",
+                      prompt["output_contract"]["updates"]["executor_source"])
+        self.assertEqual(
+            prompt["current_candidate"]["source_context"]["executor_source"]
+            ["duplicate_definitions"], context["duplicate_definitions"])
+
+        patch = {
+            "source_sha256": context["source_sha256"],
+            "remove_duplicate_definitions": [{
+                "name": "measure", "keep_line_start": duplicate["line_starts"][1],
+            }],
+            "keep_entry_guard_line_start": context["entry_guard_line_starts"][0],
+        }
+        repaired = apply_authoring_patch(
+            {"executor_source": source, "validator_source": "def validate():\n    return True\n",
+             "experiment_intent": {}},
+            {"updates": {"executor_source": patch}},
+        )["executor_source"]
+
+        self.assertIn("def measure():\n    return 2", repaired)
+        self.assertNotIn("def measure():\n    return 1", repaired)
+        self.assertIn("def unrelated():\n    return 'retain me'", repaired)
+        self.assertEqual(repaired.count("if __name__ == '__main__':"), 1)
+        self.assertEqual(_source_patch_context(repaired, "")["duplicate_definitions"], [])
+        self.assertEqual(len(_source_patch_context(repaired, "")["entry_guard_line_starts"]), 1)
+        from scisaurus.runtime.program_admission import scan_program_source
+        scan_program_source(repaired, "program executor")
+
+    def test_duplicate_entry_guard_patch_compares_complete_bodies_in_either_order(self):
+        source = (
+            "def first():\n    return 1\n\n"
+            "def second():\n    return 2\n\n"
+            "if '__main__' == __name__:\n    first()\n\n"
+            "if __name__ == '__main__':\n    second()\n"
+        )
+        context = _source_patch_context(source, "duplicate entry guards")
+        self.assertEqual(len(context["entry_guard_line_starts"]), 2)
+        self.assertTrue(context["entry_guard_source_complete"])
+        guard_sources = [item["source"] for item in context["entry_guard_source_sections"]]
+        self.assertIn("first()", guard_sources[0])
+        self.assertIn("second()", guard_sources[1])
+        prompt = authoring_patch_prompt(
+            brief={}, required_intent={}, configured_input={},
+            candidate={"executor_source": source, "validator_source": "def check(): pass",
+                       "experiment_intent": {}},
+            feedback="duplicate main guards", validation_context={},
+            validation_feedback={}, format_repair={},
+        )
+        serialized = json.dumps(prompt)
+        self.assertIn("entry_guard_source_sections", serialized)
+        self.assertIn("first()", serialized)
+        self.assertIn("second()", serialized)
+        patch = {
+            "source_sha256": context["source_sha256"],
+            "remove_duplicate_definitions": [],
+            "keep_entry_guard_line_start": context["entry_guard_line_starts"][0],
+        }
+        repaired = apply_authoring_patch(
+            {"executor_source": source, "validator_source": "def check(): pass",
+             "experiment_intent": {}},
+            {"updates": {"executor_source": patch}},
+        )["executor_source"]
+        self.assertIn("first()", repaired)
+        self.assertNotIn("    second()\n", repaired)
+        from scisaurus.runtime.program_admission import scan_program_source
+        scan_program_source(repaired, "program executor")
+
+    def test_duplicate_entry_guard_comparison_refuses_omitted_bodies(self):
+        long_body = "    value = " + repr("x" * 24500) + "\n    consume(value)\n"
+        source = (
+            "if '__main__' == __name__:\n" + long_body + "\n"
+            "if __name__ == '__main__':\n" + long_body
+        )
+        context = _source_patch_context(source, "duplicate entry guards")
+        self.assertFalse(context["entry_guard_source_complete"])
+        patch = {
+            "source_sha256": context["source_sha256"],
+            "remove_duplicate_definitions": [],
+            "keep_entry_guard_line_start": context["entry_guard_line_starts"][0],
+        }
+        with self.assertRaisesRegex(ValidationError, "complete comparison context limit"):
+            apply_authoring_patch(
+                {"executor_source": source, "validator_source": "def check(): pass",
+                 "experiment_intent": {}},
+                {"updates": {"executor_source": patch}},
+            )
+
+    def test_duplicate_structure_patch_rejects_stale_hash_and_nonduplicate_targets(self):
+        source = "def keep():\n    return 1\n\ndef keep():\n    return 2\n"
+        context = _source_patch_context(source, "duplicate keep")
+        starts = context["duplicate_definitions"][0]["line_starts"]
+        base = {"executor_source": source, "validator_source": "def validate(): pass",
+                "experiment_intent": {}}
+        stale_patch = {
+            "source_sha256": "0" * 64,
+            "remove_duplicate_definitions": [{"name": "keep", "keep_line_start": starts[0]}],
+        }
+        with self.assertRaisesRegex(ValidationError, "fingerprint does not match"):
+            apply_authoring_patch(base, {"updates": {"executor_source": stale_patch}})
+
+        invalid_target = {
+            "source_sha256": context["source_sha256"],
+            "remove_duplicate_definitions": [{"name": "missing", "keep_line_start": starts[0]}],
+        }
+        with self.assertRaisesRegex(ValidationError, "existing duplicated top-level definition"):
+            apply_authoring_patch(base, {"updates": {"executor_source": invalid_target}})
+
+        arbitrary_range = {
+            "source_sha256": context["source_sha256"],
+            "remove_duplicate_definitions": [{"name": "keep", "keep_line_start": starts[0]}],
+            "delete_lines": [1, 2],
+        }
+        with self.assertRaisesRegex(ValidationError, "only its source fingerprint"):
+            apply_authoring_patch(base, {"updates": {"executor_source": arbitrary_range}})
+
+    def test_duplicate_structure_patch_is_bounded(self):
+        self.assertEqual(AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS, 8)
+        self.assertGreater(AUTHOR_PATCH_DUPLICATE_CONTEXT_MAX_CHARS,
+                           AUTHOR_PATCH_CONTEXT_MAX_CHARS)
+        names = [f"def f{index}():\n    return 1\n" for index in range(9)]
+        source = "\n".join(names + names)
+        context = _source_patch_context(source, "all duplicate functions")
+        patch = {
+            "source_sha256": context["source_sha256"],
+            "remove_duplicate_definitions": [
+                {"name": item["name"], "keep_line_start": item["line_starts"][0]}
+                for item in context["duplicate_definitions"]
+            ],
+        }
+        with self.assertRaisesRegex(ValidationError, "bounded removal limit"):
+            apply_authoring_patch(
+                {"executor_source": source, "validator_source": "def validate(): pass",
+                 "experiment_intent": {}},
+                {"updates": {"executor_source": patch}},
+            )
+
+    def test_duplicate_structure_patch_requires_complete_comparison_context(self):
+        body = "    payload = " + repr("x" * 24500) + "\n    return payload\n"
+        source = "def calculate():\n" + body + "\ndef calculate():\n" + body
+        context = _source_patch_context(source, "duplicate calculate definitions")
+        self.assertFalse(context["duplicate_source_complete"])
+        starts = context["duplicate_definitions"][0]["line_starts"]
+        patch = {
+            "source_sha256": context["source_sha256"],
+            "remove_duplicate_definitions": [{
+                "name": "calculate", "keep_line_start": starts[0],
+            }],
+        }
+        with self.assertRaisesRegex(ValidationError, "complete comparison context limit"):
+            apply_authoring_patch(
+                {"executor_source": source, "validator_source": "def validate(): pass",
+                 "experiment_intent": {}},
+                {"updates": {"executor_source": patch}},
+            )
+
+    def test_validation_feedback_is_bound_to_the_candidate_that_was_reviewed(self):
+        candidate = {"executor_source": "def run(): return 1", "validator_source": "def check(): return 1",
+                     "experiment_intent": {"id": "study"}}
+        fingerprint = _authored_candidate_sha256(candidate)
+        feedback = {"decision": "rejected", "findings": [{"finding": "specific defect"}]}
+        state = {"validation_feedback": feedback,
+                 "validation_feedback_candidate_sha256": fingerprint}
+        self.assertEqual(_candidate_bound_value(
+            state, candidate, "validation_feedback",
+            "validation_feedback_candidate_sha256"), feedback)
+        revised = {**candidate, "executor_source": "def run(): return 2"}
+        self.assertEqual(_candidate_bound_value(
+            state, revised, "validation_feedback",
+            "validation_feedback_candidate_sha256"), {})
+        legacy = {"validation_feedback": feedback}
+        self.assertEqual(_candidate_bound_value(
+            legacy, candidate, "validation_feedback",
+            "validation_feedback_candidate_sha256"), {})
+
+    def test_prior_repair_feedback_is_not_itself_a_repeated_result(self):
+        error = ValidationError("program author response was incomplete")
+        self.assertFalse(_is_repeated_repair_failure(error, [], []))
+        self.assertTrue(_is_repeated_repair_failure(error, [str(error)], []))
+        self.assertFalse(_is_repeated_repair_failure(
+            error, [str(error)], [], seed_replay=True))
+
+    def test_malformed_response_signature_is_stable_across_finish_paths(self):
+        length_signature = _author_response_format_failure_signature(None, "length")
+        stopped_signature = _author_response_format_failure_signature(None, "stop")
+        self.assertEqual(length_signature, stopped_signature)
+        self.assertTrue(_is_repeated_repair_failure(
+            ValidationError("malformed JSON"), [], [length_signature], stopped_signature))
+        self.assertNotEqual(
+            _author_response_format_failure_signature({"partial": True}, "length"),
+            _author_response_format_failure_signature({"partial": True}, "stop"),
+        )
+        self.assertNotEqual(
+            _author_response_format_failure_signature(None, "length", route_index=0),
+            _author_response_format_failure_signature(None, "length", route_index=1),
+        )
+
+    def test_author_retry_diagnostic_matches_the_actual_source_patch_failure(self):
+        ambiguous = _author_format_repair_instructions(
+            "executor_source edit old text must match exactly once; observed 2 occurrences",
+            has_candidate=True)
+        self.assertIn("valid JSON", ambiguous)
+        self.assertIn("recorded match locations", ambiguous)
+        self.assertIn("unique", ambiguous)
+        truncated = _author_format_repair_instructions(
+            "program author response was incomplete (finish_reason=length)",
+            has_candidate=True)
+        self.assertIn("truncated", truncated)
+        self.assertEqual(AUTHOR_PATCH_MAX_OUTPUT_TOKENS, 4096)
+        self.assertIn("bounded patch contract", truncated)
+
+    def test_author_request_signature_prevents_an_unchanged_route_replay(self):
+        prompt = '{"assignment":"repair_existing_experiment_candidate"}'
+        signature = _author_request_signature("glm-5.3-flash:cloud", 4096, prompt)
+        state = {"requests": [{"request_signature": signature}]}
+        self.assertTrue(_author_request_was_attempted(state, signature))
+        self.assertFalse(_author_request_was_attempted(
+            state, _author_request_signature("glm-5.3:cloud", 4096, prompt)))
+        self.assertFalse(_author_request_was_attempted(
+            state, _author_request_signature("glm-5.3-flash:cloud", 4096, prompt + " ")))
+
+    def test_author_json_prefix_classifier_rejects_narrative_and_accepts_real_prefixes(self):
+        self.assertEqual(_author_json_prefix_state("Let me carefully parse this task."), "not_json")
+        self.assertEqual(_author_json_prefix_state('{"experiment_intent":'), "incomplete")
+        self.assertEqual(_author_json_prefix_state('{"source":"unfinished'), "incomplete")
+        self.assertEqual(_author_json_prefix_state('{"ok":true}'), "complete")
+        self.assertEqual(_author_json_prefix_state('{"ok": nope'), "invalid")
+
+    def test_format_repair_without_candidate_requests_full_artifact_not_source_edits(self):
+        full_generation = _author_format_repair_instructions(
+            "length-limited experiment-author response was not a valid JSON object prefix")
+        self.assertIn("complete authoring assignment", full_generation)
+        self.assertIn("experiment_intent, executor_source, and validator_source", full_generation)
+        self.assertIn("Do not return edits", full_generation)
+        self.assertIn("bounded patch contract", _author_format_repair_instructions(
+            "program author response was incomplete (finish_reason=length)",
+            has_candidate=True))
+
+    def test_prose_at_output_limit_skips_suffix_calls_and_reauthors_full_program(self):
+        with tempfile.TemporaryDirectory() as path:
+            foundry = self._foundry(Path(path))
+            payload = self._payload()
+
+            class NarrativeThenProgramAuthor:
+                def __init__(inner_self):
+                    inner_self.calls = 0
+                    inner_self.prompts = []
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    request = json.loads(prompt)
+                    inner_self.prompts.append(request)
+                    if inner_self.calls == 1:
+                        return ModelResult(
+                            "Let me carefully parse this task. " * 2000,
+                            "author", {"model_calls": 1}, 1.0, "length")
+                    return ModelResult(
+                        json.dumps(payload), "author", {"model_calls": 1}, 1.0, "stop")
+
+            author = NarrativeThenProgramAuthor()
+            progress = []
+            outcome = foundry.generate(
+                "bounded comparison", client=author, work_cache=self._cache(Path(path)),
+                on_progress=lambda phase, state: progress.append((phase, state)))
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual(author.calls, 2)
+        self.assertTrue(all(
+            request.get("operation") != "continue_truncated_response"
+            for request in progress[-1][1]["requests"]))
+        repair_prompt = author.prompts[1]
+        self.assertEqual(repair_prompt["assignment"], "author_experiment_program")
+        self.assertIn("complete authoring assignment",
+                      repair_prompt["format_repair"]["instructions"])
+        self.assertEqual(
+            repair_prompt["author_response_contract_version"], "experiment-author-json-v2")
+
+    def test_unknown_author_continuation_is_not_replayed_and_full_generation_recovers(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            cache = self._cache(root)
+            payload = self._payload()
+            complete_response = json.dumps(payload, separators=(",", ":"))
+
+            class InterruptedContinuationAuthor:
+                def __init__(inner_self):
+                    inner_self.calls = 0
+                    inner_self.prompts = []
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    request = json.loads(prompt)
+                    inner_self.prompts.append(request)
+                    if inner_self.calls == 1:
+                        return ModelResult(
+                            complete_response[:120], "author",
+                            {"model_calls": 1}, 0.1, "length")
+                    if request.get("assignment") == "continue_truncated_experiment_author_json":
+                        raise RuntimeError("simulated unknown continuation outcome")
+                    return ModelResult(
+                        json.dumps(payload), "author", {"model_calls": 1}, 0.1, "stop")
+
+            author = InterruptedContinuationAuthor()
+            with self.assertRaisesRegex(RuntimeError, "unknown continuation outcome"):
+                foundry.generate("bounded comparison", client=author, work_cache=cache)
+
+            outcome = foundry.generate(
+                "bounded comparison", client=author, work_cache=cache)
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual(author.calls, 3)
+        self.assertEqual(sum(
+            prompt.get("assignment") == "continue_truncated_experiment_author_json"
+            for prompt in author.prompts), 1)
+        self.assertEqual(author.prompts[2]["assignment"], "author_experiment_program")
+        self.assertIn("complete authoring assignment",
+                      author.prompts[2]["format_repair"]["instructions"])
+
+    def test_unknown_initial_author_request_recovers_with_distinct_full_generation(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            cache = self._cache(root)
+            payload = self._payload()
+
+            class UnknownThenProgramAuthor:
+                def __init__(inner_self):
+                    inner_self.calls = 0
+                    inner_self.prompts = []
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    request = json.loads(prompt)
+                    inner_self.prompts.append(request)
+                    if inner_self.calls == 1:
+                        raise RuntimeError("simulated unknown initial author outcome")
+                    return ModelResult(
+                        json.dumps(payload), "author", {"model_calls": 1}, 0.1, "stop")
+
+            author = UnknownThenProgramAuthor()
+            with self.assertRaisesRegex(RuntimeError, "unknown initial author outcome"):
+                foundry.generate("bounded comparison", client=author, work_cache=cache)
+
+            outcome = foundry.generate(
+                "bounded comparison", client=author, work_cache=cache)
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual(author.calls, 2)
+        self.assertEqual(author.prompts[1]["assignment"], "author_experiment_program")
+        self.assertIn("complete authoring assignment",
+                      author.prompts[1]["format_repair"]["instructions"])
+
+    def test_author_request_history_migrates_legacy_completed_requests(self):
+        prompt = '{"assignment":"repair_existing_experiment_candidate"}'
+        state = {"requests": [{
+            "role": "research.experiment-author", "model": "glm-5.3-flash:cloud",
+            "max_output_tokens": 8192, "prompt": prompt,
+        }]}
+        signature = _author_request_signature("glm-5.3-flash:cloud", 8192, prompt)
+        self.assertTrue(_author_request_was_attempted(state, signature))
+
+    def test_prior_blockers_are_required_review_checks_and_failed_rechecks_stay_blocking(self):
+        from scisaurus.runtime.capability_foundry import validate_program_review
+        issue = _compact_prior_blocking_issues({"findings": [{
+            "severity": "blocking", "finding": "The measured response is imposed by the equation.",
+            "evidence": "The executor directly assigns the outcome from the control parameter.",
+            "required_change": "Use an independently measured response or narrow the claim.",
+        }]})[0]
+        review = self._review_payload()
+        with self.assertRaisesRegex(ValidationError, issue["review_check_id"]):
+            validate_program_review(review, prior_blocking_issues=[issue])
+
+        review["checks"].append({
+            "id": issue["review_check_id"], "outcome": "failed",
+            "evidence": "The revised executor still assigns the outcome from the parameter.",
+        })
+        review["status"] = "rejected"
+        validated = validate_program_review(review, prior_blocking_issues=[issue])
+        self.assertTrue(any(
+            item["severity"] == "blocking"
+            and item["finding"] == issue["finding"]
+            and item["required_change"] == issue["required_change"]
+            for item in validated["findings"]))
+
+    def test_blocking_issue_ledger_survives_intervening_gate_failures_without_truncation(self):
+        findings = [{
+            "severity": "blocking",
+            "finding": f"Independent defect {index} remains in the candidate.",
+            "evidence": f"Candidate evidence {index}.",
+            "required_change": f"Repair defect {index} and verify it independently.",
+        } for index in range(15)]
+        state = {}
+        initial = _retain_prior_blocking_issues(state, {"findings": findings})
+        self.assertEqual(len(initial), 15)
+
+        recalculation_failure = {
+            "gate": "independent_recalculation", "decision": "rejected",
+            "failed_checks": [{
+                "id": "positive_observation", "outcome": "failed",
+                "evidence": "The revised candidate still has no positive observation.",
+            }],
+        }
+        retained = _retain_prior_blocking_issues(state, recalculation_failure)
+        self.assertEqual(len(retained), 16)
+        self.assertEqual(
+            {item["finding"] for item in retained},
+            {item["finding"] for item in initial}
+            | {"Prior check positive_observation failed"},
+        )
+        self.assertEqual(
+            len(_retain_prior_blocking_issues(state, {"findings": findings})), 16)
+
+        single_state = {}
+        single = _retain_prior_blocking_issues(
+            single_state, {"findings": [findings[0]]})
+        repeated_feedback = {
+            "findings": [findings[0]],
+            "failed_checks": [{
+                "id": single[0]["review_check_id"], "outcome": "failed",
+                "evidence": "The reviewer rechecked this same issue and it remains unresolved.",
+            }],
+        }
+        merged = _retain_prior_blocking_issues(single_state, repeated_feedback)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["review_check_id"], single[0]["review_check_id"])
+        self.assertIn("remains unresolved", merged[0]["evidence"])
+
+    def test_replacing_gate_feedback_does_not_drop_the_previous_gate_blocker(self):
+        state = {"validation_feedback": {"findings": [{
+            "severity": "blocking", "finding": "The outcome is imposed by the model equation.",
+            "evidence": "The executor assigns the outcome from the input parameter.",
+            "required_change": "Measure an outcome that is independent of the imposed equation.",
+        }]}}
+        later_feedback = {
+            "gate": "independent_recalculation", "decision": "rejected",
+            "failed_checks": [{
+                "id": "positive_observation", "outcome": "failed",
+                "evidence": "No observation is positive.",
+            }],
+        }
+
+        ledger = _record_program_gate_feedback(state, later_feedback)
+
+        self.assertEqual(state["validation_feedback"], later_feedback)
+        self.assertEqual(len(ledger), 2)
+        self.assertEqual(
+            {item["finding"] for item in ledger},
+            {"The outcome is imposed by the model equation.",
+             "Prior check positive_observation failed"},
+        )
+
+    def test_blocking_issue_reconciliation_clears_only_verified_issues(self):
+        from scisaurus.runtime.capability_foundry import validate_program_review
+
+        prior = _compact_prior_blocking_issues({"findings": [{
+            "severity": "blocking", "finding": f"Prior defect {index}.",
+            "evidence": f"Observed evidence {index}.",
+            "required_change": f"Resolve defect {index} with independent evidence.",
+        } for index in range(15)]})
+        review = self._review_payload()
+        review["checks"].extend({
+            "id": issue["review_check_id"],
+            "outcome": "failed" if index == 4 else "passed",
+            "evidence": f"Rechecked prior issue {index}.",
+        } for index, issue in enumerate(prior))
+        review["checks"][0].update(
+            outcome="failed", evidence="The primary mechanism remains unmeasured.")
+        review["findings"].append({
+            "severity": "blocking", "finding": "A new independent defect remains.",
+            "evidence": "The measured outcome is still imposed by the executor.",
+            "required_change": "Measure the outcome independently from the executor formula.",
+        })
+        review["status"] = "rejected"
+        review = validate_program_review(review, prior_blocking_issues=prior)
+
+        remaining = _reconcile_prior_blocking_issues(prior, review)
+        identifiers = {item["review_check_id"] for item in remaining}
+        self.assertIn(prior[4]["review_check_id"], identifiers)
+        self.assertEqual(len(identifiers), 3)
+        self.assertNotIn(prior[3]["review_check_id"], identifiers)
+        self.assertIn("A new independent defect remains.",
+                      {item["finding"] for item in remaining})
+
+    def test_seeded_candidate_migrates_format_diagnosis_then_dedupes_across_provenance(self):
+        payload = self._payload()
+        rejected = self._review_payload()
+        rejected["status"] = "rejected"
+        rejected["checks"][0].update(outcome="failed", evidence="The primary claim is imposed.")
+        rejected["findings"] = [{
+            "severity": "blocking", "finding": "The contrast is algebraic by construction.",
+            "evidence": "The down branch is the up branch times a parameter factor.",
+            "required_change": "Reframe the claim or define an independent mechanism.",
+        }]
+
+        class SequencedReviewer:
+            calls = 0
+            prior_issues_seen = None
+            prior_prompt = None
+
+            def complete(inner_self, *, system, prompt):
+                inner_self.calls += 1
+                request = json.loads(prompt)
+                if inner_self.calls > 1:
+                    inner_self.prior_issues_seen = request.get("prior_blocking_issues")
+                    inner_self.prior_prompt = request
+                value = rejected if inner_self.calls == 1 else self._review_payload()
+                value = _add_prior_review_checks(value, prompt)
+                return ModelResult(json.dumps(value), "reviewer", {"model_calls": 1}, 0.0, "stop")
+
+        class SequencedAuthor:
+            def __init__(inner_self):
+                inner_self.responses = [
+                    ModelResult(json.dumps(payload), "author", {"model_calls": 1}, 0.0, "stop"),
+                    ModelResult('{"updates":', "author", {"model_calls": 1}, 0.0, "length"),
+                    ModelResult('{"updates":', "author", {"model_calls": 1}, 0.0, "length"),
+                ]
+                inner_self.calls = 0
+                inner_self.output_limits = []
+                inner_self.prompts = []
+                inner_self.max_output_tokens = 24000
+
+            def complete(inner_self, *, system, prompt):
+                inner_self.calls += 1
+                inner_self.output_limits.append(inner_self.max_output_tokens)
+                inner_self.prompts.append(prompt)
+                request = json.loads(prompt)
+                if request.get("assignment") == "continue_truncated_experiment_author_json":
+                    return ModelResult(json.dumps({
+                        "marker": "wrong-continuation-marker",
+                        "continuation": "}",
+                    }), "author", {"model_calls": 1}, 0.0, "stop")
+                return inner_self.responses.pop(0)
+
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            cache = self._cache(root)
+            foundry = self._foundry(root)
+            reviewer = SequencedReviewer()
+            foundry.reviewer_client = reviewer
+            author = SequencedAuthor()
+            with self.assertRaises(ModelWorkBlocked):
+                foundry.generate("bounded comparison", client=author, work_cache=cache,
+                                 repair_provenance={"review_revision": 1})
+
+            foundry.max_attempts = 3
+            with self.assertRaises(ModelWorkBlocked):
+                foundry.generate("bounded comparison", client=author, work_cache=cache,
+                                 repair_provenance={"review_revision": 2})
+
+            progress = []
+            with self.assertRaises(ModelWorkBlocked) as duplicate:
+                foundry.generate("bounded comparison", client=author, work_cache=cache,
+                                 repair_provenance={"review_revision": 3},
+                                 on_progress=lambda phase, state: progress.append((phase, state)))
+
+        self.assertIn("unchanged experiment-author prompt", str(duplicate.exception))
+        self.assertEqual(author.calls, 4)
+        self.assertEqual(len(author.output_limits), author.calls)
+        self.assertEqual(len(author.prompts), len(set(author.prompts)))
+        self.assertEqual(reviewer.calls, 1)
+        migrated_state = progress[-1][1]
+        self.assertIn("truncated", migrated_state["format_repair"]["instructions"])
+        self.assertGreaterEqual(len(migrated_state["model_diagnostics"]), 2)
 
     def _cache(self, root):
         control = ControlStore(root / "ledger")
@@ -244,6 +1086,13 @@ class CapabilityFoundryTests(unittest.TestCase):
                     "protocol": "openai_compatible", "base_url": "https://fallback.invalid/v1",
                     "model": "fallback-author", "context_window_tokens": 131072,
                     "max_input_tokens": 112000, "output_format": "json_object",
+                }, {
+                    "protocol": "openai_compatible", "base_url": "https://premium.invalid/v1",
+                    "model": "premium-author", "context_window_tokens": 131072,
+                    "max_input_tokens": 112000, "output_format": "json_object",
+                    "model_call_budget_path": str(root / "model-budgets.sqlite"),
+                    "model_call_budget_key": "high-impact-pool",
+                    "model_call_budget_limit": 20,
                 }],
             }
             malformed = StubClient({"not": "an author envelope"})
@@ -260,6 +1109,570 @@ class CapabilityFoundryTests(unittest.TestCase):
                 [call.kwargs["model"] for call in factory.call_args_list],
                 ["primary-author", "fallback-author"],
             )
+            self.assertTrue(all(call.kwargs["max_output_tokens"] == 24000
+                                for call in factory.call_args_list))
+
+    def test_author_format_failure_uses_bulk_route_before_premium_fallback(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            foundry.model_config["role_models"] = {
+                "research.experiment-author": {
+                    "protocol": "openai_compatible", "base_url": "https://primary.invalid/v1",
+                    "model": "primary-author", "context_window_tokens": 131072,
+                    "max_input_tokens": 112000, "output_format": "json_object",
+                },
+            }
+            foundry.model_config["role_model_fallbacks"] = {
+                "research.experiment-author": [{
+                    "protocol": "openai_compatible", "base_url": "https://flash.invalid/v1",
+                    "model": "glm-flash-author", "context_window_tokens": 131072,
+                    "max_input_tokens": 112000, "output_format": "json_object",
+                }, {
+                    "protocol": "openai_compatible", "base_url": "https://bulk.invalid/v1",
+                    "model": "gemma-bulk-author", "context_window_tokens": 131072,
+                    "max_input_tokens": 112000, "output_format": "json_object",
+                }, {
+                    "protocol": "openai_compatible", "base_url": "https://premium.invalid/v1",
+                    "model": "premium-author", "context_window_tokens": 131072,
+                    "max_input_tokens": 112000, "output_format": "json_object",
+                    "model_call_budget_path": str(root / "model-budgets.sqlite"),
+                    "model_call_budget_key": "high-impact-pool",
+                    "model_call_budget_limit": 20,
+                }],
+            }
+            primary = StubClient({"not": "an author envelope"})
+            flash = StubClient({"still_not": "an author envelope"})
+            bulk = StubClient(self._payload())
+            with patch(
+                    "scisaurus.runtime.capability_foundry.ModelClient",
+                    side_effect=[primary, flash, bulk]) as factory:
+                outcome = foundry.generate(
+                    "bounded comparison", client=None, work_cache=self._cache(root))
+
+            self.assertEqual(outcome["status"], "registered")
+            self.assertEqual([primary.calls, flash.calls, bulk.calls], [1, 1, 1])
+            self.assertEqual(
+                [call.kwargs["model"] for call in factory.call_args_list],
+                ["primary-author", "glm-flash-author", "gemma-bulk-author"],
+            )
+
+    def test_length_limited_author_response_continues_after_resume(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            cache = self._cache(root)
+            complete_response = json.dumps(self._payload(), separators=(",", ":"))
+
+            class ContinuationClient:
+                def __init__(inner_self):
+                    inner_self.calls = 0
+                    inner_self.max_output_tokens = 24000
+                    inner_self.output_format = "json_object"
+                    inner_self.output_formats_seen = []
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    inner_self.output_formats_seen.append(inner_self.output_format)
+                    if inner_self.calls == 1:
+                        return ModelResult(
+                            complete_response[:120], "author",
+                            {"model_calls": 1, "completion_tokens": 40}, 0.1, "length")
+                    request = json.loads(prompt)
+                    prefix = request["partial_response"]
+                    suffix_start = len(prefix)
+                    suffix_end = suffix_start + (100 if inner_self.calls == 2 else 10_000_000)
+                    suffix = complete_response[suffix_start:suffix_end]
+                    return ModelResult(
+                        suffix, "author", {"model_calls": 1, "completion_tokens": 80},
+                        0.1, "stop")
+
+            class SimulatedInterruption(RuntimeError):
+                pass
+
+            author = ContinuationClient()
+            interrupted = False
+
+            def interrupt_after_persisting_suffix(phase, state):
+                nonlocal interrupted
+                if phase == "author_response_continuation_received" and not interrupted:
+                    interrupted = True
+                    raise SimulatedInterruption("restart after durable continuation response")
+
+            with self.assertRaises(SimulatedInterruption):
+                foundry.generate(
+                    "bounded comparison", client=author, work_cache=cache,
+                    on_progress=interrupt_after_persisting_suffix)
+
+            resumed_states = []
+            outcome = foundry.generate(
+                "bounded comparison", client=author, work_cache=cache,
+                on_progress=lambda phase, state: resumed_states.append((phase, state)))
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual(author.calls, 3)
+        self.assertEqual(author.output_formats_seen, ["json_object", None, None])
+        self.assertEqual(author.output_format, "json_object")
+        ready_state = next(
+            state for phase, state in reversed(resumed_states)
+            if phase == "author_response_ready_for_validation")
+        continuation_requests = [
+            request for request in ready_state["requests"]
+            if request.get("operation") == "continue_truncated_response"]
+        self.assertEqual(len(continuation_requests), 2)
+        self.assertTrue(all(request["status"] == "succeeded"
+                            for request in continuation_requests))
+        self.assertEqual(len({request["prefix_sha256"]
+                              for request in continuation_requests}), 2)
+        self.assertEqual(
+            ready_state["author_response_continuation"]["status"], "completed")
+        self.assertEqual(ready_state["author_response_continuation"]["continuations"], 2)
+
+    def test_length_limited_narrative_prefix_repairs_without_continuing_invalid_text(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            foundry.max_attempts = 3
+            cache = self._cache(root)
+
+            class NarrativeThenJSONAuthor:
+                def __init__(inner_self):
+                    inner_self.prompts = []
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.prompts.append(json.loads(prompt))
+                    if len(inner_self.prompts) == 1:
+                        return ModelResult(
+                            "Let me carefully parse this task.\\n```python\\n",
+                            "author", {"model_calls": 1}, 0.1, "length")
+                    return ModelResult(
+                        json.dumps(self._payload(), separators=(",", ":")),
+                        "author", {"model_calls": 1}, 0.1, "stop")
+
+            author = NarrativeThenJSONAuthor()
+            progress = []
+            outcome = foundry.generate(
+                "bounded comparison", client=author, work_cache=cache,
+                model_call_budget=6,
+                on_progress=lambda phase, state: progress.append((phase, state)))
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual(len(author.prompts), 2)
+        self.assertIn("format_repair", author.prompts[1])
+        ready_state = next(
+            state for phase, state in reversed(progress)
+            if phase == "author_response_ready_for_validation")
+        self.assertFalse(any(
+            request.get("operation") == "continue_truncated_response"
+            for request in ready_state["requests"]))
+        rejected_prefix = next(
+            state for phase, state in progress if phase == "author_response_not_json_prefix")
+        self.assertEqual(
+            rejected_prefix["author_response_continuation"]["status"],
+            "format_repair_required")
+        self.assertEqual(
+            rejected_prefix["author_response_continuation"]["continuations"], 0)
+
+    def test_missing_author_intent_reuses_sources_for_compact_metadata_repair(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            cache = self._cache(root)
+            complete = self._payload()
+
+            class PartialAuthor:
+                def __init__(inner_self):
+                    inner_self.prompts = []
+
+                def complete(inner_self, *, system, prompt):
+                    request = json.loads(prompt)
+                    inner_self.prompts.append(request)
+                    if len(inner_self.prompts) == 1:
+                        response = {
+                            "executor_source": complete["executor_source"],
+                            "validator_source": complete["validator_source"],
+                        }
+                    else:
+                        self.assertEqual(
+                            request["assignment"], "repair_existing_experiment_candidate")
+                        self.assertEqual(
+                            request["current_candidate"]["experiment_intent"], {})
+                        response = {"updates": {
+                            "experiment_intent": complete["experiment_intent"],
+                        }}
+                    return ModelResult(
+                        json.dumps(response), "author", {"model_calls": 1}, 0.0, "stop")
+
+            author = PartialAuthor()
+            outcome = foundry.generate(
+                "bounded comparison", client=author, work_cache=cache)
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual(len(author.prompts), 2)
+        self.assertEqual(
+            outcome["candidate"]["executor_source"], complete["executor_source"])
+        self.assertEqual(
+            outcome["candidate"]["validator_source"], complete["validator_source"])
+        self.assertEqual(
+            outcome["candidate"]["experiment_intent"], complete["experiment_intent"])
+        self.assertIn("experiment_intent", author.prompts[0]["authoring_output_order"])
+
+    def test_legacy_truncated_response_survives_validation_contract_change(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            cache = self._cache(root)
+            author = type("LegacyAuthor", (), {"model": "author"})()
+            complete_response = json.dumps(self._payload(), separators=(",", ":"))
+            runtime = foundry._runtime()
+            assignment = candidate_prompt(
+                "bounded comparison", foundry.runtime_packages, {"probe": True},
+                runtime_version=runtime["python"])
+            author_prompt = json.dumps(assignment, ensure_ascii=False, sort_keys=True)
+            signature = _author_request_signature(
+                author.model, foundry.author_max_output_tokens, author_prompt)
+            cached_result = ModelResult(
+                complete_response[:120], author.model,
+                {"model_calls": 1}, 0.1, "length")
+            cache.put("previous-validation-contract", {
+                "status": "blocked", "attempts": 1, "assignment": assignment,
+                "author_route_index": 0,
+                "author_request_signatures": [signature],
+                "requests": [{
+                    "attempt": 1, "role": "research.experiment-author",
+                    "status": "succeeded", "model": author.model,
+                    "request_signature": signature,
+                    "max_output_tokens": foundry.author_max_output_tokens,
+                    "prompt": author_prompt,
+                    "usage": {"model_calls": 1},
+                }],
+                "last_response": asdict(cached_result),
+                "usage": {"model_calls": 1},
+                "format_repair": {"previous_error": "response truncated"},
+            })
+
+            class ContinuationOnlyAuthor:
+                model = "author"
+
+                def __init__(inner_self):
+                    inner_self.calls = 0
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    request = json.loads(prompt)
+                    suffix = complete_response[len(request["partial_response"]):]
+                    return ModelResult(json.dumps({
+                        "marker": request["output_contract"]["legacy_json_envelope"]["marker"],
+                        "continuation": suffix,
+                    }), "author", {"model_calls": 1}, 0.1, "stop")
+
+            continuation_author = ContinuationOnlyAuthor()
+            outcome = foundry.generate(
+                "bounded comparison", client=continuation_author,
+                work_cache=cache)
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual(continuation_author.calls, 1)
+
+    def test_length_limited_author_does_not_dispatch_after_deadline(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            cache = self._cache(root)
+            complete_response = json.dumps(self._payload(), separators=(",", ":"))
+
+            class ExpiringClient:
+                def __init__(inner_self):
+                    inner_self.calls = 0
+                    inner_self.max_output_tokens = 24000
+                    inner_self.timeout_seconds = 1800
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    foundry.deadline = time.monotonic() - 1
+                    return ModelResult(
+                        complete_response[:120], "author",
+                        {"model_calls": 1}, 0.1, "length")
+
+            author = ExpiringClient()
+            progress = []
+            with self.assertRaisesRegex(CapabilityDeadlineError, "mission deadline"):
+                foundry.generate(
+                    "bounded comparison", client=author, work_cache=cache,
+                    deadline=time.monotonic() + 60,
+                    on_progress=lambda phase, state: progress.append((phase, state)))
+
+        self.assertEqual(author.calls, 1)
+        final_state = progress[-1][1]
+        self.assertEqual(final_state["usage"]["model_calls"], 1)
+        self.assertFalse(any(
+            item.get("operation") == "continue_truncated_response"
+            for item in final_state["requests"]))
+
+    def test_known_author_rate_limit_is_resumable_without_charging_an_attempt(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            cache = self._cache(root)
+
+            class RateLimitedAuthor:
+                def __init__(inner_self):
+                    inner_self.calls = 0
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    if inner_self.calls == 1:
+                        raise ModelCallError(
+                            "provider rate limited request", outcome_known=True,
+                            attempts=1, status_code=429, retry_after_seconds=30,
+                            provider_error_kind="rate_limited")
+                    return ModelResult(
+                        json.dumps(self._payload()), "author", {"model_calls": 1},
+                        0.1, "stop")
+
+            author = RateLimitedAuthor()
+            first_progress = []
+            with self.assertRaises(ModelCallError) as limited:
+                foundry.generate(
+                    "bounded comparison", client=author, work_cache=cache,
+                    on_progress=lambda phase, state: first_progress.append((phase, state)))
+
+            self.assertEqual(limited.exception.status_code, 429)
+            stopped = first_progress[-1][1]
+            self.assertEqual(stopped["status"], "repairing")
+            self.assertEqual(stopped["attempts"], 0)
+            self.assertEqual(stopped["requests"][-1]["status"], "provider_rate_limited")
+            self.assertEqual(stopped["usage"]["model_calls"], 1)
+            self.assertEqual(stopped["author_request_signatures"], [])
+
+            outcome = foundry.generate(
+                "bounded comparison", client=author, work_cache=cache)
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual(author.calls, 2)
+
+    def test_local_provider_cooldown_is_not_recorded_as_a_model_call(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            cache = self._cache(root)
+
+            class CooldownAuthor:
+                def __init__(inner_self):
+                    inner_self.calls = 0
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    if inner_self.calls == 1:
+                        raise ModelCallError(
+                            "route is still in provider cooldown", outcome_known=True,
+                            attempts=0, status_code=429, retry_after_seconds=5,
+                            provider_error_kind="rate_limited")
+                    return ModelResult(
+                        json.dumps(self._payload()), "author", {"model_calls": 1},
+                        0.1, "stop")
+
+            author = CooldownAuthor()
+            first_progress = []
+            with self.assertRaises(ModelCallError):
+                foundry.generate(
+                    "bounded comparison", client=author, work_cache=cache,
+                    on_progress=lambda phase, state: first_progress.append((phase, state)))
+
+            stopped = first_progress[-1][1]
+            self.assertEqual(stopped["status"], "repairing")
+            self.assertEqual(stopped["attempts"], 0)
+            self.assertEqual(stopped["requests"][-1]["status"], "cooldown_not_dispatched")
+            self.assertEqual(stopped["requests"][-1]["usage"]["model_calls"], 0)
+            self.assertEqual(stopped["usage"].get("model_calls", 0), 0)
+
+            outcome = foundry.generate(
+                "bounded comparison", client=author, work_cache=cache)
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual(author.calls, 2)
+
+    def test_known_continuation_rate_limit_retries_only_after_resume(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            cache = self._cache(root)
+            complete_response = json.dumps(self._payload(), separators=(",", ":"))
+
+            class RateLimitedContinuationClient:
+                def __init__(inner_self):
+                    inner_self.calls = 0
+                    inner_self.max_output_tokens = 24000
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    if inner_self.calls == 1:
+                        return ModelResult(
+                            complete_response[:120], "author",
+                            {"model_calls": 1}, 0.1, "length")
+                    if inner_self.calls == 2:
+                        raise ModelCallError(
+                            "provider rate limited continuation", outcome_known=True,
+                            attempts=1, status_code=429, retry_after_seconds=30,
+                            provider_error_kind="rate_limited")
+                    request = json.loads(prompt)
+                    suffix = complete_response[len(request["partial_response"]):]
+                    return ModelResult(json.dumps({
+                        "marker": request["output_contract"]["legacy_json_envelope"]["marker"],
+                        "continuation": suffix,
+                    }), "author", {"model_calls": 1}, 0.1, "stop")
+
+            author = RateLimitedContinuationClient()
+            first_progress = []
+            with self.assertRaises(ModelCallError) as limited:
+                foundry.generate(
+                    "bounded comparison", client=author, work_cache=cache,
+                    on_progress=lambda phase, state: first_progress.append((phase, state)))
+
+            self.assertEqual(limited.exception.status_code, 429)
+            stopped = first_progress[-1][1]
+            self.assertEqual(stopped["status"], "response_received")
+            self.assertEqual(
+                stopped["author_response_continuation"]["status"], "pending")
+            self.assertEqual(stopped["requests"][-1]["status"], "provider_rate_limited")
+            self.assertEqual(stopped["usage"]["model_calls"], 2)
+            self.assertEqual(len(stopped["author_request_signatures"]), 1)
+
+            outcome = foundry.generate(
+                "bounded comparison", client=author, work_cache=cache)
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual(author.calls, 3)
+
+    def test_known_independent_review_rate_limit_is_resumable(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            cache = self._cache(root)
+            author = StubClient(self._payload())
+
+            class RateLimitedReviewer:
+                def __init__(inner_self):
+                    inner_self.calls = 0
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    if inner_self.calls == 1:
+                        raise ModelCallError(
+                            "review provider rate limited request", outcome_known=True,
+                            attempts=1, status_code=429, retry_after_seconds=30,
+                            provider_error_kind="rate_limited")
+                    return ModelResult(
+                        json.dumps(self._review_payload()), "reviewer",
+                        {"model_calls": 1}, 0.1, "stop")
+
+            reviewer = RateLimitedReviewer()
+            foundry.reviewer_client = reviewer
+            first_progress = []
+            with self.assertRaises(ModelCallError) as limited:
+                foundry.generate(
+                    "bounded comparison", client=author, work_cache=cache,
+                    on_progress=lambda phase, state: first_progress.append((phase, state)))
+
+            self.assertEqual(limited.exception.status_code, 429)
+            stopped = first_progress[-1][1]
+            retained = next(iter(stopped["scientific_reviews"].values()))
+            self.assertEqual(retained["status"], "pending")
+            self.assertEqual(retained["responses"], [])
+            self.assertEqual(stopped["requests"][-1]["status"], "provider_rate_limited")
+
+            outcome = foundry.generate(
+                "bounded comparison", client=author, work_cache=cache)
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual(author.calls, 1)
+        self.assertEqual(reviewer.calls, 2)
+
+    def test_exact_budget_reserves_one_continuation_and_the_independent_review(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            complete_response = json.dumps(self._payload(), separators=(",", ":"))
+
+            class OneContinuationAuthor:
+                def __init__(inner_self):
+                    inner_self.calls = 0
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    if inner_self.calls == 1:
+                        return ModelResult(
+                            complete_response[:120], "author",
+                            {"model_calls": 1}, 0.1, "length")
+                    request = json.loads(prompt)
+                    suffix = complete_response[len(request["partial_response"]):]
+                    return ModelResult(json.dumps({
+                        "marker": request["output_contract"]["legacy_json_envelope"]["marker"],
+                        "continuation": suffix,
+                    }), "author", {"model_calls": 1}, 0.1, "stop")
+
+            author = OneContinuationAuthor()
+            progress = []
+            outcome = foundry.generate(
+                "bounded comparison", client=author,
+                model_call_budget=3,
+                on_progress=lambda phase, state: progress.append((phase, state)))
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual(author.calls, 2)
+        self.assertEqual(foundry.reviewer_client.calls, 1)
+        ready_state = next(
+            state for phase, state in reversed(progress)
+            if phase == "author_response_ready_for_validation")
+        continuation_request = next(
+            request for request in ready_state["requests"]
+            if request.get("operation") == "continue_truncated_response")
+        self.assertEqual(
+            continuation_request["max_output_tokens"],
+            AUTHOR_CONTINUATION_MAX_OUTPUT_TOKENS)
+
+    def test_long_author_response_continues_until_complete_within_stage_budget(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            complete_response = json.dumps(self._payload(), separators=(",", ":"))
+
+            class MultiContinuationAuthor:
+                def __init__(inner_self):
+                    inner_self.calls = 0
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    if inner_self.calls == 1:
+                        return ModelResult(
+                            complete_response[:120], "author",
+                            {"model_calls": 1}, 0.1, "length")
+                    request = json.loads(prompt)
+                    prefix = request["partial_response"]
+                    suffix = complete_response[len(prefix):len(prefix) + 700]
+                    return ModelResult(json.dumps({
+                        "marker": request["output_contract"]["legacy_json_envelope"]["marker"],
+                        "continuation": suffix,
+                    }), "author", {"model_calls": 1}, 0.1, "stop")
+
+            author = MultiContinuationAuthor()
+            progress = []
+            outcome = foundry.generate(
+                "bounded comparison", client=author, model_call_budget=11,
+                on_progress=lambda phase, state: progress.append((phase, state)))
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertGreater(author.calls - 1, 4)
+        ready_state = next(
+            state for phase, state in reversed(progress)
+            if phase == "author_response_ready_for_validation")
+        continuation_requests = [
+            request for request in ready_state["requests"]
+            if request.get("operation") == "continue_truncated_response"]
+        self.assertEqual(len(continuation_requests), author.calls - 1)
+        self.assertEqual(
+            ready_state["author_response_continuation"]["status"], "completed")
+        self.assertEqual(foundry.reviewer_client.calls, 1)
 
     def test_author_format_fallback_preserves_scientific_repair_as_compact_update(self):
         with tempfile.TemporaryDirectory() as path:
@@ -294,10 +1707,14 @@ class CapabilityFoundryTests(unittest.TestCase):
 
             class SequencedReviewer:
                 calls = 0
+                requests = []
 
                 def complete(self, *, system, prompt):
                     self.calls += 1
+                    request = json.loads(prompt)
+                    self.requests.append(request)
                     value = rejected if self.calls == 1 else self._review_payload()
+                    value = _add_prior_review_checks(value, prompt)
                     return ModelResult(json.dumps(value), "reviewer",
                                        {"model_calls": 1}, 0.0, "stop")
 
@@ -311,21 +1728,31 @@ class CapabilityFoundryTests(unittest.TestCase):
 
             class PrimaryAuthor:
                 calls = 0
+                max_output_tokens = 24000
 
                 def complete(self, *, system, prompt):
                     self.calls += 1
                     if self.calls == 1:
                         return ModelResult(json.dumps(payload), "primary-author",
                                            {"model_calls": 1}, 0.0, "stop")
+                    if json.loads(prompt).get("assignment") == (
+                            "continue_truncated_experiment_author_json"):
+                        return ModelResult(json.dumps({
+                            "marker": "wrong-continuation-marker",
+                            "continuation": "}",
+                        }), "primary-author", {"model_calls": 1}, 0.0, "stop")
+                    self_test.assertEqual(self.max_output_tokens, 4096)
                     return ModelResult('{"updates":', "primary-author",
                                        {"model_calls": 1, "output_tokens": 16384},
                                        0.0, "length")
 
             class FallbackAuthor:
                 calls = 0
+                max_output_tokens = 24000
                 prompt_value = None
 
                 def complete(self, *, system, prompt):
+                    self_test.assertEqual(self.max_output_tokens, 4096)
                     self.calls += 1
                     request = json.loads(prompt)
                     self.prompt_value = request
@@ -337,6 +1764,7 @@ class CapabilityFoundryTests(unittest.TestCase):
                     return ModelResult(json.dumps(update), "fallback-author",
                                        {"model_calls": 1}, 0.0, "stop")
 
+            self_test = self
             primary = PrimaryAuthor()
             fallback = FallbackAuthor()
             with patch("scisaurus.runtime.capability_foundry.ModelClient",
@@ -346,13 +1774,31 @@ class CapabilityFoundryTests(unittest.TestCase):
             self.assertEqual(outcome["status"], "registered")
             self.assertEqual(outcome["candidate"]["executor_source"].count(
                 "Execute the declared observation count exactly."), 1)
-            self.assertEqual((primary.calls, fallback.calls, reviewer.calls), (2, 1, 2))
+            self.assertEqual((primary.calls, fallback.calls, reviewer.calls), (3, 1, 2))
+            self.assertEqual(reviewer.requests[0]["prior_blocking_issues"], [])
+            second_review = reviewer.requests[1]
+            prior_issues = second_review["prior_blocking_issues"]
+            mechanism_issues = [
+                item for item in prior_issues
+                if item["finding"] == "The experiment does not test its declared mechanism."
+            ]
+            self.assertEqual(len(mechanism_issues), 1)
+            self.assertTrue(all(item["review_check_id"] for item in prior_issues))
+            required_check_ids = {
+                item["id"] for item in second_review["output_contract"]["checks"]
+            }
+            self.assertTrue({item["review_check_id"] for item in prior_issues}
+                            <= required_check_ids)
+            self.assertIn("Reassess every prior_blocking_issues entry",
+                          second_review["review_instructions"])
             feedback = fallback.prompt_value["repair_request"]["validation_feedback"]
             self.assertEqual(feedback["findings"][0]["finding"],
                              "The experiment does not test its declared mechanism.")
             self.assertEqual(fallback.prompt_value["output_contract"].keys(), {"updates"})
-            self.assertIn("finish_reason=length",
-                          fallback.prompt_value["format_repair"]["previous_error"])
+            format_error = fallback.prompt_value["format_repair"]["previous_error"]
+            self.assertNotIn("finish_reason=length", format_error)
+            self.assertNotIn("does not test its declared mechanism", format_error)
+            self.assertIn("did not satisfy the requested JSON format", format_error)
             self.assertEqual(
                 [call.kwargs["model"] for call in factory.call_args_list],
                 ["primary-author", "fallback-author"],
@@ -404,6 +1850,7 @@ class CapabilityFoundryTests(unittest.TestCase):
         intent["quality_contract"] = {"schema_version": "fixture", "required_axes": ["baseline"]}
         runner = object.__new__(ExperimentRunner)
         runner.experiment = {**intent, "execution": {"input": {"probe": True}}}
+        runner.work_orders = []
         compiled = CapabilityFoundry._payload(intent, {"probe": True})
         self.assertEqual(compiled, runner._program_input())
         self.assertEqual(compiled["experiment"]["quality_contract"], intent["quality_contract"])
@@ -540,6 +1987,22 @@ class CapabilityFoundryTests(unittest.TestCase):
                       prompt["output_contract"]["validator_source"])
         self.assertIn("request['experiment']", " ".join(prompt["constraints"]))
 
+    def test_candidate_contract_delivers_scoped_work_orders_to_generated_program(self):
+        order = {
+            "id": "repair-grid", "kind": "additional_experiment",
+            "owner": "methods.validation", "objective": "Refine the measurement grid.",
+            "why": "The prior result was boundary-sensitive.",
+            "success_condition": "The interior estimate is reproduced.",
+            "evidence_needed": "Raw observations and an independently checked estimate.",
+        }
+        prompt = candidate_prompt("bounded comparison", [], {"work_orders": [order]})
+        self.assertNotIn("work_order_assessments", prompt["output_contract"]["executor_source"])
+        self.assertNotIn("work_order_assessments", prompt["executor_output_exact_shapes"])
+        self.assertTrue(any("configured_input.work_orders" in item
+                            for item in prompt["constraints"]))
+        self.assertTrue(any("independent reviewers adjudicate" in item
+                            for item in prompt["constraints"]))
+
     def test_journal_quality_contract_is_required_during_capability_authoring(self):
         quality_contract = default_research_quality_contract()
         prompt = candidate_prompt(
@@ -558,6 +2021,19 @@ class CapabilityFoundryTests(unittest.TestCase):
                             for item in prompt["constraints"]))
         self.assertTrue(any("minimum_independent_seeds" in item
                             for item in prompt["constraints"]))
+        analysis_contract = prompt["executor_output_exact_shapes"]["analysis"]
+        self.assertIn("id,description", analysis_contract["uncertainty"])
+        self.assertIn("strings are normalized to records", analysis_contract["comparisons"])
+        self.assertIn("additional JSON evidence fields are preserved",
+                      analysis_contract["comparisons"])
+        self.assertTrue(any(
+            "closed top-level object" in item
+            and "analysis.uncertainty" in item
+            and "bootstrap_slope_difference" in item
+            for item in prompt["constraints"]))
+        self.assertTrue(any(
+            "machine-readable estimate, lower, and upper" in item
+            for item in prompt["constraints"]))
 
     def test_exact_source_edits_preserve_unchanged_code_and_input(self):
         previous = self._payload()
@@ -575,7 +2051,7 @@ class CapabilityFoundryTests(unittest.TestCase):
                 "executor_source": MINI_EXECUTOR,
             }})
 
-    def test_source_repair_uses_bounded_output_and_exact_edits(self):
+    def test_source_repair_uses_configured_output_ceiling_and_exact_edits(self):
         class RepairClient:
             def __init__(self):
                 self.max_output_tokens = 24000
@@ -604,7 +2080,7 @@ class CapabilityFoundryTests(unittest.TestCase):
 
         self.assertEqual(outcome["status"], "registered")
         self.assertEqual(outcome["candidate"]["executor_source"], MINI_EXECUTOR)
-        self.assertEqual(client.output_limits, [24000, 8192])
+        self.assertEqual(client.output_limits, [24000, 4096])
 
     def test_exact_source_edits_reject_missing_or_ambiguous_matches_atomically(self):
         previous = self._payload()
@@ -661,6 +2137,25 @@ class CapabilityFoundryTests(unittest.TestCase):
                       {"edits": [{"old": "import json", "new": "x", "regex": True}]}, None):
             with self.subTest(value=value), self.assertRaises(ValidationError):
                 apply_authoring_patch(self._payload(), {"updates": {"executor_source": value}})
+
+    def test_source_patch_limits_reject_excessive_edit_count_and_size_atomically(self):
+        candidate = self._payload()
+        candidate["executor_source"] = "a b c d e"
+        too_many_edits = {"updates": {"executor_source": {"edits": [
+            {"old": old, "new": old.upper()} for old in "abcde"
+        ]}}}
+        with self.assertRaisesRegex(ValidationError, "bounded source-edit limit of 4 edits"):
+            apply_authoring_patch(candidate, too_many_edits)
+        self.assertEqual(candidate["executor_source"], "a b c d e")
+
+        oversized = {"updates": {"executor_source": {"edits": [
+            {"old": "a", "new": "z" * AUTHOR_PATCH_MAX_SOURCE_CHARS}
+        ]}}}
+        with self.assertRaisesRegex(
+                ValidationError,
+                f"bounded source-edit limit of {AUTHOR_PATCH_MAX_SOURCE_CHARS} characters"):
+            apply_authoring_patch(candidate, oversized)
+        self.assertEqual(candidate["executor_source"], "a b c d e")
 
     def test_exact_source_repair_passes_the_full_program_gates(self):
         payload = self._payload()
@@ -981,6 +2476,98 @@ class CapabilityFoundryTests(unittest.TestCase):
             self.assertEqual((author.calls, first.calls, second.calls), (1, 1, 1))
             self.assertEqual(cache.entries()[0]["usage"]["model_calls"], 3)
 
+    def test_complete_review_json_is_accepted_when_finish_reason_is_length(self):
+        with tempfile.TemporaryDirectory() as path:
+            foundry = self._foundry(Path(path))
+            author = StubClient(self._payload())
+
+            class CompleteLengthReviewer:
+                calls = 0
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    return ModelResult(
+                        json.dumps(self._review_payload()), "reviewer",
+                        {"model_calls": 1}, 0.0, "length")
+
+            reviewer = CompleteLengthReviewer()
+            foundry.reviewer_client = reviewer
+            outcome = foundry.generate("bounded comparison", client=author)
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual((author.calls, reviewer.calls), (1, 1))
+
+    def test_truncated_review_continues_from_saved_prefix_without_repeating_prompt(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            author = StubClient(self._payload())
+
+            class LengthReviewer:
+                calls = 0
+                max_output_tokens = 1024
+                timeout_seconds = 30
+                output_format = "json"
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    if inner_self.calls == 1:
+                        return ModelResult(
+                            json.dumps(self._review_payload())[:-1], "reviewer",
+                            {"model_calls": 1}, 0.0, "length")
+                    request = json.loads(prompt)
+                    self.assertEqual(
+                        request["assignment"], "continue_truncated_independent_review_json")
+                    self.assertIsNone(inner_self.output_format)
+                    self.assertEqual(
+                        request["partial_response"][-1],
+                        json.dumps(self._review_payload())[-2],
+                    )
+                    return ModelResult("}", "reviewer", {"model_calls": 1}, 0.0, "stop")
+
+            reviewer = LengthReviewer()
+            foundry.reviewer_client = reviewer
+            outcome = foundry.generate(
+                "bounded comparison", client=author, work_cache=self._cache(root))
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual((author.calls, reviewer.calls), (1, 2))
+        self.assertEqual(reviewer.output_format, "json")
+
+    def test_unknown_review_continuation_is_not_replayed_after_resume(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            author = StubClient(self._payload())
+
+            class InterruptibleReviewer:
+                calls = 0
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    if inner_self.calls == 1:
+                        return ModelResult(
+                            json.dumps(self._review_payload())[:-1], "reviewer",
+                            {"model_calls": 1}, 0.0, "length")
+                    return ModelResult("}", "reviewer", {"model_calls": 1}, 0.0, "stop")
+
+            reviewer = InterruptibleReviewer()
+            foundry.reviewer_client = reviewer
+            cache = self._cache(root)
+
+            def interrupt_before_dispatch(phase, state):
+                if phase == "scientific_review_continuation_calling":
+                    raise KeyboardInterrupt()
+
+            with self.assertRaises(KeyboardInterrupt):
+                foundry.generate(
+                    "bounded comparison", client=author, work_cache=cache,
+                    on_progress=interrupt_before_dispatch)
+            with self.assertRaisesRegex(ModelWorkBlocked, "unobserved provider outcome"):
+                foundry.generate("bounded comparison", client=author, work_cache=cache)
+
+        self.assertEqual((author.calls, reviewer.calls), (1, 1))
+
     def test_review_format_repair_budget_is_durable_and_never_relaxes_the_gate(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -1146,17 +2733,27 @@ class CapabilityFoundryTests(unittest.TestCase):
     def test_required_revision_is_controller_owned_and_normalized(self):
         payload = self._payload()
         payload["experiment_intent"]["revision"] = INTENT["revision"] + 1
+        payload["experiment_intent"].pop("stage_seconds")
         required_intent = {
             "revision": INTENT["revision"],
             "domain": INTENT["domain"],
             "research_question": INTENT["research_question"],
+            "stage_seconds": dict(INTENT["stage_seconds"]),
         }
         prompt = candidate_prompt(
             "bounded question", [], {"probe": True}, required_intent=required_intent)
         self.assertEqual(
             prompt["output_contract"]["experiment_intent"]["revision"],
             INTENT["revision"])
+        self.assertEqual(
+            prompt["output_contract"]["experiment_intent"]["stage_seconds"],
+            INTENT["stage_seconds"])
         self.assertTrue(any("never increment it" in item for item in prompt["constraints"]))
+        self.assertTrue(any(
+            "experiment_intent.stage_seconds must contain exactly these keys" in item
+            and "reassessment" in item
+            for item in prompt["constraints"]
+        ))
 
         with tempfile.TemporaryDirectory() as path:
             progress = []
@@ -1173,6 +2770,11 @@ class CapabilityFoundryTests(unittest.TestCase):
             row.get("kind") == "controller_owned_intent_revision"
             and row.get("required") == INTENT["revision"]
             and row.get("received") == INTENT["revision"] + 1
+            for state in progress for row in state.get("normalizations", [])))
+        self.assertTrue(any(
+            row.get("kind") == "controller_owned_stage_seconds"
+            and row.get("required") == INTENT["stage_seconds"]
+            and row.get("received") is None
             for state in progress for row in state.get("normalizations", [])))
 
     def test_broken_program_is_never_registered(self):
@@ -1243,6 +2845,371 @@ class CapabilityFoundryTests(unittest.TestCase):
             self.assertIn("metrics[1]", states[-1]["feedback"])
             self.assertEqual(states[-1]["last_attempt"]["executor_source"], payload["executor_source"])
             self.assertEqual(len(states[-1]["requests"]), 2)
+
+    def test_analysis_output_contract_failure_uses_bounded_format_repair_classification(self):
+        payload = self._payload()
+        payload["executor_source"] = MINI_EXECUTOR.replace(
+            "    sys.stdout.write(json.dumps(result))",
+            '    result["analysis"] = {"controls": [{"description": "observed control"}]}\n'
+            "    sys.stdout.write(json.dumps(result))",
+        )
+        self.assertNotEqual(payload["executor_source"], MINI_EXECUTOR)
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            cache = self._cache(root)
+            client = StubClient(payload)
+            foundry = self._foundry(root)
+            states = []
+            with self.assertRaises(ModelWorkBlocked) as blocked:
+                foundry.generate("bounded comparison", client=client, work_cache=cache,
+                                 on_progress=lambda phase, state: states.append(state))
+
+            self.assertEqual(client.calls, 2)
+            self.assertEqual(blocked.exception.failure_class, "model_contract")
+            self.assertEqual(blocked.exception.recovery_mode, "format_repair_then_rerun")
+            self.assertEqual(blocked.exception.repair_gate, "analysis_output_contract")
+            self.assertEqual(states[-1]["last_failure_class"], "model_contract")
+            self.assertEqual(states[-1]["last_failure_gate"], "analysis_output_contract")
+
+    def test_stage_seconds_intent_failure_uses_format_repair_without_review_panel(self):
+        payload = self._payload()
+        payload["experiment_intent"]["stage_seconds"].pop("reassessment")
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            cache = self._cache(root)
+            author = StubClient(payload)
+            foundry = self._foundry(root)
+            states = []
+            with self.assertRaises(ModelWorkBlocked) as blocked:
+                foundry.generate(
+                    "bounded comparison", client=author, work_cache=cache,
+                    on_progress=lambda phase, state: states.append(state),
+                )
+
+        self.assertEqual(author.calls, 2)
+        self.assertEqual(foundry.reviewer_client.calls, 0)
+        self.assertEqual(blocked.exception.failure_class, "model_contract")
+        self.assertEqual(blocked.exception.recovery_mode, "format_repair_then_rerun")
+        self.assertEqual(blocked.exception.repair_gate, "author_response_contract")
+        self.assertEqual(states[-1]["last_failure_class"], "model_contract")
+        self.assertEqual(states[-1]["last_failure_gate"], "author_response_contract")
+        self.assertTrue(any(
+            item.get("failure_signature") == "author_response_contract:experiment_intent"
+            for item in states[-1]["repair_ledger"]
+        ))
+
+    def test_executor_output_shape_failure_gets_targeted_repair_not_scientific_review(self):
+        payload = self._payload()
+        payload["executor_source"] = MINI_EXECUTOR.replace(
+            "    sys.stdout.write(json.dumps(result))",
+            '    result.pop("observations")\n'
+            '    result["unrequested"] = True\n'
+            "    sys.stdout.write(json.dumps(result))",
+        )
+        self.assertNotEqual(payload["executor_source"], MINI_EXECUTOR)
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            cache = self._cache(root)
+            client = StubClient(payload)
+            complete = client.complete
+
+            def inspect_repair(**kwargs):
+                if client.calls:
+                    prompt = json.loads(kwargs["prompt"])
+                    repair = prompt["format_repair"]
+                    self.assertEqual(repair["repair_kind"], "executor_output_contract")
+                    self.assertEqual(repair["missing_fields"], ["observations"])
+                    self.assertEqual(repair["unexpected_fields"], ["unrequested"])
+                    self.assertIn("Preserve the frozen experiment intent", repair["instructions"])
+                return complete(**kwargs)
+
+            client.complete = inspect_repair
+            states = []
+            foundry = self._foundry(root)
+            with self.assertRaises(ModelWorkBlocked) as blocked:
+                foundry.generate("bounded comparison", client=client, work_cache=cache,
+                                 on_progress=lambda phase, state: states.append(state))
+
+            self.assertEqual(client.calls, 2)
+            self.assertEqual(foundry.reviewer_client.calls, 0)
+            self.assertEqual(blocked.exception.failure_class, "model_contract")
+            self.assertEqual(blocked.exception.recovery_mode, "format_repair_then_rerun")
+            self.assertEqual(blocked.exception.repair_gate, "program_output_contract")
+            self.assertEqual(states[-1]["last_failure_class"], "model_contract")
+            self.assertEqual(states[-1]["last_failure_gate"], "program_output_contract")
+
+    def test_repeated_sandbox_exception_stops_even_when_source_edits_shift_lines(self):
+        payload = self._payload()
+
+        class RepeatingSandboxAuthor:
+            def __init__(self):
+                self.calls = 0
+
+            def complete(inner_self, *, system, prompt):
+                inner_self.calls += 1
+                candidate = deepcopy(payload)
+                line = '    run_count = int(experiment["run_count"])'
+                replacement = (
+                    f"    # distinct-source-revision-{inner_self.calls}\n"
+                    '    result = 1 / 0\n'
+                    + line
+                )
+                candidate["executor_source"] = MINI_EXECUTOR.replace(
+                    line, replacement, 1)
+                return ModelResult(
+                    json.dumps(candidate), "stub",
+                    {"model_calls": 1, "input_tokens": 4, "output_tokens": 8},
+                    0.0, "stop",
+                )
+
+        with tempfile.TemporaryDirectory() as path:
+            foundry = self._foundry(Path(path))
+            foundry.max_attempts = 6
+            author = RepeatingSandboxAuthor()
+            with self.assertRaises(ModelWorkBlocked) as blocked:
+                foundry.generate("bounded comparison", client=author)
+
+        self.assertEqual(author.calls, 2)
+        signature = blocked.exception.repair_ledger[-1]["failure_signature"]
+        self.assertTrue(signature.startswith("sandbox:ZeroDivisionError:division by zero"))
+        self.assertEqual(blocked.exception.failure_class, "experiment_capability_repair")
+
+    def test_sandbox_failure_signature_ignores_paths_and_line_numbers(self):
+        first = ValidationError(
+            'executor failed in the sandbox: Traceback (most recent call last):\n'
+            '  File "/tmp/first/program.py", line 40, in main\n'
+            '    value = 1 / denominator\n'
+            'ZeroDivisionError: division by zero')
+        shifted = ValidationError(
+            'executor failed in the sandbox: Traceback (most recent call last):\n'
+            '  File "/tmp/second/program.py", line 88, in main\n'
+            '    value = 1 / denominator\n'
+            'ZeroDivisionError: division by zero')
+        self.assertEqual(_sandbox_failure_signature(first),
+                         _sandbox_failure_signature(shifted))
+
+    def test_program_gate_failure_signature_tracks_scientific_result_not_candidate_hash(self):
+        from scisaurus.runtime.program_gates import ProgramGateRejected
+        first = ProgramGateRejected(
+            "independent recalculation did not accept the candidate",
+            {"decision": "rejected", "checks": [{
+                "id": "metric_agreement", "outcome": "failed",
+                "evidence": "Metrics do not match.",
+            }], "metric_recalculations": [{
+                "metric_id": "control_slope", "reported_value": 0.0,
+                "recalculated_value": None, "tolerance": 1e-6, "matches": False,
+            }]}, gate="independent_recalculation")
+        revised_source_same_result = ProgramGateRejected(
+            "independent recalculation did not accept the candidate",
+            {"decision": "rejected", "checks": [{
+                "id": "metric_agreement", "outcome": "failed",
+                "evidence": "Still mismatched after a source edit.",
+            }], "metric_recalculations": [{
+                "metric_id": "control_slope", "reported_value": 0.0,
+                "recalculated_value": None, "tolerance": 1e-6, "matches": False,
+            }]}, gate="independent_recalculation")
+        materially_different_result = ProgramGateRejected(
+            "independent recalculation did not accept the candidate",
+            {"decision": "rejected", "checks": [{
+                "id": "metric_agreement", "outcome": "failed",
+                "evidence": "Metrics do not match.",
+            }], "metric_recalculations": [{
+                "metric_id": "control_slope", "reported_value": 0.2,
+                "recalculated_value": 0.1, "tolerance": 1e-6, "matches": False,
+            }]}, gate="independent_recalculation")
+
+        self.assertEqual(_program_gate_failure_signature(first),
+                         _program_gate_failure_signature(revised_source_same_result))
+        self.assertNotEqual(_program_gate_failure_signature(first),
+                            _program_gate_failure_signature(materially_different_result))
+
+    def test_repeated_independent_gate_result_stops_after_one_material_source_patch(self):
+        from scisaurus.runtime.program_gates import ProgramGateRejected
+
+        payload = self._payload()
+
+        class SourceRevisionAuthor:
+            calls = 0
+
+            def complete(inner_self, *, system, prompt):
+                inner_self.calls += 1
+                if inner_self.calls == 1:
+                    response = payload
+                else:
+                    response = {"updates": {"executor_source": {"edits": [{
+                        "old": "def main():",
+                        "new": "# material source revision\ndef main():",
+                    }]}}}
+                return ModelResult(json.dumps(response), "stub",
+                                   {"model_calls": 1, "input_tokens": 4, "output_tokens": 8},
+                                   0.0, "stop")
+
+        rejected = ProgramGateRejected(
+            "independent recalculation did not accept the candidate",
+            {"decision": "rejected", "checks": [{
+                "id": "metric_agreement", "outcome": "failed",
+                "evidence": "Primary outcomes do not agree.",
+            }], "metric_recalculations": [{
+                "metric_id": "tail_error", "reported_value": 0.5,
+                "recalculated_value": 0.4, "tolerance": 1e-12, "matches": False,
+            }]}, gate="independent_recalculation")
+
+        with tempfile.TemporaryDirectory() as path:
+            foundry = self._foundry(Path(path))
+            foundry.max_attempts = 8
+            author = SourceRevisionAuthor()
+            with patch("scisaurus.runtime.capability_foundry.admit_program_candidate",
+                       side_effect=rejected):
+                with self.assertRaises(ModelWorkBlocked) as blocked:
+                    foundry.generate("bounded comparison", client=author)
+
+        ledger = blocked.exception.repair_ledger
+        self.assertEqual(author.calls, 2)
+        self.assertEqual(len(ledger), 2)
+        self.assertEqual(ledger[0]["failure_signature"], ledger[1]["failure_signature"])
+        self.assertNotEqual(ledger[0]["candidate_sha256"], ledger[1]["candidate_sha256"])
+        self.assertTrue(ledger[1]["failure_signature"].startswith(
+            "program_gate:independent_recalculation:"))
+
+    def test_truncated_patch_preserves_scientific_review_without_reclassifying_it_as_a_review_failure(self):
+        payload = self._payload()
+        rejected_review = {
+            "status": "rejected",
+            "checks": [
+                {"id": name, "outcome": "failed", "evidence": "The retained program contradicts the stated mechanism."}
+                for name in sorted(PROGRAM_REVIEW_CHECKS)
+            ],
+            "findings": [{
+                "severity": "blocking",
+                "finding": "The primary slope is fixed by the equation rather than identified by the experiment.",
+                "evidence": "The executor substitutes gap directly into a_over_d, making the log slope an identity.",
+                "required_change": "Change the constitutive expression so the gap exponent is derived rather than imposed, then update the independent validator.",
+            }, {
+                "severity": "warning",
+                "finding": "The validator repeats the executor's estimator.",
+                "evidence": "Both implementations call the same slope helper.",
+                "required_change": "Calculate the slope independently and recompute a bootstrap interval.",
+            }],
+            "limitations": ["The synthetic fixture does not establish an empirical material result."],
+        }
+
+        class CandidateThenTruncatedPatch:
+            def __init__(self):
+                self.calls = 0
+                self.max_output_tokens = 24000
+                self.output_budgets = []
+                self.prompts = []
+                self.authoring_prompts = []
+
+            def complete(self, *, system, prompt):
+                self.calls += 1
+                self.output_budgets.append(self.max_output_tokens)
+                self.prompts.append(prompt)
+                request = json.loads(prompt)
+                if request.get("assignment") == "continue_truncated_experiment_author_json":
+                    return ModelResult(json.dumps({
+                        "marker": "wrong-continuation-marker",
+                        "continuation": "}",
+                    }), "stub", {"model_calls": 1}, 0.0, "stop")
+                self.authoring_prompts.append(prompt)
+                if self.calls == 1:
+                    return ModelResult(
+                        json.dumps(payload), "stub",
+                        {"model_calls": 1, "input_tokens": 5, "output_tokens": 10},
+                        0.0, "stop",
+                    )
+                return ModelResult(
+                    '{"updates":{"executor_source":{"edits":[', "stub",
+                    {"model_calls": 1, "input_tokens": 7, "output_tokens": 4096},
+                    0.0, "length",
+                )
+
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            foundry.max_attempts = 3
+            author = CandidateThenTruncatedPatch()
+            foundry.reviewer_client = StubClient(rejected_review)
+            with self.assertRaises(ModelWorkBlocked) as blocked:
+                foundry.generate("bounded comparison", client=author)
+
+        self.assertEqual(author.calls, 4)
+        self.assertEqual(len(author.output_budgets), author.calls)
+        first_repair_prompt = json.loads(author.authoring_prompts[1])
+        self.assertEqual(first_repair_prompt["assignment"], "repair_existing_experiment_candidate")
+        self.assertNotIn("capability_brief", first_repair_prompt)
+        patch_prompt = json.loads(author.authoring_prompts[-1])
+        self.assertEqual(patch_prompt["assignment"], "repair_existing_experiment_candidate")
+        self.assertNotIn("capability_brief", patch_prompt)
+        self.assertEqual(set(patch_prompt["output_contract"]), {"updates"})
+        self.assertNotIn("executor_source", patch_prompt["current_candidate"])
+        self.assertEqual(
+            patch_prompt["current_candidate"]["source_context"]["executor_source"]["source_sha256"],
+            hashlib.sha256(payload["executor_source"].encode()).hexdigest())
+        self.assertLess(
+            sum(len(item["source"]) for item in
+                patch_prompt["current_candidate"]["source_context"]["executor_source"]["sections"]),
+            len(payload["executor_source"]))
+        self.assertIn(
+            "The primary slope is fixed by the equation",
+            json.dumps(patch_prompt["repair_request"]["validation_feedback"]))
+        self.assertEqual(blocked.exception.failure_class, "model_contract")
+        self.assertEqual(blocked.exception.recovery_mode, "format_repair_then_rerun")
+        self.assertEqual(blocked.exception.repair_gate, "author_response_format")
+        feedback = blocked.exception.repair_feedback
+        self.assertEqual(feedback["validation_feedback"]["decision"], "rejected")
+        self.assertEqual(feedback["validation_feedback"]["findings"][0]["severity"], "blocking")
+        self.assertIn("equation", blocked.exception.research_review["required_repairs"][0]["repair"])
+        self.assertIn("bootstrap interval", blocked.exception.research_review["required_repairs"][1]["repair"])
+        self.assertEqual(blocked.exception.research_review["checks"][0]["outcome"], "failed")
+
+    def test_compact_output_contract_repair_is_applied_and_replayed_through_all_gates(self):
+        payload = self._payload()
+        invalid_lines = (
+            '    result.pop("observations")\n'
+            '    result["unrequested"] = True\n'
+        )
+        marker = '    sys.stdout.write(json.dumps(result))'
+        payload["executor_source"] = MINI_EXECUTOR.replace(
+            marker, invalid_lines + marker)
+        self.assertNotEqual(payload["executor_source"], MINI_EXECUTOR)
+
+        class PatchingAuthor:
+            def __init__(self):
+                self.calls = 0
+                self.max_output_tokens = 24000
+                self.prompts = []
+                self.output_budgets = []
+
+            def complete(inner_self, *, system, prompt):
+                inner_self.calls += 1
+                inner_self.prompts.append(prompt)
+                inner_self.output_budgets.append(inner_self.max_output_tokens)
+                if inner_self.calls == 1:
+                    value = payload
+                else:
+                    value = {"updates": {"executor_source": {"edits": [
+                        {"old": invalid_lines, "new": ""},
+                    ]}}}
+                return ModelResult(
+                    json.dumps(value), "stub",
+                    {"model_calls": 1, "input_tokens": 5, "output_tokens": 10},
+                    0.0, "stop",
+                )
+
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            author = PatchingAuthor()
+            outcome = foundry.generate("bounded comparison", client=author)
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual(author.calls, 2)
+        self.assertEqual(author.output_budgets, [24000, 4096])
+        repair_prompt = json.loads(author.prompts[1])
+        self.assertEqual(repair_prompt["format_repair"]["repair_kind"], "executor_output_contract")
+        self.assertEqual(repair_prompt["format_repair"]["missing_fields"], ["observations"])
+        self.assertEqual(repair_prompt["format_repair"]["unexpected_fields"], ["unrequested"])
 
     def test_repeated_admission_gate_stops_before_authoring_budget_is_spent(self):
         payload = self._payload()
@@ -1315,6 +3282,7 @@ class CapabilityFoundryTests(unittest.TestCase):
                         "evidence": f"independent recalculation {inner_self.calls}",
                         "required_change": "Repair the computation, then replay it.",
                     }]
+                verdict = _add_prior_review_checks(verdict, prompt)
                 return ModelResult(json.dumps(verdict), "reviewer",
                                    {"model_calls": 1}, 0.0, "stop")
 
@@ -1362,6 +3330,38 @@ class CapabilityFoundryTests(unittest.TestCase):
             self.assertEqual(client.calls, 1)
             self.assertEqual(foundry.generate("bounded comparison", client=client, work_cache=cache), outcome)
             self.assertEqual(client.calls, 1)
+
+    def test_changed_format_recovery_assignment_does_not_reuse_blocked_cache(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            cache = self._cache(root)
+            foundry = self._foundry(root)
+            foundry.max_attempts = 1
+
+            class InvalidAuthor:
+                model = "stub"
+
+                def __init__(inner_self):
+                    inner_self.calls = 0
+
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    return ModelResult("{}", "stub", {"model_calls": 1}, 0.0, "stop")
+
+            invalid = InvalidAuthor()
+            with self.assertRaises(ModelWorkBlocked):
+                foundry.generate(
+                    "bounded comparison", client=invalid, work_cache=cache,
+                    required_intent=INTENT)
+            self.assertEqual(invalid.calls, 1)
+
+            recovery = StubClient(self._payload())
+            outcome = foundry.generate(
+                "bounded comparison\nFormat-recovery policy revision: analysis-output-contract-2",
+                client=recovery, work_cache=cache, required_intent=INTENT)
+
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual(recovery.calls, 1)
 
     def test_author_outer_json_closer_is_repaired_without_a_second_model_call(self):
         payload = self._payload()
@@ -1430,6 +3430,11 @@ class CapabilityFoundryTests(unittest.TestCase):
             class TruncatedEnvelopeClient(StubClient):
                 def complete(self, *, system, prompt):
                     self.calls += 1
+                    if self.calls > 1:
+                        return ModelResult(json.dumps({
+                            "marker": "wrong-continuation-marker",
+                            "continuation": "}",
+                        }), "stub", {"model_calls": 1}, 0.0, "stop")
                     return ModelResult(
                         json.dumps(self.payload)[:-1], "stub",
                         {"model_calls": 1, "input_tokens": 3, "output_tokens": 4},
@@ -1441,7 +3446,7 @@ class CapabilityFoundryTests(unittest.TestCase):
             foundry.max_attempts = 1
             with self.assertRaises(ModelWorkBlocked) as raised:
                 foundry.generate("bounded comparison", client=author)
-            self.assertEqual(author.calls, 1)
+            self.assertEqual(author.calls, 2)
             self.assertEqual(load_registry(root / "registry")["capabilities"], [])
             responses = raised.exception.model_diagnostics["author_responses"]
             self.assertEqual(responses[-1]["finish_reason"], "length")
@@ -1457,7 +3462,7 @@ class CapabilityFoundryTests(unittest.TestCase):
                 def complete(self, *, system, prompt):
                     self.calls += 1
                     return ModelResult(
-                        '{"executor_source":', "stub",
+                        '{"executor_source":' if self.calls == 1 else '{"validator_source":', "stub",
                         {"model_calls": 1, "input_tokens": 11, "output_tokens": 7},
                         0.0, "length",
                     )
@@ -1466,11 +3471,18 @@ class CapabilityFoundryTests(unittest.TestCase):
             with self.assertRaises(ModelWorkBlocked) as raised:
                 self._foundry(root).generate("bounded comparison", client=author)
             self.assertIn("finish_reason=length", str(raised.exception))
-            self.assertEqual(raised.exception.usage["model_calls"], 2)
+            self.assertGreater(author.calls, 4)
+            self.assertEqual(raised.exception.usage["model_calls"], author.calls)
+            self.assertEqual(raised.exception.usage["input_tokens"], author.calls * 11)
+            self.assertEqual(raised.exception.usage["output_tokens"], author.calls * 7)
+            self.assertEqual(raised.exception.failure_class, "model_contract")
+            self.assertEqual(raised.exception.recovery_mode, "format_repair_then_rerun")
+            self.assertEqual(raised.exception.repair_gate, "author_response_format")
             responses = raised.exception.model_diagnostics["author_responses"]
-            self.assertEqual(len(responses), 2)
-            self.assertEqual(responses[-1]["finish_reason"], "length")
-            self.assertEqual(responses[-1]["outcome"], "incomplete_response")
+            author_failures = [item for item in responses
+                               if item.get("outcome") == "incomplete_response"]
+            self.assertEqual(len(author_failures), 2)
+            self.assertEqual(author_failures[-1]["finish_reason"], "length")
 
     def test_deadline_blocks_dispatch_before_a_model_call(self):
         with tempfile.TemporaryDirectory() as path:

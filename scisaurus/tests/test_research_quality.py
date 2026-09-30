@@ -1,9 +1,11 @@
 import unittest
 
+from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.research_quality import (
     default_research_quality_contract,
     ensure_minimum_quality_contract,
     evaluate_result_package_quality,
+    validate_analysis,
 )
 
 
@@ -38,6 +40,86 @@ class ResearchQualityTests(unittest.TestCase):
         })
         self.assertEqual(result["decision"], "proceed")
         self.assertEqual(result["deficits"], [])
+
+    def test_string_comparisons_normalize_to_stable_evidence_records(self):
+        analysis = self._analysis()
+        analysis["comparisons"] = [
+            "down-sweep minus up-sweep slope",
+            "beta zero control",
+            "down-sweep minus up-sweep slope",
+        ]
+
+        normalized = validate_analysis(analysis)
+        repeated = validate_analysis(analysis)
+
+        self.assertEqual(normalized, repeated)
+        self.assertEqual(len(normalized["comparisons"]), 2)
+        self.assertEqual(
+            [item["description"] for item in normalized["comparisons"]],
+            ["down-sweep minus up-sweep slope", "beta zero control"],
+        )
+        self.assertTrue(all(item["id"].startswith("comparison-")
+                            for item in normalized["comparisons"]))
+        decision = evaluate_result_package_quality({
+            "quality_contract": default_research_quality_contract(),
+            "analysis": analysis,
+            "assets": [{"id": f"figure_{index}", "role": "figure"}
+                       for index in range(3)],
+        })
+        self.assertEqual(decision["decision"], "proceed")
+
+    def test_numeric_bootstrap_interval_is_preserved_inside_uncertainty_record(self):
+        analysis = self._analysis()
+        interval = {
+            "id": "bootstrap_slope_difference",
+            "description": "Mean per-phi OLS slope difference; percentile bootstrap, 2000 resamples.",
+            "estimate": 0.25,
+            "lower": 0.11,
+            "upper": 0.39,
+            "n_resamples": 2000,
+            "seed": 17,
+        }
+        analysis["uncertainty"] = [interval]
+
+        normalized = validate_analysis(analysis)
+
+        self.assertEqual(normalized["uncertainty"], [interval])
+        decision = evaluate_result_package_quality({
+            "quality_contract": default_research_quality_contract(),
+            "analysis": analysis,
+            "assets": [{"id": f"figure_{index}", "role": "figure"}
+                       for index in range(3)],
+        })
+        self.assertEqual(decision["decision"], "proceed")
+
+    def test_numeric_bootstrap_interval_rejects_invalid_bounds_and_nonfinite_values(self):
+        invalid_records = [
+            {"id": "interval", "description": "Missing upper", "estimate": 0.2,
+             "lower": 0.1},
+            {"id": "interval", "description": "Missing point estimate", "lower": 0.1,
+             "upper": 0.3},
+            {"id": "interval", "description": "Reversed bounds", "lower": 0.4,
+             "upper": 0.1},
+            {"id": "interval", "description": "Nonfinite bound", "lower": float("nan"),
+             "upper": 0.3},
+        ]
+        for record in invalid_records:
+            with self.subTest(record=record):
+                analysis = self._analysis()
+                analysis["uncertainty"] = [record]
+                with self.assertRaises(ValidationError):
+                    validate_analysis(analysis)
+
+    def test_metric_specific_analysis_keys_remain_rejected(self):
+        analysis = self._analysis()
+        analysis["bootstrap_slope_difference"] = {
+            "estimate": 0.25,
+            "lower": 0.11,
+            "upper": 0.39,
+        }
+
+        with self.assertRaisesRegex(ValidationError, "unknown fields"):
+            validate_analysis(analysis)
 
     def test_rejected_scientific_result_is_not_admitted_despite_complete_analysis(self):
         package = {

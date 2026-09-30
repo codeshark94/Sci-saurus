@@ -12,11 +12,14 @@ from scisaurus.runtime.research_argument import (
     ArgumentAdjudicator,
     ResearchArgumentRunner,
     _normalise_argument_candidate,
+    _validate_argument_generation_budget,
     argument_response_repair_prompt,
     argument_evidence_packet,
     argument_prompt,
+    evidence_ids_from_packet,
     validate_argument_review,
     validate_research_argument,
+    review_prompt,
 )
 
 
@@ -99,6 +102,24 @@ class ResearchArgumentTests(unittest.TestCase):
             "Run a threshold sensitivity sweep.",
         )
 
+    def test_scientific_argument_prose_is_not_rejected_for_character_count(self):
+        candidate = argument()
+        candidate["primary_argument"]["thesis"] = (
+            "The observed divergence is consistent with metric sensitivity, but the current aggregate "
+            "does not distinguish that explanation from split-level sampling variation, so the claim is "
+            "limited to the supplied dataset, model, metrics, and resampling design pending the specified "
+            "per-observation decomposition and nested-resampling checks."
+        )
+        self.assertGreater(len(candidate["primary_argument"]["thesis"]), 280)
+        _validate_argument_generation_budget(
+            candidate, min_figures=2, min_tables=1, min_experiments=2)
+
+        prompt = json.loads(argument_prompt({"evidence_ids": ["e1"]}))
+        serialized_contract = json.dumps(
+            prompt["generation_limits"], ensure_ascii=False).casefold()
+        self.assertNotIn("character", serialized_contract)
+        self.assertIn("concise, complete prose", serialized_contract)
+
     def test_adjudication_repairs_reach_the_next_argument_generation(self):
         review = {
             "schema_version": "research-argument-review-1",
@@ -148,6 +169,7 @@ class ResearchArgumentTests(unittest.TestCase):
         ))
         self.assertEqual(prompt["repair_request"]["adjudication"], review)
         self.assertIn("every failed check", prompt["repair_request"]["instructions"])
+        self.assertNotIn("partial_response", prompt)
 
     def test_argument_normalizer_only_repairs_unambiguous_provider_formatting(self):
         candidate = {"argument": argument()}
@@ -158,6 +180,103 @@ class ResearchArgumentTests(unittest.TestCase):
                                    asset_ids={"figure_metric", "figure_split"})
         self.assertEqual(normalized["figure_plan"][0]["kind"], "figure")
         self.assertTrue(any(item["action"] == "unwrap_provider_envelope" for item in changes))
+
+    def test_argument_normalizer_restores_only_a_missing_authoritative_question(self):
+        expected = argument()["research_question"]
+        candidate = argument()
+        candidate.pop("research_question")
+
+        normalized, changes = _normalise_argument_candidate(
+            {"argument": candidate}, expected_research_question=expected)
+
+        self.assertEqual(normalized["research_question"], expected)
+        self.assertTrue(any(
+            item["field"] == "research_question"
+            and item["action"] == "restore_from_authoritative_evidence_packet"
+            for item in changes
+        ))
+        mismatched = argument()
+        mismatched["research_question"] = "A different research question."
+        with self.assertRaisesRegex(ValidationError, "conflicts with the authoritative"):
+            _normalise_argument_candidate(
+                mismatched, expected_research_question=expected)
+
+    def test_interpretation_envelope_projects_authoritative_patterns_and_evidence(self):
+        pattern = {
+            "id": "pattern_dilation_activity",
+            "pattern": "The dilation term remains active in every modeled cell.",
+            "so_what": "The analytic model does not establish an observed physical mechanism.",
+            "supporting_evidence": ["e1"],
+            "contradicting_evidence": ["e2"],
+        }
+        packet = {
+            "scientific_interpretation": {
+                "schema_version": "interpretation-output-1",
+                "interpretation": {
+                    "research_question": "Does the operator change the onset slope?",
+                    "result_patterns": [pattern],
+                },
+            },
+            "results_package": {"findings": [{"id": "e3"}]},
+        }
+
+        projected = argument_evidence_packet(packet)
+
+        self.assertEqual(
+            projected["scientific_interpretation"]["result_patterns"], [pattern])
+        self.assertEqual(evidence_ids_from_packet(packet), ["e1", "e2", "e3"])
+        self.assertIn("e1", projected["evidence_ids"])
+        self.assertIn("e2", projected["evidence_ids"])
+
+    def test_argument_normalizer_restores_referenced_patterns_only_from_authoritative_source(self):
+        value = argument()
+        value["hypotheses"][0]["explains_pattern_ids"].append("pattern_dilation_activity")
+        value["figure_plan"][0]["supports"].append("pattern_dilation_activity")
+        authoritative = [{
+            "id": "pattern_dilation_activity",
+            "pattern": "The dilation term remains active in every modeled cell.",
+            "so_what": "This is a model-internal result, not physical validation.",
+            "supporting_evidence": ["e1"],
+            "contradicting_evidence": ["e2"],
+            "result_ref": "e1",
+        }]
+
+        normalized, changes = _normalise_argument_candidate(
+            value, available_evidence_ids={"e1", "e2", "e3"},
+            authoritative_result_patterns=authoritative)
+
+        validate_research_argument(normalized, evidence_ids={"e1", "e2", "e3"})
+        restored = next(item for item in normalized["observed_patterns"]
+                        if item["id"] == "pattern_dilation_activity")
+        self.assertEqual(restored["evidence_ids"], ["e1", "e2"])
+        self.assertTrue(any(
+            item["action"] == "restore_from_authoritative_interpretation"
+            for item in changes))
+
+        unsupported = argument()
+        unsupported["hypotheses"][0]["explains_pattern_ids"].append("invented_pattern")
+        with self.assertRaisesRegex(ValidationError, "unknown observed pattern"):
+            candidate, _ = _normalise_argument_candidate(
+                unsupported, available_evidence_ids={"e1", "e2", "e3"},
+                authoritative_result_patterns=authoritative)
+            validate_research_argument(candidate, evidence_ids={"e1", "e2", "e3"})
+
+    def test_argument_normalizer_canonicalizes_generated_ids_and_updates_references(self):
+        value = argument()
+        original = "Sensitivity experiment: bootstrap over every gap and operator"
+        value["discriminating_experiments"][0]["id"] = original
+        value["figure_plan"][0]["supports"].append(original)
+
+        normalized, changes = _normalise_argument_candidate(value)
+
+        validate_research_argument(normalized, evidence_ids={"e1", "e2", "e3"})
+        generated_id = normalized["discriminating_experiments"][0]["id"]
+        self.assertRegex(generated_id, r"^[a-z][a-z0-9_-]{0,63}$")
+        self.assertNotEqual(generated_id, original)
+        self.assertIn(generated_id, normalized["figure_plan"][0]["supports"])
+        self.assertTrue(any(
+            item["action"] == "normalize_generated_identifier"
+            for item in changes))
 
     def test_argument_normalizer_repairs_explicit_pattern_id_list_serialization(self):
         value = argument()
@@ -184,6 +303,37 @@ class ResearchArgumentTests(unittest.TestCase):
     def test_requires_competing_hypotheses_and_figure_jobs(self):
         validate_research_argument(argument(), evidence_ids={"e1", "e2", "e3"})
 
+    def test_evidence_may_resolve_every_competing_hypothesis(self):
+        value = argument()
+        value["hypotheses"][0]["status"] = "supported"
+        value["hypotheses"][0]["evidence_ids"] = ["e1"]
+        value["hypotheses"][0]["counterevidence"] = ["e3"]
+        value["hypotheses"][1]["status"] = "disfavored"
+        value["hypotheses"][1]["evidence_ids"] = []
+        value["hypotheses"][1]["counterevidence"] = ["e2"]
+
+        validate_research_argument(value, evidence_ids={"e1", "e2", "e3"})
+
+    def test_disfavored_hypothesis_requires_linked_counterevidence(self):
+        value = argument()
+        value["hypotheses"][1]["status"] = "disfavored"
+        value["hypotheses"][1]["counterevidence"] = []
+
+        with self.assertRaisesRegex(ValidationError, "disfavored hypothesis requires counterevidence"):
+            validate_research_argument(value, evidence_ids={"e1", "e2", "e3"})
+
+    def test_argument_review_must_judge_evidence_direction_for_each_status(self):
+        prompt = json.loads(review_prompt(argument(), {"evidence_ids": ["e1", "e2", "e3"]}))
+        self.assertIn("correct direction", prompt["questions"][1])
+        self.assertIn("whether its status is warranted", prompt["questions"][1])
+
+    def test_hypothesis_counterevidence_must_reference_supplied_evidence(self):
+        value = argument()
+        value["hypotheses"][0]["counterevidence"] = ["invented-evidence"]
+
+        with self.assertRaisesRegex(ValidationError, "counterevidence references unknown evidence"):
+            validate_research_argument(value, evidence_ids={"e1", "e2", "e3"})
+
     def test_argument_normalizer_materializes_missing_result_table(self):
         value = argument()
         value["figure_plan"] = [item for item in value["figure_plan"] if item["kind"] != "table"]
@@ -202,21 +352,7 @@ class ResearchArgumentTests(unittest.TestCase):
         value["hypotheses"][0]["status"] = "candidate"
         value["hypotheses"][1]["status"] = "supported"
         value["hypotheses"][1]["evidence_ids"] = []
-        normalized, changes = _normalise_argument_candidate(
-            value,
-            available_evidence_ids={"e1", "e2", "e3"},
-        )
-        validate_research_argument(normalized, evidence_ids={"e1", "e2", "e3"})
-        self.assertEqual(normalized["hypotheses"][1]["evidence_ids"], ["e3"])
-        self.assertTrue(any(item["action"] == "restore_existing_evidence_links"
-                            and item["source"] == "counterevidence" for item in changes))
-
-    def test_argument_normalizer_uses_named_pattern_when_counterevidence_is_empty(self):
-        value = argument()
-        value["hypotheses"][0]["status"] = "candidate"
-        value["hypotheses"][1]["status"] = "disfavored"
-        value["hypotheses"][1]["counterevidence"] = []
-        value["hypotheses"][1]["evidence_ids"] = []
+        value["hypotheses"][1]["counterevidence"] = ["e1"]
         normalized, changes = _normalise_argument_candidate(
             value,
             available_evidence_ids={"e1", "e2", "e3"},
@@ -225,6 +361,22 @@ class ResearchArgumentTests(unittest.TestCase):
         self.assertEqual(normalized["hypotheses"][1]["evidence_ids"], ["e3"])
         self.assertTrue(any(item["action"] == "restore_existing_evidence_links"
                             and item["source"] == "observed_pattern" for item in changes))
+
+    def test_disfavored_hypothesis_keeps_counterevidence_separate_from_support(self):
+        value = argument()
+        value["hypotheses"][0]["status"] = "candidate"
+        value["hypotheses"][1]["status"] = "disfavored"
+        value["hypotheses"][1]["counterevidence"] = ["e2"]
+        value["hypotheses"][1]["evidence_ids"] = []
+        normalized, changes = _normalise_argument_candidate(
+            value,
+            available_evidence_ids={"e1", "e2", "e3"},
+        )
+        validate_research_argument(normalized, evidence_ids={"e1", "e2", "e3"})
+        self.assertEqual(normalized["hypotheses"][1]["evidence_ids"], [])
+        self.assertEqual(normalized["hypotheses"][1]["counterevidence"], ["e2"])
+        self.assertFalse(any(item["field"] == "hypotheses[1].evidence_ids"
+                             for item in changes))
 
     def test_argument_normalizer_maps_unsupported_to_unresolved_without_promoting_claim(self):
         value = argument()
@@ -274,9 +426,11 @@ class ResearchArgumentTests(unittest.TestCase):
 
         class FakeClient:
             assignments = []
+            configs = []
 
             def __init__(self, **config):
                 self.config = config
+                self.configs.append(config)
 
             def complete(self, *, system, prompt, images=None):
                 packet = json.loads(prompt)
@@ -305,6 +459,131 @@ class ResearchArgumentTests(unittest.TestCase):
         self.assertEqual(result["argument_defense"]["schema_version"], "argument-defense-1")
         self.assertEqual(len(result["argument_defense_sha256"]), 64)
         self.assertEqual(len(FakeClient.assignments), 2)
+        self.assertEqual(len(FakeClient.configs), 2)
+        self.assertTrue(all(config["output_format"] == "json_object"
+                            for config in FakeClient.configs))
+
+    def test_runner_restores_missing_question_without_format_repair_call(self):
+        valid = argument()
+        expected_question = valid.pop("research_question")
+        assignments = []
+
+        class MissingQuestionClient:
+            def __init__(self, **config):
+                self.config = config
+
+            def complete(self, *, system, prompt, images=None):
+                request = json.loads(prompt)
+                assignments.append(request["assignment"])
+                if request["assignment"].startswith("Build a versioned"):
+                    body = valid
+                else:
+                    body = {"schema_version": "research-argument-review-1", "decision": "accept",
+                            "checks": [
+                                {"id": "question", "outcome": "passed", "evidence": "Question is focused."},
+                                {"id": "evidence", "outcome": "passed", "evidence": "Observations are bound."},
+                                {"id": "mechanisms", "outcome": "passed", "evidence": "Mechanisms differ."},
+                                {"id": "experiments", "outcome": "passed", "evidence": "Tests discriminate."},
+                                {"id": "figures", "outcome": "passed", "evidence": "Figure jobs are explicit."},
+                            ], "required_repairs": [], "rationale": "The argument is ready for composition."}
+                return ModelResult(text=json.dumps(body), model="fake",
+                                   usage={"model_calls": 1}, elapsed_seconds=0.01,
+                                   finish_reason="stop")
+
+        packet = {
+            "research_question": expected_question,
+            "results_package": {"findings": [{"id": "e1"}], "metrics": [{"id": "e2"}],
+                                "limitations": ["A limitation."]},
+            "evidence_ids": ["e1", "e2", "e3"],
+            "asset_ids": ["figure_metric", "figure_split"],
+        }
+        with patch("scisaurus.runtime.research_argument.ModelClient", MissingQuestionClient):
+            result = ResearchArgumentRunner({
+                "base_url": "http://example.invalid", "model": "fake",
+                "protocol": "openai_compatible", "timeout_seconds": 1,
+                "max_output_tokens": 100,
+            }).run(packet)
+
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(result["argument"]["research_question"], expected_question)
+        self.assertEqual(result["model_calls"], 2)
+        self.assertEqual(len(assignments), 2)
+
+    def test_runner_preserves_nested_interpretation_pattern_without_extra_repair_call(self):
+        candidate = argument()
+        new_pattern_id = "pattern_dilation_activity"
+        malformed_experiment_id = "Sensitivity experiment: bootstrap over every gap and operator"
+        candidate["hypotheses"][0]["explains_pattern_ids"].append(new_pattern_id)
+        candidate["figure_plan"][0]["supports"].extend(
+            [new_pattern_id, malformed_experiment_id])
+        candidate["discriminating_experiments"][0]["id"] = malformed_experiment_id
+        requests = []
+
+        class SourceBackedCandidateClient:
+            def __init__(self, **config):
+                self.config = config
+
+            def complete(self, *, system, prompt, images=None):
+                request = json.loads(prompt)
+                requests.append(request["assignment"])
+                if request["assignment"].startswith("Build a versioned"):
+                    body = candidate
+                else:
+                    body = {
+                        "schema_version": "research-argument-review-1",
+                        "decision": "accept",
+                        "checks": [
+                            {"id": "question", "outcome": "passed", "evidence": "Question is focused."},
+                            {"id": "evidence", "outcome": "passed", "evidence": "Observations are bound."},
+                            {"id": "mechanisms", "outcome": "passed", "evidence": "Mechanisms differ."},
+                            {"id": "experiments", "outcome": "passed", "evidence": "Tests discriminate."},
+                            {"id": "figures", "outcome": "passed", "evidence": "Figure jobs are explicit."},
+                        ],
+                        "required_repairs": [],
+                        "rationale": "The argument remains bounded by supplied evidence.",
+                    }
+                return ModelResult(
+                    text=json.dumps(body), model="fake", usage={"model_calls": 1},
+                    elapsed_seconds=0.01, finish_reason="stop")
+
+        packet = {
+            "research_question": candidate["research_question"],
+            "evidence_ids": ["e1", "e2", "e3"],
+            "asset_ids": ["figure_metric", "figure_split"],
+            "results_package": {
+                "findings": [{"id": "e1"}, {"id": "e2"}, {"id": "e3"}],
+                "limitations": ["This is an analytic model without calibrated measurements."],
+            },
+            "scientific_interpretation": {
+                "schema_version": "interpretation-output-1",
+                "interpretation": {
+                    "research_question": candidate["research_question"],
+                    "result_patterns": [{
+                        "id": new_pattern_id,
+                        "pattern": "The dilation term remains active in every modeled cell.",
+                        "so_what": "This model-internal result does not validate physical dilation.",
+                        "supporting_evidence": ["e1"],
+                        "contradicting_evidence": ["e2"],
+                        "result_ref": "e1",
+                    }],
+                },
+            },
+        }
+        with patch("scisaurus.runtime.research_argument.ModelClient", SourceBackedCandidateClient):
+            result = ResearchArgumentRunner({
+                "base_url": "http://example.invalid", "model": "fake",
+                "protocol": "openai_compatible", "timeout_seconds": 1,
+                "max_output_tokens": 100,
+            }).run(packet)
+
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(result["model_calls"], 2)
+        self.assertEqual(len(requests), 2)
+        self.assertIn(new_pattern_id, {
+            item["id"] for item in result["argument"]["observed_patterns"]})
+        normalized_experiment_id = result["argument"]["discriminating_experiments"][0]["id"]
+        self.assertRegex(normalized_experiment_id, r"^[a-z][a-z0-9_-]{0,63}$")
+        self.assertIn(normalized_experiment_id, result["argument"]["figure_plan"][0]["supports"])
 
     def test_runner_recovers_a_length_finished_json_with_missing_outer_closer(self):
         valid = argument()
@@ -351,6 +630,7 @@ class ResearchArgumentTests(unittest.TestCase):
 
     def test_length_response_uses_compact_fallback_with_enough_output_budget(self):
         valid = argument()
+        valid["research_question"] = "Does the measured sign cross?"
         review = {
             "schema_version": "research-argument-review-1", "decision": "accept",
             "checks": [
@@ -408,7 +688,16 @@ class ResearchArgumentTests(unittest.TestCase):
         self.assertEqual(result["status"], "accepted")
         self.assertEqual(result["model_calls"], 3)
         self.assertEqual(RepairClient.configs[1]["model"], "fallback")
-        self.assertEqual(RepairClient.configs[1]["max_output_tokens"], 8192)
+        self.assertEqual(RepairClient.configs[0]["max_output_tokens"], 6144)
+        self.assertEqual(RepairClient.configs[1]["max_output_tokens"], 6144)
+        generation_limits = RepairClient.prompts[0]["generation_limits"]
+        self.assertIn("2-8 materially distinct", generation_limits["observed_patterns"])
+        self.assertIn("exactly two", generation_limits["hypotheses"])
+        self.assertIn("exactly 2 figures and 1 tables", generation_limits["figure_plan"])
+        self.assertIn("3600 output tokens", RepairClient.prompts[0]["output_contract"]["response_size"])
+        contract_text = json.dumps(
+            RepairClient.prompts[0]["output_contract"], ensure_ascii=False).casefold()
+        self.assertNotIn("character", contract_text)
         repair_prompt = RepairClient.prompts[1]
         self.assertNotIn("evidence_packet", repair_prompt)
         self.assertIn("requires exactly", repair_prompt["validation_error"])
@@ -418,14 +707,18 @@ class ResearchArgumentTests(unittest.TestCase):
     def test_failed_format_repair_is_bounded_and_accounts_for_both_calls(self):
         class AlwaysTruncatedClient:
             calls = 0
+            prompts = []
+            configs = []
 
             def __init__(self, **config):
                 self.config = config
+                self.configs.append(config)
 
             def complete(self, *, system, prompt, images=None):
                 self.__class__.calls += 1
+                self.__class__.prompts.append(json.loads(prompt))
                 return ModelResult(
-                    text=json.dumps({"schema_version": "research-argument-1"}),
+                    text='{"schema_version":',
                     model=self.config["model"],
                     usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
                     elapsed_seconds=0.01, finish_reason="length",
@@ -453,6 +746,18 @@ class ResearchArgumentTests(unittest.TestCase):
         self.assertEqual(AlwaysTruncatedClient.calls, 2)
         self.assertEqual(raised.exception.usage["model_calls"], 2)
         self.assertEqual(raised.exception.usage["output_tokens"], 40)
+        self.assertEqual(AlwaysTruncatedClient.configs[0]["max_output_tokens"], 6144)
+        self.assertEqual(AlwaysTruncatedClient.configs[1]["max_output_tokens"], 6144)
+        self.assertEqual(AlwaysTruncatedClient.prompts[1]["assignment"],
+                         "Complete the interrupted research-argument JSON response.")
+        self.assertEqual(
+            AlwaysTruncatedClient.prompts[1]["truncated_response"],
+            '{"schema_version":',
+        )
+        self.assertIn("Do not explain the repair",
+                      AlwaysTruncatedClient.prompts[1]["instruction"])
+        self.assertNotIn("partial_response", AlwaysTruncatedClient.prompts[1])
+        self.assertIn("grounding_summary", AlwaysTruncatedClient.prompts[1])
 
     def test_truncated_adjudication_uses_fallback_and_bounded_repair(self):
         review = {"schema_version": "research-argument-review-1", "decision": "accept",
@@ -509,11 +814,42 @@ class ResearchArgumentTests(unittest.TestCase):
         self.assertEqual(usage["model_calls"], 2)
         self.assertEqual(FallbackClient.configs[0]["model"], "primary")
         self.assertEqual(FallbackClient.configs[1]["model"], "fallback")
+        self.assertEqual(FallbackClient.configs[0]["max_output_tokens"], 4096)
         self.assertLessEqual(FallbackClient.configs[1]["max_output_tokens"], 4096)
         repaired_prompt = json.loads(FallbackClient.prompts[1])
         self.assertEqual(repaired_prompt["evidence_packet"], evidence_packet)
         self.assertEqual(repaired_prompt["argument_defense"], evidence_packet["argument_defense"])
         self.assertIn("evidence", repaired_prompt["questions"][1].lower())
+
+    def test_truncated_adjudication_stops_after_one_compact_repair(self):
+        class AlwaysTruncatedReviewer:
+            calls = 0
+            configs = []
+
+            def __init__(self, **config):
+                self.config = config
+                self.configs.append(config)
+
+            def complete(self, *, system, prompt, images=None):
+                self.__class__.calls += 1
+                return ModelResult(
+                    text='{"schema_version":', model=self.config["model"],
+                    usage={"model_calls": 1, "output_tokens": 4096},
+                    elapsed_seconds=0.01, finish_reason="length")
+
+        model = {
+            "base_url": "http://example.invalid/v1", "model": "primary",
+            "protocol": "openai_compatible", "timeout_seconds": 1,
+            "max_output_tokens": 8192,
+        }
+        with patch("scisaurus.runtime.research_argument.ModelClient", AlwaysTruncatedReviewer):
+            with self.assertRaisesRegex(ValidationError, "truncated"):
+                ArgumentAdjudicator(model).run(
+                    argument(), {"evidence_ids": ["e1", "e2", "e3"]})
+
+        self.assertEqual(AlwaysTruncatedReviewer.calls, 2)
+        self.assertTrue(all(config["max_output_tokens"] == 4096
+                            for config in AlwaysTruncatedReviewer.configs))
 
     def test_final_adjudication_is_preserved_when_argument_never_reaches_accept(self):
         valid = argument()

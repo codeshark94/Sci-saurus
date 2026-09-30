@@ -12,12 +12,15 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from scisaurus.runtime.retrieval import CrossrefClient, MCPFetchClient, _robots_policy
+from scisaurus.runtime.retrieval import (
+    CrossrefClient, MCPFetchClient, _RetrievalFailure, _StdioMCP, _robots_policy,
+)
 from scisaurus.runtime.pdf_text import pdf_capture_budget
 
 
@@ -284,6 +287,19 @@ class TestMCPRetrieval(unittest.TestCase):
 
     def client(self, mode="ok", **kwargs):
         return MCPFetchClient([sys.executable, str(self.script), mode, str(self.log)], **kwargs)
+
+    def test_closed_pipe_after_deadline_is_timeout_even_if_timer_callback_lags(self):
+        class ClosedPipe:
+            def write(self, _data):
+                raise BrokenPipeError("closed")
+
+        session = _StdioMCP(["unused"], 1, 1024, {}, True)
+        session.deadline = time.monotonic() - 1
+        session.process = SimpleNamespace(stdin=ClosedPipe())
+        with self.assertRaises(_RetrievalFailure) as caught:
+            session.send({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+        self.assertEqual(caught.exception.outcome, "timeout")
+        self.assertTrue(session.expired.is_set())
 
     def test_actual_stdio_lifecycle_and_capture_hash(self):
         result = self.client().fetch("https://example.org/source")

@@ -215,7 +215,10 @@ def main(argv=None) -> int:
 
     p_composer = sub.add_parser(
         "run-composer", help="run a project-scoped end-to-end research workflow under Executive Command")
-    p_composer.add_argument("--workflow", required=True, help="immutable composer workflow JSON")
+    p_composer.add_argument(
+        "--workflow", required=True,
+        help="composer workflow JSON; resume supports a bounded-to-deadline continuation update",
+    )
     p_composer.add_argument("--resume", action="store_true", help="resume the matching composer project")
     p_composer.add_argument(
         "--extend-deadline-seconds", type=float,

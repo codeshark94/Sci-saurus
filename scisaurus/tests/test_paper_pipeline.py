@@ -46,7 +46,7 @@ class ManuscriptDraftContractTests(unittest.TestCase):
         runner.model_call_timeout_seconds = 600
         self.assertEqual(runner._client(deadline=deadline).timeout_seconds, 600)
 
-    def test_surgical_repair_uses_local_route_only_after_known_cloud_429(self):
+    def test_surgical_repair_stops_after_cloud_429_without_local_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             cloud = {
                 "protocol": "openai_compatible", "base_url": "http://cloud.test/v1",
@@ -131,17 +131,15 @@ class ManuscriptDraftContractTests(unittest.TestCase):
             with patch("scisaurus.runtime.paper_pipeline.ModelClient", StubClient):
                 repaired, replacements, result = runner._repair(draft, package)
 
-            self.assertEqual(calls, ["deepseek-cloud", "gemma-local"])
-            self.assertEqual(
-                replacements["intro_p1"],
-                "The control produces a stable shear response.",
-            )
+            self.assertEqual(calls, ["deepseek-cloud"])
+            self.assertEqual(replacements, {})
+            self.assertEqual(runner.repair_failures[0]["error"],
+                             "ModelCallError: known quota response")
             self.assertEqual(repaired["sections"][0]["units"][0]["id"], "intro_p1")
-            self.assertEqual(result.usage["model_calls"], 1)
-            attempt = json.loads((Path(directory) /
-                                  "repair-round-1-batch-1-attempt-1.json").read_text())
-            self.assertEqual([item["model"] for item in attempt["provider_route_history"]],
-                             ["deepseek-cloud", "gemma-local"])
+            self.assertEqual(repaired["sections"][0]["units"][0]["text"],
+                             "The control produces a stable shear response.")
+            self.assertEqual(result.finish_reason, "partial")
+            self.assertEqual(result.usage["model_calls"], 0)
 
     def test_accepts_structured_draft(self):
         self.assertEqual(validate_manuscript_draft(self.draft())["title"], "A paper")
@@ -210,6 +208,57 @@ class ManuscriptDraftContractTests(unittest.TestCase):
             self.assertEqual(client.complete.call_count, 1)
             self.assertEqual([item["id"] for item in draft["sections"]], ["introduction", "results"])
             self.assertTrue((Path(directory) / "writer-content-normalization-1.json").is_file())
+
+    def test_writer_continues_a_truncated_manuscript_without_restarting_the_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = PaperPipelineRunner.__new__(PaperPipelineRunner)
+            runner.packet = {"writer_contract": {"section_order": [
+                {"id": "introduction", "title": "Introduction", "unit_ids": ["intro_p1"]},
+            ]}}
+            runner.paper_config = {"title": "Grounded paper", "references": []}
+            runner.model_config = {
+                "base_url": "https://models.example/v1", "protocol": "openai_compatible",
+                "model": "writer", "timeout_seconds": 10, "max_output_tokens": 8192,
+                "context_window_tokens": 65536, "max_input_tokens": 56000,
+            }
+            runner.output = Path(directory)
+            runner.imported_draft = None
+            runner.draft_before_research_review = True
+            runner.current_stage = "composition"
+            runner.deadline = time.monotonic() + 30
+            full_response = json.dumps({
+                "schema_version": "manuscript-draft-2",
+                "title": "Grounded paper",
+                "citation": "markers",
+                "sections": [{"id": "introduction", "title": "Introduction", "units": [{
+                    "id": "intro_p1", "kind": "paragraph",
+                    "text": "A complete, bounded scientific claim.",
+                }]}],
+            })
+            split = full_response.index("bounded") + 3
+            prefix, suffix = full_response[:split], full_response[split:]
+            client = Mock()
+            client.complete.side_effect = [
+                ModelResult(text=prefix, model="writer", usage={"model_calls": 1},
+                            elapsed_seconds=0.01, finish_reason="length"),
+                ModelResult(text=suffix, model="writer", usage={"model_calls": 1},
+                            elapsed_seconds=0.02, finish_reason="stop"),
+            ]
+            with patch.object(runner, "_client", return_value=client), \
+                    patch.object(runner, "_write_run_metadata"):
+                draft, result = runner._writer()
+
+            self.assertEqual(client.complete.call_count, 2)
+            self.assertEqual(client.complete.call_args_list[0].kwargs["prompt"],
+                             client.complete.call_args_list[1].kwargs["prompt"])
+            self.assertNotIn("continuation_text", client.complete.call_args_list[0].kwargs)
+            self.assertEqual(client.complete.call_args_list[1].kwargs["continuation_text"], prefix)
+            self.assertEqual(result.text, full_response)
+            self.assertEqual(result.usage["model_calls"], 2)
+            self.assertEqual(draft["title"], "Grounded paper")
+            second_attempt = json.loads((Path(directory) / "writer-attempt-2.json").read_text())
+            self.assertEqual(second_attempt["response_mode"], "continuation")
+            self.assertEqual(second_attempt["response"], suffix)
 
     def test_rejects_duplicate_unit_identity(self):
         value = self.draft()

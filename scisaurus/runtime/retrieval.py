@@ -540,6 +540,12 @@ class _StdioMCP:
         self.expired.set()
         self._kill()
 
+    def _timed_out(self):
+        if self.expired.is_set() or time.monotonic() >= self.deadline:
+            self.expired.set()
+            return True
+        return False
+
     def _reader(self, name, stream):
         try:
             while not self.stop.is_set():
@@ -567,7 +573,8 @@ class _StdioMCP:
                 pending = pending[written:]
             self.process.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
-            raise _RetrievalFailure("timeout" if self.expired.is_set() else "provider_error", "MCP server closed stdin") from exc
+            outcome = "timeout" if self._timed_out() else "provider_error"
+            raise _RetrievalFailure(outcome, "MCP server closed stdin") from exc
 
     def receive(self):
         while True:
@@ -593,7 +600,8 @@ class _StdioMCP:
             except queue.Empty as exc:
                 raise _RetrievalFailure("timeout", "MCP server did not respond before its deadline") from exc
             if name == "stdout" and not chunk:
-                raise _RetrievalFailure("timeout" if self.expired.is_set() else "provider_error", "MCP server exited before a complete response")
+                outcome = "timeout" if self._timed_out() else "provider_error"
+                raise _RetrievalFailure(outcome, "MCP server exited before a complete response")
             self.bytes_read += len(chunk)
             if self.bytes_read > self.max_bytes:
                 raise _RetrievalFailure("partial", "MCP session exceeded its output byte limit")

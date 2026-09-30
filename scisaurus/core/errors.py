@@ -11,6 +11,13 @@ class ValidationError(ContractError):
     """A record failed schema/field validation."""
 
 
+class ModelContractError(ValidationError):
+    """A generated model response failed its assigned output contract."""
+
+    failure_class = "model_contract"
+    recovery_mode = "format_repair_then_rerun"
+
+
 class ProviderConfigurationError(ValidationError):
     """A required provider cannot be used with the current local configuration.
 

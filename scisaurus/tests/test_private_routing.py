@@ -1,6 +1,8 @@
 """Owner-local model-family routing and shared premium-budget contracts."""
 import sys
+import hashlib
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 
@@ -85,9 +87,9 @@ class TestPrivateRouting(unittest.TestCase):
         )
         self.assertIsNone(config["role_models"]["research.cataloger"].get("auth_env"))
         routes = config["role_routes"]["research.literature-mapper"]
-        self.assertEqual([route["pool"] for route in routes], ["ollama", "ollama", "ollama"])
+        self.assertEqual([route["pool"] for route in routes], ["ollama", "ollama"])
         self.assertEqual([route["id"] for route in routes], [
-            "ollama-qwen-bulk", "ollama-gemma-bulk", "ollama-deepseek",
+            "ollama-gemma-bulk", "ollama-deepseek",
         ])
         self.assertTrue(all(route["base_url"] == "http://127.0.0.1:11434/v1" for route in routes))
         self.assertTrue(all(
@@ -97,6 +99,39 @@ class TestPrivateRouting(unittest.TestCase):
         self.assertNotIn("qwen", {
             route["pool"] for route_list in config["role_routes"].values() for route in route_list
         })
+        self.assertFalse(any(
+            route["id"] == "ollama-qwen-bulk"
+            for route_list in config["role_routes"].values() for route in route_list
+        ))
+        self.assertEqual(
+            len({(route["pool"], route["base_url"], route["model"]) for route in routes}),
+            len(routes),
+        )
+
+    def test_config_builder_help_is_non_destructive(self):
+        configs = PRIVATE_ROOT / "configs"
+        before = {
+            str(path.relative_to(configs)): (
+                path.stat().st_mtime_ns,
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+            for path in configs.rglob("*") if path.is_file()
+        }
+        completed = subprocess.run(
+            [sys.executable, str(PRIVATE_ROOT / "build_configs.py"), "--help"],
+            cwd=PRIVATE_ROOT.parent,
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("usage:", completed.stdout.lower())
+        after = {
+            str(path.relative_to(configs)): (
+                path.stat().st_mtime_ns,
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+            for path in configs.rglob("*") if path.is_file()
+        }
+        self.assertEqual(after, before)
 
     def test_local_qwen_cooldown_recovery_is_removed(self):
         values = self.env(

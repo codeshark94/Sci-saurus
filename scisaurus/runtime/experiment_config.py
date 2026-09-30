@@ -19,6 +19,51 @@ STUDY_TYPES = {"novel_research", "replication", "methods_validation", "explorato
 GAP_STATES = {"eligible_for_experiment", "refuted_by_prior_work", "insufficient_evidence"}
 DIRECTIONS = {"higher", "lower", "descriptive"}
 ASSET_MEDIA_TYPES = {"image/png", "image/jpeg", "application/pdf", "image/svg+xml"}
+EXPERIMENT_WORK_ORDER_KINDS = frozenset({
+    "additional_experiment", "analysis_display", "analysis_repair",
+})
+WORK_ORDER_REQUIRED_FIELDS = frozenset({
+    "id", "kind", "owner", "objective", "why", "success_condition", "evidence_needed",
+})
+WORK_ORDER_OPTIONAL_FIELDS = frozenset({
+    "failure_dossier_ref", "failure_input_sha256", "repair_commands", "acceptance_checks",
+    "review_directives", "model_diagnostics", "recovery_mode", "target_stage_id",
+    "target_stage_kind", "repair_priority", "experiment_repair_plan", "repair_strategy",
+    "attempt_lineage",
+})
+
+
+class ExperimentWorkOrderContractError(ValidationError):
+    """A controller supplied a non-executable or malformed experiment work order."""
+
+    failure_class = "harness_bug"
+
+
+def project_executable_work_orders(requests):
+    """Keep only science work orders and remove Composer-only control metadata."""
+    if requests is None:
+        return []
+    if isinstance(requests, tuple):
+        requests = list(requests)
+    if not isinstance(requests, list):
+        raise ExperimentWorkOrderContractError(
+            "Composer experiment work-order projection must be a list")
+    allowed = WORK_ORDER_REQUIRED_FIELDS | WORK_ORDER_OPTIONAL_FIELDS
+    projected = []
+    for request in requests:
+        if not isinstance(request, dict):
+            raise ExperimentWorkOrderContractError(
+                "Composer experiment work-order projection contains a non-object")
+        if request.get("kind") not in EXPERIMENT_WORK_ORDER_KINDS:
+            continue
+        missing = WORK_ORDER_REQUIRED_FIELDS - set(request)
+        if missing:
+            raise ExperimentWorkOrderContractError(
+                "Composer experiment work order omits required fields: "
+                + ", ".join(sorted(missing)))
+        projected.append({key: deepcopy(value) for key, value in request.items()
+                          if key in allowed})
+    return validate_work_orders(projected)
 
 
 def _positive_number(value, name):
@@ -49,8 +94,51 @@ def _program(value, name):
             raise ValidationError(f"{name}.environment_files must be existing absolute files")
 
 
+def validate_work_orders(value):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ExperimentWorkOrderContractError("work_orders must be a list")
+    seen = set()
+    for order in value:
+        if not isinstance(order, dict):
+            raise ExperimentWorkOrderContractError("work order must be an object")
+        missing = WORK_ORDER_REQUIRED_FIELDS - set(order)
+        unexpected = set(order) - (
+            WORK_ORDER_REQUIRED_FIELDS | WORK_ORDER_OPTIONAL_FIELDS)
+        if missing or unexpected:
+            details = []
+            if missing:
+                details.append("missing " + ", ".join(sorted(missing)))
+            if unexpected:
+                details.append("unexpected " + ", ".join(sorted(unexpected)))
+            raise ExperimentWorkOrderContractError(
+                "work order contract mismatch (" + "; ".join(details) + ")")
+        if order["kind"] == "recovery":
+            raise ExperimentWorkOrderContractError(
+                "Composer recovery directives are control-plane work, not experiment work orders")
+        for key in ("id", "kind"):
+            identifier(order[key])
+        if order["id"] in seen:
+            raise ExperimentWorkOrderContractError(
+                "work order IDs must be unique within an experiment")
+        seen.add(order["id"])
+        for key in WORK_ORDER_REQUIRED_FIELDS - {"id", "kind"}:
+            try:
+                _text(order[key], f"work_orders.{key}")
+            except ValidationError as exc:
+                raise ExperimentWorkOrderContractError(str(exc)) from exc
+        for key in WORK_ORDER_OPTIONAL_FIELDS & set(order):
+            canonical_bytes(order[key])
+    return deepcopy(value)
+
+
 def validate_experiment_config(config, *, require_literature_gate=True):
-    validate_common(config, {"experiment", "time_policy"}, retrieval=False)
+    validate_common(config, {"experiment", "time_policy", "work_orders"}, retrieval=False)
+    work_orders = validate_work_orders(config.get("work_orders"))
+    if work_orders:
+        config = deepcopy(config)
+        config["work_orders"] = work_orders
     repair_mode = config.get("limits", {}).get("repair_mode")
     if repair_mode is not None and repair_mode not in {"bounded", "until_deadline"}:
         raise ValidationError("limits.repair_mode must be bounded or until_deadline")

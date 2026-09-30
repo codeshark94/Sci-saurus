@@ -55,6 +55,19 @@ class TestJSONContract(unittest.TestCase):
                 self.assertEqual(ModelResult(text, "fixture", {}, 0, "stop").json_object(),
                                  {"text": "A literal </think> appears here."})
 
+    def test_model_envelope_escapes_raw_string_controls_without_changing_values(self):
+        raw = '{"evidence":"first line\nsecond line\tindented"}'
+        expected = {"evidence": "first line\nsecond line\tindented"}
+        self.assertEqual(ModelResult(raw, "fixture", {}, 0, "stop").json_object(), expected)
+        with self.assertRaises(ValidationError):
+            SurveyGate._json(raw.encode(), "record")
+        with self.assertRaises(ValidationError):
+            ModelResult('{"evidence":"first"\x01,"ok":true}', "fixture", {}, 0,
+                        "stop").json_object()
+        escaped = '{"evidence":"first\\\nsecond"}'
+        self.assertEqual(ModelResult(escaped, "fixture", {}, 0, "stop").json_object(),
+                         {"evidence": "first\\\nsecond"})
+
     def test_control_records_remain_plain_strict_json(self):
         self.assertEqual(SurveyGate._json(b'{"ok":true}', "record"), {"ok": True})
         for raw in ('```json\n{"ok":true}\n```', 'reasoning</think>{"ok":true}',

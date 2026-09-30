@@ -9,6 +9,7 @@ responsibility of the stage runner and its independent checks.
 
 from __future__ import annotations
 
+import ast
 from copy import deepcopy
 import hashlib
 import itertools
@@ -24,6 +25,7 @@ import shutil
 import sys
 import threading
 import time
+import traceback
 import uuid
 
 from scisaurus.core.errors import (
@@ -44,10 +46,14 @@ from scisaurus.runtime.departments import (
     stage_role,
 )
 from scisaurus.runtime.specialists import (
-    SPECIALIST_SYSTEM, VERIFIER_SYSTEM, SpecialistDispatcher,
-    build_specialist_prompt, build_verifier_prompt, redact_sensitive_text,
+    REPAIR_ADJUDICATION_SYSTEM, SPECIALIST_SYSTEM, VERIFIER_SYSTEM, SpecialistDispatcher,
+    build_repair_adjudication_prompt, build_specialist_prompt,
+    build_verifier_prompt, redact_sensitive_text,
 )
 from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
+from scisaurus.runtime.experiment_config import (
+    EXPERIMENT_WORK_ORDER_KINDS, project_executable_work_orders,
+)
 from scisaurus.runtime.models import (
     DEFAULT_MODEL_RATE_LIMIT_COOLDOWN_SECONDS,
     MAX_MODEL_RATE_LIMIT_COOLDOWN_SECONDS,
@@ -63,6 +69,8 @@ from scisaurus.runtime.topic_discovery import (
     DEFAULT_TOPIC_CONTINUATION_BUDGETS,
     EVIDENCE_MODE_VALUES,
     topic_salvage_plan,
+    topic_requires_source_data,
+    scope_maturity_requirements_to_topic_evidence,
     validate_topic_refinement,
     _topic_validation_rejection_type,
 )
@@ -70,7 +78,42 @@ from scisaurus.runtime.topic_discovery import (
 
 SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
+ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
+EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
+    "experiment-author-bounded-diff-and-resumable-length-continuation-6")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
+RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
+    "continuation_cycle", "prior_capability_repair_attempts",
+})
+REVIEW_EVIDENCE_LABELS = (
+    "Persisted independent-review finding:",
+    "Unverified Methods-panel finding:",
+    "Unverified Methods-panel repair scope:",
+    "Unverified Methods-panel diagnosis hypothesis:",
+    "Unverified Methods-panel proposed change:",
+    "Unverified Methods-verifier hypothesis:",
+    "Unverified Methods-verifier proposed scope:",
+    "Reassess persisted finding against the exact current candidate; do not assume it "
+    "still applies. Finding:",
+)
+
+
+def _atomic_write_bytes(path, body):
+    """Replace a published snapshot without exposing a partially written file."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_bytes(body)
+        os.replace(temporary, target)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 # These are the only stage outcomes that satisfy a downstream dependency in
 # strict policies. ``research_expansion_required`` and ``review_rejected`` are
 # terminal for the current attempt, but ``forward_first`` projects an admitted
@@ -139,6 +182,18 @@ EXPERIMENT_RESULT_METADATA_FIELDS = frozenset({
 })
 MAX_EXPERIMENT_RESULT_PACKAGE_BYTES = 16 * 1024 * 1024
 CAPABILITY_REPAIR_SOURCE_CHARS = 64_000
+CAPABILITY_REPAIR_PANEL_SCHEMA_VERSION = "capability-repair-panel-8"
+CAPABILITY_REPAIR_PANEL_PROMPT_REVISION = "stage-scoped-verifier-and-report-reuse-8"
+CAPABILITY_REPAIR_REVIEW_EVIDENCE_REVISION = "immutable-research-evidence-v2"
+CAPABILITY_REPAIR_UNRESOLVED_SOURCE_FILES = 2
+CAPABILITY_REPAIR_PLAN_SCHEMA_VERSIONS = frozenset({
+    "capability-repair-panel-6", "capability-repair-panel-7",
+    CAPABILITY_REPAIR_PANEL_SCHEMA_VERSION,
+})
+CAPABILITY_REPAIR_REPORT_REUSE_SCHEMA_VERSIONS = frozenset({
+    "capability-repair-panel-5", "capability-repair-panel-6",
+    "capability-repair-panel-7", CAPABILITY_REPAIR_PANEL_SCHEMA_VERSION,
+})
 
 
 def _is_experiment_result_metadata_field(key):
@@ -322,12 +377,6 @@ ARGUMENT_EXPERIMENT_REPAIR_MARKERS = (
 # leaving the stage's verifier and downstream accounting room.
 AUTONOMOUS_FOUNDRY_MODEL_CALL_LIMIT = 12
 FOUNDRY_VERIFIER_MODEL_CALL_RESERVE = 2
-# A pre-execution capability repair panel consists of four methods roles and
-# one independent adversary. Each assignment has one bounded JSON repair slot,
-# so reserve the worst-case envelope before the foundry author is admitted;
-# otherwise the panel can consume the stage quota and the controller will
-# discover the overrun only after dispatching it.
-CAPABILITY_REPAIR_PANEL_MODEL_CALL_RESERVE = 10
 # Workflows created before agenda selection existed retain declaration-order
 # semantics. New autonomous-lab workflows opt into adaptive selection
 # explicitly, so replaying an immutable legacy graph never changes its meaning.
@@ -908,11 +957,10 @@ class ComposerRunner:
         self._restored_agenda_policy = None
         self._restored_topic_lineage_reconciliation = None
         # A hold can echo the same work order in every returned stage packet.
-        # Suppress that exact request for the current Composer invocation after
-        # its owning stage has been attempted.  The set is intentionally
-        # process-local: an explicit resume creates a fresh attempt and may
-        # retry the unresolved request after the operator grants more time.
+        # Persist semantic identities so a resume cannot turn an unchanged
+        # repair into another cycle of the same experiment.
         self._attempted_request_signatures = set()
+        self.format_recovery_ledger = {}
         self.status = "running"
         self._progress_snapshot = {
             "schema_version": "composer-checkpoint-1", "workflow_id": self.workflow["id"],
@@ -931,6 +979,8 @@ class ComposerRunner:
             "continuation_budget_baseline": 0,
             "continuation_budget_used": 0,
             "continuation_pending_stage_ids": [], "active_research_requests": [],
+            "attempted_request_signatures": [],
+            "format_recovery_ledger": {},
             "department_activity": [], "stages": {}, "context": {}, "feedback": [],
             "blockers": [], "active_blockers": [],
             "blocker_counts": {"active": 0, "historical": 0},
@@ -952,9 +1002,40 @@ class ComposerRunner:
             }, "command.composer")
         else:
             head = self.store.head("command/composer/workflow")
-            if head is None or json.loads(self.store.read_body(head["body_hash"])) != self.workflow:
+            workflow_policy_update = None
+            if head is None:
                 raise ValidationError("composer resume workflow does not match the original immutable workflow")
+            stored_workflow = json.loads(self.store.read_body(head["body_hash"]))
+            if stored_workflow != self.workflow:
+                if not self._is_continuation_policy_relaxation(
+                        stored_workflow, self.workflow):
+                    raise ValidationError(
+                        "composer resume workflow does not match the original immutable workflow")
+                workflow_policy_update = {
+                    "previous_workflow_ref": head["artifact_ref"],
+                    "previous_policy": deepcopy(stored_workflow.get("continuation_policy")),
+                    "current_policy": deepcopy(self.workflow.get("continuation_policy")),
+                }
             self._restore()
+            if workflow_policy_update is not None:
+                self._workflow_record = self._publish(
+                    "command/composer/workflow", "note", self.workflow,
+                    "command.composer",
+                    subjects=[workflow_policy_update["previous_workflow_ref"]],
+                )
+                self._publish("inputs/composer-run", "note", {
+                    "schema_version": "composer-run-input-1",
+                    "workflow_ref": self._workflow_record["artifact_ref"],
+                    "run_id": self.run_id,
+                    "resume": True,
+                    "exploration_seed": self.exploration_seed,
+                    "agenda_policy": self._agenda_policy(),
+                    "workflow_policy_update": workflow_policy_update,
+                }, "command.composer",
+                    subjects=[workflow_policy_update["previous_workflow_ref"],
+                              self._workflow_record["artifact_ref"]],
+                )
+                self._checkpoint("resume:continuation_policy_relaxed", force=True)
             if isinstance(self._restored_topic_lineage_reconciliation, dict):
                 self.department_activity.append(
                     deepcopy(self._restored_topic_lineage_reconciliation))
@@ -978,6 +1059,21 @@ class ComposerRunner:
                 0, int(self.continuation_cycles or 0))
             self.active_research_requests = self._scope_active_research_requests(
                 self.active_research_requests)
+            by_id = {item["id"]: item for item in self.workflow.get("stages", [])
+                     if isinstance(item, dict) and isinstance(item.get("id"), str)}
+            survey_evidence_routes = self._reconcile_experiment_survey_evidence_routes(by_id)
+            if survey_evidence_routes:
+                self.department_activity.extend(survey_evidence_routes)
+            refreshed_experiment_reconciliation = (
+                self._refresh_restored_experiment_reconciliation())
+            if refreshed_experiment_reconciliation:
+                self.department_activity.append({
+                    "cycle": self.continuation_cycles,
+                    "action": "refresh_restored_experiment_attempt_evidence",
+                    **refreshed_experiment_reconciliation,
+                })
+                self._checkpoint(
+                    "resume:refresh_experiment_attempt_reconciliation", force=True)
             # A stopped process can leave older generations of department
             # work orders in ``running`` even after the Composer checkpoint
             # has advanced to a newer continuation.  Fence those rows during
@@ -1025,6 +1121,26 @@ class ComposerRunner:
                 os.environ.pop(key, None)
         self._runtime_environment_after = None
 
+    @staticmethod
+    def _is_continuation_policy_relaxation(previous, requested):
+        """Allow only a same-mission switch from bounded continuation to its deadline."""
+        if not isinstance(previous, dict) or not isinstance(requested, dict):
+            return False
+        previous_policy = previous.get("continuation_policy")
+        requested_policy = requested.get("continuation_policy")
+        if (not isinstance(previous_policy, dict)
+                or not isinstance(requested_policy, dict)
+                or previous_policy.get("mode", "bounded") != "bounded"
+                or requested_policy.get("mode") != "until_deadline"
+                or requested_policy.get("max_cycles") is not None):
+            return False
+        return (
+            {key: value for key, value in previous.items()
+             if key != "continuation_policy"}
+            == {key: value for key, value in requested.items()
+                if key != "continuation_policy"}
+        )
+
     def _publish(self, logical_id, artifact_type, body, author, *, subjects=()):
         return self.store.publish_artifact(logical_id=logical_id, artifact_type=artifact_type,
                                            author=author, body=canonical_bytes(body),
@@ -1052,6 +1168,25 @@ class ComposerRunner:
                 self.usage[key] += value
                 actual[key] = value
         return actual
+
+    def _merge_incremental_error_usage(self, error, incremental_usage):
+        """Attach newly consumed work without charging a restored usage snapshot."""
+        if not isinstance(incremental_usage, dict):
+            return error
+        existing = getattr(error, "usage", None)
+        usage = ({} if getattr(error, "usage_is_snapshot", False)
+                 else deepcopy(existing) if isinstance(existing, dict) else {})
+        for key in self.usage:
+            amount = incremental_usage.get(key, 0)
+            if type(amount) not in (int, float) or not math.isfinite(amount) or amount < 0:
+                continue
+            current = usage.get(key, 0)
+            if type(current) not in (int, float) or not math.isfinite(current) or current < 0:
+                current = 0
+            usage[key] = current + amount
+        error.usage = usage
+        error.usage_is_snapshot = False
+        return error
 
     def _sync_foundry_usage(self):
         """Reconcile durable per-request charges with the last usage checkpoint."""
@@ -1088,14 +1223,17 @@ class ComposerRunner:
             and type(baseline.get(key, 0)) in (int, float)
         }
 
-    def _foundry_model_call_budget(self, stage):
+    def _foundry_model_call_budget(self, stage, *, repair_panel_usage=None):
         """Reserve foundry calls inside the experiment stage envelope.
 
         Experiment production runs before its stage reviewers. Reports carried
         into a reopened work order therefore belong to an earlier attempt and
         are already accounted for by that attempt's usage ledger (or are reused
-        with zero new usage). Charging them again here starves the foundry of
-        the calls needed to admit the repaired program.
+        with zero new usage). Before a repair panel runs, reserve its configured
+        worst case. Once it completes, replace that reservation with the calls
+        actually dispatched so unused panel capacity can fund the capability
+        author and its independent admission review without exceeding the stage
+        envelope.
         """
         if not self.workflow.get("capability_foundry_config_path"):
             return None
@@ -1103,13 +1241,38 @@ class ComposerRunner:
         if not isinstance(quota, dict) or type(quota.get("max_model_calls")) is not int:
             return AUTONOMOUS_FOUNDRY_MODEL_CALL_LIMIT
         prior = self._stage_usage(stage["id"]).get("model_calls", 0)
-        repair_panel_reserve = (
-            CAPABILITY_REPAIR_PANEL_MODEL_CALL_RESERVE
-            if self._capability_repair_panel_required(stage) else 0
-        )
+        panel_required = self._capability_repair_panel_required(stage)
+        if repair_panel_usage is None:
+            repair_panel_reserve = (
+                self._capability_repair_panel_model_call_reserve(stage)
+                if panel_required else 0
+            )
+        else:
+            panel_calls = repair_panel_usage.get("model_calls") \
+                if isinstance(repair_panel_usage, dict) else None
+            repair_panel_reserve = (
+                panel_calls if type(panel_calls) is int and panel_calls >= 0
+                else self._capability_repair_panel_model_call_reserve(stage)
+                if panel_required else 0
+            )
         available = quota["max_model_calls"] - prior \
             - FOUNDRY_VERIFIER_MODEL_CALL_RESERVE - repair_panel_reserve
         return max(0, min(AUTONOMOUS_FOUNDRY_MODEL_CALL_LIMIT, available))
+
+    def _capability_repair_panel_model_call_reserve(self, stage):
+        """Reserve the configured Methods and verifier call ceilings, not a stale constant."""
+        route = self.departments.stage_route(stage.get("kind", "experiment"))
+        department = route["department"]
+        appointments = list(route.get("required_roles", []))
+        verifier = self.departments._resolve_assignment(department, "adversary")
+        appointments.append(verifier)
+        return sum(
+            appointment["quota"]["max_calls"]
+            for appointment in appointments
+            if appointment.get("execution_kind") in {"model", "review"}
+            and isinstance(appointment.get("quota"), dict)
+            and type(appointment["quota"].get("max_calls")) is int
+        )
 
     def _capability_repair_panel_required(self, stage):
         """Return whether a fresh capability needs an upper-model design panel."""
@@ -1117,6 +1280,10 @@ class ComposerRunner:
             return False
         context = self.context.get(stage.get("id"), {})
         context = context if isinstance(context, dict) else {}
+        recovery = context.get("failure_recovery")
+        if (isinstance(recovery, dict)
+                and recovery.get("failure_class") == "evidence_input_unavailable"):
+            return False
         error = context.get("error")
         if self._is_pre_execution_capability_failure(stage, context, error):
             return True
@@ -1129,7 +1296,7 @@ class ComposerRunner:
         requests = self._requests_for_stage(stage)
         substantive_repair = any(
             isinstance(item, dict)
-            and item.get("kind") in {"additional_experiment", "analysis_display", "analysis_repair"}
+            and item.get("kind") in EXPERIMENT_WORK_ORDER_KINDS
             for item in requests
         )
         if not substantive_repair:
@@ -1144,6 +1311,89 @@ class ComposerRunner:
     def _foundry_progress(self, stage_id, phase, state):
         self._sync_foundry_usage()
         self._checkpoint(f"{stage_id}:capability_{phase}", force=True)
+
+    def _verified_source_data_manifest(self, stage_id):
+        """Return only current survey data whose immutable source blobs verify."""
+        if not isinstance(stage_id, str):
+            return None
+        stages = {
+            item.get("id"): item for item in self.workflow.get("stages", [])
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        experiment_stage = stages.get(stage_id)
+        if not isinstance(experiment_stage, dict):
+            return None
+        ancestors = self._stage_ancestor_ids(experiment_stage)
+        manifests = []
+        for ancestor_id in ancestors:
+            if stages.get(ancestor_id, {}).get("kind") != "survey":
+                continue
+            context = self.context.get(ancestor_id)
+            if (not isinstance(context, dict)
+                    or context.get("survey_current") is not True
+                    or context.get("assessment_current") is not True):
+                continue
+            manifest = context.get("source_data_manifest")
+            if manifest is not None:
+                manifests.append(manifest)
+        if not manifests:
+            return None
+        if len(manifests) != 1:
+            from scisaurus.runtime.capability_foundry import SourceDataUnavailable
+            raise SourceDataUnavailable(
+                "current survey provides multiple source-data manifests; resolve them into one "
+                "explicit, lineage-bound dataset before experiment authoring")
+        from scisaurus.runtime.capability_foundry import (
+            SourceDataUnavailable, _validate_source_data_manifest,
+        )
+        manifest = manifests[0]
+        try:
+            _validate_source_data_manifest(manifest)
+            for dataset in manifest["datasets"]:
+                source_record = self.store.get(dataset["artifact_ref"])
+                body_hash = source_record.get("body_hash")
+                if not isinstance(body_hash, str):
+                    raise ValidationError("source artifact has no immutable body hash")
+                source_body = self.store.read_body(body_hash)
+                observed_hash = hashlib.sha256(source_body).hexdigest()
+                if (observed_hash != dataset["source_sha256"]
+                        or body_hash != dataset["source_sha256"]):
+                    raise ValidationError("source artifact digest does not match the manifest")
+        except (NotFoundError, OSError, ValidationError, TypeError, KeyError) as exc:
+            raise SourceDataUnavailable(
+                "current survey source-data manifest is invalid or does not resolve to its "
+                "immutable source artifact; do not substitute model-generated values") from exc
+        return deepcopy(manifest)
+
+    @staticmethod
+    def _topic_maturity_requirement_scope(topic, topic_context):
+        """Project only reviewer requirements that still apply to this evidence scope."""
+        topic_context = topic_context if isinstance(topic_context, dict) else {}
+        requirements = topic_context.get("maturity_open_requirements", [])
+        evolution = topic_context.get("topic_evolution")
+        evolution = evolution if isinstance(evolution, dict) else {}
+        changed_dimensions = evolution.get("changed_dimensions", [])
+        changed_dimensions = set(
+            item for item in changed_dimensions if isinstance(item, str)
+        ) if isinstance(changed_dimensions, list) else set()
+        evidence_boundary_changed = (
+            evolution.get("mode") in {"refinement", "pivot"}
+            and bool(changed_dimensions.intersection({
+                "evidence_mode", "data_regime", "measurement",
+            }))
+        )
+        return scope_maturity_requirements_to_topic_evidence(
+            topic, requirements,
+            evidence_boundary_changed=evidence_boundary_changed,
+        )
+
+    @staticmethod
+    def _topic_requires_source_data(topic, topic_context):
+        """Detect empirical values required by the current topic, not its retired parent."""
+        requirement_scope = ComposerRunner._topic_maturity_requirement_scope(
+            topic, topic_context)
+        return topic_requires_source_data(
+            topic, additional_requirements=requirement_scope["active"])
 
     def _incremental_stage_usage(self, stage, usage):
         """Charge only newly consumed work from a resumed runner window."""
@@ -1362,24 +1612,31 @@ class ComposerRunner:
 
     @staticmethod
     def _normalize_topic_intake_failure(error, stage):
-        """Preserve a scientific topic rejection across every runner boundary.
+        """Preserve topic-repair classification across every runner boundary.
 
         A topic validation can be raised after the runner has assembled its
         result (for example while materializing the conditional research
-        program) or before the runner's local exception boundary.  Both are
-        candidate-level scientific rejections and must enter the same fresh
-        exploration path instead of becoming a generic transient retry.
+        program) or before the runner's local exception boundary. Execution
+        inventory errors are repairable contract failures, never evidence to
+        reject or replace the scientific question.
         """
         if stage.get("kind") != "topic_discovery":
             return error
         if getattr(error, "retryable_topic_intake", False):
             return error
         rejection_type = _topic_validation_rejection_type(error)
-        if rejection_type not in {"feasibility", "novelty"}:
+        if rejection_type not in {
+                "feasibility_contract", "novelty", "refinement_contract"}:
             return error
         setattr(error, "retryable_topic_intake", True)
         setattr(error, "topic_intake_recoverable", True)
-        setattr(error, "topic_retry_reason", "scientific_candidate_rejected")
+        setattr(
+            error, "topic_retry_reason",
+            "refinement_contract_failure" if rejection_type == "refinement_contract"
+            else ("intake_contract_failure"
+                  if rejection_type == "feasibility_contract"
+                  else "scientific_candidate_rejected"),
+        )
         return error
 
     @staticmethod
@@ -1552,10 +1809,16 @@ class ComposerRunner:
 
     def _stage_experiment_capability_id(self, stage):
         """Return the capability identity expected by an experiment stage."""
+        return self._stage_experiment_capability_id_from_context(
+            self.workflow, getattr(self, "context", {}), stage)
+
+    @staticmethod
+    def _stage_experiment_capability_id_from_context(workflow, context_by_stage, stage):
+        """Resolve an experiment capability from its current topic lineage."""
         if not isinstance(stage, dict) or stage.get("kind") != "experiment":
             return None
         by_id = {
-            item.get("id"): item for item in self.workflow.get("stages", [])
+            item.get("id"): item for item in workflow.get("stages", [])
             if isinstance(item, dict) and isinstance(item.get("id"), str)
         }
         pending = list(stage.get("depends_on", []))
@@ -1567,7 +1830,7 @@ class ComposerRunner:
             seen.add(stage_id)
             ancestor = by_id[stage_id]
             if ancestor.get("kind") == "topic_discovery":
-                context = self.context.get(stage_id, {})
+                context = context_by_stage.get(stage_id, {})
                 if isinstance(context, dict):
                     topic = context.get("topic")
                     if isinstance(topic, dict) and isinstance(
@@ -1754,18 +2017,35 @@ class ComposerRunner:
         failure_recovery = context.get("failure_recovery")
         if not isinstance(failure_recovery, dict):
             failure_recovery = {}
+        current_failure_class = classify_failure(
+            "experiment", error if error is not None else context.get("error"))
+        if (current_failure_class == "resource_fence"
+                or context.get("failure_class") == "resource_fence"
+                or failure_recovery.get("failure_class") == "resource_fence"):
+            return False
+        if (current_failure_class == "harness_bug"
+                or context.get("failure_class") == "harness_bug"):
+            return False
+        if current_failure_class == "experiment_failure":
+            # A current, concrete executor/result failure supersedes stale
+            # format-recovery state from an earlier author response.
+            return True
+        if failure_recovery.get("requires_capability_repair") is True:
+            # A later transport failure must not erase the typed scientific
+            # rejection retained in the same checkpoint.
+            return True
         # A malformed provider envelope is a transport/model-contract
         # recovery, not a failed scientific capability.  Counting it against
         # the pre-execution design lease used to authorize an empty
         # experiment handoff after many retries.
-        if (failure_recovery.get("failure_class") == "model_contract"
+        if (context.get("failure_class") == "model_contract"
+                or failure_recovery.get("failure_class") == "model_contract"
                 or failure_recovery.get("recovery_mode") == "format_repair_then_rerun"
-                or context.get("review_status") == "model_contract_repair"):
+                or context.get("review_status") in {
+                    "model_contract_repair", "format_recovery_exhausted"}
+                or (context.get("format_recovery") is True
+                    and context.get("format_recovery_dispatched") is True)):
             return False
-        if failure_recovery.get("requires_capability_repair") is True:
-            # A failed executable is a repairable pre-execution capability
-            # failure even when the runner never produced a JSON result.
-            return True
         messages = [str(error or ""), str(context.get("error") or "")]
         debt = context.get("failure_debt")
         if isinstance(debt, dict):
@@ -1804,8 +2084,11 @@ class ComposerRunner:
                 recovery.get("recovery_mode") in {
                     "repair_then_rerun", "format_repair_then_rerun",
                     "experiment_diagnose_patch_execute_recalculate",
+                    "refine_topic_to_available_evidence",
                 }
-                or recovery.get("failure_class") == "model_contract"
+                or recovery.get("failure_class") in {
+                    "model_contract", "evidence_input_unavailable",
+                }
                 or context.get("review_status") == "model_contract_repair"
                 or context.get("format_recovery") is True
             )
@@ -1921,6 +2204,247 @@ class ComposerRunner:
             and request.get("owner") == "methods.validation"
         )
 
+    def _unresolved_experiment_attempt_inventory(self, stage, context, *, include_paths=False):
+        """Merge the scoped checkpoint ledger with any carried recovery summary.
+
+        Recovery directives are durable snapshots and can predate later
+        interrupted attempts.  The experiment stage history is authoritative
+        for those attempts; never let a stale empty summary authorize an
+        equivalent execution.
+        """
+        context = context if isinstance(context, dict) else {}
+        current_topic = self._current_topic_identity()
+        current_topic_id = (
+            current_topic.get("topic_id") if isinstance(current_topic, dict) else None
+        )
+        inventory = {}
+
+        def include(value, *, checkpoint=False):
+            if not isinstance(value, dict):
+                return
+            state = value.get("state")
+            if state not in {"started", "unknown", "result_unknown"}:
+                return
+            topic_id = value.get("topic_id")
+            if (isinstance(current_topic_id, str) and isinstance(topic_id, str)
+                    and topic_id != current_topic_id):
+                return
+            fields = (
+                "attempt_id", "attempt_number", "cycle", "state", "external_ref",
+                "topic_id", "topic_cycle", "result_manifest",
+            )
+            if include_paths:
+                fields += ("project_dir",)
+            summary = {
+                key: value[key]
+                for key in fields
+                if key in value
+            }
+            identity = summary.get("attempt_id")
+            if not isinstance(identity, str) or not identity:
+                identity = (summary.get("attempt_number"), summary.get("cycle"))
+            prior = inventory.get(identity, {})
+            if checkpoint:
+                prior.update(summary)
+            else:
+                for key, item in summary.items():
+                    prior.setdefault(key, item)
+            inventory[identity] = prior
+
+        carried = context.get("unresolved_prior_attempts")
+        for item in carried if isinstance(carried, list) else []:
+            include(item)
+
+        stage_record = self.stage_records.get(stage.get("id")) if isinstance(stage, dict) else None
+        stage_record = stage_record if isinstance(stage_record, dict) else {}
+        history = stage_record.get("attempts")
+        for item in history if isinstance(history, list) else []:
+            include(item, checkpoint=True)
+
+        # The active outer attempt may not yet have been appended to its
+        # history.  Record it as unresolved so the resulting order can require
+        # ledger reconciliation before any equivalent code execution.
+        attempt_id = stage_record.get("attempt_id")
+        if (stage_record.get("status") in {"running", "retrying"}
+                and isinstance(attempt_id, str) and attempt_id):
+            include({
+                "attempt_id": attempt_id,
+                "attempt_number": stage_record.get("attempt_number"),
+                "cycle": self.continuation_cycles,
+                "state": "started",
+                "external_ref": stage_record.get("external_ref"),
+                "topic_id": stage_record.get("topic_id"),
+                "topic_cycle": stage_record.get("topic_cycle"),
+                "result_manifest": stage_record.get("result_manifest"),
+                "project_dir": stage_record.get("project_dir"),
+            }, checkpoint=True)
+
+        def sort_key(item):
+            return (
+                item.get("cycle") if type(item.get("cycle")) is int else -1,
+                item.get("attempt_number") if type(item.get("attempt_number")) is int else -1,
+                str(item.get("attempt_id", "")),
+            )
+
+        return sorted(inventory.values(), key=sort_key)
+
+    def _experiment_attempt_reconciliation(self, stage, context):
+        """Summarize every unresolved same-lineage attempt for a repair order."""
+        unresolved = self._unresolved_experiment_attempt_inventory(stage, context)
+        detailed_inventory = self._unresolved_experiment_attempt_inventory(
+            stage, context, include_paths=True)
+        topic_stage = next((item for item in self.workflow.get("stages", [])
+                            if isinstance(item, dict)
+                            and item.get("kind") == "topic_discovery"), None)
+        topic_context = (self.context.get(topic_stage.get("id"))
+                         if isinstance(topic_stage, dict) else None)
+        topic_context = topic_context if isinstance(topic_context, dict) else {}
+        selected_topic = topic_context.get("topic")
+        evidence = self._unresolved_prior_attempt_evidence(
+            stage, detailed_inventory,
+            selected_topic=selected_topic if isinstance(selected_topic, dict) else None,
+        )
+        records = evidence.get("records")
+        records = records if isinstance(records, dict) else {}
+        worker_results = evidence.get("worker_results")
+        worker_results = worker_results if isinstance(worker_results, dict) else {}
+        evidence_records = []
+        for item in detailed_inventory:
+            attempt_number = item.get("attempt_number")
+            cycle = item.get("cycle")
+            key = (f"cycle-{cycle}-attempt-{attempt_number}"
+                   if type(cycle) is int and type(attempt_number) is int else None)
+            record = records.get(key) if isinstance(key, str) else None
+            record = record if isinstance(record, dict) else {}
+            attempt_record = {
+                field: item.get(field)
+                for field in ("attempt_id", "attempt_number", "cycle", "state",
+                              "topic_id", "topic_cycle")
+                if item.get(field) is not None
+            }
+            attempt_record["external_ref_recorded"] = bool(item.get("external_ref"))
+            attempt_record["classification"] = record.get(
+                "classification", "attempt_path_unavailable"
+            )
+            for field in ("stage_run", "stage_progress", "stage_result_check",
+                          "generated_programs"):
+                value = record.get(field)
+                if value is not None:
+                    attempt_record[field] = deepcopy(value)
+            worker_rows = worker_results.get(key, []) if isinstance(key, str) else []
+            if isinstance(worker_rows, list):
+                attempt_record["worker_result_count"] = len(worker_rows)
+                attempt_record["workers"] = [{
+                    field: worker.get(field)
+                    for field in ("task_id", "ok", "operation_outcome", "process_returncode",
+                                  "capture_truncated", "capture_incomplete",
+                                  "observation_count", "metric_count", "task_ledger")
+                    if worker.get(field) is not None
+                } for worker in worker_rows[:4] if isinstance(worker, dict)]
+            evidence_records.append(attempt_record)
+        artifact_evidence = {
+            "attempt_count": evidence.get("attempt_count", 0),
+            "inspected_count": evidence.get("inspected_count", 0),
+            "missing_directory_count": evidence.get("missing_directory_count", 0),
+            "recorded_attempt_count": len(evidence_records),
+            "records": evidence_records,
+            "admission_rule": evidence.get("admission_rule"),
+        }
+        artifact_evidence["sha256"] = hashlib.sha256(
+            canonical_bytes(artifact_evidence)).hexdigest()
+        return {
+            "required": bool(unresolved),
+            "unresolved_attempt_count": len(unresolved),
+            "unresolved_attempts_sha256": hashlib.sha256(
+                canonical_bytes(unresolved)).hexdigest(),
+            "recent_unresolved_attempts": deepcopy(unresolved[-8:]),
+            "omitted_attempt_count": max(0, len(unresolved) - 8),
+            "artifact_evidence": artifact_evidence,
+            "rule": (
+                "The controller's checkpoint attempt ledger is authoritative. Before equivalent "
+                "execution, reconcile every listed same-lineage attempt against its task ledger, "
+                "run/progress report, worker result, and canonical stage result. A successful worker "
+                "subprocess without an acknowledged stage result is not a released scientific result; "
+                "generated source or figures alone are not results. Reuse prior output only when "
+                "capability, input, source identity, and current independent checks agree. Keep "
+                "ambiguous outcomes unresolved; launch equivalent work only after a material "
+                "source/design change and evidence that no equivalent operation remains active."
+            ),
+        }
+
+    def _refresh_restored_experiment_reconciliation(self):
+        """Refresh persisted experiment repair orders from the current attempt ledger."""
+        stage = next((item for item in self.workflow.get("stages", [])
+                      if isinstance(item, dict) and item.get("kind") == "experiment"), None)
+        if not isinstance(stage, dict):
+            return None
+        context = self.context.get(stage.get("id"))
+        if not isinstance(context, dict):
+            return None
+        reconciliation = self._experiment_attempt_reconciliation(stage, context)
+        refreshed_ids = set()
+
+        def refresh(value, *, trusted_container=False):
+            if not isinstance(value, dict):
+                return
+            plan = value.get("experiment_repair_plan")
+            if not isinstance(plan, dict):
+                return
+            lineage = plan.get("lineage")
+            if (not isinstance(lineage, dict)
+                    or "prior_attempt_reconciliation" not in lineage
+                    or (not trusted_container
+                        and self._request_target_kind(value) != "experiment")):
+                return
+            objective = value.get("objective")
+            if isinstance(objective, str) and objective:
+                label_pattern = "(?:" + "|".join(
+                    re.escape(label) for label in REVIEW_EVIDENCE_LABELS) + ")"
+                nested_labels = re.compile(
+                    rf"(?P<label>{label_pattern})(?:\s*{label_pattern})+")
+                normalized_objective = nested_labels.sub(
+                    lambda match: f"{match.group('label')} ", objective)
+                if normalized_objective != objective:
+                    value["objective"] = normalized_objective
+                    request_id = value.get("id")
+                    if isinstance(request_id, str):
+                        refreshed_ids.add(request_id)
+            request_lineage = value.get("attempt_lineage")
+            if (isinstance(request_lineage, dict)
+                    and "prior_attempt_reconciliation" in request_lineage
+                    and request_lineage["prior_attempt_reconciliation"] != reconciliation):
+                request_lineage["prior_attempt_reconciliation"] = deepcopy(reconciliation)
+                request_id = value.get("id")
+                if isinstance(request_id, str):
+                    refreshed_ids.add(request_id)
+            if lineage["prior_attempt_reconciliation"] != reconciliation:
+                lineage["prior_attempt_reconciliation"] = deepcopy(reconciliation)
+                request_id = value.get("id")
+                if isinstance(request_id, str):
+                    refreshed_ids.add(request_id)
+
+        refresh(context, trusted_container=True)
+        for field in ("research_requests", "research_expansion_requests",
+                      "deferred_research_requests"):
+            requests = context.get(field)
+            if isinstance(requests, list):
+                for request in requests:
+                    refresh(request)
+        deferred = context.get("deferred_experiment_repair")
+        refresh(deferred, trusted_container=True)
+        recovery = context.get("failure_recovery")
+        refresh(recovery, trusted_container=True)
+        for request in self.active_research_requests:
+            refresh(request)
+        if not refreshed_ids:
+            return None
+        return {
+            "stage_id": stage["id"],
+            "request_ids": sorted(refreshed_ids),
+            "unresolved_attempt_count": reconciliation["unresolved_attempt_count"],
+            "artifact_evidence_sha256": reconciliation["artifact_evidence"]["sha256"],
+        }
+
     def _autonomous_experiment_repair_request(self, stage, context, error,
                                                repair_attempts):
         """Create a concrete code-and-evidence repair order for one lineage.
@@ -1933,6 +2457,16 @@ class ComposerRunner:
         if not isinstance(stage, dict) or stage.get("kind") != "experiment":
             return None
         context = context if isinstance(context, dict) else {}
+        deferred_repair = context.get("deferred_experiment_repair")
+        if isinstance(deferred_repair, dict):
+            context = deepcopy(context)
+            for key in (
+                    "experiment_repair_plan", "capability_repair_panel",
+                    "specialist_reports", "specialist_verifier",
+                    "deferred_preexecution_review"):
+                if not context.get(key) and deferred_repair.get(key) is not None:
+                    context[key] = deepcopy(deferred_repair[key])
+            context.pop("deferred_experiment_repair", None)
         recovery = context.get("failure_recovery")
         recovery = recovery if isinstance(recovery, dict) else {}
         history = context.get("experiment_repair_history")
@@ -1941,21 +2475,119 @@ class ComposerRunner:
         panel = panel if isinstance(panel, dict) else {}
         panel_verifier = panel.get("verifier")
         panel_verifier = panel_verifier if isinstance(panel_verifier, dict) else {}
+        diagnostics = recovery.get("model_diagnostics")
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        prior_feedback = diagnostics.get("repair_feedback")
+        prior_feedback = prior_feedback if isinstance(prior_feedback, dict) else {}
+        pending_prior_issues = prior_feedback.get("prior_issues_pending_reassessment")
+        pending_prior_issues = (
+            pending_prior_issues if isinstance(pending_prior_issues, list) else [])
+
+        evidence_labels = REVIEW_EVIDENCE_LABELS
 
         def evidence_strings(value):
             if not isinstance(value, list):
                 return []
-            return [item.strip()[:1400] for item in value
-                    if isinstance(item, str) and item.strip()]
+            cleaned = []
+            for item in value:
+                if not isinstance(item, str) or not item.strip():
+                    continue
+                text = item.strip()
+                previous = None
+                while text != previous:
+                    previous = text
+                    for label in evidence_labels:
+                        if text.startswith(label):
+                            text = text[len(label):].lstrip()
+                            break
+                if text:
+                    cleaned.append(text[:1400])
+            return cleaned
 
-        root_causes = evidence_strings(panel.get("root_causes"))
-        required_changes = evidence_strings(panel.get("required_changes"))
-        reviewer_evidence = list(dict.fromkeys([
-            *root_causes,
-            *required_changes,
-            *evidence_strings(panel_verifier.get("critical_findings")),
-            *evidence_strings(panel_verifier.get("repair_scope")),
-        ]))[:12]
+        def unique_evidence(values, limit):
+            result = []
+            seen = set()
+            for item in values:
+                if not isinstance(item, str) or not item.strip():
+                    continue
+                raw = item.strip()
+                text = raw
+                first_label = ""
+                previous = None
+                while text != previous:
+                    previous = text
+                    for label in evidence_labels:
+                        if text.startswith(label):
+                            if not first_label:
+                                first_label = label
+                            text = text[len(label):].lstrip()
+                            break
+                if not text:
+                    continue
+                key = " ".join(text.split()).casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(f"{first_label}{text}"[:1400])
+                if len(result) >= limit:
+                    break
+            return result
+
+        # Checkpoint panels written by older runtimes called model-generated
+        # findings "root_causes". They remain reviewer hypotheses until
+        # reproduced from source, observations, or deterministic validation.
+        diagnostic_hypotheses = evidence_strings(
+            panel.get("diagnostic_hypotheses") or panel.get("root_causes"))
+        proposed_changes = evidence_strings(
+            panel.get("proposed_changes") or panel.get("required_changes"))
+        prior_plan = context.get("experiment_repair_plan")
+        prior_plan_evidence = evidence_strings(
+            prior_plan.get("review_evidence") if isinstance(prior_plan, dict) else None)
+        current_reviewer_evidence = unique_evidence([
+            *(f"Persisted independent-review finding: {item}"
+              for item in prior_plan_evidence),
+            *(f"Unverified Methods-panel finding: {item}"
+              for item in evidence_strings(panel.get("critical_findings"))),
+            *(f"Unverified Methods-panel repair scope: {item}"
+              for item in evidence_strings(panel.get("repair_scope"))),
+            *(f"Unverified Methods-panel diagnosis hypothesis: {item}"
+              for item in diagnostic_hypotheses),
+            *(f"Unverified Methods-panel proposed change: {item}"
+              for item in proposed_changes),
+            *(f"Unverified Methods-verifier hypothesis: {item}"
+              for item in evidence_strings(panel_verifier.get("critical_findings"))),
+            *(f"Unverified Methods-verifier proposed scope: {item}"
+              for item in evidence_strings(panel_verifier.get("repair_scope"))),
+        ], 12)
+        pending_issue_evidence = []
+        pending_prior_issue_records = []
+        for item in pending_prior_issues:
+            if not isinstance(item, dict):
+                continue
+            finding = item.get("finding")
+            evidence = item.get("evidence")
+            required_change = item.get("required_change")
+            if not all(isinstance(value, str) and value.strip()
+                       for value in (finding, evidence, required_change)):
+                continue
+            pending_prior_issue_records.append({
+                "finding": finding.strip()[:1200],
+                "evidence": evidence.strip()[:1000],
+                "required_change": required_change.strip()[:1000],
+                **({"review_check_id": item["review_check_id"]}
+                   if isinstance(item.get("review_check_id"), str) else {}),
+            })
+            pending_issue_evidence.append(
+                "Reassess persisted finding against the exact current candidate; do not assume it "
+                f"still applies. Finding: {finding.strip()[:600]} Evidence: "
+                f"{evidence.strip()[:500]} Required change if still supported: "
+                f"{required_change.strip()[:500]}"
+            )
+        reviewer_evidence = unique_evidence([
+            *pending_issue_evidence, *current_reviewer_evidence,
+        ], 12)
+        if pending_issue_evidence:
+            pending_issue_evidence = pending_issue_evidence[:12]
         if not reviewer_evidence:
             directives = recovery.get("review_directives")
             if isinstance(directives, list):
@@ -1966,21 +2598,30 @@ class ComposerRunner:
                     and isinstance(item.get("text"), str)
                     and item["text"].strip()
                 ))[:12]
+        survey_request = self._route_unexecuted_experiment_to_survey(
+            stage, context, error, reviewer_evidence)
+        if survey_request is not None:
+            return survey_request
         repair_axis = "review_directed" if reviewer_evidence else "failure_directed"
         repair_instruction = (
-            "Resolve the latest independent Methods panel's root-cause findings and required changes. "
-            "Treat that evidence as authoritative; do not substitute an unrelated generic repair axis."
+            "Reassess every retained independent-review finding as a hypothesis, not a confirmed defect. "
+            "Reproduce it against the exact current executor, validator, raw observations, and result; "
+            "repair only if the defect is confirmed. If the evidence contradicts the review, record the "
+            "contradiction and preserve the supported result or claim scope. Do not blindly replay an old "
+            "diff or substitute a generic repair."
             if reviewer_evidence else
             "Diagnose and repair the exact failed mechanism or execution assumption recorded in the "
             "immutable failure evidence before changing unrelated design dimensions."
         )
         repair_evidence = (
-            "Every applicable reviewer-directed correction is tied to an executor or validator change, "
-            "then replayed in a fresh namespace and independently recalculated."
+            "Every review hypothesis is either confirmed and repaired with a fresh replay, disproved with "
+            "reproducible evidence, or recorded as a bounded unresolved limitation; independently "
+            "recalculate any resulting scientific claim."
             if reviewer_evidence else
             "The diagnosed failure is bound to source or a deterministic check, corrected in the "
             "executor and validator as applicable, then replayed and independently recalculated."
         )
+        prior_attempt_reconciliation = self._experiment_attempt_reconciliation(stage, context)
         cycle = self.continuation_cycles + 1
         digest = str(
             recovery.get("input_sha256")
@@ -1995,15 +2636,26 @@ class ComposerRunner:
         commands = deepcopy(commands) if isinstance(commands, list) else []
         commands.extend([
             {
+                "id": "methods-reconcile-prior-attempts",
+                "operation": "inspect",
+                "target": "all unresolved prior experiment attempts in the repair context",
+                "instruction": prior_attempt_reconciliation["rule"],
+                "acceptance_check": (
+                    "The controller has classified the full checkpoint inventory represented by its "
+                    "digest; no equivalent unresolved operation is dispatched."
+                ),
+            },
+            {
                 "id": "methods-diagnose-source-and-trace",
                 "operation": "inspect",
                 "target": "the exact executor, validator, raw trace, and failed gate",
                 "instruction": (
                     "Reconstruct the failure from the immutable dossier before editing code; "
-                    "identify the first invalid scientific assumption and bind it to a source line, "
-                    "observed field, or deterministic check."
+                    "treat reviewer diagnoses as hypotheses and bind any confirmed invalid assumption "
+                    "to a source line, observed field, or deterministic check; document contradicted "
+                    "hypotheses without forcing an edit."
                 ),
-                "acceptance_check": "The repair plan names the failed assumption and the evidence that falsifies it.",
+                "acceptance_check": "Each diagnosis is confirmed by evidence, contradicted with evidence, or explicitly bounded as unresolved.",
             },
             {
                 "id": "methods-edit-executor-and-validator",
@@ -2028,7 +2680,11 @@ class ComposerRunner:
         ])
         checks = recovery.get("acceptance_checks")
         checks = deepcopy(checks) if isinstance(checks, list) else []
-        checks.extend([repair_evidence, "The repaired code is executed in a new immutable attempt namespace."])
+        checks.extend([
+            repair_evidence,
+            "The repaired code is executed in a new immutable attempt namespace.",
+            "Prior unknown attempts are reconciled before any equivalent execution is dispatched.",
+        ])
         plan = {
             "schema_version": "experiment-repair-plan-1",
             "mode": "diagnose_patch_execute_recalculate",
@@ -2038,19 +2694,25 @@ class ComposerRunner:
                 "continuation_cycle": cycle,
                 "failure_input_sha256": recovery.get("input_sha256") or context.get("failure_input_sha256"),
                 "prior_gate": prior_gate,
+                "prior_attempt_reconciliation": prior_attempt_reconciliation,
             },
             "design_axis": repair_axis,
             "instruction": repair_instruction,
             "required_evidence": repair_evidence,
             "review_evidence": reviewer_evidence,
-            "root_causes": root_causes[:8],
-            "required_changes": required_changes[:8],
+            "root_causes": [],
+            "required_changes": [],
+            "diagnostic_hypotheses": diagnostic_hypotheses[:8],
+            "proposed_changes": proposed_changes[:8],
+            "prior_findings_to_reassess": pending_prior_issue_records[:12],
             "must_preserve": [
                 "the admitted topic and exact research question",
                 "the prior failure dossier and raw diagnostic evidence",
                 "independent validation rather than executor self-confirmation",
+                "unresolved attempt states until their durable outcomes are reconciled",
             ],
-            "must_change": reviewer_evidence[:8] or [repair_instruction],
+            "must_verify": reviewer_evidence[:8],
+            "must_change": [],
             "prohibited": [
                 "forwarding an unexecuted result to interpretation",
                 "patching result JSON instead of the executable source",
@@ -2086,11 +2748,13 @@ class ComposerRunner:
             )[:1800],
             "success_condition": (
                 "The repaired executor and validator run in a fresh namespace, every primary outcome "
-                "is independently recalculated, and the result is admitted or recorded as a bounded negative result."
+                "is independently recalculated, unresolved prior attempts are reconciled without blind "
+                "replay, and the result is admitted or recorded as a bounded negative result."
             ),
             "evidence_needed": (
                 "Immutable failure dossier, exact executor/validator sources, raw observations, "
-                "execution trace, deterministic replay, independent recalculation, and adversarial review."
+                "execution trace, each unresolved prior attempt's durable status/result evidence, "
+                "deterministic replay, independent recalculation, and adversarial review."
             ),
             "source_stage_id": stage.get("id"),
             "failure_dossier_ref": recovery.get("dossier_ref") or context.get("failure_dossier_ref"),
@@ -2140,6 +2804,346 @@ class ComposerRunner:
             context["failure_recovery"] = recovery
         self.context[stage["id"]] = context
         return request
+
+    def _route_unexecuted_experiment_to_survey(self, stage, context, error,
+                                               reviewer_evidence=None):
+        """Resolve an admitted pilot's evidence deficit before repairing code.
+
+        A code-capability repair is not actionable when the current same-topic
+        survey explicitly admitted only an exploratory pilot for insufficient
+        evidence. Give Research one source-backed acquisition pass first; the
+        Methods repair remains deferred until the scientific input is usable.
+        """
+        if not self._is_pre_execution_capability_failure(stage, context, error):
+            failure_text = error if error is not None else context.get("error")
+            is_reproducible_harness_failure = (
+                isinstance(stage, dict)
+                and stage.get("kind") == "experiment"
+                and isinstance(context, dict)
+                and context.get("results_status") in {None, "not_executed"}
+                and classify_failure("experiment", failure_text) == "harness_bug"
+                and not self._has_executed_experiment_result(
+                    context, self._stage_experiment_capability_id(stage),
+                    project_dir=self._current_experiment_result_project_dir(stage))
+            )
+            if not is_reproducible_harness_failure:
+                return None
+        by_id = {
+            item.get("id"): item for item in self.workflow.get("stages", [])
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        pending = list(stage.get("depends_on", []))
+        seen = set()
+        survey_stage = None
+        survey_context = None
+        while pending:
+            stage_id = pending.pop(0)
+            if stage_id in seen:
+                continue
+            seen.add(stage_id)
+            candidate = by_id.get(stage_id)
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("kind") == "survey":
+                candidate_context = self.context.get(stage_id)
+                if (isinstance(candidate_context, dict)
+                        and self._request_context_matches_current_topic(
+                            stage_id, candidate_context)):
+                    survey_stage = candidate
+                    survey_context = candidate_context
+                    break
+            pending.extend(candidate.get("depends_on", []))
+        if not isinstance(survey_stage, dict) or not isinstance(survey_context, dict):
+            return None
+        topic_stage = self._topic_stage_for_survey(survey_stage)
+        if not isinstance(topic_stage, dict):
+            return None
+        topic_context = self.context.get(topic_stage["id"])
+        topic_context = topic_context if isinstance(topic_context, dict) else {}
+        topic = topic_context.get("topic")
+        topic = topic if isinstance(topic, dict) else {}
+        topic_id = topic.get("id")
+        question = topic.get("research_question") or topic.get("question")
+        identity = self._current_topic_identity()
+        if (not isinstance(topic_id, str) or not topic_id
+                or not isinstance(question, str) or not question.strip()
+                or not isinstance(identity, dict)
+                or identity.get("topic_id") != topic_id
+                or survey_context.get("gap_state") != "insufficient_evidence"
+                or survey_context.get("topic_admission") != "exploratory_pilot"
+                or survey_context.get("survey_current") is not True
+                or survey_context.get("assessment_current") is not True):
+            return None
+        expansion_history = context.get("survey_evidence_expansion_history")
+        expansion_history = expansion_history if isinstance(expansion_history, list) else []
+        if any(isinstance(item, dict)
+               and item.get("topic_id") == identity["topic_id"]
+               and item.get("topic_cycle") == identity["topic_cycle"]
+               for item in expansion_history):
+            return None
+        survey_lineage = survey_context.get("topic_lineage")
+        survey_cycles = [value for value in (
+            survey_lineage.get("topic_cycle") if isinstance(survey_lineage, dict) else None,
+            survey_context.get("topic_cycle"),
+        ) if type(value) is int and value >= 0]
+        if any(value != identity["topic_cycle"] for value in survey_cycles):
+            return None
+        deferred_survey_orders = survey_context.get("deferred_research_requests")
+        if isinstance(deferred_survey_orders, list) and any(
+                isinstance(item, dict)
+                and item.get("kind") == "literature_expansion"
+                and item.get("owner") == "research.intelligence"
+                for item in deferred_survey_orders):
+            return None
+
+        review_items = []
+        for item in reviewer_evidence if isinstance(reviewer_evidence, list) else []:
+            if isinstance(item, str) and item.strip():
+                review_items.append(item.strip()[:1400])
+        for source in (
+                context.get("experiment_repair_plan"),
+                context.get("capability_repair_panel"),
+                context.get("specialist_verifier")):
+            if not isinstance(source, dict):
+                continue
+            for key in ("review_evidence", "critical_findings", "repair_scope",
+                        "diagnostic_hypotheses", "required_changes", "root_causes"):
+                value = source.get(key)
+                if isinstance(value, list):
+                    review_items.extend(item.strip()[:1400] for item in value
+                                        if isinstance(item, str) and item.strip())
+        for request in self.active_research_requests:
+            if (not isinstance(request, dict)
+                    or request.get("source_stage_id") != stage.get("id")):
+                continue
+            directives = request.get("review_directives")
+            if isinstance(directives, list):
+                review_items.extend(
+                    item["text"].strip()[:1400] for item in directives
+                    if isinstance(item, dict) and isinstance(item.get("text"), str)
+                    and item["text"].strip())
+        review_items = list(dict.fromkeys(review_items))[:12]
+        topic_cycle = identity["topic_cycle"]
+        survey_ref = survey_context.get("survey_ref")
+        assessment_ref = survey_context.get("assessment_ref")
+        safe_topic = re.sub(r"[^a-z0-9-]+", "-", topic_id.casefold()).strip("-")[:24]
+        request = {
+            "id": f"auto-survey-evidence-{safe_topic or 'topic'}",
+            "kind": "literature_expansion",
+            "owner": "research.intelligence",
+            "source_stage_id": stage["id"],
+            "target_stage_id": survey_stage["id"],
+            "target_stage_kind": "survey",
+            "topic_id": topic_id,
+            "topic_cycle": topic_cycle,
+            "repair_priority": "immediate",
+            "recovery_mode": "survey_evidence_before_experiment_repair",
+            "objective": (
+                "Resolve the missing literature evidence for the current question before any further "
+                "experiment-code repair. Preserve the same physical phenomenon and question: "
+                f"{question.strip()[:1600]} Search primary sources and citation chains; acquire and "
+                "verify full text where available; extract comparable measurements with exact source "
+                "locations and provenance. Do not invent values or present synthetic calculations as "
+                "empirical evidence."
+            )[:3600],
+            "why": (
+                "The current survey is explicitly exploratory-only because its gap assessment is "
+                "insufficient, and the experiment has no executed result. Methods cannot repair a "
+                "computational capability into evidence that the survey has not established."
+            ),
+            "success_condition": (
+                "Publish a current survey and gap assessment that either (a) contains source-traceable "
+                "measurements for the declared comparison, including geometry/gap, sweep direction, "
+                "onset definition, uncertainty, and exact page/figure/table, or (b) records a bounded "
+                "targeted negative search with source coverage and the precise unavailable evidence. "
+                "Then issue an evidence-based same-phenomenon decision: admit a feasible experiment, "
+                "narrow the empirical claim, or explicitly reframe as a prediction/model study without "
+                "claiming empirical confirmation."
+            ),
+            "evidence_needed": (
+                "The immutable current survey and assessment, primary-source full-text spans and hashes, "
+                "an extracted data table with units and uncertainty where available, search/citation-chain "
+                "coverage, and the following independent-review findings: "
+                + (" | ".join(review_items) if review_items else
+                   "No reviewer finding was available; independently test whether the required comparison "
+                   "is supported by source data." )
+            )[:7000],
+            "source_survey_ref": survey_ref,
+            "source_assessment_ref": assessment_ref,
+            "review_directives": [
+                {"id": f"survey-evidence-review-{index + 1}",
+                 "kind": "source_evidence_check", "source": "independent_review",
+                 "text": item}
+                for index, item in enumerate(review_items)
+            ],
+        }
+        if topic_cycle is not None:
+            request["topic_cycle"] = topic_cycle
+
+        if self._has_executed_experiment_result(
+                context, self._stage_experiment_capability_id(stage),
+                project_dir=self._current_experiment_result_project_dir(stage)):
+            return None
+
+        superseded = []
+        for key in ("research_expansion_requests", "research_requests",
+                    "deferred_research_requests"):
+            values = context.get(key)
+            if not isinstance(values, list):
+                continue
+            keep = []
+            for item in values:
+                if (isinstance(item, dict)
+                        and self._request_target_kind(item) == "experiment"):
+                    superseded.append(deepcopy(item))
+                else:
+                    keep.append(item)
+            context[key] = keep
+        stale_active = [item for item in self.active_research_requests
+                        if isinstance(item, dict)
+                        and item.get("source_stage_id") == stage["id"]
+                        and self._request_target_kind(item) == "experiment"]
+        superseded.extend(deepcopy(stale_active))
+        if stale_active:
+            stale_ids = {item.get("id") for item in stale_active}
+            self.active_research_requests = [
+                item for item in self.active_research_requests
+                if not (isinstance(item, dict) and item.get("id") in stale_ids)
+            ]
+        if superseded:
+            archive = context.get("superseded_research_requests")
+            archive = deepcopy(archive) if isinstance(archive, list) else []
+            for item in superseded:
+                record = {
+                    **item,
+                    "superseded_reason": (
+                        "same-topic survey evidence must be resolved before experiment execution"),
+                }
+                if not any(isinstance(old, dict)
+                           and old.get("id") == record.get("id")
+                           and old.get("superseded_reason") == record["superseded_reason"]
+                           for old in archive):
+                    archive.append(record)
+            context["superseded_research_requests"] = archive[-24:]
+
+        prior_plan = context.pop("experiment_repair_plan", None)
+        recovery = context.get("failure_recovery")
+        if isinstance(recovery, dict):
+            recovery = deepcopy(recovery)
+            nested_plan = recovery.pop("experiment_repair_plan", None)
+            if prior_plan is None:
+                prior_plan = nested_plan
+            recovery["deferred_recovery_mode"] = recovery.get("recovery_mode")
+            recovery["recovery_mode"] = "survey_evidence_before_experiment_repair"
+            recovery["requires_capability_repair"] = False
+            context["failure_recovery"] = recovery
+        deferred = context.get("deferred_experiment_repair")
+        deferred = deepcopy(deferred) if isinstance(deferred, dict) else {}
+        if prior_plan is not None:
+            lineage = prior_plan.get("lineage") if isinstance(prior_plan, dict) else None
+            if not isinstance(lineage, dict):
+                lineage = {"source_stage_id": stage.get("id")}
+                prior_plan["lineage"] = lineage
+            lineage["prior_attempt_reconciliation"] = (
+                self._experiment_attempt_reconciliation(stage, context))
+            deferred["experiment_repair_plan"] = deepcopy(prior_plan)
+        for key in ("capability_repair_panel", "specialist_reports",
+                    "specialist_verifier", "deferred_preexecution_review"):
+            if key in context:
+                deferred[key] = deepcopy(context.pop(key))
+        if deferred:
+            deferred["reason"] = (
+                "Evidence acquisition for the admitted topic precedes any computational repair; "
+                "reassess this Methods review only after the current survey is resolved.")
+            context["deferred_experiment_repair"] = deferred
+
+        request_signature = self._research_request_signature(request)
+        already_present = any(
+            isinstance(item, dict)
+            and self._research_request_signature(item) == request_signature
+            for item in self.active_research_requests
+        )
+        if not already_present:
+            requests = context.get("research_requests")
+            if not isinstance(requests, list):
+                requests = []
+            requests.append(deepcopy(request))
+            context["research_requests"] = requests
+            self.active_research_requests.append(deepcopy(request))
+        expansion_history = deepcopy(expansion_history)
+        expansion_history.append({
+            "topic_id": topic_id,
+            "topic_cycle": topic_cycle,
+            "source_survey_ref": survey_ref,
+            "source_assessment_ref": assessment_ref,
+            "request_id": request["id"],
+        })
+        context["survey_evidence_expansion_history"] = expansion_history[-8:]
+        context.update({
+            "stage_id": stage["id"],
+            "kind": "experiment",
+            "status": "research_expansion_required",
+            "review_status": "scientific_assignment_blocked",
+            "release_blocking": True,
+            "failure_debt": {
+                "stage_id": stage["id"],
+                "kind": "experiment",
+                "failure_class": "insufficient_survey_evidence",
+                "error": str(error)[:4096],
+                "next_action": "resolve same-topic survey evidence before deciding on experiment repair",
+                "release_blocking": True,
+                "failure_dossier_ref": context.get("failure_dossier_ref"),
+            },
+        })
+        self.context[stage["id"]] = context
+        return request
+
+    def _reconcile_experiment_survey_evidence_routes(self, by_id):
+        """Replace stale Methods orders when a resumed pilot lacks survey evidence."""
+        reconciled = []
+        for stage_id, stage in by_id.items():
+            if not isinstance(stage, dict) or stage.get("kind") != "experiment":
+                continue
+            context = self.context.get(stage_id)
+            if not isinstance(context, dict):
+                continue
+            review_evidence = []
+            plan = context.get("experiment_repair_plan")
+            if isinstance(plan, dict) and isinstance(plan.get("review_evidence"), list):
+                review_evidence.extend(plan["review_evidence"])
+            existing = []
+            for key in ("research_expansion_requests", "research_requests",
+                        "deferred_research_requests"):
+                value = context.get(key)
+                if isinstance(value, list):
+                    existing.extend(item for item in value if isinstance(item, dict))
+            existing.extend(item for item in self.active_research_requests
+                            if isinstance(item, dict)
+                            and item.get("source_stage_id") == stage_id)
+            existing_signatures = {
+                self._research_request_signature(item) for item in existing
+            }
+            request = self._route_unexecuted_experiment_to_survey(
+                stage, context, context.get("error"), review_evidence)
+            if not isinstance(request, dict):
+                continue
+            if self._research_request_signature(request) in existing_signatures:
+                continue
+            reconciled.append({
+                "cycle": self.continuation_cycles,
+                "action": "reopen_same_topic_survey_before_experiment_repair",
+                "source_stage_id": stage_id,
+                "target_stage_id": request["target_stage_id"],
+                "topic_id": request["topic_id"],
+                "superseded_request_ids": [
+                    item.get("id") for item in context.get("superseded_research_requests", [])
+                    if isinstance(item, dict) and item.get("superseded_reason")
+                    == "same-topic survey evidence must be resolved before experiment execution"
+                ][-12:],
+                "next_action": "acquire source-backed evidence; do not rerun unadmitted experiment code",
+                "model_calls": 0,
+            })
+        return reconciled
 
     def _composer_can_advance_after_admission(self, stage, error):
         """Return whether Composer authority may hand off a failed stage.
@@ -2752,6 +3756,227 @@ class ComposerRunner:
             report = persisted
         return report
 
+    def _is_superseded_stale_task_blocker(self, blocker):
+        """Release stale task blockers only when durable history proves they are obsolete.
+
+        A terminal task cannot be resumed under its old identity. A
+        ``result_unknown`` attempt remains conservatively accounted, but it
+        need not gate today's frontier when a later successful stage attempt
+        for the current topic has superseded it.
+        """
+        reason = str(blocker.get("reason", "")) if isinstance(blocker, dict) else ""
+        completed_match = re.search(
+            r"task (?P<task_id>[A-Za-z0-9_.:-]*?(?P<stage_id>topic|survey|experiment|interpretation|argument|paper)"
+            r"-continuation-(?P<cycle>[1-9][0-9]*)) not dispatchable \(state=stale\)",
+            reason,
+        )
+        match = re.search(
+            r"task (?P<task_id>[A-Za-z0-9_.:-]+-continuation-(?P<cycle>[1-9][0-9]*)) "
+            r"already has unresolved attempt (?P<attempt_id>[A-Za-z0-9_.:-]+) "
+            r"\(state=(?P<observed_state>[^)]*)\)",
+            reason,
+        )
+        if completed_match:
+            cycle = int(completed_match.group("cycle"))
+            if cycle >= self.continuation_cycles:
+                return False
+            try:
+                task = self.tasks.get(completed_match.group("task_id"))
+                attempts = self.tasks.attempts_for_task(task["task_id"])
+            except NotFoundError:
+                return False
+            task_payload = task.get("payload")
+            task_payload = task_payload if isinstance(task_payload, dict) else {}
+            stage_id = task_payload.get("stage_id") or completed_match.group("stage_id")
+            if (task.get("state") != "stale"
+                    or stage_id != completed_match.group("stage_id")
+                    or not attempts):
+                return False
+            stage_record = self.stage_records.get(stage_id)
+            history = stage_record.get("attempts", []) if isinstance(stage_record, dict) else []
+            if not isinstance(history, list):
+                return False
+            current_topic = self._current_topic_identity()
+            later_results = []
+            unresolved_count = 0
+            for attempt in attempts:
+                if attempt.get("task_id") != task["task_id"]:
+                    return False
+                payload = attempt.get("payload")
+                payload = payload if isinstance(payload, dict) else {}
+                attempt_number = payload.get("attempt_number")
+                if ((payload.get("stage_id") or stage_id) != stage_id
+                        or type(attempt_number) is not int):
+                    return False
+                source = next((item for item in history
+                               if isinstance(item, dict)
+                               and type(item.get("attempt_number")) is int
+                               and item["attempt_number"] == attempt_number
+                               and type(item.get("cycle")) is int
+                               and item["cycle"] == cycle), None)
+                if source is None:
+                    return False
+
+                state = attempt.get("state")
+                if state in {"started", "result_unknown"}:
+                    unresolved_count += 1
+                    if (source.get("state") not in {"unknown", "result_unknown", "started"}
+                            or not isinstance(current_topic, dict)
+                            or not isinstance(current_topic.get("topic_id"), str)
+                            or not current_topic["topic_id"]
+                            or type(current_topic.get("topic_cycle")) is not int
+                            or not isinstance(source.get("topic_id"), str)
+                            or not source["topic_id"]
+                            or type(source.get("topic_cycle")) is not int
+                            or source["topic_cycle"] < 1):
+                        return False
+                    eligible = [
+                        item for item in history
+                        if isinstance(item, dict)
+                        and type(item.get("attempt_number")) is int
+                        and item["attempt_number"] > attempt_number
+                        and type(item.get("cycle")) is int
+                        and item["cycle"] >= cycle
+                        and item.get("state") in {"succeeded", "completed"}
+                        and item.get("topic_id") == current_topic["topic_id"]
+                        and type(item.get("topic_cycle")) is int
+                        and item["topic_cycle"] == current_topic["topic_cycle"]
+                    ]
+                    if not eligible:
+                        return False
+                    later_results.extend(eligible)
+                    continue
+
+                if state in {"succeeded", "completed"}:
+                    if source.get("state") not in {"succeeded", "completed"}:
+                        return False
+                    later_results.append(source)
+                    continue
+                if state not in {"failed", "cancelled"} or source.get("state") != state:
+                    return False
+                eligible = [
+                    item for item in history
+                    if isinstance(item, dict)
+                    and type(item.get("attempt_number")) is int
+                    and item["attempt_number"] > attempt_number
+                    and type(item.get("cycle")) is int
+                    and item["cycle"] >= cycle
+                    and item.get("state") in {"succeeded", "completed"}
+                ]
+                if not eligible:
+                    return False
+                later_results.extend(eligible)
+
+            if not later_results:
+                return False
+            latest = max(later_results, key=lambda item: item["attempt_number"])
+            blocker.update({
+                "gating": False,
+                "release_blocking": False,
+                "recovery": ("historical_stale_task_unknown_outcome_superseded"
+                             if unresolved_count else
+                             "historical_stale_task_superseded_by_later_stage_result"),
+                "task_id": task["task_id"],
+                "task_state": task["state"],
+                "task_attempt_states": [attempt.get("state") for attempt in attempts],
+                "superseded_by_stage_attempt_number": latest["attempt_number"],
+                "superseded_by_cycle": latest["cycle"],
+                "unknown_attempt_accounting": [
+                    attempt.get("usage", {}).get("accounting")
+                    for attempt in attempts
+                    if attempt.get("state") in {"started", "result_unknown"}
+                    and isinstance(attempt.get("usage"), dict)
+                ],
+            })
+            return True
+        if not match or int(match.group("cycle")) >= self.continuation_cycles:
+            return False
+        try:
+            task = self.tasks.get(match.group("task_id"))
+            attempt = self.tasks.get_attempt(match.group("attempt_id"))
+        except NotFoundError:
+            return False
+        if (task.get("state") != "stale"
+                or attempt.get("task_id") != task.get("task_id")
+                or attempt.get("state") not in {
+                    "result_unknown", "succeeded", "failed", "cancelled",
+                }):
+            return False
+        task_payload = task.get("payload")
+        attempt_payload = attempt.get("payload")
+        task_payload = task_payload if isinstance(task_payload, dict) else {}
+        attempt_payload = attempt_payload if isinstance(attempt_payload, dict) else {}
+        stage_id = attempt_payload.get("stage_id") or task_payload.get("stage_id")
+        attempt_number = attempt_payload.get("attempt_number")
+        stage_record = self.stage_records.get(stage_id)
+        history = stage_record.get("attempts", []) if isinstance(stage_record, dict) else []
+        cycle = int(match.group("cycle"))
+        topic = self._current_topic_identity()
+        if (type(attempt_number) is not int or not isinstance(history, list)
+                or not isinstance(topic, dict)
+                or not isinstance(topic.get("topic_id"), str)
+                or not topic["topic_id"]
+                or type(topic.get("topic_cycle")) is not int):
+            return False
+        source = next((item for item in history
+                       if isinstance(item, dict)
+                       and type(item.get("attempt_number")) is int
+                       and item.get("attempt_number") == attempt_number
+                       and type(item.get("cycle")) is int
+                       and item.get("cycle") == cycle
+                       and item.get("state") in {"unknown", "result_unknown", "started"}), None)
+        if (source is None
+                or not isinstance(source.get("topic_id"), str)
+                or not source.get("topic_id")
+                or type(source.get("topic_cycle")) is not int
+                or source.get("topic_cycle") < 1):
+            return False
+        newer = []
+        for item in history:
+            if (not isinstance(item, dict)
+                    or type(item.get("attempt_number")) is not int
+                    or item["attempt_number"] <= attempt_number
+                    or type(item.get("cycle")) is not int
+                    or item["cycle"] < cycle
+                    or item.get("state") not in {"succeeded", "completed"}):
+                continue
+            if isinstance(topic, dict):
+                item_topic_id = item.get("topic_id")
+                item_topic_cycle = item.get("topic_cycle")
+                if (type(item_topic_cycle) is not int
+                        or item_topic_id != topic.get("topic_id")
+                        or item_topic_cycle != topic.get("topic_cycle")):
+                    continue
+            newer.append(item)
+        if not newer:
+            return False
+        latest = max(newer, key=lambda item: item["attempt_number"])
+        attempt_usage = attempt.get("usage")
+        same_topic_lineage = (
+            source.get("topic_id") == topic["topic_id"]
+            and source.get("topic_cycle") == topic["topic_cycle"]
+        )
+        blocker.update({
+            "gating": False,
+            "release_blocking": False,
+            "recovery": (
+                "historical_stale_task_unknown_outcome_superseded_by_current_topic_result"
+                if not same_topic_lineage else
+                "historical_stale_task_superseded_by_later_result"
+            ),
+            "task_id": task.get("task_id"),
+            "task_state": task.get("state"),
+            "attempt_id": attempt.get("attempt_id"),
+            "attempt_state": attempt.get("state"),
+            "attempt_accounting": attempt_usage.get("accounting")
+            if isinstance(attempt_usage, dict) else None,
+            "superseded_by_stage_id": stage_id,
+            "superseded_by_attempt_number": latest["attempt_number"],
+            "superseded_by_topic_id": topic["topic_id"],
+            "superseded_by_topic_cycle": topic["topic_cycle"],
+        })
+        return True
+
     def _active_blockers(self):
         """Return blockers that still constrain the current Composer frontier.
 
@@ -2779,12 +4004,58 @@ class ComposerRunner:
                 if mission_held:
                     active.append({"reason": str(item)[:240]})
                 continue
+            if item.get("stage_id") is None:
+                if self._is_superseded_stale_task_blocker(item):
+                    continue
             if (item.get("gating") is False
                     or item.get("release_blocking") is False
-                    or item.get("recovery") == "cycle_admitted"
+                    or item.get("recovery") in {
+                        "cycle_admitted",
+                        "superseded_by_current_stage_state",
+                    }
                     or item.get("disposition") == "forwarded_with_findings"):
                 continue
             stage_id = item.get("stage_id")
+            blocker_attempt = item.get("attempt_number")
+            if type(blocker_attempt) is not int:
+                dossier_ref = item.get("failure_dossier_ref")
+                match = (re.search(r"/attempt-([1-9][0-9]*)@", dossier_ref)
+                         if isinstance(dossier_ref, str) else None)
+                blocker_attempt = int(match.group(1)) if match else None
+            stage_record = self.stage_records.get(stage_id, {})
+            if (blocker_attempt is None
+                    and item.get("reason") == "provider_cooldown"
+                    and type(item.get("attempts")) is int
+                    and item["attempts"] > 0):
+                # Older cooldown blockers stored the owning attempt count in
+                # ``attempts`` but omitted ``attempt_number``.  That count is
+                # written from len(attempt_history) when the blocker is
+                # created, so it can be reconciled against durable stage
+                # history without guessing from timestamps or error text.
+                blocker_attempt = item["attempts"]
+            if (item.get("reason") == "provider_cooldown"
+                    and type(blocker_attempt) is int and blocker_attempt > 0):
+                retry_epoch = item.get("retry_after_epoch")
+                retry_expired = (
+                    type(retry_epoch) in (int, float)
+                    and math.isfinite(retry_epoch)
+                    and retry_epoch <= time.time()
+                )
+                later_success = any(
+                    isinstance(attempt, dict)
+                    and type(attempt.get("attempt_number")) is int
+                    and attempt["attempt_number"] > blocker_attempt
+                    and attempt.get("state") in {"succeeded", "completed"}
+                    for attempt in stage_record.get("attempts", [])
+                ) if isinstance(stage_record.get("attempts", []), list) else False
+                if retry_expired and later_success:
+                    continue
+            current_attempt = stage_record.get(
+                "attempt_number", stage_record.get("attempt_count"))
+            if (type(blocker_attempt) is int and type(current_attempt) is int
+                    and blocker_attempt < current_attempt
+                    and item.get("reason") != "provider_cooldown"):
+                continue
             if (item.get("stop_reason") == "process_interrupted"
                     and self.status == "paused" and stage_id == "workflow"):
                 active.append(deepcopy(item))
@@ -2851,7 +4122,7 @@ class ComposerRunner:
         # Preserve the pre-mode meaning of an explicitly supplied cycle count.
         if "mode" not in configured and "max_cycles" in configured:
             policy["mode"] = "bounded"
-        if self._forward_first():
+        if self._forward_first() and policy["mode"] != "until_deadline":
             bounded = dict(FORWARD_FIRST_CONTINUATION_POLICY)
             if isinstance(configured, dict) and type(configured.get("max_cycles")) is int:
                 bounded["max_cycles"] = min(
@@ -3090,6 +4361,7 @@ class ComposerRunner:
         """
         requests = []
         seen = set()
+        suppressed_request_sources = set()
         for stage_id, context in self.context.items():
             if not isinstance(context, dict):
                 continue
@@ -3174,7 +4446,9 @@ class ComposerRunner:
                             "failure_dossier_ref", "failure_input_sha256",
                             "repair_commands", "acceptance_checks", "review_directives",
                             "model_diagnostics", "recovery_mode", "target_stage_id",
-                            "target_stage_kind", "repair_priority", "experiment_repair_plan",
+                            "target_stage_kind", "repair_priority", "repair_policy_revision",
+                            "source_survey_ref", "source_assessment_ref",
+                            "experiment_repair_plan",
                             "repair_strategy", "attempt_lineage"):
                         if key in request:
                             item[key] = deepcopy(request[key])
@@ -3184,6 +4458,7 @@ class ComposerRunner:
                         item["topic_id"] = topic_identity["topic_id"]
                         item["topic_cycle"] = topic_identity["topic_cycle"]
                     if self._research_request_signature(item) in self._attempted_request_signatures:
+                        suppressed_request_sources.add(stage_id)
                         continue
                     requests.append(item)
                     seen.add(request_id)
@@ -3197,7 +4472,7 @@ class ComposerRunner:
                     item for item in requests
                     if isinstance(item, dict) and item.get("source_stage_id") == stage_id
                 ]
-                if not stage_requests:
+                if not stage_requests and stage_id not in suppressed_request_sources:
                     item = self._autonomous_recovery_request(stage_id, context)
                     if (isinstance(item, dict)
                             and item.get("id") not in seen
@@ -3361,6 +4636,11 @@ class ComposerRunner:
             self._forward_first()
             and any(self._is_topic_pivot_request(item) for item in requests)
         )
+        evidence_refinement_override = any(
+            isinstance(item, dict)
+            and item.get("recovery_mode") == "refine_topic_to_available_evidence"
+            for item in requests
+        )
         format_recovery_stage_ids = {
             item.get("target_stage_id") for item in requests
             if isinstance(item, dict)
@@ -3377,6 +4657,7 @@ class ComposerRunner:
         continuation_budget_override = (
             experiment_repair_override or topic_pivot_override
             or same_topic_budget_override or format_recovery_override
+            or evidence_refinement_override
         )
         policy = self._continuation_policy()
         if (policy.get("mode", "bounded") == "bounded"
@@ -3407,6 +4688,15 @@ class ComposerRunner:
             context = self.context.get(stage_id)
             if isinstance(context, dict) and context.get("format_recovery") is True:
                 context["format_recovery_dispatched"] = True
+                signature = context.get("format_recovery_signature")
+                entry = self.format_recovery_ledger.get(signature)
+                if isinstance(entry, dict) and entry.get("status") == "pending":
+                    entry.update({
+                        "status": "dispatched",
+                        "dispatched_cycle": self.continuation_cycles,
+                        "request_ids": [item.get("id") for item in requests
+                                        if item.get("target_stage_id") == stage_id],
+                    })
         self.reopened_stage_ids = set(targets)
         self.continuation_pending_stage_ids = set(targets)
         # A continuation is a new dispatch boundary.  A prior child may have
@@ -4506,11 +5796,14 @@ class ComposerRunner:
             "recorded_at": now_iso(),
         }
         evolution = context.get("topic_evolution") if isinstance(context, dict) else None
-        if isinstance(evolution, dict) and evolution.get("mode") == "refinement":
+        if isinstance(evolution, dict) and evolution.get("mode") in {
+                "refinement", "feasibility_revalidation"}:
             entry["parent_topic_id"] = evolution.get("parent_topic_id")
             entry["refinement_cycle"] = evolution.get("cycle")
             entry["refinement_reason"] = evolution.get("reason")
             entry["changed_dimensions"] = list(evolution.get("changed_dimensions", []))
+            if evolution.get("mode") == "feasibility_revalidation":
+                entry["event_type"] = "same_topic_runtime_feasibility_revalidation"
         self._append_topic_history_entries([entry])
 
     def _record_topic_rejection_history(self, rejected_entries):
@@ -4554,9 +5847,11 @@ class ComposerRunner:
         if not isinstance(topic_id, str) or not topic_id:
             return None
         evolution = context.get("topic_evolution")
-        topic_cycle = evolution.get("cycle") if isinstance(evolution, dict) else None
+        topic_cycle = context.get("topic_cycle")
         if type(topic_cycle) is not int or topic_cycle < 0:
-            topic_cycle = self.continuation_cycles
+            topic_cycle = evolution.get("cycle") if isinstance(evolution, dict) else None
+        if type(topic_cycle) is not int or topic_cycle < 0:
+            topic_cycle = 0
         return {"topic_id": topic_id, "topic_cycle": topic_cycle}
 
     def _refresh_stage_topic_lineage(self, stage_id, context, *, attempt_id,
@@ -4609,7 +5904,7 @@ class ComposerRunner:
         prior_transition_ref = context.get("lineage_transition_ref")
         for key in (
                 "superseded_topic_id", "lineage_state", "lineage_transition_ref",
-                "topic_pivot_cycle"):
+                "topic_pivot_cycle", "pivoted_to_topic"):
             context.pop(key, None)
         context["topic_id"] = topic_identity["topic_id"]
         context["topic_cycle"] = topic_identity["topic_cycle"]
@@ -4734,14 +6029,26 @@ class ComposerRunner:
             return False
         lineage = context.get("topic_lineage")
         if isinstance(lineage, dict) and isinstance(lineage.get("topic_id"), str):
-            return lineage.get("topic_id") == identity["topic_id"]
+            if lineage.get("topic_id") != identity["topic_id"]:
+                return False
+            recorded_cycles = [value for value in (
+                lineage.get("topic_cycle"), context.get("topic_cycle"),
+            ) if type(value) is int and value >= 0]
+            if recorded_cycles:
+                return all(value == identity["topic_cycle"] for value in recorded_cycles)
+            return identity["topic_cycle"] == 0
         record = self.stage_records.get(stage_id, {})
         if isinstance(record, dict):
             if (record.get("lineage_state") == "awaiting_topic_admission"
                     or isinstance(record.get("superseded_topic_id"), str)):
                 return False
             if isinstance(record.get("topic_id"), str):
-                return record.get("topic_id") == identity["topic_id"]
+                if record.get("topic_id") != identity["topic_id"]:
+                    return False
+                record_cycle = record.get("topic_cycle")
+                if type(record_cycle) is int and record_cycle >= 0:
+                    return record_cycle == identity["topic_cycle"]
+                return identity["topic_cycle"] == 0
         return True
 
     def _scope_active_research_requests(self, requests):
@@ -4764,7 +6071,9 @@ class ComposerRunner:
             topic_context = {}
         refinement_completed = (
             isinstance(topic_context.get("topic_evolution"), dict)
-            and topic_context["topic_evolution"].get("mode") == "refinement"
+            and topic_context["topic_evolution"].get("mode") in {
+                "refinement", "feasibility_revalidation",
+            }
             and topic_record.get("status") in STAGE_READY_STATUSES
         )
         scoped = []
@@ -4945,21 +6254,115 @@ class ComposerRunner:
         return requests
 
     @staticmethod
+    def _normalize_research_request_value(value):
+        """Remove volatile execution identity while retaining scientific intent."""
+        if isinstance(value, str):
+            normalized = value.strip()
+            normalized = re.sub(
+                r"artifact:[A-Za-z0-9._/-]+@[1-9][0-9]*", "artifact:<version>", normalized)
+            normalized = re.sub(
+                r"/Users/[^\s\"'<>]+|/private/[^\s\"'<>]+|/tmp/[^\s\"'<>]+",
+                "<path>", normalized)
+            normalized = re.sub(
+                r"\b(attempt|cycle|continuation)[-_ ]\d+\b",
+                lambda match: match.group(1).casefold() + "-<n>",
+                normalized, flags=re.IGNORECASE)
+            normalized = re.sub(r"\b[0-9a-f]{32,64}\b", "<digest>", normalized,
+                                flags=re.IGNORECASE)
+            return normalized
+        if isinstance(value, list):
+            return [ComposerRunner._normalize_research_request_value(item)
+                    for item in value]
+        if isinstance(value, dict):
+            return {
+                key: (deepcopy(item) if isinstance(key, str) and key.endswith("_sha256")
+                      else ComposerRunner._normalize_research_request_value(item))
+                for key, item in sorted(value.items())
+                if key not in ({"id", "created_at", "updated_at", "timestamp"}
+                               | RESEARCH_REQUEST_EXECUTION_METADATA_KEYS)
+            }
+        return value
+
+    @staticmethod
     def _research_request_signature(request):
-        """Return a stable identity for one substantive work-order attempt."""
-        stable = {key: request.get(key) for key in (
-            "id", "kind", "owner", "objective", "why", "success_condition",
-            "evidence_needed", "source_stage_id", "target_stage_id",
-            "target_stage_kind", "repair_priority")}
+        """Identify a substantive order independently of its artifact/path wrapper."""
+        stable = {
+            key: ComposerRunner._normalize_research_request_value(request.get(key))
+            for key in (
+                "kind", "owner", "objective", "success_condition", "evidence_needed",
+                "source_stage_id", "target_stage_id", "target_stage_kind",
+                "topic_id", "topic_cycle", "source_survey_ref", "source_assessment_ref",
+                "failure_input_sha256",
+                "recovery_mode", "repair_policy_revision", "repair_commands", "acceptance_checks",
+                "review_directives", "experiment_repair_plan", "repair_strategy",
+            )
+            if key in request
+        }
+        for key in ("source_survey_ref", "source_assessment_ref"):
+            if key in request:
+                stable[key] = deepcopy(request[key])
         return hashlib.sha256(canonical_bytes(stable)).hexdigest()
+
+    def _restore_attempted_research_request_signatures(self, checkpoint):
+        """Restore persisted work-order fences and migrate completed legacy cycles."""
+        checkpoint = checkpoint if isinstance(checkpoint, dict) else {}
+        restored = checkpoint.get("attempted_request_signatures", [])
+        if isinstance(restored, list):
+            self._attempted_request_signatures.update(
+                item for item in restored
+                if isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item))
+
+        stages = {
+            stage.get("id"): stage for stage in self.workflow.get("stages", [])
+            if isinstance(stage, dict) and isinstance(stage.get("id"), str)
+        }
+        feedback = checkpoint.get("feedback", [])
+        if not isinstance(feedback, list):
+            return
+        terminal = {"succeeded", "completed", "failed", "blocked", "cancelled"}
+        for decision in feedback:
+            if (not isinstance(decision, dict)
+                    or decision.get("action") != "continue_research"
+                    or type(decision.get("cycle")) is not int):
+                continue
+            cycle = decision["cycle"]
+            for request in decision.get("research_requests", []):
+                if not isinstance(request, dict):
+                    continue
+                target_id = request.get("target_stage_id")
+                if isinstance(target_id, str):
+                    target_stages = [stages[target_id]] if target_id in stages else []
+                else:
+                    target_kind = self._request_target_kind(request)
+                    target_stages = [stage for stage in stages.values()
+                                     if stage.get("kind") == target_kind]
+                attempted = False
+                for stage in target_stages:
+                    record = self.stage_records.get(stage["id"], {})
+                    attempts = record.get("attempts", []) if isinstance(record, dict) else []
+                    if any(
+                            isinstance(attempt, dict)
+                            and attempt.get("cycle") == cycle
+                            and attempt.get("state") in terminal
+                            and not re.search(
+                                r"\b(?:429|quota[_ -]?exhausted|rate[_ -]?limit)\b",
+                                str(attempt.get("error", "")), re.IGNORECASE)
+                            for attempt in attempts if isinstance(attempt, dict)):
+                        attempted = True
+                        break
+                if attempted:
+                    self._attempted_request_signatures.add(
+                        self._research_request_signature(request))
 
     @staticmethod
     def _is_topic_pivot_request(request):
         return (
             isinstance(request, dict)
             and request.get("kind") == "topic_refinement"
-            and request.get("recovery_mode")
-            != "continue_same_topic_after_local_budget"
+            and request.get("recovery_mode") not in {
+                "continue_same_topic_after_local_budget",
+                "runtime_feasibility_revalidation_same_question",
+            }
         )
 
     def _mark_research_requests_attempted(self, stage):
@@ -5135,6 +6538,13 @@ class ComposerRunner:
         stage_requests = self._requests_for_stage(stage)
         requests = [item for item in stage_requests
                     if self._is_topic_pivot_request(item)]
+        feasibility_repairs = [
+            item for item in stage_requests
+            if isinstance(item, dict)
+            and item.get("kind") == "topic_refinement"
+            and item.get("recovery_mode")
+            == "runtime_feasibility_revalidation_same_question"
+        ]
         contract_repairs = [
             item for item in stage_requests
             if item.get("kind") == "recovery"
@@ -5192,10 +6602,51 @@ class ComposerRunner:
                 "evidence_needed": " ".join(evidence),
                 "source_stage_id": stage["id"],
             }]
-        if not requests and not contract_repairs:
+        if not requests and not contract_repairs and not feasibility_repairs:
             return None
         if not isinstance(parent, dict):
             return None
+        if feasibility_repairs:
+            request = feasibility_repairs[-1]
+            retained_fields = (
+                "admission_state", "maturity_open_requirements",
+                "maturity_requirement_dispositions", "maturity_reviews",
+                "maturity_review_history", "maturity_score", "next_evidence_action",
+                "source_challenge", "candidate_prior_work", "candidate_sampling_trace",
+                "rejected_topic_history", "topic_history",
+            )
+            parent_evidence = {
+                "frontier_seed_plan": deepcopy(parent_context.get("frontier_seed_plan")),
+                "recent_papers": [
+                    deepcopy(item) for item in parent_context.get("recent_papers", [])
+                    if isinstance(item, dict)
+                ][:16],
+                "candidate_prior_work": [
+                    deepcopy(item) for item in parent_context.get("candidate_prior_work", [])
+                    if isinstance(item, dict)
+                ][:16],
+                "source_challenge": deepcopy(parent_context.get("source_challenge")),
+                "retained_admission": {
+                    key: deepcopy(parent_context[key])
+                    for key in retained_fields if key in parent_context
+                },
+            }
+            return {
+                "mode": "runtime_feasibility_revalidation",
+                "cycle": self.continuation_cycles,
+                "objective": request.get("objective"),
+                "parent_topic_id": parent.get("id"),
+                "parent_topic": deepcopy(parent),
+                "parent_evidence": parent_evidence,
+                "reason": str(
+                    (parent_context.get("runtime_feasibility_revalidation") or {}).get(
+                        "reason") or request.get("why") or "")[:1200],
+                "work_orders": [{key: request.get(key) for key in (
+                    "id", "kind", "objective", "why", "success_condition",
+                    "evidence_needed")}],
+                "changed_dimensions": [],
+                "salvage_plan": None,
+            }
         survey = self._survey_context_for_topic(stage)
         survey_evidence = {}
         survey_dir = survey.get("project_dir") if isinstance(survey, dict) else None
@@ -5496,6 +6947,31 @@ class ComposerRunner:
         candidate = result.get("topic") if isinstance(result, dict) else None
         if not isinstance(parent, dict) or not isinstance(candidate, dict):
             return
+        if refinement_context.get("mode") == "runtime_feasibility_revalidation":
+            mutable_execution_fields = {
+                "feasibility", "feasibility_plan", "resource_plan",
+                "capability_requirements", "experiment_capability_id",
+                "experiment_design",
+            }
+            scientific_parent = {
+                key: value for key, value in parent.items()
+                if key not in mutable_execution_fields
+            }
+            scientific_candidate = {
+                key: value for key, value in candidate.items()
+                if key not in mutable_execution_fields
+            }
+            if scientific_candidate != scientific_parent:
+                changed = sorted(
+                    key for key in set(scientific_candidate) | set(scientific_parent)
+                    if scientific_candidate.get(key) != scientific_parent.get(key)
+                )
+                error = ValidationError(
+                    "runtime-feasibility repair may update execution feasibility fields only; "
+                    "it cannot change admitted research identity fields: "
+                    + ", ".join(changed))
+                error.failure_class = "model_contract"
+                raise error
         salvage_plan = refinement_context.get("salvage_plan")
         try:
             validate_topic_refinement(
@@ -5522,8 +6998,7 @@ class ComposerRunner:
             }]
             raise error from exc
 
-    @staticmethod
-    def _carry_provisional_verifier_challenge(context, verifier_result):
+    def _carry_provisional_verifier_challenge(self, context, verifier_result):
         """Route a survey-stage challenge forward without declaring it solved.
 
         A provisional topic has already passed deterministic schema, source,
@@ -5557,7 +7032,21 @@ class ComposerRunner:
             merged.append(text[:1600])
             if len(merged) >= 16:
                 break
-        context["maturity_open_requirements"] = merged
+        requirement_scope = self._topic_maturity_requirement_scope(
+            context.get("topic"), {**context, "maturity_open_requirements": merged})
+        context["maturity_open_requirements"] = requirement_scope["active"]
+        if requirement_scope["out_of_scope"]:
+            context["maturity_requirement_dispositions"] = [
+                {
+                    "requirement": item,
+                    "disposition": "empirical_validation_limit",
+                    "reason": (
+                        "The refined self-contained estimand does not consume observed rows; "
+                        "report this as an empirical validation boundary."
+                    ),
+                }
+                for item in requirement_scope["out_of_scope"][:8]
+            ]
         response["control_disposition"] = "carried_to_literature_survey"
         verifier_result["response"] = response
         verifier_result["gate_disposition"] = "carried_to_literature_survey"
@@ -5591,10 +7080,14 @@ class ComposerRunner:
             topic_context = self.context.get(topic_stage["id"], {})
             if (isinstance(topic_context, dict)
                     and topic_context.get("admission_state") == "provisional_for_survey"):
+                requirement_scope = self._topic_maturity_requirement_scope(
+                    topic_context.get("topic"), topic_context)
                 supported = deepcopy(result)
                 supported["topic_admission"] = "provisional_supported_for_experiment"
                 supported["carried_maturity_requirements"] = deepcopy(
-                    topic_context.get("maturity_open_requirements", []))
+                    requirement_scope["active"])
+                supported["empirical_validation_limits"] = deepcopy(
+                    requirement_scope["out_of_scope"])
                 return supported
             return result
         if state not in {"refuted_by_prior_work", "insufficient_evidence"}:
@@ -5605,8 +7098,15 @@ class ComposerRunner:
                 and result.get("assessment_current") is True):
             pilot = deepcopy(result)
             pilot["topic_admission"] = "exploratory_pilot"
+            topic_context = self.context.get(topic_stage["id"], {})
+            requirement_scope = self._topic_maturity_requirement_scope(
+                topic_context.get("topic") if isinstance(topic_context, dict) else None,
+                topic_context,
+            )
             pilot["carried_maturity_requirements"] = deepcopy(
-                self.context.get(topic_stage["id"], {}).get("maturity_open_requirements", []))
+                requirement_scope["active"])
+            pilot["empirical_validation_limits"] = deepcopy(
+                requirement_scope["out_of_scope"])
             pilot["carried_maturity_requirements"].append(
                 "Literature novelty remains unresolved; exploratory results cannot establish an original contribution.")
             return pilot
@@ -6086,6 +7586,12 @@ class ComposerRunner:
             "repair_commands": compact_list(recovery.get("repair_commands"), 8, 1100),
             "review_directives": compact_list(recovery.get("review_directives"), 12, 1100),
         }
+        selected_plan = context.get("repair_plan")
+        has_adjudicated_plan = (
+            context.get("schema_version") in CAPABILITY_REPAIR_PLAN_SCHEMA_VERSIONS
+            and context.get("decision") == "repair"
+            and isinstance(selected_plan, dict)
+        )
         panel_reports = context.get("reports")
         if not isinstance(panel_reports, list):
             panel_reports = packet.get("prior_specialist_reviews")
@@ -6106,10 +7612,11 @@ class ComposerRunner:
         return {
             "schema_version": context.get("schema_version") or "capability-repair-panel-1",
             "input_sha256": context.get("input_sha256") or packet.get("input_sha256"),
+            "review_input_sha256": context.get("review_input_sha256"),
             "evidence_priority": (
-                "The latest independent Methods panel root_causes and required_changes are the "
-                "authoritative repair target; reconcile any conflicting generic work-order wording "
-                "in favor of the panel's evidence."
+                "Immutable observations, source, and deterministic validation are the evidence of "
+                "record. Methods-panel findings and requested changes are hypotheses to test, not "
+                "verified causes or mandatory edits; reconcile them against the deterministic failure."
             ),
             "topic": ComposerRunner._capability_repair_projection(
                 packet.get("topic"), max_depth=4, max_keys=24, max_items=8, max_text=1600),
@@ -6124,6 +7631,9 @@ class ComposerRunner:
                 "validator_source": source("validator"),
                 "source_integrity": deepcopy(last_attempt.get("source_integrity", {})),
                 "prompt_source_integrity": prompt_source_integrity,
+                "historical_execution_sources": ComposerRunner._capability_repair_projection(
+                    packet.get("unresolved_attempt_sources", []), max_depth=4,
+                    max_keys=24, max_items=16, max_text=7000),
             },
             "prior_foundry_work": {
                 "status": prior_work.get("status"),
@@ -6148,9 +7658,22 @@ class ComposerRunner:
             "prior_specialist_reviews": reports,
             "prior_verifier": ComposerRunner._capability_repair_projection(
                 packet.get("prior_verifier"), max_depth=4, max_keys=20, max_items=8, max_text=1400),
-            "root_causes": compact_list(context.get("root_causes"), 12, 1400),
-            "required_changes": compact_list(context.get("required_changes"), 12, 1400),
-            "acceptance_checks": compact_list(context.get("acceptance_checks"), 8, 900),
+            "decision": context.get("decision"),
+            "repair_plan": ComposerRunner._capability_repair_projection(
+                selected_plan, max_depth=5, max_keys=24, max_items=10, max_text=1600)
+            if has_adjudicated_plan else None,
+            "diagnostic_hypotheses": compact_list(
+                [selected_plan.get("root_cause", {}).get("statement", "")]
+                if has_adjudicated_plan and isinstance(selected_plan.get("root_cause"), dict)
+                else context.get("diagnostic_hypotheses") or context.get("root_causes"), 12, 1400),
+            "proposed_changes": compact_list(
+                [item.get("instruction", "") for item in selected_plan.get("required_changes", [])
+                 if isinstance(item, dict)]
+                if has_adjudicated_plan else
+                context.get("proposed_changes") or context.get("required_changes"), 12, 1400),
+            "acceptance_checks": compact_list(
+                selected_plan.get("acceptance_checks") if has_adjudicated_plan
+                else context.get("acceptance_checks"), 8, 900),
             "repair_commands": compact_list(context.get("repair_commands"), 8, 1100),
             "verifier": ComposerRunner._capability_repair_projection(
                 context.get("verifier"), max_depth=4, max_keys=20, max_items=8, max_text=1400),
@@ -6160,17 +7683,60 @@ class ComposerRunner:
 
     @staticmethod
     def _capability_authoring_follow_up_projection(requests, *, repair_context=None):
-        """Project actionable requests, resolving stale axes against current review evidence."""
+        """Project repair requests while keeping reviewer hypotheses distinct from facts."""
         repair_context = repair_context if isinstance(repair_context, dict) else {}
-        repair_roots = repair_context.get("root_causes")
-        repair_roots = [item[:1400] for item in repair_roots[:8]
-                        if isinstance(item, str) and item.strip()] \
-            if isinstance(repair_roots, list) else []
-        repair_changes = repair_context.get("required_changes")
-        repair_changes = [item[:1400] for item in repair_changes[:8]
-                          if isinstance(item, str) and item.strip()] \
-            if isinstance(repair_changes, list) else []
-        review_evidence = list(dict.fromkeys([*repair_roots, *repair_changes]))[:12]
+        adjudicated_plan = repair_context.get("repair_plan")
+        adjudicated = (
+            repair_context.get("schema_version") in CAPABILITY_REPAIR_PLAN_SCHEMA_VERSIONS
+            and repair_context.get("decision") == "repair"
+            and isinstance(adjudicated_plan, dict)
+        )
+        if (repair_context.get("schema_version") in CAPABILITY_REPAIR_PLAN_SCHEMA_VERSIONS
+                and not adjudicated):
+            return [{
+                key: deepcopy(item.get(key)) for key in (
+                    "id", "kind", "target_stage_id", "target_stage_kind", "attempt_lineage",
+                ) if key in item
+            } | {
+                "objective": (
+                    "Do not generate or execute a replacement capability: the Methods lead's "
+                    "pre-execution repair plan was not independently admitted. Preserve the current "
+                    "topic and failure dossier, and route the exact verifier objection or missing "
+                    "evidence to a scoped Methods or Literature task."
+                ),
+                "repair_panel_decision": repair_context.get("decision"),
+                "repair_panel_reason": str(repair_context.get("plan_validation_error") or "")[:1400],
+            } for item in requests if isinstance(item, dict)]
+
+        repair_hypotheses = repair_context.get("diagnostic_hypotheses")
+        if adjudicated:
+            root = adjudicated_plan.get("root_cause")
+            root = root if isinstance(root, dict) else {}
+            repair_hypotheses = [root.get("statement", "")]
+        if not isinstance(repair_hypotheses, list):
+            repair_hypotheses = repair_context.get("root_causes", [])
+        repair_hypotheses = [item[:1400] for item in repair_hypotheses[:8]
+                             if isinstance(item, str) and item.strip()] \
+            if isinstance(repair_hypotheses, list) else []
+        proposed_changes = (adjudicated_plan.get("required_changes", [])
+                            if adjudicated else repair_context.get("proposed_changes"))
+        if not isinstance(proposed_changes, list):
+            proposed_changes = repair_context.get("required_changes", [])
+        proposed_changes = [item[:1400] for item in proposed_changes[:8]
+                            if isinstance(item, str) and item.strip()] \
+            if isinstance(proposed_changes, list) else []
+        review_evidence = list(dict.fromkeys([
+            *(f"Adjudicated Methods root cause: {item}" if adjudicated
+              else f"Unverified diagnosis hypothesis: {item}"
+              for item in repair_hypotheses),
+            *(
+                f"Adjudicated Methods change: {item.get('target')}: {item.get('instruction')} "
+                f"(basis: {item.get('scientific_basis')})"
+                if adjudicated and isinstance(item, dict)
+                else f"Unverified proposed change: {item}"
+                for item in proposed_changes
+            ),
+        ]))[:12]
         output = []
         for item in requests if isinstance(requests, list) else []:
             if not isinstance(item, dict):
@@ -6180,6 +7746,7 @@ class ComposerRunner:
                       else item.get(key)) for key in (
                     "kind", "objective", "why", "success_condition", "evidence_needed",
                     "failure_dossier_ref", "failure_input_sha256", "recovery_mode",
+                    "repair_policy_revision",
                     "target_stage_id", "target_stage_kind", "repair_priority",
                     "experiment_repair_plan", "repair_strategy", "attempt_lineage",
                 ) if key in item
@@ -6208,24 +7775,121 @@ class ComposerRunner:
             if (review_evidence
                     and (item.get("target_stage_kind") == "experiment"
                          or item.get("kind") == "additional_experiment")):
-                entry["objective"] = (
-                    "Resolve the latest independent Methods panel's root-cause findings and required "
-                    "changes. Treat that evidence as authoritative; do not follow a conflicting generic "
-                    "repair-axis instruction. Independent review evidence: "
-                    + " | ".join(review_evidence[:5])
-                )[:2400]
-                entry["repair_strategy"] = "review_directed"
-                entry["independent_review_evidence"] = review_evidence
-                entry["experiment_repair_plan"] = {
-                    "schema_version": "experiment-repair-plan-1",
-                    "mode": "diagnose_patch_execute_recalculate",
-                    "design_axis": "review_directed",
-                    "root_causes": repair_roots,
-                    "required_changes": repair_changes,
-                    "must_change": review_evidence[:8],
-                }
+                if adjudicated:
+                    entry["objective"] = (
+                        "Implement only the single Methods-lead plan below against the immutable failure. "
+                        "Do not add competing reviewer proposals, change the admitted question, tune an "
+                        "outcome threshold, or substitute values for censored observations. Preserve the "
+                        "plan's uncertainty and prove each acceptance check with source tests, a fresh "
+                        "execution, and an independent recalculation. Adjudicated plan: "
+                        + json.dumps(adjudicated_plan, ensure_ascii=False, sort_keys=True)
+                    )[:4000]
+                    entry["repair_strategy"] = "methods_adjudicated"
+                    entry["methods_adjudication"] = deepcopy(adjudicated_plan)
+                    entry["experiment_repair_plan"] = {
+                        "schema_version": "experiment-repair-plan-2",
+                        "mode": "diagnose_patch_execute_recalculate",
+                        "design_axis": "methods_adjudicated",
+                        "failure_lineage": deepcopy(adjudicated_plan.get("failure_lineage")),
+                        "root_causes": [deepcopy(adjudicated_plan.get("root_cause"))],
+                        "required_changes": deepcopy(adjudicated_plan.get("required_changes", [])),
+                        "acceptance_checks": deepcopy(adjudicated_plan.get("acceptance_checks", [])),
+                        "dissent_resolution": deepcopy(adjudicated_plan.get("dissent_resolution", [])),
+                        "residual_uncertainties": deepcopy(adjudicated_plan.get("residual_uncertainties", [])),
+                        "must_verify": deepcopy(adjudicated_plan.get("acceptance_checks", [])),
+                    }
+                else:
+                    entry["objective"] = (
+                        "Test the latest Methods-panel diagnosis hypotheses against the immutable failure, "
+                        "source, raw observations, and deterministic validation. Reviewer judgments are "
+                        "not confirmation: repair only defects reproduced from those records; if a claim is "
+                        "contradicted, document the evidence and retain the valid result; if unresolved, "
+                        "state a bounded limitation. Preserve the admitted question and do not force a "
+                        "source change just to satisfy a reviewer. Review input: "
+                        + " | ".join(review_evidence[:5])
+                    )[:2400]
+                    entry["repair_strategy"] = "review_directed"
+                    entry["review_hypotheses"] = review_evidence
+                    entry["experiment_repair_plan"] = {
+                        "schema_version": "experiment-repair-plan-1",
+                        "mode": "diagnose_patch_execute_recalculate",
+                        "design_axis": "review_directed",
+                        "root_causes": [],
+                        "required_changes": [],
+                        "diagnostic_hypotheses": repair_hypotheses,
+                        "proposed_changes": proposed_changes,
+                        "must_verify": review_evidence[:8],
+                        "must_change": [],
+                    }
             output.append(entry)
         return output
+
+    @staticmethod
+    def _capability_authoring_review_contract(requests):
+        """Require observable dispositions for review findings in capability repairs."""
+        directive_ids = []
+        for request in requests if isinstance(requests, list) else []:
+            if not isinstance(request, dict):
+                continue
+            if (request.get("kind") != "additional_experiment"
+                    and request.get("target_stage_kind") != "experiment"):
+                continue
+            directives = request.get("review_directives")
+            if not isinstance(directives, list):
+                continue
+            directive_ids.extend(
+                item["id"] for item in directives
+                if isinstance(item, dict)
+                and isinstance(item.get("id"), str)
+                and item["id"].strip()
+            )
+        directive_ids = list(dict.fromkeys(directive_ids))[:16]
+        if not directive_ids:
+            return None
+        return {
+            "required_directive_ids": directive_ids,
+            "proof": (
+                "Independently adjudicate every review directive against source, raw observations, and "
+                "deterministic validation. For a confirmed defect, repair it; for a contradicted review "
+                "claim, cite the result path that falsifies it; for unresolved uncertainty, state a bounded "
+                "limitation. Do not implement a reviewer proposal without evidence that the change is needed."
+            ),
+            "not_sufficient": [
+                "comments without changed behavior or a new check",
+                "unchanged results relabeled as a repair",
+                "editing result JSON or observations to satisfy a review",
+                "blindly implementing a reviewer proposal without verifying the alleged defect",
+            ],
+            "verification": [
+                "execute in a fresh attempt namespace",
+                "replay and independently recalculate the primary outcomes",
+                "retain unresolved directives as explicit limitations rather than claiming they passed",
+            ],
+        }
+
+    @staticmethod
+    def _capability_repair_provenance(repair_context):
+        """Normalize legacy repair-panel payloads before foundry admission."""
+        if not isinstance(repair_context, dict):
+            return None
+        ledger = repair_context.get("ledger")
+        ledger = ledger if isinstance(ledger, dict) else {}
+
+        def records(primary, fallback):
+            value = repair_context.get(primary)
+            if not isinstance(value, list):
+                value = repair_context.get(fallback)
+            return deepcopy(value[:12]) if isinstance(value, list) else []
+
+        return {
+            "kind": "independent_repair",
+            "origin": "composer_model_panel",
+            "panel_stage_id": ledger.get("panel_stage_id"),
+            "panel_input_sha256": repair_context.get("input_sha256"),
+            "panel_verdict_artifact_ref": ledger.get("verifier_artifact_ref"),
+            "diagnostic_hypotheses": records("diagnostic_hypotheses", "root_causes"),
+            "proposed_changes": records("proposed_changes", "required_changes"),
+        }
 
     def _latest_foundry_failure_projection(self, question, domain):
         """Find the latest failed authoring state for this exact scientific intent."""
@@ -6410,6 +8074,1016 @@ class ComposerRunner:
             **failed,
         }
 
+    def _prior_attempt_result_evidence(self, stage, prior_context, *, selected_topic=None):
+        """Resolve a rejected experiment result only inside its own attempt namespace."""
+        unavailable = {
+            "available": False,
+            "identity_verified": False,
+            "admissible_as_verified_claims": False,
+        }
+        if not isinstance(stage, dict) or stage.get("kind") != "experiment":
+            return {**unavailable, "reason": "not_an_experiment_stage"}
+        prior_context = prior_context if isinstance(prior_context, dict) else {}
+        stage_id = stage.get("id")
+        attempt_number = prior_context.get("attempt_number")
+        project_dir = prior_context.get("project_dir")
+        if (prior_context.get("stage_id") != stage_id
+                or type(attempt_number) is not int or attempt_number < 1
+                or not isinstance(project_dir, str)):
+            return {**unavailable, "reason": "prior_attempt_identity_incomplete"}
+        try:
+            stage_root = Path(stage["project_dir"]).resolve()
+            if (stage_root.name.startswith("attempt-")
+                    and stage_root.parent.name == "attempts"):
+                # Stage runners receive an attempt-scoped descriptor. Prior
+                # evidence lives beside that attempt, under the stable stage
+                # project root, so using the current attempt directory as the
+                # containment root incorrectly hides every prior result.
+                stage_root = next((parent for parent in stage_root.parents
+                                   if (parent / "continuations").is_dir()), None)
+                if stage_root is None:
+                    return {**unavailable,
+                            "reason": "prior_attempt_stage_root_unresolvable"}
+            attempt_root = Path(project_dir).resolve()
+            attempt_root.relative_to(stage_root)
+            if (attempt_root == stage_root
+                    or attempt_root.name != f"attempt-{attempt_number}"
+                    or attempt_root.parent.name != "attempts"):
+                return {**unavailable, "reason": "prior_attempt_namespace_mismatch"}
+
+            def bound_file(value):
+                if not isinstance(value, str) or not value:
+                    return None
+                candidate = Path(value)
+                if not candidate.is_absolute():
+                    candidate = attempt_root / candidate
+                candidate = candidate.resolve()
+                candidate.relative_to(attempt_root)
+                if (not candidate.is_file()
+                        or candidate.stat().st_size > MAX_EXPERIMENT_RESULT_PACKAGE_BYTES):
+                    return None
+                return candidate
+
+            run_path = bound_file(prior_context.get("output_path"))
+            package_path = bound_file(prior_context.get("results_package"))
+            if run_path is None or package_path is None:
+                return {**unavailable, "reason": "prior_attempt_output_missing_or_out_of_scope"}
+            run_record = _read_experiment_result_payload(
+                str(run_path), base_dir=attempt_root)
+            package = _read_experiment_result_payload(
+                str(package_path), base_dir=attempt_root)
+            if not isinstance(run_record, dict) or not isinstance(package, dict):
+                return {**unavailable, "reason": "prior_attempt_output_not_a_json_object"}
+            expected_question = (selected_topic.get("research_question")
+                                 if isinstance(selected_topic, dict) else None)
+            if (isinstance(expected_question, str)
+                    and package.get("question") != expected_question):
+                return {**unavailable, "reason": "prior_attempt_research_question_mismatch"}
+            if run_record.get("status") in {
+                    "queued", "pending", "running", "in_progress", "starting"}:
+                return {**unavailable, "reason": "prior_attempt_is_still_running"}
+            recorded_package_path = run_record.get("results_package")
+            if isinstance(recorded_package_path, str):
+                recorded_package_path = bound_file(recorded_package_path)
+                if recorded_package_path != package_path:
+                    return {**unavailable, "reason": "prior_attempt_results_package_path_mismatch"}
+
+            context_refs = prior_context.get("execution_refs")
+            run_refs = run_record.get("execution_refs")
+            provenance = package.get("provenance")
+            package_refs = provenance.get("execution_refs") if isinstance(provenance, dict) else None
+            if (not isinstance(context_refs, list) or not context_refs
+                    or not all(isinstance(ref, str) and ref for ref in context_refs)
+                    or run_refs != context_refs or package_refs != context_refs):
+                return {**unavailable, "reason": "prior_attempt_execution_refs_do_not_match"}
+            for key in ("project_id", "study_id", "assessment_ref"):
+                context_value = prior_context.get(key)
+                run_value = run_record.get(key)
+                if (isinstance(context_value, str) and context_value
+                        and isinstance(run_value, str) and run_value
+                        and context_value != run_value):
+                    return {**unavailable, "reason": f"prior_attempt_{key}_mismatch"}
+            package_assessment_ref = (
+                package.get("validation", {}).get("assessment_ref")
+                if isinstance(package.get("validation"), dict) else None
+            )
+            if (isinstance(package_assessment_ref, str)
+                    and isinstance(run_record.get("assessment_ref"), str)
+                    and package_assessment_ref != run_record["assessment_ref"]):
+                return {**unavailable, "reason": "prior_attempt_assessment_ref_mismatch"}
+
+            review_evidence = []
+            validation = package.get("validation")
+            review_refs = (validation.get("model_review_refs", [])
+                           if isinstance(validation, dict) else [])
+            if isinstance(review_refs, list):
+                for review_ref in review_refs[:8]:
+                    match = (re.fullmatch(
+                        r"artifact:methods/experiment-reviews/([a-z][a-z0-9_-]{0,63})@([1-9][0-9]*)",
+                        review_ref,
+                    ) if isinstance(review_ref, str) else None)
+                    if not match:
+                        continue
+                    reviewer_id = match.group(1)
+                    candidates = [
+                        path for path in (attempt_root / "runs").glob(
+                            f"experiment-{reviewer_id}-*/result.json")
+                        if re.fullmatch(
+                            rf"experiment-{re.escape(reviewer_id)}-[1-9][0-9]*",
+                            path.parent.name,
+                        ) and path.is_file()
+                        and path.stat().st_size <= MAX_EXPERIMENT_RESULT_PACKAGE_BYTES
+                    ]
+                    for review_path in sorted(
+                            candidates, key=lambda path: path.stat().st_mtime_ns,
+                            reverse=True):
+                        try:
+                            review_bytes = review_path.read_bytes()
+                            envelope = json.loads(review_bytes)
+                            result = envelope.get("result") if isinstance(envelope, dict) else None
+                            response_text = result.get("text") if isinstance(result, dict) else None
+                            response = (json.loads(response_text)
+                                        if isinstance(response_text, str) else result)
+                        except (OSError, ValueError, TypeError):
+                            continue
+                        if (not isinstance(response, dict)
+                                or response.get("reviewer_id") != reviewer_id):
+                            continue
+                        checks = response.get("checks")
+                        adverse_checks = [
+                            {
+                                "check_id": item.get("check_id"),
+                                "outcome": item.get("outcome"),
+                                "evidence": str(item.get("evidence", ""))[:1600],
+                            }
+                            for item in checks if isinstance(item, dict)
+                            and item.get("outcome") != "passed"
+                        ][:8] if isinstance(checks, list) else []
+                        findings = response.get("finding_assessments")
+                        adverse_findings = [
+                            {
+                                "finding_id": item.get("finding_id"),
+                                "outcome": item.get("outcome"),
+                                "rationale": str(item.get("rationale", ""))[:1200],
+                            }
+                            for item in findings if isinstance(item, dict)
+                            and item.get("outcome") not in {"supported", "consistent"}
+                        ][:8] if isinstance(findings, list) else []
+                        limitations = response.get("limitations")
+                        review_evidence.append({
+                            "reviewer_id": reviewer_id,
+                            "declared_ref": review_ref,
+                            "attempt_local_path": review_path.relative_to(
+                                attempt_root).as_posix(),
+                            "sha256": hashlib.sha256(review_bytes).hexdigest(),
+                            "decision": response.get("decision"),
+                            "adverse_checks": adverse_checks,
+                            "adverse_findings": adverse_findings,
+                            "limitations": [str(item)[:1000]
+                                            for item in limitations[:6]
+                                            if isinstance(item, str)]
+                            if isinstance(limitations, list) else [],
+                            "attempt_identity_verified": True,
+                        })
+                        break
+
+            package_bytes = package_path.read_bytes()
+            run_bytes = run_path.read_bytes()
+            assets = package.get("assets")
+            assets = assets if isinstance(assets, list) else []
+            raw_asset = next((asset for asset in assets
+                              if isinstance(asset, dict)
+                              and (asset.get("role") == "raw_data"
+                                   or asset.get("id") == "raw_data")), None)
+            raw_payload = None
+            raw_path = None
+            raw_bytes = None
+            if isinstance(raw_asset, dict) and isinstance(raw_asset.get("path"), str):
+                raw_path = (package_path.parent / raw_asset["path"]).resolve()
+                raw_path.relative_to(attempt_root)
+                if (raw_path.is_file()
+                        and raw_path.stat().st_size <= MAX_EXPERIMENT_RESULT_PACKAGE_BYTES):
+                    raw_bytes = raw_path.read_bytes()
+                    declared_hash = raw_asset.get("sha256")
+                    actual_hash = hashlib.sha256(raw_bytes).hexdigest()
+                    if isinstance(declared_hash, str) and declared_hash != actual_hash:
+                        return {**unavailable, "reason": "prior_attempt_raw_data_hash_mismatch"}
+                    raw_payload = json.loads(raw_bytes)
+                    if not isinstance(raw_payload, (dict, list)):
+                        return {**unavailable, "reason": "prior_attempt_raw_data_invalid"}
+
+            observations = (
+                raw_payload.get("observations")
+                if isinstance(raw_payload, dict) else raw_payload
+            )
+            if not isinstance(observations, list):
+                observations = package.get("observations")
+            if not isinstance(observations, list):
+                observations = []
+            sample_size = min(24, len(observations))
+            sample_indices = sorted({
+                round(index * (len(observations) - 1) / max(1, sample_size - 1))
+                for index in range(sample_size)
+            })
+            sample_rows = [observations[index] for index in sample_indices]
+            columns = sorted({
+                str(key) for row in sample_rows if isinstance(row, dict)
+                for key in row
+            })[:48]
+
+            science_fields = (
+                "question", "hypothesis", "study_type", "procedures", "metrics",
+                "analysis", "findings", "limitations", "validation",
+                "quality_contract", "quality_admission",
+            )
+
+            def without_provenance(value):
+                if isinstance(value, dict):
+                    return {
+                        key: without_provenance(item)
+                        for key, item in value.items()
+                        if (key not in {"provenance", "assets"}
+                            and not key.casefold().endswith(("_ref", "_refs")))
+                    }
+                if isinstance(value, list):
+                    return [without_provenance(item) for item in value]
+                return value
+
+            scientific_payload = {
+                key: without_provenance(package[key])
+                for key in science_fields if key in package
+            }
+            if isinstance(raw_payload, dict):
+                scientific_observations = raw_payload.get("observations", [])
+            else:
+                scientific_observations = raw_payload or observations
+
+            def normalize_fingerprint_numbers(value):
+                if isinstance(value, float):
+                    return float(format(value, ".10g"))
+                if isinstance(value, dict):
+                    return {key: normalize_fingerprint_numbers(item)
+                            for key, item in value.items()}
+                if isinstance(value, list):
+                    return [normalize_fingerprint_numbers(item) for item in value]
+                return value
+
+            scientific_sha256 = hashlib.sha256(canonical_bytes({
+                "results": normalize_fingerprint_numbers(scientific_payload),
+                "observations": normalize_fingerprint_numbers(scientific_observations),
+                "review_evidence": [{
+                    "reviewer_id": item.get("reviewer_id"),
+                    "decision": item.get("decision"),
+                    "adverse_checks": [{
+                        "check_id": check.get("check_id"),
+                        "outcome": check.get("outcome"),
+                    } for check in item.get("adverse_checks", [])],
+                    "adverse_findings": [{
+                        "finding_id": finding.get("finding_id"),
+                        "outcome": finding.get("outcome"),
+                    } for finding in item.get("adverse_findings", [])],
+                } for item in review_evidence],
+            })).hexdigest()
+            measurement_sha256 = hashlib.sha256(canonical_bytes({
+                "observations": normalize_fingerprint_numbers(scientific_observations),
+                "metrics": normalize_fingerprint_numbers(package.get("metrics", [])),
+            })).hexdigest()
+
+            derived = {key: package[key] for key in (
+                "metrics", "analysis", "findings", "limitations", "validation",
+            ) if key in package}
+            figures = []
+            for asset in assets:
+                if (not isinstance(asset, dict)
+                        or not (asset.get("role") == "figure"
+                                or str(asset.get("media_type", "")).casefold().startswith("image/"))):
+                    continue
+                figure = {
+                    key: asset.get(key) for key in ("id", "caption", "media_type", "sha256")
+                    if asset.get(key) is not None
+                }
+                figure_path = None
+                if isinstance(asset.get("path"), str):
+                    figure_path = (package_path.parent / asset["path"]).resolve()
+                    figure_path.relative_to(attempt_root)
+                figure["file_verified"] = bool(
+                    figure_path and figure_path.is_file()
+                    and figure_path.stat().st_size <= MAX_EXPERIMENT_RESULT_PACKAGE_BYTES
+                    and isinstance(asset.get("sha256"), str)
+                    and hashlib.sha256(figure_path.read_bytes()).hexdigest() == asset["sha256"]
+                )
+                figures.append(figure)
+
+            relative = lambda path: path.relative_to(attempt_root).as_posix()
+            raw_record = {
+                "available": raw_payload is not None,
+                "path": relative(raw_path) if raw_path is not None else None,
+                "sha256": hashlib.sha256(raw_bytes).hexdigest() if raw_bytes is not None else None,
+                "observation_count": len(observations),
+                "columns": columns,
+                "sample_indices": sample_indices,
+                "sample_rows": _bounded_experiment_result_projection(sample_rows),
+            }
+            result_record = {
+                **unavailable,
+                "available": True,
+                "identity_verified": True,
+                "stage_id": stage_id,
+                "attempt_number": attempt_number,
+                "run_status": run_record.get("status"),
+                "prior_status": prior_context.get("status"),
+                "validation_decision": (package.get("validation", {}).get("decision")
+                                         if isinstance(package.get("validation"), dict)
+                                         else None),
+                "assessment_ref": run_record.get("assessment_ref"),
+                "execution_refs": context_refs,
+                "admissible_as_verified_claims": False,
+                "scientific_sha256": scientific_sha256,
+                "measurement_sha256": measurement_sha256,
+                "files": {
+                    "run_record": {"path": relative(run_path),
+                                   "sha256": hashlib.sha256(run_bytes).hexdigest()},
+                    "results_package": {"path": relative(package_path),
+                                        "sha256": hashlib.sha256(package_bytes).hexdigest()},
+                    "raw_data": raw_record,
+                },
+                "results_package": _bounded_experiment_result_projection(scientific_payload),
+                "derived_results": _bounded_experiment_result_projection(derived),
+                "review_evidence": _bounded_experiment_result_projection(review_evidence),
+                "figures": _bounded_experiment_result_projection(figures),
+            }
+            return result_record
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+            return {**unavailable, "reason": "prior_attempt_evidence_failed_scope_or_integrity_check"}
+
+    def _unresolved_prior_attempt_evidence(self, stage, attempts, *, selected_topic=None):
+        """Project durable evidence for unresolved attempts without promoting results.
+
+        A worker's result file is not the same thing as an acknowledged stage
+        result. Keep both ledgers visible so a repair panel can reconcile a
+        completed subprocess, an interrupted run, and a missing result before
+        it orders any equivalent execution.
+        """
+        attempts = attempts if isinstance(attempts, list) else []
+        summary = {
+            "attempt_count": 0,
+            "inspected_count": 0,
+            "missing_directory_count": 0,
+            "records": {},
+            "worker_results": {},
+            "generated_sources": [],
+            "generated_source_selection_policy": (
+                "Include at most the two most recent distinct generated program sources "
+                "whose exact path is bound to a complete successful local-program result. "
+                "These remain diagnostic and are never admitted as research results."
+            ),
+            "admission_rule": (
+                "Unresolved worker output is diagnostic evidence only. It is not a released claim. "
+                "Reconcile the stage record and nested task/attempt ledger before an equivalent "
+                "operation; a fresh run requires a material source/design change."
+            ),
+        }
+        if not isinstance(stage, dict) or stage.get("kind") != "experiment":
+            return summary
+        unresolved = sorted(
+            (item for item in attempts
+             if isinstance(item, dict)
+             and item.get("state") in {"started", "unknown", "result_unknown"}),
+            key=lambda item: (
+                item.get("attempt_number") if type(item.get("attempt_number")) is int else -1,
+                item.get("cycle") if type(item.get("cycle")) is int else -1,
+            ), reverse=True,
+        )
+        summary["attempt_count"] = len(unresolved)
+        try:
+            stage_root = Path(stage["project_dir"]).resolve()
+            if stage_root.name.startswith("attempt-") and stage_root.parent.name == "attempts":
+                stage_root = next((parent for parent in stage_root.parents
+                                   if (parent / "continuations").is_dir()), None)
+            if stage_root is None:
+                raise ValueError("experiment stage root is unavailable")
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            summary["evidence_status"] = "stage_root_unavailable"
+            return summary
+
+        def read_json(path, attempt_root):
+            try:
+                resolved = path.resolve()
+                resolved.relative_to(attempt_root)
+                if (not resolved.is_file()
+                        or resolved.stat().st_size > MAX_EXPERIMENT_RESULT_PACKAGE_BYTES):
+                    return None, None
+                raw = resolved.read_bytes()
+                value = json.loads(raw)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                return None, None
+            return (value if isinstance(value, dict) else None,
+                    hashlib.sha256(raw).hexdigest())
+
+        def nested_task_ledger(attempt_root, task_id):
+            database = attempt_root / "state" / "control.sqlite"
+            if not database.is_file() or not isinstance(task_id, str):
+                return {"available": False}
+            connection = None
+            try:
+                connection = sqlite3.connect(
+                    f"{database.resolve().as_uri()}?mode=ro", uri=True, timeout=0.5)
+                connection.row_factory = sqlite3.Row
+                tables = {row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                if not {"tasks", "attempts"}.issubset(tables):
+                    return {"available": False, "reason": "ledger_schema_unavailable"}
+                task = connection.execute(
+                    "SELECT state FROM tasks WHERE task_id=?", (task_id,)
+                ).fetchone()
+                rows = connection.execute(
+                    "SELECT state,lease_expiry,external_ref FROM attempts "
+                    "WHERE task_id=? ORDER BY created_at DESC LIMIT 4", (task_id,)
+                ).fetchall()
+                now = time.time()
+                return {
+                    "available": True,
+                    "task_state": task["state"] if task else "missing",
+                    "attempt_count": len(rows),
+                    "attempt_states": "; ".join(
+                        f"{row['state']} (lease_expired="
+                        f"{type(row['lease_expiry']) in (int, float) and row['lease_expiry'] <= now}; "
+                        f"external_ref_recorded={bool(row['external_ref'])})"
+                        for row in rows),
+                }
+            except (OSError, sqlite3.Error, TypeError, ValueError):
+                return {"available": False, "reason": "ledger_read_failed"}
+            finally:
+                if connection is not None:
+                    connection.close()
+
+        def nested_operation_ledger(attempt_root):
+            """Read unresolved external operations without promoting their outputs."""
+            database = attempt_root / "state" / "control.sqlite"
+            if not database.is_file():
+                return {"available": False, "operation_count": 0, "operations": []}
+            connection = None
+            try:
+                resolved_database = database.resolve()
+                resolved_database.relative_to(attempt_root.resolve())
+                connection = sqlite3.connect(
+                    f"{resolved_database.as_uri()}?mode=ro", uri=True, timeout=0.5)
+                connection.row_factory = sqlite3.Row
+                tables = {row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                if not {"tasks", "attempts"}.issubset(tables):
+                    return {"available": False, "reason": "ledger_schema_unavailable",
+                            "operation_count": 0, "operations": []}
+                operations = []
+                task_rows = connection.execute(
+                    "SELECT task_id,kind,state,payload_json FROM tasks "
+                    "ORDER BY updated_at DESC LIMIT 128").fetchall()
+                for task in task_rows:
+                    try:
+                        payload = json.loads(task["payload_json"])
+                    except (TypeError, ValueError):
+                        payload = None
+                    operation = payload.get("operation") if isinstance(payload, dict) else None
+                    if not isinstance(operation, str) or not operation:
+                        continue
+                    attempt_rows = connection.execute(
+                        "SELECT state,external_ref,usage_json FROM attempts "
+                        "WHERE task_id=? ORDER BY created_at DESC LIMIT 4",
+                        (task["task_id"],),
+                    ).fetchall()
+                    nested_attempts = []
+                    for nested_attempt in attempt_rows:
+                        try:
+                            usage = json.loads(nested_attempt["usage_json"])
+                        except (TypeError, ValueError):
+                            usage = None
+                        accounting = usage.get("accounting") if isinstance(usage, dict) else None
+                        nested_attempts.append({
+                            "state": nested_attempt["state"],
+                            "external_ref_recorded": bool(nested_attempt["external_ref"]),
+                            "outcome_unknown": nested_attempt["state"] in {
+                                "started", "unknown", "result_unknown",
+                            },
+                            "accounting": accounting if accounting in {
+                                "conservative_pending_reconciliation", "settled",
+                            } else None,
+                        })
+                    operations.append({
+                        "task_id": str(task["task_id"])[:120],
+                        "kind": str(task["kind"])[:80],
+                        "task_state": str(task["state"])[:80],
+                        "operation": operation[:80],
+                        "attempts": nested_attempts,
+                    })
+                    if len(operations) == 8:
+                        break
+                return {
+                    "available": True,
+                    "operation_count": len(operations),
+                    "operations": operations,
+                    "truncated": len(task_rows) == 128,
+                }
+            except (OSError, sqlite3.Error, TypeError, ValueError):
+                return {"available": False, "reason": "ledger_read_failed",
+                        "operation_count": 0, "operations": []}
+            finally:
+                if connection is not None:
+                    connection.close()
+
+        def compact_items(value, limit):
+            if not isinstance(value, list):
+                return []
+            output = []
+            for item in value[:limit]:
+                projected = _bounded_experiment_result_projection(item)
+                text = (projected if isinstance(projected, str)
+                        else json.dumps(projected, ensure_ascii=False, sort_keys=True))
+                output.append(redact_sensitive_text(text)[:700])
+            return output
+
+        for item in unresolved:
+            attempt_number, cycle = item.get("attempt_number"), item.get("cycle")
+            if (type(attempt_number) is not int or attempt_number < 1
+                    or type(cycle) is not int or cycle < 1
+                    or not isinstance(item.get("project_dir"), str)):
+                continue
+            key = f"cycle-{cycle}-attempt-{attempt_number}"
+            record = {
+                "attempt_number": attempt_number,
+                "cycle": cycle,
+                "attempt_state": item.get("state"),
+                "external_ref_recorded": bool(item.get("external_ref")),
+                "admissible_as_verified_claims": False,
+                "worker_results": [],
+            }
+            summary["records"][key] = record
+            try:
+                attempt_root = Path(item["project_dir"]).resolve()
+                attempt_root.relative_to(stage_root)
+                if (attempt_root == stage_root
+                        or attempt_root.name != f"attempt-{attempt_number}"
+                        or attempt_root.parent.name != "attempts"):
+                    record["classification"] = "attempt_namespace_mismatch"
+                    continue
+            except (OSError, RuntimeError, TypeError, ValueError):
+                record["classification"] = "attempt_namespace_mismatch"
+                continue
+            if not attempt_root.is_dir():
+                record["classification"] = "attempt_directory_missing"
+                summary["missing_directory_count"] += 1
+                continue
+
+            record["nested_operation_ledger"] = nested_operation_ledger(attempt_root)
+
+            run_record, run_sha256 = read_json(attempt_root / "output" / "run.json", attempt_root)
+            progress, progress_sha256 = read_json(
+                attempt_root / "output" / "progress.json", attempt_root)
+            if run_record is not None:
+                record["stage_run"] = {
+                    "status": run_record.get("status"),
+                    "error": redact_sensitive_text(str(run_record.get("error") or ""))[:500],
+                    "results_package_present": bool(run_record.get("results_package")),
+                    "execution_ref_count": len(run_record.get("execution_refs", []))
+                    if isinstance(run_record.get("execution_refs"), list) else 0,
+                    "sha256": run_sha256,
+                }
+            if progress is not None:
+                active_tasks = progress.get("active_tasks")
+                record["stage_progress"] = {
+                    "phase": progress.get("phase"),
+                    "status": progress.get("status"),
+                    "active_task_ids": [str(value)[:120] for value in active_tasks[:8]
+                                        if isinstance(value, str)]
+                    if isinstance(active_tasks, list) else [],
+                    "sha256": progress_sha256,
+                }
+
+            operation_sources = []
+            operations_dir = attempt_root / "workspace" / "operations"
+            if operations_dir.is_dir():
+                for pattern in (
+                        "*/generated_executor/execution.py",
+                        "*/generated_validator/validation.py",
+                        "*/generated_validator/execution.py"):
+                    try:
+                        source_paths = sorted(operations_dir.glob(pattern))[:8]
+                    except OSError:
+                        source_paths = []
+                    for source_path in source_paths:
+                        try:
+                            if source_path.is_symlink():
+                                continue
+                            resolved = source_path.resolve(strict=True)
+                            relative_path = resolved.relative_to(attempt_root).as_posix()
+                            source_bytes = resolved.read_bytes()
+                        except (OSError, RuntimeError, ValueError):
+                            continue
+                        if len(source_bytes) <= CAPABILITY_REPAIR_SOURCE_CHARS * 4:
+                            operation_sources.append({
+                                "path": relative_path,
+                                "resolved_path": resolved,
+                                "sha256": hashlib.sha256(source_bytes).hexdigest(),
+                                "size_bytes": len(source_bytes),
+                                "source_bytes": source_bytes,
+                                "worker_result_refs": [],
+                            })
+
+            def command_binds_source(metadata, source_path):
+                if (not isinstance(metadata, dict)
+                        or metadata.get("provider") != "local-program"
+                        or metadata.get("process_returncode") != 0
+                        or metadata.get("capture_truncated") is not False
+                        or metadata.get("capture_incomplete") is not False):
+                    return False
+                command = metadata.get("command")
+                if not isinstance(command, list) or not command:
+                    return False
+                cwd_value = metadata.get("cwd")
+                try:
+                    cwd = Path(cwd_value).resolve(strict=True) if isinstance(
+                        cwd_value, str) and cwd_value else None
+                except (OSError, RuntimeError, ValueError):
+                    cwd = None
+                for argument in command:
+                    if not isinstance(argument, str) or not argument:
+                        continue
+                    candidate = Path(argument)
+                    if not candidate.is_absolute():
+                        if cwd is None:
+                            continue
+                        candidate = cwd / candidate
+                    try:
+                        resolved = candidate.resolve(strict=True)
+                        resolved.relative_to(attempt_root)
+                    except (OSError, RuntimeError, ValueError):
+                        continue
+                    if resolved == source_path:
+                        return True
+                return False
+
+            runs_dir = attempt_root / "runs"
+            result_paths = []
+            if runs_dir.is_dir():
+                try:
+                    result_paths = sorted(
+                        (path for path in runs_dir.glob("*/result.json")
+                         if path.is_file() and not path.is_symlink()),
+                        key=lambda path: path.stat().st_mtime_ns, reverse=True,
+                    )[:16]
+                except OSError:
+                    result_paths = []
+            for result_path in result_paths:
+                envelope, result_sha256 = read_json(result_path, attempt_root)
+                if not isinstance(envelope, dict):
+                    continue
+                result = envelope.get("result")
+                result = result if isinstance(result, dict) else {}
+                metadata = result.get("metadata")
+                metadata = metadata if isinstance(metadata, dict) else {}
+                document = result.get("document")
+                if not isinstance(document, dict) and isinstance(result.get("text"), str):
+                    try:
+                        parsed_text = json.loads(result["text"])
+                        document = parsed_text if isinstance(parsed_text, dict) else None
+                    except (TypeError, ValueError):
+                        document = None
+                document = document if isinstance(document, dict) else {}
+                observations = document.get("observations")
+                metrics = document.get("metrics")
+                findings = document.get("findings")
+                limitations = document.get("limitations")
+                worker_record = {
+                    "task_id": result_path.parent.name[:120],
+                    "result_sha256": result_sha256,
+                    "ok": envelope.get("ok") is True,
+                    "operation_outcome": result.get("outcome"),
+                    "provider": metadata.get("provider"),
+                    "transport": metadata.get("transport"),
+                    "process_returncode": metadata.get("process_returncode"),
+                    "capture_truncated": metadata.get("capture_truncated") is True,
+                    "capture_incomplete": metadata.get("capture_incomplete") is True,
+                    "schema_version": document.get("schema_version"),
+                    "study_id": document.get("study_id"),
+                    "observation_count": len(observations)
+                    if isinstance(observations, list) else None,
+                    "metric_count": len(metrics) if isinstance(metrics, list) else None,
+                    "metrics": compact_items(metrics, 8),
+                    "findings": compact_items(findings, 4),
+                    "limitations": compact_items(limitations, 4),
+                    "admissible_as_verified_claims": False,
+                }
+                worker_record["task_ledger"] = nested_task_ledger(
+                    attempt_root, worker_record["task_id"])
+                record["worker_results"].append(worker_record)
+                if worker_record["ok"] is not True:
+                    continue
+                for source in operation_sources:
+                    if not command_binds_source(metadata, source["resolved_path"]):
+                        continue
+                    source_ref = {
+                        "attempt_number": attempt_number,
+                        "cycle": cycle,
+                        "task_id": worker_record["task_id"],
+                        "worker_result_sha256": result_sha256,
+                        "source_path": source["path"],
+                    }
+                    source["worker_result_refs"].append(source_ref)
+                    existing = next((candidate for candidate in summary["generated_sources"]
+                                     if candidate.get("source_sha256") == source["sha256"]), None)
+                    if existing is None:
+                        if len(summary["generated_sources"]) >= \
+                                CAPABILITY_REPAIR_UNRESOLVED_SOURCE_FILES:
+                            source["source_evidence_omission_reason"] = (
+                                "The repair evidence packet includes the two most recent "
+                                "distinct linked program sources."
+                            )
+                            continue
+                        try:
+                            source_text = source["source_bytes"].decode("utf-8")
+                        except UnicodeDecodeError:
+                            source_text = None
+                        safe_source = (redact_sensitive_text(source_text)
+                                       if isinstance(source_text, str) else None)
+                        source_available = (
+                            isinstance(safe_source, str)
+                            and len(safe_source) <= CAPABILITY_REPAIR_SOURCE_CHARS
+                        )
+                        prompt_sha256 = (
+                            hashlib.sha256(safe_source.encode("utf-8")).hexdigest()
+                            if source_available else None
+                        )
+                        existing = {
+                            "source_path": source["path"],
+                            "source_sha256": source["sha256"],
+                            "source_bytes": source["size_bytes"],
+                            "source_characters": len(source_text)
+                            if isinstance(source_text, str) else None,
+                            "prompt_source_sha256": prompt_sha256,
+                            "prompt_source_characters": len(safe_source)
+                            if source_available else None,
+                            "redaction_applied": (
+                                safe_source != source_text
+                                if isinstance(source_text, str) else False
+                            ),
+                            "source_available": source_available,
+                            "execution_link_verified": True,
+                            "source_chunks": (
+                                [safe_source[index:index + 7000]
+                                 for index in range(0, len(safe_source), 7000)]
+                                if source_available else []
+                            ),
+                            "omission_reason": (
+                                None if source_available else
+                                "source exceeds the repair evidence bound or is not UTF-8"
+                            ),
+                            "source_question_binding": (
+                                "The attempt's research-question identity is not verified against "
+                                "the current admitted question. Diagnostic source only."
+                            ),
+                            "admissible_as_verified_claims": False,
+                            "execution_refs": [],
+                        }
+                        summary["generated_sources"].append(existing)
+                    if source_ref not in existing["execution_refs"]:
+                        existing["execution_refs"].append(source_ref)
+
+            if operation_sources:
+                record["generated_programs"] = [{
+                    "path": source["path"],
+                    "sha256": source["sha256"],
+                    "size_bytes": source["size_bytes"],
+                    "execution_link_verified": bool(source["worker_result_refs"]),
+                    "worker_result_refs": source["worker_result_refs"][:8],
+                } for source in operation_sources[:8]]
+            if record["worker_results"]:
+                summary["worker_results"][key] = record["worker_results"]
+                record["worker_result_count"] = len(record["worker_results"])
+                record.pop("worker_results", None)
+
+            stage_status = run_record.get("status") if isinstance(run_record, dict) else None
+            has_successful_worker = any(
+                worker.get("ok") is True
+                and worker.get("process_returncode") == 0
+                and worker.get("capture_truncated") is False
+                and worker.get("capture_incomplete") is False
+                for worker in summary["worker_results"].get(key, [])
+            )
+            if stage_status in {"completed", "accepted"} and run_record.get("results_package"):
+                candidate = {
+                    "stage_id": stage.get("id"),
+                    "attempt_number": attempt_number,
+                    "project_dir": str(attempt_root),
+                    "output_path": str(attempt_root / "output" / "run.json"),
+                    "results_package": run_record.get("results_package"),
+                    "execution_refs": run_record.get("execution_refs"),
+                    "project_id": run_record.get("project_id"),
+                    "study_id": run_record.get("study_id"),
+                    "assessment_ref": run_record.get("assessment_ref"),
+                    "status": item.get("state"),
+                }
+                checked = self._prior_attempt_result_evidence(
+                    stage, candidate, selected_topic=selected_topic)
+                record["stage_result_check"] = {
+                    "available": checked.get("available") is True,
+                    "reason": checked.get("reason"),
+                    "scientific_sha256": checked.get("scientific_sha256"),
+                    "measurement_sha256": checked.get("measurement_sha256"),
+                    "observation_count": checked.get("files", {}).get(
+                        "raw_data", {}).get("observation_count")
+                    if isinstance(checked.get("files"), dict) else None,
+                }
+                record["classification"] = (
+                    "final_stage_artifacts_need_current_identity_and_validation"
+                    if checked.get("available") is True
+                    else "stage_run_present_but_result_not_reconciled"
+                )
+            elif has_successful_worker:
+                record["classification"] = "worker_result_durable_stage_result_unacknowledged"
+            elif any(
+                    attempt.get("outcome_unknown") is True
+                    for operation in record.get("nested_operation_ledger", {}).get(
+                        "operations", [])
+                    for attempt in operation.get("attempts", [])):
+                record["classification"] = "nested_operation_outcome_unknown"
+            elif stage_status in {"paused", "failed", "interrupted"}:
+                record["classification"] = "interrupted_without_final_stage_result"
+            elif record.get("worker_result_count", 0):
+                record["classification"] = "worker_result_requires_reconciliation"
+            else:
+                record["classification"] = "no_durable_result_found"
+            summary["inspected_count"] += 1
+
+        return summary
+
+    def _prior_attempt_result_history(self, stage, *, selected_topic=None, limit=24):
+        """Find recent materialized results without letting empty attempts hide them."""
+        if not isinstance(stage, dict) or stage.get("kind") != "experiment":
+            return {"available_attempts": 0, "same_measurement_repeated": False,
+                    "measurements": [], "related_results": [],
+                    "materialized_attempts_scanned": 0,
+                    "non_materialized_attempts_skipped": 0}
+        stage_record = self.stage_records.get(stage.get("id"), {})
+        attempts = stage_record.get("attempts", []) if isinstance(stage_record, dict) else []
+        if not isinstance(attempts, list):
+            attempts = []
+        evidence_records = []
+        related_results = []
+        non_materialized_attempts_skipped = 0
+        materialized_attempts_scanned = 0
+        terminal = {"succeeded", "completed", "failed", "blocked"}
+        result_limit = max(1, int(limit))
+        current_question = (selected_topic.get("research_question")
+                            if isinstance(selected_topic, dict) else None)
+        current_topic_id = (selected_topic.get("id")
+                            if isinstance(selected_topic, dict) else None)
+        try:
+            stage_root = Path(stage["project_dir"]).resolve()
+            if stage_root.name.startswith("attempt-") and stage_root.parent.name == "attempts":
+                stage_root = next((parent for parent in stage_root.parents
+                                   if (parent / "continuations").is_dir()), None)
+            if stage_root is None:
+                raise ValueError("experiment stage root is unavailable")
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return {"available_attempts": 0, "same_measurement_repeated": False,
+                    "measurements": [], "related_results": [],
+                    "materialized_attempts_scanned": 0,
+                    "non_materialized_attempts_skipped": 0,
+                    "evidence_status": "stage_root_unavailable"}
+        for attempt in reversed(attempts):
+            if not isinstance(attempt, dict) or attempt.get("state") not in terminal:
+                continue
+            attempt_number = attempt.get("attempt_number")
+            project_dir = attempt.get("project_dir")
+            if type(attempt_number) is not int or not isinstance(project_dir, str):
+                continue
+            attempt_root = Path(project_dir).resolve()
+            if (attempt_root.name != f"attempt-{attempt_number}"
+                    or attempt_root.parent.name != "attempts"):
+                continue
+            try:
+                attempt_root.relative_to(stage_root)
+            except ValueError:
+                continue
+            run_path = attempt_root / "output" / "run.json"
+            if run_path.is_symlink() or not run_path.is_file():
+                non_materialized_attempts_skipped += 1
+                continue
+            materialized_attempts_scanned += 1
+            run_record = _read_experiment_result_payload(
+                str(run_path), base_dir=attempt_root)
+            if not isinstance(run_record, dict):
+                continue
+            package_path = run_record.get("results_package")
+            if not isinstance(package_path, str):
+                continue
+            package_metadata = _read_experiment_result_payload(
+                package_path, base_dir=attempt_root)
+            if not isinstance(package_metadata, dict):
+                continue
+            result_question = package_metadata.get("question")
+            run_study_id = run_record.get("study_id")
+            study_topic_id = (run_study_id.split("-cycle-", 1)[0]
+                              if isinstance(run_study_id, str)
+                              and "-cycle-" in run_study_id else None)
+            attempt_topic_id = attempt.get("topic_id")
+            same_topic = (
+                isinstance(current_topic_id, str)
+                and (attempt_topic_id == current_topic_id
+                     or (attempt_topic_id is None
+                         and study_topic_id == current_topic_id))
+            )
+            same_question = (
+                isinstance(current_question, str) and result_question == current_question)
+            if not same_question and not same_topic:
+                continue
+            if same_question and len(evidence_records) >= result_limit:
+                continue
+            context = {
+                "stage_id": stage.get("id"),
+                "attempt_number": attempt_number,
+                "project_dir": str(attempt_root),
+                "output_path": str(run_path),
+                "results_package": package_path,
+                "execution_refs": run_record.get("execution_refs"),
+                "project_id": run_record.get("project_id"),
+                "study_id": run_record.get("study_id"),
+                "assessment_ref": run_record.get("assessment_ref"),
+                "status": attempt.get("state"),
+            }
+            evidence = self._prior_attempt_result_evidence(
+                stage, context)
+            if evidence.get("available") is True:
+                if same_question:
+                    evidence_records.append(evidence)
+                    continue
+                if same_topic and isinstance(result_question, str):
+                    package = evidence.get("results_package", {})
+                    derived = evidence.get("derived_results", {})
+                    related_results.append({
+                        "attempt_number": attempt_number,
+                        "study_id": run_record.get("study_id"),
+                        "question": result_question,
+                        "validation_decision": evidence.get("validation_decision"),
+                        "observation_count": evidence.get("files", {}).get(
+                            "raw_data", {}).get("observation_count"),
+                        "measurement_sha256": evidence.get("measurement_sha256"),
+                        "metrics": _bounded_experiment_result_projection(
+                            derived.get("metrics", [])[:8]
+                            if isinstance(derived.get("metrics"), list) else []),
+                        "findings": _bounded_experiment_result_projection(
+                            package.get("findings", [])[:4]
+                            if isinstance(package.get("findings"), list) else []),
+                        "limitations": _bounded_experiment_result_projection(
+                            package.get("limitations", [])[:6]
+                            if isinstance(package.get("limitations"), list) else []),
+                        "admissible_as_current_claims": False,
+                        "exclusion_reason": "research_question_mismatch",
+                    })
+
+        grouped = {}
+        for evidence in evidence_records:
+            fingerprint = evidence.get("measurement_sha256")
+            if not isinstance(fingerprint, str):
+                continue
+            group = grouped.get(fingerprint)
+            if group is None:
+                group = {
+                    "measurement_sha256": fingerprint,
+                    "repeat_count": 0,
+                    "attempt_numbers": [],
+                    "observation_count": evidence.get("files", {}).get(
+                        "raw_data", {}).get("observation_count"),
+                    "metrics": evidence.get("derived_results", {}).get("metrics", []),
+                    "findings": evidence.get("results_package", {}).get("findings", []),
+                    "limitations": evidence.get("results_package", {}).get("limitations", []),
+                    "validation_decision": evidence.get("validation_decision"),
+                    "review_evidence": evidence.get("review_evidence", []),
+                    "execution_refs": evidence.get("execution_refs", []),
+                }
+                grouped[fingerprint] = group
+            group["repeat_count"] += 1
+            attempt_number = evidence.get("attempt_number")
+            if type(attempt_number) is int and len(group["attempt_numbers"]) < 8:
+                group["attempt_numbers"].append(attempt_number)
+
+        measurements = list(grouped.values())[:8]
+        for measurement in measurements:
+            measurement["identical_measurement_repeated"] = (
+                measurement["repeat_count"] > 1)
+        related_results.sort(key=lambda item: (
+            item.get("validation_decision") not in {"accepted", "accepted_with_limitations"},
+            -item["attempt_number"],
+        ))
+        return {
+            "available_attempts": len(evidence_records),
+            "same_measurement_repeated": any(
+                item["repeat_count"] > 1 for item in measurements),
+            "measurements": measurements,
+            "related_results": related_results[:8],
+            "materialized_attempts_scanned": materialized_attempts_scanned,
+            "non_materialized_attempts_skipped": non_materialized_attempts_skipped,
+        }
+
     def _build_capability_repair_packet(self, stage, topic_result, prior_context, error):
         """Assemble bounded evidence for the model-led methods repair panel."""
         selected = topic_result.get("topic") if isinstance(topic_result, dict) else {}
@@ -6442,6 +9116,15 @@ class ComposerRunner:
         failure_attempt_number = (
             verified_dossier.get("attempt_number") if verified_dossier else None
         )
+        prior_attempt_result = self._prior_attempt_result_evidence(
+            stage, prior_context, selected_topic=selected)
+        prior_attempt_history = self._prior_attempt_result_history(
+            stage, selected_topic=selected)
+        unresolved_attempt_evidence = self._unresolved_prior_attempt_evidence(
+            stage, prior_context.get("unresolved_prior_attempts"),
+            selected_topic=selected)
+        unresolved_attempt_sources = unresolved_attempt_evidence.pop(
+            "generated_sources", [])
 
         def is_bound_to_failure(value):
             if not verified_dossier or not isinstance(value, dict):
@@ -6594,6 +9277,64 @@ class ComposerRunner:
             repair_plan_is_bound and has_conflicting_content(repair_plan))
         if not repair_plan_is_bound or repair_plan_content_conflicts:
             repair_plan = None
+        program_snapshot = (
+            deepcopy(verified_dossier.get("program_snapshot", []))
+            if verified_dossier else
+            self._failure_program_snapshot(stage, topic_context=topic_result)
+        )
+        for source in program_snapshot:
+            if not isinstance(source, dict):
+                continue
+            if isinstance(source.get("path"), str):
+                source["path"] = Path(source["path"]).name
+            if isinstance(source.get("source"), str):
+                source["source"] = redact_sensitive_text(source["source"])
+            source.setdefault(
+                "source_linkage",
+                "topic_capability_source_snapshot; exact execution-source linkage is unverified",
+            )
+        foundry_attempt = foundry_failure.get("last_attempt")
+        foundry_attempt = foundry_attempt if isinstance(foundry_attempt, dict) else {}
+        candidate_source_files = foundry_attempt.get("source_files")
+        candidate_source_files = (
+            candidate_source_files if isinstance(candidate_source_files, dict) else {})
+        exact_candidate_sources = {}
+        for source_name in ("executor", "validator"):
+            source_record = candidate_source_files.get(source_name)
+            source_record = source_record if isinstance(source_record, dict) else {}
+            chunks = source_record.get("source_chunks")
+            chunks = chunks if isinstance(chunks, list) else []
+            chunks = [chunk for chunk in chunks if isinstance(chunk, str)]
+            reconstructed = "".join(chunks)
+            prompt_sha256 = source_record.get("prompt_source_sha256")
+            prompt_characters = source_record.get("prompt_source_characters")
+            chunks_complete = (
+                source_record.get("available") is True
+                and source_record.get("integrity_verified") is True
+                and source_record.get("matches_expected") is True
+                and source_record.get("source_truncated") is False
+                and len(chunks) == len(source_record.get("source_chunks", []))
+                and len(chunks) <= 16
+                and all(len(chunk) <= 7000 for chunk in chunks)
+                and type(prompt_characters) is int
+                and len(reconstructed) == prompt_characters
+                and isinstance(prompt_sha256, str)
+                and hashlib.sha256(reconstructed.encode("utf-8")).hexdigest()
+                == prompt_sha256
+            )
+            exact_candidate_sources[source_name] = {
+                "available": chunks_complete,
+                "source_sha256": source_record.get("expected_sha256"),
+                "source_characters": source_record.get("source_characters"),
+                "prompt_source_sha256": prompt_sha256,
+                "prompt_source_characters": prompt_characters,
+                "redaction_applied": source_record.get("redaction_applied") is True,
+                "source_chunks": chunks if chunks_complete else [],
+                "omission_reason": None if chunks_complete else (
+                    source_record.get("omission_reason")
+                    or "The source chunks are unavailable or fail integrity verification."
+                ),
+            }
         exact_observed = (verified_dossier.get("observed_result")
                           if verified_dossier else None)
         failure_lineage = {
@@ -6624,19 +9365,25 @@ class ComposerRunner:
             "failure": {
                 "error": (verified_dossier.get("error") if verified_dossier
                           else str(error)[:4096]),
-                "prior_status": exact_observed.get("status")
-                if isinstance(exact_observed, dict) else None,
+                "prior_status": (exact_observed.get("status")
+                                 if isinstance(exact_observed, dict)
+                                 else prior_context.get("status")
+                                 if prior_attempt_result.get("available") is True else None),
             },
             "failure_recovery": failure_recovery,
             "program_snapshot": self._capability_repair_projection(
-                verified_dossier.get("program_snapshot", []) if verified_dossier else [],
-                max_text=18000),
+                program_snapshot, max_text=18000),
             "observed_result": self._capability_repair_projection({
                 "failure_dossier_result": exact_observed,
             } if exact_observed is not None else {}, max_text=7000),
             "failure_observed_result": self._capability_repair_projection(
                 exact_observed, max_text=9000),
+            "prior_attempt_result_evidence": prior_attempt_result,
+            "prior_attempt_result_history": prior_attempt_history,
+            "unresolved_attempt_evidence": unresolved_attempt_evidence,
+            "unresolved_attempt_sources": unresolved_attempt_sources,
             "prior_foundry_work": foundry_failure,
+            "exact_candidate_sources": exact_candidate_sources,
             "experiment_repair_plan": self._capability_repair_projection(
                 repair_plan, max_text=4200),
             "experiment_repair_history": self._capability_repair_projection(
@@ -6671,7 +9418,9 @@ class ComposerRunner:
                 "policy": (
                     "Only evidence bound to this immutable failure dossier, stage attempt, and input "
                     "digest is included, and its narrative must not cite a different attempt or "
-                    "failure digest; excluded history remains in the ledger."
+                    "failure digest; prior result packages are separately bound to their exact "
+                    "attempt directory and execution refs, remain explicitly unadmitted, and "
+                    "excluded history remains in the ledger."
                 ),
             },
             "repair_contract": {
@@ -6693,10 +9442,771 @@ class ComposerRunner:
                 ],
             },
         }
+        intent = foundry_failure.get("last_attempt")
+        intent = intent.get("experiment_intent") if isinstance(intent, dict) else None
+        prior_measurements = [{
+            "measurement_sha256": item.get("measurement_sha256"),
+            "validation_decision": item.get("validation_decision"),
+            "review_evidence": [{
+                "reviewer_id": review.get("reviewer_id"),
+                "decision": review.get("decision"),
+                "adverse_checks": [{
+                    "check_id": check.get("check_id"),
+                    "outcome": check.get("outcome"),
+                    "evidence": self._normalize_research_request_value(
+                        check.get("evidence", "")),
+                } for check in review.get("adverse_checks", [])
+                  if isinstance(check, dict)],
+                "adverse_findings": [{
+                    "finding_id": finding.get("finding_id"),
+                    "outcome": finding.get("outcome"),
+                    "rationale": self._normalize_research_request_value(
+                        finding.get("rationale", "")),
+                } for finding in review.get("adverse_findings", [])
+                  if isinstance(finding, dict)],
+            } for review in item.get("review_evidence", [])
+              if isinstance(review, dict)],
+        } for item in prior_attempt_history.get("measurements", [])
+          if isinstance(item, dict)]
+        prior_measurements.sort(key=canonical_bytes)
+        survey_refs = {
+            key: prior_context.get(key)
+            for key in ("survey_ref", "assessment_ref", "survey_evidence_ref",
+                        "gap_assessment_ref", "source_survey_ref")
+            if isinstance(prior_context.get(key), str)
+        }
+        unresolved_identity = []
+        unresolved_records = unresolved_attempt_evidence.get("records", {})
+        unresolved_records = unresolved_records if isinstance(unresolved_records, dict) else {}
+        unresolved_workers = unresolved_attempt_evidence.get("worker_results", {})
+        unresolved_workers = unresolved_workers if isinstance(unresolved_workers, dict) else {}
+        for key, record in sorted(unresolved_records.items()):
+            if not isinstance(record, dict):
+                continue
+            if record.get("classification") == "attempt_directory_missing":
+                continue
+            run = record.get("stage_run")
+            run = run if isinstance(run, dict) else {}
+            stage_check = record.get("stage_result_check")
+            stage_check = stage_check if isinstance(stage_check, dict) else {}
+            operation_ledger = record.get("nested_operation_ledger")
+            operation_ledger = operation_ledger if isinstance(operation_ledger, dict) else {}
+            operations = operation_ledger.get("operations", [])
+            operations = operations if isinstance(operations, list) else []
+            worker_summary = []
+            worker_records = unresolved_workers.get(key, [])
+            worker_records = worker_records if isinstance(worker_records, list) else []
+            for worker in worker_records[:8]:
+                if not isinstance(worker, dict):
+                    continue
+                ledger = worker.get("task_ledger")
+                ledger = ledger if isinstance(ledger, dict) else {}
+                summary = {name: worker.get(name) for name in (
+                    "task_id", "result_sha256", "ok", "operation_outcome", "study_id",
+                    "process_returncode", "capture_truncated", "capture_incomplete",
+                    "observation_count", "metric_count")}
+                summary["task_state"] = ledger.get("task_state")
+                summary["attempt_states"] = ledger.get("attempt_states")
+                worker_summary.append(summary)
+            unresolved_identity.append({
+                "attempt_number": record.get("attempt_number"),
+                "cycle": record.get("cycle"),
+                "attempt_state": record.get("attempt_state"),
+                "classification": record.get("classification"),
+                "external_ref_recorded": record.get("external_ref_recorded"),
+                "stage_run": {name: run.get(name) for name in (
+                    "status", "results_package_present", "execution_ref_count")},
+                "stage_result_check": {name: stage_check.get(name) for name in (
+                    "available", "reason", "scientific_sha256", "measurement_sha256",
+                    "observation_count")},
+                "nested_operations": [{
+                    "task_id": operation.get("task_id"),
+                    "operation": operation.get("operation"),
+                    "task_state": operation.get("task_state"),
+                    "attempts": operation.get("attempts", []),
+                } for operation in operations if isinstance(operation, dict)],
+                "generated_program_hashes": [
+                    program.get("sha256") for program in record.get(
+                        "generated_programs", [])
+                    if isinstance(program, dict) and isinstance(program.get("sha256"), str)
+                ],
+                "workers": worker_summary,
+            })
+        unresolved_identity.sort(key=lambda item: (
+            item.get("attempt_number") if type(item.get("attempt_number")) is int else -1,
+            item.get("cycle") if type(item.get("cycle")) is int else -1,
+        ))
+        unresolved_source_identity = [{name: source.get(name) for name in (
+            "source_sha256", "prompt_source_sha256", "source_available",
+            "execution_link_verified",
+        ) if name in source}
+            for source in unresolved_attempt_sources if isinstance(source, dict)]
+        packet["experiment_intent"] = deepcopy(intent)
+        packet["survey_evidence_refs"] = deepcopy(survey_refs)
+        packet["prior_measurements"] = deepcopy(prior_measurements)
+        packet["review_input_sha256"] = self._capability_repair_review_input_sha256(packet)
+        packet["science_input_sha256"] = hashlib.sha256(canonical_bytes({
+            "stage_id": stage.get("id"),
+            "topic": packet.get("topic"),
+            "experiment_intent": intent,
+            "candidate_sources": {
+                name: {
+                    "available": record.get("available") is True,
+                    "source_sha256": record.get("source_sha256"),
+                    "prompt_source_sha256": record.get("prompt_source_sha256"),
+                }
+                for name, record in exact_candidate_sources.items()
+            },
+            "program_snapshot": [{
+                "sha256": item.get("sha256"),
+                "size_bytes": item.get("size_bytes"),
+            } for item in program_snapshot if isinstance(item, dict)],
+            "survey_refs": survey_refs,
+            "failure": {
+                "observed_status": packet.get("failure", {}).get("prior_status"),
+                "recovery_mode": failure_recovery_context.get("recovery_mode"),
+                "failure_class": failure_recovery_context.get("failure_class"),
+            },
+            "current_result": {
+                "available": prior_attempt_result.get("available") is True,
+                "scientific_sha256": prior_attempt_result.get("scientific_sha256"),
+                "validation_decision": prior_attempt_result.get("validation_decision"),
+            },
+            "prior_measurements": prior_measurements,
+            "review_evidence": prior_reports,
+            "repair_plan": self._normalize_research_request_value(
+                packet.get("experiment_repair_plan", {})),
+            "repair_history": self._normalize_research_request_value(
+                packet.get("experiment_repair_history", [])),
+            "prior_verifier": self._normalize_research_request_value(
+                packet.get("prior_verifier", {})),
+            "validation_feedback": self._normalize_research_request_value(
+                foundry_failure.get("validation_feedback", {})),
+            "unresolved_execution_evidence": unresolved_identity,
+            "unresolved_execution_sources": unresolved_source_identity,
+        })).hexdigest()
         packet = self._capability_repair_projection(
-            packet, max_text=CAPABILITY_REPAIR_SOURCE_CHARS)
-        packet["input_sha256"] = hashlib.sha256(canonical_bytes(packet)).hexdigest()
+            packet, max_depth=9, max_text=CAPABILITY_REPAIR_SOURCE_CHARS)
+        semantic_packet = deepcopy(packet)
+        semantic_packet["repair_prompt_revision"] = CAPABILITY_REPAIR_PANEL_PROMPT_REVISION
+        semantic_packet.pop("continuation_cycle", None)
+        semantic_packet["failure_lineage"] = {
+            "stage_id": stage.get("id"),
+            "identity_verified": bool(verified_dossier),
+        }
+        semantic_packet["failure_recovery"] = {
+            "identity_verified": bool(verified_dossier),
+        }
+        semantic_packet["provenance_exclusions"] = {}
+        semantic_packet["prior_attempt_result_evidence"] = {
+            "available": prior_attempt_result.get("available") is True,
+            "scientific_sha256": prior_attempt_result.get("scientific_sha256"),
+            "admissible_as_verified_claims": False,
+        }
+        semantic_packet["prior_attempt_result_history"] = {
+            "same_measurement_repeated": prior_attempt_history.get(
+                "same_measurement_repeated") is True,
+            "measurements": [{
+                "measurement_sha256": item.get("measurement_sha256"),
+                "validation_decision": item.get("validation_decision"),
+                "review_evidence": [{
+                    "reviewer_id": review.get("reviewer_id"),
+                    "decision": review.get("decision"),
+                    "adverse_checks": [{
+                        "check_id": check.get("check_id"),
+                        "outcome": check.get("outcome"),
+                        "evidence": self._normalize_research_request_value(
+                            check.get("evidence", "")),
+                    } for check in review.get("adverse_checks", [])
+                      if isinstance(check, dict)],
+                    "adverse_findings": [{
+                        "finding_id": finding.get("finding_id"),
+                        "outcome": finding.get("outcome"),
+                        "rationale": self._normalize_research_request_value(
+                            finding.get("rationale", "")),
+                    } for finding in review.get("adverse_findings", [])
+                      if isinstance(finding, dict)],
+                } for review in item.get("review_evidence", [])
+                  if isinstance(review, dict)],
+            } for item in prior_attempt_history.get("measurements", [])
+              if isinstance(item, dict)],
+            "related_results": [{
+                "attempt_number": item.get("attempt_number"),
+                "question": item.get("question"),
+                "validation_decision": item.get("validation_decision"),
+                "measurement_sha256": item.get("measurement_sha256"),
+                "admissible_as_current_claims": False,
+            } for item in prior_attempt_history.get("related_results", [])
+              if isinstance(item, dict)],
+        }
+        semantic_packet["unresolved_attempt_evidence"] = unresolved_identity
+        semantic_packet["program_snapshot"] = [
+            {key: source.get(key) for key in ("sha256", "size_bytes", "source")
+             if key in source}
+            for source in program_snapshot if isinstance(source, dict)
+        ]
+        packet["input_sha256"] = hashlib.sha256(
+            canonical_bytes(semantic_packet)).hexdigest()
         return packet
+
+    @staticmethod
+    def _validated_capability_repair_plan(report, packet):
+        """Accept one lineage-bound methods plan, never a bundle of suggestions."""
+        if not isinstance(report, dict):
+            return None, "the methods lead report is unavailable"
+        response = report.get("response") if isinstance(report, dict) else None
+        response = response if isinstance(response, dict) else {}
+        raw = response.get("raw") if isinstance(response.get("raw"), dict) else {}
+        plan = raw.get("repair_plan")
+        if report.get("status") != "succeeded" or response.get("decision") != "repair":
+            return None, "the methods lead did not issue a repair decision"
+        if not isinstance(plan, dict):
+            return None, "the methods lead did not provide a substantive repair plan"
+        expected_lineage = packet.get("failure_lineage")
+        expected_lineage = expected_lineage if isinstance(expected_lineage, dict) else {}
+        required_lineage = (
+            "stage_id", "failure_dossier_ref", "attempt_number", "failure_input_sha256")
+        expected_hash = expected_lineage.get("failure_input_sha256")
+        if (expected_lineage.get("identity_verified") is not True
+                or not isinstance(expected_lineage.get("stage_id"), str)
+                or not isinstance(expected_lineage.get("failure_dossier_ref"), str)
+                or type(expected_lineage.get("attempt_number")) is not int
+                or not isinstance(expected_hash, str) or len(expected_hash) != 64
+                or any(character not in "0123456789abcdef" for character in expected_hash)):
+            return None, "the current failure dossier identity is not verified"
+        topic = packet.get("topic") if isinstance(packet.get("topic"), dict) else {}
+        if plan.get("topic_id") != topic.get("id"):
+            return None, "the repair plan changes or omits the admitted topic identity"
+        if plan.get("disposition") != "repair":
+            return None, "the methods lead requested evidence or declined a repair"
+        root_cause = plan.get("root_cause")
+        if not isinstance(root_cause, dict):
+            return None, "the repair plan has no evidence-bound root cause"
+        statement = root_cause.get("statement")
+        evidence = root_cause.get("evidence")
+        if (not isinstance(statement, str) or not statement.strip()
+                or not isinstance(evidence, list)
+                or not any(isinstance(item, str) and item.strip() for item in evidence)):
+            return None, "the root cause is missing a concrete evidence link"
+        changes = plan.get("required_changes")
+        if not isinstance(changes, list) or not changes:
+            return None, "the repair plan has no selected source or design change"
+        normalized_changes = []
+        for change in changes[:6]:
+            if not isinstance(change, dict):
+                return None, "a selected repair change is not a structured instruction"
+            fields = {key: change.get(key) for key in (
+                "target", "instruction", "scientific_basis", "source_refs")}
+            if any(not isinstance(fields[key], str) or not fields[key].strip()
+                   for key in ("target", "instruction", "scientific_basis")):
+                return None, "a selected repair change lacks its target, instruction, or scientific basis"
+            if not isinstance(fields["source_refs"], list):
+                fields["source_refs"] = []
+            fields["source_refs"] = [str(item)[:300] for item in fields["source_refs"][:6]]
+            normalized_changes.append({key: value[:1600] if isinstance(value, str) else value
+                                       for key, value in fields.items()})
+        checks = plan.get("acceptance_checks")
+        checks = checks if isinstance(checks, list) else []
+        repair_contract = packet.get("repair_contract")
+        repair_contract = repair_contract if isinstance(repair_contract, dict) else {}
+        mandatory_checks = repair_contract.get("must_prove", [])
+        if not isinstance(mandatory_checks, list):
+            return None, "the repair contract has an invalid must_prove list"
+        normalized_checks = []
+        for value in [*checks, *mandatory_checks]:
+            if not isinstance(value, str) or not value.strip():
+                continue
+            normalized = value.strip()[:1200]
+            if normalized not in normalized_checks:
+                normalized_checks.append(normalized)
+        if not normalized_checks:
+            return None, "the repair plan has no falsifiable acceptance checks"
+        if len(normalized_checks) > 16:
+            return None, "the bounded repair contract has more than 16 acceptance checks"
+        return {
+            "schema_version": "experiment-repair-adjudication-1",
+            "topic_id": topic.get("id"),
+            "failure_lineage": {key: expected_lineage.get(key)
+                                for key in required_lineage},
+            "disposition": "repair",
+            "root_cause": {
+                "statement": statement[:1800],
+                "evidence": [str(item)[:1400] for item in evidence[:8]
+                             if isinstance(item, str) and item.strip()],
+            },
+            "required_changes": normalized_changes,
+            "acceptance_checks": normalized_checks,
+            # Reviewer reports and cited evidence are the audit trail. Free-form
+            # attribution prose is not an admission field: an inaccurate paraphrase
+            # must not veto an otherwise evidence-bound experimental design.
+            "dissent_resolution": [],
+            "residual_uncertainties": [str(item)[:900] for item in
+                                       plan.get("residual_uncertainties", [])[:8]
+                                       if isinstance(item, str) and item.strip()]
+            if isinstance(plan.get("residual_uncertainties"), list) else [],
+        }, None
+
+    @staticmethod
+    def _capability_repair_verdict(repair_plan, verifier):
+        """Require independent acceptance before any replacement code can run.
+
+        A pre-execution hold is feedback for revising the plan, not an uncertainty
+        that can be deferred until after the proposed design has already run.
+        """
+        if not isinstance(repair_plan, dict) or not isinstance(verifier, dict):
+            return "hold", []
+        response = verifier.get("response")
+        response = response if isinstance(response, dict) else {}
+        if verifier.get("status") != "succeeded":
+            return "hold", []
+        decision = response.get("decision")
+        blocking = response.get("blocking_findings")
+        if not isinstance(blocking, list):
+            blocking = response.get("critical_findings")
+        blocking = blocking if isinstance(blocking, list) else []
+        required_revisions = response.get("required_revisions")
+        required_revisions = required_revisions if isinstance(required_revisions, list) else []
+        concerns = list(dict.fromkeys(
+            str(item).strip()[:1600] for item in [*blocking, *required_revisions]
+            if isinstance(item, str) and item.strip()
+        ))
+        if decision == "accept" and not concerns:
+            return "repair", []
+        if not concerns:
+            rationale = response.get("rationale")
+            if isinstance(rationale, str) and rationale.strip():
+                concerns.append(rationale.strip()[:1600])
+        return "hold", concerns[:8]
+
+    @staticmethod
+    def _capability_repair_verifier_unavailable_reason(verifier):
+        """Keep transport/format failures distinct from an actual scientific hold."""
+        if isinstance(verifier, dict) and verifier.get("status") == "succeeded":
+            return None
+        if not isinstance(verifier, dict):
+            return "independent verifier produced no usable verdict"
+        error = verifier.get("error")
+        if isinstance(error, str) and error.strip():
+            return f"independent verifier produced no usable verdict: {error.strip()[:1000]}"
+        status = verifier.get("status")
+        return (f"independent verifier produced no usable verdict (status={status})"
+                if status else "independent verifier produced no usable verdict")
+
+    @staticmethod
+    def _capability_repair_lead_input_digest(packet, reports, prior_plan_review=None):
+        """Invalidate cached lead output when a verifier requires plan revision."""
+        return hashlib.sha256(canonical_bytes({
+            "prompt_revision": CAPABILITY_REPAIR_PANEL_PROMPT_REVISION,
+            "packet_input_sha256": packet.get("input_sha256"),
+            "prior_plan_review": prior_plan_review,
+            "reviewer_reports": [{
+                "role_id": item.get("role_id"),
+                "status": item.get("status"),
+                "response": item.get("response"),
+            } for item in reports if isinstance(item, dict)],
+        })).hexdigest()
+
+    @classmethod
+    def _repair_plan_from_reconciled_reports(cls, reports, packet):
+        """Normalize an explicit Methods repair decision without adding claims.
+
+        Older checkpoints stored the lead's decision and actions under the
+        generic specialist response schema, which prohibited the nested
+        ``repair_plan`` key.  This adapter preserves the lead's selected
+        action and reviewer evidence, then binds it to the current failure
+        dossier.  The independent verifier still has to accept the plan.
+        """
+        if not isinstance(reports, list) or not isinstance(packet, dict):
+            return None
+        normalized_reports = []
+        for report in reports:
+            if not isinstance(report, dict) or report.get("status") != "succeeded":
+                continue
+            response = report.get("response")
+            response = response if isinstance(response, dict) else {}
+            raw = response.get("raw")
+            raw = raw if isinstance(raw, dict) else {}
+            normalized_reports.append({
+                **report,
+                "response": {
+                    **response,
+                    "decision": response.get("decision", report.get("decision")),
+                    "summary": response.get("summary", report.get("summary", "")),
+                    "findings": response.get("findings", report.get("findings", [])),
+                    "requested_actions": response.get(
+                        "requested_actions", report.get("requested_actions", [])),
+                    "raw": raw,
+                },
+            })
+        lead = next((item for item in reversed(normalized_reports)
+                     if item.get("role_id") == "methodologist"), None)
+        if lead is None or lead["response"].get("decision") != "repair":
+            return None
+        corroborating = [item for item in normalized_reports
+                         if item.get("role_id") not in {
+                             "methodologist", "adversarial-reviewer",
+                         }
+                         and item["response"].get("decision") == "repair"
+                         and item["response"].get("findings")]
+        if len(corroborating) < 2:
+            return None
+
+        lead_response = lead["response"]
+        summary = lead_response.get("summary")
+        summary = summary.strip() if isinstance(summary, str) else ""
+        if not summary:
+            return None
+        raw_actions = lead_response.get("raw", {}).get("requested_actions")
+        if not isinstance(raw_actions, list):
+            raw_actions = lead_response.get("requested_actions")
+        if not isinstance(raw_actions, list):
+            return None
+
+        changes = []
+        explicit_checks = []
+        for value in raw_actions[:3]:
+            action = value if isinstance(value, dict) else None
+            if action is None and isinstance(value, str):
+                try:
+                    parsed = ast.literal_eval(value)
+                except (SyntaxError, ValueError):
+                    parsed = None
+                action = parsed if isinstance(parsed, dict) else None
+            if isinstance(action, dict):
+                instruction = action.get("instruction", action.get("action"))
+                check = action.get("check", action.get("completion_check"))
+                target = action.get("target", "experiment design")
+                scientific_basis = action.get("scientific_basis", summary)
+                source_refs = action.get("source_refs", [])
+            else:
+                instruction = value
+                check = None
+                target = "experiment design"
+                scientific_basis = summary
+                source_refs = []
+            if not isinstance(instruction, str) or not instruction.strip():
+                continue
+            if not isinstance(target, str) or not target.strip():
+                target = "experiment design"
+            if not isinstance(scientific_basis, str) or not scientific_basis.strip():
+                scientific_basis = summary
+            if not isinstance(source_refs, list):
+                source_refs = []
+            source_refs = [str(item)[:300] for item in source_refs[:6]
+                           if isinstance(item, str) and item.strip()]
+            if not source_refs:
+                exact_sources = packet.get("exact_candidate_sources")
+                exact_sources = exact_sources if isinstance(exact_sources, dict) else {}
+                source_refs = [
+                    f"{name}:{record['source_sha256']}"
+                    for name, record in exact_sources.items()
+                    if name in {"executor", "validator"}
+                    and isinstance(record, dict)
+                    and isinstance(record.get("source_sha256"), str)
+                ]
+            changes.append({
+                "target": target[:300],
+                "instruction": instruction.strip()[:1600],
+                "scientific_basis": scientific_basis.strip()[:1600],
+                "source_refs": source_refs,
+            })
+            if isinstance(check, str) and check.strip():
+                explicit_checks.append(check.strip()[:1200])
+        if not changes:
+            return None
+
+        repair_contract = packet.get("repair_contract")
+        repair_contract = repair_contract if isinstance(repair_contract, dict) else {}
+        mandatory_checks = repair_contract.get("must_prove", [])
+        if not isinstance(mandatory_checks, list):
+            return None
+        checks = []
+        for item in [*explicit_checks[:3], *mandatory_checks]:
+            if isinstance(item, str) and item.strip() and item.strip() not in checks:
+                checks.append(item.strip()[:1200])
+        if not checks:
+            return None
+
+        evidence = []
+        for item in (lead, *corroborating):
+            response = item["response"]
+            findings = response.get("findings")
+            if not isinstance(findings, list):
+                continue
+            for finding in findings:
+                if isinstance(finding, str) and finding.strip() and finding not in evidence:
+                    evidence.append(finding.strip()[:1400])
+                if len(evidence) == 6:
+                    break
+            if len(evidence) == 6:
+                break
+        if not evidence:
+            return None
+
+        topic = packet.get("topic") if isinstance(packet.get("topic"), dict) else {}
+        lineage = packet.get("failure_lineage")
+        lineage = lineage if isinstance(lineage, dict) else {}
+        candidate = {
+            "schema_version": "experiment-repair-adjudication-1",
+            "topic_id": topic.get("id"),
+            "failure_lineage": {
+                key: lineage.get(key) for key in (
+                    "stage_id", "failure_dossier_ref", "attempt_number",
+                    "failure_input_sha256",
+                )
+            },
+            "disposition": "repair",
+            "root_cause": {"statement": summary[:1800], "evidence": evidence[:6]},
+            "required_changes": changes[:3],
+            "acceptance_checks": checks,
+        }
+        adapted_report = {
+            "status": "succeeded",
+            "response": {"decision": "repair", "raw": {"repair_plan": candidate}},
+        }
+        plan, _error = cls._validated_capability_repair_plan(adapted_report, packet)
+        return plan
+
+    @classmethod
+    def _capability_repair_plan_admitted(cls, panel):
+        """Only cache a repair panel as complete when its plan passed review."""
+        if (not isinstance(panel, dict) or panel.get("status") != "completed"
+                or panel.get("decision") != "repair"
+                or not isinstance(panel.get("repair_plan"), dict)):
+            return False
+        packet = panel.get("packet")
+        if (not isinstance(packet, dict)
+                or packet.get("input_sha256") != panel.get("input_sha256")):
+            return False
+        validated, error = cls._validated_capability_repair_plan({
+            "status": "succeeded",
+            "response": {
+                "decision": "repair",
+                "raw": {"repair_plan": panel["repair_plan"]},
+            },
+        }, packet)
+        if error is not None or validated is None:
+            return False
+        verifier = panel.get("verifier")
+        blocking = (verifier.get("blocking_findings")
+                    if isinstance(verifier, dict) else None)
+        if not isinstance(blocking, list):
+            blocking = verifier.get("critical_findings", []) \
+                if isinstance(verifier, dict) else []
+        required_revisions = (verifier.get("required_revisions", [])
+                              if isinstance(verifier, dict) else [])
+        return (
+            isinstance(verifier, dict)
+            and verifier.get("status") == "succeeded"
+            and verifier.get("decision") == "accept"
+            and not blocking
+            and not required_revisions
+        )
+
+    @classmethod
+    def _capability_repair_review_input_sha256(cls, packet):
+        """Fingerprint only question-bound scientific evidence for reviewer reuse.
+
+        Failure dossier IDs, continuation counters, repair plans, reviewer prose, and
+        task-state transitions are administrative/adjudication state. They must not
+        invalidate independent reviews when no research evidence changed.
+        """
+        if not isinstance(packet, dict):
+            return None
+        topic = packet.get("topic")
+        topic = topic if isinstance(topic, dict) else {}
+        foundry = packet.get("prior_foundry_work")
+        foundry = foundry if isinstance(foundry, dict) else {}
+        last_attempt = foundry.get("last_attempt")
+        last_attempt = last_attempt if isinstance(last_attempt, dict) else {}
+        intent = packet.get("experiment_intent")
+        if intent is None:
+            intent = last_attempt.get("experiment_intent")
+
+        sources = packet.get("exact_candidate_sources")
+        sources = sources if isinstance(sources, dict) else {}
+        source_identity = {
+            str(name): {
+                "available": record.get("available") is True,
+                "source_sha256": record.get("source_sha256"),
+                "prompt_source_sha256": record.get("prompt_source_sha256"),
+            }
+            for name, record in sources.items() if isinstance(record, dict)
+        }
+        programs = packet.get("program_snapshot")
+        programs = programs if isinstance(programs, list) else []
+        program_identity = [
+            {key: item.get(key) for key in ("sha256", "size_bytes") if key in item}
+            for item in programs if isinstance(item, dict)
+        ]
+
+        result = packet.get("prior_attempt_result_evidence")
+        result = result if isinstance(result, dict) else {}
+        result_identity = {key: result.get(key) for key in (
+            "available", "scientific_sha256", "measurement_sha256",
+            "observation_count",
+        ) if key in result}
+
+        history = packet.get("prior_attempt_result_history")
+        history = history if isinstance(history, dict) else {}
+        measurements = packet.get("prior_measurements")
+        if not isinstance(measurements, list):
+            measurements = history.get("measurements")
+        measurements = measurements if isinstance(measurements, list) else []
+        measurement_identity = [{"measurement_sha256": item.get("measurement_sha256")}
+                                for item in measurements
+                                if isinstance(item, dict)
+                                and isinstance(item.get("measurement_sha256"), str)]
+        related = history.get("related_results")
+        related = related if isinstance(related, list) else []
+        related_identity = [{key: item.get(key) for key in (
+            "question", "measurement_sha256",
+        ) if key in item} for item in related if isinstance(item, dict)]
+
+        unresolved = packet.get("unresolved_attempt_evidence")
+        unresolved = unresolved if isinstance(unresolved, dict) else {}
+        unresolved_sources = packet.get("unresolved_attempt_sources")
+        unresolved_sources = unresolved_sources if isinstance(unresolved_sources, list) else []
+        records = unresolved.get("records")
+        records = records if isinstance(records, dict) else {}
+        worker_results = unresolved.get("worker_results")
+        worker_results = worker_results if isinstance(worker_results, dict) else {}
+        material_attempts = []
+        for key, record in records.items():
+            if not isinstance(record, dict):
+                continue
+            if record.get("classification") == "attempt_directory_missing":
+                continue
+            check = record.get("stage_result_check")
+            check = check if isinstance(check, dict) else {}
+            stage_result = ({name: check.get(name) for name in (
+                "scientific_sha256", "measurement_sha256", "observation_count",
+            ) if name in check} if check.get("available") is True else None)
+            run = record.get("stage_run")
+            run = run if isinstance(run, dict) else {}
+            run_result = ({name: run.get(name) for name in (
+                "results_package_present", "execution_ref_count",
+            ) if name in run} if run.get("results_package_present")
+                          or run.get("execution_ref_count", 0) else None)
+
+            nested = record.get("nested_operation_ledger")
+            nested = nested if isinstance(nested, dict) else {}
+            operations = nested.get("operations")
+            operations = operations if isinstance(operations, list) else []
+            operation_identity = []
+            for operation in operations:
+                if not isinstance(operation, dict):
+                    continue
+                attempts = operation.get("attempts")
+                attempts = attempts if isinstance(attempts, list) else []
+                attempt_identity = [{name: item.get(name) for name in (
+                    "outcome_unknown", "external_ref_recorded", "accounting",
+                ) if name in item} for item in attempts if isinstance(item, dict)]
+                operation_identity.append({
+                    "operation": operation.get("operation"),
+                    "attempts": attempt_identity,
+                })
+            operation_identity.sort(key=canonical_bytes)
+
+            workers = worker_results.get(key)
+            if not isinstance(workers, list):
+                workers = record.get("worker_results")
+            workers = workers if isinstance(workers, list) else []
+            worker_identity = [{name: worker.get(name) for name in (
+                "result_sha256", "ok", "operation_outcome", "process_returncode",
+                "capture_truncated", "capture_incomplete", "observation_count",
+                "metric_count",
+            ) if name in worker} for worker in workers if isinstance(worker, dict)]
+            worker_identity.sort(key=canonical_bytes)
+            generated = record.get("generated_program_hashes")
+            if not isinstance(generated, list):
+                generated = record.get("generated_programs")
+                generated = [item.get("sha256") for item in generated
+                             if isinstance(item, dict)] if isinstance(generated, list) else []
+            generated = sorted(item for item in generated if isinstance(item, str))
+            if (stage_result or run_result or operation_identity or worker_identity
+                    or generated):
+                material_attempts.append({
+                    "external_ref_recorded": record.get("external_ref_recorded") is True,
+                    "stage_result": stage_result,
+                    "run_result": run_result,
+                    "operations": operation_identity,
+                    "workers": worker_identity,
+                    "generated_program_hashes": generated,
+                })
+        material_attempts.sort(key=canonical_bytes)
+        deduplicated_attempts = []
+        seen_attempts = set()
+        for item in material_attempts:
+            encoded = canonical_bytes(item)
+            if encoded not in seen_attempts:
+                seen_attempts.add(encoded)
+                deduplicated_attempts.append(item)
+
+        survey_refs = packet.get("survey_evidence_refs")
+        if not isinstance(survey_refs, dict):
+            survey_refs = packet.get("survey_refs")
+        survey_refs = survey_refs if isinstance(survey_refs, dict) else {}
+        evidence = {
+            "contract_revision": CAPABILITY_REPAIR_REVIEW_EVIDENCE_REVISION,
+            "topic": {key: topic.get(key) for key in (
+                "id", "title", "domain", "research_question", "scope",
+                "comparison", "measurement", "disconfirmation_test", "resource_plan",
+            )},
+            "experiment_intent": intent,
+            "candidate_sources": source_identity,
+            "program_snapshot": program_identity,
+            "survey_refs": survey_refs,
+            "current_result": result_identity,
+            "prior_measurements": measurement_identity,
+            "related_results": related_identity,
+            "unresolved_material_evidence": deduplicated_attempts,
+            "unresolved_execution_sources": [{name: source.get(name) for name in (
+                "source_sha256", "prompt_source_sha256", "source_available",
+                "execution_link_verified",
+            ) if name in source}
+                for source in unresolved_sources if isinstance(source, dict)],
+        }
+        return hashlib.sha256(canonical_bytes(evidence)).hexdigest()
+
+    @staticmethod
+    def _capability_repair_reports_reusable(panel):
+        """Check whether any independent, evidence-bound reviewer report can be reused."""
+        if not isinstance(panel, dict):
+            return False
+        reports = panel.get("reports")
+        if not isinstance(reports, list):
+            return False
+        completed_roles = {
+            item.get("role_id") for item in reports
+            if isinstance(item, dict)
+            and item.get("role_id") in {
+                "statistical-reviewer", "reproducibility-reviewer", "analysis-reviewer",
+            }
+            and item.get("status") == "succeeded"
+            and isinstance(item.get("summary"), str)
+            and item.get("summary").strip()
+        }
+        return bool(completed_roles)
+
+    @staticmethod
+    def _capability_repair_cached_reports(panel):
+        reports = panel.get("reports") if isinstance(panel, dict) else None
+        if not isinstance(reports, list):
+            return {}
+        reusable_roles = {
+            "statistical-reviewer", "reproducibility-reviewer", "analysis-reviewer",
+        }
+        cached = {}
+        for item in reports:
+            if (not isinstance(item, dict)
+                    or item.get("role_id") not in reusable_roles
+                    or item.get("status") != "succeeded"
+                    or not isinstance(item.get("summary"), str)
+                    or not item["summary"].strip()):
+                continue
+            cached[item["role_id"]] = deepcopy(item)
+        return cached
 
     def _run_capability_repair_panel(self, stage, descriptor, topic_result,
                                      prior_context, error):
@@ -6705,16 +10215,140 @@ class ComposerRunner:
             stage, topic_result, prior_context, error)
         prior_context = prior_context if isinstance(prior_context, dict) else {}
         retained = prior_context.get("capability_repair_panel")
+        cached_review_reports = None
+        prior_plan_review = None
+        retained_packet = retained.get("packet") if isinstance(retained, dict) else None
+        retained_lineage = (retained_packet.get("failure_lineage")
+                            if isinstance(retained_packet, dict) else None)
+        retained_lineage = retained_lineage if isinstance(retained_lineage, dict) else {}
+        retained_review_digest = self._capability_repair_review_input_sha256(
+            retained_packet)
+        current_review_digest = (packet.get("review_input_sha256")
+                                 or self._capability_repair_review_input_sha256(packet))
+        retained_input_lineage = {
+            key: retained_lineage.get(key) for key in (
+                "stage_id", "failure_dossier_ref", "attempt_number", "failure_input_sha256",
+            )
+        }
+        current_failure_lineage = packet.get("failure_lineage")
+        current_failure_lineage = (current_failure_lineage
+                                   if isinstance(current_failure_lineage, dict) else {})
+        same_failure_identity = (
+            retained_lineage.get("identity_verified") is True
+            and current_failure_lineage.get("identity_verified") is True
+            and retained_input_lineage == {
+                key: current_failure_lineage.get(key) for key in retained_input_lineage
+            }
+        )
         if (isinstance(retained, dict)
-                and retained.get("input_sha256") == packet.get("input_sha256")):
-            return deepcopy(retained)
+                and retained.get("schema_version") in CAPABILITY_REPAIR_PLAN_SCHEMA_VERSIONS
+                and retained.get("prompt_revision") == CAPABILITY_REPAIR_PANEL_PROMPT_REVISION
+                and retained.get("input_sha256") == packet.get("input_sha256")
+                and same_failure_identity
+                and retained_review_digest == current_review_digest
+                and self._capability_repair_plan_admitted(retained)):
+            cached = deepcopy(retained)
+            cached["dispatch_usage"] = {
+                key: 0 for key in ("model_calls", "input_tokens", "output_tokens")
+            }
+            return cached
+        if (isinstance(retained, dict)
+                and retained.get("schema_version") in CAPABILITY_REPAIR_REPORT_REUSE_SCHEMA_VERSIONS
+                and retained_lineage.get("identity_verified") is True
+                and retained_review_digest == current_review_digest
+                and packet.get("failure_lineage", {}).get("identity_verified") is True):
+            retained_verifier = retained.get("verifier")
+            retained_verifier = (retained_verifier
+                                 if isinstance(retained_verifier, dict) else {})
+            retained_blocking = retained_verifier.get("blocking_findings")
+            if not isinstance(retained_blocking, list):
+                retained_blocking = retained_verifier.get("critical_findings")
+            retained_blocking = (retained_blocking
+                                 if isinstance(retained_blocking, list) else [])
+            retained_revisions = retained_verifier.get("required_revisions")
+            retained_revisions = (retained_revisions
+                                  if isinstance(retained_revisions, list) else [])
+            verifier_rejected_plan = (
+                isinstance(retained.get("repair_plan"), dict)
+                and retained_verifier.get("status") == "succeeded"
+                and (retained_verifier.get("decision") != "accept"
+                     or bool(retained_blocking)
+                     or bool(retained_revisions))
+            )
+            if verifier_rejected_plan:
+                prior_plan_review = {
+                    "prior_plan": deepcopy(retained["repair_plan"]),
+                    "verifier_decision": retained_verifier.get("decision"),
+                    "verifier_rationale": str(retained_verifier.get("rationale") or ""),
+                    "blocking_findings": [
+                        str(item) for item in retained_blocking
+                        if isinstance(item, str) and item.strip()
+                    ],
+                    "required_revisions": [
+                        str(item) for item in retained_revisions
+                        if isinstance(item, str) and item.strip()
+                    ],
+                    "deferred_gates": [
+                        str(item) for item in retained_verifier.get(
+                            "deferred_gates", [])
+                        if isinstance(item, str) and item.strip()
+                    ] if isinstance(retained_verifier.get("deferred_gates"), list) else [],
+                    "repair_scope": [
+                        str(item)
+                        for item in retained_verifier.get("repair_scope", [])
+                        if isinstance(item, str) and item.strip()
+                    ] if isinstance(retained_verifier.get("repair_scope"), list) else [],
+                    "open_concerns": [
+                        str(item)
+                        for item in retained_verifier.get("open_concerns", [])
+                        if isinstance(item, str) and item.strip()
+                    ] if isinstance(retained_verifier.get("open_concerns"), list) else [],
+                    "instruction": (
+                        "Revise the pre-execution plan. Resolve each blocking finding and required "
+                        "revision through a concrete change or supplied-evidence rebuttal. Do not "
+                        "defer a blocking design defect to post-execution uncertainty."
+                    ),
+                }
+            required_role_ids = list(
+                self.departments.stage_route("experiment").get("required_role_ids", []))
+            reviewer_role_ids = [role_id for role_id in required_role_ids
+                                 if role_id != "methodologist"]
+            cached_review_by_role = self._capability_repair_cached_reports(retained)
+            if cached_review_by_role:
+                cached_review_reports = cached_review_by_role
+                pending_cached_reviewer_roles = [
+                    role_id for role_id in reviewer_role_ids
+                    if role_id not in cached_review_by_role
+                ]
+                self.department_activity.append({
+                    "cycle": self.continuation_cycles,
+                    "action": ("reuse_capability_repair_reviews_for_revision"
+                               if prior_plan_review else "reuse_capability_repair_reviews"),
+                    "stage_id": stage.get("id"),
+                    "panel_stage_id": (retained.get("ledger") or {}).get("panel_stage_id"),
+                    "review_input_sha256": packet.get("review_input_sha256"),
+                    "lead_reconciliation_required": True,
+                    "cached_reviewer_roles": sorted(cached_review_by_role),
+                    "pending_reviewer_roles": pending_cached_reviewer_roles,
+                    "model_calls_dispatched_so_far": 0,
+                    "reason": (
+                        "reuse successful same-evidence independent reports; rerun only missing "
+                        "review roles, have the Methods lead reconcile the current dossier, and "
+                        "have the independent verifier assess the newly bound plan"
+                        if prior_plan_review else
+                        "reuse successful same-evidence independent reports; rerun only missing "
+                        "review roles, then adjudicate the current-dossier plan and verifier"
+                    ),
+                })
 
         base = re.sub(r"[^a-z0-9-]+", "-", str(stage.get("id", "experiment")).casefold()).strip("-")
         attempt = prior_context.get("capability_repair_attempts", 1)
         if type(attempt) is not int or attempt < 1:
             attempt = 1
-        suffix = f"-repair-panel-{self.continuation_cycles}-{attempt}"
-        panel_id = f"{(base or 'experiment')[:64 - len(suffix)]}{suffix}"
+        panel_id = self._capability_repair_panel_stage_id(
+            base or "experiment", packet.get("science_input_sha256"),
+            self.continuation_cycles, attempt)
+        assignment_attempt = self._next_capability_repair_assignment_attempt(panel_id)
         panel_stage = deepcopy(stage)
         panel_stage.update({
             "id": panel_id,
@@ -6722,25 +10356,113 @@ class ComposerRunner:
             "deadline_seconds": min(float(stage.get("deadline_seconds", 900)),
                                      max(1.0, self._remaining())),
         })
+        prior_evidence = packet.get("prior_attempt_result_evidence", {})
+        prior_evidence = prior_evidence if isinstance(prior_evidence, dict) else {}
+        prior_raw_data = prior_evidence.get("files", {}).get("raw_data", {})
+        prior_raw_data = prior_raw_data if isinstance(prior_raw_data, dict) else {}
+        prior_context_summary = {
+            "available": prior_evidence.get("available") is True,
+            "run_status": prior_evidence.get("run_status"),
+            "validation_decision": prior_evidence.get("validation_decision"),
+            "scientific_sha256": prior_evidence.get("scientific_sha256"),
+            "admissible_as_verified_claims": False,
+        }
+        prior_result_package = prior_evidence.get("results_package")
+        prior_result_package = (prior_result_package
+                                if isinstance(prior_result_package, dict) else {})
+        prior_foundry_intent = self._capability_repair_prior_intent(packet)
+        prior_review_summary = {
+            "question": prior_result_package.get("question"),
+            "hypothesis": prior_result_package.get("hypothesis"),
+            "metrics": prior_result_package.get("metrics", []),
+            "analysis": prior_result_package.get("analysis", {}),
+            "findings": prior_result_package.get("findings", []),
+            "limitations": prior_result_package.get("limitations", []),
+            "validation_decision": prior_evidence.get("validation_decision"),
+            "review_evidence": prior_evidence.get("review_evidence", []),
+            "raw_data": {
+                "sha256": prior_raw_data.get("sha256"),
+                "observation_count": prior_raw_data.get("observation_count"),
+                "columns": prior_raw_data.get("columns", []),
+                "sample_indices": prior_raw_data.get("sample_indices", []),
+                "sample_rows": prior_raw_data.get("sample_rows", []),
+            },
+            "figures": prior_evidence.get("figures", []),
+            "admissible_as_verified_claims": False,
+        } if prior_evidence.get("available") is True else None
+        model_packet = deepcopy(packet)
+        model_packet.pop("continuation_cycle", None)
+        current_lineage = packet.get("failure_lineage")
+        current_lineage = current_lineage if isinstance(current_lineage, dict) else {}
+        model_packet["failure_lineage"] = {
+            "stage_id": stage.get("id"),
+            "identity_verified": current_lineage.get("identity_verified") is True,
+            "failure_dossier_ref": current_lineage.get("failure_dossier_ref"),
+            "attempt_number": current_lineage.get("attempt_number"),
+            "failure_input_sha256": current_lineage.get("failure_input_sha256"),
+            "failure_dossier_body_sha256": current_lineage.get(
+                "failure_dossier_body_sha256"),
+            "adjudication_packet_input_sha256": packet.get("input_sha256"),
+        }
+        recovery_packet = model_packet.get("failure_recovery")
+        recovery_packet = recovery_packet if isinstance(recovery_packet, dict) else {}
+        model_packet["failure_recovery"] = {
+            key: recovery_packet.get(key)
+            for key in ("recovery_mode", "failure_class")
+            if recovery_packet.get(key) is not None
+        }
         panel_result = {
             "_repair_panel": True,
-            "capability_repair_packet": deepcopy(packet),
+            "capability_repair_packet": model_packet,
             "research_question": packet["topic"].get("research_question"),
-            "hypotheses": ((packet.get("prior_foundry_work") or {}).get("last_attempt") or {}
-                           ).get("experiment_intent", {}).get("hypothesis"),
-            "design": ((packet.get("prior_foundry_work") or {}).get("last_attempt") or {}
-                       ).get("experiment_intent", {}),
+            "hypotheses": (prior_result_package.get("hypothesis")
+                           if prior_result_package
+                           else prior_foundry_intent.get("hypothesis")),
+            "design": {
+                "procedures": prior_result_package.get("procedures", []),
+                "prior_foundry_intent": deepcopy(prior_foundry_intent),
+            },
             "analysis_plan": {
-                "state": "pre_execution_repair_panel",
+                "state": "prior_attempt_results_require_methods_repair"
+                if prior_evidence.get("available") is True else "pre_execution_repair_panel",
                 "failure": packet["failure"],
                 "repair_contract": packet["repair_contract"],
+                "prior_attempt_evidence": prior_context_summary,
             },
-            "claims": {"status": "failed_capability_requires_model_repair"
-                       if not prior_context.get("raw_results")
-                       else "observed_result_requires_model_repair"},
-            "raw_results": prior_context.get("raw_results"),
-            "derived_results": prior_context.get("derived_results", {}),
-            "figures": prior_context.get("figures", []),
+            "claims": {
+                "status": "prior_attempt_result_rejected_not_verified"
+                if prior_evidence.get("available") is True
+                else "failed_capability_requires_model_repair",
+                "admissible_as_verified_claims": False,
+                "validation_decision": prior_evidence.get("validation_decision"),
+            },
+            "raw_results": {
+                "observation_count": prior_raw_data.get("observation_count"),
+                "columns": prior_raw_data.get("columns", []),
+                "sample_indices": prior_raw_data.get("sample_indices", []),
+                "sample_rows": prior_raw_data.get("sample_rows", []),
+                "raw_data_sha256": prior_raw_data.get("sha256"),
+            } if prior_evidence.get("available") is True else prior_context.get("raw_results"),
+            "derived_results": prior_evidence.get(
+                "derived_results", prior_context.get("derived_results", {})),
+            "figures": prior_evidence.get("figures", prior_context.get("figures", [])),
+            "execution_manifest": {
+                "state": "prior_attempt_result_identity_verified"
+                if prior_evidence.get("available") is True else "no_prior_result_bound",
+                **prior_context_summary,
+                "execution_refs": prior_evidence.get("execution_refs", []),
+                "files": prior_evidence.get("files", {}),
+            },
+            "analysis_code": {
+                "state": "topic_capability_source_snapshot_not_execution_verified"
+                if packet.get("program_snapshot") else "source_snapshot_not_available",
+                "files": packet.get("program_snapshot", []),
+                "execution_refs": prior_evidence.get("execution_refs", []),
+            },
+            "failure_evidence": {
+                **prior_context_summary,
+            "prior_attempt_result": prior_review_summary,
+        },
         }
         input_ref = {
             "kind": "capability_repair_panel",
@@ -6748,16 +10470,150 @@ class ComposerRunner:
             "panel_id": panel_id,
             "digest": packet["input_sha256"],
         }
+        active_roles = (["methodologist", *[
+            role_id for role_id in reviewer_role_ids
+            if role_id not in (cached_review_reports or {})
+        ]] if cached_review_reports is not None else None)
         assignment = self.departments.begin_stage(
-            panel_id, "experiment", attempt_number=1, input_ref=input_ref,
-            deadline_seconds=panel_stage["deadline_seconds"], active_role_ids=None,
+            panel_id, "experiment", attempt_number=assignment_attempt, input_ref=input_ref,
+            deadline_seconds=panel_stage["deadline_seconds"], active_role_ids=active_roles,
         )
-        bundle = self._run_specialist_pool(
-            panel_stage, assignment, descriptor, stage_result=panel_result)
-        bundle = self._publish_specialist_reports(panel_stage, assignment, bundle)
+        assignments = [item for item in assignment.get("assignments", [])
+                       if isinstance(item, dict)
+                       and item.get("assignment_phase") == "specialist"]
+        lead = next((item for item in assignments
+                     if item.get("assigned_role") == "methods.methodologist"), None)
+        reviewers = [item for item in assignments if item is not lead]
+        reviewer_assignment = {**deepcopy(assignment), "assignments": reviewers}
+        if cached_review_reports is not None:
+            retained_reports = []
+            reports_by_role = {}
+            for role_id in reviewer_role_ids:
+                item = cached_review_reports.get(role_id)
+                if not isinstance(item, dict):
+                    continue
+                response = {
+                    key: deepcopy(item.get(key))
+                    for key in ("decision", "summary", "findings", "evidence_gaps",
+                                "requested_actions", "normalization_warnings")
+                    if key in item
+                }
+                report = {**deepcopy(item), "response": response, "usage": {}}
+                retained_reports.append(report)
+                reports_by_role[report["role_id"]] = report
+            missing_assignments = [
+                item for item in reviewer_assignment.get("assignments", [])
+                if isinstance(item, dict)
+                and item.get("role_id") not in reports_by_role
+            ]
+            fresh_bundle = ({"reports": [], "by_role": {}, "usage": {},
+                             "model_enabled": True}
+                            if not missing_assignments else self._run_specialist_pool(
+                                panel_stage,
+                                {**deepcopy(reviewer_assignment),
+                                 "assignments": missing_assignments},
+                                descriptor, stage_result=panel_result,
+                                cache_input_digest=packet.get("science_input_sha256")))
+            if missing_assignments:
+                fresh_bundle = self._publish_specialist_reports(
+                    panel_stage,
+                    {**deepcopy(reviewer_assignment),
+                     "assignments": missing_assignments},
+                    fresh_bundle)
+            for report in fresh_bundle.get("reports", []):
+                role_id = report.get("role_id")
+                if isinstance(role_id, str):
+                    reports_by_role[role_id] = report
+            reviewer_bundle = {
+                "reports": [reports_by_role[role_id] for role_id in reviewer_role_ids
+                            if role_id in reports_by_role],
+                "by_role": reports_by_role,
+                "usage": self._specialist_usage(fresh_bundle.get("reports", [])),
+                "model_enabled": fresh_bundle.get("model_enabled") is True,
+            }
+        else:
+            reviewer_bundle = self._run_specialist_pool(
+                panel_stage, reviewer_assignment, descriptor, stage_result=panel_result,
+                cache_input_digest=packet.get("science_input_sha256"))
+            reviewer_bundle = self._publish_specialist_reports(
+                panel_stage, reviewer_assignment, reviewer_bundle)
+
+        lead_bundle = {"reports": [], "by_role": {}, "usage": {},
+                       "model_enabled": reviewer_bundle.get("model_enabled") is True}
+        plan_validation_error = "methods lead assignment is unavailable"
+        repair_plan = None
+        repair_plan_source = None
+        if isinstance(lead, dict) and reviewer_bundle.get("model_enabled") is True:
+            lead_assignment_row = deepcopy(lead)
+            lead_assignment_row["_response_contract"] = "repair_adjudication"
+            lead_assignment_row["_prompt"] = build_repair_adjudication_prompt(
+                lead_assignment_row, packet, reviewer_bundle.get("reports", []),
+                prior_plan_review=prior_plan_review)
+            lead_assignment = {**deepcopy(assignment),
+                               "assignments": [lead_assignment_row]}
+            lead_result = {
+                **panel_result,
+                "repair_adjudication": {
+                    "stage": ("pre_execution_plan_revision" if prior_plan_review
+                              else "pre_execution_plan"),
+                    "reviewer_reports": deepcopy(reviewer_bundle.get("reports", [])),
+                    "prior_plan_review": deepcopy(prior_plan_review),
+                },
+            }
+            lead_input_digest = self._capability_repair_lead_input_digest(
+                packet, reviewer_bundle.get("reports", []), prior_plan_review)
+            lead_bundle = self._run_specialist_pool(
+                panel_stage, lead_assignment, descriptor, stage_result=lead_result,
+                cache_input_digest=lead_input_digest)
+            lead_bundle = self._publish_specialist_reports(
+                panel_stage, lead_assignment, lead_bundle)
+            lead_report = lead_bundle.get("by_role", {}).get(lead.get("role_id"))
+            repair_plan, plan_validation_error = self._validated_capability_repair_plan(
+                lead_report, packet)
+            if repair_plan is not None:
+                repair_plan_source = "methods_lead_response"
+            if repair_plan is None:
+                repair_plan = self._repair_plan_from_reconciled_reports(
+                    [*reviewer_bundle.get("reports", []),
+                     *lead_bundle.get("reports", [])], packet)
+                if repair_plan is not None:
+                    plan_validation_error = None
+                    repair_plan_source = "validated_report_reconciliation"
+
+        reports_by_role = {
+            **reviewer_bundle.get("by_role", {}),
+            **lead_bundle.get("by_role", {}),
+        }
+        reports = [reports_by_role[item.get("role_id")]
+                   for item in assignments if item.get("role_id") in reports_by_role]
+        known_report_ids = {item.get("role_id") for item in reports}
+        reports.extend(report for report in (
+            *reviewer_bundle.get("reports", []), *lead_bundle.get("reports", []))
+            if isinstance(report, dict) and report.get("role_id") not in known_report_ids)
+        bundle = {
+            "reports": reports,
+            "by_role": reports_by_role,
+            "packet": lead_bundle.get("packet") or reviewer_bundle.get("packet", {}),
+            "model_enabled": reviewer_bundle.get("model_enabled") is True,
+        }
+        chief_result = {
+            "status": "pre_execution_repair_plan",
+            "decision": "repair" if repair_plan else "hold",
+            "repair_adjudication": repair_plan or {
+                "status": "invalid_or_unavailable",
+                "reason": plan_validation_error,
+                "failure_lineage": deepcopy(packet.get("failure_lineage", {})),
+            },
+        }
+        verification_result = {
+            **panel_result,
+            "repair_verification_scope": "pre_execution_plan",
+            "prior_plan_review": deepcopy(prior_plan_review),
+            "repair_adjudication": deepcopy(chief_result["repair_adjudication"]),
+        }
         verifier = self._run_specialist_verifier(
-            panel_stage, assignment, descriptor, bundle, panel_result,
-            stage_result=panel_result)
+            panel_stage, assignment, descriptor, bundle, chief_result,
+            stage_result=verification_result)
         panel_usage = self._specialist_usage(bundle.get("reports", []))
         if isinstance(verifier, dict):
             verifier_usage = self._specialist_usage([verifier])
@@ -6767,14 +10623,12 @@ class ComposerRunner:
         panel_error = None if model_enabled else "capability repair panel has no configured model route"
         panel_outcome = "completed" if model_enabled else "blocked"
         assignment_result = self.departments.finish_stage(
-            panel_id, "experiment", attempt_number=1, outcome=panel_outcome,
+            panel_id, "experiment", attempt_number=assignment_attempt, outcome=panel_outcome,
             output_ref=None, usage=panel_usage, error=panel_error,
             actor="command.composer", specialist_results=bundle.get("by_role", {}),
             verifier_result=verifier, failure_scope=None if model_enabled else "stage",
         )
         reports = []
-        root_causes = []
-        required_changes = []
         for report in bundle.get("reports", []):
             response = report.get("response") if isinstance(report.get("response"), dict) else {}
             reports.append({
@@ -6782,30 +10636,45 @@ class ComposerRunner:
                 "assigned_role": report.get("assigned_role"),
                 "status": report.get("status"),
                 "decision": response.get("decision", report.get("decision")),
-                "summary": str(response.get("summary", report.get("summary", "")))[:2400],
-                "findings": [str(item)[:1600] for item in response.get("findings", [])[:8]]
+                "summary": str(response.get("summary", report.get("summary", ""))),
+                "findings": [str(item) for item in response.get("findings", [])]
                 if isinstance(response.get("findings"), list) else [],
-                "requested_actions": [str(item)[:1600] for item in response.get("requested_actions", [])[:8]]
+                "evidence_gaps": [str(item) for item in response.get("evidence_gaps", [])]
+                if isinstance(response.get("evidence_gaps"), list) else [],
+                "requested_actions": [str(item) for item in response.get("requested_actions", [])]
                 if isinstance(response.get("requested_actions"), list) else [],
                 "artifact_ref": report.get("artifact_ref"),
             })
-            root_causes.extend(reports[-1]["findings"])
-            required_changes.extend(reports[-1]["requested_actions"])
+        panel_decision, open_verifier_concerns = self._capability_repair_verdict(
+            repair_plan, verifier)
         verifier_response = verifier.get("response") if isinstance(verifier, dict) else {}
         verifier_response = verifier_response if isinstance(verifier_response, dict) else {}
-        root_causes.extend(str(item)[:1600] for item in verifier_response.get("critical_findings", [])[:8]
-                           if isinstance(verifier_response.get("critical_findings"), list))
-        required_changes.extend(str(item)[:1600] for item in verifier_response.get("repair_scope", [])[:8]
-                                if isinstance(verifier_response.get("repair_scope"), list))
+        diagnostic_hypotheses = (
+            [repair_plan["root_cause"]["statement"]] if repair_plan else
+            [finding for report in reports for finding in report.get("findings", [])]
+        )
+        proposed_changes = (
+            [change["instruction"] for change in repair_plan["required_changes"]]
+            if repair_plan else []
+        )
         panel = {
-            "schema_version": "capability-repair-panel-1",
+            "schema_version": CAPABILITY_REPAIR_PANEL_SCHEMA_VERSION,
+            "prompt_revision": CAPABILITY_REPAIR_PANEL_PROMPT_REVISION,
             "status": "completed" if model_enabled else "unavailable",
-            "decision": "repair" if model_enabled else "defer",
+            "decision": panel_decision if model_enabled else "defer",
+            "repair_plan_source": repair_plan_source,
             "input_sha256": packet["input_sha256"],
+            "science_input_sha256": packet.get("science_input_sha256"),
+            "review_input_sha256": current_review_digest,
             "packet": packet,
-            "root_causes": list(dict.fromkeys(root_causes))[:24],
-            "required_changes": list(dict.fromkeys(required_changes))[:24],
-            "acceptance_checks": deepcopy(packet["repair_contract"]["must_prove"]),
+            "repair_plan": repair_plan,
+            "prior_plan_review": prior_plan_review,
+            "plan_validation_error": plan_validation_error if not repair_plan else None,
+            "diagnostic_hypotheses": list(dict.fromkeys(diagnostic_hypotheses))[:8],
+            "proposed_changes": list(dict.fromkeys(proposed_changes))[:6],
+            "acceptance_checks": deepcopy(
+                repair_plan["acceptance_checks"] if repair_plan
+                else packet["repair_contract"]["must_prove"]),
             "repair_commands": deepcopy(
                 prior_context.get("repair_commands", [])
                 if isinstance(prior_context.get("repair_commands"), list) else []
@@ -6813,16 +10682,30 @@ class ComposerRunner:
             "reports": reports,
             "verifier": {
                 "status": verifier.get("status") if isinstance(verifier, dict) else None,
+                "error": (str(verifier.get("error", ""))[:1200]
+                          if isinstance(verifier, dict)
+                          and verifier.get("status") != "succeeded" else None),
                 "decision": verifier_response.get("decision"),
-                "rationale": str(verifier_response.get("rationale", ""))[:2400],
-                "critical_findings": [str(item)[:1600] for item in verifier_response.get("critical_findings", [])[:8]]
+                "rationale": str(verifier_response.get("rationale", "")),
+                "blocking_findings": [str(item) for item in
+                                      verifier_response.get("blocking_findings", [])]
+                if isinstance(verifier_response.get("blocking_findings"), list) else [],
+                "required_revisions": [str(item) for item in
+                                       verifier_response.get("required_revisions", [])]
+                if isinstance(verifier_response.get("required_revisions"), list) else [],
+                "deferred_gates": [str(item) for item in
+                                   verifier_response.get("deferred_gates", [])]
+                if isinstance(verifier_response.get("deferred_gates"), list) else [],
+                "critical_findings": [str(item) for item in verifier_response.get("critical_findings", [])]
                 if isinstance(verifier_response.get("critical_findings"), list) else [],
-                "repair_scope": [str(item)[:1600] for item in verifier_response.get("repair_scope", [])[:8]]
+                "repair_scope": [str(item) for item in verifier_response.get("repair_scope", [])]
                 if isinstance(verifier_response.get("repair_scope"), list) else [],
+                "open_concerns": open_verifier_concerns,
                 "artifact_ref": verifier.get("artifact_ref") if isinstance(verifier, dict) else None,
             },
             "ledger": {
                 "panel_stage_id": panel_id,
+                "assignment_attempt_number": assignment_attempt,
                 "assignment_plan_ref": assignment.get("plan_ref"),
                 "chief_synthesis_ref": assignment_result.get("chief_synthesis_ref"),
                 "verifier_artifact_ref": assignment_result.get("verifier_artifact_ref"),
@@ -6830,6 +10713,7 @@ class ComposerRunner:
                 "verifier_agent": assignment.get("verifier_agent"),
             },
             "usage": panel_usage,
+            "dispatch_usage": deepcopy(panel_usage),
             "error": panel_error,
         }
         self.department_activity.append({
@@ -6838,6 +10722,7 @@ class ComposerRunner:
             "stage_id": stage.get("id"),
             "panel_stage_id": panel_id,
             "decision": panel["decision"],
+            "plan_validation_error": panel.get("plan_validation_error"),
             "active_agents": deepcopy(assignment.get("active_agents", [])),
             "verifier_agent": assignment.get("verifier_agent"),
             "chief_synthesis_ref": assignment_result.get("chief_synthesis_ref"),
@@ -6847,9 +10732,68 @@ class ComposerRunner:
         self._checkpoint(f"{stage.get('id')}:capability_repair_panel", force=True)
         return panel
 
+    def _next_capability_repair_assignment_attempt(self, panel_id):
+        """Resume a clean panel attempt; supersede only calls known to be unknown."""
+        rows = self.departments.stage_assignment_states(panel_id)
+        if not rows:
+            return 1
+        attempt_numbers = [item["attempt_number"] for item in rows
+                           if type(item.get("attempt_number")) is int]
+        if not attempt_numbers:
+            return 1
+        latest_attempt = max(attempt_numbers)
+        latest_rows = [item for item in rows
+                       if item.get("attempt_number") == latest_attempt]
+        progress_stages = self._progress_snapshot.get("stages", {})
+        progress_stages = progress_stages if isinstance(progress_stages, dict) else {}
+        stage_progress = progress_stages.get(panel_id, {})
+        stage_progress = stage_progress if isinstance(stage_progress, dict) else {}
+        live_by_role = stage_progress.get("specialist_live", {})
+        live_by_role = live_by_role if isinstance(live_by_role, dict) else {}
+        for item in latest_rows:
+            if (item.get("assignment_phase") != "verifier"
+                    or item.get("task_state") != "queued"
+                    or item.get("attempt_state") is not None):
+                continue
+            live = live_by_role.get(item.get("assigned_role"), {})
+            if (isinstance(live, dict)
+                    and live.get("event") == "dispatched"
+                    and live.get("task_id") == item.get("task_id")
+                    and live.get("stage_id") == panel_id):
+                self.departments.reconcile_dispatched_verifier_unknown(
+                    panel_id, "experiment", latest_attempt,
+                    dispatch_event=live,
+                )
+                rows = self.departments.stage_assignment_states(panel_id)
+                latest_rows = [row for row in rows
+                               if row.get("attempt_number") == latest_attempt]
+                break
+        # A completed verifier is bound to the exact packet it reviewed. Start
+        # a new assignment generation on panel re-entry; the durable model-work
+        # cache still reuses an identical prompt without another provider call.
+        if any(item.get("assignment_phase") == "verifier"
+               and item.get("attempt_state") == "succeeded" for item in latest_rows):
+            return latest_attempt + 1
+        if any(item.get("attempt_state") in {"failed", "result_unknown"}
+               for item in latest_rows):
+            return latest_attempt + 1
+        return latest_attempt
+
+    @staticmethod
+    def _capability_repair_prior_intent(packet):
+        """Normalize nullable legacy foundry fields before reviewer projection."""
+        packet = packet if isinstance(packet, dict) else {}
+        foundry_work = packet.get("prior_foundry_work")
+        foundry_work = foundry_work if isinstance(foundry_work, dict) else {}
+        last_attempt = foundry_work.get("last_attempt")
+        last_attempt = last_attempt if isinstance(last_attempt, dict) else {}
+        intent = last_attempt.get("experiment_intent")
+        return intent if isinstance(intent, dict) else {}
+
     def _materialize_topic_capability(self, result, *, force_regenerate=False,
                                       continuation_requests=(), continuation_revision=None,
                                       stage_id=None, study_type=None,
+                                      stage_seconds=None,
                                       quality_contract=None,
                                       model_call_budget=None, repair_context=None):
         """Generate and admit a pinned program for one science-first topic.
@@ -6875,6 +10819,19 @@ class ComposerRunner:
         selected = result.get("topic") if isinstance(result, dict) else None
         if not isinstance(selected, dict):
             raise ValidationError("capability foundry requires a selected topic")
+        topic_context = result if isinstance(result, dict) else {}
+        requirement_scope = self._topic_maturity_requirement_scope(
+            selected, topic_context)
+        requires_source_data = self._topic_requires_source_data(selected, topic_context)
+        source_data_manifest = (
+            self._verified_source_data_manifest(stage_id)
+            if requires_source_data else None
+        )
+        if requires_source_data and source_data_manifest is None:
+            from scisaurus.runtime.capability_foundry import SourceDataUnavailable
+            raise SourceDataUnavailable(
+                "empirical experiment requires current controller-verified source rows; "
+                "do not reuse or generate a capability without its evidence input")
         question = selected.get("research_question")
         domain = selected.get("domain")
         if not isinstance(question, str) or not isinstance(domain, str):
@@ -6969,10 +10926,39 @@ class ComposerRunner:
                 timeout_seconds=configured["timeout_seconds"],
                 model_timeout_seconds=configured_model_timeout,
             )
+            foundry_input = {}
+            executable_work_orders = project_executable_work_orders(
+                continuation_requests)
+            if executable_work_orders:
+                foundry_input["work_orders"] = executable_work_orders
+            if source_data_manifest is not None:
+                foundry_input["source_data_manifest"] = source_data_manifest
             brief = {
                 "topic": {key: selected.get(key) for key in (
                     "id", "title", "domain", "research_question", "scope",
-                    "disconfirmation_test", "resource_plan")},
+                    "disconfirmation_test", "resource_plan", "data_regime",
+                    "research_form", "evidence_mode", "comparison_type",
+                    "feasibility_plan")},
+                "evidence_policy": {
+                    "requires_source_data_manifest": requires_source_data,
+                    "source_data_status": (
+                        "verified_current_manifest_available"
+                        if source_data_manifest is not None else "unavailable"),
+                    "open_requirements": requirement_scope["active"][:8],
+                    "empirical_validation_limits": [
+                        {
+                            "requirement": item,
+                            "disposition": "not_an_input_to_current_analytic_estimand",
+                        }
+                        for item in requirement_scope["out_of_scope"][:8]
+                    ],
+                    "rule": (
+                        "Published, public-dataset, measured, or digitized observations must be "
+                        "supplied as exact rows bound to immutable source artifacts. Without them, "
+                        "do not invent values or claim empirical fit; return control to Research to "
+                        "reformulate the evidence boundary."
+                    ),
+                },
                 "source_challenge": result.get("source_challenge"),
                 "continuation": {
                     "cycle": self.continuation_cycles if continuation_requests else None,
@@ -6995,6 +10981,10 @@ class ComposerRunner:
                     "no network access or undeclared data",
                 ],
             }
+            review_contract = self._capability_authoring_review_contract(
+                brief["continuation"]["requests"])
+            if review_contract is not None:
+                brief["review_directive_contract"] = review_contract
             program_projection = self._topic_program_projection(result, max_alternatives=8)
             if program_projection is not None:
                 brief["research_program"] = program_projection
@@ -7003,12 +10993,14 @@ class ComposerRunner:
                     repair_context)
                 brief["repair_execution_contract"] = {
                     "evidence_priority": (
-                        "The latest independent Methods panel root_causes and required_changes are "
-                        "authoritative. If a generic work-order axis conflicts with that evidence, "
-                        "follow the evidence and explain the correction."
+                        "The immutable failure, raw observations, source, and deterministic checks are "
+                        "authoritative. Methods-panel diagnosis hypotheses and proposed changes must "
+                        "be independently verified against them; do not edit code merely to satisfy a "
+                        "reviewer or to make a failed verdict appear resolved."
                     ),
                     "sequence": [
-                        "inspect the exact failure dossier, observed result, executor source, and validator source",
+                    "inspect the exact failure dossier, observed result, executor source, and validator source",
+                    "use linked historical execution sources only as diagnostics, never as current-topic evidence",
                         "identify the first invalid mechanism or acceptance assumption",
                         "make a source-level repair that changes that mechanism rather than relabelling a threshold",
                         "run an independent sensitivity/recalculation check before registration",
@@ -7025,7 +11017,12 @@ class ComposerRunner:
                         "claiming a resolved mechanism when the new run remains diagnostic",
                     ],
                 }
-            required_intent = {"domain": domain, "research_question": question}
+            required_intent = {
+                "domain": domain,
+                "research_question": question,
+            }
+            if isinstance(stage_seconds, dict):
+                required_intent["stage_seconds"] = deepcopy(stage_seconds)
             if study_type is not None:
                 required_intent["study_type"] = study_type
             if isinstance(quality_contract, dict):
@@ -7043,24 +11040,13 @@ class ComposerRunner:
             try:
                 outcome = foundry.generate(
                     json.dumps(brief, ensure_ascii=False, sort_keys=True),
+                    test_input=foundry_input or None,
                     required_intent=required_intent,
                     work_cache=ModelWorkCache(self.store, self._publish, namespace="command/foundry-work"),
                     on_progress=lambda phase, state: self._foundry_progress(stage_id or selected["id"], phase, state),
                     deadline=time.monotonic() + self._remaining(),
                     model_call_budget=model_call_budget,
-                    repair_provenance=(
-                        {
-                            "kind": "independent_repair",
-                            "origin": "composer_model_panel",
-                            "panel_stage_id": repair_context.get("ledger", {}).get("panel_stage_id"),
-                            "panel_input_sha256": repair_context.get("input_sha256"),
-                            "panel_verdict_artifact_ref": repair_context.get("ledger", {}).get(
-                                "verifier_artifact_ref"),
-                            "root_causes": deepcopy(repair_context.get("root_causes", []))[:12],
-                            "required_changes": deepcopy(repair_context.get("required_changes", []))[:12],
-                        }
-                        if isinstance(repair_context, dict) else None
-                    ),
+                    repair_provenance=self._capability_repair_provenance(repair_context),
                 )
             except Exception as exc:
                 self._sync_foundry_usage()
@@ -7172,7 +11158,7 @@ class ComposerRunner:
         observed_experiment_repair = (
             has_observed_experiment
             and bool(self.continuation_cycles)
-            and any(item.get("kind") in {"additional_experiment", "analysis_display", "analysis_repair"}
+            and any(item.get("kind") in EXPERIMENT_WORK_ORDER_KINDS
                     for item in continuation_requests)
             and (
                 (isinstance(prior_experiment, dict)
@@ -7187,7 +11173,7 @@ class ComposerRunner:
         )
         needs_fresh_capability = (
             bool(self.continuation_cycles and continuation_requests)
-            and any(item.get("kind") in {"additional_experiment", "analysis_display", "analysis_repair"}
+            and any(item.get("kind") in EXPERIMENT_WORK_ORDER_KINDS
                     for item in continuation_requests)
                     and has_observed_experiment
         ) or fresh_pre_execution_repair
@@ -7218,23 +11204,54 @@ class ComposerRunner:
             if fresh_pre_execution_repair:
                 prior_experiment["review_status"] = "scientific_assignment_blocked"
             self.context[stage["id"]] = prior_experiment
+            if (repair_context.get("schema_version") in CAPABILITY_REPAIR_PLAN_SCHEMA_VERSIONS
+                    and not self._capability_repair_plan_admitted(repair_context)):
+                reason = repair_context.get("plan_validation_error")
+                if not reason:
+                    verifier = repair_context.get("verifier")
+                    verifier = verifier if isinstance(verifier, dict) else {}
+                    reason = self._capability_repair_verifier_unavailable_reason(verifier)
+                    if reason is None:
+                        open_concerns = verifier.get("open_concerns")
+                        open_concerns = (open_concerns
+                                         if isinstance(open_concerns, list) else [])
+                        reason = (
+                            "independent reviewer requires a revised plan: "
+                            f"{str(open_concerns[0])[:1200]}" if open_concerns else
+                            "independent reviewer did not accept the selected plan"
+                        )
+                blocked = ModelWorkBlocked(
+                    "replacement capability withheld because the pre-execution Methods repair "
+                    f"plan was not admitted: {reason}"
+                )
+                blocked.capability_repair_panel_attempted = True
+                self._merge_incremental_error_usage(
+                    blocked, repair_context.get("dispatch_usage"))
+                raise blocked
         if needs_fresh_capability and self.workflow.get("capability_foundry_config_path"):
             if repair_panel_required and isinstance(prior_experiment, dict):
                 prior_experiment["capability_repair_attempts"] = capability_repair_attempts + 1
                 self.context[stage["id"]] = prior_experiment
+            foundry_model_call_budget = model_call_budget
+            if repair_panel_required:
+                foundry_model_call_budget = self._foundry_model_call_budget(
+                    stage, repair_panel_usage=repair_context.get("dispatch_usage"))
             try:
                 self._materialize_topic_capability(
                     topic_context, force_regenerate=True,
                     continuation_requests=continuation_requests,
                     continuation_revision=int((config.get("experiment") or {}).get("revision", 1)),
                     stage_id=stage["id"], study_type="exploratory" if pilot_survey else None,
+                    stage_seconds=(config.get("experiment") or {}).get("stage_seconds"),
                     quality_contract=(current.get("quality_contract")
                                       if isinstance(current.get("quality_contract"), dict) else None),
-                    model_call_budget=model_call_budget,
+                    model_call_budget=foundry_model_call_budget,
                     repair_context=repair_context)
             except Exception as exc:
                 if self._capability_repair_panel_completed(repair_context):
                     exc.capability_repair_panel_completed = True
+                self._merge_incremental_error_usage(
+                    exc, repair_context.get("dispatch_usage"))
                 raise
             generated = topic_context.get("generated_capability")
         elif self.workflow.get("capability_foundry_config_path"):
@@ -7242,12 +11259,17 @@ class ComposerRunner:
             # gate.  Do not spend the topic-stage wall generating an executable
             # program before the survey has tested whether the question is
             # actually worth executing.
-            self._materialize_topic_capability(topic_context, stage_id=stage["id"],
-                                               study_type="exploratory" if pilot_survey else None,
-                                               quality_contract=(current.get("quality_contract")
-                                                                 if isinstance(current.get("quality_contract"), dict)
-                                                                 else None),
-                                               model_call_budget=model_call_budget)
+            self._materialize_topic_capability(
+                topic_context,
+                continuation_requests=continuation_requests,
+                continuation_revision=int((config.get("experiment") or {}).get("revision", 1)),
+                stage_id=stage["id"],
+                study_type="exploratory" if pilot_survey else None,
+                stage_seconds=(config.get("experiment") or {}).get("stage_seconds"),
+                quality_contract=(current.get("quality_contract")
+                                  if isinstance(current.get("quality_contract"), dict)
+                                  else None),
+                model_call_budget=model_call_budget)
             generated = topic_context.get("generated_capability")
         if isinstance(generated, dict):
             capability_id = generated.get("capability_id")
@@ -7328,7 +11350,9 @@ class ComposerRunner:
             f"{context}\nSelected executable capability: {capability_id}.\n"
             f"Selected research question: {selected.get('research_question', '')}"
         )
-        maturity_requirements = topic_context.get("maturity_open_requirements", [])
+        requirement_scope = self._topic_maturity_requirement_scope(
+            selected, topic_context)
+        maturity_requirements = requirement_scope["active"]
         if (topic_context.get("admission_state") == "provisional_for_survey"
                 and isinstance(maturity_requirements, list) and maturity_requirements):
             config["supplied_context"] += (
@@ -7336,6 +11360,14 @@ class ComposerRunner:
                 "analysis, and interpretation must address these still-open intake requirements; "
                 "the literature gap decision does not by itself resolve them:\n- "
                 + "\n- ".join(str(item) for item in maturity_requirements[:8])
+            )
+        if requirement_scope["out_of_scope"]:
+            config["supplied_context"] += (
+                "\nEmpirical validation limits from the broader or prior evidence scope:\n- "
+                + "\n- ".join(requirement_scope["out_of_scope"][:8])
+                + "\nThe current estimand is self-contained analytical/synthetic work. Do not "
+                "claim that it fits or validates measured observations; state this boundary in "
+                "the interpretation and manuscript."
             )
         program_projection = self._topic_program_projection(topic_context, max_alternatives=8)
         if program_projection is not None:
@@ -7458,9 +11490,7 @@ class ComposerRunner:
         return config
 
     def _argument_minimums(self, stage_id, config):
-        """Raise argument display floors to the publication profile."""
-        if self._allows_provisional_progress():
-            return {"figures": 0, "tables": 0, "experiments": 1}
+        """Keep the argument's scientific display floor independent of admission policy."""
         minimums = {"figures": 2, "tables": 1, "experiments": 2}
         profile = self._paper_depth_profile(stage_id)
         if profile is not None:
@@ -7902,10 +11932,11 @@ class ComposerRunner:
             config["project_id"] = str(Path(stage["project_dir"]).resolve())
             experiment = config.get("experiment", {})
             experiment["revision"] = int(experiment.get("revision", 1)) + self.continuation_cycles
+            config["work_orders"] = project_executable_work_orders(requests)
             context = config.get("supplied_context", "")
             config["supplied_context"] = (
-                f"{context}\nContinuation work orders:\n"
-                + json.dumps(requests, ensure_ascii=False, sort_keys=True))
+                f"{context}\nStructured continuation work orders are supplied to the experiment executor "
+                "and must be resolved with result-linked evidence or an explicit limitation.")
             if quota_recovery is not None:
                 limits = config.setdefault("limits", {})
                 current_rounds = limits.get("max_rounds")
@@ -7931,7 +11962,9 @@ class ComposerRunner:
     @staticmethod
     def _follow_up_projection(requests):
         return [{
+            "id": item.get("id"),
             "kind": item["kind"],
+            "owner": item.get("owner"),
             "objective": item["objective"],
             "why": item["why"],
             "success_condition": item["success_condition"],
@@ -7939,7 +11972,8 @@ class ComposerRunner:
             **({key: deepcopy(item[key]) for key in (
                 "failure_dossier_ref", "failure_input_sha256", "repair_commands",
                 "acceptance_checks", "review_directives", "model_diagnostics",
-                "recovery_mode", "target_stage_id", "target_stage_kind",
+                "recovery_mode", "repair_policy_revision",
+                "target_stage_id", "target_stage_kind",
                 "repair_priority", "experiment_repair_plan", "repair_strategy",
                 "attempt_lineage") if key in item}),
         } for item in requests]
@@ -8451,6 +12485,8 @@ class ComposerRunner:
             "reopened_stage_ids": sorted(self.reopened_stage_ids),
             "continuation_pending_stage_ids": sorted(self.continuation_pending_stage_ids),
             "active_research_requests": deepcopy(self.active_research_requests),
+            "attempted_request_signatures": sorted(self._attempted_request_signatures),
+            "format_recovery_ledger": deepcopy(self.format_recovery_ledger),
             "department_activity": deepcopy(self.department_activity),
             "deadline_extensions": deepcopy(self.deadline_extensions),
             "stages": checkpoint_stages, "context": deepcopy(self.context),
@@ -8471,7 +12507,7 @@ class ComposerRunner:
         with self._progress_lock:
             output = self.root / "output"
             output.mkdir(parents=True, exist_ok=True)
-            (output / "progress.json").write_bytes(canonical_bytes(state))
+            _atomic_write_bytes(output / "progress.json", canonical_bytes(state))
         self.next_checkpoint = now + float(self.workflow["time_policy"]["checkpoint_seconds"])
         self.on_progress({"phase": phase, "elapsed_seconds": round(state["elapsed_seconds"], 2),
                           "remaining_seconds": round(state["remaining_seconds"], 2),
@@ -8512,9 +12548,7 @@ class ComposerRunner:
             })
             output = self.root / "output"
             output.mkdir(parents=True, exist_ok=True)
-            temporary = output / f"progress-live-{uuid.uuid4().hex}.tmp"
-            temporary.write_bytes(canonical_bytes(state))
-            temporary.replace(output / "progress.json")
+            _atomic_write_bytes(output / "progress.json", canonical_bytes(state))
             # Keep the heartbeat fields and specialist cards in the in-memory
             # base as well. The next specialist event must build on the latest
             # live state instead of restoring the last stage-boundary snapshot.
@@ -8912,6 +12946,9 @@ class ComposerRunner:
             self.reopened_stage_ids = set(body.get("reopened_stage_ids", []))
             self.continuation_pending_stage_ids = set(body.get("continuation_pending_stage_ids", []))
             self.active_research_requests = body.get("active_research_requests", [])
+            ledger = body.get("format_recovery_ledger")
+            if isinstance(ledger, dict):
+                self.format_recovery_ledger = deepcopy(ledger)
             self.department_activity = body.get("department_activity", [])
             self.deadline_extensions = body.get("deadline_extensions", [])
             if (type(body.get("exploration_seed")) is int
@@ -8993,6 +13030,10 @@ class ComposerRunner:
                 "continuation_pending_stage_ids", self.continuation_pending_stage_ids))
             self.active_research_requests = live_checkpoint.get(
                 "active_research_requests", self.active_research_requests)
+            ledger = live_checkpoint.get("format_recovery_ledger")
+            if isinstance(ledger, dict):
+                self.format_recovery_ledger = deepcopy(ledger)
+            self._restore_attempted_research_request_signatures(live_checkpoint)
             self.department_activity = live_checkpoint.get("department_activity", self.department_activity)
             self.deadline_extensions = live_checkpoint.get("deadline_extensions", self.deadline_extensions)
             if (type(live_checkpoint.get("exploration_seed")) is int
@@ -9401,11 +13442,11 @@ class ComposerRunner:
     def _restored_topic_feasibility_failure(self, by_id):
         """Recheck a completed topic against the current execution boundary.
 
-        A checkpoint can outlive the code that produced it.  If a newer
+        A checkpoint can outlive the code that produced it. If a newer
         Composer adds a required feasibility contract, letting an older topic
         flow directly into survey or experiment would bypass the new gate.
-        Return the affected topic stage and a durable reason so ``run`` can
-        reopen its dependency closure through the ordinary continuation path.
+        Missing empirical rows are handled as source acquisition downstream,
+        not converted into a topic-feasibility rejection here.
         """
         if not any(stage.get("kind") == "experiment"
                    for stage in self.workflow.get("stages", [])):
@@ -9434,7 +13475,8 @@ class ComposerRunner:
             package = _materialize_foundry_capability_requirements(
                 deepcopy(topic_context), runtime_context)
             feasibility = validate_topic_feasibility(package, runtime_context)
-            if feasibility.get("status") == "legacy_unchecked":
+            if (feasibility.get("status") == "legacy_unchecked"
+                    and topic_context.get("admission_state") != "provisional_for_survey"):
                 return (topic_stage["id"],
                         "completed topic output has no current capability admission record")
         except (KeyError, OSError, StopIteration, TypeError, ValueError, ValidationError) as exc:
@@ -9442,7 +13484,7 @@ class ComposerRunner:
         return None
 
     def _queue_topic_feasibility_revalidation(self, stage_id, reason):
-        """Attach a typed topic repair order to an incompatible checkpoint."""
+        """Repair a legacy execution plan without reopening the research question."""
         context = self.context.get(stage_id)
         if not isinstance(context, dict):
             context = {"kind": "topic_discovery", "status": "invalidated"}
@@ -9456,15 +13498,27 @@ class ComposerRunner:
                 "id": request_id,
                 "kind": "topic_refinement",
                 "owner": "research.intelligence",
-                "objective": "Replan the selected direction against the current executable and data boundary before literature admission.",
-                "why": "The checkpoint predates the machine-readable feasibility admission contract.",
-                "success_condition": "A candidate carries a valid feasibility plan that passes the current runtime boundary and can be admitted to the survey.",
-                "evidence_needed": "Current runtime inventory, experiment boundary, declared inputs, dependency availability, provider work, model work, and compute limit.",
+                "objective": (
+                    "Repair the selected study's machine-readable execution-feasibility plan while "
+                    "preserving its admitted research question and scientific identity exactly."),
+                "why": (
+                    "The checkpoint lacks a current execution-feasibility record; that is an "
+                    "admission-metadata gap, not evidence against the research question."),
+                "success_condition": (
+                    "The same topic identity and research question pass current runtime feasibility "
+                    "checks with only feasibility, resource, or executable-capability fields repaired."),
+                "evidence_needed": (
+                    "The retained topic and research question; current runtime inventory; experiment "
+                    "boundary; declared input availability; required packages and executables; provider, "
+                    "model, and compute limits. Do not change the scientific question."),
+                "recovery_mode": "runtime_feasibility_revalidation_same_question",
             })
         context["research_requests"] = requests
         context["runtime_feasibility_revalidation"] = {
             "status": "required", "reason": str(reason)[:2048],
         }
+        context["status"] = "research_expansion_required"
+        context["review_status"] = "runtime_feasibility_revalidation"
         self.context[stage_id] = context
 
     def _reconcile_interrupted_attempt(self, attempt_id):
@@ -10020,63 +14074,101 @@ class ComposerRunner:
             })
             return True
         prior_recoveries = 0
-        if isinstance(existing, dict) and type(existing.get("recovery_count")) is int:
+        topic_identity = self._current_topic_identity() or {}
+        same_quota_scope = (
+            isinstance(existing, dict)
+            and existing.get("dimension") == getattr(quota_error, "dimension", None)
+            and existing.get("limit") == getattr(quota_error, "limit", None)
+            and existing.get("topic_id") in (None, topic_identity.get("topic_id"))
+            and existing.get("topic_cycle") in (None, topic_identity.get("topic_cycle"))
+        )
+        if same_quota_scope and type(existing.get("recovery_count")) is int:
             prior_recoveries = max(0, existing["recovery_count"])
         recovery_count = prior_recoveries + 1
         if (stage.get("kind") == "survey" and prior_recoveries >= 1):
-            # One narrowed allocation is a useful repair. A second exhausted
-            # allocation without a current gap assessment is evidence that
-            # the direction, not the worker, is the bottleneck. Return to the
-            # topic frontier instead of charging another identical survey
-            # cycle against the mission.
+            # A local model-call ceiling is not scientific evidence against
+            # the topic. Use retained sources for one gap-assessment-only
+            # repair; if that exact workspace is unavailable, keep the same
+            # topic blocked for an explicit decision instead of manufacturing
+            # a topic pivot from quota arithmetic.
+            if self._admit_scoped_survey_repair(
+                    stage, context, completed, by_id, quota_error):
+                self.department_activity.append({
+                    "cycle": self.continuation_cycles,
+                    "action": "route_repeated_survey_quota_to_retained_evidence_repair",
+                    "stage_id": stage_id,
+                    "recovery_count": recovery_count,
+                    "reason": "quota exhaustion does not adjudicate the topic",
+                    "next_action": "complete_only_the_missing_survey_milestone_from_retained_evidence",
+                })
+                return True
             context.update({
                 "stage_id": stage_id,
                 "kind": stage.get("kind"),
-                "status": "research_expansion_required",
+                "status": "blocked",
                 "error": str(quota_error)[:4096],
                 "review_status": "survey_quota_recovery_exhausted",
                 "quota_recovery": {
-                    "status": "pivot_required",
-                    "mode": "topic_pivot",
+                    "status": "exhausted",
+                    "mode": "retained_evidence_repair",
                     "previous_cycle": previous_cycle,
                     "recovery_count": recovery_count,
                     "dimension": getattr(quota_error, "dimension", None),
                     "limit": getattr(quota_error, "limit", None),
                     "observed": getattr(quota_error, "observed", None),
                     "reason": (
-                        "two bounded survey allocations were consumed without a current gap decision"
+                        "retained-evidence repair could not be safely admitted; quota alone does not justify a topic pivot"
                     ),
                 },
+                "release_blocking": True,
                 "research_expansion_requests": [],
                 "research_requests": [],
             })
             self.context[stage_id] = context
-            pivoted = self._pivot_topic_after_scientific_blocker(
-                stage, context, completed, by_id,
-                reason=(
-                    "the survey exhausted a full allocation and one narrowed recovery allocation "
-                    "without producing a current gap decision"
+            self.department_activity.append({
+                "cycle": previous_cycle,
+                "action": "hold_survey_quota_without_topic_pivot",
+                "stage_id": stage_id,
+                "recovery_count": recovery_count,
+                "reason": "the retained evidence frontier was unavailable for a scoped repair",
+                "next_action": "preserve_topic_and_request_a_concrete_scoped_evidence_plan",
+            })
+            return False
+        if same_quota_scope and prior_recoveries >= 1:
+            exhausted = deepcopy(existing)
+            exhausted.update({
+                "status": "exhausted",
+                "exhausted_cycle": previous_cycle,
+                "recovery_count": prior_recoveries,
+                "dimension": getattr(quota_error, "dimension", None),
+                "limit": getattr(quota_error, "limit", None),
+                "observed": getattr(quota_error, "observed", None),
+                "reason": (
+                    "the original allocation and one narrowed recovery allocation both "
+                    "exhausted the same stage quota"
                 ),
-                objective=(
-                    "Preserve the admitted phenomenon and narrow or strengthen its literature question "
-                    "to one bounded, decisive evidence target. Do not replay the exhausted survey packet; "
-                    "change the comparator, claim scope, or evidence boundary using its unresolved findings."
-                ),
-                why=(
-                    "Repeating the same literature map consumed another bounded allocation without "
-                    "adding a current gap assessment. Refine the evidence plan within the same phenomenon "
-                    "instead of discarding the research direction."
-                ),
-            )
-            if pivoted:
-                self.department_activity.append({
-                    "cycle": self.continuation_cycles,
-                    "action": "pivot_topic_after_repeated_survey_quota",
-                    "stage_id": stage_id,
-                    "recovery_count": recovery_count,
-                    "reason": "same survey exhausted two bounded allocations",
-                })
-            return pivoted
+            })
+            context.update({
+                "status": "blocked",
+                "error": str(quota_error)[:4096],
+                "review_status": "stage_quota_recovery_exhausted",
+                "release_blocking": True,
+                "quota_recovery": exhausted,
+                "research_expansion_requests": [],
+                "research_requests": [],
+            })
+            self.context[stage_id] = context
+            self.department_activity.append({
+                "cycle": previous_cycle,
+                "action": "stage_quota_recovery_exhausted",
+                "stage_id": stage_id,
+                "dimension": getattr(quota_error, "dimension", None),
+                "limit": getattr(quota_error, "limit", None),
+                "observed": getattr(quota_error, "observed", None),
+                "recovery_count": prior_recoveries,
+                "next_action": "stop_dispatching_this_stage_until_its_workload_or_quota_changes",
+            })
+            return False
         context.update({
             "stage_id": stage_id,
             "kind": stage.get("kind"),
@@ -10092,6 +14184,8 @@ class ComposerRunner:
                 "request_id": self._autonomous_recovery_request_id(
                     stage_id, previous_cycle + 1),
                 "recovery_count": recovery_count,
+                "topic_id": topic_identity.get("topic_id"),
+                "topic_cycle": topic_identity.get("topic_cycle"),
                 "dimension": getattr(quota_error, "dimension", None),
                 "limit": getattr(quota_error, "limit", None),
                 "observed": getattr(quota_error, "observed", None),
@@ -10224,41 +14318,12 @@ class ComposerRunner:
             self._checkpoint("resume:stale_stage_quota_blockers_reconciled", force=True)
         return False
 
-    def _restore_completed_survey_after_quota_recovery(self, completed, by_id):
-        """Reuse a current exploratory survey instead of buying another catalog pass.
-
-        A quota recovery request is not a scientific finding. If its exact
-        topic lineage already has a durable, admitted exploratory survey and
-        current gap assessment, preserve that result and defer further
-        literature expansion until the experiment identifies a concrete need.
-        """
-        stage = next((item for item in self.workflow.get("stages", [])
-                      if item.get("kind") == "survey"), None)
-        if not isinstance(stage, dict) or stage["id"] not in by_id:
-            return False
-        stage_id = stage["id"]
-        context = self.context.get(stage_id)
-        if not isinstance(context, dict):
-            return False
-        recovery = context.get("quota_recovery")
-        if not (
-            context.get("status") == "research_expansion_required"
-            and context.get("review_status") == "stage_quota_exhausted"
-            and isinstance(recovery, dict)
-            and recovery.get("status") in {"required", "admitted"}
-        ):
-            return False
-        topic = self._current_topic_identity()
-        topic_id = topic.get("topic_id") if isinstance(topic, dict) else None
-        topic_cycle = topic.get("topic_cycle") if isinstance(topic, dict) else None
-        if not isinstance(topic_id, str) or type(topic_cycle) is not int:
-            return False
+    def _completed_survey_frontier_for_topic(self, stage_id, topic_id, topic_cycle):
+        """Find a completed, durable survey/assessment pair for one topic."""
         record = self.stage_records.get(stage_id)
         attempts = record.get("attempts", []) if isinstance(record, dict) else []
         if not isinstance(attempts, list):
-            return False
-
-        retained = None
+            return None
         for attempt in reversed(attempts):
             if (not isinstance(attempt, dict)
                     or attempt.get("state") not in {"succeeded", "completed"}
@@ -10288,8 +14353,47 @@ class ComposerRunner:
             references = [run["survey_ref"], run["assessment_ref"]]
             if not self._survey_references_are_durable(project_dir, references):
                 continue
-            retained = (attempt, project_dir, run, result)
-            break
+            return attempt, project_dir, run, result
+        return None
+
+    def _restore_completed_survey_after_quota_recovery(self, completed, by_id):
+        """Reuse a current exploratory survey instead of buying another catalog pass.
+
+        A quota recovery request is not a scientific finding. If its exact
+        topic lineage already has a durable, admitted exploratory survey and
+        current gap assessment, preserve that result and defer further
+        literature expansion until the experiment identifies a concrete need.
+        """
+        stage = next((item for item in self.workflow.get("stages", [])
+                      if item.get("kind") == "survey"), None)
+        if not isinstance(stage, dict) or stage["id"] not in by_id:
+            return False
+        stage_id = stage["id"]
+        context = self.context.get(stage_id)
+        if not isinstance(context, dict):
+            return False
+        record = self.stage_records.get(stage_id)
+        recovery = context.get("quota_recovery")
+        recoverable_quota_state = (
+            context.get("status") == "research_expansion_required"
+            and context.get("review_status") == "stage_quota_exhausted"
+            and isinstance(recovery, dict)
+            and recovery.get("status") in {"required", "admitted"}
+        ) or (
+            context.get("status") == "blocked"
+            and context.get("review_status") == "survey_quota_recovery_exhausted"
+            and isinstance(recovery, dict)
+            and recovery.get("status") == "exhausted"
+        )
+        if not recoverable_quota_state:
+            return False
+        topic = self._current_topic_identity()
+        topic_id = topic.get("topic_id") if isinstance(topic, dict) else None
+        topic_cycle = topic.get("topic_cycle") if isinstance(topic, dict) else None
+        if not isinstance(topic_id, str) or type(topic_cycle) is not int:
+            return False
+        retained = self._completed_survey_frontier_for_topic(
+            stage_id, topic_id, topic_cycle)
         if retained is None:
             return False
 
@@ -10666,23 +14770,28 @@ class ComposerRunner:
                     reasons.append("provisional_topic")
             if kind == "survey":
                 effective_status = context_status or record_status
-                if context.get("topic_admission") in {
+                bounded_pilot = (
+                    self._allows_provisional_progress()
+                    and context.get("topic_admission") == "exploratory_pilot"
+                    and context.get("gap_state") == "insufficient_evidence"
+                    and context.get("survey_current") is True
+                    and context.get("assessment_current") is True
+                )
+                if (context.get("topic_admission") in {
                         "exploratory_pilot", "expand_literature_before_refine",
-                        "refine_before_experiment"}:
+                        "refine_before_experiment"} and not bounded_pilot):
                     reasons.append("survey_not_experiment_eligible")
-                if context.get("gap_state") in {"insufficient_evidence", "refuted_by_prior_work"}:
+                if (context.get("gap_state") in {"insufficient_evidence", "refuted_by_prior_work"}
+                        and not bounded_pilot):
                     reasons.append("survey_gap_unresolved")
                 if context.get("survey_current") is False or context.get("assessment_current") is False:
                     reasons.append("survey_assessment_not_current")
-                if (effective_status in {"completed", "accepted"}
-                        and "gap_state" in context
-                        and context.get("gap_state") != "eligible_for_experiment"):
-                    reasons.append("survey_not_experiment_eligible")
-                if (effective_status in {"completed", "accepted"}
-                        and ("survey_current" in context or "assessment_current" in context)
-                        and (context.get("survey_current") is not True
-                             or context.get("assessment_current") is not True)):
-                    reasons.append("survey_assessment_not_current")
+                if effective_status in {"completed", "accepted"}:
+                    if context.get("gap_state") != "eligible_for_experiment" and not bounded_pilot:
+                        reasons.append("survey_not_experiment_eligible")
+                    if (context.get("survey_current") is not True
+                            or context.get("assessment_current") is not True):
+                        reasons.append("survey_assessment_not_current")
             if kind == "experiment" and context.get("results_status") == "not_executed":
                 reasons.append("experiment_not_executed")
 
@@ -10695,7 +14804,7 @@ class ComposerRunner:
                 })
         return blockers
 
-    def _ensure_paper_gate_repair_requests(self, blockers):
+    def _ensure_paper_gate_repair_requests(self, blockers, *, synthesize=True):
         """Create one scoped repair order without discarding the current branch."""
         repairs = []
         for blocker in blockers[:1]:
@@ -10718,6 +14827,8 @@ class ComposerRunner:
             ]
             if unattempted:
                 repairs.extend(deepcopy(unattempted))
+                continue
+            if not synthesize:
                 continue
 
             # Candidate packets do not always emit a typed work order.  Reuse
@@ -10742,9 +14853,14 @@ class ComposerRunner:
         return repairs
 
     def _refresh_paper_release_gate(self, completed, by_id, release_blocked_stage_ids):
-        """Fence paper dispatch until every scientific ancestor is releasable."""
+        """Allow provisional drafting while keeping unresolved science unreleasable."""
         changed = False
         self._paper_gate_repair_requests = []
+        # A provisional manuscript is a work product for review, not scientific
+        # release. An unresolved survey or reviewer hold should travel with the
+        # draft as explicit debt; only a missing admitted question or an
+        # unexecuted experiment makes an empirical draft unsupported at source.
+        hard_draft_blockers = {"provisional_topic", "experiment_not_executed"}
         for paper_stage in self.workflow.get("stages", []):
             if paper_stage.get("kind") != "paper":
                 continue
@@ -10759,14 +14875,65 @@ class ComposerRunner:
             gate = record.get("release_gate") if isinstance(record, dict) else None
             gate_is_ours = isinstance(gate, dict) and gate.get("kind") == "upstream_scientific_hold"
             if blockers:
-                repairs = self._ensure_paper_gate_repair_requests(blockers)
+                hard_blocked = any(
+                    hard_draft_blockers.intersection(item.get("reasons", []))
+                    for item in blockers if isinstance(item, dict)
+                )
+                unstarted_paper = (
+                    record.get("attempt_count", 0) == 0
+                    and not record.get("attempts")
+                    and not record.get("output_path")
+                )
+                if (not hard_blocked and self._allows_provisional_progress()
+                        and unstarted_paper):
+                    next_draft_gate = {
+                        "kind": "upstream_scientific_candidate",
+                        "release_blocking": True,
+                        "blockers": blockers,
+                    }
+                    if (record.get("draft_gate") != next_draft_gate
+                            or record.get("status") != "pending"
+                            or record.get("release_blocking") is True):
+                        record.update({
+                            "kind": "paper",
+                            "status": "pending",
+                            "release_blocking": False,
+                            "draft_gate": next_draft_gate,
+                        })
+                        if gate_is_ours:
+                            record.pop("release_gate", None)
+                            record.pop("error", None)
+                        self.stage_records[paper_id] = record
+                        self.department_activity.append({
+                            "cycle": self.continuation_cycles,
+                            "action": "paper_provisional_draft_admitted",
+                            "stage_id": paper_id,
+                            "blockers": blockers,
+                            "next_action": (
+                                "compose and review a provisional manuscript; retain all upstream "
+                                "findings and block final release until their debt is resolved"
+                            ),
+                        })
+                        changed = True
+                    completed.discard(paper_id)
+                    release_blocked_stage_ids.discard(paper_id)
+                    continue
+
+                repairs = self._ensure_paper_gate_repair_requests(
+                    blockers, synthesize=hard_blocked)
                 self._paper_gate_repair_requests.extend(repairs)
                 completed.discard(paper_id)
                 release_blocked_stage_ids.add(paper_id)
+                prior_status = (
+                    gate.get("paper_status_before_gate")
+                    if gate_is_ours and isinstance(gate.get("paper_status_before_gate"), str)
+                    else record.get("status", "pending")
+                )
                 next_gate = {
                     "kind": "upstream_scientific_hold",
                     "stage_id": paper_id,
                     "release_blocking": True,
+                    "paper_status_before_gate": prior_status,
                     "blockers": blockers,
                     "repair_requests": repairs,
                 }
@@ -10777,6 +14944,7 @@ class ComposerRunner:
                         "kind": "paper",
                         "status": "candidate_needs_review",
                         "release_blocking": True,
+                        "draft_gate": None,
                         "release_gate": next_gate,
                         "error": "paper release blocked by unresolved upstream scientific evidence",
                     })
@@ -10803,13 +14971,17 @@ class ComposerRunner:
 
             # Remove only a gate created by this method.  A real paper attempt
             # or a separately produced editorial candidate must remain intact.
-            if (gate_is_ours and record.get("attempt_count", 0) == 0
-                    and not record.get("attempts") and not record.get("output_path")):
+            release_blocked_stage_ids.discard(paper_id)
+            if gate_is_ours:
+                prior_status = gate.get("paper_status_before_gate")
                 for key in ("release_gate", "error", "release_blocking"):
                     record.pop(key, None)
-                record["status"] = "pending"
+                if record.get("attempt_count", 0) == 0 and not record.get("attempts"):
+                    record["status"] = "pending"
+                elif prior_status in {"completed", "accepted", "candidate_needs_review"}:
+                    record["status"] = prior_status
+                record.pop("draft_gate", None)
                 self.stage_records[paper_id] = record
-                release_blocked_stage_ids.discard(paper_id)
                 changed = True
         return changed
 
@@ -10981,7 +15153,9 @@ class ComposerRunner:
             identity = identities.get(work_id, {})
             # DOI fields are only emitted when an independently reconciled
             # identity exists.  A catalog record alone remains a URL citation.
-            doi = identity.get("doi") if identity.get("status") == "verified" else None
+            doi = (identity.get("doi")
+                   if identity.get("status") in {"verified", "verified_with_gaps"}
+                   else None)
             authors = work.get("authors") or source.get("authors") or "Authors not supplied by OpenAlex"
             if isinstance(authors, list):
                 authors = ", ".join(
@@ -11353,6 +15527,93 @@ class ComposerRunner:
         return selected or deepcopy(results)
 
     @staticmethod
+    def _specialist_argument_seed(results, interpretation):
+        """Build a provisional claim/evidence seed from completed research outputs."""
+        results = results if isinstance(results, dict) else {}
+        interpretation = interpretation if isinstance(interpretation, dict) else {}
+        research_question = (interpretation.get("research_question")
+                             or results.get("question"))
+        patterns = interpretation.get("result_patterns")
+        claims = []
+        if isinstance(patterns, list):
+            for pattern in patterns:
+                if not isinstance(pattern, dict):
+                    continue
+                claim = deepcopy(pattern)
+                evidence_ids = []
+                for key in ("evidence_ids", "supporting_evidence",
+                            "contradicting_evidence"):
+                    refs = pattern.get(key)
+                    if isinstance(refs, list):
+                        evidence_ids.extend(
+                            item for item in refs
+                            if isinstance(item, str) and item not in evidence_ids
+                        )
+                result_ref = pattern.get("result_ref")
+                if isinstance(result_ref, str) and result_ref not in evidence_ids:
+                    evidence_ids.append(result_ref)
+                claim["evidence_ids"] = evidence_ids
+                claim["claim_status"] = "provisional"
+                claims.append(claim)
+        if not claims:
+            findings = results.get("findings")
+            if isinstance(findings, list):
+                for finding in findings:
+                    if not isinstance(finding, dict):
+                        continue
+                    claim = deepcopy(finding)
+                    evidence_ids = [finding["id"]] if isinstance(
+                        finding.get("id"), str) else []
+                    metric_ids = finding.get("metric_ids")
+                    if isinstance(metric_ids, list):
+                        evidence_ids.extend(
+                            item for item in metric_ids
+                            if isinstance(item, str) and item not in evidence_ids
+                        )
+                    claim["evidence_ids"] = evidence_ids
+                    claim["claim_status"] = "observed"
+                    claims.append(claim)
+        mechanisms = interpretation.get("competing_explanations")
+        mechanisms = deepcopy(mechanisms) if isinstance(mechanisms, list) else []
+        tests = interpretation.get("discriminating_experiments")
+        tests = deepcopy(tests) if isinstance(tests, list) else []
+        limitations = []
+        for source in (results.get("limitations"), interpretation.get("limitations")):
+            if not isinstance(source, list):
+                continue
+            for item in source:
+                if item not in limitations:
+                    limitations.append(deepcopy(item))
+        evidence_gaps = interpretation.get("evidence_gaps")
+        evidence_gaps = deepcopy(evidence_gaps) if isinstance(evidence_gaps, list) else []
+        requested_actions = interpretation.get("requested_actions")
+        requested_actions = (
+            deepcopy(requested_actions) if isinstance(requested_actions, list) else [])
+        assets = results.get("assets")
+        assets = [deepcopy(item) for item in assets if isinstance(item, dict)] \
+            if isinstance(assets, list) else []
+        plan = {
+            "schema_version": "argument-plan-seed-1",
+            "status": "provisional_seed",
+            "research_question": research_question,
+            "candidate_claims": deepcopy(claims),
+            "candidate_mechanisms": deepcopy(mechanisms),
+            "discriminating_experiments": deepcopy(tests),
+            "current_interpretation": deepcopy(interpretation.get("conclusion")),
+            "limitations": deepcopy(limitations),
+            "evidence_gaps": deepcopy(evidence_gaps),
+            "requested_actions": deepcopy(requested_actions),
+            "available_result_assets": assets,
+        }
+        return {
+            "research_question": research_question,
+            "claims": claims,
+            "mechanism": mechanisms,
+            "limitations": limitations,
+            "argument_plan": plan,
+        }
+
+    @staticmethod
     def _specialist_interpretation_value(value):
         value = ComposerRunner._specialist_json_value(value)
         if not isinstance(value, dict):
@@ -11472,12 +15733,24 @@ class ComposerRunner:
                     "schema_version", "decision", "checks", "findings",
                     "required_repairs", "rationale") if isinstance(review, dict) and key in review
             }
+            complete_argument_fields = {
+                "research_question", "observed_patterns", "hypotheses",
+                "primary_argument", "limitations", "discriminating_experiments",
+                "figure_plan",
+            }
+            has_complete_argument = (
+                isinstance(argument, dict)
+                and complete_argument_fields.issubset(argument)
+            )
+            seed = self._specialist_argument_seed(results, interpretation)
             claims = []
-            if isinstance(argument, dict):
+            if has_complete_argument:
                 claims.extend(deepcopy(argument.get("observed_patterns", [])))
                 primary = argument.get("primary_argument")
                 if isinstance(primary, dict):
                     claims.append(deepcopy(primary))
+            else:
+                claims = deepcopy(seed["claims"])
             evidence_records = []
             if isinstance(results, dict):
                 for key in ("procedures", "metrics", "findings", "limitations", "assets"):
@@ -11486,26 +15759,42 @@ class ComposerRunner:
                         evidence_records.extend(deepcopy(value))
             if isinstance(interpretation, dict):
                 evidence_records.extend(deepcopy(interpretation.get("result_patterns", [])))
-            research_question = (argument.get("research_question")
-                                 if isinstance(argument, dict) else None)
-            if not research_question and isinstance(results, dict):
-                research_question = results.get("question")
+            research_question = (
+                argument.get("research_question") if has_complete_argument else None
+            ) or seed["research_question"]
+            argument_plan = argument if has_complete_argument else deepcopy(seed["argument_plan"])
+            if isinstance(argument, dict) and not has_complete_argument:
+                for key, value in argument.items():
+                    if value not in (None, "", [], {}):
+                        argument_plan.setdefault(key, deepcopy(value))
+                argument_plan["partial_argument_candidate"] = deepcopy(argument)
+            mechanisms = (argument.get("hypotheses", []) if has_complete_argument
+                          else seed["mechanism"])
+            limitations = (argument.get("limitations", []) if has_complete_argument
+                           else seed["limitations"])
             projected.update({
                 "research_question": research_question,
                 "claims": claims,
                 "results": results,
                 "interpretation": interpretation,
                 "review_findings": review,
-                "argument_plan": argument,
-                "mechanism": deepcopy(argument.get("hypotheses", [])
-                                      if isinstance(argument, dict) else []),
-                "limitations": deepcopy(argument.get("limitations", [])
-                                         if isinstance(argument, dict) else []),
+                "argument_plan": argument_plan,
+                "mechanism": deepcopy(mechanisms),
+                "limitations": deepcopy(limitations),
                 "evidence_records": evidence_records,
                 "section_contract": {
                     "research_question": research_question,
                     "figure_plan": deepcopy(argument.get("figure_plan", [])
-                                             if isinstance(argument, dict) else []),
+                                             if has_complete_argument else []),
+                    "candidate_claim_ids": [
+                        item.get("id") for item in claims
+                        if isinstance(item, dict) and isinstance(item.get("id"), str)
+                    ],
+                    "available_result_assets": deepcopy(
+                        argument_plan.get("available_result_assets", [])
+                        if isinstance(argument_plan, dict) else []),
+                    "status": ("accepted_argument" if has_complete_argument
+                               else "provisional_seed"),
                 },
                 "style_constraints": (
                     "Report observations separately from mechanisms; keep unsupported explanations "
@@ -11704,9 +15993,14 @@ class ComposerRunner:
             key: deepcopy(selected.get(key))
             for key in ("scope", "data_regime", "feasibility", "resource_plan",
                         "capability_requirements", "comparison", "measurement",
-                        "disconfirmation_test")
+                        "disconfirmation_test", "research_form", "evidence_mode")
             if selected.get(key) is not None
         }
+        maturity_scope = self._topic_maturity_requirement_scope(selected, topic_context)
+        method_constraints["maturity_open_requirements"] = deepcopy(
+            maturity_scope.get("active", []))
+        method_constraints["maturity_out_of_scope_requirements"] = deepcopy(
+            maturity_scope.get("out_of_scope", []))
         method_constraints["feasibility_plan"] = deepcopy(feasibility_plan)
         available_assets = {
             "prior_work_ids": deepcopy(selected.get("prior_work_ids", [])),
@@ -11839,6 +16133,8 @@ class ComposerRunner:
         prior_stage_context = prior_stage_context if isinstance(prior_stage_context, dict) else {}
         failure_recovery = prior_stage_context.get("failure_recovery")
         failure_recovery = failure_recovery if isinstance(failure_recovery, dict) else None
+        prior_repair_plan = prior_stage_context.get("experiment_repair_plan")
+        prior_repair_plan = prior_repair_plan if isinstance(prior_repair_plan, dict) else {}
         blockers = [
             {key: deepcopy(item.get(key)) for key in ("stage_id", "reason", "diagnostics") if key in item}
             for item in self.blockers
@@ -11864,17 +16160,24 @@ class ComposerRunner:
             or (failure_recovery.get("dossier_ref")
                 if isinstance(failure_recovery, dict) else None)
         )
+        current_failure_message = result.get("error")
         failure_message = (
-            prior_stage_context.get("error")
+            current_failure_message if isinstance(current_failure_message, str)
+            else prior_stage_context.get("error")
             or (failure_recovery.get("error")
                 if isinstance(failure_recovery, dict) else None)
         )
+        current_capability_evidence = result.get("capability_failure_evidence")
+        if not isinstance(current_capability_evidence, dict):
+            current_capability_evidence = prior_stage_context.get(
+                "capability_failure_evidence")
         failure_evidence = None
         if (failure_dossier_ref or failure_message or failure_recovery
-                or capability_repair_panel):
+                or capability_repair_panel or current_capability_evidence):
             failure_evidence = self._capability_repair_projection({
-                "failure_class": failure_recovery.get("failure_class")
-                if isinstance(failure_recovery, dict) else None,
+                "failure_class": result.get("failure_class") or (
+                    failure_recovery.get("failure_class")
+                    if isinstance(failure_recovery, dict) else None),
                 "failure_dossier_ref": failure_dossier_ref,
                 "failure_dossier": self._failure_dossier_evidence(
                     failure_dossier_ref,
@@ -11890,19 +16193,32 @@ class ComposerRunner:
                         if isinstance(failure_recovery, dict) else None)
                 ),
                 "error": failure_message,
+                "capability_failure_evidence": deepcopy(current_capability_evidence),
+                "research_review": deepcopy(result.get("research_review")
+                                              or prior_stage_context.get("research_review")),
                 "review_directives": recovery_directives,
                 "repair_plan": {
-                    key: deepcopy(prior_stage_context["experiment_repair_plan"].get(key))
-                    for key in ("design_axis", "instruction", "required_evidence",
-                                "root_causes", "required_changes", "review_evidence")
-                    if isinstance(prior_stage_context.get("experiment_repair_plan"), dict)
-                    and key in prior_stage_context["experiment_repair_plan"]
+                    **{
+                        key: deepcopy(prior_repair_plan.get(key))
+                        for key in ("design_axis", "instruction", "required_evidence",
+                                    "review_evidence")
+                        if key in prior_repair_plan
+                    },
+                    "diagnostic_hypotheses": deepcopy(
+                        prior_repair_plan.get("diagnostic_hypotheses")
+                        or prior_repair_plan.get("root_causes", [])),
+                    "proposed_changes": deepcopy(
+                        prior_repair_plan.get("proposed_changes")
+                        or prior_repair_plan.get("required_changes", [])),
                 },
                 "latest_methods_panel": {
                     "decision": capability_repair_panel.get("decision"),
-                    "root_causes": deepcopy(capability_repair_panel.get("root_causes", []))[:8],
-                    "required_changes": deepcopy(
-                        capability_repair_panel.get("required_changes", []))[:8],
+                    "diagnostic_hypotheses": deepcopy(
+                        capability_repair_panel.get("diagnostic_hypotheses")
+                        or capability_repair_panel.get("root_causes", []))[:8],
+                    "proposed_changes": deepcopy(
+                        capability_repair_panel.get("proposed_changes")
+                        or capability_repair_panel.get("required_changes", []))[:8],
                     "verifier": {
                         "decision": panel_verifier.get("decision"),
                         "critical_findings": deepcopy(
@@ -12050,9 +16366,10 @@ class ComposerRunner:
         live = {key: deepcopy(event.get(key)) for key in (
             "event", "role", "role_id", "task_id", "stage_id", "model_role", "route_id",
             "provider_pool", "model", "base_url", "cache_prompt", "execution_mode", "status",
+            "assignment_attempt_number",
             "context_window_tokens", "max_input_tokens",
             "decision", "elapsed_seconds", "error", "attempts", "usage", "artifact_ref",
-            "response_ref",
+            "response_ref", "continuation", "continuation_from_chars",
         ) if key in event}
         live["observed_at"] = now_iso()
         now = self.clock()
@@ -12080,9 +16397,7 @@ class ComposerRunner:
             self._progress_snapshot = deepcopy(state)
             output = self.root / "output"
             output.mkdir(parents=True, exist_ok=True)
-            temporary = output / f"progress-specialist-{uuid.uuid4().hex}.tmp"
-            temporary.write_bytes(canonical_bytes(state))
-            temporary.replace(output / "progress.json")
+            _atomic_write_bytes(output / "progress.json", canonical_bytes(state))
 
     def _dispatch_specialist_work(self, dispatcher, assignments, packet, *, verifier=False):
         """Persist each completed role before another role can fail or time out."""
@@ -12118,6 +16433,21 @@ class ComposerRunner:
                               elapsed_seconds=0, request_attempts=0,
                               execution_mode="retained_model_result" if retained["status"] == "succeeded" else "retained_failure")
                 reports.append(report)
+                if hasattr(dispatcher, "on_progress"):
+                    dispatcher.on_progress({
+                        "event": "reused_model_result",
+                        "role": assignment.get("assigned_role"),
+                        "role_id": assignment.get("role_id"),
+                        "task_id": assignment.get("task_id"),
+                        "stage_id": assignment.get("stage_id"),
+                        "model_role": assignment.get("model_role"),
+                        "assignment_attempt_number": assignment.get("attempt_number"),
+                        "status": report.get("status"),
+                        "decision": report.get("decision"),
+                        "execution_mode": report.get("execution_mode"),
+                        "artifact_ref": retained.get("cache_ref"),
+                        "usage": {},
+                    })
             else:
                 pending.append(assignment)
         # Cooldowns are route-scoped.  The capacity pool remains shared, but
@@ -12155,7 +16485,8 @@ class ComposerRunner:
         reports.extend(dispatcher.dispatch(pending, packet, verifier=verifier, on_result=retain))
         return reports
 
-    def _run_specialist_pool(self, stage, stage_assignment, descriptor, *, stage_result=None):
+    def _run_specialist_pool(self, stage, stage_assignment, descriptor, *, stage_result=None,
+                             cache_input_digest=None):
         """Run the admitted specialist assignments in a bounded provider pool."""
         model = self._specialist_model_config(stage, descriptor)
         if model is None or not isinstance(stage_assignment, dict):
@@ -12171,7 +16502,11 @@ class ComposerRunner:
         deadline = time.monotonic() + min(float(stage["deadline_seconds"]), self._remaining())
         packet = self._specialist_stage_packet(
             stage, descriptor, stage_result=stage_result)
-        packet_digest = hashlib.sha256(canonical_bytes(packet)).hexdigest()
+        packet_digest = (
+            cache_input_digest if isinstance(cache_input_digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", cache_input_digest)
+            else hashlib.sha256(canonical_bytes(packet)).hexdigest()
+        )
         assignment_number = stage_assignment.get("attempt_number")
         stage_record = self.stage_records.get(stage.get("id"), {})
         attempt_history = stage_record.get("attempts", []) if isinstance(stage_record, dict) else []
@@ -12225,10 +16560,13 @@ class ComposerRunner:
             else:
                 pending_assignments.append(assignment)
         if pending_assignments:
+            assignment_number = stage_assignment.get("attempt_number")
             dispatcher = SpecialistDispatcher(
                 model, provider_pools=self._specialist_provider_pools(descriptor),
                 max_parallel=min(max_parallel, len(pending_assignments)), deadline=deadline,
-                on_progress=lambda event: self._specialist_progress(stage["id"], event),
+                on_progress=lambda event: self._specialist_progress(stage["id"], {
+                    **event, "assignment_attempt_number": assignment_number,
+                }),
             )
             for report in self._dispatch_specialist_work(dispatcher, pending_assignments, packet):
                 role_id = report.get("role_id")
@@ -12284,10 +16622,14 @@ class ComposerRunner:
         # reducing it to ``{status, error}`` made every reviewer report that the
         # argument was empty and prevented a meaningful repair order.
         for attribute in ("research_argument", "research_review", "research_feedback",
-                          "research_response", "research_review_argument_sha256"):
+                          "research_response", "research_review_argument_sha256",
+                          "capability_failure_evidence", "model_diagnostics",
+                          "repair_feedback"):
             value = getattr(error, attribute, None)
             if value is not None:
                 result[attribute] = deepcopy(value)
+        if getattr(error, "capability_repair_routed", False):
+            result["capability_repair_routed"] = True
         if isinstance(result.get("research_argument"), dict):
             result.setdefault("argument", deepcopy(result["research_argument"]))
             package = result.get("argument_package")
@@ -12363,6 +16705,16 @@ class ComposerRunner:
         return bundle, verifier, stage_result
 
     @staticmethod
+    def _capability_repair_panel_stage_id(stage_id, science_digest, cycle, attempt):
+        """Keep one durable Methods assignment lineage for unchanged evidence."""
+        base = re.sub(r"[^a-z0-9-]+", "-", str(stage_id).casefold()).strip("-")
+        if isinstance(science_digest, str) and re.fullmatch(r"[0-9a-f]{64}", science_digest):
+            suffix = f"-repair-panel-{science_digest[:12]}"
+        else:
+            suffix = f"-repair-panel-{cycle}-{attempt}"
+        return f"{(base or 'experiment')[:64 - len(suffix)]}{suffix}"
+
+    @staticmethod
     def _capability_repair_panel_completed(panel):
         """Whether a completed Methods panel already reviewed this failed design."""
         if not isinstance(panel, dict) or panel.get("status") != "completed":
@@ -12376,20 +16728,56 @@ class ComposerRunner:
         return isinstance(verifier, dict) and verifier.get("status") == "succeeded"
 
     @staticmethod
-    def _should_run_failure_specialist_review(error):
-        """Avoid a second empty review when a full capability-repair panel just ran."""
-        if getattr(error, "capability_repair_panel_completed", False):
+    def _failure_review_was_material(context, recovery=None):
+        """Whether durable state contains a substantive prior specialist review."""
+        context = context if isinstance(context, dict) else {}
+        recovery = recovery if isinstance(recovery, dict) else {}
+        reports = context.get("specialist_reports")
+        reviewed_reports = isinstance(reports, list) and any(
+            isinstance(report, dict) and report.get("status") == "succeeded"
+            for report in reports)
+        verifier = context.get("specialist_verifier")
+        reviewed_verifier = (
+            isinstance(verifier, dict) and verifier.get("status") == "succeeded")
+        directives = context.get("review_directives") or recovery.get("review_directives")
+        reviewed_directives = isinstance(directives, list) and any(
+            (isinstance(item, dict) and isinstance(item.get("text"), str)
+             and item["text"].strip())
+            or (isinstance(item, str) and item.strip())
+            for item in directives)
+        return reviewed_reports or reviewed_verifier or reviewed_directives
+
+    def _should_run_failure_specialist_review(self, error, stage=None):
+        """Review scientific evidence, not transport or missing-input failures."""
+        if (getattr(error, "capability_repair_panel_completed", False)
+                or getattr(error, "capability_repair_panel_attempted", False)
+                or getattr(error, "capability_repair_routed", False)):
+            return False
+        if (getattr(error, "failure_class", None) == "experiment_capability_repair"
+                and getattr(error, "recovery_mode", None) == "repair_then_rerun"):
+            # The Foundry verdict is consumed by the next-turn Methods panel;
+            # another generic failure pool would repeat the same review work.
             return False
         from scisaurus.runtime.capability_foundry import CapabilityDeadlineError
-        return not isinstance(error, (
+        if isinstance(error, (
             ProviderCooldownError,
             ProviderConfigurationError,
             QuotaExceededError,
             ComposerLateStageResult,
             ComposerHardDeadlineExceeded,
             CapabilityDeadlineError,
-            KeyboardInterrupt,
-        )) and not (isinstance(error, ModelCallError) and error.status_code == 429)
+                KeyboardInterrupt,
+        )) or (isinstance(error, ModelCallError) and error.status_code == 429):
+            return False
+        if classify_failure(
+                stage.get("kind") if isinstance(stage, dict) else None,
+                error, getattr(error, "stage_result", None)) == "harness_bug":
+            return False
+        if not isinstance(stage, dict):
+            return True
+        return classify_failure(
+            stage.get("kind"), error, getattr(error, "stage_result", None)
+        ) not in {"model_contract", "evidence_input_unavailable"}
 
     @staticmethod
     def _specialist_usage(reports):
@@ -12527,11 +16915,19 @@ class ComposerRunner:
                          if isinstance(item, dict) and item.get("assignment_phase") == "verifier"), None)
         if verifier is None:
             return None
+        verifier = deepcopy(verifier)
         deadline = time.monotonic() + min(float(stage["deadline_seconds"]), self._remaining())
+
+        def on_progress(event):
+            self._specialist_progress(stage["id"], {
+                **event,
+                "assignment_attempt_number": stage_assignment.get("attempt_number"),
+            })
+
         dispatcher = SpecialistDispatcher(
             model, provider_pools=self._specialist_provider_pools(descriptor),
             max_parallel=1, deadline=deadline,
-            on_progress=lambda event: self._specialist_progress(stage["id"], event),
+            on_progress=on_progress,
         )
         # The verifier must see the same concrete stage result that the
         # producer specialists reviewed. ``chief_result`` is the stage
@@ -12540,6 +16936,8 @@ class ComposerRunner:
         # appear empty to the adversary.
         packet_source = stage_result if isinstance(stage_result, dict) else chief_result
         packet = self._specialist_stage_packet(stage, descriptor, stage_result=packet_source)
+        if isinstance(stage_result, dict) and stage_result.get("repair_verification_scope"):
+            packet["repair_verification_scope"] = stage_result["repair_verification_scope"]
         packet["chief_result"] = deepcopy(chief_result)
         packet["specialist_reports"] = deepcopy(bundle.get("reports", []))
         if stage.get("kind") == "topic_discovery":
@@ -12574,14 +16972,55 @@ class ComposerRunner:
                     "scientific refutation. Without that evidence, require an adjacent, parent-preserving "
                     "repair and do not accept an unrelated replacement."
                 )
-        verifier = deepcopy(verifier)
         verifier_quota = verifier.get("quota") if isinstance(verifier.get("quota"), dict) else {}
         context_limit = dispatcher.input_limit_for_role(
             verifier.get("model_role"), verifier_quota.get("max_input_tokens"))
         verifier["_prompt"] = build_verifier_prompt(
             stage, packet, bundle.get("reports", []), chief_result,
             max_input_tokens=context_limit)
+        model_identity = {
+            key: value for key, value in model.items()
+            if key not in {"api_key", "api_token", "auth_env", "headers", "timeout_seconds"}
+        }
+        input_digest = hashlib.sha256(canonical_bytes({
+            "system": VERIFIER_SYSTEM,
+            "model_role": verifier.get("model_role"),
+            "model": model_identity,
+            "prompt": verifier["_prompt"],
+        })).hexdigest()
+        retained = self.departments.find_durable_verifier_report(
+            stage["id"], stage_assignment.get("attempt_number"),
+            input_digest=input_digest)
+        if isinstance(retained, dict):
+            report = deepcopy(retained["report"])
+            prior_usage = report.get("usage")
+            prior_usage = prior_usage if isinstance(prior_usage, dict) else {}
+            report.update({
+                "provider_call_reused": True,
+                "reused_prior_usage": deepcopy(prior_usage),
+                "usage": {
+                    key: 0 for key, value in prior_usage.items()
+                    if type(value) in (int, float) and math.isfinite(value) and value >= 0
+                },
+                "artifact_ref": retained["artifact_ref"],
+            })
+            self._specialist_progress(stage["id"], {
+                "event": "reused_durable_result",
+                "role": verifier.get("assigned_role"),
+                "role_id": verifier.get("role_id"),
+                "task_id": verifier.get("task_id"),
+                "stage_id": stage["id"],
+                "assignment_attempt_number": stage_assignment.get("attempt_number"),
+                "status": report.get("status"),
+                "artifact_ref": retained["artifact_ref"],
+                "usage": {},
+            })
+            return report
         verifier["quota"] = {**verifier_quota, "max_input_tokens": context_limit}
+        # Attempt bookkeeping uses the control-store connection owned by the
+        # Composer thread. Start it here, before dispatch enters worker threads;
+        # the live progress callback must remain file-only and thread-safe.
+        self.departments.start_verifier_attempt(verifier)
         result = self._dispatch_specialist_work(dispatcher, [verifier], packet, verifier=True)
         report = result[0] if result else {
             "status": "failed", "error": "verifier dispatcher returned no report", "usage": {},
@@ -12591,6 +17030,7 @@ class ComposerRunner:
             "project_id": self.workflow["project_id"],
             "stage_id": stage["id"], "stage_kind": stage["kind"],
             "attempt_number": stage_assignment.get("attempt_number"),
+            "input_digest": input_digest,
             "assigned_role": verifier.get("assigned_role"), "role_id": verifier.get("role_id"),
             "model_role": verifier.get("model_role"),
             "assignment_id": verifier.get("assignment_id"), "task_id": verifier.get("task_id"),
@@ -12803,6 +17243,8 @@ class ComposerRunner:
                 blocked.usage = getattr(exc, "usage", {})
                 if getattr(exc, "capability_repair_panel_completed", False):
                     blocked.capability_repair_panel_completed = True
+                if getattr(exc, "capability_repair_panel_attempted", False):
+                    blocked.capability_repair_panel_attempted = True
                 raise blocked from exc
             failures = (retained or {}).get("failed_attempts", 0) + 1
             limit = ((descriptor.get("limits") or {}).get("max_rounds")
@@ -12813,8 +17255,13 @@ class ComposerRunner:
                             "failed_attempts": failures, "error": error})
             if exhausted:
                 blocked = ModelWorkBlocked(error)
-                if getattr(exc, "capability_repair_panel_completed", False):
-                    blocked.capability_repair_panel_completed = True
+                for attribute in (
+                        "failure_class", "recovery_mode", "repair_gate",
+                        "repair_attempts", "repair_ledger", "repair_feedback",
+                        "model_diagnostics", "capability_repair_panel_completed",
+                        "capability_repair_panel_attempted"):
+                    if hasattr(exc, attribute):
+                        setattr(blocked, attribute, deepcopy(getattr(exc, attribute)))
                 for attribute in ("research_argument", "research_review", "research_feedback",
                                   "research_response", "research_review_argument_sha256"):
                     value = getattr(exc, attribute, None)
@@ -13383,15 +17830,39 @@ class ComposerRunner:
             owner = self.departments.stage_route(stage["kind"])["role"]
         except (AttributeError, KeyError, ValidationError):
             owner = STAGE_ROLES.get(stage["kind"], "executive-command.arbiter")
-        return {
-            "id": f"recovery-{safe_stage}-format-{digest}-{attempt}"[:64],
+        policy_revision = self._format_recovery_policy_revision(stage)
+        objective = (
+        "Repair the model response contract for this exact stage: use the configured output "
+        "ceiling for an initial candidate and compact, bounded exact edits for a repair; "
+        "do not regenerate the full program or repeat an identical request. Validate the "
+        "complete JSON object locally. "
+        "Preserve the scientific assignment and do not invent or release a result."
+    )
+        if stage.get("kind") == "argument":
+            objective = (
+                "Re-run the scientific argument under the revised prose policy: preserve complete, "
+                "evidence-grounded claims; enforce the JSON schema, item counts, evidence IDs, and "
+                "configured output-token budget, without per-field character ceilings."
+            )
+        elif stage.get("kind") == "experiment":
+            objective = (
+                "Retry only the experiment program-author response under the revised output policy: "
+                "use the configured author output-token ceiling for an initial candidate; for a repair, "
+                "return one compact schema-valid JSON object containing only bounded exact source edits. "
+                "Do not regenerate the full program or repeat an identical request. Use only the primary "
+                "or non-premium format fallback. The prior program "
+                "was never admitted or executed, so do not issue a scientific experiment/code-repair "
+                "order or claim new observations."
+            )
+        request_digest = digest
+        if policy_revision:
+            request_digest = hashlib.sha256(
+                f"{digest}:{policy_revision}".encode("utf-8")).hexdigest()[:16]
+        request = {
+            "id": f"recovery-{safe_stage}-format-{request_digest}-{attempt}"[:64],
             "kind": "recovery",
             "owner": owner,
-            "objective": (
-                "Repair the model response contract for this exact stage: reroute the next call or "
-                "use a compact schema-only prompt, then validate the complete JSON object locally. "
-                "Preserve the scientific assignment and do not invent or release a result."
-            ),
+            "objective": objective,
             "why": (
                 "The previous provider response was unusable as JSON before the experiment produced "
                 "an observation; forwarding it would create a false downstream input."
@@ -13415,6 +17886,752 @@ class ComposerRunner:
             "acceptance_checks": deepcopy(
                 context.get("acceptance_checks") or recovery.get("acceptance_checks") or []),
         }
+        if policy_revision:
+            request["repair_policy_revision"] = policy_revision
+        return request
+
+    @staticmethod
+    def _format_recovery_policy_revision(stage):
+        if isinstance(stage, dict) and stage.get("kind") == "argument":
+            return ARGUMENT_RESPONSE_CONTRACT_REVISION
+        if isinstance(stage, dict) and stage.get("kind") == "experiment":
+            return EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION
+        return None
+
+    @staticmethod
+    def _persisted_blocking_foundry_feedback(context):
+        """Return only complete, still-actionable scientific findings in a checkpoint."""
+        recovery = context.get("failure_recovery") if isinstance(context, dict) else None
+        if not isinstance(recovery, dict):
+            return None
+        diagnostics = recovery.get("model_diagnostics")
+        if not isinstance(diagnostics, dict):
+            return None
+        candidates = []
+        repair_feedback = diagnostics.get("repair_feedback")
+        if isinstance(repair_feedback, dict):
+            candidates.append(repair_feedback.get("validation_feedback"))
+        ledger = diagnostics.get("repair_ledger")
+        if isinstance(ledger, list):
+            candidates.extend(
+                item.get("validation_feedback")
+                for item in reversed(ledger) if isinstance(item, dict)
+            )
+        for feedback in candidates:
+            if not isinstance(feedback, dict) or feedback.get("decision") != "rejected":
+                continue
+            gate = feedback.get("gate")
+            findings = feedback.get("findings")
+            if (not isinstance(gate, str)
+                    or gate not in {"adversarial_review", "independent_recalculation",
+                                    "deterministic_replay", "validator_readiness", "static_scan"}
+                    or not isinstance(findings, list)):
+                continue
+            complete_findings = [
+                item for item in findings
+                if isinstance(item, dict) and item.get("severity") in {"blocking", "warning"}
+                and all(isinstance(item.get(key), str) and item[key].strip()
+                        for key in ("finding", "evidence", "required_change"))
+            ]
+            if any(item.get("severity") == "blocking" for item in complete_findings):
+                return {
+                    "gate": gate,
+                    "decision": "rejected",
+                    "failed_checks": deepcopy(feedback.get("failed_checks", [])),
+                    "findings": deepcopy(complete_findings),
+                }
+        return None
+
+    def _reconcile_mixed_experiment_response_failure(self, by_id):
+        """Restore a scientific program repair hidden by a later truncated patch response."""
+        reconciled = []
+        for stage_id, stage in by_id.items():
+            if not isinstance(stage, dict) or stage.get("kind") != "experiment":
+                continue
+            context = self.context.get(stage_id)
+            record = self.stage_records.get(stage_id)
+            if not isinstance(context, dict) or not isinstance(record, dict):
+                continue
+            recovery = context.get("failure_recovery")
+            if not isinstance(recovery, dict):
+                continue
+            dossier_ref = recovery.get("dossier_ref") or context.get("failure_dossier_ref")
+            if not (
+                    context.get("failure_class") == "model_contract"
+                    and recovery.get("failure_class") == "model_contract"
+                    and recovery.get("recovery_mode") == "format_repair_then_rerun"
+                    and context.get("format_recovery_dispatched") is True
+                    and context.get("results_status") in (None, "not_executed")
+                    and isinstance(dossier_ref, str)
+                    and dossier_ref.startswith(
+                        "artifact:command/composer/failure-recovery/experiment/attempt-")
+            ):
+                continue
+            feedback = self._persisted_blocking_foundry_feedback(context)
+            if not isinstance(feedback, dict):
+                continue
+            error_text = str(context.get("error") or record.get("error") or "")
+            lowered = error_text.casefold()
+            if ("capability foundry did not admit a program" not in lowered
+                    or "program author response was incomplete" not in lowered
+                    or "finish_reason=length" not in lowered):
+                continue
+            attempts = record.get("attempts")
+            attempts = attempts if isinstance(attempts, list) else []
+            latest = attempts[-1] if attempts and isinstance(attempts[-1], dict) else {}
+            if (latest.get("state") != "failed"
+                    or latest.get("failure_class") != "model_contract"):
+                continue
+            unresolved_prior_attempts = [
+                {
+                    key: prior[key]
+                    for key in ("attempt_id", "attempt_number", "cycle", "state",
+                                "project_dir", "external_ref")
+                    if key in prior
+                }
+                for prior in attempts[:-1]
+                if isinstance(prior, dict)
+                and prior.get("state") in {"started", "unknown", "result_unknown"}
+            ]
+            if self._has_executed_experiment_result(
+                    context,
+                    self._stage_experiment_capability_id(stage),
+                    project_dir=latest.get("project_dir")):
+                continue
+            latest_attempt_number = latest.get("attempt_number")
+            attempt_count = record.get("attempt_count")
+            attempt_number = max((
+                value for value in (latest_attempt_number, attempt_count,
+                                    context.get("attempt_number"), recovery.get("attempt_number"))
+                if type(value) is int and value >= 0
+            ), default=0) + 1
+
+            findings = feedback["findings"]
+            error = ModelWorkBlocked(
+                "capability foundry patch response was truncated while a blocking scientific "
+                "program review remained unresolved"
+            )
+            error.failure_class = "experiment_capability_repair"
+            error.recovery_mode = "repair_then_rerun"
+            error.repair_gate = feedback["gate"]
+            error.capability_repair_routed = True
+            error.repair_feedback = {
+                "gate": feedback["gate"],
+                "feedback": "Persisted blocking findings remain unresolved; repair program source before replay.",
+                "validation_feedback": deepcopy(feedback),
+                "validation_context": deepcopy(
+                    recovery.get("model_diagnostics", {}).get("repair_feedback", {}).get(
+                        "validation_context", {})),
+            }
+            error.research_review = {
+                "status": "rejected",
+                "checks": deepcopy(feedback.get("failed_checks", [])),
+                "required_repairs": [
+                    {"repair": (
+                        f"{item['finding']} Evidence: {item['evidence']} "
+                        f"Required change: {item['required_change']}"
+                    )[:1800]}
+                    for item in findings
+                ],
+            }
+            error.model_diagnostics = {
+                "source_failure_dossier_ref": dossier_ref,
+                "persisted_gate": feedback["gate"],
+                "blocking_finding_count": len(findings),
+                "unresolved_prior_attempts": deepcopy(unresolved_prior_attempts),
+            }
+            recovery_context = deepcopy(context)
+            if isinstance(latest.get("project_dir"), str):
+                recovery_context["project_dir"] = latest["project_dir"]
+            if isinstance(latest.get("attempt_id"), str):
+                recovery_context["attempt_id"] = latest["attempt_id"]
+            if type(latest_attempt_number) is int:
+                recovery_context["attempt_number"] = latest_attempt_number
+            error.stage_result = deepcopy(recovery_context)
+            error_attempt = dict(latest)
+            error_attempt.setdefault("project_dir", recovery_context.get("project_dir"))
+            self._record_failure_recovery(
+                stage, error_attempt, error, recovery_context,
+                {"reports": []}, None, attempt_number,
+                attempt_id=latest.get("attempt_id"),
+            )
+
+            repaired_context = self.context.get(stage_id)
+            if not isinstance(repaired_context, dict):
+                continue
+            for key in (
+                    "format_recovery", "format_recovery_attempts",
+                    "format_recovery_dispatched", "format_recovery_signature",
+                    "format_recovery_policy_revision"):
+                repaired_context.pop(key, None)
+            repaired_context["failure_class"] = "experiment_failure"
+            repaired_context["review_status"] = "scientific_assignment_blocked"
+            repaired_context["release_blocking"] = True
+            if unresolved_prior_attempts:
+                repaired_context["unresolved_prior_attempts"] = deepcopy(
+                    unresolved_prior_attempts)
+                repaired_context.pop("results_status", None)
+            else:
+                repaired_context["results_status"] = "not_executed"
+            repaired_context["research_expansion_requests"] = []
+            repaired_context["deferred_research_requests"] = []
+            self.context[stage_id] = repaired_context
+
+            superseded = [
+                item for item in self.active_research_requests
+                if isinstance(item, dict)
+                and item.get("target_stage_id") == stage_id
+                and item.get("recovery_mode") == "format_repair_then_rerun"
+            ]
+            self.active_research_requests = [
+                item for item in self.active_research_requests if item not in superseded
+            ]
+            retired = self.departments.retire_superseded_work_orders(
+                {item.get("id") for item in self.active_research_requests
+                 if isinstance(item, dict) and isinstance(item.get("id"), str)},
+                reason="scientific review evidence superseded format-only experiment recovery",
+            )
+            if retired:
+                self.organization_snapshot = deepcopy(self.departments.snapshot())
+
+            record.update({
+                "status": "research_expansion_required",
+                "error": str(error),
+                "failure_class": "experiment_failure",
+                "failure_dossier_ref": repaired_context.get("failure_dossier_ref"),
+                "repair_order_issued": True,
+            })
+            self.stage_records[stage_id] = record
+            self.continuation_pending_stage_ids.add(stage_id)
+            event = {
+                "cycle": self.continuation_cycles,
+                "action": "reconcile_scientific_experiment_failure_after_format_truncation",
+                "stage_id": stage_id,
+                "source_dossier_ref": dossier_ref,
+                "recovery_dossier_ref": repaired_context.get("failure_dossier_ref"),
+                "attempt_number": attempt_number,
+                "gate": feedback["gate"],
+                "blocking_finding_count": len(findings),
+                "unresolved_prior_attempts": deepcopy(unresolved_prior_attempts),
+                "retired_format_request_ids": [
+                    item.get("id") for item in superseded
+                    if isinstance(item.get("id"), str)
+                ],
+                "next_action": "resume_same_topic_with_source_level_methods_repair",
+            }
+            self.department_activity.append(event)
+            reconciled.append(event)
+        return reconciled
+
+    def _reconcile_interrupted_foundry_rejection(self, by_id):
+        """Restore current-topic Foundry evidence after an interrupted stage call."""
+        reconciled = []
+        allowed_gates = {
+            "adversarial_review", "independent_recalculation",
+            "deterministic_replay", "validator_readiness", "static_scan",
+        }
+        for stage_id, stage in by_id.items():
+            if not isinstance(stage, dict) or stage.get("kind") != "experiment":
+                continue
+            record = self.stage_records.get(stage_id)
+            attempts = record.get("attempts") if isinstance(record, dict) else None
+            latest = attempts[-1] if isinstance(attempts, list) and attempts else None
+            if (not isinstance(latest, dict)
+                    or latest.get("state") not in {"unknown", "result_unknown"}):
+                continue
+            match = self._topic_context_for_stage(stage)
+            if not isinstance(match, tuple) or len(match) != 2:
+                continue
+            topic_context = match[1]
+            topic = topic_context.get("topic") if isinstance(topic_context, dict) else None
+            if (not isinstance(topic, dict)
+                    or topic.get("id") != latest.get("topic_id")
+                    or not isinstance(topic.get("research_question"), str)
+                    or not isinstance(topic.get("domain"), str)):
+                continue
+            foundry = self._latest_foundry_failure_projection(
+                topic["research_question"], topic["domain"])
+            if (not isinstance(foundry, dict)
+                    or foundry.get("status") in (None, "succeeded")
+                    or foundry.get("cache_body_verified") is not True
+                    or not re.fullmatch(r"[0-9a-f]{64}",
+                                        str(foundry.get("cache_body_sha256", "")))):
+                continue
+            feedback = foundry.get("validation_feedback")
+            if (not isinstance(feedback, dict)
+                    or feedback.get("decision") != "rejected"
+                    or feedback.get("gate") not in allowed_gates):
+                continue
+            findings = [
+                deepcopy(item) for item in feedback.get("findings", [])
+                if isinstance(item, dict) and item.get("severity") == "blocking"
+                and all(isinstance(item.get(key), str) and item[key].strip()
+                        for key in ("finding", "evidence", "required_change"))
+            ]
+            if not findings:
+                continue
+
+            context = self.context.get(stage_id)
+            context = context if isinstance(context, dict) else {}
+            project_dir = latest.get("project_dir")
+            if self._has_executed_experiment_result(
+                    context, self._stage_experiment_capability_id(stage),
+                    project_dir=project_dir):
+                continue
+            identity = hashlib.sha256(canonical_bytes({
+                "stage_id": stage_id,
+                "attempt_id": latest.get("attempt_id"),
+                "topic_id": topic["id"],
+                "research_question": topic["research_question"],
+                "domain": topic["domain"],
+                "foundry_cache_body_sha256": foundry["cache_body_sha256"],
+            })).hexdigest()
+            prior = context.get("foundry_rejection_reconciliation")
+            if isinstance(prior, dict) and prior.get("identity") == identity:
+                continue
+
+            unresolved = [
+                {key: deepcopy(item[key]) for key in (
+                    "attempt_id", "attempt_number", "cycle", "state", "project_dir",
+                    "external_ref", "topic_id", "topic_cycle") if key in item}
+                for item in attempts
+                if isinstance(item, dict)
+                and item.get("state") in {"started", "unknown", "result_unknown"}
+            ]
+            evidence = {
+                "source": "capability_foundry",
+                "cache_ref": foundry.get("cache_ref"),
+                "cache_body_sha256": foundry["cache_body_sha256"],
+                "validation_feedback": deepcopy(feedback),
+                "experiment_result_observed": False,
+                "unresolved_attempts": deepcopy(unresolved),
+            }
+            error = ModelWorkBlocked(
+                "current-topic capability Foundry review rejected the experiment program: "
+                + str(foundry.get("feedback") or "blocking scientific findings remain")[:2000]
+            )
+            error.failure_class = "experiment_capability_repair"
+            error.recovery_mode = "repair_then_rerun"
+            error.repair_gate = feedback["gate"]
+            error.repair_feedback = {
+                "gate": feedback["gate"],
+                "feedback": "Repair the candidate from its persisted scientific review evidence.",
+                "validation_feedback": deepcopy(feedback),
+            }
+            error.capability_failure_evidence = deepcopy(evidence)
+            error.research_review = {
+                "status": "rejected",
+                "checks": deepcopy(feedback.get("failed_checks", [])),
+                "required_repairs": [{"repair": (
+                    f"{item['finding']} Evidence: {item['evidence']} "
+                    f"Required change: {item['required_change']} "
+                    "Reconcile unresolved attempts in their durable operation ledger; do not "
+                    "replay an unknown operation or change the admitted question."
+                )[:2200]} for item in findings],
+            }
+            error.model_diagnostics = {
+                "interrupted_attempt_id": latest.get("attempt_id"),
+                "foundry_cache_ref": foundry.get("cache_ref"),
+                "foundry_cache_body_sha256": foundry["cache_body_sha256"],
+                "foundry_gate": feedback["gate"],
+                "blocking_finding_count": len(findings),
+                "unresolved_attempts": deepcopy(unresolved),
+            }
+            error.stage_result = {
+                "status": "blocked", "error": str(error),
+                "failure_scope": "pre_execution_capability_review",
+                "stage_id": stage_id, "kind": "experiment",
+                "attempt_id": latest.get("attempt_id"),
+                "attempt_number": latest.get("attempt_number"),
+                "project_dir": project_dir, "topic_id": topic["id"],
+                "topic_cycle": latest.get("topic_cycle"),
+                "execution_observation": "no_admitted_experiment_result_observed",
+                "results_status": "not_observed", "execution_refs": [],
+                "unresolved_prior_attempts": deepcopy(unresolved),
+                "capability_failure_evidence": deepcopy(evidence),
+                "capability_repair_routed": True,
+                "research_review": deepcopy(error.research_review),
+                "model_diagnostics": deepcopy(error.model_diagnostics),
+            }
+            attempt_number = max((value for value in (
+                record.get("attempt_count"), latest.get("attempt_number"),
+                context.get("attempt_number"))
+                if type(value) is int and value >= 0), default=0) + 1
+            dossier = self._record_failure_recovery(
+                stage, dict(latest), error, error.stage_result,
+                {"reports": []}, None, attempt_number,
+                attempt_id=latest.get("attempt_id"))
+            repaired = self.context.get(stage_id)
+            if not isinstance(repaired, dict):
+                continue
+            repaired.update({
+                "foundry_rejection_reconciliation": {
+                    "identity": identity, "attempt_id": latest.get("attempt_id"),
+                    "cache_body_sha256": foundry["cache_body_sha256"],
+                    "dossier_ref": dossier.get("artifact_ref"),
+                },
+                "capability_failure_evidence": deepcopy(evidence),
+                "unresolved_prior_attempts": deepcopy(unresolved),
+                "capability_repair_routed": True,
+                "failure_class": "experiment_failure",
+                "review_status": "scientific_assignment_blocked",
+                "release_blocking": True,
+            })
+            self.context[stage_id] = repaired
+            superseded = [
+                item for item in self.active_research_requests
+                if isinstance(item, dict) and item.get("target_stage_id") == stage_id
+                and item.get("recovery_mode") == "format_repair_then_rerun"
+            ]
+            self.active_research_requests = [
+                item for item in self.active_research_requests if item not in superseded
+            ]
+            retired = self.departments.retire_superseded_work_orders(
+                {item.get("id") for item in self.active_research_requests
+                 if isinstance(item, dict) and isinstance(item.get("id"), str)},
+                reason="current-topic scientific findings superseded format-only retry")
+            if retired:
+                self.organization_snapshot = deepcopy(self.departments.snapshot())
+            record.update({
+                "status": "research_expansion_required",
+                "error": str(error), "failure_class": "experiment_failure",
+                "failure_dossier_ref": repaired.get("failure_dossier_ref"),
+                "repair_order_issued": True,
+            })
+            self.stage_records[stage_id] = record
+            self.continuation_pending_stage_ids.add(stage_id)
+            event = {
+                "cycle": self.continuation_cycles,
+                "action": "reconcile_interrupted_foundry_rejection",
+                "stage_id": stage_id, "attempt_id": latest.get("attempt_id"),
+                "topic_id": topic["id"], "topic_cycle": latest.get("topic_cycle"),
+                "foundry_cache_ref": foundry.get("cache_ref"),
+                "recovery_dossier_ref": repaired.get("failure_dossier_ref"),
+                "gate": feedback["gate"], "blocking_finding_count": len(findings),
+                "unresolved_attempts": deepcopy(unresolved),
+                "retired_format_request_ids": [item.get("id") for item in superseded
+                                                if isinstance(item.get("id"), str)],
+                "model_calls": 0,
+                "next_action": "run_methods_repair_before_same-topic_capability_regeneration",
+            }
+            self.department_activity.append(event)
+            reconciled.append(event)
+        return reconciled
+
+    @staticmethod
+    def _append_deferred_preexecution_review(context, record):
+        """Retain every pre-execution review while keeping the legacy latest view."""
+        archive = context.get("deferred_preexecution_reviews")
+        archive = deepcopy(archive) if isinstance(archive, list) else []
+        legacy = context.get("deferred_preexecution_review")
+        if isinstance(legacy, dict) and not any(
+                isinstance(item, dict) and canonical_bytes(item) == canonical_bytes(legacy)
+                for item in archive):
+            archive.append(deepcopy(legacy))
+        if not any(
+                isinstance(item, dict) and canonical_bytes(item) == canonical_bytes(record)
+                for item in archive):
+            archive.append(deepcopy(record))
+        context["deferred_preexecution_reviews"] = archive
+        context["deferred_preexecution_review"] = deepcopy(archive[-1])
+
+    def _reconcile_experiment_author_output_policy(self, by_id):
+        """Reopen an unexecuted author-contract failure under the current policy.
+
+        Older checkpoints can misclassify malformed model-authored intent as a
+        scientific experiment failure and dispatch reviewers before any
+        program was admitted. Reopen only a ledger-backed, unexecuted contract
+        failure; retain those reports for later reassessment against fresh
+        executable evidence.
+        """
+        reconciled = []
+        for stage_id, stage in by_id.items():
+            if not isinstance(stage, dict) or stage.get("kind") != "experiment":
+                continue
+            context = self.context.get(stage_id)
+            record = self.stage_records.get(stage_id)
+            if not isinstance(context, dict) or not isinstance(record, dict):
+                continue
+
+            error_text = str(context.get("error") or record.get("error") or "")
+            lowered = error_text.casefold()
+            recovery = context.get("failure_recovery")
+            recovery = recovery if isinstance(recovery, dict) else {}
+            diagnostics = recovery.get("model_diagnostics")
+            diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+            repair_ledger = diagnostics.get("repair_ledger")
+            repair_ledger = repair_ledger if isinstance(repair_ledger, list) else []
+            legacy_intent_contract_failure = (
+                "capability foundry did not admit a program" in lowered
+                and "stage_seconds requires exactly" in lowered
+                and context.get("failure_class") in {
+                    "experiment_failure", "experiment_capability_repair",
+                }
+                and recovery.get("recovery_mode") in {
+                    "repair_then_rerun", "experiment_diagnose_patch_execute_recalculate",
+                }
+                and bool(repair_ledger)
+                and all(
+                    isinstance(item, dict)
+                    and classify_failure("experiment", item.get("error")) == "model_contract"
+                    for item in repair_ledger
+                )
+                and context.get("results_status") in (None, "not_executed")
+                and not self._has_executed_experiment_result(
+                    context, self._stage_experiment_capability_id(stage),
+                    project_dir=self._current_experiment_result_project_dir(stage),
+                )
+            )
+            legacy_work_order_projection_failure = (
+                "work order requires its routing, objective, success and evidence fields"
+                in lowered
+                and context.get("failure_class") in {
+                    "experiment_failure", "experiment_capability_repair",
+                }
+                and recovery.get("recovery_mode") in {
+                    "repair_then_rerun", "experiment_diagnose_patch_execute_recalculate",
+                }
+                and any(
+                    isinstance(item, dict)
+                    and "work order requires its routing, objective, success and evidence fields"
+                    in str(item.get("error") or "").casefold()
+                    for item in repair_ledger
+                )
+                and context.get("results_status") in (None, "not_executed")
+                and not self._has_executed_experiment_result(
+                    context, self._stage_experiment_capability_id(stage),
+                    project_dir=self._current_experiment_result_project_dir(stage),
+                )
+            )
+            if legacy_work_order_projection_failure and not legacy_intent_contract_failure:
+                # This response shape error came from projecting a Composer
+                # recovery order into the capability-authoring request. It is
+                # a harness defect, not malformed model-authored science. Keep
+                # the pending order, prior review, and repair-panel assignments
+                # intact so the corrected projection can continue the same
+                # research task without a formatting-only retry.
+                # Leave the checkpoint byte-for-byte equivalent at this
+                # boundary: changing the panel packet here invalidates its
+                # content-addressed specialist cache and can repeat completed
+                # reviews. The corrected runtime projects the existing order
+                # before provider admission.
+                continue
+
+            legacy_author_contract_failure = legacy_intent_contract_failure
+            if legacy_author_contract_failure:
+                archived_review = {
+                    key: deepcopy(context[key])
+                    for key in (
+                        "specialist_reports", "specialist_verifier", "specialist_usage",
+                        "experiment_repair_plan", "review_directives",
+                        "failure_observed_result", "unresolved_prior_attempts",
+                    )
+                    if key in context
+                }
+                if archived_review:
+                    deferred_review = {
+                        "failure_dossier_ref": context.get("failure_dossier_ref")
+                        or recovery.get("dossier_ref"),
+                        "failure_class": context.get("failure_class"),
+                        "recovery_mode": recovery.get("recovery_mode"),
+                        "evidence": archived_review,
+                        "reason": (
+                            "The experiment candidate was blocked before a result was released; "
+                            "retain its scientific review for reassessment against a fresh "
+                            "admitted execution."
+                        ),
+                    }
+                    self._append_deferred_preexecution_review(context, deferred_review)
+                    for key in archived_review:
+                        context.pop(key, None)
+                commands = build_repair_commands(
+                    "experiment", "model_contract", error_text=error_text)
+                checks = [
+                    item.get("acceptance_check") for item in commands
+                    if isinstance(item, dict) and item.get("acceptance_check")
+                ]
+                recovery = deepcopy(recovery)
+                recovery.update({
+                    "failure_class": "model_contract",
+                    "recovery_mode": "format_repair_then_rerun",
+                    "requires_capability_repair": False,
+                    "repair_commands": deepcopy(commands),
+                    "acceptance_checks": deepcopy(checks),
+                    "review_directives": [],
+                })
+                context.update({
+                    "failure_class": "model_contract",
+                    "review_status": "format_recovery_exhausted",
+                    "failure_recovery": recovery,
+                    "format_recovery": True,
+                    "format_recovery_dispatched": True,
+                    "repair_commands": deepcopy(commands),
+                    "acceptance_checks": deepcopy(checks),
+                    "review_directives": [],
+                })
+                self.context[stage_id] = context
+
+                # Mark only the checkpoint projection stale. The child task,
+                # attempt, and any saved response remain in the durable ledger.
+                panel_prefix = f"experiment-repair-panel-{self.continuation_cycles}-"
+                for panel_id, panel in self.stage_records.items():
+                    if (not isinstance(panel_id, str) or not panel_id.startswith(panel_prefix)
+                            or not isinstance(panel, dict)):
+                        continue
+                    live = panel.get("specialist_live")
+                    if not isinstance(live, dict) or not live:
+                        continue
+                    panel["superseded_specialist_live"] = deepcopy(live)
+                    panel["specialist_live"] = {}
+                    panel["active_agents"] = []
+                    panel["status"] = "stale"
+                    panel["superseded_reason"] = (
+                        "author response contract repair precedes scientific review")
+                    self.stage_records[panel_id] = panel
+
+            if not (
+                    context.get("format_recovery") is True
+                    and context.get("format_recovery_dispatched") is True
+                    and context.get("review_status") == "format_recovery_exhausted"
+                    and context.get("failure_class") == "model_contract"
+            ):
+                continue
+            revision = self._format_recovery_policy_revision(stage)
+            if not revision or context.get("format_recovery_policy_revision") == revision:
+                continue
+            incomplete_author_response = (
+                "stage_seconds requires exactly" in lowered
+                or "experiment_intent requires" in lowered
+                or "experiment_intent stage_seconds" in lowered
+                or (
+                    ("program author response was incomplete" in lowered
+                     or "program author did not finish normally" in lowered)
+                    and ("finish_reason=length" in lowered or "valid json" in lowered)
+                )
+            )
+            if not incomplete_author_response:
+                continue
+            if (self._persisted_blocking_foundry_feedback(context) is not None
+                    and not legacy_author_contract_failure):
+                continue
+            if context.get("results_status") not in (None, "not_executed"):
+                continue
+
+            current_signature = self._format_recovery_signature(stage, error_text)
+            prior_entry = self.format_recovery_ledger.get(current_signature)
+            if isinstance(prior_entry, dict) and prior_entry.get("status") in {
+                    "dispatched", "exhausted"}:
+                continue
+            request_context = deepcopy(context)
+            request_context.update({
+                "failure_dossier_ref": context.get("failure_dossier_ref"),
+                "format_recovery_policy_revision": revision,
+                "format_recovery_signature": current_signature,
+            })
+            request = self._format_contract_recovery_request(stage, request_context)
+            if not isinstance(request, dict):
+                continue
+
+            stale_requests = [
+                item for item in self.active_research_requests
+                if isinstance(item, dict)
+                and item.get("target_stage_id") == stage_id
+                and (
+                    item.get("source_stage_id") == stage_id
+                    or (legacy_author_contract_failure
+                        and item.get("kind") == "additional_experiment"
+                        and item.get("recovery_mode")
+                        == "experiment_diagnose_patch_execute_recalculate")
+                )
+            ]
+            self.active_research_requests = [
+                item for item in self.active_research_requests
+                if item not in stale_requests
+            ]
+            next_recovery = deepcopy(recovery)
+            next_recovery.update({
+                "schema_version": "failure-recovery-ledger-1",
+                "failure_class": "model_contract",
+                "dossier_ref": context.get("failure_dossier_ref")
+                or recovery.get("dossier_ref"),
+                "input_sha256": context.get("failure_input_sha256")
+                or recovery.get("input_sha256"),
+                "recovery_mode": "format_repair_then_rerun",
+                "requires_capability_repair": False,
+                "attempt_number": record.get("attempt_count"),
+                "response_contract_revision": revision,
+            })
+            context.update({
+                "status": "research_expansion_required",
+                "review_status": "model_contract_repair",
+                "failure_class": "model_contract",
+                "release_blocking": True,
+                "failure_recovery": next_recovery,
+                "format_recovery": True,
+                "format_recovery_dispatched": False,
+                "format_recovery_policy_revision": revision,
+                "format_recovery_signature": current_signature,
+                "research_requests": [request],
+                "research_expansion_requests": [],
+                "deferred_research_requests": [],
+            })
+            entry = self.format_recovery_ledger.setdefault(current_signature, {
+                "stage_id": stage_id,
+                "status": "pending",
+                "first_attempt": record.get("attempt_count"),
+                "failure_signature": current_signature,
+                "legacy_policy_migration": True,
+            })
+            if entry.get("status") not in {"pending", "dispatched", "exhausted"}:
+                entry["status"] = "pending"
+            record.update({
+                "status": "research_expansion_required",
+                "error": error_text[:4096],
+                "recovery_contract_revision": revision,
+            })
+            self.context[stage_id] = context
+            self.stage_records[stage_id] = record
+            self.continuation_pending_stage_ids.add(stage_id)
+            reconciled.append({
+                "stage_id": stage_id,
+                "policy_revision": revision,
+                "request_id": request["id"],
+                "failure_class_migrated": legacy_author_contract_failure,
+                "retired_stale_request_ids": [
+                    item.get("id") for item in stale_requests
+                    if isinstance(item.get("id"), str)
+                ],
+                "reason": "retry the unexecuted program-author response with the corrected output and fallback policy",
+            })
+        if reconciled:
+            self.department_activity.append({
+                "cycle": self.continuation_cycles,
+                "action": "reconcile_experiment_author_output_policy",
+                "stages": reconciled,
+                "next_action": "run one same-topic format repair before any scientific experiment recovery",
+            })
+        return reconciled
+
+    @staticmethod
+    def _format_recovery_signature(stage, error):
+        """Identify the same response-contract failure across attempts and resumes."""
+        text = str(error).casefold()
+        text = re.sub(
+            r"\b(attempt|cycle)[\s:#_-]*\d+\b", r"\1 <n>", text,
+            flags=re.IGNORECASE)
+        text = re.sub(r"\b[0-9a-f]{32,64}\b", "<digest>", text,
+                      flags=re.IGNORECASE)
+        text = re.sub(r"\s+", " ", text).strip()
+        identity = {
+            "stage_id": stage.get("id") if isinstance(stage, dict) else None,
+            "stage_kind": stage.get("kind") if isinstance(stage, dict) else None,
+            "failure_class": "model_contract",
+            "error": text,
+        }
+        policy_revision = ComposerRunner._format_recovery_policy_revision(stage)
+        if policy_revision:
+            identity["response_contract_revision"] = policy_revision
+        return hashlib.sha256(canonical_bytes(identity)).hexdigest()
 
     def _record_failure_recovery(self, stage, attempt_stage, error, context,
                                  specialist_bundle, specialist_verifier,
@@ -13442,6 +18659,8 @@ class ComposerRunner:
         # on collisions; durable state only fills fields the new attempt did
         # not produce.
         durable_context = self.context.get(stage.get("id")) if isinstance(stage, dict) else None
+        prior_stage_context = (
+            deepcopy(durable_context) if isinstance(durable_context, dict) else {})
         if isinstance(durable_context, dict):
             recovered_base = deepcopy(durable_context)
             if isinstance(context, dict):
@@ -13481,6 +18700,132 @@ class ComposerRunner:
             prior_attempts = 0
             if isinstance(context, dict) and type(context.get("format_recovery_attempts")) is int:
                 prior_attempts = context["format_recovery_attempts"]
+            signature = self._format_recovery_signature(stage, error)
+            policy_revision = self._format_recovery_policy_revision(stage)
+            ledger_entry = self.format_recovery_ledger.get(signature)
+            prior_recovery = prior_stage_context.get("failure_recovery")
+            if (not isinstance(ledger_entry, dict)
+                    and prior_stage_context.get("format_recovery_dispatched") is True
+                    and isinstance(prior_recovery, dict)
+                    and prior_recovery.get("failure_class") == "model_contract"
+                    and (policy_revision is None
+                         or prior_stage_context.get("format_recovery_policy_revision")
+                         == policy_revision)
+                    and self._format_recovery_signature(
+                        stage, prior_stage_context.get("error", "")) == signature):
+                ledger_entry = {
+                    "stage_id": stage["id"], "status": "dispatched",
+                    "first_attempt": prior_recovery.get("attempt_number"),
+                    "failure_reviewed": self._failure_review_was_material(
+                        prior_stage_context, prior_recovery),
+                    "legacy_checkpoint_migration": True,
+                }
+                self.format_recovery_ledger[signature] = ledger_entry
+            if isinstance(ledger_entry, dict) and ledger_entry.get("status") in {
+                    "dispatched", "exhausted"}:
+                ledger_entry.update({
+                    "status": "exhausted",
+                    "last_attempt": attempt_number,
+                    "last_dossier_ref": dossier["artifact_ref"],
+                    "repeated_failures": int(ledger_entry.get("repeated_failures", 0)) + 1,
+                })
+                recovery_context = deepcopy(context) if isinstance(context, dict) else {}
+                recovery_context.update({
+                    "stage_id": stage["id"],
+                    "kind": stage["kind"],
+                    "status": "blocked",
+                    "error": str(error)[:4096],
+                    "review_status": "format_recovery_exhausted",
+                    "release_blocking": True,
+                    "failure_dossier_ref": dossier["artifact_ref"],
+                    "failure_class": "model_contract",
+                    "failure_recovery": {
+                        "schema_version": "failure-recovery-ledger-1",
+                        "failure_class": "model_contract",
+                        "dossier_ref": dossier["artifact_ref"],
+                        "input_sha256": dossier.get("input_sha256"),
+                        "repair_commands": deepcopy(dossier.get("repair_commands", [])),
+                        "acceptance_checks": deepcopy(dossier.get("acceptance_checks", [])),
+                        "review_directives": deepcopy(dossier.get("review_directives", [])),
+                        "model_diagnostics": deepcopy(dossier.get("model_diagnostics", {})),
+                        "recovery_mode": "format_repair_then_rerun",
+                        "requires_capability_repair": False,
+                        "attempt_number": attempt_number,
+                        "response_contract_revision": policy_revision,
+                    },
+                    "format_recovery": True,
+                    "format_recovery_signature": signature,
+                    "format_recovery_dispatched": True,
+                    "format_recovery_attempts": prior_attempts + 1,
+                    "format_recovery_policy_revision": policy_revision,
+                    "research_requests": [],
+                    "research_expansion_requests": [],
+                    "deferred_research_requests": [],
+                })
+                self.context[stage["id"]] = recovery_context
+                exhausted_orders = [
+                    item for item in self.active_research_requests
+                    if isinstance(item, dict)
+                    and item.get("source_stage_id") == stage["id"]
+                    and item.get("target_stage_id") == stage["id"]
+                ]
+                if exhausted_orders:
+                    exhausted_ids = {
+                        item.get("id") for item in exhausted_orders
+                        if isinstance(item.get("id"), str)
+                    }
+                    self.active_research_requests = [
+                        item for item in self.active_research_requests
+                        if item not in exhausted_orders
+                    ]
+                    retired_orders = self.departments.retire_superseded_work_orders(
+                        {item.get("id") for item in self.active_research_requests
+                         if isinstance(item, dict) and isinstance(item.get("id"), str)},
+                        reason=("same-stage model-contract recovery was exhausted without "
+                                "an admitted experiment program"),
+                    )
+                    self.department_activity.append({
+                        "cycle": self.continuation_cycles,
+                        "action": "retire_exhausted_model_contract_work_orders",
+                        "stage_id": stage["id"],
+                        "request_ids": sorted(exhausted_ids),
+                        "retired_work_orders": retired_orders,
+                        "next_action": "stop automatic redispatch until the response contract or route changes",
+                    })
+                self.department_activity.append({
+                    "cycle": self.continuation_cycles,
+                    "action": "suppress_repeated_model_contract_recovery",
+                    "stage_id": stage["id"],
+                    "attempt_number": attempt_number,
+                    "failure_signature": signature,
+                    "dossier_ref": dossier["artifact_ref"],
+                    "next_action": "change_the_response_contract_or_model_route_before_retry",
+                })
+                return dossier
+            if not isinstance(ledger_entry, dict):
+                ledger_entry = {
+                    "stage_id": stage["id"], "status": "pending",
+                    "first_attempt": attempt_number,
+                    "failure_signature": signature,
+                }
+                self.format_recovery_ledger[signature] = ledger_entry
+            review_reports = (
+                specialist_bundle.get("reports", [])
+                if isinstance(specialist_bundle, dict) else [])
+            same_prior_failure = (
+                self._format_recovery_signature(
+                    stage, prior_stage_context.get("error", "")) == signature)
+            ledger_entry.update({
+                "last_attempt": attempt_number,
+                "last_dossier_ref": dossier["artifact_ref"],
+                "failure_reviewed": bool(
+                    any(isinstance(report, dict) and report.get("status") == "succeeded"
+                        for report in review_reports)
+                    or (isinstance(specialist_verifier, dict)
+                        and specialist_verifier.get("status") == "succeeded")
+                    or (same_prior_failure and self._failure_review_was_material(
+                        prior_stage_context, prior_recovery))),
+            })
             recovery = {
                 "schema_version": "failure-recovery-ledger-1",
                 "failure_class": "model_contract",
@@ -13505,6 +18850,7 @@ class ComposerRunner:
                 "status": "format_recovery_required",
                 "error": str(error)[:4096],
                 "review_status": "model_contract_repair",
+                "failure_class": "model_contract",
                 "failure_recovery": recovery,
                 "failure_dossier_ref": dossier["artifact_ref"],
                 "repair_commands": deepcopy(dossier.get("repair_commands", [])),
@@ -13512,8 +18858,13 @@ class ComposerRunner:
                 "review_directives": deepcopy(dossier.get("review_directives", [])),
                 "model_diagnostics": deepcopy(dossier.get("model_diagnostics", {})),
                 "research_requests": [],
+                "research_expansion_requests": [],
+                "deferred_research_requests": [],
                 "format_recovery": True,
+                "format_recovery_dispatched": False,
                 "format_recovery_attempts": prior_attempts + 1,
+                "format_recovery_signature": signature,
+                "format_recovery_policy_revision": policy_revision,
             })
             format_request = self._format_contract_recovery_request(
                 stage, recovery_context, dossier)
@@ -13635,7 +18986,8 @@ class ComposerRunner:
         if not isinstance(stage, dict) or stage.get("kind") != "experiment":
             return False
         if not isinstance(dossier, dict) or dossier.get("failure_class") in {
-                "resource_fence", "operational_recovery", "model_contract"}:
+                "resource_fence", "operational_recovery", "model_contract",
+                "evidence_input_unavailable"}:
             return False
         if dossier.get("failure_class") == "experiment_failure":
             return True
@@ -14102,7 +19454,9 @@ class ComposerRunner:
             model = json.loads(model_path.read_text())
             minimums = self._argument_minimums(stage["id"], config)
             result = ResearchArgumentRunner(model, deadline_seconds=stage_deadline).run(
-                argument_evidence_packet(packet), min_figures=minimums["figures"],
+                argument_evidence_packet(packet), max_attempts=1,
+                max_response_attempts=2, max_adjudication_attempts=2,
+                min_figures=minimums["figures"],
                 min_tables=minimums["tables"], min_experiments=minimums["experiments"])
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(canonical_bytes(result))
@@ -14553,9 +19907,78 @@ class ComposerRunner:
             })
         return resolved
 
+    @staticmethod
+    def _valid_topic_pivot_scientific_basis(basis):
+        """Accept only typed, persisted research judgments as pivot evidence."""
+        if not isinstance(basis, dict):
+            return False
+        if basis.get("kind") == "topic_candidate_rejection":
+            if basis.get("retry_reason") != "scientific_candidate_rejected":
+                return False
+            rejections = basis.get("rejected_candidates")
+            if not isinstance(rejections, list):
+                return False
+            return any(
+                isinstance(item, dict)
+                and isinstance(item.get("topic_id"), str)
+                and item["topic_id"].strip()
+                and item.get("rejection_type") in {
+                    "novelty", "source_challenge", "maturity", "refinement",
+                }
+                and isinstance(item.get("rejection_reason"), str)
+                and item["rejection_reason"].strip()
+                for item in rejections
+            )
+        if basis.get("kind") == "parent_refinement_rejection":
+            return (
+                isinstance(basis.get("parent_topic_id"), str)
+                and bool(basis["parent_topic_id"].strip())
+                and basis.get("rejection_type") == "refinement"
+                and _topic_validation_rejection_type(
+                    basis.get("validation_error")) == "refinement"
+            )
+        return False
+
     def _pivot_topic_after_scientific_blocker(self, stage, context, completed, by_id,
-                                              *, reason, objective, why):
-        """Open an evidence-led refinement for a non-productive stage blocker."""
+                                              *, reason, objective, why,
+                                              scientific_basis=None,
+                                              recovery_mode=None):
+        """Refine a topic only from a typed scientific rejection record."""
+        context = context if isinstance(context, dict) else {}
+        if (stage.get("kind") != "topic_discovery"
+                or not self._valid_topic_pivot_scientific_basis(scientific_basis)):
+            self.department_activity.append({
+                "cycle": self.continuation_cycles,
+                "action": "reject_topic_pivot_without_scientific_evidence",
+                "stage_id": stage.get("id"),
+                "reason": str(reason)[:1200],
+                "basis_kind": (scientific_basis.get("kind")
+                               if isinstance(scientific_basis, dict) else None),
+            })
+            return False
+        recovery = context.get("failure_recovery")
+        recovery = recovery if isinstance(recovery, dict) else {}
+        superseded = context.get("superseded_scope_failure")
+        superseded = superseded if isinstance(superseded, dict) else {}
+        stage_record = self.stage_records.get(stage.get("id"), {})
+        failure_classes = {
+            value for value in (
+                context.get("failure_class"), recovery.get("failure_class"),
+                superseded.get("failure_class"),
+                stage_record.get("failure_class") if isinstance(stage_record, dict) else None,
+            ) if isinstance(value, str)
+        }
+        attempts = stage_record.get("attempts", []) if isinstance(stage_record, dict) else []
+        if isinstance(attempts, list):
+            failure_classes.update(
+                item.get("failure_class") for item in attempts[-8:]
+                if isinstance(item, dict) and isinstance(item.get("failure_class"), str)
+            )
+        technical_classes = {
+            "model_contract", "resource_fence", "operational_recovery",
+            "context_budget", "evidence_input_unavailable", "experiment_failure",
+            "experiment_contract", "stage_contract",
+        }
         topic_stage_id = stage.get("id") if stage.get("kind") == "topic_discovery" else None
         if topic_stage_id is None:
             pending = list(stage.get("depends_on", []))
@@ -14644,6 +20067,7 @@ class ComposerRunner:
         topic_context["topic_pivot"] = {
             "status": "required", "reason": reason,
             "source_stage_id": stage["id"], "cycle": pivot_cycle,
+            "scientific_basis": deepcopy(scientific_basis),
         }
         topic_context.pop("generated_capability", None)
         topic_context["research_expansion_requests"] = [{
@@ -14659,6 +20083,8 @@ class ComposerRunner:
                 "an executable primary estimand."
             ),
             "evidence_needed": " ".join(evidence_needed),
+            **({"recovery_mode": recovery_mode}
+               if isinstance(recovery_mode, str) and recovery_mode else {}),
         }]
         topic_context["research_requests"] = []
         self.context[topic_stage_id] = topic_context
@@ -14673,7 +20099,8 @@ class ComposerRunner:
             "cycle": self.continuation_cycles,
             "action": "pivot_topic_after_scientific_blocker",
             "stage_id": stage["id"], "topic_stage_id": topic_stage_id,
-            "reason": reason,
+            "reason": reason, "scientific_basis": deepcopy(scientific_basis),
+            "superseded_failure_classes": sorted(failure_classes & technical_classes),
         })
         return True
 
@@ -14712,7 +20139,10 @@ class ComposerRunner:
                     deepcopy(item) for item in rejected
                     if isinstance(item, dict)
                     and isinstance(item.get("topic_id"), str)
-                    and item["topic_id"].strip()
+                and item["topic_id"].strip()
+                    and item.get("rejection_type") in {
+                        "novelty", "source_challenge", "maturity", "refinement",
+                    }
                 ] if isinstance(rejected, list) else []
                 traces = latest.get("candidate_attempt_trace")
                 if not isinstance(traces, list) or not traces:
@@ -14725,7 +20155,7 @@ class ComposerRunner:
                         rejection_type = trace.get("rejection_type")
                         selected = trace.get("selected_topic")
                         if (rejection_type not in {
-                                "novelty", "source_challenge", "maturity", "feasibility"}
+                                "novelty", "source_challenge", "maturity", "refinement"}
                                 or not isinstance(selected, dict)
                                 or not isinstance(selected.get("id"), str)):
                             continue
@@ -14762,6 +20192,12 @@ class ComposerRunner:
                     "topic discovery bounded intake exhausted",
                     "topic discovery quota exhausted",
                 ))
+                if (retry_reason == "scientific_candidate_rejected"
+                        and not rejected and not semantic_rejections):
+                    # Older checkpoints mislabeled malformed feasibility plans
+                    # as scientific rejection. Do not turn that stale label
+                    # into permission to choose a different research question.
+                    retry_reason = None
                 if (retry_reason not in {
                         "scientific_candidate_rejected", "intake_contract_failure"}
                         and legacy_local_topic_exhaustion
@@ -14884,6 +20320,9 @@ class ComposerRunner:
         self.context[stage["id"]] = context
         if rejected:
             self._record_topic_rejection_history(rejected)
+        parent_topic = context.get("topic")
+        parent_topic_id = (
+            parent_topic.get("id") if isinstance(parent_topic, dict) else None)
         admitted = self._pivot_topic_after_scientific_blocker(
             stage, context, completed, by_id,
             reason=(
@@ -14901,6 +20340,12 @@ class ComposerRunner:
                 "the response JSON was malformed. Repair the research formulation and carry forward the "
                 "same evidence lineage."
             ),
+            scientific_basis={
+                "kind": "parent_refinement_rejection",
+                "parent_topic_id": parent_topic_id,
+                "rejection_type": "refinement",
+                "validation_error": validation_error,
+            },
         )
         if admitted:
             self.department_activity.append({
@@ -15166,7 +20611,9 @@ class ComposerRunner:
                                      if isinstance(item, dict)), {})
         if not (
             topic_record.get("status") == "blocked"
-            and latest_topic_attempt.get("failure_class") == "model_contract"
+            and latest_topic_attempt.get("failure_class") in {
+                "model_contract", "topic_refinement_contract",
+            }
             and isinstance(pivot, dict)
             and pivot.get("status") == "required"
             and pivot.get("source_stage_id") == survey_id
@@ -15220,6 +20667,202 @@ class ComposerRunner:
                 break
         if admitted_topic is None:
             return False
+
+        completed_survey = self._completed_survey_frontier_for_topic(
+            survey_id, topic_id, topic_cycle)
+        if completed_survey is not None:
+            # A quota-triggered pivot can be persisted after a successful
+            # exploratory survey and a substantive downstream review. Restore
+            # both durable decisions and resume the review's evidence-producing
+            # Methods work order; never rerun the catalogue or repeat the
+            # already completed experiment just to get past the stale pivot.
+            argument_stage = next((stage for stage in self.workflow.get("stages", [])
+                                   if stage.get("kind") == "argument"), None)
+            if not isinstance(argument_stage, dict):
+                return False
+            argument_record = self.stage_records.get(argument_stage["id"])
+            argument_record = argument_record if isinstance(argument_record, dict) else {}
+            argument_attempts = argument_record.get("attempts", [])
+            argument_attempts = argument_attempts if isinstance(argument_attempts, list) else []
+            repair_requests = None
+            source_argument_attempt = None
+            for attempt in reversed(argument_attempts):
+                if (not isinstance(attempt, dict)
+                        or attempt.get("state") != "failed"
+                        or attempt.get("failure_class") != "scientific_review"
+                        or attempt.get("topic_id") != topic_id
+                        or attempt.get("topic_cycle") != topic_cycle
+                        or not isinstance(attempt.get("failure_dossier_ref"), str)):
+                    continue
+                try:
+                    manifest = self.store.get(attempt["failure_dossier_ref"])
+                    dossier = json.loads(self.store.read_body(manifest["body_hash"]))
+                except (NotFoundError, KeyError, OSError, TypeError, ValueError):
+                    continue
+                if (not isinstance(dossier, dict)
+                        or dossier.get("stage_id") != argument_stage["id"]
+                        or dossier.get("attempt_number") != attempt.get("attempt_number")
+                        or dossier.get("failure_class") != "scientific_review"
+                        or not isinstance(dossier.get("review_directives"), list)):
+                    continue
+                dossier["artifact_ref"] = attempt["failure_dossier_ref"]
+                methods_request = self._argument_experiment_repair_request(
+                    argument_stage, dossier)
+                if methods_request is None:
+                    continue
+                argument_request = build_repair_request(
+                    dossier, stage_id=argument_stage["id"])
+                argument_request["failure_dossier_ref"] = attempt["failure_dossier_ref"]
+                repair_requests = [argument_request, methods_request]
+                source_argument_attempt = attempt
+                break
+            if repair_requests is None:
+                return False
+
+            topic_context = deepcopy(topic_context)
+            topic_context.update({
+                "kind": "topic_discovery",
+                "status": "completed",
+                "topic": deepcopy(admitted_topic["topic"]),
+                "topic_evolution": deepcopy(admitted_topic["topic_evolution"]),
+                "topic_id": topic_id,
+                "topic_cycle": topic_cycle,
+                "restored_frontier": {
+                    "source_attempt": admitted_topic_attempt.get("attempt_number"),
+                    "failed_pivot_attempt": latest_topic_attempt.get("attempt_number"),
+                    "reason": "retain the admitted topic after a quota-only survey pivot",
+                },
+                "research_requests": [],
+                "research_expansion_requests": [],
+            })
+            for key in (
+                    "topic_pivot", "deferred_research_requests", "failure_recovery",
+                    "failure_dossier_ref", "format_recovery", "format_recovery_attempts",
+                    "format_recovery_dispatched", "repair_commands", "acceptance_checks",
+                    "model_diagnostics", "error"):
+                topic_context.pop(key, None)
+            self.context[topic_id_stage] = topic_context
+            topic_record = deepcopy(topic_record)
+            topic_record.update({
+                "status": "completed",
+                "topic_id": topic_id,
+                "topic_cycle": topic_cycle,
+                "restored_frontier": deepcopy(topic_context["restored_frontier"]),
+            })
+            topic_record.pop("error", None)
+            self.stage_records[topic_id_stage] = topic_record
+            completed.add(topic_id_stage)
+
+            survey_attempt, survey_project, survey_run, survey_result = completed_survey
+            survey_context = self.context.get(survey_id)
+            survey_context = deepcopy(survey_context) if isinstance(survey_context, dict) else {}
+            survey_context.update({
+                "stage_id": survey_id,
+                "kind": "survey",
+                "status": "completed",
+                "review_status": "exploratory_pilot_retained",
+                "topic_id": topic_id,
+                "topic_cycle": topic_cycle,
+                "topic_lineage": {"topic_id": topic_id, "topic_cycle": topic_cycle},
+                "project_dir": str(survey_project),
+                "survey_ref": survey_run["survey_ref"],
+                "assessment_ref": survey_run["assessment_ref"],
+                "survey_current": True,
+                "assessment_current": True,
+                "gap_state": survey_result.get("gap_state"),
+                "topic_admission": survey_result["topic_admission"],
+                "research_requests": [],
+                "research_expansion_requests": [],
+                "restored_frontier": {
+                    "source_attempt": survey_attempt.get("attempt_number"),
+                    "survey_ref": survey_run["survey_ref"],
+                    "assessment_ref": survey_run["assessment_ref"],
+                    "reason": "reuse the current survey and preserve insufficient evidence as a limitation",
+                },
+            })
+            for key in ("topic_pivot_cycle", "superseded_topic_id", "lineage_state",
+                        "lineage_transition_ref", "error"):
+                survey_context.pop(key, None)
+            self.context[survey_id] = survey_context
+            survey_record = deepcopy(self.stage_records.get(survey_id, {}))
+            survey_record.update({
+                "kind": "survey",
+                "status": "completed",
+                "topic_id": topic_id,
+                "topic_cycle": topic_cycle,
+                "project_dir": str(survey_project),
+                "survey_ref": survey_run["survey_ref"],
+                "assessment_ref": survey_run["assessment_ref"],
+                "gap_state": survey_result.get("gap_state"),
+                "results_status": "completed",
+                "restored_frontier": deepcopy(survey_context["restored_frontier"]),
+            })
+            survey_record.pop("error", None)
+            self.stage_records[survey_id] = survey_record
+            self.continuation_pending_stage_ids.discard(survey_id)
+            completed.add(survey_id)
+
+            self.active_research_requests = repair_requests
+            targets = self._continuation_targets(repair_requests, by_id)
+            for target_id in targets:
+                target_context = self.context.get(target_id)
+                target_context = deepcopy(target_context) if isinstance(target_context, dict) else {}
+                target_context.update({
+                    "stage_id": target_id,
+                    "kind": by_id[target_id].get("kind"),
+                    "status": "pending",
+                    "topic_lineage": {"topic_id": topic_id, "topic_cycle": topic_cycle},
+                    "research_requests": [],
+                    "research_expansion_requests": [],
+                })
+                for key in ("superseded_topic_id", "lineage_state",
+                            "lineage_transition_ref", "topic_pivot_cycle", "error"):
+                    target_context.pop(key, None)
+                self.context[target_id] = target_context
+                record = self.stage_records.get(target_id)
+                if isinstance(record, dict):
+                    record = deepcopy(record)
+                    record.update({"status": "retrying", "topic_id": topic_id,
+                                   "topic_cycle": topic_cycle})
+                    self.stage_records[target_id] = record
+
+            # Target preparation clears stale request projections. Restore the
+            # durable source-stage requests afterward so the next continuation
+            # can be reconstructed from checkpoint context, not only from the
+            # transient active-request cache.
+            argument_context = self.context[argument_stage["id"]]
+            argument_context["research_requests"] = deepcopy(repair_requests)
+
+            for blocker in self.blockers:
+                if (isinstance(blocker, dict)
+                        and blocker.get("stage_id") == survey_id
+                        and blocker.get("stop_reason") == "stage_quota_exhausted"):
+                    blocker.update({
+                        "recovery": "superseded_by_current_stage_state",
+                        "superseded_stage_status": "completed",
+                        "superseded_by_survey_ref": survey_run["survey_ref"],
+                    })
+                elif (isinstance(blocker, dict)
+                      and blocker.get("stage_id") == topic_id_stage
+                      and blocker.get("attempt_number") == latest_topic_attempt.get("attempt_number")):
+                    blocker["disposition"] = "forwarded_with_findings"
+            self.department_activity.append({
+                "cycle": self.continuation_cycles,
+                "action": "restore_completed_survey_and_scientific_review_after_quota_pivot",
+                "topic_id": topic_id,
+                "topic_cycle": topic_cycle,
+                "topic_attempt": admitted_topic_attempt.get("attempt_number"),
+                "failed_pivot_attempt": latest_topic_attempt.get("attempt_number"),
+                "survey_attempt": survey_attempt.get("attempt_number"),
+                "survey_ref": survey_run["survey_ref"],
+                "assessment_ref": survey_run["assessment_ref"],
+                "argument_attempt": source_argument_attempt.get("attempt_number"),
+                "argument_dossier_ref": source_argument_attempt.get("failure_dossier_ref"),
+                "work_order_ids": [item["id"] for item in repair_requests],
+                "model_calls": 0,
+                "next_action": "run_methods_calibration_then_rebuild_and_review_the_argument",
+            })
+            return True
 
         survey_record = self.stage_records.get(survey_id)
         survey_record = survey_record if isinstance(survey_record, dict) else {}
@@ -15683,6 +21326,13 @@ class ComposerRunner:
         if (gap_state == "insufficient_evidence"
                 and not self._allows_provisional_progress()):
             return False
+        retained_evidence_expansions = [
+            deepcopy(item) for item in experiment_context.get(
+                "survey_evidence_expansion_history", [])
+            if isinstance(item, dict)
+            and item.get("topic_id") == topic["id"]
+            and item.get("topic_cycle") == topic_cycle
+        ]
 
         archived_topic_state = {
             key: deepcopy(topic_context[key]) for key in (
@@ -15886,6 +21536,7 @@ class ComposerRunner:
             },
             "research_requests": [],
             "research_expansion_requests": [],
+            "survey_evidence_expansion_history": retained_evidence_expansions[-8:],
         }
         self.context[experiment_id] = experiment_context
         experiment_record.update({
@@ -15963,17 +21614,21 @@ class ComposerRunner:
                     record.pop(key, None)
                 self.stage_records[stage_id] = record
 
-        # Discard the abandoned branch's pending set before opening the
-        # executable Methods repair; it must not mark the restored topic or
-        # survey as unfinished again.
+        # Discard the abandoned branch's pending set before admitting the
+        # restored same-topic continuation.
         self.continuation_pending_stage_ids.clear()
         self.reopened_stage_ids.clear()
         admitted = self._begin_continuation(completed, by_id)
         if not admitted:
             return False
+        survey_evidence_first = request.get("kind") == "literature_expansion"
         self.department_activity.append({
             "cycle": self.continuation_cycles,
-            "action": "restore_verified_frontier_and_repair_experiment",
+            "action": (
+                "restore_verified_frontier_and_acquire_survey_evidence"
+                if survey_evidence_first else
+                "restore_verified_frontier_and_repair_experiment"
+            ),
             "topic_id": topic["id"],
             "topic_cycle": topic_cycle,
             "topic_attempt": accepted_topic_attempt.get("attempt_number"),
@@ -15983,9 +21638,18 @@ class ComposerRunner:
             "gap_state": gap_state,
             "failure_dossier_ref": dossier_ref,
             "request_id": request["id"],
-            "next_action": "Methods repairs the same-topic experiment in a fresh attempt; novelty remains exploratory",
+            "next_action": (
+                "Research resolves the same-topic evidence gap before Methods work; novelty remains exploratory"
+                if survey_evidence_first else
+                "Methods repairs the same-topic experiment in a fresh attempt; novelty remains exploratory"
+            ),
         })
-        self._checkpoint("resume:restore_verified_frontier_and_methods_repair", force=True)
+        self._checkpoint(
+            "resume:restore_verified_frontier_and_acquire_survey_evidence"
+            if survey_evidence_first else
+            "resume:restore_verified_frontier_and_methods_repair",
+            force=True,
+        )
         return True
 
     def _resume_exhausted_pre_execution_experiment(self, completed, by_id):
@@ -16011,31 +21675,126 @@ class ComposerRunner:
             if not isinstance(context, dict) or not isinstance(record, dict):
                 continue
             if context.get("pivoted_to_topic"):
-                # Migrate checkpoints written before topic pivots retired the
-                # old lineage. The pivot marker is durable, but older packets
-                # may still carry the failed capability gate alongside it.
-                stale_keys = (
-                    "failure_recovery", "failure_debt", "failure_dossier_ref",
-                    "repair_commands", "acceptance_checks", "review_directives",
-                    "model_diagnostics", "format_recovery", "format_recovery_attempts",
-                    "format_recovery_dispatched",
-                    "capability_repair_attempts", "experiment_repair_plan",
-                    "experiment_repair_history", "capability_repair_panel",
-                )
-                if any(key in context for key in stale_keys):
-                    for key in stale_keys:
-                        context.pop(key, None)
-                    context["status"] = "research_expansion_required"
-                    context["review_status"] = "topic_pivot_pending"
-                    context["error"] = "legacy topic pivot lineage retired before new topic execution"
+                current_topic = self._current_topic_identity()
+                context_topic = {
+                    "topic_id": context.get("topic_id"),
+                    "topic_cycle": context.get("topic_cycle"),
+                }
+                record_topic = {
+                    "topic_id": record.get("topic_id"),
+                    "topic_cycle": record.get("topic_cycle"),
+                }
+                if (isinstance(current_topic, dict)
+                        and context_topic == current_topic
+                        and record_topic == current_topic):
+                    # The marker survives old lineage transitions in some
+                    # checkpoints even after a stage attempt has completed
+                    # under the newly admitted topic.  In that state it is
+                    # historical metadata, not permission to discard the
+                    # current topic's repair dossier.
+                    context.pop("pivoted_to_topic", None)
+                    repair_request = next((item for item in self.active_research_requests
+                                           if self._is_experiment_repair_request(item)
+                                           and item.get("target_stage_id", stage_id) == stage_id
+                                           and item.get("topic_id") == current_topic["topic_id"]
+                                           and item.get("topic_cycle") == current_topic["topic_cycle"]),
+                                          None)
+                    restored_fields = []
+                    if repair_request is not None:
+                        for key in (
+                                "failure_dossier_ref", "failure_input_sha256",
+                                "failure_scope",
+                                "failure_observed_result", "experiment_repair_plan",
+                                "repair_commands", "acceptance_checks", "review_directives",
+                                "model_diagnostics", "capability_repair_attempts",
+                                "capability_repair_panel"):
+                            if key not in context and key in repair_request:
+                                context[key] = deepcopy(repair_request[key])
+                                restored_fields.append(key)
+                        repair_plan = repair_request.get("experiment_repair_plan")
+                        repair_plan = repair_plan if isinstance(repair_plan, dict) else {}
+                        repair_lineage = repair_plan.get("lineage")
+                        repair_lineage = repair_lineage if isinstance(repair_lineage, dict) else {}
+                        repair_input = repair_request.get("failure_input_sha256")
+                        repair_dossier = repair_request.get("failure_dossier_ref")
+                        repair_mode = repair_request.get("recovery_mode")
+                        if (repair_plan.get("schema_version") == "experiment-repair-plan-1"
+                                and repair_lineage.get("prior_gate") == "experiment_failure"
+                                and repair_request.get("topic_id") == current_topic["topic_id"]
+                                and repair_request.get("topic_cycle") == current_topic["topic_cycle"]
+                                and repair_mode == "experiment_diagnose_patch_execute_recalculate"
+                                and isinstance(repair_dossier, str)
+                                and repair_dossier.startswith("artifact:")
+                                and isinstance(repair_input, str)
+                                and len(repair_input) == 64
+                                and all(char in "0123456789abcdef" for char in repair_input)):
+                            recovery = context.get("failure_recovery")
+                            recovery = recovery if isinstance(recovery, dict) else {}
+                            recovery.update({
+                                "failure_class": "experiment_failure",
+                                "recovery_mode": repair_mode,
+                                "requires_capability_repair": True,
+                                "dossier_ref": repair_dossier,
+                                "input_sha256": repair_input,
+                            })
+                            context["failure_recovery"] = recovery
+                            context["failure_class"] = "experiment_failure"
+                            context["failure_dossier_ref"] = repair_dossier
+                            context["failure_input_sha256"] = repair_input
+                            restored_fields.extend([
+                                "failure_recovery.requires_capability_repair",
+                                "failure_class",
+                            ])
+                        if context.get("error") == (
+                                "legacy topic pivot lineage retired before new topic execution"):
+                            context.pop("error", None)
+                        context["status"] = "research_expansion_required"
+                        if (isinstance(context.get("failure_recovery"), dict)
+                                and context["failure_recovery"].get(
+                                    "requires_capability_repair") is True):
+                            context["review_status"] = "scientific_assignment_blocked"
+                        else:
+                            context["review_status"] = "same_topic_repair_pending"
                     self.context[stage_id] = context
                     self.department_activity.append({
                         "cycle": self.continuation_cycles,
-                        "action": "migrate_topic_pivot_lineage",
+                        "action": "reconcile_stale_topic_pivot_marker",
                         "stage_id": stage_id,
-                        "next_action": "execute the new topic lineage without the superseded repair gate",
+                        "topic_id": current_topic["topic_id"],
+                        "topic_cycle": current_topic["topic_cycle"],
+                        "request_id": repair_request.get("id")
+                        if repair_request is not None else None,
+                        "restored_fields": restored_fields,
+                        "reason": (
+                            "the stage record matches the current topic; preserve its active repair order"
+                        ),
                     })
-                continue
+                else:
+                    # Migrate checkpoints written before topic pivots retired
+                    # the old lineage. The pivot marker is durable, but older
+                    # packets may still carry a superseded failure gate.
+                    stale_keys = (
+                        "failure_recovery", "failure_debt", "failure_dossier_ref",
+                        "repair_commands", "acceptance_checks", "review_directives",
+                        "model_diagnostics", "format_recovery", "format_recovery_attempts",
+                        "format_recovery_dispatched",
+                        "capability_repair_attempts", "experiment_repair_plan",
+                        "experiment_repair_history", "capability_repair_panel",
+                    )
+                    if any(key in context for key in stale_keys):
+                        for key in stale_keys:
+                            context.pop(key, None)
+                        context["status"] = "research_expansion_required"
+                        context["review_status"] = "topic_pivot_pending"
+                        context["error"] = "legacy topic pivot lineage retired before new topic execution"
+                        self.context[stage_id] = context
+                        self.department_activity.append({
+                            "cycle": self.continuation_cycles,
+                            "action": "migrate_topic_pivot_lineage",
+                            "stage_id": stage_id,
+                            "next_action": "execute the new topic lineage without the superseded repair gate",
+                        })
+                    continue
             if not self._is_pre_execution_capability_failure(
                     stage, context, record.get("error")):
                 continue
@@ -16088,12 +21847,82 @@ class ComposerRunner:
             return False
         prior_context = self.context.get(stage["id"])
         prior_context = deepcopy(prior_context) if isinstance(prior_context, dict) else {}
+        failure_recovery = prior_context.get("failure_recovery")
+        failure_recovery = failure_recovery if isinstance(failure_recovery, dict) else {}
+        if (getattr(error, "failure_class", None) == "evidence_input_unavailable"
+                or failure_recovery.get("failure_class") == "evidence_input_unavailable"):
+            prior_context.update({
+                "status": "research_expansion_required",
+                "review_status": "evidence_input_unavailable",
+                "release_blocking": True,
+                "error": str(error)[:4096],
+                "results_status": "not_executed",
+            })
+            survey_stage = next((candidate for candidate in self.workflow.get("stages", [])
+                                 if candidate.get("kind") == "survey"), None)
+            dossier = {
+                "stage_kind": stage.get("kind"),
+                "failure_class": "evidence_input_unavailable",
+                "error": str(error),
+                "input_sha256": (failure_recovery.get("input_sha256")
+                                 or prior_context.get("failure_input_sha256", "")),
+                "repair_commands": deepcopy(
+                    prior_context.get("repair_commands")
+                    or failure_recovery.get("repair_commands") or []),
+                "acceptance_checks": deepcopy(
+                    prior_context.get("acceptance_checks")
+                    or failure_recovery.get("acceptance_checks") or []),
+                "review_directives": [],
+            }
+            request = build_repair_request(
+                dossier, stage_id=stage["id"],
+                target_stage_id=survey_stage.get("id") if survey_stage else None,
+                target_stage_kind="survey",
+            )
+            request.update({
+                "id": f"source-data-recovery-{stage['id']}-{self.continuation_cycles + 1}",
+                "recovery_mode": "acquire_evidence_same_topic",
+                "failure_dossier_ref": (
+                    prior_context.get("failure_dossier_ref")
+                    or failure_recovery.get("dossier_ref")),
+                "why": (
+                    "The experiment has no controller-verified source rows. That describes the current "
+                    "data-acquisition state, not evidence against the admitted research question. "
+                    "Acquire and verify the declared source data before making any scientific feasibility "
+                    "decision."
+                ),
+                "evidence_needed": (
+                    "The unchanged admitted topic and its evidence plan; source repositories and search "
+                    "queries; immutable source artifacts; and a controller-verified row manifest. Do not "
+                    "substitute synthetic rows or change the topic because an input is missing."
+                ),
+            })
+            topic_identity = self._current_topic_identity()
+            if topic_identity is not None:
+                request["topic_id"] = topic_identity["topic_id"]
+                request["topic_cycle"] = topic_identity["topic_cycle"]
+            prior_context["research_requests"] = [request]
+            prior_context["research_expansion_requests"] = []
+            self.context[stage["id"]] = prior_context
+            admitted = self._begin_continuation(completed, by_id)
+            if admitted:
+                self.department_activity.append({
+                    "cycle": self.continuation_cycles,
+                    "action": "acquire_source_evidence_without_topic_change",
+                    "stage_id": stage["id"],
+                    "target_stage_id": request.get("target_stage_id"),
+                    "topic_id": request.get("topic_id"),
+                    "request_id": request["id"],
+                    "failure_dossier_ref": request.get("failure_dossier_ref"),
+                })
+            return admitted
         topic_retry_reason = getattr(error, "topic_retry_reason", None)
         legacy_topic_contract_failure = (
             stage.get("kind") == "topic_discovery"
             and self._is_topic_intake_retry(error, stage)
             and topic_retry_reason == "intake_contract_failure"
         )
+        survey_assignment_blocker = self._is_survey_evidence_contract_blocker(stage, error)
         if (stage.get("kind") == "topic_discovery"
                 and self._is_topic_intake_retry(error, stage)
                 and topic_retry_reason == "scientific_candidate_rejected"):
@@ -16127,6 +21956,26 @@ class ComposerRunner:
             self.context[stage["id"]] = prior_context
             if rejected:
                 self._record_topic_rejection_history(rejected)
+            trace_reasons = {}
+            for trace in traces:
+                selected = trace.get("selected_topic")
+                if (isinstance(selected, dict)
+                        and isinstance(selected.get("id"), str)
+                        and isinstance(trace.get("error"), str)):
+                    trace_reasons[selected["id"]] = trace["error"]
+            rejected_candidates = []
+            for item in rejected:
+                candidate_id = item.get("topic_id")
+                rejection_reason = (
+                    item.get("rejection_reason") or trace_reasons.get(candidate_id))
+                if (isinstance(candidate_id, str)
+                        and isinstance(rejection_reason, str)
+                        and rejection_reason.strip()):
+                    rejected_candidates.append({
+                        "topic_id": candidate_id,
+                        "rejection_type": item.get("rejection_type"),
+                        "rejection_reason": rejection_reason[:2048],
+                    })
             admitted = self._pivot_topic_after_scientific_blocker(
                 stage, prior_context, completed, by_id,
                 reason=(
@@ -16145,6 +21994,11 @@ class ComposerRunner:
                     "this formulation, not the retained scientific phenomenon; the next order must use the "
                     "recorded rejection and continue the same evidence lineage."
                 ),
+                scientific_basis={
+                    "kind": "topic_candidate_rejection",
+                    "retry_reason": topic_retry_reason,
+                    "rejected_candidates": rejected_candidates,
+                },
             )
             if admitted:
                 self.department_activity.append({
@@ -16155,26 +22009,51 @@ class ComposerRunner:
                     "reason": topic_retry_reason,
                 })
             return admitted
-        failure_recovery = prior_context.get("failure_recovery")
-        failure_recovery = failure_recovery if isinstance(failure_recovery, dict) else {}
         topic_budget_exhausted = self._is_local_topic_budget_exhaustion(error, stage)
-        model_contract_failure = (
+        current_failure_class = classify_failure(stage.get("kind"), error)
+        current_experiment_failure = (
+            stage.get("kind") == "experiment"
+            and current_failure_class == "experiment_failure"
+        )
+        retryable_topic_intake = (
+            stage.get("kind") == "topic_discovery"
+            and getattr(error, "retryable_topic_intake", False)
+            and getattr(error, "status_code", None)
+            not in {408, 425, 429, 500, 502, 503, 504}
+        )
+        if (current_failure_class == "resource_fence"
+                and (not topic_budget_exhausted
+                     and not retryable_topic_intake
+                     or getattr(error, "status_code", None)
+                     in {408, 425, 429, 500, 502, 503, 504})):
+            return False
+        model_contract_failure = not current_experiment_failure and (
             getattr(error, "failure_class", None) == "model_contract"
-            or failure_recovery.get("failure_class") == "model_contract"
+            or classify_failure(stage.get("kind"), error) == "model_contract"
+            or prior_context.get("failure_class") == "model_contract"
+            or prior_context.get("review_status") in {
+                "model_contract_repair", "format_recovery_exhausted"}
             or legacy_topic_contract_failure
+            or (not topic_budget_exhausted
+                and failure_recovery.get("failure_class") == "model_contract")
+        ) and not survey_assignment_blocker
+        format_signature = self._format_recovery_signature(stage, error)
+        format_ledger_entry = self.format_recovery_ledger.get(format_signature)
+        exact_format_recovery_spent = (
+            isinstance(format_ledger_entry, dict)
+            and format_ledger_entry.get("status") in {"dispatched", "exhausted"}
         )
         # An exhausted local envelope does not erase a typed response-contract
         # failure. Repair the exact model contract first; only a scientific
         # rejection or genuinely spent proposal budget opens a new topic intake.
-        if (model_contract_failure
-                and prior_context.get("format_recovery_dispatched") is not True):
+        if model_contract_failure and not exact_format_recovery_spent:
             # A bounded format repair is a same-stage route/prompt change. It
             # is still autonomous work: admit one explicit recovery order so
             # the next Composer pass actually reruns this stage. It must not
             # be mislabeled as a scientific pivot or released downstream.
             if ((failure_recovery.get("recovery_mode") == "format_repair_then_rerun"
                  or legacy_topic_contract_failure)
-                    and prior_context.get("format_recovery_dispatched") is not True):
+                    and not exact_format_recovery_spent):
                 requests = [item for item in prior_context.get("research_requests", [])
                             if isinstance(item, dict)]
                 if not requests:
@@ -16204,28 +22083,19 @@ class ComposerRunner:
                             "next_action": "reroute_and_compact_before_scientific_recovery",
                         })
                         return True
-            # If the bounded route/format recovery also failed, keep the
-            # current scope from replaying indefinitely. For a full research
-            # mission, pivot to a fresh topic so the Composer keeps searching
-            # for a useful direction; for a standalone stage, preserve the
-            # explicit blocker for the caller.
-            if stage.get("kind") in {"survey", "experiment"}:
-                return self._pivot_topic_after_scientific_blocker(
-                    stage, prior_context, completed, by_id,
-                    reason="the stage response contract failed its bounded repair pass",
-                    objective=(
-                        "Preserve the admitted phenomenon and scientific assignment. Repair the exact "
-                        "response contract with a compact, stage-valid evidence packet; do not treat a "
-                        "format failure as a scientific rejection or replace the research line."
-                    ),
-                    why=(
-                        "The bounded response-format repair failed, but no scientific evidence rejected "
-                        "the parent question. Change the response route or packet shape while retaining "
-                        "the topic and evidence already gathered."
-                    ),
-                )
-            # In particular, do not let a model-contract failure become a
-            # downstream missing-input handoff.
+        if model_contract_failure:
+            # A repeated or unadmittable response is an operational blocker,
+            # not evidence against the research question. Preserve the topic
+            # and prevent a format-only failure from spawning a scientific
+            # pivot or a duplicate recovery call.
+            self.department_activity.append({
+                "cycle": self.continuation_cycles,
+                "action": "model_contract_recovery_exhausted",
+                "stage_id": stage["id"],
+                "failure_signature": format_signature,
+                "recovery_status": (format_ledger_entry or {}).get("status", "unavailable"),
+                "next_action": "preserve_scope_until_a_distinct_response_repair_is_available",
+            })
             return False
         pre_execution_capability_failure = self._is_pre_execution_capability_failure(
             stage, prior_context, error)
@@ -16250,14 +22120,9 @@ class ComposerRunner:
             stage.get("kind") == "survey"
             and self._is_survey_aggregate_review_failure(error)
         )
-        # A survey's bounded model contract is an evidence gate, not a
-        # recoverable formatting retry.  The survey runner already spends its
-        # local repair allowance and persists the failed assignment.  Reopening
-        # the same survey here would recreate the same 70k-token assessment
-        # packet on every Composer cycle, even though no new source evidence
-        # has entered the graph.  Treat these failures as a scientific
-        # direction blocker and move the frontier back to topic discovery.
-        survey_assignment_blocker = self._is_survey_evidence_contract_blocker(stage, error)
+        # A survey evidence-contract failure is not evidence against the topic.
+        # Reopen only the retained assessment workspace; if that repair is no
+        # longer available, preserve the same-topic blocker for source repair.
         if ((not isinstance(error, ModelWorkBlocked)
              and not topic_budget_exhausted
              and not survey_review_blocker
@@ -16377,41 +22242,34 @@ class ComposerRunner:
             if self._admit_scoped_survey_repair(
                     stage, context, completed, by_id, error):
                 return True
-            # The retained review workspace is exhausted or not recoverable.
-            # Ask Research for a nearby refinement, never a new phenomenon.
-            return self._pivot_topic_after_scientific_blocker(
-                stage, context, completed, by_id,
-                reason="the literature acceptance gate rejected the current direction after a full pass",
-                objective=(
-                    "Preserve the parent phenomenon and repair the cited literature-fidelity findings "
-                    "by narrowing the claim, comparator, observable, or source boundary. Do not replace "
-                    "the research line with an unrelated subject; change phenomenon only when cited "
-                    "evidence directly refutes it or establishes infeasibility."
+            context.update({
+                "status": "research_expansion_required",
+                "review_status": "survey_integrity_repair_waiting",
+                "release_blocking": True,
+                "error": str(error)[:4096],
+            })
+            self.context[stage["id"]] = context
+            self.department_activity.append({
+                "cycle": self.continuation_cycles,
+                "action": "hold_same_topic_after_survey_integrity_failure",
+                "stage_id": stage["id"],
+                "reason": (
+                    "bibliographic/source-integrity findings require evidence repair and do not establish "
+                    "that the research question is scientifically infeasible"
                 ),
-                why=(
-                    "The exact aggregate review could not be repaired within its retained survey "
-                    "workspace. Its findings justify strengthening or narrowing the same question, "
-                    "not discarding the phenomenon."
-                ),
-            )
+            })
+            return False
         if survey_assignment_blocker:
             if self._admit_scoped_survey_repair(
                     stage, context, completed, by_id, error):
                 return True
-            return self._pivot_topic_after_scientific_blocker(
-                stage, context, completed, by_id,
-                reason="the literature evidence contract was exhausted without a valid gap assessment",
-                objective=(
-                    "Preserve the parent phenomenon and repair the evidence contract using its exact "
-                    "reviewer findings. Narrow the comparator, observable, source boundary, or strength "
-                    "of the claim; never replace it with an unrelated topic."
-                ),
-                why=(
-                    "The scoped assessment repair has already been used or its checkpoint is unavailable. "
-                    "That is not evidence against the phenomenon; refine the same research line and retain "
-                    "all usable evidence."
-                ),
-            )
+            self.department_activity.append({
+                "cycle": self.continuation_cycles,
+                "action": "hold_same_topic_after_survey_contract_failure",
+                "stage_id": stage["id"],
+                "reason": "the evidence contract is an output-validation requirement, not a scientific finding",
+            })
+            return False
         context.update({
             "stage_id": stage["id"],
             "kind": stage["kind"],
@@ -16729,6 +22587,21 @@ class ComposerRunner:
         try:
             self._reconcile_interrupted_stage_attempts()
             by_id = {stage["id"]: stage for stage in self.workflow["stages"]}
+            foundry_rejections = self._reconcile_interrupted_foundry_rejection(by_id)
+            if foundry_rejections:
+                self._checkpoint(
+                    "resume:restore_same_topic_scientific_repair_after_foundry_rejection",
+                    force=True,
+                )
+            mixed_experiment_failures = self._reconcile_mixed_experiment_response_failure(by_id)
+            if mixed_experiment_failures:
+                self._checkpoint(
+                    "resume:restore_scientific_experiment_repair_after_truncation",
+                    force=True,
+                )
+            author_policy_reconciled = self._reconcile_experiment_author_output_policy(by_id)
+            if author_policy_reconciled:
+                self._checkpoint("resume:experiment_author_output_policy", force=True)
             stale_forward_handoffs = self._reconcile_stale_forward_handoffs(by_id)
             if stale_forward_handoffs:
                 self._checkpoint("resume:reconcile_stale_forward_handoffs", force=True)
@@ -16919,6 +22792,31 @@ class ComposerRunner:
                     return self._finish()
                 migration_reopened = True
                 self._checkpoint("resume:argument_review_routed_to_experiment", force=True)
+            # A persisted failed topic refinement with an intact admitted
+            # frontier is a recovery case, not a fresh hold to re-admit. Restore
+            # its source-grounded survey and scientific work orders before the
+            # generic hold handler can reopen the stale pivot request.
+            retained_survey_frontier_restored = (
+                self._restore_retained_survey_frontier_after_failed_topic_pivot(
+                    completed, by_id)
+            )
+            if retained_survey_frontier_restored:
+                if not self._begin_continuation(completed, by_id):
+                    self.status = "paused"
+                    self.blockers.append({
+                        "stage_id": next((stage["id"] for stage in self.workflow["stages"]
+                                          if stage.get("kind") == "survey"), "survey"),
+                        "reason": (
+                            "the retained topic/evidence frontier was restored, but its scoped "
+                            "repair work orders could not be admitted"
+                        ),
+                        "stop_reason": "recovery_admission_blocked",
+                        "model_calls_dispatched": 0,
+                    })
+                    self._checkpoint("paused:retained_survey_recovery_unavailable", force=True)
+                    return self._finish()
+                migration_reopened = True
+                self._checkpoint("resume:retained_survey_frontier_admitted", force=True)
             # A checkpoint may predate the immediate-hold admission rule.  On
             # resume, repair/review holds are reconciled before the scheduler
             # can admit any downstream consumer; this also prevents an
@@ -16935,27 +22833,6 @@ class ComposerRunner:
                 self.status = hold_status
                 self._checkpoint(f"resume:{hold_status}", force=True)
                 return self._finish()
-            retained_survey_frontier_restored = (
-                self._restore_retained_survey_frontier_after_failed_topic_pivot(
-                    completed, by_id)
-            )
-            if retained_survey_frontier_restored:
-                if not self._begin_continuation(completed, by_id):
-                    self.status = "paused"
-                    self.blockers.append({
-                        "stage_id": next((stage["id"] for stage in self.workflow["stages"]
-                                          if stage.get("kind") == "survey"), "survey"),
-                        "reason": (
-                            "the retained accepted survey was restored, but no continuation "
-                            "lease was available for its pending gap assessment"
-                        ),
-                        "stop_reason": "recovery_admission_blocked",
-                        "model_calls_dispatched": 0,
-                    })
-                    self._checkpoint("paused:retained_survey_recovery_unavailable", force=True)
-                    return self._finish()
-                migration_reopened = True
-                self._checkpoint("resume:retained_survey_frontier_admitted", force=True)
             # A supervisor may restart after the previous process wrote a
             # terminal-looking blocker. Reopen recoverable scientific stages
             # before dependency scheduling so a restart is a continuation, not
@@ -16980,6 +22857,13 @@ class ComposerRunner:
             if self._resume_exhausted_pre_execution_experiment(completed, by_id):
                 self._checkpoint("resume:experiment_repair_admitted", force=True)
             while True:
+                if self._restore_completed_survey_after_quota_recovery(completed, by_id):
+                    # Stage outcomes can become durable after startup during a
+                    # continuation. Reconcile them before quota admission so
+                    # a successful survey is neither charged as a fresh pass
+                    # nor converted into a topic pivot.
+                    self._checkpoint("survey:reuse_completed_result_before_quota_admission",
+                                     force=True)
                 paper_gate_changed = self._refresh_paper_release_gate(
                     completed, by_id, release_blocked_stage_ids)
                 if paper_gate_changed:
@@ -17388,7 +23272,7 @@ class ComposerRunner:
                                     # a bounded failure envelope) before the
                                     # outer recovery path records the dossier.
                                     reviewable_failure = self._should_run_failure_specialist_review(
-                                        producer_error)
+                                        producer_error, attempt_stage)
                                     if reviewable_failure:
                                         specialist_bundle, specialist_verifier, context = (
                                             self._run_failure_specialist_review(
@@ -17675,9 +23559,21 @@ class ComposerRunner:
                                     retry_after_seconds=(exc.retry_after_seconds if retry_after_known
                                         else DEFAULT_MODEL_RATE_LIMIT_COOLDOWN_SECONDS),
                                     rate_limit={"provider": "model", "status_code": 429,
-                                                "retry_after_known": retry_after_known})
+                                                "retry_after_known": retry_after_known,
+                                                "provider_error_kind": exc.provider_error_kind})
                                 exc.usage = original_usage
                             self._normalize_topic_intake_failure(exc, stage)
+                            if classify_failure(
+                                    stage.get("kind"), exc,
+                                    getattr(exc, "stage_result", None)) == "harness_bug":
+                                try:
+                                    exc.runtime_frames = [
+                                        {"file": frame.filename, "line": frame.lineno,
+                                         "function": frame.name}
+                                        for frame in traceback.extract_tb(exc.__traceback__)[-12:]
+                                    ]
+                                except (AttributeError, TypeError):
+                                    exc.runtime_frames = []
                             last_error = exc
                             failure_usage = (deepcopy(context.get("usage", {})) if usage_recorded
                                              else self._record_failed_stage_usage(exc))
@@ -17698,6 +23594,13 @@ class ComposerRunner:
                                     failure_usage[key] = failure_usage.get(key, 0) + amount
                             provider_paused = isinstance(exc, ProviderCooldownError)
                             provider_configuration = isinstance(exc, ProviderConfigurationError)
+                            rate_limit = getattr(exc, "rate_limit", None)
+                            model_rate_limited = (
+                                provider_paused
+                                and isinstance(rate_limit, dict)
+                                and rate_limit.get("provider") == "model"
+                                and rate_limit.get("status_code") == 429
+                            )
                             provider_fallback_admitted = (
                                 provider_paused
                                 and stage["kind"] == "survey"
@@ -17708,6 +23611,9 @@ class ComposerRunner:
                             stage_contract_failure = (
                                 isinstance(exc, (ValidationError, ModelWorkBlocked))
                                 or isinstance(getattr(exc, "stage_result", None), dict)
+                                or classify_failure(
+                                    stage.get("kind"), exc,
+                                    getattr(exc, "stage_result", None)) == "harness_bug"
                             )
                             resource_or_control_failure = (
                                 provider_paused or provider_configuration
@@ -17794,7 +23700,7 @@ class ComposerRunner:
                                         rejection_type = trace.get("rejection_type")
                                         if rejection_type not in {
                                                 "novelty", "source_challenge", "maturity",
-                                                "feasibility"}:
+                                                "refinement"}:
                                             continue
                                         selected = (
                                             trace.get("selected_topic")
@@ -17944,6 +23850,7 @@ class ComposerRunner:
                             retry_open = (
                                 not provider_configuration
                                 and not quota_exhausted
+                                and not model_rate_limited
                                 # Topic intake already has an explicit
                                 # candidate/contract repair loop. Re-entering
                                 # that loop here creates a second, deadline-
@@ -18005,6 +23912,7 @@ class ComposerRunner:
                                     exc, getattr(exc, "cooldown_retry_index", attempt_number))
                                 cooldown_blocker = {
                                     "stage_id": stage_id,
+                                    "attempt_number": attempt_number,
                                     "reason": "provider_cooldown",
                                     "provider_error": str(exc),
                                     "retry_after_seconds": retry_after,
@@ -18202,6 +24110,7 @@ class ComposerRunner:
                             "acceptance_checks": deepcopy(failure_dossier.get("acceptance_checks", [])),
                         })
                     blocker = {"stage_id": stage_id, "reason": str(error),
+                               "attempt_number": len(attempt_history),
                                "attempts": len(attempt_history)}
                     if isinstance(failure_dossier, dict):
                         blocker.update({
@@ -18424,6 +24333,8 @@ class ComposerRunner:
             "reopened_stage_ids": sorted(self.reopened_stage_ids),
             "continuation_pending_stage_ids": sorted(self.continuation_pending_stage_ids),
             "active_research_requests": deepcopy(self.active_research_requests),
+            "attempted_request_signatures": sorted(self._attempted_request_signatures),
+            "format_recovery_ledger": deepcopy(self.format_recovery_ledger),
             "department_activity": deepcopy(self.department_activity),
             "deadline_decisions": deepcopy(self.deadline_decisions),
             "deadline_extensions": deepcopy(self.deadline_extensions),
@@ -18452,7 +24363,7 @@ class ComposerRunner:
             self._publish("command/composer/run", "report", result, "command.composer")
             output = self.root / "output"
             output.mkdir(parents=True, exist_ok=True)
-            (output / "run.json").write_bytes(canonical_bytes(result))
+            _atomic_write_bytes(output / "run.json", canonical_bytes(result))
             self.on_progress({"phase": self.status, "elapsed_seconds": round(elapsed, 2),
                               "stages": deepcopy(self.stage_records),
                               "blockers": deepcopy(result["active_blockers"]),

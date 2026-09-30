@@ -3,7 +3,7 @@
 The writer is not the place where a research question, a contribution, and a
 mechanism are first invented.  This module makes that reasoning an explicit,
 versioned artifact.  It binds observed patterns to evidence, keeps competing
-hypotheses predictive and provisional, and reserves a job for every planned
+hypotheses predictive and evidence-calibrated, and reserves a job for every planned
 figure or table.  The public language in the artifact is intentionally
 reader-facing; control-plane state stays in the surrounding run records.
 """
@@ -31,6 +31,9 @@ HYPOTHESIS_STATUSES = {"candidate", "supported", "disfavored", "unresolved"}
 FIGURE_KINDS = {"figure", "table"}
 REVIEW_DECISIONS = {"accept", "revise", "insufficient_evidence"}
 REVIEW_OUTCOMES = {"passed", "failed", "insufficient_evidence"}
+ARGUMENT_OUTPUT_TOKEN_BUDGET = 6144
+ARGUMENT_REPAIR_OUTPUT_TOKEN_BUDGET = 6144
+ARGUMENT_REVIEW_REPAIR_OUTPUT_TOKEN_BUDGET = 4096
 
 
 def _text(value, name, *, public=True):
@@ -74,8 +77,9 @@ def validate_research_argument(value, *, evidence_ids=None, asset_ids=None, min_
     ``evidence_ids`` is optional for standalone planning, but the paper
     pipeline supplies it.  Once supplied, every asserted observation and
     every claimed mechanism is forced to point to an existing result or source
-    record.  Candidate explanations may have no supporting evidence yet, but
-    they must carry a prediction and a discriminating test.
+    record. A supported explanation needs linked supporting evidence; a
+    disfavored explanation needs linked counterevidence. Candidate explanations
+    may lack decisive evidence, but still carry predictions and a test.
     """
     fields = {"schema_version", "research_question", "observed_patterns", "hypotheses",
               "primary_argument", "discriminating_experiments", "figure_plan", "limitations"}
@@ -114,7 +118,6 @@ def validate_research_argument(value, *, evidence_ids=None, asset_ids=None, min_
         raise ValidationError("research argument requires at least two competing hypotheses")
     hypothesis_ids = set()
     mechanisms = set()
-    provisional = False
     for hypothesis in hypotheses:
         expected = {"id", "statement", "mechanism", "status", "predictions",
                     "counterevidence", "discriminating_test", "evidence_ids",
@@ -129,26 +132,27 @@ def validate_research_argument(value, *, evidence_ids=None, asset_ids=None, min_
         status = hypothesis["status"]
         if status not in HYPOTHESIS_STATUSES:
             raise ValidationError("hypothesis status is unsupported")
-        provisional = provisional or status in {"candidate", "unresolved"}
         mechanisms.add(re.sub(r"\W+", " ", hypothesis["mechanism"].casefold()).strip())
         _strings(hypothesis["predictions"], "hypothesis predictions", nonempty=True)
-        _strings(hypothesis["counterevidence"], "hypothesis counterevidence")
+        counterevidence = _strings(hypothesis["counterevidence"], "hypothesis counterevidence")
+        if evidence_ids is not None and set(counterevidence) - evidence_ids:
+            raise ValidationError("hypothesis counterevidence references unknown evidence")
         _text(hypothesis["discriminating_test"], "hypothesis discriminating_test")
         _strings(hypothesis["explains_pattern_ids"], "hypothesis explains_pattern_ids", nonempty=True)
         if set(hypothesis["explains_pattern_ids"]) - pattern_ids:
             raise ValidationError("hypothesis explains an unknown observed pattern")
         refs = hypothesis["evidence_ids"]
-        if status in {"supported", "disfavored"}:
+        if status == "supported":
             _evidence_refs(refs, "hypothesis evidence_ids", evidence_ids)
         else:
             _strings(refs, "hypothesis evidence_ids")
             if evidence_ids is not None and set(refs) - evidence_ids:
                 raise ValidationError("hypothesis evidence_ids reference unknown evidence")
+        if status == "disfavored" and not counterevidence:
+            raise ValidationError("disfavored hypothesis requires counterevidence")
         hypothesis_ids.add(hypothesis["id"])
     if len(mechanisms) < 2:
         raise ValidationError("hypotheses must describe distinct mechanisms")
-    if not provisional:
-        raise ValidationError("at least one competing hypothesis must remain candidate or unresolved")
     if set().union(*(set(item["explains_pattern_ids"]) for item in hypotheses)) != pattern_ids:
         raise ValidationError("every observed pattern must be explained by at least one hypothesis")
 
@@ -294,8 +298,8 @@ def evidence_ids_from_packet(packet):
                     ids.add(item["id"])
         for index, _ in enumerate(results.get("limitations", [])):
             ids.add(f"limitation-{index}")
-    interpretation = packet.get("scientific_interpretation")
-    if isinstance(interpretation, dict):
+    interpretation = _interpretation_record(packet.get("scientific_interpretation"))
+    if interpretation:
         for pattern in interpretation.get("result_patterns", []):
             for key in ("supporting_evidence", "contradicting_evidence"):
                 ids.update(item for item in pattern.get(key, []) if isinstance(item, str))
@@ -314,6 +318,14 @@ def evidence_ids_from_packet(packet):
     return sorted(ids)
 
 
+def _interpretation_record(value):
+    """Unwrap the stage-output envelope used by persisted interpretation artifacts."""
+    if not isinstance(value, dict):
+        return {}
+    nested = value.get("interpretation")
+    return nested if isinstance(nested, dict) else value
+
+
 def argument_evidence_packet(packet):
     """Project a writer packet into bounded evidence and result context."""
     if not isinstance(packet, dict):
@@ -323,7 +335,8 @@ def argument_evidence_packet(packet):
         "research_question": packet.get("study_question") or packet.get("question") or packet.get("research_question"),
         "scope_statement": packet.get("scope_statement"),
         "results_package": result,
-        "scientific_interpretation": packet.get("scientific_interpretation"),
+        "scientific_interpretation": _interpretation_record(
+            packet.get("scientific_interpretation")),
         "literature_evidence": packet.get("literature_evidence", []),
         "reference_cards": packet.get("reference_cards", []),
         "evidence_ids": evidence_ids_from_packet(packet),
@@ -358,31 +371,120 @@ SYSTEM = (
     "the result patterns that matter, formulate at least two competing mechanisms with distinct predictions, "
     "and specify experiments that could distinguish them. Select a bounded primary argument only after showing "
     "why it is the most defensible interpretation. Every major pattern needs a figure or table with a concrete "
-    "reader-facing job. Keep possible mechanisms explicitly provisional and never invent measurements, sources, "
+    "reader-facing job. Classify mechanisms according to the supplied evidence: evidence_ids are evidence that "
+    "supports a mechanism and counterevidence is evidence that contradicts it. A supported mechanism needs at "
+    "least one supporting evidence ID; a disfavored mechanism needs at least one counterevidence ID. Use candidate "
+    "or unresolved when the evidence does not discriminate, and supported or disfavored only when observations "
+    "warrant that judgment. "
+    "Do not force an unresolved alternative merely to preserve uncertainty. Never invent measurements, sources, "
     "or citations. Use public scientific language; do not expose hashes, artifact IDs, acceptance states, "
     "validator vocabulary, or internal enums. A weak point may be handled only by a clearly labelled scope boundary, "
     "alternative explanation, mechanistic interpretation, or future test; rhetoric must never substitute for missing "
-    "evidence. Return exactly the requested JSON object and no markdown."
+    "evidence. Do not include analysis or commentary in the response. Return exactly the requested "
+    "JSON object and no markdown."
 )
 
 
 def _argument_output_contract(*, min_figures, min_tables, min_experiments):
     return {
         "schema_version": SCHEMA_VERSION,
-        "observed_patterns": "list of {id,observation,implication,evidence_ids}; at least two",
-        "hypotheses": "list of {id,statement,mechanism,status,predictions,counterevidence,discriminating_test,evidence_ids,explains_pattern_ids}; at least two; status must be exactly candidate, supported, disfavored, or unresolved",
-        "primary_argument": "{thesis,primary_hypothesis_id,rationale,scope_boundary}",
-        "discriminating_experiments": "list of {id,question,design,controls,predictions,measurements,tests_hypothesis_ids}",
-        "figure_plan": "list of {id,kind,asset_id,purpose,supports,source_refs,readout,placement}; every observed pattern covered; every figure asset_id must be copied from evidence_packet.asset_ids and table asset_id may be null",
-        "limitations": "nonempty list of limitations that materially affect interpretation",
+        "observed_patterns": (
+            "2-8 materially distinct grouped findings as {id,observation,implication,evidence_ids}; "
+            "use concise complete prose; group compatible measurements without dropping a distinct "
+            "null or positive result"
+        ),
+        "hypotheses": (
+            "exactly 2 competing mechanisms as {id,statement,mechanism,status,predictions,"
+            "counterevidence,discriminating_test,evidence_ids,explains_pattern_ids}; evidence_ids are the "
+            "supporting evidence for the mechanism (required when status=supported); counterevidence lists "
+            "evidence against it (required when status=disfavored); statement, mechanism, "
+            "and discriminating_test should be concise and complete; at most 2 predictions; "
+            "counterevidence is a unique list of exact IDs from evidence_packet.evidence_ids containing all decisive "
+            "counterevidence; status exactly candidate, supported, disfavored, or unresolved"
+        ),
+        "primary_argument": (
+            "{thesis,primary_hypothesis_id,rationale,scope_boundary}; use concise, complete prose"
+        ),
+        "discriminating_experiments": (
+            f"exactly {min_experiments} focused tests as {{id,question,design,controls,predictions,"
+            "measurements,tests_hypothesis_ids}}; at most 2 controls, predictions, and measurements per test; "
+            "collectively test both hypotheses and state enough detail for reproducibility"
+        ),
+        "figure_plan": (
+            f"exactly {min_figures} figures and {min_tables} tables, each as "
+            "{id,kind,asset_id,purpose,supports,source_refs,readout,placement}; cover every pattern, "
+            "combine related readouts; keep descriptions concise and informative; every figure "
+            "asset_id must be copied from evidence_packet.asset_ids and table asset_id may be null"
+        ),
+        "limitations": "1-8 concise limitations that materially affect interpretation",
         "response_size": (
-            "Keep prose fields to one or two concise sentences. Include only the result patterns, "
-            "competing explanations, tests, and visuals needed to make the argument auditable; "
-            "do not repeat the full evidence packet."
+            "Target <=3600 output tokens. Return minified JSON, no markdown or commentary. Do not add "
+            "extra hypotheses, experiments, figures, or tables. Prefer compact but complete scientific prose, "
+            "cite exact IDs, and retain every material finding by grouping related evidence."
         ),
         "minimums": {"figures": min_figures, "tables": min_tables,
                      "experiments": min_experiments},
     }
+
+
+def _validate_argument_generation_budget(value, *, min_figures, min_tables,
+                                         min_experiments):
+    """Enforce structural response limits without rejecting scientific prose length."""
+    def prose(text, name):
+        if not isinstance(text, str) or not text.strip():
+            raise ValidationError(f"{name} must be nonempty text")
+
+    patterns = value["observed_patterns"]
+    if len(patterns) > 8:
+        raise ValidationError("research argument permits at most eight grouped observations")
+    for item in patterns:
+        prose(item["observation"], "observed pattern observation")
+        prose(item["implication"], "observed pattern implication")
+
+    hypotheses = value["hypotheses"]
+    if len(hypotheses) != 2:
+        raise ValidationError("research argument requires exactly two competing hypotheses")
+    for item in hypotheses:
+        for field in ("statement", "mechanism", "discriminating_test"):
+            prose(item[field], f"hypothesis {field}")
+        if len(item["predictions"]) > 2:
+            raise ValidationError("hypothesis predictions permit at most two items")
+        for text in item["predictions"]:
+            prose(text, "hypothesis prediction")
+
+    primary = value["primary_argument"]
+    for field in ("thesis", "rationale", "scope_boundary"):
+        prose(primary[field], f"primary argument {field}")
+
+    experiments = value["discriminating_experiments"]
+    if len(experiments) != min_experiments:
+        raise ValidationError(
+            f"research argument requires exactly {min_experiments} focused experiments")
+    for item in experiments:
+        for field in ("question", "design"):
+            prose(item[field], f"discriminating experiment {field}")
+        for field in ("controls", "predictions", "measurements"):
+            if len(item[field]) > 2:
+                raise ValidationError(
+                    f"discriminating experiment {field} permits at most two items")
+            for text in item[field]:
+                prose(text, f"discriminating experiment {field}")
+
+    figures = [item for item in value["figure_plan"] if item["kind"] == "figure"]
+    tables = [item for item in value["figure_plan"] if item["kind"] == "table"]
+    if len(figures) != min_figures or len(tables) != min_tables:
+        raise ValidationError(
+            f"research argument requires exactly {min_figures} figures and {min_tables} tables")
+    for item in value["figure_plan"]:
+        prose(item["purpose"], "figure purpose")
+        prose(item["readout"], "figure readout")
+        prose(item["placement"], "figure placement")
+
+    limitations = value["limitations"]
+    if len(limitations) > 8:
+        raise ValidationError("research argument permits at most eight limitations")
+    for limitation in limitations:
+        prose(limitation, "research argument limitation")
 
 
 def _argument_repair_summary(evidence_packet):
@@ -402,8 +504,7 @@ def _argument_repair_summary(evidence_packet):
 
     results = evidence_packet.get("results_package")
     results = results if isinstance(results, dict) else {}
-    interpretation = evidence_packet.get("scientific_interpretation")
-    interpretation = interpretation if isinstance(interpretation, dict) else {}
+    interpretation = _interpretation_record(evidence_packet.get("scientific_interpretation"))
     return {
         "research_question": evidence_packet.get("research_question"),
         "results": {
@@ -433,25 +534,34 @@ def argument_response_repair_prompt(evidence_packet, *, previous_response,
                                     min_tables=1, min_experiments=2,
                                     validation_feedback=None):
     """Repair one bounded response using the partial work and exact ID domain."""
-    previous = (previous_response if isinstance(previous_response, (dict, list))
-                else str(previous_response or "")[:30000])
     payload = {
         "assignment": "Complete the interrupted research-argument JSON response.",
         "instruction": (
-            "Return one complete object matching output_contract. Preserve supported content and exact IDs; "
-            "repair the reported defect, keep prose concise, and do not infer absent measurements."
+            "Return one complete minified JSON object matching the required structure and item counts in "
+            "output_contract. Preserve supported content and exact IDs; repair the reported defect, "
+            "and do not infer absent measurements. Keep prose concise but scientifically complete. Do not "
+            "explain the repair or add a preamble; return the JSON object directly."
         ),
         "validation_error": str(validation_error)[:1600],
-        "partial_response": previous,
         "grounding_summary": _argument_repair_summary(evidence_packet),
         "output_contract": _argument_output_contract(
             min_figures=min_figures, min_tables=min_tables,
             min_experiments=min_experiments),
         "evidence_id_policy": (
-            "Copy evidence_ids and source_refs only from allowed_evidence_ids. A figure asset_id must be "
+            "Copy evidence_ids and source_refs only from allowed_evidence_ids. Keep supporting evidence_ids "
+            "separate from counterevidence; do not copy a contrary ID into the supporting list. A figure asset_id must be "
             "copied exactly from available_asset_ids; never invent an ID or filename."
         ),
     }
+    if isinstance(previous_response, (dict, list)):
+        payload["partial_response"] = deepcopy(previous_response)
+    elif isinstance(previous_response, str) and previous_response.strip():
+        payload["truncated_response"] = previous_response[:24000]
+        payload["truncated_response_was_trimmed"] = len(previous_response) > 24000
+        payload["truncated_response_instructions"] = (
+            "Treat this as an incomplete draft, not evidence. Preserve only complete, supported content; "
+            "condense it to the output contract, remove redundant prose, and verify every evidence ID."
+        )
     if isinstance(validation_feedback, dict):
         adjudication = validation_feedback.get("adjudication")
         if isinstance(adjudication, dict):
@@ -471,12 +581,36 @@ def argument_prompt(evidence_packet, *, min_figures=2, min_tables=1, min_experim
                     validation_feedback=None):
     payload = {
         "assignment": "Build a versioned scientific argument before any manuscript prose is written.",
+        "generation_limits": {
+            "observed_patterns": (
+                "Group into 2-8 materially distinct patterns; preserve every distinct null or positive finding, "
+                "combine related measurements where their evidence supports grouping, and cite exact IDs."
+            ),
+            "hypotheses": (
+                "Return exactly two: the best-supported mechanism and the strongest live alternative. "
+                "Do not add a third; use concise complete prose and at most two predictions per hypothesis. "
+                "Assign each status from the evidence; all hypotheses may be supported or "
+                "disfavored when warranted. Include every decisive counterevidence ID available in the packet."
+            ),
+            "discriminating_experiments": (
+                f"Return exactly {min_experiments} tests with concise, reproducible designs; each "
+                "controls/predictions/measurements list has at most two items and collectively covers both hypotheses."
+            ),
+            "figure_plan": (
+                f"Return exactly {min_figures} figures and {min_tables} tables. Combine related readouts so "
+                "the minimum displays cover every pattern; keep descriptions concise and informative."
+            ),
+            "prose": (
+                "Use concise, complete prose. Use no extra rows or fields, do not repeat the evidence packet, "
+                "and omit hidden scratchwork."
+            ),
+        },
         "evidence_packet": evidence_packet,
         "required_reasoning": [
             "Separate observations from explanations and identify the most decision-relevant result pattern.",
             "Keep at least two competing hypotheses with different mechanisms and falsifiable predictions.",
             "For each hypothesis, name the observed patterns it explains; for each experiment, name the hypotheses it tests.",
-            "For each hypothesis, state what supplied evidence supports or contradicts it and what remains unknown.",
+            "For each hypothesis, distinguish supporting evidence_ids from counterevidence, judge whether the status follows from those directions, and state what remains unknown.",
             "Design at least the requested number of controlled, discriminating experiments.",
             "Plan figures and tables as parts of the argument: each must answer a reader question and cover every observed pattern.",
             "State a primary bounded thesis and the scope boundary that prevents overclaiming.",
@@ -494,7 +628,8 @@ def argument_prompt(evidence_packet, *, min_figures=2, min_tables=1, min_experim
             min_experiments=min_experiments),
         "evidence_id_policy": (
             "evidence_ids and source_refs are arrays of exact IDs copied from evidence_packet.evidence_ids. "
-            "Use [] only for an unresolved candidate hypothesis with no supplied support; observed patterns and "
+            "Keep supporting evidence_ids distinct from counterevidence; never copy contrary evidence into the "
+            "supporting list. Use [] only when a hypothesis has no supplied supporting evidence; observed patterns and "
             "figure source_refs must be nonempty."
         ),
         "asset_binding_policy": {
@@ -534,21 +669,21 @@ def argument_prompt(evidence_packet, *, min_figures=2, min_tables=1, min_experim
 
 
 def _normalise_argument_candidate(value, *, available_asset_ids=None, available_assets=None,
-                                   available_evidence_ids=None):
+                                   available_evidence_ids=None,
+                                   expected_research_question=None,
+                                   authoritative_result_patterns=None):
     """Repair unambiguous provider formatting without changing scientific content.
 
-    A provider can state the evidence against a supported or disfavored
-    hypothesis in ``counterevidence`` while omitting the parallel
-    ``evidence_ids`` links.  That is a contract omission, not a missing
-    experiment, when the same strings already occur in the observed-pattern
-    evidence.  Restore only exact, already-known IDs and leave genuinely
-    unsupported hypotheses for the scientific validator to reject.
+    A supported hypothesis can omit its supporting ``evidence_ids`` while
+    naming observed patterns that already cite the relevant results. Restore
+    only those exact, already-known pattern links. Counterevidence is a
+    separate direction and is never promoted to supporting evidence.
     """
     if not isinstance(value, dict):
         return value, []
     candidate = deepcopy(value)
     changes = []
-    required = {"schema_version", "research_question", "observed_patterns", "hypotheses",
+    required = {"schema_version", "observed_patterns", "hypotheses",
                 "primary_argument", "discriminating_experiments", "figure_plan", "limitations"}
     if not required.issubset(candidate):
         for wrapper in ("argument", "research_argument", "research_argument_map", "proposal"):
@@ -557,6 +692,19 @@ def _normalise_argument_candidate(value, *, available_asset_ids=None, available_
                 candidate = deepcopy(nested)
                 changes.append({"field": wrapper, "action": "unwrap_provider_envelope"})
                 break
+    if isinstance(expected_research_question, str) and expected_research_question.strip():
+        supplied_question = candidate.get("research_question")
+        if not isinstance(supplied_question, str) or not supplied_question.strip():
+            candidate["research_question"] = expected_research_question
+            changes.append({
+                "field": "research_question",
+                "action": "restore_from_authoritative_evidence_packet",
+            })
+        elif supplied_question.strip() != expected_research_question.strip():
+            raise ValidationError(
+                "research argument question conflicts with the authoritative evidence packet")
+
+    identifier_maps = _normalise_argument_node_ids(candidate, changes)
     asset_ids = set(item for item in (available_asset_ids or []) if isinstance(item, str))
     path_to_id = {}
     for asset in available_assets or []:
@@ -601,13 +749,65 @@ def _normalise_argument_candidate(value, *, available_asset_ids=None, available_
     # counterevidence IDs, then fall back to evidence attached to the named
     # observed patterns.  Both routes are restricted to the packet's known
     # evidence set when one was supplied; no identifier is invented here.
-    patterns_by_id = {
-        item.get("id"): item for item in candidate.get("observed_patterns", [])
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    }
     known_evidence = (set(item for item in (available_evidence_ids or [])
                           if isinstance(item, str))
                       if available_evidence_ids is not None else None)
+    observed_patterns = candidate.get("observed_patterns")
+    observed_patterns = observed_patterns if isinstance(observed_patterns, list) else []
+    pattern_ids = {item.get("id") for item in observed_patterns
+                   if isinstance(item, dict) and isinstance(item.get("id"), str)}
+    authoritative_by_id = {
+        item.get("id"): item for item in (authoritative_result_patterns or [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    referenced_pattern_ids = set()
+    for hypothesis in candidate.get("hypotheses", []):
+        if isinstance(hypothesis, dict):
+            refs = hypothesis.get("explains_pattern_ids")
+            if isinstance(refs, list):
+                referenced_pattern_ids.update(item for item in refs if isinstance(item, str))
+    for display in candidate.get("figure_plan", []):
+        if isinstance(display, dict):
+            refs = display.get("supports")
+            if isinstance(refs, list):
+                referenced_pattern_ids.update(item for item in refs if isinstance(item, str))
+    for pattern_id in sorted(referenced_pattern_ids - pattern_ids):
+        source = authoritative_by_id.get(pattern_id)
+        if not isinstance(source, dict):
+            continue
+        observation = source.get("pattern") or source.get("observation")
+        implication = source.get("so_what") or source.get("implication")
+        refs = []
+        for field in ("supporting_evidence", "contradicting_evidence"):
+            items = source.get(field)
+            if isinstance(items, list):
+                refs.extend(item for item in items if isinstance(item, str))
+        result_ref = source.get("result_ref")
+        if isinstance(result_ref, str):
+            refs.append(result_ref)
+        refs = list(dict.fromkeys(refs))
+        if (not isinstance(observation, str) or not observation.strip()
+                or not isinstance(implication, str) or not implication.strip()
+                or not refs
+                or (known_evidence is not None and not set(refs).issubset(known_evidence))):
+            continue
+        observed_patterns.append({
+            "id": pattern_id,
+            "observation": observation,
+            "implication": implication,
+            "evidence_ids": refs,
+        })
+        candidate["observed_patterns"] = observed_patterns
+        pattern_ids.add(pattern_id)
+        changes.append({
+            "field": f"observed_patterns.{pattern_id}",
+            "action": "restore_from_authoritative_interpretation",
+            "evidence_ids": refs,
+        })
+    patterns_by_id = {
+        item.get("id"): item for item in observed_patterns
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
     for index, hypothesis in enumerate(candidate.get("hypotheses", [])):
         if not isinstance(hypothesis, dict):
             continue
@@ -639,34 +839,25 @@ def _normalise_argument_candidate(value, *, available_asset_ids=None, available_
                     "from": status,
                     "to": normalized_status,
                 })
-        if hypothesis.get("status") not in {"supported", "disfavored"}:
+        if hypothesis.get("status") != "supported":
             continue
         refs = hypothesis.get("evidence_ids")
         if not isinstance(refs, list) or refs:
             continue
         derived = []
         source = None
-        for evidence_id in hypothesis.get("counterevidence", []):
-            if not isinstance(evidence_id, str):
+        for pattern_id in hypothesis.get("explains_pattern_ids", []):
+            pattern = patterns_by_id.get(pattern_id)
+            if not isinstance(pattern, dict):
                 continue
-            if known_evidence is None or evidence_id in known_evidence:
-                if evidence_id not in derived:
-                    derived.append(evidence_id)
-        if derived:
-            source = "counterevidence"
-        else:
-            for pattern_id in hypothesis.get("explains_pattern_ids", []):
-                pattern = patterns_by_id.get(pattern_id)
-                if not isinstance(pattern, dict):
+            for evidence_id in pattern.get("evidence_ids", []):
+                if not isinstance(evidence_id, str):
                     continue
-                for evidence_id in pattern.get("evidence_ids", []):
-                    if not isinstance(evidence_id, str):
-                        continue
-                    if known_evidence is None or evidence_id in known_evidence:
-                        if evidence_id not in derived:
-                            derived.append(evidence_id)
-            if derived:
-                source = "observed_pattern"
+                if known_evidence is None or evidence_id in known_evidence:
+                    if evidence_id not in derived:
+                        derived.append(evidence_id)
+        if derived:
+            source = "observed_pattern"
         if derived:
             hypothesis["evidence_ids"] = derived
             changes.append({
@@ -732,6 +923,83 @@ def _normalise_argument_candidate(value, *, available_asset_ids=None, available_
     return candidate, changes
 
 
+def _normalise_argument_node_ids(candidate, changes):
+    """Canonicalize model-generated node IDs and keep their local references aligned."""
+    identifier_maps = {"hypotheses": {}, "discriminating_experiments": {}, "figure_plan": {}}
+    used_by_field = {field: set() for field in identifier_maps}
+    valid_identifier = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
+
+    def canonical_id(value, used):
+        if not isinstance(value, str) or valid_identifier.fullmatch(value):
+            return value
+        slug = re.sub(r"[^a-z0-9_-]+", "_", value.casefold()).strip("_-")
+        if not slug or not "a" <= slug[0] <= "z":
+            slug = f"node_{slug}" if slug else "node"
+        if len(slug) > 64:
+            suffix = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:8]
+            slug = f"{slug[:55].rstrip('_-')}_{suffix}"
+        base = slug
+        suffix_number = 2
+        while slug in used:
+            suffix = f"_{suffix_number}"
+            slug = f"{base[:64 - len(suffix)].rstrip('_-')}{suffix}"
+            suffix_number += 1
+        return slug
+
+    for field, mapping in identifier_maps.items():
+        rows = candidate.get(field)
+        if not isinstance(rows, list):
+            continue
+        used = used_by_field[field]
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+                continue
+            original = row["id"]
+            # Duplicate source IDs are semantic ambiguity, not a formatting issue.
+            if original in mapping:
+                continue
+            normalized = canonical_id(original, used)
+            if isinstance(normalized, str):
+                used.add(normalized)
+                mapping[original] = normalized
+                if normalized != original:
+                    row["id"] = normalized
+                    changes.append({
+                        "field": f"{field}.{original}",
+                        "action": "normalize_generated_identifier",
+                        "to": normalized,
+                    })
+
+    hypothesis_ids = identifier_maps["hypotheses"]
+    experiment_ids = identifier_maps["discriminating_experiments"]
+    primary = candidate.get("primary_argument")
+    if isinstance(primary, dict):
+        original = primary.get("primary_hypothesis_id")
+        if isinstance(original, str) and original in hypothesis_ids:
+            primary["primary_hypothesis_id"] = hypothesis_ids[original]
+    for experiment in candidate.get("discriminating_experiments", []):
+        if not isinstance(experiment, dict):
+            continue
+        refs = experiment.get("tests_hypothesis_ids")
+        if isinstance(refs, list):
+            experiment["tests_hypothesis_ids"] = list(dict.fromkeys(
+                hypothesis_ids.get(ref, ref) if isinstance(ref, str) else ref for ref in refs
+            ))
+    pattern_ids = {item.get("id") for item in candidate.get("observed_patterns", [])
+                   if isinstance(item, dict) and isinstance(item.get("id"), str)}
+    for display in candidate.get("figure_plan", []):
+        if not isinstance(display, dict):
+            continue
+        refs = display.get("supports")
+        if isinstance(refs, list):
+            display["supports"] = list(dict.fromkeys(
+                ref if ref in pattern_ids else
+                hypothesis_ids.get(ref, experiment_ids.get(ref, ref))
+                for ref in refs
+            ))
+    return identifier_maps
+
+
 def review_prompt(argument, evidence_packet, argument_defense=None):
     return json.dumps({
         "assignment": "Independently challenge the proposed research argument before manuscript composition.",
@@ -740,7 +1008,7 @@ def review_prompt(argument, evidence_packet, argument_defense=None):
         "evidence_packet": evidence_packet,
         "questions": [
             "Is the research question genuinely unresolved and narrower than the supplied procedure?",
-            "Are the observed patterns traceable to supplied evidence, and is the primary thesis bounded by them?",
+            "Are the observed patterns traceable to supplied evidence, is the thesis bounded by them, and does each supported/disfavored hypothesis use evidence_ids and counterevidence in the correct direction? Cite each hypothesis and evidence ID, and explain whether its status is warranted.",
             "Do competing hypotheses differ in mechanism and make distinguishable predictions?",
             "Does each hypothesis explain a named pattern, and does each experiment test named hypotheses with meaningful controls?",
             "Does every observed pattern have a figure or table whose purpose and readout advance the argument?",
@@ -803,7 +1071,8 @@ class ArgumentAdjudicator:
                 self.model_config, role="strategy.argument-reviewer",
                 system=SYSTEM, prompt=prompt, deadline=deadline,
                 prefer_fallback=repairing_response,
-                output_token_cap=4096 if repairing_response else None,
+                output_token_cap=ARGUMENT_REVIEW_REPAIR_OUTPUT_TOKEN_BUDGET,
+                output_format="json_object",
                 client_factory=ModelClient,
             )
             self.provider_route_history.extend(routes)
@@ -813,6 +1082,18 @@ class ArgumentAdjudicator:
                 last_error = ValidationError(
                     "research argument review did not finish normally: "
                     f"{result.finish_reason}")
+                if result.finish_reason == "length":
+                    try:
+                        review = result.json_object(allow_missing_closers=True)
+                        validate_argument_review(review, argument=argument)
+                    except ValidationError as exc:
+                        last_error = ValidationError(
+                            "research argument review was truncated and could not be repaired "
+                            f"without guessing: {exc}")
+                    else:
+                        return review, usage
+                if repairing_response:
+                    break
                 previous = result.text
                 continue
             try:
@@ -840,11 +1121,22 @@ class ResearchArgumentRunner:
         self.deadline_seconds = float(deadline_seconds) if deadline_seconds is not None else None
 
     def run(self, evidence_packet, *, evidence_ids=None, max_attempts=3,
+            max_response_attempts=None, max_adjudication_attempts=3,
             min_figures=2, min_tables=1, min_experiments=2):
         if not isinstance(evidence_packet, dict):
             raise ValidationError("research argument evidence packet must be an object")
         if type(max_attempts) is not int or not 1 <= max_attempts <= 8:
             raise ValidationError("research argument max_attempts must be between one and eight")
+        if max_response_attempts is None:
+            max_response_attempts = max_attempts
+        if (type(max_response_attempts) is not int
+                or not 1 <= max_response_attempts <= 8):
+            raise ValidationError(
+                "research argument max_response_attempts must be between one and eight")
+        if (type(max_adjudication_attempts) is not int
+                or not 1 <= max_adjudication_attempts <= 8):
+            raise ValidationError(
+                "research argument max_adjudication_attempts must be between one and eight")
         if evidence_ids is None:
             evidence_ids = evidence_packet.get("evidence_ids", [])
         deadline = time.monotonic() + self.deadline_seconds if self.deadline_seconds is not None else None
@@ -860,7 +1152,7 @@ class ResearchArgumentRunner:
             partial_response = None
             last_error = feedback
             generated = False
-            for attempt in range(max_attempts):
+            for attempt in range(max_response_attempts):
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0.2:
@@ -885,7 +1177,10 @@ class ResearchArgumentRunner:
                 result, routes = complete_with_role_fallbacks(
                     self.model_config, role="strategy.argument", system=SYSTEM,
                     prompt=prompt, deadline=deadline,
-                    prefer_fallback=repairing_response, output_token_cap=8192,
+                    prefer_fallback=repairing_response,
+                    output_token_cap=(ARGUMENT_REPAIR_OUTPUT_TOKEN_BUDGET
+                                      if repairing_response else ARGUMENT_OUTPUT_TOKEN_BUDGET),
+                    output_format="json_object",
                     client_factory=ModelClient,
                 )
                 provider_route_history.extend(routes)
@@ -906,11 +1201,18 @@ class ResearchArgumentRunner:
                             available_assets=(evidence_packet.get("results_package") or {}).get("assets", [])
                             if isinstance(evidence_packet.get("results_package"), dict) else [],
                             available_evidence_ids=evidence_ids,
+                            expected_research_question=evidence_packet.get("research_question"),
+                            authoritative_result_patterns=_interpretation_record(
+                                evidence_packet.get("scientific_interpretation")).get(
+                                    "result_patterns", []),
                         )
                         validate_research_argument(
                             candidate, evidence_ids=evidence_ids,
                             asset_ids=evidence_packet.get("asset_ids"),
                             min_figures=min_figures, min_tables=min_tables,
+                            min_experiments=min_experiments)
+                        _validate_argument_generation_budget(
+                            candidate, min_figures=min_figures, min_tables=min_tables,
                             min_experiments=min_experiments)
                     except ValidationError as exc:
                         last_error = ValidationError(
@@ -918,7 +1220,7 @@ class ResearchArgumentRunner:
                             f"{result.finish_reason}; candidate validation failed: {exc}")
                         last_error.__cause__ = exc
                         previous = result.text
-                        partial_response = candidate if isinstance(candidate, dict) else result.text
+                        partial_response = candidate if isinstance(candidate, dict) else None
                         if repairing_response:
                             break
                         continue
@@ -934,14 +1236,21 @@ class ResearchArgumentRunner:
                         available_assets=(evidence_packet.get("results_package") or {}).get("assets", [])
                         if isinstance(evidence_packet.get("results_package"), dict) else [],
                         available_evidence_ids=evidence_ids,
+                        expected_research_question=evidence_packet.get("research_question"),
+                        authoritative_result_patterns=_interpretation_record(
+                            evidence_packet.get("scientific_interpretation")).get(
+                                "result_patterns", []),
                     )
                     validate_research_argument(candidate, evidence_ids=evidence_ids,
                                                 asset_ids=evidence_packet.get("asset_ids"),
                                                 min_figures=min_figures, min_tables=min_tables,
                                                 min_experiments=min_experiments)
+                    _validate_argument_generation_budget(
+                        candidate, min_figures=min_figures, min_tables=min_tables,
+                        min_experiments=min_experiments)
                 except ValidationError as exc:
                     last_error, previous = exc, result.text
-                    partial_response = candidate if isinstance(candidate, dict) else result.text
+                    partial_response = candidate if isinstance(candidate, dict) else None
                     if repairing_response:
                         break
                     continue
@@ -971,7 +1280,9 @@ class ResearchArgumentRunner:
             adjudicator = ArgumentAdjudicator(
                 self.model_config, deadline_seconds=review_deadline)
             try:
-                review, review_usage = adjudicator.run(argument, defense_packet)
+                review, review_usage = adjudicator.run(
+                    argument, defense_packet,
+                    max_attempts=max_adjudication_attempts)
             except Exception as exc:
                 failed_review_usage = getattr(exc, "usage", {})
                 if isinstance(failed_review_usage, dict):

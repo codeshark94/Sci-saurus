@@ -13,7 +13,9 @@ from scisaurus.runtime.models import (
     record_model_provider_cooldown,
 )
 from scisaurus.runtime.specialists import (
-    SPECIALIST_SYSTEM, VERIFIER_SYSTEM, SpecialistDispatcher,
+    REPAIR_ADJUDICATION_SYSTEM, SPECIALIST_SYSTEM, VERIFIER_SYSTEM,
+    SpecialistDispatcher,
+    _normalise_report, _normalise_verdict,
     build_specialist_prompt, build_verifier_prompt, redact_sensitive_text,
 )
 
@@ -46,6 +48,25 @@ class _SpecialistHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *_args):
         return
+
+
+class SpecialistServiceTests(unittest.TestCase):
+    def test_unbound_service_role_is_not_reported_as_successful_work(self):
+        events = []
+        dispatcher = SpecialistDispatcher({
+            "protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+            "model": "unused", "timeout_seconds": 1, "max_output_tokens": 32,
+        }, on_progress=events.append)
+        report = dispatcher._execute({
+            "assigned_role": "research.source-acquirer",
+            "role_id": "source-acquirer", "model_role": "research.source-acquirer",
+            "execution_kind": "service", "quota": {"max_calls": 1},
+        }, {"stage_result": {"status": "completed"}})
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["execution_mode"], "service_unavailable")
+        self.assertEqual(report["failure_class"], "service_unavailable")
+        self.assertEqual(events[-1]["event"], "failed")
+        self.assertEqual(report["usage"], {})
 
 
 class _VerifierRetryHandler(BaseHTTPRequestHandler):
@@ -121,6 +142,43 @@ class SpecialistDispatcherTests(unittest.TestCase):
             "auth_env": None,
         })
 
+    def test_verifier_prompt_is_stable_when_only_runtime_usage_changes(self):
+        stage = {"id": "experiment-panel", "kind": "experiment"}
+        packet = {"objective": "Review the evidence-bound repair plan."}
+        chief = {
+            "decision": "repair", "summary": "The calibration target is missing.",
+            "usage": {"model_calls": 2, "input_tokens": 4000, "output_tokens": 600},
+        }
+        replayed_chief = {**chief, "usage": {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}}
+        original_usage = {"model_calls": 2, "input_tokens": 1200, "output_tokens": 240}
+        report = {
+            "assigned_role": "methods.methodologist", "role_id": "methodologist",
+            "status": "succeeded", "model_role": "methods.methodologist",
+            "model": "deepseek-v4.1-flash:cloud", "usage": original_usage,
+            "response": {"decision": "repair", "summary": "Add an external calibration target.",
+                         "findings": ["The closure currently supplies its own constraint."],
+                         "evidence_gaps": [], "requested_actions": ["Bind to a published value."]},
+        }
+        replayed = {
+            **report, "usage": {}, "reused_prior_usage": original_usage,
+            "provider_call_reused": True, "execution_mode": "retained_model_result",
+        }
+
+        original = build_verifier_prompt(stage, packet, [report], chief)
+        resumed = build_verifier_prompt(stage, packet, [replayed], replayed_chief)
+
+        self.assertEqual(original, resumed)
+        self.assertNotIn('"usage"', original)
+        self.assertEqual(
+            original, build_verifier_prompt(stage, packet, [report], replayed_chief))
+        changed_evidence = {
+            **replayed,
+            "response": {**report["response"], "findings": [
+                "A different material finding changes the review payload."]},
+        }
+        self.assertNotEqual(
+            resumed, build_verifier_prompt(stage, packet, [changed_evidence], chief))
+
     def test_ollama_route_context_supersedes_small_role_context_ceiling(self):
         base = "http://ollama.example/v1"
         model = {
@@ -172,6 +230,7 @@ class SpecialistDispatcherTests(unittest.TestCase):
         self.assertEqual(reports[0]["context_window_tokens"], 262144)
         self.assertEqual(reports[0]["max_input_tokens"], 245760)
         self.assertEqual(client.call_args.kwargs["max_input_tokens"], 245760)
+        self.assertEqual(client.call_args.kwargs["output_format"], "json_object")
 
     def test_role_quota_clamps_route_timeout_before_provider_dispatch(self):
         model = {
@@ -248,6 +307,226 @@ class SpecialistDispatcherTests(unittest.TestCase):
         self.assertLessEqual(estimate_input_tokens(SPECIALIST_SYSTEM, prompt), 12000)
         self.assertNotIn("dependencies", json.loads(prompt)["shared_stage_context"])
         self.assertEqual(json.loads(prompt)["projected_input"]["topic"]["question"], "A bounded question")
+        contract = json.loads(prompt)["output_contract"]
+        self.assertIn("ranked findings naming supplied evidence and its consequence",
+                      contract["findings"][0])
+        self.assertIn("falsifiable completion check", contract["requested_actions"][0])
+
+    def test_length_limited_review_continues_the_same_response_until_third_call(self):
+        model = {
+            "protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+            "model": "fallback", "timeout_seconds": 5.0,
+            "max_output_tokens": 8192, "context_window_tokens": 1048576,
+            "max_input_tokens": 1040384,
+        }
+        assignment = {
+            "assigned_role": "methods.analysis-reviewer",
+            "role_id": "analysis-reviewer", "model_role": "methods.analysis-reviewer",
+            "execution_kind": "model", "stage_id": "experiment",
+            "stage_kind": "experiment",
+            "quota": {"max_calls": 3, "max_input_tokens": 1040384,
+                      "max_output_tokens": 24576,
+                      "max_output_tokens_per_call": 8192, "max_seconds": 30},
+            "_prompt": json.dumps({"objective": "Review the independent recalculation."}),
+        }
+        complete = json.dumps({
+            "decision": "repair",
+            "summary": "Independent recalculation found a mismatch in the reported estimate.",
+            "findings": ["The archived observations do not reproduce the reported estimate."],
+            "evidence_gaps": [],
+            "requested_actions": [
+                "Recompute the statistic from archived observations and record the interval."
+            ],
+        })
+        first, second = complete[:30], complete[30:75]
+        third = complete[75:]
+        results = [
+            ModelResult(first, "fake", {"model_calls": 1, "output_tokens": 100},
+                        0.01, "length", 1),
+            ModelResult(second, "fake", {"model_calls": 1, "output_tokens": 100},
+                        0.01, "length", 1),
+            ModelResult(third, "fake", {"model_calls": 1, "output_tokens": 100},
+                        0.01, "stop", 1),
+        ]
+
+        with patch("scisaurus.runtime.specialists.ModelClient") as client:
+            client.return_value.complete.side_effect = results
+            report = SpecialistDispatcher(
+                model, max_parallel=1, deadline=time.monotonic() + 30,
+            ).dispatch([assignment], {"objective": "Review the independent recalculation."})[0]
+
+        self.assertEqual(report["status"], "succeeded")
+        self.assertEqual(report["response"]["decision"], "repair")
+        self.assertEqual(report["validation_retries"], 2)
+        self.assertEqual(report["usage"]["model_calls"], 3)
+        self.assertEqual(client.return_value.complete.call_count, 3)
+        calls = client.return_value.complete.call_args_list
+        self.assertEqual(calls[1].kwargs["continuation_text"], first)
+        self.assertEqual(calls[2].kwargs["continuation_text"], first + second)
+
+    def test_review_finishes_fourth_continuation_inside_existing_token_budget(self):
+        model = {
+            "protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+            "model": "fallback", "timeout_seconds": 5.0,
+            "max_output_tokens": 8192, "context_window_tokens": 1048576,
+            "max_input_tokens": 1040384,
+        }
+        assignment = {
+            "assigned_role": "methods.analysis-reviewer",
+            "role_id": "analysis-reviewer", "model_role": "methods.analysis-reviewer",
+            "execution_kind": "model", "stage_id": "experiment",
+            "stage_kind": "experiment",
+            "quota": {"max_calls": 4, "max_input_tokens": 245760,
+                      "max_output_tokens": 24576,
+                      "max_output_tokens_per_call": 8192, "max_seconds": 30},
+            "_prompt": json.dumps({"objective": "Review the independent recalculation."}),
+        }
+        complete = json.dumps({
+            "decision": "repair",
+            "summary": "The independent recalculation disagrees with the reported estimate.",
+            "findings": ["The archived observations do not reproduce the reported estimate."],
+            "evidence_gaps": [],
+            "requested_actions": ["Recompute the estimate directly from the archived observations."],
+        })
+        chunks = [complete[:25], complete[25:51], complete[51:79], complete[79:]]
+        results = [
+            ModelResult(chunks[index], "fake", {"model_calls": 1, "output_tokens": tokens},
+                        0.01, "length" if index < 3 else "stop", 1)
+            for index, tokens in enumerate((7000, 7000, 7000, 3576))
+        ]
+        events = []
+        with patch("scisaurus.runtime.specialists.ModelClient") as client:
+            client.return_value.complete.side_effect = results
+            report = SpecialistDispatcher(
+                model, max_parallel=1, deadline=time.monotonic() + 30,
+                on_progress=events.append,
+            ).dispatch([assignment], {"objective": "Review the independent recalculation."})[0]
+
+        self.assertEqual(report["status"], "succeeded")
+        self.assertEqual(report["response"]["decision"], "repair")
+        self.assertEqual(report["usage"]["output_tokens"], 24576)
+        self.assertEqual(client.return_value.complete.call_count, 4)
+        calls = client.return_value.complete.call_args_list
+        self.assertEqual(calls[3].kwargs["continuation_text"], "".join(chunks[:3]))
+        self.assertEqual([call.kwargs["max_output_tokens"] for call in client.call_args_list],
+                         [8192, 8192, 8192, 3576])
+        self.assertEqual(sum(event.get("event") == "continuing" for event in events), 3)
+
+    def test_repair_adjudication_uses_a_nonconflicting_response_contract(self):
+        model = {
+            "protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+            "model": "fallback", "timeout_seconds": 5.0,
+            "max_output_tokens": 2048, "context_window_tokens": 65536,
+            "max_input_tokens": 60000,
+        }
+        repair_plan = {
+            "schema_version": "experiment-repair-adjudication-1",
+            "topic_id": "direction_3", "disposition": "repair",
+            "root_cause": {"statement": "The estimand is an input.",
+                            "evidence": ["The source fixes both branch slopes."]},
+            "required_changes": [{
+                "target": "estimand", "instruction": "Use a signed slope difference.",
+                "scientific_basis": "The null must be reachable.", "source_refs": [],
+            }],
+            "acceptance_checks": ["Equal slopes produce an interval containing zero."],
+        }
+        result = ModelResult(
+            json.dumps({
+                "decision": "repair", "summary": "The branch contrast is planted.",
+                "findings": ["The input fixes the observed contrast."],
+                "evidence_gaps": [], "requested_actions": [],
+                "repair_plan": repair_plan,
+            }),
+            "fake", {"model_calls": 1, "output_tokens": 300}, 0.01, "stop", 1,
+        )
+        assignment = {
+            "assigned_role": "methods.methodologist", "role_id": "methodologist",
+            "model_role": "methods.methodologist", "execution_kind": "model",
+            "stage_id": "experiment-repair-panel", "stage_kind": "experiment",
+            "quota": {"max_calls": 1, "max_input_tokens": 60000,
+                      "max_output_tokens": 2048, "max_seconds": 10},
+            "_response_contract": "repair_adjudication",
+            "_prompt": json.dumps({"decision_contract": "repair adjudication"}),
+        }
+        with patch("scisaurus.runtime.specialists.ModelClient") as client:
+            client.return_value.complete.return_value = result
+            report = SpecialistDispatcher(
+                model, max_parallel=1, deadline=time.monotonic() + 10,
+            ).dispatch([assignment], {"topic_id": "direction_3"})[0]
+
+        self.assertEqual(report["status"], "succeeded", report.get("error"))
+        dispatched_call = client.return_value.complete.call_args
+        self.assertEqual(dispatched_call.kwargs["system"], REPAIR_ADJUDICATION_SYSTEM)
+        self.assertNotEqual(dispatched_call.kwargs["system"], SPECIALIST_SYSTEM)
+        self.assertEqual(report["response"]["raw"]["repair_plan"], repair_plan)
+
+    def test_review_response_contracts_preserve_complete_evidence_without_word_ceilings(self):
+        self.assertIn("at most three", SPECIALIST_SYSTEM)
+        self.assertIn("a longer item is preferable to omitting material support", SPECIALIST_SYSTEM)
+        self.assertIn("blocking_findings, required_revisions, deferred_gates", VERIFIER_SYSTEM)
+        self.assertIn("without omitting material support or applying word-count limits", VERIFIER_SYSTEM)
+        for normalise, payload in (
+            (_normalise_report, {
+                "decision": "repair", "summary": "One short reason.",
+                "findings": ["The evidence field shows the stated defect."],
+                "evidence_gaps": [], "requested_actions": [],
+            }),
+            (_normalise_verdict, {
+                "decision": "hold", "rationale": "The result is not independently supported.",
+                "critical_findings": ["The result omits the recalculated interval."],
+                "repair_scope": [],
+            }),
+        ):
+            normalized = normalise(payload)
+            self.assertLessEqual(len(normalized.get("findings", normalized.get("critical_findings", []))), 3)
+            self.assertLessEqual(len(normalized.get("requested_actions", normalized.get("repair_scope", []))), 3)
+        detailed = {
+            "decision": "repair",
+            "summary": "A supported explanation. " * 30,
+            "findings": ["Evidence and consequence. " * 8, "Second finding.",
+                         "Third finding.", "Fourth finding.", "Fifth finding.",
+                         "Sixth finding.", "Seventh finding.", "Eighth finding.",
+                         "Ninth finding."],
+            "evidence_gaps": [], "requested_actions": [],
+        }
+        normalized = _normalise_report(detailed)
+        self.assertGreater(len(normalized["summary"].split()), 80)
+        self.assertEqual(len(normalized["findings"]), 9)
+        self.assertIn("Ninth finding", normalized["findings"][-1])
+        self.assertIn("Ninth finding", normalized["raw"]["findings"][-1])
+        self.assertEqual(normalized["normalization_warnings"], [])
+
+        long_item = {
+            "decision": "repair", "summary": "Short.",
+            "findings": ["evidence " * 400], "evidence_gaps": [],
+            "requested_actions": [],
+        }
+        normalized_long_item = _normalise_report(long_item)
+        self.assertEqual(len(normalized_long_item["findings"][0]), len(long_item["findings"][0]))
+        self.assertEqual(normalized_long_item["raw"]["findings"][0], long_item["findings"][0])
+
+        detailed_verdict = {
+            "decision": "hold", "rationale": "The evidence is incomplete. " * 21,
+            "critical_findings": ["Evidence-linked defect. " * 8, "Second.", "Third.",
+                                 "Fourth."],
+            "repair_scope": [],
+        }
+        normalized_verdict = _normalise_verdict(detailed_verdict)
+        self.assertGreater(len(normalized_verdict["rationale"].split()), 80)
+        self.assertEqual(len(normalized_verdict["blocking_findings"]), 4)
+        self.assertEqual(normalized_verdict["critical_findings"],
+                         detailed_verdict["critical_findings"])
+
+        revisable = _normalise_verdict({
+            "decision": "accept", "rationale": "The current plan is safe.",
+            "blocking_findings": [],
+            "required_revisions": [],
+            "deferred_gates": ["Verify generated source hashes before execution."],
+            "repair_scope": ["Clarify the reporting note in the manuscript."],
+        })
+        self.assertEqual(revisable["blocking_findings"], [])
+        self.assertEqual(revisable["deferred_gates"],
+                         ["Verify generated source hashes before execution."])
 
     def test_specialist_prompt_redacts_credentials_embedded_in_source_text(self):
         source = (
@@ -558,6 +837,35 @@ class SpecialistDispatcherTests(unittest.TestCase):
         self.assertNotIn("failure_observed_result", repair)
         self.assertNotIn("last_attempt", repair["prior_foundry_work"])
 
+    def test_pre_execution_repair_verifier_reviews_the_plan_not_missing_results(self):
+        plan = {
+            "schema_version": "experiment-repair-adjudication-1",
+            "topic_id": "direction_3",
+            "failure_lineage": {"stage_id": "experiment", "attempt_number": 4},
+            "disposition": "repair",
+            "root_cause": {"statement": "The intervention cancels.",
+                            "evidence": ["The output is constant."]},
+            "required_changes": [{"target": "executor", "instruction": "Change the state update."}],
+            "acceptance_checks": ["Recalculate independently."],
+        }
+        prompt = build_verifier_prompt(
+            {"id": "experiment-repair-panel", "kind": "experiment"},
+            {
+                "objective": "Review a proposed repair.",
+                "repair_panel": True,
+                "repair_verification_scope": "pre_execution_plan",
+                "capability_repair_packet": {
+                    "failure_lineage": {"stage_id": "experiment", "attempt_number": 4},
+                    "repair_contract": {"must_preserve": ["question"]},
+                },
+            }, [], {"repair_adjudication": plan}, max_input_tokens=16000)
+        payload = json.loads(prompt)
+        self.assertEqual(payload["chief_result"]["repair_adjudication"]["topic_id"],
+                         "direction_3")
+        self.assertEqual(payload["verifier_contract"]["acceptance_target"],
+                         "the scoped methods repair plan before source authoring or execution")
+        self.assertIn("Do not hold solely", payload["verifier_contract"]["repair_panel_rule"])
+
     def test_topic_verifier_judges_provisional_result_against_survey_admission(self):
         chief_result = {
             "status": "completed",
@@ -695,36 +1003,94 @@ class SpecialistDispatcherTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
-    def test_specialist_repairs_provider_truncation_once_when_quota_has_repair_slot(self):
+    def test_specialist_continues_provider_truncation_until_stop_within_call_quota(self):
         model = {
             "protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
             "model": "fallback", "timeout_seconds": 5.0,
-            "max_output_tokens": 100, "context_window_tokens": 4096,
-            "max_input_tokens": 2048,
+            "max_output_tokens": 8192, "context_window_tokens": 262144,
+            "max_input_tokens": 245760,
         }
         assignment = {
             "assigned_role": "methods.methodologist", "role_id": "methodologist",
             "model_role": "methods.methodologist", "execution_kind": "model",
             "stage_id": "repair", "stage_kind": "experiment",
-            "quota": {"max_calls": 2, "max_input_tokens": 1000,
-                      "max_output_tokens": 100, "max_seconds": 5},
+            "quota": {"max_calls": 2, "max_input_tokens": 245760,
+                      "max_output_tokens": 16384,
+                      "max_output_tokens_per_call": 8192, "max_seconds": 5},
             "_prompt": json.dumps({"objective": "bounded repair"}),
         }
-        truncated = ModelResult('{"decision":"repair"', "fake", {"model_calls": 1}, 0.01, "length", 1)
-        complete = ModelResult(json.dumps({
-            "decision": "repair", "summary": "repaired", "findings": [],
-            "evidence_gaps": [], "requested_actions": [],
-        }), "fake", {"model_calls": 1}, 0.01, "stop", 1)
+        truncated = ModelResult(
+            '{"decision":"repair"', "fake",
+            {"model_calls": 1, "output_tokens": 7000}, 0.01, "length", 1)
+        suffix = ModelResult(
+            ',"summary":"repaired","findings":[],"evidence_gaps":[],"requested_actions":[]}',
+            "fake", {"model_calls": 1, "output_tokens": 7000}, 0.01, "stop", 1)
+        events = []
         with patch("scisaurus.runtime.specialists.ModelClient") as client:
-            client.return_value.complete.side_effect = [truncated, complete]
+            client.return_value.complete.side_effect = [truncated, suffix]
             result = SpecialistDispatcher(
                 model, max_parallel=1, deadline=time.monotonic() + 10,
+                on_progress=events.append,
             ).dispatch([assignment], {"objective": "bounded repair"})[0]
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(result["validation_retries"], 1)
         self.assertEqual(result["usage"]["model_calls"], 2)
+        self.assertEqual(result["usage"]["output_tokens"], 14000)
+        self.assertEqual(client.return_value.complete.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["max_output_tokens"] for call in client.call_args_list],
+            [8192, 8192],
+        )
+        first_call, continuation_call = client.return_value.complete.call_args_list
+        self.assertNotIn("continuation_text", first_call.kwargs)
+        self.assertEqual(continuation_call.kwargs["continuation_text"], truncated.text)
+        self.assertEqual(continuation_call.kwargs["prompt"], first_call.kwargs["prompt"])
+        self.assertEqual([item["kind"] for item in result["retry_history"]],
+                         ["length_continuation"])
+        self.assertEqual(sum(event.get("event") == "continuing" for event in events), 1)
 
-    def test_provider_429_reroutes_same_assignment_to_healthy_primary_route(self):
+    def test_specialist_continuation_never_exceeds_cumulative_output_budget(self):
+        model = {
+            "protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+            "model": "fallback", "timeout_seconds": 5.0,
+            "max_output_tokens": 8192, "context_window_tokens": 262144,
+            "max_input_tokens": 245760,
+        }
+        assignment = {
+            "assigned_role": "methods.methodologist", "role_id": "methodologist",
+            "model_role": "methods.methodologist", "execution_kind": "model",
+            "stage_id": "repair", "stage_kind": "experiment",
+            "quota": {"max_calls": 3, "max_input_tokens": 245760,
+                      "max_output_tokens": 1000,
+                      "max_output_tokens_per_call": 8192, "max_seconds": 5},
+            "_prompt": json.dumps({"objective": "bounded repair"}),
+        }
+        results = [
+            ModelResult('{"decision":', "fake",
+                        {"model_calls": 1, "output_tokens": 700}, 0.01, "length", 1),
+            ModelResult('"repair"', "fake",
+                        {"model_calls": 1, "output_tokens": 300}, 0.01, "length", 1),
+        ]
+        events = []
+        with patch("scisaurus.runtime.specialists.ModelClient") as client:
+            client.return_value.complete.side_effect = results
+            report = SpecialistDispatcher(
+                model, max_parallel=1, deadline=time.monotonic() + 10,
+                on_progress=events.append,
+            ).dispatch([assignment], {"objective": "bounded repair"})[0]
+
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("cumulative output-token budget", report["error"])
+        self.assertEqual(report["usage"]["output_tokens"], 1000)
+        self.assertEqual(client.return_value.complete.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["max_output_tokens"] for call in client.call_args_list],
+            [1000, 300],
+        )
+        self.assertEqual(sum(event.get("event") == "output_budget_exhausted"
+                             for event in events), 1)
+
+    def test_provider_429_fences_parallel_pool_without_route_retry(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), _ProviderFallbackHandler)
         server.lock = threading.Lock()
         server.models = []
@@ -767,17 +1133,80 @@ class SpecialistDispatcherTests(unittest.TestCase):
                 on_progress=events.append,
             ).dispatch(assignments, {"objective": "test"})
             self.assertEqual(len(results), 2)
-            self.assertTrue(all(item["status"] == "succeeded" for item in results))
-            self.assertEqual({item["provider_pool"] for item in results}, {"primary"})
-            self.assertEqual(sum(item["provider_retries"] for item in results), 1)
+            self.assertEqual({item["status"] for item in results}, {"succeeded", "failed"})
+            limited = next(item for item in results if item["status_code"] == 429)
+            self.assertEqual(limited["provider_retries"], 0)
+            self.assertTrue(any(item.get("status_code") == 429 for item in results))
+            self.assertEqual(sum(item["provider_retries"] for item in results), 0)
             self.assertEqual(server.models.count("gemma"), 1)
-            self.assertEqual(server.models.count("primary"), 2)
-            self.assertTrue(any(event.get("event") == "provider_route_failed"
-                                and event.get("status_code") == 429 for event in events))
+            self.assertEqual(server.models.count("primary"), 1)
+            self.assertEqual(len(server.models), 2)
+            self.assertFalse(any(event.get("event") == "provider_route_failed"
+                                 and event.get("status_code") == 429 for event in events))
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_provider_429_stops_specialist_assignments_still_queued(self):
+        quota_scope = "specialist-queued-429-test"
+        model = {
+            "protocol": "openai_compatible",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "auth_env": None,
+            "provider_quota_scope": quota_scope,
+            "model": "deepseek-cloud",
+            "timeout_seconds": 5.0,
+            "max_output_tokens": 100,
+            "context_window_tokens": 4096,
+            "max_input_tokens": 2048,
+            "role_routes": {"research.search-planner": [{
+                "id": "cloud", "pool": "cloud",
+                "protocol": "openai_compatible",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "model": "deepseek-cloud", "auth_env": None,
+            }]},
+        }
+        assignments = [{
+            "assigned_role": f"research.search-planner-{index}",
+            "role_id": f"search-planner-{index}",
+            "model_role": "research.search-planner",
+            "execution_kind": "model", "stage_id": "survey",
+            "stage_kind": "survey", "quota": {
+                "max_calls": 1, "max_input_tokens": 1000,
+                "max_output_tokens": 100, "max_seconds": 5,
+            },
+            "_prompt": json.dumps({"assignment": index}),
+        } for index in range(4)]
+        calls = []
+
+        class RateLimitedClient:
+            def __init__(self, **route):
+                self.route = route
+
+            def complete(self, *, system, prompt, images=None):
+                calls.append(self.route["model"])
+                raise ModelCallError(
+                    "provider quota exhausted", outcome_known=True,
+                    attempts=1, status_code=429,
+                    provider_error_kind="quota_exhausted",
+                )
+
+        try:
+            with patch("scisaurus.runtime.specialists.ModelClient", RateLimitedClient):
+                results = SpecialistDispatcher(
+                    model, provider_pools={
+                        "cloud": {"max_concurrent": 1,
+                                  "base_urls": [model["base_url"]]},
+                    }, max_parallel=1, deadline=time.monotonic() + 10,
+                ).dispatch(assignments, {"objective": "bounded test"})
+        finally:
+            clear_model_provider_cooldown(quota_scope)
+
+        self.assertEqual(len(results), len(assignments))
+        self.assertEqual(calls, ["deepseek-cloud"])
+        self.assertTrue(all(result.get("status_code") == 429 for result in results))
+        self.assertTrue(all(result.get("provider_retries") == 0 for result in results))
 
     def test_nested_specialist_role_inherits_safe_parent_routes(self):
         endpoint = "http://127.0.0.1:11434/v1"
@@ -818,7 +1247,7 @@ class SpecialistDispatcherTests(unittest.TestCase):
             "role_id": "adversarial-reviewer", "model_role": "review.arbiter",
             "execution_kind": "review", "stage_id": "experiment",
             "stage_kind": "experiment", "quota": {
-                "max_calls": 1, "max_input_tokens": 1000,
+                "max_calls": 2, "max_input_tokens": 1000,
                 "max_output_tokens": 100, "max_seconds": 5,
             },
             "_prompt": json.dumps({"stage": "experiment"}),
@@ -842,7 +1271,7 @@ class SpecialistDispatcherTests(unittest.TestCase):
         self.assertEqual(result["route_id"], "ollama-deepseek")
         self.assertEqual(result["provider_retries"], 1)
 
-    def test_specialist_uses_local_cooldown_route_only_after_all_cloud_routes_429(self):
+    def test_specialist_429_fences_cloud_and_does_not_use_local_cooldown_route(self):
         base = "http://127.0.0.1:11434/v1"
         cloud = {
             "protocol": "openai_compatible", "base_url": base,
@@ -914,13 +1343,10 @@ class SpecialistDispatcherTests(unittest.TestCase):
                 }, max_parallel=1, deadline=time.monotonic() + 10,
             ).dispatch([assignment], {"objective": "test"}, verifier=True)[0]
 
-        self.assertEqual(calls, [
-            "deepseek-v4.1-flash:cloud", "glm-5.3-flash:cloud",
-            "gemma4:31b-cloud", "gemma-local",
-        ])
-        self.assertEqual(result["status"], "succeeded")
-        self.assertEqual(result["model"], "gemma-local")
-        self.assertEqual(result["provider_retries"], 3)
+        self.assertEqual(calls, ["deepseek-v4.1-flash:cloud"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status_code"], 429)
+        self.assertEqual(result["provider_retries"], 0)
         self.assertGreater(model_provider_cooldown_remaining(cloud), 0)
 
         later_assignment = {
@@ -941,9 +1367,9 @@ class SpecialistDispatcherTests(unittest.TestCase):
                     "ollama": {"max_concurrent": 3, "base_urls": [base]},
                 }, max_parallel=1, deadline=time.monotonic() + 10,
             ).dispatch([later_assignment], {"objective": "test"})[0]
-        self.assertEqual(calls[calls_before_later_role:], ["gemma-local"])
-        self.assertEqual(later_result["status"], "succeeded", repr(later_result))
-        self.assertEqual(later_result["provider_pool"], "ollama")
+        self.assertEqual(calls[calls_before_later_role:], [])
+        self.assertEqual(later_result["status"], "failed", repr(later_result))
+        self.assertEqual(later_result["status_code"], 429)
 
         clear_model_provider_cooldown(cloud)
         healthy_calls = []
@@ -970,7 +1396,7 @@ class SpecialistDispatcherTests(unittest.TestCase):
         self.assertEqual(healthy_result["status"], "succeeded")
         self.assertEqual(healthy_calls, ["deepseek-v4.1-flash:cloud"])
 
-    def test_shared_429_arriving_during_admission_retries_on_qwen(self):
+    def test_shared_429_during_admission_does_not_retry_on_another_route(self):
         base = "http://127.0.0.1:11434/v1"
         cloud_scope = "cloud-account-race"
         model = {
@@ -999,19 +1425,13 @@ class SpecialistDispatcherTests(unittest.TestCase):
             "_prompt": json.dumps({"stage": "experiment"}),
         }
         calls = []
-        success = ModelResult(json.dumps({
-            "decision": "accept", "rationale": "retried after shared cooldown",
-            "critical_findings": [], "repair_scope": [],
-        }), "gemma-local", {"model_calls": 1, "input_tokens": 10,
-                           "output_tokens": 5}, 0.01, "stop", 1)
-
         class StubClient:
             def __init__(self, **route):
                 self.route = route
 
             def complete(self, *, system, prompt, images=None):
                 calls.append(self.route["model"])
-                return success
+                raise AssertionError("provider cooldown must block before dispatch")
 
         cooldown_inserted = False
 
@@ -1035,15 +1455,12 @@ class SpecialistDispatcherTests(unittest.TestCase):
             clear_model_provider_cooldown({"provider_quota_scope": cloud_scope})
 
         self.assertTrue(cooldown_inserted)
-        self.assertEqual(calls, ["gemma-local"])
-        self.assertEqual(result["status"], "succeeded", repr(result))
-        self.assertEqual(result["route_id"], "ollama-local-cooldown-recovery")
-        self.assertEqual(result["usage"]["model_calls"], 1)
-        self.assertEqual(result["retry_history"][0]["kind"],
-                         "provider_cooldown_admission")
-        self.assertEqual(result["retry_history"][0]["request_attempts"], 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(result["status"], "failed", repr(result))
+        self.assertEqual(result["status_code"], 429)
+        self.assertEqual(result["provider_retries"], 0)
 
-    def test_single_known_429_can_reach_cooldown_route(self):
+    def test_single_known_429_stops_before_cooldown_route(self):
         base = "http://127.0.0.1:11434/v1"
         cloud = {
             "protocol": "openai_compatible", "base_url": base,
@@ -1074,20 +1491,12 @@ class SpecialistDispatcherTests(unittest.TestCase):
             "_prompt": json.dumps({"stage": "survey"}),
         }
         calls = []
-        success = ModelResult(json.dumps({
-            "decision": "observe", "summary": "continued on independent provider",
-            "findings": [], "evidence_gaps": [], "requested_actions": [],
-        }), "gemma-local", {"model_calls": 1, "input_tokens": 10,
-                                "output_tokens": 5}, 0.01, "stop", 1)
-
         class RouteClient:
             def __init__(self, **route):
                 self.route = route
 
             def complete(self, *, system, prompt, images=None):
                 calls.append(self.route["model"])
-                if self.route["model"] == "gemma-local":
-                    return success
                 raise ModelCallError(
                     "model HTTP request failed with status 429",
                     outcome_known=True, attempts=1, status_code=429,
@@ -1101,12 +1510,10 @@ class SpecialistDispatcherTests(unittest.TestCase):
                 }, max_parallel=1, deadline=time.monotonic() + 10,
             ).dispatch([assignment], {"objective": "test"})[0]
 
-        self.assertEqual(calls, [
-            "deepseek-v4.1-flash:cloud", "gemma-local",
-        ])
-        self.assertEqual(result["status"], "succeeded")
-        self.assertEqual(result["provider_pool"], "ollama")
-        self.assertEqual(result["provider_retries"], 1)
+        self.assertEqual(calls, ["deepseek-v4.1-flash:cloud"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status_code"], 429)
+        self.assertEqual(result["provider_retries"], 0)
 
     def test_emergency_local_route_is_not_used_for_transient_server_failures(self):
         base = "http://127.0.0.1:11434/v1"
@@ -1142,9 +1549,16 @@ class SpecialistDispatcherTests(unittest.TestCase):
         }
         calls = []
 
-        for status_code in (503, 429):
-            with self.subTest(status_code=status_code):
+        for status_code, max_calls, expected_models in (
+                (503, 1, ["deepseek-v4.1-flash:cloud"]),
+                (503, 2, ["deepseek-v4.1-flash:cloud", "glm-5.3-flash:cloud"]),
+                (429, 2, ["deepseek-v4.1-flash:cloud"])):
+            with self.subTest(status_code=status_code, max_calls=max_calls):
                 calls.clear()
+                current_assignment = dict(assignment)
+                current_assignment["quota"] = {
+                    **assignment["quota"], "max_calls": max_calls,
+                }
 
                 class UnavailableCloud:
                     def __init__(self, **route):
@@ -1164,11 +1578,9 @@ class SpecialistDispatcherTests(unittest.TestCase):
                             "cloud": {"max_concurrent": 3, "base_urls": [base]},
                             "ollama": {"max_concurrent": 3, "base_urls": [base]},
                         }, max_parallel=1, deadline=time.monotonic() + 10,
-                    ).dispatch([dict(assignment)], {"objective": "test"})[0]
+                    ).dispatch([current_assignment], {"objective": "test"})[0]
 
-                self.assertEqual(calls, [
-                    "deepseek-v4.1-flash:cloud", "glm-5.3-flash:cloud",
-                ])
+                self.assertEqual(calls, expected_models)
                 self.assertEqual(report["status"], "result_unknown")
 
 

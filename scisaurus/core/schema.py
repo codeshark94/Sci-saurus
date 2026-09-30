@@ -201,6 +201,45 @@ def _final_json_object_candidate(text: str) -> str | None:
     return None
 
 
+def _escape_model_string_controls(text: str) -> str:
+    """Escape literal JSON control characters inside model-produced strings.
+
+    This preserves their exact string value while repairing a common
+    serialization defect. Control characters outside strings remain invalid.
+    """
+    output = []
+    in_string = False
+    escaped = False
+    changed = False
+    for char in text:
+        if in_string:
+            if ord(char) < 0x20:
+                if escaped and output and output[-1] == "\\":
+                    output.pop()
+                    output.append("\\\\")
+                    escaped = False
+                output.append(f"\\u{ord(char):04x}")
+                changed = True
+                continue
+            if escaped:
+                escaped = False
+                output.append(char)
+            elif char == "\\":
+                escaped = True
+                output.append(char)
+            elif char == '"':
+                in_string = False
+                output.append(char)
+            else:
+                output.append(char)
+        elif char == '"':
+            in_string = True
+            output.append(char)
+        else:
+            output.append(char)
+    return "".join(output) if changed else text
+
+
 def json_object(raw, name="JSON", *, model_envelope=False,
                 allow_missing_closers=False) -> dict:
     """Parse one unambiguous object, with optional provider transport wrappers.
@@ -270,6 +309,8 @@ def json_object(raw, name="JSON", *, model_envelope=False,
                 candidates.append(extracted)
     error = None
     for candidate in candidates:
+        if model_envelope and isinstance(candidate, str):
+            candidate = _escape_model_string_controls(candidate)
         try:
             value = json.loads(candidate, object_pairs_hook=unique, parse_constant=finite,
                                parse_float=finite_float)

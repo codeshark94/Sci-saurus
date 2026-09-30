@@ -58,7 +58,12 @@ class ComposerSupervisorTests(unittest.TestCase):
             results = [
                 {"status": "blocked", "remaining_seconds": 20,
                  "stages": {"survey": {"status": "blocked"}},
-                 "blockers": [{"stage_id": "survey", "reason": "transient"}]},
+                 "blockers": [{"stage_id": "survey", "reason": "transient"}],
+                 "active_research_requests": [{
+                     "id": "survey-repair-1", "kind": "literature_expansion",
+                     "objective": "Narrow the evidence search to the unresolved comparator.",
+                     "target_stage_id": "survey",
+                 }]},
                 {"status": "completed", "remaining_seconds": 10,
                  "stages": {}, "blockers": []},
             ]
@@ -143,6 +148,377 @@ class ComposerSupervisorTests(unittest.TestCase):
             })
             snapshot = supervisor._live_snapshot()
             self.assertTrue(supervisor._scheduled_retry_wait(snapshot))
+
+    def test_model_429_stops_supervisor_without_replaying_the_mission(self):
+        with tempfile.TemporaryDirectory() as path:
+            supervisor = ComposerSupervisor({
+                "id": "model-rate-limit-stop-test",
+                "project_id": str(Path(path) / "project"),
+            })
+            limited = {
+                "status": "paused",
+                "remaining_seconds": 3600,
+                "active_blockers": [{
+                    "reason": "provider_cooldown",
+                    "rate_limit": {
+                        "provider": "model",
+                        "status_code": 429,
+                        "provider_error_kind": "quota_exhausted",
+                    },
+                }],
+                "blockers": [],
+            }
+            self.assertFalse(supervisor._should_resume(limited))
+
+            expired_cooldown = {
+                **limited,
+                "active_blockers": [{
+                    **limited["active_blockers"][0],
+                    "retry_after_epoch": time.time() - 1,
+                    "retry_after_seconds": 3600,
+                }],
+            }
+            self.assertFalse(supervisor._should_resume(expired_cooldown))
+
+            active_cooldown = {
+                **limited,
+                "active_blockers": [{
+                    **limited["active_blockers"][0],
+                    "retry_after_epoch": time.time() + 3600,
+                }],
+            }
+            self.assertFalse(supervisor._should_resume(active_cooldown))
+
+            resolved_historical = {
+                **limited,
+                "active_blockers": [],
+                "blockers": limited["active_blockers"],
+                "stop_reason": "provider_cooldown",
+            }
+            self.assertFalse(supervisor._should_resume(resolved_historical))
+
+    def test_candidate_with_an_active_scoped_repair_resumes_same_mission(self):
+        with tempfile.TemporaryDirectory() as path:
+            supervisor = ComposerSupervisor({
+                "id": "candidate-repair-resume-test",
+                "project_id": str(Path(path) / "project"),
+            })
+            self.assertFalse(supervisor._should_resume({
+                "status": "candidate_needs_review",
+                "remaining_seconds": 3600,
+                "active_research_requests": [],
+            }))
+            self.assertTrue(supervisor._should_resume({
+                "status": "candidate_needs_review",
+                "remaining_seconds": 3600,
+                "active_research_requests": [{
+                    "id": "repair-result", "kind": "additional_experiment",
+                    "objective": "Run the preregistered comparator sensitivity check.",
+                    "target_stage_id": "experiment",
+                }],
+            }))
+
+    def test_supervisor_stops_a_blocked_stage_without_an_actionable_order(self):
+        supervisor = ComposerSupervisor({
+            "id": "no-work-order-stop-test", "project_id": "/tmp/no-work-order-stop",
+        }, poll_seconds=0)
+        self.assertFalse(supervisor._should_resume({
+            "status": "blocked", "remaining_seconds": 3600,
+            "stages": {"argument": {
+                "status": "blocked", "attempt_count": 11,
+                "error": "research argument did not finish normally: length",
+            }},
+            "blockers": [{"stage_id": "argument", "reason": "same failure"}],
+            "active_research_requests": [],
+        }))
+
+    def test_supervisor_resumes_durable_blocking_review_after_truncated_patch(self):
+        supervisor = ComposerSupervisor({
+            "id": "durable-scientific-repair-resume",
+            "project_id": "/tmp/durable-scientific-repair-resume",
+        })
+        finding = {
+            "severity": "blocking",
+            "finding": "The proposed branch contrast is algebraically imposed.",
+            "evidence": "The branch equation fixes the reported slope difference.",
+            "required_change": "Derive a discriminating mechanism and independent test.",
+        }
+        experiment = {
+            "status": "blocked",
+            "failure_class": "model_contract",
+            "failure_dossier_ref": (
+                "artifact:command/composer/failure-recovery/experiment/attempt-9@1"),
+            "format_recovery_dispatched": True,
+            "error": (
+                "capability foundry did not admit a program: program author response "
+                "was incomplete (finish_reason=length): invalid JSON"),
+            "capability_id": "current-capability",
+            "project_dir": "/tmp/durable-scientific-repair-resume/attempt-9",
+            "failure_recovery": {
+                "failure_class": "model_contract",
+                "recovery_mode": "format_repair_then_rerun",
+                "dossier_ref": (
+                    "artifact:command/composer/failure-recovery/experiment/attempt-9@1"),
+                "model_diagnostics": {"repair_ledger": [{
+                    "validation_feedback": {
+                        "gate": "adversarial_review",
+                        "decision": "rejected",
+                        "findings": [finding],
+                    },
+                }]},
+            },
+        }
+        failed_stage = {
+            "status": "blocked",
+            "attempts": [{
+                "state": "unknown", "attempt_number": 341, "cycle": 684,
+                "project_dir": "/tmp/durable-scientific-repair-resume/attempt-341",
+            }, {
+                "state": "failed", "failure_class": "model_contract",
+                "attempt_number": 462,
+                "project_dir": "/tmp/durable-scientific-repair-resume/attempt-9",
+            }],
+        }
+        experiment["unresolved_prior_attempts"] = [{
+            "attempt_id": "experiment-cycle-684-attempt-341",
+            "attempt_number": 341, "cycle": 684, "state": "unknown",
+            "project_dir": "/tmp/durable-scientific-repair-resume/attempt-341",
+        }]
+        result = {
+            "status": "blocked", "remaining_seconds": 3600,
+            "context": {"experiment": experiment},
+            "stages": {"experiment": failed_stage},
+            "active_research_requests": [], "active_blockers": [],
+        }
+
+        self.assertTrue(supervisor._should_resume(result))
+        self.assertFalse(supervisor._should_resume({
+            **result,
+            "active_blockers": [{"reason": "provider_cooldown", "rate_limit": {
+                "provider": "model", "status_code": 429,
+                "provider_error_kind": "quota_exhausted",
+            }}],
+        }))
+        supervisor.identical_exit_count = 1
+        self.assertTrue(supervisor._should_resume(result))
+        self.assertFalse(supervisor._should_resume({
+            "status": "blocked", "remaining_seconds": 3600,
+            "active_research_requests": [], "active_blockers": [],
+        }))
+        supervisor.identical_exit_count = 0
+
+        malformed = json.loads(json.dumps(result))
+        malformed["context"]["experiment"]["failure_recovery"][
+            "model_diagnostics"]["repair_ledger"][0]["validation_feedback"][
+                "findings"][0]["required_change"] = " "
+        self.assertFalse(supervisor._should_resume(malformed))
+
+        executed = json.loads(json.dumps(result))
+        executed["context"]["experiment"]["metrics"] = [{
+            "id": "slope_difference", "value": -0.2,
+        }]
+        self.assertFalse(supervisor._should_resume(executed))
+
+    def test_supervisor_uses_topic_capability_not_study_id_for_result_veto(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            attempt_dir = root / "attempt-9"
+            package = attempt_dir / "output" / "results-package" / "results-package.json"
+            package.parent.mkdir(parents=True)
+            package.write_text(json.dumps({
+                "capability_id": "cap-b", "study_id": "study-b",
+                "observations": [{"value": 0.7}],
+            }))
+            workflow = {
+                "id": "topic-capability-result-veto",
+                "project_id": str(root / "project"),
+                "stages": [
+                    {"id": "topic", "kind": "topic_discovery", "depends_on": []},
+                    {"id": "experiment", "kind": "experiment", "depends_on": ["topic"]},
+                ],
+            }
+            supervisor = ComposerSupervisor(workflow)
+            result = {
+                "status": "blocked", "remaining_seconds": 3600,
+                "active_research_requests": [], "active_blockers": [],
+                "context": {
+                    "topic": {"topic": {
+                        "experiment_capability_id": "cap-b",
+                        "research_question": "Current lineage question",
+                    }},
+                    "experiment": {
+                        "status": "blocked", "failure_class": "model_contract",
+                        "failure_dossier_ref": (
+                            "artifact:command/composer/failure-recovery/experiment/attempt-9@1"),
+                        "format_recovery_dispatched": True,
+                        "error": (
+                            "capability foundry did not admit a program: program author response "
+                            "was incomplete (finish_reason=length): invalid JSON"),
+                        "study_id": "study-b",
+                        "project_dir": str(root / "older-attempt"),
+                        "results_package": "output/results-package/results-package.json",
+                        "failure_recovery": {
+                            "failure_class": "model_contract",
+                            "recovery_mode": "format_repair_then_rerun",
+                            "dossier_ref": (
+                                "artifact:command/composer/failure-recovery/experiment/attempt-9@1"),
+                            "model_diagnostics": {"repair_ledger": [{
+                                "validation_feedback": {
+                                    "gate": "adversarial_review", "decision": "rejected",
+                                    "findings": [{
+                                        "severity": "blocking",
+                                        "finding": "The claim is fixed by the equation.",
+                                        "evidence": "The down branch adds the only difference.",
+                                        "required_change": "Use an independent discriminating derivation.",
+                                    }],
+                                },
+                            }]},
+                        },
+                    },
+                },
+                "stages": {"experiment": {
+                    "status": "blocked",
+                    "attempts": [{
+                        "state": "failed", "failure_class": "model_contract",
+                        "attempt_number": 9, "project_dir": str(attempt_dir),
+                    }],
+                }},
+            }
+
+            self.assertFalse(supervisor._should_resume(result))
+
+    def test_current_provider_failure_resumes_actionable_work_despite_historical_quota(self):
+        supervisor = ComposerSupervisor({
+            "id": "historical-quota-does-not-stop-current-work",
+            "project_id": "/tmp/historical-quota-does-not-stop-current-work",
+        }, poll_seconds=0)
+        current_provider_failure = {
+            "stage_id": "survey", "attempt_number": 388,
+            "reason": "OpenAlex returned HTTP 504 (query_timeout)",
+            "failure_class": "provider_error",
+        }
+        stale_quota = {
+            "stage_id": "survey", "stop_reason": "stage_quota_exhausted",
+            "recovery": "superseded_by_current_stage_state",
+        }
+        self.assertTrue(supervisor._should_resume({
+            "status": "blocked",
+            "remaining_seconds": 3600,
+            "interim_report": {"stop_reason": "blocked"},
+            "active_blockers": [current_provider_failure],
+            "blockers": [stale_quota, current_provider_failure],
+            "active_research_requests": [{
+                "id": "survey-repair",
+                "objective": "Continue with a distinct search query after the provider timeout.",
+            }],
+        }))
+
+    def test_identical_failure_fingerprint_ignores_attempt_counter(self):
+        first = {
+            "status": "blocked", "stop_reason": "blocked", "stages": {
+                "argument": {"status": "blocked", "attempt_count": 10,
+                             "error": "argument attempt-10 failed: invalid JSON"},
+            },
+            "active_research_requests": [], "active_blockers": [],
+        }
+        second = {
+            **first,
+            "stages": {"argument": {"status": "blocked", "attempt_count": 11,
+                                      "error": "argument attempt-11 failed: invalid JSON"}},
+        }
+        from scisaurus.runtime.composer_supervisor import _result_fingerprint
+
+        self.assertEqual(_result_fingerprint(first), _result_fingerprint(second))
+
+    def test_revised_repair_policy_is_a_new_semantic_work_order(self):
+        from scisaurus.runtime.composer_supervisor import _research_request_fingerprint
+
+        prior = {
+            "kind": "recovery", "owner": "strategy.argument",
+            "objective": "Repair the argument response under the old contract.",
+            "success_condition": "Return a complete schema-valid argument.",
+            "repair_policy_revision": "character-limited-v0",
+        }
+        revised = {
+            **prior, "repair_policy_revision": "prose-without-character-ceilings-1",
+        }
+        self.assertNotEqual(
+            _research_request_fingerprint(prior),
+            _research_request_fingerprint(revised))
+
+    def test_changed_scoped_order_is_semantic_progress_but_echoed_order_stops(self):
+        supervisor = ComposerSupervisor({
+            "id": "semantic-progress-test", "project_id": "/tmp/semantic-progress",
+        }, poll_seconds=0)
+        request = {
+            "id": "repair-attempt-1", "kind": "additional_experiment",
+            "objective": "Recalculate the declared baseline from the retained data.",
+            "success_condition": "The independent calculation reproduces the reported value.",
+            "target_stage_id": "experiment",
+        }
+        base = {
+            "status": "blocked", "remaining_seconds": 3600,
+            "stages": {"experiment": {"status": "blocked", "attempt_count": 4,
+                                        "error": "experiment attempt-4 failed"}},
+            "active_research_requests": [request], "active_blockers": [],
+        }
+        from scisaurus.runtime.composer_supervisor import _result_fingerprint
+
+        self.assertTrue(supervisor._should_resume(base))
+        supervisor.identical_exit_count = 1
+        self.assertFalse(supervisor._should_resume(base))
+        changed = {
+            **base,
+            "active_research_requests": [{
+                **request, "id": "repair-attempt-5",
+                "objective": "Repair the sampling frame and rerun the paired analysis.",
+            }],
+        }
+        self.assertNotEqual(_result_fingerprint(base), _result_fingerprint(changed))
+
+    def test_watchdog_and_child_exception_recovery_are_bounded(self):
+        supervisor = ComposerSupervisor({
+            "id": "bounded-process-recovery-test", "project_id": "/tmp/bounded-recovery",
+        }, poll_seconds=0)
+        watchdog = {
+            "status": "blocked", "remaining_seconds": 3600,
+            "active_research_requests": [], "active_blockers": [{
+                "watchdog": True, "active_attempts": ["attempt-1"],
+                "stage_id": "experiment", "reason": "watchdog timeout",
+            }],
+        }
+        self.assertTrue(supervisor._should_resume(watchdog))
+        supervisor.identical_exit_count = 1
+        self.assertFalse(supervisor._should_resume(watchdog))
+        supervisor.identical_exit_count = 0
+        no_active_attempt = {
+            **watchdog,
+            "active_blockers": [{**watchdog["active_blockers"][0], "active_attempts": []}],
+        }
+        self.assertFalse(supervisor._should_resume(no_active_attempt))
+        recoverable_exception = {
+            "status": "blocked", "remaining_seconds": 3600,
+            "active_research_requests": [],
+            "active_blockers": [{"recoverable": True, "failure_class": "child_exception"}],
+        }
+        self.assertTrue(supervisor._should_resume(recoverable_exception))
+
+    def test_harness_bug_stops_automatic_retries_even_with_open_work_orders(self):
+        supervisor = ComposerSupervisor({
+            "id": "harness-bug-stop-test", "project_id": "/tmp/harness-bug-stop",
+        }, poll_seconds=0)
+        result = {
+            "status": "blocked", "remaining_seconds": 3600,
+            "active_blockers": [{
+                "stage_id": "experiment", "failure_class": "harness_bug",
+                "reason": "AttributeError: NoneType.get",
+            }],
+            "active_research_requests": [{
+                "id": "repair-order", "objective": "repair and rerun the experiment",
+            }],
+        }
+
+        self.assertFalse(supervisor._should_resume(result))
 
     def test_watchdog_bounds_unrepresentable_remaining_time_by_workflow_deadline(self):
         with tempfile.TemporaryDirectory() as path:
@@ -481,6 +857,28 @@ class ComposerSupervisorTests(unittest.TestCase):
                     for item in value["blockers"]
                 ))
 
+    def test_interrupted_checkpoint_does_not_relabel_older_run_reports(self):
+        with tempfile.TemporaryDirectory() as path:
+            project = Path(path) / "project"
+            output = project / "output"
+            output.mkdir(parents=True)
+            current = {"schema_version": "fixture", "status": "running",
+                       "run_id": "current", "blockers": []}
+            stale = {"schema_version": "fixture", "status": "completed",
+                     "run_id": "previous", "blockers": []}
+            (output / "progress.json").write_text(json.dumps(current))
+            (output / "run.json").write_text(json.dumps(stale))
+            (output / "interim_report.json").write_text(json.dumps(stale))
+            supervisor = ComposerSupervisor({
+                "id": "interrupt-stale-report-test", "project_id": str(project),
+            })
+            supervisor._mark_interrupted_checkpoint()
+            progress = json.loads((output / "progress.json").read_text())
+            self.assertEqual(progress["status"], "paused")
+            self.assertEqual(progress["phase"], "paused")
+            for name in ("run.json", "interim_report.json"):
+                self.assertEqual(json.loads((output / name).read_text()), stale)
+
     def test_restarts_from_durable_state_after_recoverable_exit(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -491,6 +889,11 @@ class ComposerSupervisorTests(unittest.TestCase):
                     "stages": {"topic": {"status": "blocked", "error": "scientific blocker"}},
                     "blockers": [{"stage_id": "topic", "reason": "scientific blocker"}],
                     "continuation_cycles": 1,
+                    "active_research_requests": [{
+                        "id": "topic-repair", "kind": "topic_refinement",
+                        "objective": "Refine the same phenomenon into a falsifiable question.",
+                        "target_stage_id": "topic",
+                    }],
                 },
                 {"status": "completed", "remaining_seconds": 10,
                  "stages": {}, "blockers": [], "continuation_cycles": 2},

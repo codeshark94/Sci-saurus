@@ -219,6 +219,12 @@ class OpenAlexFixture(BaseHTTPRequestHandler):
                 "message": ("Insufficient budget. This request costs $0.001 but you only have "
                             "$0.0007 remaining. Resets at midnight UTC."),
             }).encode()
+        elif mode == "query-timeout":
+            status, body = 504, json.dumps({
+                "error": "Gateway timeout",
+                "message": "Your query took too long and was stopped. Please narrow the query.",
+                "reason": "query_timeout",
+            }).encode()
         elif mode == "redirect":
             status, body = 302, b""
         elif mode == "malformed":
@@ -326,6 +332,23 @@ class TestOpenAlex(unittest.TestCase):
         self.assertEqual(OpenAlexFixture.rate_limit_count, 1)
         self.assertTrue(all(check["outcome"] == "passed" for check in self.inspect(result,
                                                                                        self.arguments("rate-limit-once"))))
+
+    def test_query_timeout_is_recorded_without_repeating_the_same_search(self):
+        arguments = self.arguments("reentrant jamming shear thickening down-sweep unjamming onset confinement gap")
+        before = len(OpenAlexFixture.requests)
+        result = self.client(max_retries=3).run(**{**arguments, "query": "query-timeout"})
+
+        self.assertEqual(result["outcome"], "provider_error")
+        self.assertEqual(result["metadata"]["http_status"], 504)
+        self.assertEqual(result["metadata"]["request"]["cursor"], None)
+        self.assertEqual(OpenAlexFixture.requests[before]["query"]["cursor"], ["*"])
+        self.assertEqual(len(OpenAlexFixture.requests) - before, 1)
+        self.assertEqual(result["metadata"]["attempts"], 1)
+        self.assertEqual(result["metadata"]["retry_suppressed_reason"],
+                         "query_timeout_requires_a_different_search")
+        self.assertEqual(result["raw_response"]["reason"], "query_timeout")
+        checks = self.inspect(result, {**arguments, "query": "query-timeout"}, representative=False)
+        self.assertTrue(all(check["outcome"] == "passed" for check in checks), checks)
 
     def test_rate_limit_cause_and_retry_budget_are_preserved(self):
         started = time.monotonic()

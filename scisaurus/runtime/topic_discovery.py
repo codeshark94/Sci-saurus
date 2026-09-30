@@ -245,6 +245,87 @@ EVIDENCE_MODE_INPUTS = {
     "controlled_measurement": {"new_measurement"},
 }
 
+SOURCE_OBSERVATION_MODES = {
+    "published_observations", "public_dataset", "controlled_measurement",
+}
+_SOURCE_DATA_USE_PATTERNS = (
+    re.compile(
+        r"\bdigitiz\w*|\bmeasured\s+(?:data|observations|trend)\b|"
+        r"\b(?:raw|source)\s+(?:observation|measurement|dataset)s?\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:published|reported|source|literature|paper|article|figure)"
+        r"\b[^.;]{0,100}\b(?:data|observations?|measurements?|values?|curve|trend|points?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:data|observations?|measurements?|values?|curve|trend|points?)\b"
+        r"[^.;]{0,100}\b(?:from|in|reported\s+by)\b[^.;]{0,50}"
+        r"\b(?:published|source|literature|paper|article|figure)\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def topic_requires_source_data(topic, *, additional_requirements=()):
+    """Return whether a topic needs empirical rows rather than literature context."""
+    topic = topic if isinstance(topic, dict) else {}
+    if topic.get("evidence_mode") in SOURCE_OBSERVATION_MODES:
+        return True
+    plan = topic.get("feasibility_plan")
+    evidence_inputs = plan.get("evidence_inputs", []) if isinstance(plan, dict) else []
+    if isinstance(evidence_inputs, list) and any(
+            isinstance(item, dict)
+            and item.get("kind") in {"public_dataset", "new_measurement", "external_service"}
+            for item in evidence_inputs):
+        return True
+    requirements = (additional_requirements
+                    if isinstance(additional_requirements, (list, tuple)) else ())
+    text = " ".join(str(value) for value in (
+        topic.get("research_question", ""), topic.get("scope", ""),
+        topic.get("data_regime", ""), topic.get("resource_plan", ""),
+        *requirements,
+    ))
+    return any(pattern.search(text) for pattern in _SOURCE_DATA_USE_PATTERNS)
+
+
+def scope_maturity_requirements_to_topic_evidence(
+        topic, requirements, *, evidence_boundary_changed=False):
+    """Separate empirical-data requests from requirements for a revised analytic study.
+
+    A reviewer requirement to digitize observations belongs to the empirical
+    estimand that produced it. When a refinement changes the evidence boundary
+    to a self-contained analytic or synthetic study, that request remains an
+    explicit validation limitation, but it is no longer an input dependency of
+    the new calculation.
+    """
+    if type(evidence_boundary_changed) is not bool:
+        raise ValidationError("evidence_boundary_changed must be boolean")
+    normalized = list(dict.fromkeys(
+        item.strip() for item in (requirements or [])
+        if isinstance(item, str) and item.strip()
+    )) if isinstance(requirements, (list, tuple)) else []
+    topic = topic if isinstance(topic, dict) else {}
+    plan = topic.get("feasibility_plan")
+    analytic_self_contained = (
+        topic.get("evidence_mode") in {"analytical_derivation", "synthetic_simulation"}
+        and isinstance(plan, dict)
+        and plan.get("experiment_input") == "self_contained"
+        and not topic_requires_source_data(topic)
+    )
+    if not evidence_boundary_changed or not analytic_self_contained:
+        return {"active": normalized, "out_of_scope": []}
+
+    active = []
+    out_of_scope = []
+    for requirement in normalized:
+        if topic_requires_source_data({}, additional_requirements=(requirement,)):
+            out_of_scope.append(requirement)
+        else:
+            active.append(requirement)
+    return {"active": active, "out_of_scope": out_of_scope}
+
 # These fields describe the epistemic shape of a candidate, not its subject
 # matter.  A diverse frontier seed list is insufficient when every candidate
 # is still a two-model simulation.  Keeping the vocabulary bounded makes the
@@ -373,7 +454,10 @@ TOPIC_SALVAGE_BRANCHES = (
         "id": "evidence-boundary",
         "goal": "change the evidence mode and study boundary to an independently testable question",
         "change_dimensions": ("evidence_mode", "research_form", "scope", "comparison_type"),
-        "dependent_dimensions": ("comparison", "data_regime", "measurement", "disconfirmation_test"),
+        "dependent_dimensions": (
+            "comparison", "data_regime", "measurement", "disconfirmation_test",
+            "theory_target", "experiment_capability_id",
+        ),
         "preserve": "only claims that remain supported after the new evidence boundary is applied",
     },
 )
@@ -603,7 +687,7 @@ _MODEL_CANDIDATE_FIELD_ALIASES = {
 
 
 _TOPIC_SEMANTIC_REJECTION_TYPES = frozenset({
-    "novelty", "source_challenge", "maturity", "feasibility", "refinement",
+    "novelty", "source_challenge", "maturity", "refinement",
 })
 
 
@@ -641,12 +725,12 @@ def _topic_validation_rejection_type(error):
                 "required_executables",
                 "must include feasibility_plan", "requires feasibility_plan",
             ))):
-        # The direction cannot enter the configured execution boundary as
-        # declared. This is candidate-level negative evidence, not a generic
-        # JSON formatting failure: retain its signature so the Composer can
-        # pivot rather than spend the intake budget regenerating it unchanged.
-        return "feasibility"
+        # A malformed or unsupported execution inventory is a repairable
+        # contract defect. It says nothing about whether the scientific
+        # question is feasible after the plan is corrected.
+        return "feasibility_contract"
     if any(marker in text for marker in (
+            "must materially change at least one of its assigned dimensions",
             "must materially change at least two of its assigned dimensions",
             "changed dimensions outside its assigned repair scope",
     )):
@@ -715,13 +799,26 @@ def _topic_retry_reason(error, candidate_attempt_trace, rejected_topic_history):
     if ("model call failed" in text
             or ("provider" in text and "failed" in text)):
         return None
+    # A candidate may have failed a real novelty check, but returning the
+    # byte-identical rejected answer after an explicit repair is a response
+    # contract failure. It is not new evidence that the underlying topic
+    # should pivot again.
+    if any(isinstance(trace, dict) and trace.get("status") == "repeated_response"
+           for trace in candidate_attempt_trace or []):
+        return "intake_contract_failure"
     direct_type = _topic_validation_rejection_type(error)
+    if direct_type == "feasibility_contract":
+        return "intake_contract_failure"
+    if direct_type == "refinement_contract":
+        return "refinement_contract_failure"
     if direct_type in _TOPIC_SEMANTIC_REJECTION_TYPES:
         return "scientific_candidate_rejected"
     for trace in reversed(candidate_attempt_trace or []):
         if not isinstance(trace, dict):
             continue
         trace_type = trace.get("rejection_type")
+        if trace_type == "refinement_contract":
+            return "refinement_contract_failure"
         if trace_type in _TOPIC_SEMANTIC_REJECTION_TYPES:
             return "scientific_candidate_rejected"
         if trace.get("status") in {
@@ -2175,10 +2272,10 @@ def validate_topic_refinement(parent, candidate, *, require_structural_pivot=Fal
         branch_dimensions = set(branch_spec["change_dimensions"])
         dependent_dimensions = set(branch_spec.get("dependent_dimensions", ()))
         branch_changes = set(changed).intersection(branch_dimensions)
-        if len(branch_changes) < 2:
+        if not branch_changes:
             raise ValidationError(
                 "topic salvage branch " + branch_id
-                + " must materially change at least two of its assigned dimensions: "
+                + " must materially change at least one of its assigned dimensions: "
                 + ", ".join(branch_spec["change_dimensions"]))
         unexpected_changes = (
             set(changed) - branch_dimensions - dependent_dimensions - {"research_question"})
@@ -2375,7 +2472,18 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
             _repair_feasibility_input_statuses({"candidates": [candidate]})
             _repair_feasibility_input_duplicates({"candidates": [candidate]})
             _repair_feasibility_input_contract({"candidates": [candidate]}, {})
-            validate_feasibility_plan(candidate["feasibility_plan"])
+            plan = validate_feasibility_plan(candidate["feasibility_plan"])
+            if (candidate.get("evidence_mode") in SOURCE_OBSERVATION_MODES
+                    and plan.get("experiment_input") == "self_contained"):
+                raise ValidationError(
+                    "feasibility_plan marks the experiment self_contained while evidence_mode "
+                    "requires published, dataset, or measured observations; provide controller-verified "
+                    "source rows or reformulate to analytical/synthetic evidence")
+            if (plan.get("experiment_input") == "self_contained"
+                    and topic_requires_source_data(candidate)):
+                raise ValidationError(
+                    "self_contained feasibility cannot fit published observations or consume "
+                    "digitized or measured source data without a controller-verified source-data input")
         if capability_ids:
             selected_capability = candidate.get("experiment_capability_id")
             if not isinstance(selected_capability, str) or selected_capability not in capability_ids:
@@ -3021,7 +3129,9 @@ def _grounding_eligible_frontier_seeds(frontier_seeds, recent_papers, candidate_
 def _parent_focused_refinement_inputs(refinement_context):
     """Reuse the selected topic's evidence instead of reseeding unrelated fields."""
     if (not isinstance(refinement_context, dict)
-            or refinement_context.get("mode") != "refinement"):
+            or refinement_context.get("mode") not in {
+                "refinement", "runtime_feasibility_revalidation",
+            }):
         return None
     parent = refinement_context.get("parent_topic")
     evidence = refinement_context.get("parent_evidence")
@@ -4106,7 +4216,9 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "candidate prose is reader-facing: do not use the words frozen, validator, accepted artifact, model calls, release candidate, or SHA-256; say prespecified or independent recalculation where scientifically appropriate",
     ]
     if (isinstance(refinement_context, dict)
-            and refinement_context.get("mode") == "refinement"
+            and refinement_context.get("mode") in {
+                "refinement", "runtime_feasibility_revalidation",
+            }
             and isinstance(refinement_context.get("parent_topic"), dict)):
         parent = refinement_context["parent_topic"]
         phenomenon = parent.get("phenomenon") or parent.get("title")
@@ -4560,7 +4672,8 @@ def _refinement_target_seed(frontier_seeds, recent_papers, parent_seed_id,
 def _topic_candidate_refinement_prompt(objective, parent_candidate, *,
                                        base_package, target_shape, target_seed,
                                        frontier_seeds, recent_papers, runtime_context,
-                                       refinement_feedback):
+                                       refinement_feedback,
+                                       same_question_feasibility_repair=False):
     """Build a compact contract for repairing only the rejected selection."""
     def reader_projection(value):
         if isinstance(value, dict):
@@ -4629,9 +4742,33 @@ def _topic_candidate_refinement_prompt(objective, parent_candidate, *,
         "frontier_seed_id": "copy target_frontier_seed_id exactly",
         "prior_work_ids": "one to three work_id values from target_seed_records only",
     }
+    if same_question_feasibility_repair:
+        for field in (
+                "id", "title", "domain", "research_question", "research_form",
+                "evidence_mode", "comparison_type", "phenomenon", "mechanism",
+                "data_regime", "comparison", "measurement", "theory_target", "scope",
+                "search_queries", "why_promising", "disconfirmation_test",
+                "disconfirmation_test_note"):
+            if field in candidate_contract:
+                candidate_contract[field] = f"copy parent_candidate.{field} exactly"
+        candidate_contract["domain"] = "copy parent_candidate.domain exactly"
+        if isinstance(parent_candidate.get("frontier_seed_id"), str):
+            candidate_contract["frontier_seed_id"] = (
+                "copy parent_candidate.frontier_seed_id exactly")
+        else:
+            candidate_contract["frontier_seed_id"] = (
+                "omit unless target_seed_records provide verifiable provenance")
+        if isinstance(parent_candidate.get("prior_work_ids"), list):
+            candidate_contract["prior_work_ids"] = (
+                "copy parent_candidate.prior_work_ids exactly")
+        else:
+            candidate_contract["prior_work_ids"] = (
+                "omit unless target_seed_records provide verifiable provenance")
     if catalog:
         candidate_contract["experiment_capability_id"] = (
-            "copy the parent candidate's exact experiment_capability_id")
+            "select a runtime-compatible catalog capability only if the existing one is infeasible"
+            if same_question_feasibility_repair
+            else "copy the parent candidate's exact experiment_capability_id")
         design_ids = {
             item.get("id") for item in catalog
             if isinstance(item, dict) and item.get("design_driven")
@@ -4639,9 +4776,15 @@ def _topic_candidate_refinement_prompt(objective, parent_candidate, *,
         parent_capability = parent_candidate.get("experiment_capability_id")
         if parent_capability in design_ids:
             candidate_contract["experiment_design"] = (
-                "copy the parent's valid bounded design and change only values allowed by its template")
+                "choose a valid design for the selected capability and change only values allowed by its template"
+                if same_question_feasibility_repair
+                else "copy the parent's valid bounded design and change only values allowed by its template")
     payload = {
-        "assignment": "repair_selected_topic_candidate",
+        "assignment": (
+            "repair_runtime_feasibility_without_changing_question"
+            if same_question_feasibility_repair
+            else "repair_selected_topic_candidate"
+        ),
         "principal_objective": objective,
         "candidate_id_to_copy_exactly": parent_candidate.get("id"),
         "parent_candidate": parent_projection,
@@ -4664,7 +4807,16 @@ def _topic_candidate_refinement_prompt(objective, parent_candidate, *,
         "output_contract": {
             "candidate": candidate_contract,
         },
-        "constraints": [
+        "constraints": ([
+            "Return exactly one object with exactly one top-level key: candidate.",
+            "Copy the candidate id exactly; do not create a new id or return package metadata.",
+            "This is a technical feasibility-plan repair, not a scientific review or topic pivot.",
+            "Preserve every supplied research-identity field exactly, including the research question, phenomenon, mechanism, comparison, measurement, evidence mode, and research form.",
+            "Only feasibility, feasibility_plan, resource_plan, and execution-capability fields may change; do not weaken or replace the admitted scientific claim to fit a runtime limitation.",
+            "Copy required_shape exactly from the parent and preserve its frontier evidence. Do not add unsupported data, software, equipment, citations, or results.",
+            "If no honest executable plan exists for the unchanged question, retain the question and state the precise unavailable requirement in feasibility_plan; do not invent a substitute topic.",
+            "Return only the JSON object with no markdown or explanation.",
+        ] if same_question_feasibility_repair else [
             "Return exactly one object with exactly one top-level key: candidate.",
             "Copy the candidate id exactly; do not create a new id and do not return package metadata.",
             "Keep the phenomenon field identical to the parent and name its core system in the research question. Change the question's testable boundary, mechanism, comparator, observable, evidence mode, or claim scope without changing the phenomenon.",
@@ -4678,10 +4830,11 @@ def _topic_candidate_refinement_prompt(objective, parent_candidate, *,
             "Do not include capability_requirements unless it is a complete object copied from the parent.",
             "Use only literal keys listed in output_contract.candidate; omit aliases such as mechanism_boundary or disconfirmation_test_note_optional and put boundary detail in data_regime or theory_target.",
             "Return only the JSON object with no markdown or explanation.",
-        ],
+        ]),
     }
     retained_phenomenon = parent_candidate.get("phenomenon")
-    if isinstance(retained_phenomenon, str) and retained_phenomenon.strip():
+    if (not same_question_feasibility_repair
+            and isinstance(retained_phenomenon, str) and retained_phenomenon.strip()):
         payload["constraints"].insert(
             2,
             "Explicitly name the parent's specific system and setting in research_question: "
@@ -4818,6 +4971,13 @@ def _maturity_review_prompt(objective, package, *, refinement_context=None,
             "do_not_reward_feasibility_alone": True,
             "require_structural_pivot_on_refine": require_structural_pivot,
         },
+        "evidence_scope_rule": (
+            "Judge the declared estimand and evidence mode. Do not require digitized or measured rows "
+            "for a self-contained analytical or synthetic result unless the question claims to fit, "
+            "estimate, or validate an observed trend. For a model-only result, require explicit "
+            "equations, parameter provenance, sensitivity or recovery checks, and a bounded statement "
+            "that does not imply empirical validation."
+        ),
         "output_constraints": [
             "Return exactly one JSON object with exactly the six keys in output_contract.",
             "Do not echo assignment, dimensions, score_scale, admission_rule, topic_package, or any other metadata.",
@@ -5310,8 +5470,14 @@ class TopicDiscoveryRunner:
             raise ValidationError("topic discovery refinement_context must be an object when supplied")
         has_parent_refinement = (
             isinstance(refinement_context, dict)
-            and refinement_context.get("mode") == "refinement"
+            and refinement_context.get("mode") in {
+                "refinement", "runtime_feasibility_revalidation",
+            }
             and isinstance(refinement_context.get("parent_topic"), dict)
+        )
+        same_question_feasibility_repair = (
+            isinstance(refinement_context, dict)
+            and refinement_context.get("mode") == "runtime_feasibility_revalidation"
         )
         single_parent_refinement = (
             has_parent_refinement
@@ -5344,10 +5510,16 @@ class TopicDiscoveryRunner:
         sampling_trace = []
         frontier_seed_plan = None
         focused_refinement = _parent_focused_refinement_inputs(refinement_context)
+        if same_question_feasibility_repair and focused_refinement is None:
+            raise ValidationError(
+                "same-question feasibility revalidation requires the retained topic's "
+                "scientific identity and provenance; preserve the checkpoint and repair "
+                "that technical context before dispatch")
         if focused_refinement is not None:
             frontier_seed_plan, focused_papers = focused_refinement
             recent_papers = focused_papers
-        if bibliography is not False and not recent_papers:
+        if (bibliography is not False and not recent_papers
+                and not same_question_feasibility_repair):
             # Do not spend a proposal call when the next literature request is
             # already fenced by the shared account ledger. The fake clients
             # used by offline tests need not implement this optional method.
@@ -5417,39 +5589,49 @@ class TopicDiscoveryRunner:
         if single_parent_refinement:
             work_orders = refinement_context.get("work_orders")
             work_orders = work_orders if isinstance(work_orders, list) else []
-            feedback = refinement_context.get("refinement_feedback")
-            refinement_feedback = deepcopy(feedback) if isinstance(feedback, dict) else {}
-            refinement_feedback.setdefault(
-                "review_type", "composer_scoped_parent_refinement")
-            if not refinement_feedback.get("rationale"):
-                refinement_feedback["rationale"] = str(
-                    refinement_context.get("reason")
-                    or "The retained topic needs a source-grounded, testable refinement.")[:2200]
-            required_changes = list(refinement_feedback.get("required_changes", []))
-            for order in work_orders[:4]:
-                if not isinstance(order, dict):
-                    continue
-                detail = " ".join(
-                    str(order.get(key) or "").strip()
-                    for key in ("objective", "success_condition", "evidence_needed")
-                    if str(order.get(key) or "").strip()
-                )
-                if detail:
-                    required_changes.append(detail[:1800])
-            survey_feedback = refinement_context.get("survey_feedback")
-            if isinstance(survey_feedback, dict):
-                gap_state = survey_feedback.get("gap_state")
-                nomination = survey_feedback.get("nomination")
-                if gap_state or nomination:
-                    required_changes.append(
-                        "Use the retained survey decision: "
-                        + json.dumps({"gap_state": gap_state, "nomination": nomination},
-                                     ensure_ascii=False, sort_keys=True)[:1800]
+            if same_question_feasibility_repair:
+                refinement_feedback = {
+                    "review_type": "runtime_feasibility_revalidation",
+                    "rationale": str(refinement_context.get("reason") or
+                                     "The execution plan needs a current feasibility record.")[:2200],
+                    "required_changes": [
+                        "Repair only the machine-readable execution-feasibility plan while preserving the admitted research question and all scientific identity fields exactly."
+                    ],
+                }
+            else:
+                feedback = refinement_context.get("refinement_feedback")
+                refinement_feedback = deepcopy(feedback) if isinstance(feedback, dict) else {}
+                refinement_feedback.setdefault(
+                    "review_type", "composer_scoped_parent_refinement")
+                if not refinement_feedback.get("rationale"):
+                    refinement_feedback["rationale"] = str(
+                        refinement_context.get("reason")
+                        or "The retained topic needs a source-grounded, testable refinement.")[:2200]
+                required_changes = list(refinement_feedback.get("required_changes", []))
+                for order in work_orders[:4]:
+                    if not isinstance(order, dict):
+                        continue
+                    detail = " ".join(
+                        str(order.get(key) or "").strip()
+                        for key in ("objective", "success_condition", "evidence_needed")
+                        if str(order.get(key) or "").strip()
                     )
-            refinement_feedback["required_changes"] = list(dict.fromkeys(
-                str(item).strip() for item in required_changes
-                if isinstance(item, str) and item.strip()
-            ))[:8]
+                    if detail:
+                        required_changes.append(detail[:1800])
+                survey_feedback = refinement_context.get("survey_feedback")
+                if isinstance(survey_feedback, dict):
+                    gap_state = survey_feedback.get("gap_state")
+                    nomination = survey_feedback.get("nomination")
+                    if gap_state or nomination:
+                        required_changes.append(
+                            "Use the retained survey decision: "
+                            + json.dumps({"gap_state": gap_state, "nomination": nomination},
+                                         ensure_ascii=False, sort_keys=True)[:1800]
+                        )
+                refinement_feedback["required_changes"] = list(dict.fromkeys(
+                    str(item).strip() for item in required_changes
+                    if isinstance(item, str) and item.strip()
+                ))[:8]
             refinement_base_package = {
                 "schema_version": SCHEMA_VERSION,
                 "objective": objective,
@@ -5496,6 +5678,23 @@ class TopicDiscoveryRunner:
                            maturity_open_requirements=None,
                            maturity_review_error=None):
             """Assemble one admitted topic without duplicating gate semantics."""
+            retained_admission = {}
+            if same_question_feasibility_repair:
+                evidence = refinement_context.get("parent_evidence")
+                evidence = evidence if isinstance(evidence, dict) else {}
+                retained_admission = evidence.get("retained_admission")
+                retained_admission = (
+                    retained_admission if isinstance(retained_admission, dict) else {})
+                if not candidate_prior_work:
+                    candidate_prior_work = deepcopy(
+                        evidence.get("candidate_prior_work", []))
+                if not candidate_sampling_trace:
+                    candidate_sampling_trace = deepcopy(
+                        retained_admission.get("candidate_sampling_trace", []))
+                if source_challenge is None:
+                    source_challenge = deepcopy(evidence.get("source_challenge"))
+                admission_state = retained_admission.get(
+                    "admission_state", admission_state)
             output = {
                 **package,
                 "status": "completed",
@@ -5518,6 +5717,12 @@ class TopicDiscoveryRunner:
                 "usage": usage,
                 "budget": budget.snapshot(),
             }
+            if same_question_feasibility_repair:
+                for key, value in retained_admission.items():
+                    if key not in {
+                            "source_challenge", "candidate_prior_work",
+                            "candidate_sampling_trace"}:
+                        output[key] = deepcopy(value)
             if review is not None:
                 output.update({
                     "maturity_reviews": deepcopy(maturity_reviews),
@@ -5531,13 +5736,36 @@ class TopicDiscoveryRunner:
                 )
                 if isinstance(maturity_open_requirements, list):
                     requirements = [*maturity_open_requirements, *requirements]
+                changed_dimensions = set(evolution_dimensions or [])
+                if has_parent_refinement:
+                    changed_dimensions.update(refinement_changed_dimensions or [])
+                requirement_scope = scope_maturity_requirements_to_topic_evidence(
+                    selected,
+                    requirements,
+                    evidence_boundary_changed=bool(
+                        has_parent_refinement
+                        and changed_dimensions.intersection({
+                            "evidence_mode", "data_regime", "measurement",
+                        })
+                    ),
+                )
                 output.update({
                     "admission_state": admission_state,
-                    "maturity_open_requirements": list(dict.fromkeys(
-                        str(item).strip() for item in requirements if str(item).strip()
-                    ))[:8],
+                    "maturity_open_requirements": requirement_scope["active"][:8],
                     "next_evidence_action": "literature_survey",
                 })
+                if requirement_scope["out_of_scope"]:
+                    output["maturity_requirement_dispositions"] = [
+                        {
+                            "requirement": item,
+                            "disposition": "empirical_validation_limit",
+                            "reason": (
+                                "The refined estimand is self-contained analytical/synthetic work; "
+                                "retain this as a limit on empirical claims, not as an input to the calculation."
+                            ),
+                        }
+                        for item in requirement_scope["out_of_scope"][:8]
+                    ]
                 if isinstance(maturity_review_error, str) and maturity_review_error.strip():
                     output["maturity_review_error"] = maturity_review_error[:2048]
             if refinement_context:
@@ -5545,6 +5773,8 @@ class TopicDiscoveryRunner:
                 response_contract_only = (
                     refinement_context.get("mode") == "response_contract_repair")
                 evolution_mode = (
+                    "feasibility_revalidation" if same_question_feasibility_repair
+                    else
                     "refinement" if has_parent_refinement
                     else "response_contract_repair"
                     if response_contract_only and parent_topic_id == selected.get("id")
@@ -5556,7 +5786,7 @@ class TopicDiscoveryRunner:
                         list(evolution_dimensions or [])
                         + list(refinement_changed_dimensions or [])
                     )) or list(refinement_context.get("changed_dimensions", []))
-                    if has_parent_refinement else []
+                    if has_parent_refinement and not same_question_feasibility_repair else []
                 )
                 evolution_reason = refinement_context.get("reason")
                 if not isinstance(evolution_reason, str) or not evolution_reason.strip():
@@ -5621,8 +5851,8 @@ class TopicDiscoveryRunner:
                 instruction += (
                     f" This is bounded salvage branch {active.get('id')}: "
                     f"{active.get('goal', '')}. Preserve the supported parent core, "
-                    "make the branch observable in the candidate, and change at least "
-                    "two of these dimensions: "
+                    "make the branch observable in the candidate, and materially change "
+                    "at least one of these dimensions: "
                     + ", ".join(str(item) for item in active.get("change_dimensions", []))
                     + ". Supporting fields may change only as needed for internal consistency: "
                     + ", ".join(str(item) for item in active.get(
@@ -5631,12 +5861,13 @@ class TopicDiscoveryRunner:
                 )
                 validation_error = str(payload.get("validation_error") or "").casefold()
                 if any(marker in validation_error for marker in (
+                        "must materially change at least one of its assigned dimensions",
                         "must materially change at least two of its assigned dimensions",
                         "changed dimensions outside its assigned repair scope",
                 )):
                     repair = (
                         " This is a scoped-response contract correction, not a scientific rejection. "
-                        "Keep the parent phenomenon and candidate id. Make at least two substantive "
+                        "Keep the parent phenomenon and candidate id. Make at least one substantive "
                         "changes among this branch's change_dimensions. Restore every field named as "
                         "outside the assigned repair scope to its parent value unless it is explicitly "
                         "listed as a dependent_dimension. Change dependent fields only when needed for "
@@ -5676,29 +5907,55 @@ class TopicDiscoveryRunner:
             if (refinement_feedback is not None
                     and refinement_base_package is not None
                     and refinement_parent is not None):
-                target_shape = _refinement_target_shape(
-                    refinement_base_package,
-                    refinement_parent.get("id"),
-                    runtime_context,
-                    seed=((generation_seed + 7919) % MAX_PROVIDER_SEED
-                          if generation_seed is not None else None),
-                    salvage_plan=(refinement_context.get("salvage_plan")
-                                  if isinstance(refinement_context, dict) else None),
-                )
-                target_seed = _refinement_target_seed(
-                    candidate_frontier_seeds,
-                    recent_papers,
-                    refinement_parent.get("frontier_seed_id"),
-                    refinement_feedback,
-                    sampling_seed=((generation_seed + 104729) % MAX_PROVIDER_SEED
-                                   if generation_seed is not None else None),
-                    occupied_seed_ids={
-                        item.get("frontier_seed_id")
-                        for item in (refinement_base_package.get("candidates") or [])
-                        if isinstance(item, dict)
-                        and item.get("id") != refinement_parent.get("id")
-                    },
-                )
+                if same_question_feasibility_repair:
+                    target_shape = {
+                        field: refinement_parent.get(field)
+                        for field in PORTFOLIO_DIMENSIONS
+                    }
+                    parent_seed = refinement_parent.get("frontier_seed_id")
+                    if not isinstance(parent_seed, str) or not parent_seed.strip():
+                        parent_seed = next((
+                            item.get("id") for item in candidate_frontier_seeds
+                            if isinstance(item, dict)
+                            and isinstance(item.get("id"), str)
+                            and item.get("id").strip()
+                        ), None)
+                    target_seed = (
+                        {"target_seed_id": parent_seed,
+                         "eligible_seed_ids": [parent_seed],
+                         "target_work_ids": [
+                             item["work_id"] for item in recent_papers
+                             if isinstance(item, dict)
+                             and item.get("frontier_seed_id") == parent_seed
+                             and isinstance(item.get("work_id"), str)
+                         ][:5]}
+                        if isinstance(parent_seed, str) and parent_seed.strip()
+                        else None
+                    )
+                else:
+                    target_shape = _refinement_target_shape(
+                        refinement_base_package,
+                        refinement_parent.get("id"),
+                        runtime_context,
+                        seed=((generation_seed + 7919) % MAX_PROVIDER_SEED
+                              if generation_seed is not None else None),
+                        salvage_plan=(refinement_context.get("salvage_plan")
+                                      if isinstance(refinement_context, dict) else None),
+                    )
+                    target_seed = _refinement_target_seed(
+                        candidate_frontier_seeds,
+                        recent_papers,
+                        refinement_parent.get("frontier_seed_id"),
+                        refinement_feedback,
+                        sampling_seed=((generation_seed + 104729) % MAX_PROVIDER_SEED
+                                       if generation_seed is not None else None),
+                        occupied_seed_ids={
+                            item.get("frontier_seed_id")
+                            for item in (refinement_base_package.get("candidates") or [])
+                            if isinstance(item, dict)
+                            and item.get("id") != refinement_parent.get("id")
+                        },
+                    )
                 if target_shape is not None and target_seed is not None:
                     single_candidate_refinement = True
                     refinement_payload = json.loads(
@@ -5712,6 +5969,8 @@ class TopicDiscoveryRunner:
                             recent_papers=recent_papers,
                             runtime_context=prompt_runtime_context,
                             refinement_feedback=refinement_feedback,
+                            same_question_feasibility_repair=(
+                                same_question_feasibility_repair),
                         )
                     )
                     if single_parent_refinement:
@@ -5763,6 +6022,10 @@ class TopicDiscoveryRunner:
                     apply_salvage_prompt(refinement_payload)
                     prompt = json.dumps(
                         refinement_payload, ensure_ascii=False, sort_keys=True)
+                elif same_question_feasibility_repair:
+                    raise ValidationError(
+                        "same-question feasibility revalidation cannot be admitted without "
+                        "the retained frontier identity; do not start fresh topic discovery")
                 elif single_parent_refinement or source_refinement_count > 0:
                     missing = []
                     if target_shape is None:
@@ -6258,15 +6521,11 @@ class TopicDiscoveryRunner:
                     consecutive_refinement_contract_rejections += 1
                 else:
                     consecutive_refinement_contract_rejections = 0
-                if (rejection_type == "feasibility"
+                if (rejection_type == "feasibility_contract"
                         or (rejection_type == "novelty" and attempt_record is None)):
-                    # An infeasible execution boundary cannot be repaired by
-                    # resampling the same candidate, and a novelty error raised
-                    # before a complete candidate is recorded has no reliable
-                    # scientific direction to feed back. Once a concrete
-                    # candidate exists, novelty is repairable within this
-                    # bounded intake: the next prompt receives its rejection
-                    # and the exact-response guard prevents a duplicate call.
+                    # A failed plan repair must not replace the scientific
+                    # direction with a different portfolio. Surface the
+                    # contract failure for a same-question repair boundary.
                     break
                 if (rejection_type == "novelty"
                         and consecutive_novelty_rejections
@@ -6310,7 +6569,7 @@ class TopicDiscoveryRunner:
                         outcome_known=True))
                 consecutive_novelty_rejections = 0
                 consecutive_refinement_contract_rejections = 0
-                if (rejection_type == "feasibility"
+                if (rejection_type == "feasibility_contract"
                         or (rejection_type == "novelty" and attempt_record is None)):
                     break
                 continue
@@ -6322,7 +6581,9 @@ class TopicDiscoveryRunner:
                 refinement_changed_dimensions = (
                     validate_topic_refinement(
                         refinement_parent or refinement_anchor, selected,
-                        require_structural_pivot=frontier_seed_plan is not None,
+                        require_structural_pivot=(
+                            frontier_seed_plan is not None
+                            and not same_question_feasibility_repair),
                         require_frontier_seed_pivot=(
                             isinstance(refinement_feedback, dict)
                             and refinement_feedback.get("require_frontier_seed_pivot") is True
@@ -6372,7 +6633,7 @@ class TopicDiscoveryRunner:
             candidate_prior_work = []
             source_challenge = None
             candidate_sampling_trace = []
-            if bibliography is not False:
+            if bibliography is not False and not same_question_feasibility_repair:
                 try:
                     targeted = {
                         "schema_version": FRONTIER_SEED_SCHEMA_VERSION,
@@ -6454,7 +6715,7 @@ class TopicDiscoveryRunner:
                     refinement_base_package = deepcopy(package)
                     previous = None
                     continue
-            if maturity_review_rounds:
+            if maturity_review_rounds and not same_question_feasibility_repair:
                 review_seed = ((generation_seed if generation_seed is not None else 0)
                                + 104729 * (attempt + 1)) % MAX_PROVIDER_SEED
                 review = None

@@ -29,7 +29,7 @@ from scisaurus.runtime.models import (
     ModelCallError, ModelClient, ModelResult, effective_model_timeout,
     model_call_budget_available,
     is_local_qwen_route, model_context_error, model_provider_quota_scope,
-    role_routes_for, resolve_model_config,
+    MODEL_CONTINUATION_INSTRUCTION, role_routes_for, resolve_model_config,
     with_runtime_cooldown_fallback,
 )
 from scisaurus.runtime.literature import ProviderCooldownError
@@ -105,7 +105,12 @@ def _invoke_worker(kind, params, channel):
             client = ModelClient(**resolve_model_config(
                 params["client"], role=params.get("role"),
                 overrides=params.get("sampling_overrides")))
-            result = asdict(client.complete(system=SYSTEM, prompt=params["prompt"], images=params.get("images")))
+            result = asdict(_complete_model_with_continuation(
+                client, system=SYSTEM, prompt=params["prompt"],
+                images=params.get("images"),
+                initial_prefix=params.get("continuation_text"),
+                journal_path=params.get("_continuation_journal_path"),
+            ))
         elif kind == "crossref":
             from scisaurus.runtime.retrieval import CrossrefClient
             result = CrossrefClient(**params["client"]).search(params["query"], limit=params["limit"])
@@ -125,13 +130,120 @@ def _invoke_worker(kind, params, channel):
             raise ValueError("unknown operation")
         channel.put({"ok": True, "result": result})
     except Exception as exc:
-        payload = {"ok": False, "error": str(exc), "error_type": type(exc).__name__,
-                   "outcome_known": bool(getattr(exc, "outcome_known", kind != "model"))}
-        for key in ("status_code", "retry_after_seconds"):
-            value = getattr(exc, key, None)
-            if value is not None:
-                payload[key] = value
+        payload = _worker_error_payload(exc, kind)
+        journal_path = params.get("_continuation_journal_path")
+        if isinstance(journal_path, str) and Path(journal_path).is_file():
+            payload["partial_output_journal_path"] = journal_path
         channel.put(payload)
+
+
+def _complete_model_with_continuation(client, *, system, prompt, images=None,
+                                      initial_prefix=None, journal_path=None,
+                                      max_continuations=16):
+    """Continue truncated model output without replaying the original request.
+
+    Every suffix request is a real provider call: ``ModelClient`` reserves its
+    own model-call budget, and the returned usage is accumulated for the parent
+    execution task. The durable journal preserves completed chunks if a later
+    suffix call is interrupted or rate-limited.
+    """
+    if type(max_continuations) is not int or max_continuations < 0:
+        raise ValueError("max_continuations must be a non-negative integer")
+    segments = []
+    usage = {}
+    elapsed_seconds = 0.0
+    request_attempts = 0
+    complete_text = initial_prefix or ""
+
+    def persist(status, *, finish_reason=None, error=None):
+        if not isinstance(journal_path, str) or not journal_path:
+            return
+        body = canonical_bytes({
+            "schema_version": "model-continuation-journal-1",
+            "status": status,
+            "model": segments[-1]["model"] if segments else client.model,
+            "initial_prefix_chars": len(initial_prefix or ""),
+            "initial_prefix_sha256": (
+                hashlib.sha256(initial_prefix.encode("utf-8")).hexdigest()
+                if initial_prefix else None
+            ),
+            "finish_reason": finish_reason,
+            "segments": segments,
+            "response": complete_text,
+            "response_sha256": hashlib.sha256(
+                complete_text.encode("utf-8")).hexdigest(),
+            "usage": usage,
+            "elapsed_seconds": elapsed_seconds,
+            "request_attempts": request_attempts,
+            "error": error,
+        })
+        path = Path(journal_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+
+    call_kwargs = {"system": system, "prompt": prompt, "images": images}
+    if initial_prefix is not None:
+        if not isinstance(initial_prefix, str) or not initial_prefix:
+            raise ValidationError("continuation_text must be nonempty when supplied")
+        call_kwargs["continuation_text"] = initial_prefix
+    result = client.complete(**call_kwargs)
+    calls = 0
+    while True:
+        segment = result.text or ""
+        complete_text += segment
+        calls += 1
+        segments.append({
+            "call": calls,
+            "model": result.model,
+            "finish_reason": result.finish_reason,
+            "response": segment,
+            "response_sha256": hashlib.sha256(segment.encode("utf-8")).hexdigest(),
+            "usage": result.usage,
+        })
+        for key, value in result.usage.items():
+            if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                usage[key] = usage.get(key, 0) + value
+        elapsed_seconds += result.elapsed_seconds
+        request_attempts += result.request_attempts
+        if result.finish_reason != "length" or calls > max_continuations:
+            break
+        if not segment:
+            persist("incomplete", finish_reason="length",
+                    error="provider returned an empty truncated response")
+            return ModelResult(
+                text=complete_text, model=result.model, usage=usage,
+                elapsed_seconds=elapsed_seconds, finish_reason="length",
+                request_attempts=request_attempts,
+            )
+        persist("continuing", finish_reason=result.finish_reason)
+        result = client.complete(
+            system=system, prompt=prompt, images=images,
+            continuation_text=complete_text,
+        )
+    status = "completed" if result.finish_reason == "stop" else "incomplete"
+    persist(status, finish_reason=result.finish_reason)
+    return ModelResult(
+        text=complete_text, model=result.model, usage=usage,
+        elapsed_seconds=elapsed_seconds, finish_reason=result.finish_reason,
+        request_attempts=request_attempts,
+    )
+
+
+def _worker_error_payload(exc, kind):
+    """Serialize typed provider failure details across the worker boundary."""
+    payload = {"ok": False, "error": str(exc), "error_type": type(exc).__name__,
+               "outcome_known": bool(getattr(exc, "outcome_known", kind != "model"))}
+    for key in ("status_code", "retry_after_seconds", "provider_error_kind",
+                "attempts", "elapsed_seconds"):
+        value = getattr(exc, key, None)
+        if value is not None:
+            payload[key] = value
+    return payload
 
 
 def _worker_entry(worker_target, kind, params, channel):
@@ -140,8 +252,7 @@ def _worker_entry(worker_target, kind, params, channel):
     try:
         worker_target(kind, params, channel)
     except Exception as exc:
-        channel.put({"ok": False, "error": f"{type(exc).__name__}: {exc}",
-                     "outcome_known": bool(getattr(exc, "outcome_known", kind != "model"))})
+        channel.put(_worker_error_payload(exc, kind))
 
 
 class ExecutionRuntime:
@@ -220,14 +331,13 @@ class ExecutionRuntime:
         self.provider_pools = dict(config["limits"].get("provider_pools") or {})
         self.provider_active = {name: 0 for name in self.provider_pools}
         self.provider_route_cursors = {}
-        # A provider-wide response such as HTTP 429 is stronger evidence than
-        # a temporarily full slot.  Keep that health signal for the lifetime
-        # of this bounded dispatch so other logical assignments can use a
-        # healthy alternate route instead of repeatedly hammering the dead
-        # pool.
+        # A rate limit fences every model dispatch in this run. The supervisor
+        # persists the stop and requires an explicit resume after the quota is
+        # available; route failover must not hide a provider 429.
         self.provider_cooldowns = {}
         self.provider_cooldown_fallback_allowed = {}
         self._loaded_provider_cooldown_scopes = set()
+        self.model_rate_limit_fence = None
         self.model_calls_dispatched = 0
         self.cancelled = False
         self.cancellation_reason = None
@@ -412,6 +522,22 @@ class ExecutionRuntime:
                     self._dispatch(entry)
                 if not active:
                     for spec in pending:
+                        fenced = self.model_rate_limit_fence
+                        if spec["kind"] == "model" and fenced is not None:
+                            metadata = {"status_code": 429}
+                            if fenced.get("provider_error_kind"):
+                                metadata["provider_error_kind"] = fenced["provider_error_kind"]
+                            if type(fenced.get("retry_after_seconds")) in (int, float):
+                                metadata["retry_after_seconds"] = fenced["retry_after_seconds"]
+                            outcome = self._undispatched(
+                                spec,
+                                fenced.get("error") or "model dispatch stopped after HTTP 429",
+                                **metadata,
+                            )
+                            logical_task_id = spec.get("_logical_task_id", spec["task_id"])
+                            self._finalize_logical_task(logical_task_id, spec["task_id"], outcome)
+                            outcomes[logical_task_id] = outcome
+                            continue
                         cooldowns = self._pending_cooldowns(spec)
                         outcome = self._undispatched(spec,
                             "configured provider is cooling down" if cooldowns else
@@ -570,6 +696,10 @@ class ExecutionRuntime:
             # ModelClient retains the existing task-level validation for a
             # malformed prompt; context preflight is only meaningful for text.
             return None
+        continuation_text = params.get("continuation_text")
+        if isinstance(continuation_text, str) and continuation_text:
+            prompt += ("\n\n" + continuation_text + "\n\n"
+                       + MODEL_CONTINUATION_INSTRUCTION)
         images = params.get("images")
         image_count = len(images) if isinstance(images, list) else 0
         return model_context_error(effective, system=SYSTEM, prompt=prompt,
@@ -694,6 +824,13 @@ class ExecutionRuntime:
         if remaining <= 0:
             return
         self.provider_cooldowns[quota_scope] = time.monotonic() + remaining
+        if body.get("status_code") == 429:
+            self.model_rate_limit_fence = {
+                "status_code": 429,
+                "provider_error_kind": body.get("provider_error_kind"),
+                "retry_after_seconds": remaining,
+                "error": "model dispatch fenced by a persisted HTTP 429 response",
+            }
         fallback_basis = body.get("fallback_basis")
         eligible_basis = (
             isinstance(fallback_basis, dict)
@@ -704,6 +841,7 @@ class ExecutionRuntime:
             body.get("fallback_eligible") is True
             and eligible_basis
             and body.get("quota_scope") == quota_scope
+            and body.get("status_code") != 429
         )
 
     @staticmethod
@@ -724,6 +862,8 @@ class ExecutionRuntime:
 
     def _provider_route(self, spec):
         """Select one route with pool capacity and a fitting context budget."""
+        if spec["kind"] == "model" and self.model_rate_limit_fence is not None:
+            return _NO_PROVIDER_CAPACITY
         if spec["kind"] != "model" or not self.provider_pools:
             return None
         override = spec.get("_provider_route_override")
@@ -770,6 +910,8 @@ class ExecutionRuntime:
                 quota_scope = model_provider_quota_scope(effective)
                 cooldown_until, fallback_allowed = self._provider_cooldown_state(
                     quota_scope)
+                if self.model_rate_limit_fence is not None:
+                    return _NO_PROVIDER_CAPACITY
                 if cooldown_until > time.monotonic():
                     cooldown_blocked = True
                     fallback_ready = fallback_ready or fallback_allowed
@@ -875,9 +1017,15 @@ class ExecutionRuntime:
         use a bounded route cooldown; the Composer owns the longer retry
         schedule and must not inherit an invented mission-long provider ban.
         """
-        if not isinstance(pool_name, str) or not pool_name:
-            return
-        if not isinstance(config, dict):
+        status_code = message.get("status_code") if isinstance(message, dict) else None
+        if status_code == 429:
+            self.model_rate_limit_fence = {
+                "status_code": 429,
+                "provider_error_kind": message.get("provider_error_kind"),
+                "retry_after_seconds": message.get("retry_after_seconds"),
+                "error": str(message.get("error") or "model provider returned HTTP 429")[:2048],
+            }
+        if not isinstance(pool_name, str) or not pool_name or not isinstance(config, dict):
             return
         quota_scope = model_provider_quota_scope(config)
         delay = message.get("retry_after_seconds")
@@ -891,11 +1039,7 @@ class ExecutionRuntime:
             and self.provider_cooldown_fallback_allowed.get(quota_scope, False)
         )
         self.provider_cooldowns[quota_scope] = max(until, previous_until)
-        status_code = message.get("status_code")
-        newly_eligible = (
-            status_code == 429 and message.get("outcome_known") is True
-        )
-        fallback_eligible = newly_eligible or previous_eligible
+        fallback_eligible = previous_eligible and status_code != 429
         self.provider_cooldown_fallback_allowed[quota_scope] = fallback_eligible
         self._publish(self._provider_cooldown_artifact_id(quota_scope), "note", {
             "pool": pool_name, "quota_scope": quota_scope,
@@ -915,8 +1059,15 @@ class ExecutionRuntime:
         spec = entry["spec"]
         if spec["kind"] != "model" or not self._provider_route_failure(message):
             return None
+        if message.get("partial_output_journal_path"):
+            # Replaying the original request would discard already completed
+            # output chunks. Recovery must resume from the durable prefix.
+            return None
         pool_name = spec["params"].get("provider_pool")
         current = spec["params"].get("client")
+        if message.get("status_code") == 429:
+            self._mark_provider_cooldown(pool_name, message, current)
+            return None
         if pool_name:
             self._mark_provider_cooldown(pool_name, message, current)
         role = spec["params"].get("role") or spec["actor"]
@@ -1069,6 +1220,12 @@ class ExecutionRuntime:
             raise TimeoutError("run deadline reached before dispatch")
         result_dir = self.dir / "runs" / task_id
         result_dir.mkdir(parents=True, exist_ok=False)
+        if spec["kind"] == "model":
+            spec = dict(spec)
+            spec["params"] = dict(spec["params"])
+            spec["params"]["_continuation_journal_path"] = str(
+                result_dir / "model-continuation.json")
+            entry["spec"] = spec
         entry["channel"] = _ResultFile(result_dir / "result.json", self.config["limits"]["max_result_bytes"])
         process = multiprocessing.get_context("spawn").Process(
             target=_worker_entry, args=(self.worker_target, spec["kind"], spec["params"], entry["channel"]))
@@ -1148,7 +1305,9 @@ class ExecutionRuntime:
         reason = str(message.get("error", "worker failure omitted its error"))
         failure = {"error": reason, "outcome_known": known,
                    "dispatch_started": entry["dispatched"]}
-        for key in ("status_code", "retry_after_seconds"):
+        for key in ("status_code", "retry_after_seconds", "provider_error_kind",
+                    "error_type", "attempts", "elapsed_seconds",
+                    "partial_output_journal_path"):
             if message.get(key) is not None:
                 failure[key] = message[key]
         self._publish(f"command/failures/{task_id}", "report", failure,
@@ -1165,7 +1324,8 @@ class ExecutionRuntime:
         else:
             self._block_pending(spec, reason)
         result = {"ok": False, "error": reason, "outcome_known": known}
-        for key in ("status_code", "retry_after_seconds"):
+        for key in ("status_code", "retry_after_seconds", "provider_error_kind",
+                    "attempts", "elapsed_seconds", "partial_output_journal_path"):
             if message.get(key) is not None:
                 result[key] = message[key]
         if message.get("error_type") is not None:
@@ -1198,6 +1358,10 @@ class ExecutionRuntime:
             params["images"] = images
         data, ref = self._call(task_id, "model", params, actor=role, task_kind=task_kind, reservation_id=reservation_id)
         result = ModelResult(**data)
-        if result.finish_reason != "stop":
-            raise ValidationError(f"model generation did not finish normally: {result.finish_reason}")
-        return result.json_object(), ref
+        try:
+            return result.json_object(allow_missing_closers=True), ref
+        except ValidationError:
+            if result.finish_reason != "stop":
+                raise ValidationError(
+                    f"model generation remained incomplete after continuation: {result.finish_reason}")
+            raise

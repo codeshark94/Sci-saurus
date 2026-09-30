@@ -127,11 +127,12 @@ class ScientificInterpretationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "unknown evidence"):
             validate_interpretation(value, evidence_ids={"finding-1"})
 
-    def test_known_429_uses_configured_ollama_model_fallback_without_rewriting_evidence(self):
+    def test_known_429_stops_without_dispatching_model_fallback(self):
         primary = {
             "protocol": "openai_compatible", "base_url": "http://127.0.0.1:11434/v1",
             "model": "deepseek-v4.1-flash:cloud", "auth_env": None,
             "context_window_tokens": 262144, "max_input_tokens": 245760,
+            "max_output_tokens": 8192,
         }
         fallback = {**primary, "model": "glm-5.3-flash:cloud"}
         config = {
@@ -159,22 +160,18 @@ class ScientificInterpretationTests(unittest.TestCase):
                 )
 
         with patch("scisaurus.runtime.scientific_interpretation.ModelClient", StubClient):
-            result = ScientificInterpretationRunner(config).run(
-                {"evidence_ids": ["finding-1"]}, evidence_ids={"finding-1"},
-            )
+            with self.assertRaises(ModelCallError) as caught:
+                ScientificInterpretationRunner(config).run(
+                    {"evidence_ids": ["finding-1"]}, evidence_ids={"finding-1"},
+                )
 
-        self.assertEqual(routed_models, [primary["model"], fallback["model"]])
-        self.assertEqual(result["usage"], {
-            "model_calls": 1, "input_tokens": 23, "output_tokens": 17,
-        })
-        self.assertEqual(result["provider_route_history"], [
-            {"route": "primary", "model": primary["model"],
-             "status_code": 429, "provider_error_kind": None,
-             "request_attempts": 1},
-            {"route": "fallback-1", "model": fallback["model"],
-             "status_code": 200, "request_attempts": 1},
-        ])
-        self.assertEqual(result["interpretation"], interpretation())
+        self.assertEqual(routed_models, [primary["model"]])
+        self.assertEqual(caught.exception.attempts, 1)
+        self.assertEqual(caught.exception.route_history, [{
+            "route": "primary", "model": primary["model"],
+            "status_code": 429, "provider_error_kind": None,
+            "request_attempts": 1,
+        }])
 
     def test_unknown_model_outcome_does_not_replay_through_fallback(self):
         primary = {
@@ -208,7 +205,7 @@ class ScientificInterpretationTests(unittest.TestCase):
                 )
         self.assertEqual(calls, [primary["model"]])
 
-    def test_all_configured_routes_are_named_when_each_returns_429(self):
+    def test_all_configured_routes_stop_at_first_429(self):
         primary = {
             "protocol": "openai_compatible", "base_url": "http://127.0.0.1:11434/v1",
             "model": "deepseek-v4.1-flash:cloud", "auth_env": None,
@@ -238,15 +235,13 @@ class ScientificInterpretationTests(unittest.TestCase):
                 ScientificInterpretationRunner(config).run(
                     {"evidence_ids": ["finding-1"]}, evidence_ids={"finding-1"},
                 )
-        self.assertEqual(calls, [primary["model"], fallback["model"], last_resort["model"]])
-        self.assertEqual(caught.exception.attempts, 3)
-        self.assertEqual(
-            [entry["status_code"] for entry in caught.exception.route_history],
-            [429, 429, 429],
-        )
-        self.assertIn(primary["model"], str(caught.exception))
-        self.assertIn(fallback["model"], str(caught.exception))
-        self.assertIn(last_resort["model"], str(caught.exception))
+        self.assertEqual(calls, [primary["model"]])
+        self.assertEqual(caught.exception.attempts, 1)
+        self.assertEqual(caught.exception.route_history, [{
+            "route": "primary", "model": primary["model"],
+            "status_code": 429, "provider_error_kind": None,
+            "request_attempts": 1,
+        }])
 
     def test_account_quota_429_does_not_fan_out_to_other_models(self):
         primary = {
@@ -281,7 +276,7 @@ class ScientificInterpretationTests(unittest.TestCase):
         self.assertEqual(calls, [primary["model"]])
         self.assertEqual(caught.exception.provider_error_kind, "quota_exhausted")
 
-    def test_provider_quota_uses_only_independent_cooldown_fallback(self):
+    def test_provider_quota_never_uses_local_cooldown_fallback(self):
         cloud = {
             "protocol": "openai_compatible",
             "base_url": "http://127.0.0.1:11434/v1",
@@ -326,13 +321,13 @@ class ScientificInterpretationTests(unittest.TestCase):
                 )
 
         with patch("scisaurus.runtime.scientific_interpretation.ModelClient", StubClient):
-            result = ScientificInterpretationRunner(config).run(
-                {"evidence_ids": ["finding-1"]}, evidence_ids={"finding-1"},
-            )
+            with self.assertRaises(ModelCallError) as caught:
+                ScientificInterpretationRunner(config).run(
+                    {"evidence_ids": ["finding-1"]}, evidence_ids={"finding-1"},
+                )
 
-        self.assertEqual(calls, [cloud["model"], local["model"]])
-        self.assertEqual(result["usage"]["model_calls"], 1)
-        self.assertEqual(result["provider_route_history"][-1]["model"], local["model"])
+        self.assertEqual(calls, [cloud["model"]])
+        self.assertEqual(caught.exception.provider_error_kind, "quota_exhausted")
 
     def test_cooldown_fallback_stays_last_when_a_peer_is_preferred(self):
         from scisaurus.runtime.models import model_route_candidates

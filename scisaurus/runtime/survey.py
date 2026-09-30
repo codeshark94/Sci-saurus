@@ -18,7 +18,7 @@ from scisaurus.core.surveys import (ABSTENTION_REASONS, RELATIONSHIP_SEMANTICS, 
                                    is_explicit_abstention, work_review_checks)
 from scisaurus.runtime.execution import SYSTEM, ExecutionRuntime, _invoke_worker
 from scisaurus.runtime.config import configured_worker_slots
-from scisaurus.runtime.bibliographic_identity import reconcile_result
+from scisaurus.runtime.bibliographic_identity import normalize_doi, reconcile_result
 from scisaurus.runtime.models import (
     ModelResult, estimate_input_tokens, is_local_qwen_route,
     role_config_for, role_routes_for,
@@ -29,6 +29,7 @@ from scisaurus.runtime.literature import (
     preferred_oa_pdf_url, provider_cooldown_seconds,
 )
 from scisaurus.runtime.operations import OperationsCell
+from scisaurus.runtime.operation_adapters import get_adapter
 from scisaurus.runtime.scores import exact, identifier
 from scisaurus.runtime.survey_config import validate_survey_config, search_query
 from scisaurus.runtime.survey_records import (
@@ -1602,6 +1603,39 @@ class SurveyRunner(ExecutionRuntime):
         metadata = result.get("metadata")
         if not isinstance(metadata, dict):
             raise ValidationError("bibliographic capability returned no metadata object")
+        outcome = result.get("outcome")
+        provider_failure = outcome in {
+            "provider_error", "timeout", "auth_required", "access_denied",
+            "rate_limited",
+        } or (outcome == "not_found" and operation != "work")
+        if provider_failure:
+            detail = {
+                "outcome": outcome,
+                "http_status": metadata.get("http_status"),
+                "rate_limit": metadata.get("rate_limit"),
+                "execution_ref": execution,
+            }
+            self.gaps.append({
+                "kind": "bibliographic_failure",
+                "request": arguments,
+                "provider": "openalex",
+                "outcome": outcome,
+                "http_status": metadata.get("http_status"),
+                "execution_ref": execution,
+                "error": result.get("error"),
+            })
+            if outcome == "rate_limited":
+                self._raise_provider_cooldown(
+                    detail,
+                    "OpenAlex survey retrieval is paused until the provider quota resets",
+                )
+                raise ValidationError(
+                    "OpenAlex rate limit was recorded; do not treat it as an empty search"
+                )
+            if outcome in {"auth_required", "access_denied"}:
+                raise ValidationError(
+                    f"OpenAlex {outcome} is not a query-level gap; stop bibliography dispatch"
+                )
         # A concrete OpenAlex work lookup can legitimately return a verified
         # 404.  That negative result has no list-pagination ``meta`` block,
         # but it still needs a durable query record so citation expansion can
@@ -1610,6 +1644,8 @@ class SurveyRunner(ExecutionRuntime):
         # result record.
         if (operation == "work" and result.get("outcome") == "not_found"
                 and metadata.get("http_status") == 404 and not result["works"]):
+            page = {"count": 0, "next_cursor": None, "has_more": False}
+        elif provider_failure:
             page = {"count": 0, "next_cursor": None, "has_more": False}
         else:
             required = ("count", "next_cursor", "has_more")
@@ -1621,7 +1657,9 @@ class SurveyRunner(ExecutionRuntime):
         added = self._ingest(result["works"], execution, admission=admission)
         body = {"request": arguments, "role": role, "execution_ref": execution, "plan_ref": plan_ref,
                 "returned_work_ids": [w["id"] for w in result["works"]], "new_unique_works": added,
-                "count": page["count"], "next_cursor": page["next_cursor"], "has_more": page["has_more"]}
+                "count": page["count"], "next_cursor": page["next_cursor"], "has_more": page["has_more"],
+                "outcome": outcome, "provider_error": result.get("error") if provider_failure else None,
+                "provider_http_status": metadata.get("http_status") if provider_failure else None}
         record = self._publish(f"kb/queries/{self.api_calls}", "query_record", body, role,
                                subjects=[execution, *([plan_ref] if plan_ref else [])])
         self.query_refs.append(record["artifact_ref"])
@@ -1721,7 +1759,7 @@ class SurveyRunner(ExecutionRuntime):
                 route["source_kind"] = "pdf"
             else:
                 route["source_kind"] = "auto"
-            fallback = preferred_oa_pdf_url(locations)
+            fallback = preferred_oa_pdf_url(locations, exclude_urls=(route["url"],))
             route["fallback_urls"] = [fallback] if fallback and fallback != route["url"] else []
             routes.append((route, False))
         selected_ids = self._analysis_selection()
@@ -1751,7 +1789,8 @@ class SurveyRunner(ExecutionRuntime):
                     url = "https://doi.org/" + doi if isinstance(doi, str) and doi.strip() else None
                 if not isinstance(url, str) or not url.strip():
                     continue
-                pdf_fallback = preferred_oa_pdf_url(work.get("locations"))
+                pdf_fallback = preferred_oa_pdf_url(
+                    work.get("locations"), exclude_urls=(url,))
                 routes.append(({
                     "work_id": wid,
                     "title": work.get("title") or wid,
@@ -1859,9 +1898,45 @@ class SurveyRunner(ExecutionRuntime):
             self.source_docs[record["artifact_ref"]] = body
             self._update_register()
 
+    def _reconcile_retained_identity(self, wid, work, record):
+        """Re-evaluate a retained conflict from its pinned Crossref response.
+
+        Older checkpoints treated every publication-year difference as an
+        identity conflict. Rebuild only conflicted records from the original
+        successful lookup; never spend another provider call or rewrite the
+        prior immutable artifact.
+        """
+        previous = self._body(record)
+        if previous.get("status") != "conflicted":
+            return None
+        lookup_ref = previous.get("lookup_execution_ref")
+        work_record = self.work_records.get(wid)
+        if not isinstance(lookup_ref, str) or not isinstance(work_record, dict):
+            return None
+        try:
+            _, _, result, params = self.gate._recorded_execution(
+                lookup_ref, "research.identity-checker", operation="crossref",
+                task_kinds={"retrieval"},
+            )
+            if (normalize_doi(params.get("query")) != normalize_doi(work.get("doi"))
+                    or result.get("metadata", {}).get("match_mode") != "exact_doi"):
+                return None
+            checks, _ = get_adapter("crossref").inspect_result(
+                {"adapter": "crossref"}, result, params, representative=False,
+            )
+            if not all(check.get("outcome") == "passed" for check in checks):
+                return None
+            return reconcile_result(
+                work, work_record["artifact_ref"], result, lookup_ref,
+            )
+        except (KeyError, TypeError, ValueError, ValidationError):
+            return None
+
     def _reconcile_identities(self):
         if "identity" not in self.bindings:
-            return
+            retained = True
+        else:
+            retained = False
         # Identity reconciliation is a verification input for substantive
         # map/review work, not a requirement for every catalog hit.  The
         # catalog may contain up to ``max_works`` records while the declared
@@ -1872,7 +1947,36 @@ class SurveyRunner(ExecutionRuntime):
         for wid, work in list(self.works.items()):
             if wid not in identity_scope:
                 continue
-            if not work.get("doi") or wid in self.identity_records:
+            if not work.get("doi"):
+                continue
+            existing = self.identity_records.get(wid)
+            if existing is not None:
+                if self._body(existing).get("status") == "conflicted":
+                    revised = self._reconcile_retained_identity(wid, work, existing)
+                    if revised is not None and revised != self._body(existing):
+                        prior_ref = existing["artifact_ref"]
+                        record = self._record(
+                            f"kb/identities/{wid}", "reference_card", revised,
+                            "research.identity-checker",
+                            subjects=[self.work_records[wid]["artifact_ref"],
+                                      revised["lookup_execution_ref"], prior_ref],
+                        )
+                        self.identity_records[wid] = record
+                        if revised["status"] not in {"conflicted", "insufficient_evidence"}:
+                            self.gaps = [gap for gap in self.gaps
+                                         if not (gap.get("work_id") == wid
+                                                 and gap.get("identity_ref") == prior_ref
+                                                 and isinstance(gap.get("kind"), str)
+                                                 and gap["kind"].startswith(
+                                                     "bibliographic_identity_"))]
+                        elif not any(gap.get("identity_ref") == record["artifact_ref"]
+                                     for gap in self.gaps):
+                            self.gaps.append({
+                                "kind": "bibliographic_identity_" + revised["status"],
+                                "work_id": wid, "identity_ref": record["artifact_ref"],
+                            })
+                continue
+            if retained or wid in self.identity_records:
                 continue
             if self.api_calls >= self.bounds["max_api_calls"]:
                 self.gaps.append({"kind": "identity_call_limit", "work_id": wid})

@@ -19,6 +19,7 @@ from scisaurus.core.store import ArtifactStore
 from scisaurus.core.source_spans import bind, expand_evidence
 from scisaurus.core.surveys import ABSTENTION_REASONS, SurveyGate
 from scisaurus.runtime.execution import SYSTEM, _invoke_worker
+from scisaurus.runtime.bibliographic_identity import reconcile_result
 from scisaurus.runtime.literature import ProviderCooldownError
 from scisaurus.runtime.model_work import ModelWorkCache
 from scisaurus.runtime.model_work import ModelWorkBlocked
@@ -83,6 +84,14 @@ class SurveyHTTPFixture(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if path.path == "/gateway-error.pdf":
+            body = b"upstream gateway unavailable"
+            self.send_response(502)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path.path == "/mcp-denied":
             self.send_response(403)
             self.send_header("Content-Length", "0")
@@ -123,6 +132,18 @@ class SurveyHTTPFixture(BaseHTTPRequestHandler):
             self.send_response(429)
             self.send_header("Content-Type", "application/json")
             self.send_header("Retry-After", "1")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if query.get("search", [None])[0] == "query-timeout":
+            body = json.dumps({
+                "error": "Gateway timeout",
+                "message": "Your query took too long and was stopped. Please narrow the query.",
+                "reason": "query_timeout",
+            }).encode()
+            self.send_response(504)
+            self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -744,6 +765,32 @@ class TestSurveyRunner(unittest.TestCase):
             result = runner.run()
         self.assertEqual(result["status"], "paused")
         self.assertEqual(result["failure"], {"kind": "process_interrupted"})
+
+    def test_search_timeout_is_a_recorded_gap_and_does_not_block_later_queries(self):
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        runner._initialize()
+        runner._setup()
+        before = len(SurveyHTTPFixture.requests)
+
+        runner._search(["query-timeout", "independent terminology"], "research.searcher")
+
+        sent = SurveyHTTPFixture.requests[before:]
+        self.assertEqual([row["query"].get("search", [None])[0] for row in sent],
+                         ["query-timeout", "independent terminology"])
+        timeout = next(row for row in runner.search_log
+                       if row["request"].get("query") == "query-timeout")
+        later = next(row for row in runner.search_log
+                     if row["request"].get("query") == "independent terminology")
+        self.assertEqual(timeout["outcome"], "provider_error")
+        self.assertEqual(timeout["provider_http_status"], 504)
+        self.assertEqual(timeout["returned_work_ids"], [])
+        self.assertEqual(later["outcome"], "ok")
+        self.assertIn("W201", later["returned_work_ids"])
+        self.assertTrue(any(gap.get("kind") == "bibliographic_failure"
+                            and gap.get("http_status") == 504 for gap in runner.gaps))
+        self.assertEqual(sum(1 for row in sent
+                             if row["query"].get("search", [None])[0] == "query-timeout"), 1)
 
     def open_store(self):
         control = ControlStore(self.root / "run")
@@ -1696,6 +1743,33 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertEqual(gaps[0]["source_url"], "https://example.org/unavailable")
 
+    def test_failed_primary_oa_pdf_uses_next_distinct_oa_pdf(self):
+        SurveyHTTPFixture.locations_by_work = {"W401": [
+            {
+                "is_oa": True,
+                "landing_page_url": "https://example.org/aps-record",
+                "pdf_url": f"http://127.0.0.1:{self.server.server_port}/gateway-error.pdf",
+            },
+            {
+                "is_oa": True,
+                "landing_page_url": "https://example.org/arxiv-record",
+                "pdf_url": f"http://127.0.0.1:{self.server.server_port}/fallback.pdf",
+            },
+        ]}
+        primary_url = f"http://127.0.0.1:{self.server.server_port}/gateway-error.pdf"
+        config = self.full_text_config("fulltext-refutes", source_url=primary_url)
+        result = self.runtime(config).run()
+
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        self.assertEqual(result["coverage"]["verified_full_texts"], 1)
+        requested_paths = [item["path"] for item in SurveyHTTPFixture.requests]
+        self.assertIn("/gateway-error.pdf", requested_paths)
+        self.assertIn("/fallback.pdf", requested_paths)
+        _, store = self.open_store()
+        capture = json.loads(store.read_body(store.head("kb/full-text/W401")["body_hash"]))
+        self.assertTrue(capture["identity_verified"])
+        self.assertTrue(capture["url"].endswith("/fallback.pdf"))
+
     def test_registered_openalex_pdf_uses_poppler_even_without_pdf_suffix(self):
         landing_page = "https://example.org/W401"
         pdf_url = f"http://127.0.0.1:{self.server.server_port}/paper-download"
@@ -1883,6 +1957,68 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(set(proof), {"work_id", "source_ref", "quote", "start", "end", "quote_sha256"})
         source = json.loads(store.read_body(store.get(proof["source_ref"])["body_hash"]))
         self.assertEqual(source["text"][proof["start"]:proof["end"]], proof["quote"])
+
+    def test_resume_reconciles_legacy_year_conflict_from_pinned_execution_without_calling_provider(self):
+        runner = self.runtime(survey_config(self.endpoint))
+        self.addCleanup(runner.control.close)
+        work = {
+            "work_id": "W1", "doi": "10.1234/example", "title": "Same title",
+            "year": 2012, "abstract": "Abstract text.",
+        }
+        work_record = runner._publish(
+            "kb/works/W1", "reference_card", work, "research.seed-searcher")
+        result = {
+            "outcome": "ok",
+            "metadata": {"match_mode": "exact_doi"},
+            "sources": [{
+                "doi": "10.1234/example", "title": "Same title",
+                "published": {"date-parts": [[2013]]},
+            }],
+        }
+        execution = runner._publish(
+            "command/executions/identity-fixture", "report", result,
+            "research.identity-checker")
+        identity = reconcile_result(
+            work, work_record["artifact_ref"], result, execution["artifact_ref"])
+        legacy = deepcopy(identity)
+        legacy["status"] = "conflicted"
+        year = next(check for check in legacy["checks"] if check["field"] == "year")
+        year["outcome"] = "conflict"
+        year.pop("variance_years", None)
+        old_record = runner._publish(
+            "kb/identities/W1", "reference_card", legacy,
+            "research.identity-checker",
+            subjects=[work_record["artifact_ref"], execution["artifact_ref"]])
+        runner.work_records["W1"] = work_record
+        runner.works["W1"] = work
+        runner.identity_records["W1"] = old_record
+        runner.gaps = [{
+            "kind": "bibliographic_identity_conflicted", "work_id": "W1",
+            "identity_ref": old_record["artifact_ref"],
+        }]
+        params = {"query": "10.1234/example", "limit": 3}
+
+        class ValidCrossrefAdapter:
+            @staticmethod
+            def inspect_result(_profile, _result, _params, representative=False):
+                return ([{"outcome": "passed"}], {})
+
+        with patch.object(runner, "_analysis_selection", return_value={"W1"}), \
+                patch.object(runner.gate, "_recorded_execution",
+                             return_value=(None, None, result, params)) as recorded, \
+                patch("scisaurus.runtime.survey.get_adapter",
+                      return_value=ValidCrossrefAdapter), \
+                patch.object(runner, "_update_register"):
+            runner._reconcile_identities()
+
+        current = runner.identity_records["W1"]
+        current_body = runner._body(current)
+        self.assertEqual(current_body["status"], "verified_with_gaps")
+        self.assertNotEqual(current["artifact_ref"], old_record["artifact_ref"])
+        self.assertEqual(runner._body(old_record)["status"], "conflicted")
+        self.assertEqual(runner.api_calls, 0)
+        self.assertEqual(runner.gaps, [])
+        recorded.assert_called_once()
 
     def test_resume_charges_api_reservations_even_without_provider_results(self):
         config = survey_config(self.endpoint)
@@ -2098,24 +2234,33 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["_contract_repair_boundary"], "model-contract-repair-7")
 
-    def test_resume_finishes_pending_searches_after_partial_capture_and_rate_limit(self):
+    def test_rate_limit_pauses_partial_survey_and_resume_continues_after_cooldown(self):
         config = survey_config(self.endpoint)
         config["survey"]["seed_queries"] = ["recall timing", "rate limited topic"]
         config["survey"]["search"]["expansion_rounds"] = 0
-        # Exercise recovery from a provider failure explicitly; the live
-        # default now retries transient responses within one request budget.
+        # A provider-declared cooldown is a pause, not a malformed workload
+        # result. Resume only after the stated interval and retain the first
+        # successful query rather than replaying it.
         config["survey"]["bibliography"]["client"]["max_retries"] = 0
         SurveyHTTPFixture.rate_limit_once = "rate limited topic"
         first = self.runtime(config).run()
-        self.assertEqual(first["status"], "blocked")
+        self.assertEqual(first["status"], "paused")
+        self.assertEqual(first["failure"]["kind"], "provider_cooldown")
         self.assertEqual(first["coverage"]["unique_works"], 1)
-        self.assertIn("Workload output or provider schema failed", first["error"])
+        self.assertIn("OpenAlex survey retrieval is paused", first["error"])
+        self.assertTrue(first["failure"]["retry_after_seconds"] > 0)
+        first_searches = [request["query"].get("search", [None])[0]
+                          for request in SurveyHTTPFixture.requests
+                          if request["path"] == "/works"]
+        self.assertEqual(first_searches.count("recall timing"), 1)
+        self.assertEqual(first_searches.count("rate limited topic"), 1)
 
         policy = {
             "additional_seconds": 40,
             "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
             "source_changes": {"mode": "reject", "reopen_scopes": []},
         }
+        time.sleep(first["failure"]["retry_after_seconds"] + 0.05)
         completed = self.runtime(config, resume_policy=policy).run()
         self.assertEqual(completed["status"], "completed", completed)
         successful = [row["request"]["query"] for row in completed["coverage"]["searches"]

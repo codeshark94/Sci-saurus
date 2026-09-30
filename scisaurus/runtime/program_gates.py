@@ -119,8 +119,9 @@ def admit_program_candidate(candidate, *, execute, validate, readiness=None, rev
     if (document.get("study_id") != candidate["study_id"]
             or document.get("revision") != candidate["revision"]):
         raise ValidationError("program output does not match the candidate study identity")
-    document = validate_program_output(document, candidate["experiment_intent"])
     configured_input = program_validator_configured_input(candidate)
+    document = validate_program_output(
+        document, candidate["experiment_intent"], configured_input.get("work_orders", []))
     verdict_result = validate(canonical_bytes(experiment_validation_payload(
         candidate["experiment_intent"], configured_input, document, digests[0])))
     if getattr(verdict_result, "mode", None) != "sandbox-exec":

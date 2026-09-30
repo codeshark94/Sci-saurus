@@ -226,6 +226,11 @@ class PaperReleaseTests(unittest.TestCase):
                     {"field": "year", "outcome": "match", "openalex": 2026, "crossref": 2026}],
                 "observation_refs": [], "lookup_execution_ref": None}}
             builder._bind(manuscript, survey, json.loads(self.results.read_text()))
+            identity = survey["identities"][value["references"][0]["identity_ref"]]
+            identity["status"] = "verified_with_gaps"
+            year = next(check for check in identity["checks"] if check["field"] == "year")
+            year.update(outcome="compatible_variance", crossref=2027, variance_years=1)
+            builder._bind(manuscript, survey, json.loads(self.results.read_text()))
             survey["identities"][value["references"][0]["identity_ref"]]["status"] = "conflicted"
             with self.assertRaisesRegex(ValidationError, "verified survey bibliographic identity"):
                 builder._bind(manuscript, survey, json.loads(self.results.read_text()))

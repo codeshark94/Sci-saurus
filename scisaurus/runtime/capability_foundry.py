@@ -16,6 +16,7 @@ passes.
 """
 from __future__ import annotations
 
+import ast
 import json
 import hashlib
 import math
@@ -28,24 +29,33 @@ import unicodedata
 from dataclasses import asdict
 from pathlib import Path
 
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import ModelContractError, ValidationError
 from scisaurus.core.schema import canonical_bytes, json_object as parse_complete_json_object
 from scisaurus.runtime.capability_registry import (
     experiment_program_payload, experiment_validation_payload,
     load_registry, register_capability,
 )
-from scisaurus.runtime.experiment import validate_program_output
+from scisaurus.runtime.experiment import (
+    PROGRAM_OUTPUT_FIELDS, ExperimentProgramOutputContractError,
+    validate_program_output,
+)
+from scisaurus.runtime.experiment_config import validate_work_orders
 from scisaurus.runtime.models import (
-    ModelClient, ModelResult, effective_model_timeout, resolve_model_config,
+    ModelCallError, ModelClient, ModelResult, effective_model_timeout,
+    resolve_model_config,
 )
 from scisaurus.runtime.model_work import ModelWorkBlocked
-from scisaurus.runtime.program_admission import (scan_program_source, validate_experiment_intent,
-                                                validate_program_candidate)
+from scisaurus.runtime.program_admission import (
+    ExperimentIntentContractError, is_main_entry_guard, scan_program_source,
+    validate_experiment_intent,
+    validate_program_candidate,
+)
 from scisaurus.runtime.program_gates import (ProgramGateRejected, admit_program_candidate,
                                             validate_validator_readiness)
 from scisaurus.runtime.program_sandbox import run_sandboxed, sandbox_status
 from scisaurus.runtime.research_quality import (
-    ANALYSIS_FIELDS, default_research_quality_contract,
+    ANALYSIS_FIELDS, AnalysisContractError, analysis_output_contract,
+    default_research_quality_contract,
 )
 
 
@@ -59,6 +69,100 @@ def _sandbox_status_text(returncode):
         signal_name = f"signal {signal_number}"
     return f"{returncode} ({signal_name})"
 
+
+class SourceDataUnavailable(ValidationError):
+    """Raised before authoring when empirical data are absent from controller input."""
+
+    failure_class = "evidence_input_unavailable"
+    recovery_mode = "refine_topic_to_available_evidence"
+
+
+def _requires_source_data_manifest(brief):
+    """Read the controller's explicit empirical-data admission policy."""
+    if isinstance(brief, str):
+        try:
+            brief = json.loads(brief)
+        except (TypeError, ValueError):
+            return False
+    policy = brief.get("evidence_policy") if isinstance(brief, dict) else None
+    return (isinstance(policy, dict)
+            and policy.get("requires_source_data_manifest") is True)
+
+
+def _validate_source_data_manifest(value):
+    """Validate the controller-owned rows required for literature-data analysis."""
+    if (not isinstance(value, dict)
+            or set(value) != {"schema_version", "datasets"}
+            or value.get("schema_version") != "source-data-manifest-1"
+            or not isinstance(value.get("datasets"), list)
+            or not value["datasets"]):
+        raise ValidationError(
+            "source_data_manifest must be a nonempty source-data-manifest-1 object")
+    seen_rows = set()
+    for dataset in value["datasets"]:
+        required = {
+            "artifact_ref", "source_sha256", "source_url", "source_location",
+            "extraction_method", "rows",
+        }
+        if not isinstance(dataset, dict) or set(dataset) != required:
+            raise ValidationError("source-data manifest dataset has an invalid shape")
+        if (not isinstance(dataset["artifact_ref"], str)
+                or not dataset["artifact_ref"].startswith("artifact:")
+                or not isinstance(dataset["source_sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", dataset["source_sha256"])):
+            raise ValidationError("source-data manifest must bind an immutable source artifact")
+        for key in ("source_url", "source_location", "extraction_method"):
+            if not isinstance(dataset[key], str) or not dataset[key].strip():
+                raise ValidationError(f"source-data manifest {key} must be nonempty")
+        rows = dataset["rows"]
+        if not isinstance(rows, list) or not rows:
+            raise ValidationError("source-data manifest datasets must contain extracted rows")
+        for row in rows:
+            if (not isinstance(row, dict) or set(row) != {"row_id", "values"}
+                    or not isinstance(row.get("row_id"), str) or not row["row_id"].strip()
+                    or row["row_id"] in seen_rows
+                    or not isinstance(row.get("values"), dict) or not row["values"]):
+                raise ValidationError("source-data manifest row has an invalid shape or identity")
+            seen_rows.add(row["row_id"])
+            for name, number in row["values"].items():
+                if (not isinstance(name, str) or not name.strip()
+                        or type(number) not in (int, float) or not math.isfinite(number)):
+                    raise ValidationError("source-data manifest values must be named finite numbers")
+    canonical_bytes(value)
+    return value
+
+
+def _validate_source_observation_binding(document, configured_input):
+    """Require every reported empirical row to reproduce one acquired source row."""
+    manifest = configured_input.get("source_data_manifest")
+    if manifest is None:
+        return
+    _validate_source_data_manifest(manifest)
+    source_rows = {
+        row["row_id"]: row["values"]
+        for dataset in manifest["datasets"] for row in dataset["rows"]
+    }
+    observations = document.get("observations")
+    if not isinstance(observations, list) or len(observations) != len(source_rows):
+        raise ValidationError(
+            "empirical observations must preserve every acquired source row exactly once")
+    observed_ids = set()
+    for observation in observations:
+        if (not isinstance(observation, dict)
+                or set(observation) - {"source_record_id", "source_values", "replicate"}
+                or not isinstance(observation.get("source_record_id"), str)
+                or observation["source_record_id"] not in source_rows
+                or observation["source_record_id"] in observed_ids
+                or observation.get("source_values") != source_rows[observation["source_record_id"]]):
+            raise ValidationError(
+                "empirical observation must retain its exact controller-supplied source row and identity")
+        replicate = observation.get("replicate")
+        if replicate is not None and (type(replicate) is not int or replicate < 1):
+            raise ValidationError("empirical observation replicate must be a positive integer")
+        observed_ids.add(observation["source_record_id"])
+    if observed_ids != set(source_rows):
+        raise ValidationError("empirical observations omit acquired source rows")
+
 SYSTEM = (
     "You are the program-authoring specialist for an autonomous research laboratory. "
     "You write ONE deterministic, seeded experiment program and ONE independently authored "
@@ -70,7 +174,15 @@ SYSTEM = (
     "hashlib, pathlib, sys, itertools, functools, random, collections, dataclasses, typing, "
     "decimal, fractions, re, time, os, numpy and matplotlib. "
     "The executor reads a JSON request from stdin and writes exactly one JSON object to stdout. "
-    "Return exactly the requested JSON object and no markdown."
+    "This is a machine-readable artifact task: do not output reasoning, scratch work, plans, "
+    "explanations, progress narration, or markdown. The first non-whitespace character must be "
+    "'{', and the entire response must be exactly one complete JSON object. Keep prose fields "
+    "concise; put implementation only in the requested source fields."
+)
+AUTHOR_CONTINUATION_SYSTEM = (
+    "You continue an incomplete model-authored JSON object. The supplied prefix is immutable. "
+    "Return only the exact next raw characters of the original object as plain text. Do not wrap "
+    "the suffix in JSON or markdown, repeat the prefix, add analysis, or include unrelated content."
 )
 REVIEW_SYSTEM = (
     "You are an independent methods reviewer, not the program author. Treat supplied code and prose as "
@@ -87,11 +199,17 @@ REVIEW_SYSTEM = (
 PROGRAM_REVIEW_CHECKS = {"method_implementation", "estimator_definedness",
                          "independent_validation", "claim_support"}
 
-PROGRAM_OUTPUT_FIELDS = ("schema_version", "study_id", "revision", "procedures", "observations",
-                         "metrics", "findings", "limitations", "assets")
 ATTEMPT_FIELDS = {"executor_source", "validator_source", "experiment_intent"}
 LEGACY_TRANSPORT_FIELDS = {"runtime", "test_input"}
 IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,63}")
+AUTHOR_PATCH_MAX_OUTPUT_TOKENS = 4096
+AUTHOR_PATCH_MAX_EDITS = 4
+AUTHOR_PATCH_MAX_SOURCE_CHARS = 12000
+AUTHOR_PATCH_CONTEXT_MAX_CHARS = 9000
+AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS = 8
+AUTHOR_PATCH_DUPLICATE_CONTEXT_MAX_CHARS = 48000
+AUTHOR_CONTINUATION_MAX_OUTPUT_TOKENS = 24000
+AUTHOR_MAX_CONTINUATIONS = 4
 CONFIG_SCHEMA = "capability-foundry-config-1"
 CONFIG_FIELDS = {
     "schema_version", "model_config_path", "runtime_python", "workspace_root",
@@ -99,7 +217,6 @@ CONFIG_FIELDS = {
     "max_attempts", "timeout_seconds",
 }
 CONFIG_OPTIONAL_FIELDS = {"model_timeout_seconds"}
-AUTHOR_REPAIR_MAX_OUTPUT_TOKENS = 8192
 
 
 def _canonical_capability_identifier(value):
@@ -261,6 +378,298 @@ def _normalize_program_validation_error(error):
     return error
 
 
+def _is_repeated_repair_failure(error, failures, failure_signatures,
+                                failure_signature=None, *, seed_replay=False):
+    """Detect a repeated result, not a repeated repair instruction.
+
+    ``feedback`` is the defect the current candidate is supposed to repair.
+    Comparing a new result to that text incorrectly rejects the first repair
+    response whenever it reproduces the same error; only a result already
+    observed in this foundry work item is a duplicate.
+    """
+    if isinstance(error, ModelWorkBlocked):
+        return True
+    if seed_replay:
+        return False
+    return (str(error) in failures
+            or (failure_signature is not None
+                and failure_signature in failure_signatures))
+
+
+def _author_response_format_failure_signature(envelope, finish_reason, route_index=0):
+    """Deduplicate malformed responses per route, not across independent models."""
+    failure = ("invalid_json" if envelope is None
+               else f"{finish_reason}:invalid_envelope")
+    return f"author_response_format:{failure}:route={route_index}"
+
+
+def _author_continuation_prompt(partial_response):
+    """Frame a syntactically valid partial JSON response for exact suffix continuation."""
+    prefix_digest = hashlib.sha256(partial_response.encode("utf-8")).hexdigest()
+    marker = f"continue-{prefix_digest[:24]}"
+    prompt = json.dumps({
+        "assignment": "continue_truncated_experiment_author_json",
+        "partial_response": partial_response,
+        "partial_response_sha256": prefix_digest,
+        "output_contract": {
+            "raw_suffix": "the exact next raw characters only; do not wrap or repeat the prefix",
+            "legacy_json_envelope": {
+                "marker": marker,
+                "continuation": "compatibility for already-persisted continuation prompts only",
+            },
+        },
+        "instructions": [
+            "The previous model response ended at its output-token limit inside one JSON object.",
+            "Continue that exact object from its final character; do not restart, summarize, or alter the prefix.",
+            "Return only the next raw text suffix, not a JSON object, string, or markdown block.",
+            "The controller has disabled structured JSON output for this continuation request.",
+            "Stop as soon as the original JSON object is complete; do not add commentary or a second object.",
+        ],
+    }, ensure_ascii=False, sort_keys=True)
+    return marker, prefix_digest, prompt
+
+
+def _author_json_prefix_state(text):
+    """Classify whether a truncated author response can safely be suffix-continued."""
+    if not isinstance(text, str):
+        return "invalid"
+    partial = text.lstrip()
+    if not partial.startswith("{"):
+        return "not_json"
+    try:
+        value, end = json.JSONDecoder().raw_decode(partial)
+    except json.JSONDecodeError as exc:
+        if (exc.pos >= len(partial)
+                or exc.msg.startswith("Unterminated string starting at")):
+            return "incomplete"
+        return "invalid"
+    if isinstance(value, dict) and not partial[end:].strip():
+        return "complete"
+    return "invalid"
+
+
+def _review_continuation_prompt(partial_response):
+    """Frame an exact suffix continuation for a truncated reviewer verdict."""
+    prefix_digest = hashlib.sha256(partial_response.encode("utf-8")).hexdigest()
+    marker = f"continue-review-{prefix_digest[:24]}"
+    prompt = json.dumps({
+        "assignment": "continue_truncated_independent_review_json",
+        "partial_response": partial_response,
+        "partial_response_sha256": prefix_digest,
+        "output_contract": {
+            "raw_suffix": "the exact next raw characters only; do not wrap or repeat the prefix",
+        },
+        "instructions": [
+            "The previous independent scientific review ended at its output-token limit.",
+            "Continue that exact JSON object from its final character without changing the prefix.",
+            "Return only the next raw text suffix, not a JSON object or markdown block.",
+            "Stop immediately when the original JSON object is complete.",
+        ],
+        "continuation_marker": marker,
+    }, ensure_ascii=False, sort_keys=True)
+    return marker, prefix_digest, prompt
+
+
+def _author_continuation_suffix(partial_response, result, marker):
+    """Extract a raw suffix, accepting the former JSON envelope for checkpoints."""
+    text = result.text
+    try:
+        envelope = result.json_object()
+    except ValidationError:
+        envelope = None
+    if isinstance(envelope, dict) and (
+            "marker" in envelope or "continuation" in envelope):
+        if (set(envelope) != {"marker", "continuation"}
+                or envelope.get("marker") != marker
+                or not isinstance(envelope.get("continuation"), str)
+                or not envelope["continuation"]):
+            raise ValidationError(
+                "continuation response did not match its requested marker and shape")
+        text = envelope["continuation"]
+    elif text.lstrip().startswith('{"marker"'):
+        raise ValidationError("continuation response returned an incomplete legacy JSON envelope")
+
+    if text.startswith(partial_response):
+        text = text[len(partial_response):]
+    else:
+        overlap_limit = min(len(partial_response), len(text), 512)
+        for overlap in range(overlap_limit, 31, -1):
+            if partial_response.endswith(text[:overlap]):
+                text = text[overlap:]
+                break
+    if not text:
+        raise ValidationError("continuation response contained no new suffix characters")
+    return text
+
+
+def _sum_model_usage(*values):
+    totals = {}
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for key, amount in value.items():
+            if type(amount) in (int, float):
+                totals[key] = totals.get(key, 0) + amount
+    return totals
+
+
+def _author_request_signature(model, max_output_tokens, prompt):
+    return hashlib.sha256(canonical_bytes({
+        "model": model,
+        "max_output_tokens": max_output_tokens,
+        "prompt": prompt,
+    })).hexdigest()
+
+
+def _model_route_identity(model):
+    if not isinstance(model, str):
+        return None
+    return model.strip().casefold().removesuffix(":cloud")
+
+
+def _author_request_was_attempted(state, signature):
+    return signature in _author_request_signatures(state)
+
+
+def _author_request_signature_from_record(request):
+    if not isinstance(request, dict):
+        return None
+    if request.get("role", "research.experiment-author") != "research.experiment-author":
+        return None
+    if request.get("status") in {"provider_rate_limited", "cooldown_not_dispatched"}:
+        return None
+    signature = request.get("request_signature")
+    if isinstance(signature, str) and signature:
+        return signature
+    model = request.get("model")
+    output_tokens = request.get("max_output_tokens")
+    prompt = request.get("prompt")
+    if (not isinstance(model, str) or not isinstance(prompt, str)
+            or type(output_tokens) is not int):
+        return None
+    return _author_request_signature(model, output_tokens, prompt)
+
+
+def _author_request_signatures(state):
+    if not isinstance(state, dict):
+        return []
+    signatures = state.get("author_request_signatures")
+    result = set(signatures) if isinstance(signatures, list) else set()
+    requests = state.get("requests")
+    if isinstance(requests, list):
+        result.update(
+            signature for signature in
+            (_author_request_signature_from_record(item) for item in requests)
+            if signature is not None
+        )
+    return sorted(result)
+
+
+def _author_format_repair_instructions(reason, *, has_candidate=False):
+    message = str(reason)
+    if not has_candidate:
+        return (
+            "The previous response was not valid JSON and did not produce a usable program artifact. "
+            "Discard that response "
+            "and fulfill the complete authoring assignment in this prompt. Return exactly one complete "
+            "JSON object with only experiment_intent, executor_source, and validator_source. The intent "
+            "must preserve the supplied research question and acceptance criteria; the executor and "
+            "validator must be complete implementations. Do not return edits or an updates envelope. "
+            "Do not include reasoning, commentary, a preamble, or markdown; start with '{' and stop "
+            "after the object's closing brace."
+        )
+    if "old text must match exactly once" in message:
+        return (
+            "The previous response was valid JSON, but its source patch was rejected because the old "
+            "excerpt was missing or matched multiple locations. Use the recorded match locations and "
+            "include enough adjacent code to make each old excerpt unique. Return only compact exact "
+            "edits; do not rewrite either source file."
+        )
+    if ("finish_reason=length" in message
+            or "response was incomplete" in message
+            or "exceeds the bounded source-edit limit" in message):
+        return (
+            "The previous source-patch response was truncated or exceeded the bounded patch contract. "
+            f"Return at most {AUTHOR_PATCH_MAX_EDITS} exact edits and no more than "
+            f"{AUTHOR_PATCH_MAX_SOURCE_CHARS} characters total across old and new source text. "
+            "Do not return complete programs, commentary, or derivations. Keep the repair scoped to the "
+            "single active issue; the candidate will be replayed through every gate."
+        )
+    return (
+        "The previous response did not satisfy the authoring patch contract. Return only a compact "
+        f"updates object with at most {AUTHOR_PATCH_MAX_EDITS} exact edits and no more than "
+        f"{AUTHOR_PATCH_MAX_SOURCE_CHARS} characters total across old and new source text. "
+        "Use unique excerpts and do not rewrite complete programs."
+    )
+
+
+def _sandbox_failure_signature(error):
+    """Identify the same sandbox exception when source edits only move lines."""
+    lines = str(error).splitlines()
+    if not any("executor failed in the sandbox" in line.casefold() for line in lines[:2]):
+        return None
+    exception = re.fullmatch(
+        r"(?P<type>[A-Za-z_][A-Za-z0-9_.]*):\s*(?P<message>.*)",
+        next((line.strip() for line in reversed(lines) if line.strip()), ""),
+    )
+    if exception is None:
+        return None
+    frames = []
+    for index, line in enumerate(lines[:-1]):
+        match = re.fullmatch(
+            r'\s*File ".*?", line \d+, in (?P<function>[^\s]+)\s*', line)
+        if match is None:
+            continue
+        source = " ".join(lines[index + 1].strip().split())
+        if source:
+            frames.append(f"{match.group('function')}:{source}")
+    if not frames:
+        return None
+    return (
+        f"sandbox:{exception.group('type')}:{exception.group('message')}"
+        f"|{'|'.join(frames[-2:])}"
+    )
+
+
+def _program_gate_failure_signature(error):
+    """Fingerprint an unchanged scientific gate failure across source edits."""
+    feedback = getattr(error, "feedback", None)
+    if not isinstance(feedback, dict) or not isinstance(feedback.get("gate"), str):
+        return None
+    checks = sorted({
+        (item.get("id"), item.get("outcome"))
+        for item in feedback.get("failed_checks", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    })
+    mismatches = []
+    for item in feedback.get("metric_mismatches", []):
+        if not isinstance(item, dict):
+            continue
+        mismatches.append({
+            key: item.get(key)
+            for key in ("metric_id", "reported_value", "recalculated_value",
+                        "tolerance", "matches")
+            if key in item
+        })
+    mismatches.sort(key=lambda item: str(item.get("metric_id", "")))
+    findings = sorted({
+        item["finding"].strip()
+        for item in feedback.get("findings", [])
+        if isinstance(item, dict) and isinstance(item.get("finding"), str)
+        and item["finding"].strip()
+    })
+    if not checks and not mismatches and not findings:
+        return None
+    evidence = {
+        "gate": feedback["gate"],
+        "failed_checks": checks,
+        "metric_mismatches": mismatches,
+        "findings": findings,
+    }
+    digest = hashlib.sha256(canonical_bytes(evidence)).hexdigest()
+    return f"program_gate:{feedback['gate']}:{digest}"
+
+
 def validate_foundry_config(value):
     """Validate the immutable host paths and budgets for generated programs."""
     if (not isinstance(value, dict)
@@ -307,35 +716,33 @@ def validate_foundry_config(value):
 
 
 def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, runtime_version=None):
+    work_orders = test_input.get("work_orders", []) if isinstance(test_input, dict) else []
+    if not isinstance(work_orders, list):
+        raise ValidationError("capability foundry work_orders test input must be a list")
+    executor_fields = list(PROGRAM_OUTPUT_FIELDS)
     quality_contract = (
         required_intent.get("quality_contract")
         if isinstance(required_intent, dict) else None
     )
     requires_analysis = isinstance(quality_contract, dict)
-    analysis_descriptions = {
-        "conditions": (
-            "nonempty list of distinct condition names that actually occur in the emitted observations"
-        ),
-        "independent_seeds": (
-            "nonempty list of unique nonnegative seeds actually used by the experiment"
-        ),
-        "controls": "list of actual control conditions and their observed role",
-        "comparisons": "list of {id,description} objects for comparisons actually computed",
-        "uncertainty": "list of uncertainty procedures/results, or empty only when not required",
-        "effect_sizes": "list of effect-size procedures/results, or empty only when not required",
-        "sensitivity": "list of sensitivity analyses/results, or empty only when not required",
-        "ablation": "list of ablation analyses/results, or empty only when not required",
-        "raw_data": "list naming the emitted raw observations and their fields",
-    }
-    analysis_output_contract = {
-        key: analysis_descriptions[key] for key in sorted(ANALYSIS_FIELDS)
-    }
+    requires_source_data = _requires_source_data_manifest(brief)
+    analysis_descriptions = analysis_output_contract()
+    analysis_shape = {key: analysis_descriptions[key] for key in sorted(ANALYSIS_FIELDS)}
     prompt = {
         "assignment": "author_experiment_program",
+        "author_response_contract_version": "experiment-author-json-v2",
+        "authoring_output_order": [
+            "experiment_intent", "executor_source", "validator_source",
+        ],
+        "response_contract": (
+            "Return only one complete JSON object with those three keys. The first non-whitespace "
+            "character is { and the final character is }. Put no reasoning, plan, prose, or markdown "
+            "outside it; keep descriptions concise and place implementation only in the source fields."
+        ),
         "capability_brief": brief,
         "output_contract": {
             "executor_source": "complete Python source; reads {'configured_input','experiment'} from stdin, "
-                               f"writes one JSON object with exactly {list(PROGRAM_OUTPUT_FIELDS)} "
+                               f"writes one JSON object with exactly {executor_fields} "
                                + ("and a required analysis object matching executor_output_exact_shapes.analysis; "
                                   if requires_analysis else "and optionally analysis; ")
                                + "schema_version must be experiment-program-output-1; "
@@ -397,7 +804,10 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
         "executor_output_exact_shapes": {
             "procedures": [{"id": "protocol", "description": "nonempty text",
                             "source": "nonempty provenance text"}],
-            "observations": [{"replicate": 1, "raw_measurement": 0.0}],
+            "observations": ([{"source_record_id": "exact manifest row_id",
+                               "source_values": {"measurement": 0.0}, "replicate": 1}]
+                             if requires_source_data else
+                             [{"replicate": 1, "raw_measurement": 0.0}]),
             "metrics": [{"id": "exact primary_outcomes id", "value": 0.0,
                          "unit": "exact primary_outcomes unit", "conditions": "nonempty text",
                          "source": "observations", "presentation": "nonempty text"}],
@@ -438,6 +848,12 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             "max_observations": 5000, "max_asset_bytes": 10000000,
         },
         "constraints": [
+            "Emit experiment_intent before either source field in the returned JSON object. "
+            "It is the compact frozen design record; preserve it even when either source would "
+            "need a later continuation.",
+            "experiment_intent.stage_seconds must contain exactly these keys: "
+            "setup, supervision, production, unit_review, integrated_review, reassessment; "
+            "provide a positive finite number for each key and no additional keys.",
             "Both programs execute directly under Python with __name__ == '__main__'; invoke the entry point "
             "at module level or under that exact guard so each stdin request produces stdout JSON.",
             "the executor and validator receive the same controller-owned, frozen experiment intent at "
@@ -496,10 +912,13 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             "A crossing estimator must return an explicit censored or undefined status when no interior crossing exists. "
             "A primary metric may carry JSON null for that status when its finding/presentation records the reason. "
             "Never replace a no-crossing, first-grid, or last-grid result with an endpoint, zero, NaN, or Infinity.",
+            "When an observation marks an event as censored, non-crossing, unobserved, or undefined, do not put a numeric point event value in that row. Record any censoring bound in a separately named bound field and exclude it from point-event estimators; a boundary reached by the search is not an observed onset.",
+            "Every condition-specific primary outcome, including null, ablation, and alternative-mechanism outcomes, must be recalculable from emitted observation rows. Emit explicit raw rows for each declared condition with a condition label and the raw measurements used by that outcome. Do not calculate a condition-specific metric only inside the executor and label its source as observations. If a condition cannot be observed under the admitted design, keep its estimand undefined and state the limitation.",
             "If the observed grid is censored at a boundary but the research question or hypothesis claims an interior "
             "transition, do not manufacture an onset or merely alter the validator. Repair the scientific design by "
             "changing the intervention grid, dynamics, or explicitly measurable estimand, and revise the intent and "
             "both programs together; otherwise preserve the null as a bounded negative result.",
+            "Do not tune physical parameters merely to force a crossing, nonzero effect, or desired sign. Any changed physical parameter or range must be justified from the admitted topic's source evidence or a clearly labelled calibration study, and its sensitivity range must be reported. If no evidence-supported parameter regime yields an interior crossing, report a bounded censored/negative result or propose a same-question estimand that the data can identify; do not manufacture a positive result.",
             "If repair evidence reports constant observations, a boundary fallback, a dimension mismatch, or a "
             "declared intervention that does not enter the dynamics, discard that method and author a materially "
             "different executable design. Changing only a threshold or relabelling the same algebraic output is not repair.",
@@ -519,8 +938,26 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             "but unidentifiable program.",
         ],
     }
+    if requires_source_data:
+        prompt["constraints"].extend([
+            "This experiment depends on empirical source data. Use only configured_input.source_data_manifest; "
+            "never digitize, infer, approximate, or invent source values from prose, figures, abstracts, or memory.",
+            "Emit exactly one observation per manifest row. Each observation must preserve that row's exact "
+            "source_record_id and source_values, with a positive replicate index; calculate metrics from those "
+            "values and do not add, omit, or alter rows.",
+        ])
+    if work_orders:
+        prompt["constraints"].extend([
+            "Read every configured_input.work_orders item and implement its exact id, objective, success_condition, and evidence_needed in executable procedures and result data; do not treat supplied_context prose as a substitute.",
+            "Emit the experiment's scientific outputs only. Do not add work_order_assessments or self-certify completion; independent reviewers adjudicate each order against the executable outputs.",
+        ])
     if required_intent:
         prompt["required_intent_fields"] = required_intent
+        for key, value in required_intent.items():
+            if key == "quality_contract":
+                continue
+            if key in prompt["output_contract"]["experiment_intent"]:
+                prompt["output_contract"]["experiment_intent"][key] = deepcopy_config(value)
         prompt["constraints"].append(
             "copy every supplied required_intent_fields value exactly into experiment_intent; do not broaden, "
             "rename, paraphrase, or substitute the admitted scientific question")
@@ -532,7 +969,7 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
         if requires_analysis:
             prompt["output_contract"]["experiment_intent"]["quality_contract"] = deepcopy_config(
                 quality_contract)
-            prompt["executor_output_exact_shapes"]["analysis"] = analysis_output_contract
+            prompt["executor_output_exact_shapes"]["analysis"] = analysis_shape
             prompt["constraints"].extend([
                 "The supplied quality_contract is frozen in this novel-research intent. The executor MUST "
                 "emit a top-level analysis object with exactly the fields in "
@@ -545,6 +982,13 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
                 "analysis.controls and analysis.comparisons must describe computed evidence and meet "
                 f"minimum_controls={quality_contract.get('minimum_controls')} and "
                 f"minimum_comparisons={quality_contract.get('minimum_comparisons')}.",
+                "analysis is a closed top-level object: use only the keys named in "
+                "executor_output_exact_shapes.analysis. Never add a metric-specific key such as "
+                "bootstrap_slope_difference at this level; put a numeric estimate and its interval "
+                "inside an analysis.uncertainty evidence record with id and description.",
+                "For a bootstrap interval, store machine-readable estimate, lower, and upper values "
+                "on the same analysis.uncertainty record; include the resampling method, unit, and "
+                "replicate count in its description or additional evidence fields.",
                 "For every required analysis kind, include a nonempty, result-grounded entry in its "
                 "corresponding analysis list; leave an unrequired kind empty rather than fabricate it. "
                 "analysis.raw_data must identify the actual raw observations emitted.",
@@ -560,6 +1004,8 @@ def apply_authoring_patch(previous, response):
     if not isinstance(updates, dict) or not updates or set(updates) - ATTEMPT_FIELDS:
         raise ValidationError("authoring updates may change only executor_source, validator_source or experiment_intent")
     result = deepcopy_config(previous)
+    edit_count = 0
+    source_edit_chars = 0
 
     def merge(target, patch):
         for key, value in patch.items():
@@ -581,16 +1027,38 @@ def apply_authoring_patch(previous, response):
         if isinstance(value, str):
             raise ValidationError(
                 f"{name} repair must use compact exact source edits; complete source replacement is not accepted")
+        if (isinstance(value, dict)
+                and "remove_duplicate_definitions" in value):
+            if set(value) not in (
+                    {"source_sha256", "remove_duplicate_definitions"},
+                    {"source_sha256", "remove_duplicate_definitions",
+                     "keep_entry_guard_line_start"}):
+                raise ValidationError(
+                    f"{name} structural patch must contain only its source fingerprint and duplicate selections")
+            if not isinstance(result.get(name), str):
+                raise ValidationError(f"{name} structural patch requires existing source")
+            result[name] = _apply_duplicate_structure_patch(result[name], value, name=name)
+            continue
         if (not isinstance(value, dict) or set(value) != {"edits"}
                 or not isinstance(value["edits"], list) or not value["edits"]
                 or not isinstance(result.get(name), str)):
             raise ValidationError(f"{name} repair requires complete source or a nonempty exact edits list")
+        if edit_count + len(value["edits"]) > AUTHOR_PATCH_MAX_EDITS:
+            raise ValidationError(
+                f"authoring patch exceeds the bounded source-edit limit of "
+                f"{AUTHOR_PATCH_MAX_EDITS} edits")
         source = result[name]
         for edit in value["edits"]:
             if (not isinstance(edit, dict) or set(edit) != {"old", "new"}
                     or not isinstance(edit["old"], str) or not edit["old"]
                     or not isinstance(edit["new"], str)):
                 raise ValidationError(f"{name} edit requires nonempty old text and string new text")
+            source_edit_chars += len(edit["old"]) + len(edit["new"])
+            edit_count += 1
+            if source_edit_chars > AUTHOR_PATCH_MAX_SOURCE_CHARS:
+                raise ValidationError(
+                    f"authoring patch exceeds the bounded source-edit limit of "
+                    f"{AUTHOR_PATCH_MAX_SOURCE_CHARS} characters")
             positions = []
             cursor = 0
             while len(positions) < 4:
@@ -623,6 +1091,672 @@ def apply_authoring_patch(previous, response):
     return result
 
 
+def _definition_line_start(node):
+    return min([node.lineno] + [item.lineno for item in node.decorator_list])
+
+
+def _apply_duplicate_structure_patch(source, patch, *, name):
+    if not isinstance(patch.get("source_sha256"), str):
+        raise ValidationError(f"{name} structural patch requires the current source SHA-256")
+    observed_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    if patch["source_sha256"] != observed_hash:
+        raise ValidationError(f"{name} structural patch source fingerprint does not match current source")
+    removals = patch.get("remove_duplicate_definitions")
+    if not isinstance(removals, list):
+        raise ValidationError(f"{name} structural patch requires duplicate-definition selections")
+    if len(removals) > AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS:
+        raise ValidationError(
+            f"{name} structural patch exceeds the bounded removal limit of "
+            f"{AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS}")
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        raise ValidationError(f"{name} structural patch requires syntactically valid Python") from exc
+
+    definitions = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definitions.setdefault(node.name, []).append(node)
+    duplicate_nodes = [
+        node for matches in definitions.values() if len(matches) > 1
+        for node in matches
+    ]
+    guards = [node for node in tree.body if is_main_entry_guard(node)]
+    if duplicate_nodes or len(guards) > 1:
+        lines = source.splitlines()
+        duplicate_context_chars = sum(
+            len("\n".join(lines[_definition_line_start(node) - 1:
+                                  node.end_lineno or node.lineno]))
+            for node in duplicate_nodes)
+        guard_context_chars = sum(
+            len("\n".join(lines[node.lineno - 1:node.end_lineno or node.lineno]))
+            for node in guards)
+        if duplicate_context_chars + guard_context_chars > AUTHOR_PATCH_DUPLICATE_CONTEXT_MAX_CHARS:
+            raise ValidationError(
+                f"{name} duplicate source sections exceed the complete comparison context limit; "
+                "structural removal is not safe")
+    ranges = []
+    selected_names = set()
+    removed_count = 0
+    for selection in removals:
+        if (not isinstance(selection, dict)
+                or set(selection) != {"name", "keep_line_start"}
+                or not isinstance(selection["name"], str)
+                or type(selection["keep_line_start"]) is not int):
+            raise ValidationError(
+                f"{name} structural definition selection requires name and keep_line_start")
+        function_name = selection["name"]
+        if function_name in selected_names:
+            raise ValidationError(f"{name} structural patch repeats definition {function_name!r}")
+        selected_names.add(function_name)
+        matches = definitions.get(function_name, [])
+        starts = [_definition_line_start(node) for node in matches]
+        if len(matches) < 2 or selection["keep_line_start"] not in starts:
+            raise ValidationError(
+                f"{name} structural patch may select only an existing duplicated top-level definition")
+        removed = [node for node, start in zip(matches, starts)
+                   if start != selection["keep_line_start"]]
+        removed_count += len(removed)
+        ranges.extend((_definition_line_start(node), node.end_lineno or node.lineno)
+                      for node in removed)
+
+    if "keep_entry_guard_line_start" in patch:
+        keep_guard = patch["keep_entry_guard_line_start"]
+        if type(keep_guard) is not int:
+            raise ValidationError(f"{name} entry-guard selection must be a source line number")
+        guard_lines = [node.lineno for node in guards]
+        if len(guards) < 2 or keep_guard not in guard_lines:
+            raise ValidationError(
+                f"{name} structural patch may select only an existing duplicated __main__ guard")
+        removed_guards = [node for node in guards if node.lineno != keep_guard]
+        removed_count += len(removed_guards)
+        ranges.extend((node.lineno, node.end_lineno or node.lineno)
+                      for node in removed_guards)
+    if not ranges:
+        raise ValidationError(f"{name} structural patch must remove at least one duplicate declaration")
+    if removed_count > AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS:
+        raise ValidationError(
+            f"{name} structural patch removes more than "
+            f"{AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS} duplicate declarations")
+    ranges.sort()
+    if any(current[0] <= previous[1] for previous, current in zip(ranges, ranges[1:])):
+        raise ValidationError(f"{name} structural patch selected overlapping duplicate declarations")
+
+    lines = source.splitlines(keepends=True)
+    for start, end in reversed(ranges):
+        del lines[start - 1:end]
+    return "".join(lines)
+
+
+def _bounded_repair_text(value, limit=1600):
+    if not isinstance(value, str):
+        value = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    value = value.strip()
+    return value if len(value) <= limit else value[:limit - 1].rstrip() + "…"
+
+
+def _compact_prior_blocking_issues(value):
+    """Carry earlier blockers into the next independent candidate review."""
+    issues = {}
+
+    def append(kind, identifier, finding, evidence, required_change, *, extras=None,
+               review_check_id=None):
+        finding = _bounded_repair_text(finding, 1000)
+        evidence = _bounded_repair_text(evidence, 1000)
+        required_change = _bounded_repair_text(required_change, 1000)
+        identifier = identifier or (
+            f"prior-{kind}-" + hashlib.sha256(canonical_bytes({
+                "finding": finding, "evidence": evidence,
+                "required_change": required_change,
+            })).hexdigest()[:16])
+        check_id = review_check_id or (
+            "prior_issue_" + hashlib.sha256(identifier.encode()).hexdigest()[:12])
+        issue = {
+            "id": identifier, "kind": kind, "finding": finding,
+            "evidence": evidence, "required_change": required_change,
+            "review_check_id": check_id,
+        }
+        if isinstance(extras, dict):
+            issue.update({key: _bounded_repair_text(value, 300)
+                          for key, value in extras.items()})
+        issues[check_id] = issue
+
+    if isinstance(value, list):
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            finding = item.get("finding")
+            required_change = item.get("required_change")
+            if not isinstance(finding, str) or not isinstance(required_change, str):
+                continue
+            append(
+                item.get("kind", "finding") if isinstance(item.get("kind"), str) else "finding",
+                item.get("id") if isinstance(item.get("id"), str) else None,
+                finding, item.get("evidence", "Evidence remains to be independently checked."),
+                required_change,
+                extras={key: item[key] for key in ("check_id",) if key in item},
+                review_check_id=item.get("review_check_id"),
+            )
+    elif isinstance(value, dict):
+        findings = value.get("findings")
+        if isinstance(findings, list):
+            for item in findings:
+                if not isinstance(item, dict) or item.get("severity") != "blocking":
+                    continue
+                finding = item.get("finding", "Prior blocking finding remains unresolved")
+                evidence = item.get("evidence", "The revised candidate needs evidence for this finding.")
+                required_change = item.get("required_change", "Resolve the prior finding with verifiable evidence.")
+                identifier = "prior-finding-" + hashlib.sha256(canonical_bytes({
+                    "finding": finding, "evidence": evidence,
+                    "required_change": required_change,
+                })).hexdigest()[:16]
+                append("finding", identifier, finding, evidence, required_change)
+
+        checks = value.get("failed_checks")
+        if not isinstance(checks, list):
+            checks = value.get("checks")
+            checks = ([item for item in checks if isinstance(item, dict)
+                       and item.get("outcome") == "failed"]
+                      if isinstance(checks, list) else [])
+        for item in checks:
+            if not isinstance(item, dict) or item.get("outcome", "failed") != "failed":
+                continue
+            check_id = _bounded_repair_text(item.get("id", "unknown"), 100)
+            append(
+                "failed_check", f"prior-check-{check_id}",
+                item.get("finding") or f"Prior check {check_id} failed",
+                item.get("evidence", "The prior check did not pass."),
+                item.get("required_change") or
+                f"Re-run check {check_id} on the revised candidate and resolve its failure.",
+                extras={"check_id": check_id},
+            )
+
+        mismatches = value.get("metric_mismatches")
+        if isinstance(mismatches, list):
+            for item in mismatches:
+                if not isinstance(item, dict):
+                    continue
+                metric_id = item.get("metric_id", item.get("metric", "unknown"))
+                reported = item.get("reported_value", item.get("observed", "unknown"))
+                recalculated = item.get("recalculated_value", item.get("expected", "unknown"))
+                append(
+                    "metric_mismatch", f"prior-metric-{_bounded_repair_text(metric_id, 100)}",
+                    f"Metric {metric_id} did not match its independent recalculation.",
+                    f"reported={reported}; recalculated={recalculated}",
+                    "Recompute this metric independently from the recorded observations or "
+                    "remove claims that depend on the unverified value.",
+                    extras={key: item[source] for key, source in (
+                        ("reported_value", "reported_value"),
+                        ("recalculated_value", "recalculated_value"),
+                        ("expected", "expected"), ("observed", "observed"),
+                        ("tolerance", "tolerance"), ("matches", "matches"),
+                    ) if source in item},
+                )
+    return list(issues.values())
+
+
+def _merge_prior_blocking_issues(*values):
+    issues = []
+    by_check_id = {}
+    by_content = {}
+    for value in values:
+        for item in _compact_prior_blocking_issues(value):
+            check_id = item.get("check_id") if item.get("kind") == "failed_check" else None
+            existing = by_check_id.get(check_id) if check_id else None
+            content_id = hashlib.sha256(canonical_bytes({
+                "kind": item["kind"],
+                "finding": item["finding"],
+                "required_change": item["required_change"],
+            })).hexdigest()
+            if existing is None:
+                existing = by_content.get(content_id)
+            if existing is not None:
+                existing["evidence"] = item["evidence"]
+                continue
+            issues.append(item)
+            by_check_id[item["review_check_id"]] = item
+            by_content[content_id] = item
+    return issues
+
+
+def _retain_prior_blocking_issues(state, *values):
+    state["blocking_issue_ledger"] = _merge_prior_blocking_issues(
+        state.get("blocking_issue_ledger"), *values)
+    return state["blocking_issue_ledger"]
+
+
+def _authored_candidate_sha256(candidate):
+    if not isinstance(candidate, dict) or not ATTEMPT_FIELDS.issubset(candidate):
+        return None
+    authored = {key: candidate[key] for key in sorted(ATTEMPT_FIELDS)}
+    return hashlib.sha256(canonical_bytes(authored)).hexdigest()
+
+
+def _candidate_bound_value(state, candidate, value_key, fingerprint_key):
+    fingerprint = _authored_candidate_sha256(candidate)
+    value = state.get(value_key) if isinstance(state, dict) else None
+    if (fingerprint is None or not isinstance(value, dict)
+            or state.get(fingerprint_key) != fingerprint):
+        return {}
+    return value
+
+
+def _source_patch_context(source, focus_text):
+    """Project only complete, relevant functions into a bounded patch request."""
+    if not isinstance(source, str):
+        return {"source_sha256": None, "sections": [], "omitted": []}
+    source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    lines = source.splitlines()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        line_number = exc.lineno or 1
+        start = max(1, line_number - 12)
+        end = min(len(lines), line_number + 12)
+        excerpt = "\n".join(lines[start - 1:end])
+        return {
+            "source_sha256": source_hash,
+            "syntax_error": {"line": line_number, "message": exc.msg},
+            "sections": ([{"name": "syntax_error_context", "line_start": start,
+                           "line_end": end, "source": excerpt}] if excerpt else []),
+            "omitted": [],
+        }
+
+    nodes = [node for node in tree.body
+             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    by_name = {}
+    for node in nodes:
+        by_name.setdefault(node.name, []).append(node)
+    duplicate_definitions = [
+        {"name": name, "line_starts": [
+            _definition_line_start(node)
+            for node in matches]}
+        for name, matches in sorted(by_name.items()) if len(matches) > 1
+    ]
+    duplicate_names = {item["name"] for item in duplicate_definitions}
+    entry_guards = [node for node in tree.body if is_main_entry_guard(node)]
+    identifiers = set(re.findall(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_])",
+                                 str(focus_text)))
+    selected = []
+    for name in sorted(identifiers):
+        if name not in duplicate_names:
+            selected.extend(by_name.get(name, []))
+    if not selected:
+        if "main" not in duplicate_names:
+            selected.extend(by_name.get("main", []))
+    if not selected and nodes:
+        selected.extend(nodes[:2])
+
+    def callees(node):
+        return {
+            item.func.id if isinstance(item.func, ast.Name) else item.func.attr
+            for item in ast.walk(node) if isinstance(item, ast.Call)
+            and isinstance(item.func, (ast.Name, ast.Attribute))
+        }
+
+    initial = list(selected)
+    for node in initial:
+        for name in sorted(callees(node)):
+            if name not in duplicate_names:
+                selected.extend(by_name.get(name, []))
+    unique = []
+    seen = set()
+    for node in selected:
+        identity = (node.name, node.lineno, node.end_lineno)
+        if identity not in seen:
+            seen.add(identity)
+            unique.append(node)
+    unique.sort(key=lambda node: (node.name not in identifiers,
+                                  node.name != "main", node.lineno))
+
+    sections, omitted, used = [], [], 0
+    for node in unique:
+        start = min([node.lineno] + [item.lineno for item in node.decorator_list])
+        end = node.end_lineno or node.lineno
+        excerpt = "\n".join(lines[start - 1:end])
+        if used + len(excerpt) > AUTHOR_PATCH_CONTEXT_MAX_CHARS:
+            omitted.append({"name": node.name, "line_start": start, "line_end": end})
+            continue
+        sections.append({"name": node.name, "line_start": start,
+                         "line_end": end, "source": excerpt})
+        used += len(excerpt)
+    duplicate_source_sections, duplicate_source_omitted, duplicate_used = [], [], 0
+    duplicate_nodes = sorted(
+        (node for name in duplicate_names for node in by_name[name]),
+        key=lambda node: (node.lineno, node.name))
+    for node in duplicate_nodes:
+        start = _definition_line_start(node)
+        end = node.end_lineno or node.lineno
+        excerpt = "\n".join(lines[start - 1:end])
+        if duplicate_used + len(excerpt) > AUTHOR_PATCH_DUPLICATE_CONTEXT_MAX_CHARS:
+            duplicate_source_omitted.append({
+                "name": node.name, "line_start": start, "line_end": end,
+            })
+            continue
+        duplicate_source_sections.append({
+            "name": node.name, "line_start": start,
+            "line_end": end, "source": excerpt,
+        })
+        duplicate_used += len(excerpt)
+    entry_guard_source_sections, entry_guard_source_omitted = [], []
+    for node in entry_guards:
+        start = node.lineno
+        end = node.end_lineno or node.lineno
+        excerpt = "\n".join(lines[start - 1:end])
+        if duplicate_used + len(excerpt) > AUTHOR_PATCH_DUPLICATE_CONTEXT_MAX_CHARS:
+            entry_guard_source_omitted.append({
+                "line_start": start, "line_end": end,
+            })
+            continue
+        entry_guard_source_sections.append({
+            "line_start": start, "line_end": end, "source": excerpt,
+        })
+        duplicate_used += len(excerpt)
+    return {
+        "source_sha256": source_hash,
+        "sections": sections,
+        "omitted": omitted,
+        "duplicate_definitions": duplicate_definitions,
+        "duplicate_source_sections": duplicate_source_sections,
+        "duplicate_source_omitted": duplicate_source_omitted,
+        "duplicate_source_complete": (
+            not duplicate_source_omitted and not entry_guard_source_omitted),
+        "entry_guard_source_sections": entry_guard_source_sections,
+        "entry_guard_source_omitted": entry_guard_source_omitted,
+        "entry_guard_source_complete": not entry_guard_source_omitted,
+        "entry_guard_line_starts": [node.lineno for node in entry_guards],
+    }
+
+
+def _record_program_gate_feedback(state, feedback, candidate=None):
+    previous_feedback = state.get("validation_feedback")
+    state["validation_feedback"] = deepcopy_config(feedback)
+    state["validation_feedback_candidate_sha256"] = _authored_candidate_sha256(candidate)
+    if state["validation_feedback_candidate_sha256"] is not None:
+        state["blocking_issue_ledger_candidate_sha256"] = (
+            state["validation_feedback_candidate_sha256"])
+    return _retain_prior_blocking_issues(state, previous_feedback, feedback)
+
+
+def _reconcile_prior_blocking_issues(prior_issues, review):
+    prior_issues = _compact_prior_blocking_issues(prior_issues)
+    checks = review.get("checks", []) if isinstance(review, dict) else []
+    findings = review.get("findings", []) if isinstance(review, dict) else []
+    check_by_id = {
+        item["id"]: item for item in checks
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    unresolved = []
+    for issue in prior_issues:
+        check = check_by_id.get(issue["review_check_id"])
+        if check is None or check.get("outcome") != "failed":
+            continue
+        retained = deepcopy_config(issue)
+        if isinstance(check.get("evidence"), str) and check["evidence"].strip():
+            retained["evidence"] = _bounded_repair_text(check["evidence"], 1000)
+        matching_finding = next((item for item in findings
+                                 if isinstance(item, dict)
+                                 and item.get("severity") == "blocking"
+                                 and item.get("finding") == issue["finding"]), None)
+        if matching_finding is not None:
+            for field in ("evidence", "required_change"):
+                value = matching_finding.get(field)
+                if isinstance(value, str) and value.strip():
+                    retained[field] = _bounded_repair_text(value, 1000)
+        unresolved.append(retained)
+
+    unresolved_findings = {item["finding"] for item in unresolved}
+    prior_check_ids = {item["review_check_id"] for item in prior_issues}
+    new_findings = [
+        item for item in findings
+        if isinstance(item, dict) and item.get("severity") == "blocking"
+        and item.get("finding") not in unresolved_findings
+    ]
+    new_failed_checks = [
+        item for item in checks
+        if isinstance(item, dict) and item.get("outcome") == "failed"
+        and item.get("id") not in prior_check_ids
+    ]
+    return _merge_prior_blocking_issues(
+        unresolved,
+        {"findings": new_findings, "failed_checks": new_failed_checks},
+    )
+
+
+def _compact_repair_findings(value):
+    if not isinstance(value, dict):
+        return {}
+    result = {
+        key: value[key]
+        for key in ("decision", "gate")
+        if isinstance(value.get(key), str)
+    }
+    raw_checks = value.get("failed_checks")
+    raw_findings = value.get("findings")
+    raw_mismatches = value.get("metric_mismatches")
+    checks = [item for item in (raw_checks if isinstance(raw_checks, list) else [])
+              if isinstance(item, dict)]
+    findings = [item for item in (raw_findings if isinstance(raw_findings, list) else [])
+                if isinstance(item, dict)]
+    mismatches = [item for item in (raw_mismatches if isinstance(raw_mismatches, list) else [])
+                  if isinstance(item, dict)]
+    blocking = [item for item in findings if item.get("severity") == "blocking"]
+    active_finding = blocking[0] if blocking else None
+    active_check = checks[0] if checks and active_finding is None else None
+    active_mismatch = mismatches[0] if mismatches and not (active_finding or active_check) else None
+
+    def compact(item, keys):
+        compacted = {}
+        for key in keys:
+            if key not in item:
+                continue
+            item_value = item[key]
+            compacted[key] = (
+                item_value if item_value is None or type(item_value) in (bool, int, float)
+                else _bounded_repair_text(item_value, 1200)
+            )
+        return compacted
+
+    if active_finding is not None:
+        result["findings"] = [{
+            key: _bounded_repair_text(active_finding[key], 1200)
+            for key in ("severity", "finding", "evidence", "required_change")
+            if key in active_finding
+        }]
+    else:
+        result["findings"] = []
+    if active_check is not None:
+        result["failed_checks"] = [compact(
+            active_check, ("id", "outcome", "evidence", "severity", "finding", "required_change"))]
+    if active_mismatch is not None:
+        if "metric_id" in active_mismatch:
+            result["metric_mismatches"] = [compact(
+                active_mismatch, ("metric_id", "reported_value", "recalculated_value",
+                                  "tolerance", "matches"))]
+        else:
+            result["metric_mismatches"] = [compact(
+                active_mismatch, ("metric", "expected", "observed"))]
+
+    active_check_index = 0 if active_check is not None else None
+    deferred_check_ids = [
+        _bounded_repair_text(item.get("id", "unknown"), 120)
+        for index, item in enumerate(checks)
+        if index != active_check_index
+    ]
+    if deferred_check_ids:
+        result["deferred_failed_check_ids"] = deferred_check_ids
+    active_mismatch_index = 0 if active_mismatch is not None else None
+    deferred_metric_ids = [
+        _bounded_repair_text(item.get("metric_id", item.get("metric", "unknown")), 120)
+        for index, item in enumerate(mismatches)
+        if index != active_mismatch_index
+    ]
+    if deferred_metric_ids:
+        result["deferred_metric_ids"] = deferred_metric_ids
+
+    result["repair_scope"] = {
+        "policy": "one_issue_per_candidate_revision",
+        "active_issue": (
+            "blocking_finding" if active_finding is not None else
+            "failed_check" if active_check is not None else
+            "metric_mismatch" if active_mismatch is not None else "none"
+        ),
+        "deferred_blocking_findings": max(0, len(blocking) - (active_finding is not None)),
+        "deferred_warning_findings": sum(
+            item.get("severity") == "warning" for item in findings),
+        "deferred_failed_checks": len(deferred_check_ids),
+        "deferred_metric_mismatches": len(deferred_metric_ids),
+    }
+    return result
+
+
+def _compact_repair_context(value):
+    if not isinstance(value, dict):
+        return {}
+    result = {
+        key: value[key]
+        for key in ("observation_count", "sampled_observation_count")
+        if type(value.get(key)) is int
+    }
+    metrics = value.get("metrics")
+    if isinstance(metrics, list):
+        result["metrics"] = [
+            {key: _bounded_repair_text(item[key], 180)
+             for key in ("id", "value_repr") if key in item}
+            for item in metrics[:16] if isinstance(item, dict)
+        ]
+    numeric = value.get("numeric_observation_fields")
+    if isinstance(numeric, dict):
+        result["numeric_observation_fields"] = {
+            key: {name: item[name] for name in (
+                "count", "finite_count", "unique_finite_count", "min", "max")
+                  if name in item}
+            for key, item in list(numeric.items())[:16]
+            if isinstance(key, str) and isinstance(item, dict)
+        }
+    return result
+
+
+def authoring_patch_prompt(*, brief, required_intent, configured_input,
+                           candidate, feedback, validation_context,
+                           validation_feedback, format_repair):
+    """Ask for a compact patch without repeating the full authoring contract."""
+    topic = brief.get("topic") if isinstance(brief, dict) else None
+    topic_fields = (
+        "id", "title", "domain", "research_question", "scope",
+        "disconfirmation_test", "research_form", "evidence_mode",
+    )
+    topic = ({key: _bounded_repair_text(topic[key], 1200)
+              for key in topic_fields if key in topic}
+             if isinstance(topic, dict) else {})
+    orders = configured_input.get("work_orders", [])
+    if not isinstance(orders, list):
+        orders = []
+    compact_orders = []
+    for order in orders[:8]:
+        if not isinstance(order, dict):
+            continue
+        compact_orders.append({
+            key: _bounded_repair_text(order[key], 800)
+            for key in ("id", "objective", "success_condition", "evidence_needed")
+            if key in order
+        })
+    output_contract = {"updates": {
+        "executor_source": (
+            "optional {'edits':[{'old':unique_text,'new':replacement}]} or a fingerprinted duplicate-only "
+            "structural patch {'source_sha256':...,'remove_duplicate_definitions':["
+            "{'name':...,'keep_line_start':...}],'keep_entry_guard_line_start':...}; "
+            f"the entry-guard field is optional; at most {AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS} "
+            "duplicate declarations may be removed; never return full source"),
+        "validator_source": (
+            "optional {'edits':[{'old':unique_text,'new':replacement}]} or a fingerprinted duplicate-only "
+            "structural patch {'source_sha256':...,'remove_duplicate_definitions':["
+            "{'name':...,'keep_line_start':...}],'keep_entry_guard_line_start':...}; "
+            f"the entry-guard field is optional; at most {AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS} "
+            "duplicate declarations may be removed; never return full source"),
+        "experiment_intent": "optional JSON merge patch containing only changed fields",
+    }}
+    format_details = {}
+    for key in ("repair_kind", "previous_error", "required_fields", "observed_fields",
+                "missing_fields", "unexpected_fields", "instructions"):
+        if key not in format_repair:
+            continue
+        value = format_repair[key]
+        format_details[key] = (
+            [_bounded_repair_text(item, 300) for item in value[:16]]
+            if isinstance(value, list) else _bounded_repair_text(value, 1400)
+        )
+    compact_feedback = _compact_repair_findings(validation_feedback)
+    repair_scope = compact_feedback.get("repair_scope", {})
+    active_issue = repair_scope.get("active_issue", "none")
+    if active_issue != "none" and "previous_error" in format_details:
+        format_details["previous_error"] = (
+            "The prior response did not satisfy the requested JSON format. Return one complete JSON "
+            "object matching output_contract and address only the single active issue below; "
+            "deferred scientific findings remain recorded for later review."
+        )
+    format_error = format_details.get("previous_error")
+    previous_error_source = feedback if feedback is not None else format_error
+    previous_error = (
+        f"The prior candidate failed {compact_feedback.get('gate', 'validation')}; "
+        "see the single active issue below."
+        if active_issue != "none" else _bounded_repair_text(previous_error_source, 2200)
+    )
+    repair_focus_error = previous_error if active_issue != "none" else feedback
+    repair_focus = "\n".join((
+        _bounded_repair_text(repair_focus_error, 1800),
+        json.dumps(compact_feedback, ensure_ascii=False, sort_keys=True),
+        json.dumps(format_details, ensure_ascii=False, sort_keys=True),
+        json.dumps(_compact_repair_context(validation_context),
+                   ensure_ascii=False, sort_keys=True),
+    ))
+    return {
+        "assignment": "repair_existing_experiment_candidate",
+        "topic": topic,
+        "required_intent_fields": required_intent or {},
+        "candidate_sha256": _authored_candidate_sha256(candidate),
+        "current_candidate": {
+            "experiment_intent": candidate.get("experiment_intent", {}),
+            "source_context": {
+                "executor_source": _source_patch_context(
+                    candidate.get("executor_source"), repair_focus),
+                "validator_source": _source_patch_context(
+                    candidate.get("validator_source"), repair_focus),
+            },
+        },
+        "repair_request": {
+            "previous_error": previous_error,
+            "observed_failure_context": _compact_repair_context(validation_context),
+            "validation_feedback": compact_feedback,
+            "work_orders": compact_orders,
+        },
+        "format_repair": format_details,
+        "output_contract": output_contract,
+        "instructions": (
+            "Return exactly one JSON object with only the updates key. Make the smallest exact source edits "
+            "that resolve only the single active issue identified in repair_scope. Do not attempt deferred "
+            "findings or checks in this revision; they remain recorded and will be independently reviewed "
+            "after the candidate is replayed. Preserve the frozen estimand and controller-owned inputs; "
+            "do not change results or invent observations. "
+            "Do not emit internal reasoning, deliberation, alternative hypotheses, or narration. "
+            "Use only the supplied complete source sections and do not reconstruct omitted source. "
+            "Do not repeat the candidate, include rationale, or rewrite either source file. For duplicate "
+            "definitions, compare every supplied complete duplicate_source_section and choose the exact "
+            "line_start to retain from duplicate_definitions. Use the fingerprinted structural patch "
+            "only when duplicate_source_complete is true; otherwise do not guess which source to retain. "
+            "For duplicate __main__ guards, compare every complete entry_guard_source_section and choose "
+            "the exact line_start to retain; use the structural guard patch only when "
+            "entry_guard_source_complete is true. The structural patch can remove only "
+            "other duplicate declarations, never arbitrary line ranges. The source_sha256 must match the "
+            "current source context. Otherwise use exact edits whose old source excerpt occurs exactly once. "
+            "Use at most "
+            f"{AUTHOR_PATCH_MAX_EDITS} edits and no more than {AUTHOR_PATCH_MAX_SOURCE_CHARS} "
+            "characters total across old and new source text. If the reported failure is only an "
+            "output-shape mismatch, repair that shape and leave the scientific design unchanged."
+        ),
+    }
+
+
 def program_failure_context(document):
     """Project numerical failure evidence without forwarding an entire dataset."""
     if not isinstance(document, dict):
@@ -647,7 +1781,14 @@ def program_failure_context(document):
                         for item in metrics[:24] if isinstance(item, dict)]}
 
 
-def validate_program_review(value):
+def validate_program_review(value, *, prior_blocking_issues=None):
+    prior_blocking_issues = (
+        prior_blocking_issues if isinstance(prior_blocking_issues, list) else [])
+    prior_check_ids = {
+        item["review_check_id"] for item in prior_blocking_issues
+        if isinstance(item, dict) and isinstance(item.get("review_check_id"), str)
+    }
+    required_check_ids = PROGRAM_REVIEW_CHECKS | prior_check_ids
     required = {"status", "checks", "findings"}
     if (not isinstance(value, dict) or not required.issubset(value)
             or set(value) - (required | {"limitations"})):
@@ -659,7 +1800,7 @@ def validate_program_review(value):
     if not isinstance(checks, list):
         raise ValidationError(
             "scientific program review checks must be a list containing exactly: "
-            + ", ".join(sorted(PROGRAM_REVIEW_CHECKS)))
+            + ", ".join(sorted(required_check_ids)))
     required_check_fields = frozenset({"id", "outcome", "evidence"})
     diagnostic_check_fields = frozenset({
         "id", "outcome", "evidence", "severity", "finding", "required_change",
@@ -688,10 +1829,10 @@ def validate_program_review(value):
             malformed.append(index)
     ids = [item.get("id") for item in checks if isinstance(item, dict)]
     string_ids = [item for item in ids if isinstance(item, str)]
-    missing = sorted(PROGRAM_REVIEW_CHECKS - set(string_ids))
-    unexpected = sorted(set(string_ids) - PROGRAM_REVIEW_CHECKS)
+    missing = sorted(required_check_ids - set(string_ids))
+    unexpected = sorted(set(string_ids) - required_check_ids)
     duplicates = sorted({item for item in string_ids if string_ids.count(item) > 1})
-    if (len(checks) != len(PROGRAM_REVIEW_CHECKS) or malformed or missing or unexpected or duplicates):
+    if (len(checks) != len(required_check_ids) or malformed or missing or unexpected or duplicates):
         details = []
         if malformed:
             details.append("malformed rows=" + ",".join(str(index) for index in malformed))
@@ -712,6 +1853,23 @@ def validate_program_review(value):
             or any(not isinstance(item.get(key), str) or not item[key].strip()
                    for key in ("finding", "evidence", "required_change")) for item in findings)):
         raise ValidationError("scientific program review findings must cite evidence and a scoped repair")
+    findings = list(findings)
+    failed_checks = {item["id"]: item for item in checks
+                     if item["outcome"] == "failed"}
+    for issue in prior_blocking_issues:
+        if not isinstance(issue, dict):
+            continue
+        check = failed_checks.get(issue.get("review_check_id"))
+        if check is None:
+            continue
+        if not any(item["finding"] == issue.get("finding") for item in findings):
+            findings.append({
+                "severity": "blocking",
+                "finding": issue.get("finding") or "Prior blocking issue remains unresolved",
+                "evidence": check["evidence"],
+                "required_change": issue.get("required_change") or
+                    "Resolve the prior issue and provide passing evidence.",
+            })
     rejected = (
         any(item["outcome"] == "failed" for item in checks)
         or any(item.get("severity") == "blocking" for item in checks)
@@ -719,7 +1877,7 @@ def validate_program_review(value):
     )
     if value["status"] != ("rejected" if rejected else "admitted"):
         raise ValidationError("scientific program review status contradicts its checks")
-    return value
+    return {**value, "findings": findings}
 
 
 class CapabilityFoundry:
@@ -857,6 +2015,19 @@ class CapabilityFoundry:
         if model_call_budget is not None and (
                 type(model_call_budget) is not int or model_call_budget < 1):
             raise ValidationError("foundry model_call_budget must be a positive integer when supplied")
+        configured_input = test_input if test_input is not None else {"probe": True}
+        validate_work_orders(
+            configured_input.get("work_orders")
+            if isinstance(configured_input, dict) else None)
+        requires_source_data = _requires_source_data_manifest(brief)
+        source_manifest = (configured_input.get("source_data_manifest")
+                           if isinstance(configured_input, dict) else None)
+        if requires_source_data and source_manifest is None:
+            raise SourceDataUnavailable(
+                "empirical experiment requires controller-supplied source_data_manifest; "
+                "reformulate to available evidence or acquire and verify structured source rows")
+        if source_manifest is not None:
+            _validate_source_data_manifest(source_manifest)
         self.deadline = deadline
         author_role = "research.experiment-author"
         author_route_configs = []
@@ -871,6 +2042,11 @@ class CapabilityFoundry:
             # its meaning.
             for alternative in self.model_config.get("role_model_fallbacks", {}).get(
                     author_role, []):
+                # A budgeted premium model is reserved for consequential
+                # scientific decisions. A malformed envelope is a transport
+                # defect, not a reason to spend that scarce call budget.
+                if alternative.get("model_call_budget_key"):
+                    continue
                 fallback_model = deepcopy_config(self.model_config)
                 fallback_model.setdefault("role_models", {})[author_role] = deepcopy_config(alternative)
                 fallback_config = resolve_model_config(fallback_model, role=author_role)
@@ -897,11 +2073,11 @@ class CapabilityFoundry:
                     author_route_configs.append(fallback_config)
             client = ModelClient(**author_route_configs[0])
         runtime = self._runtime()
-        configured_input = test_input if test_input is not None else {"probe": True}
         base_prompt = candidate_prompt(brief, self.runtime_packages, configured_input,
             required_intent=required_intent, runtime_version=runtime["python"])
         key = None
         state = {"status": "pending", "attempts": 0, "usage": {}, "requests": [],
+                 "author_request_signatures": [],
                  "repair_gate_counts": {}, "repair_ledger": [],
                  "assignment": base_prompt}
         if work_cache is not None:
@@ -917,18 +2093,25 @@ class CapabilityFoundry:
                 model={name: value for name, value in self.model_config.items() if name != "timeout_seconds"})
             state = work_cache.get(key) or state
             state.pop("cache_ref", None)
+            if not isinstance(state.get("author_request_signatures"), list):
+                state["author_request_signatures"] = []
             if state["status"] == "pending":
                 # A changed contract may reuse failed source as repair input,
                 # never as an accepted result. Exact scientific inputs stay
                 # pinned and the rebuilt candidate runs every current gate.
-                for prior in work_cache.entries():
+                def reusable_prior_candidate(prior):
                     requests = prior.get("requests", [])
                     candidate = (prior.get("outcome", {}).get("candidate")
                                  if prior.get("status") == "succeeded" else prior.get("last_attempt"))
                     if (not (requests or prior.get("assignment"))
                             or not isinstance(candidate, dict) or not ATTEMPT_FIELDS.issubset(candidate)):
-                        continue
-                    original = prior.get("assignment") or json.loads(requests[0]["prompt"])
+                        return None
+                    try:
+                        original = prior.get("assignment") or json.loads(requests[0]["prompt"])
+                    except (IndexError, TypeError, ValueError):
+                        return None
+                    if not isinstance(original, dict):
+                        return None
                     original_input = original.get("configured_input", original.get("output_contract", {}).get("test_input"))
                     prior_required = original.get("required_intent_fields") or {}
                     required = base_prompt.get("required_intent_fields") or {}
@@ -936,14 +2119,111 @@ class CapabilityFoundry:
                             or any(required.get(name) != value for name, value in prior_required.items())
                             or original_input != configured_input
                             or not (prior.get("feedback") or prior.get("status") == "succeeded")):
+                        return None
+                    return requests, candidate
+
+                reusable_prior = []
+                resumable_response = None
+                for prior in work_cache.entries():
+                    if prior.get("assignment") == base_prompt:
+                        response = prior.get("last_response")
+                        requests = prior.get("requests", [])
+                        last_request = requests[-1] if requests else None
+                        prior_route_index = prior.get("author_route_index", 0)
+                        if not isinstance(last_request, dict):
+                            last_request = {}
+                        if author_route_configs:
+                            current_route_model = (
+                                author_route_configs[prior_route_index].get("model")
+                                if type(prior_route_index) is int
+                                and 0 <= prior_route_index < len(author_route_configs)
+                                else None
+                            )
+                        else:
+                            current_route_model = getattr(
+                                client, "model", client.__class__.__name__)
+                        prior_continuation = prior.get("author_response_continuation")
+                        continuation_state = (
+                            prior_continuation.get("status")
+                            if isinstance(prior_continuation, dict) else None
+                        )
+                        if (
+                                isinstance(response, dict)
+                                and isinstance(response.get("text"), str)
+                                and response["text"]
+                                and response.get("finish_reason") == "length"
+                                and isinstance(last_request, dict)
+                                and last_request.get("role", author_role) == author_role
+                                and last_request.get("status") == "succeeded"
+                                and isinstance(last_request.get("request_signature"), str)
+                                and last_request.get("request_signature")
+                                and _model_route_identity(response.get("model"))
+                                    == _model_route_identity(current_route_model)
+                                and _model_route_identity(last_request.get("model"))
+                                    == _model_route_identity(current_route_model)
+                                and continuation_state not in {"calling", "result_unknown"}
+                                and type(prior.get("attempts")) is int
+                                and prior.get("attempts", 0) > 0
+                        ):
+                            resumable_response = deepcopy_config(prior)
+                            resumable_response.pop("cache_ref", None)
+                            break
+
+                    seed = reusable_prior_candidate(prior)
+                    if seed is None:
                         continue
+                    requests, candidate = seed
+                    reusable_prior.append((prior, requests, candidate))
+                    state["author_request_signatures"].extend(
+                        _author_request_signatures(prior))
+                state["author_request_signatures"] = sorted(set(
+                    state["author_request_signatures"]))
+                if resumable_response is not None:
+                    # The authored bytes are untrusted input. Reuse a known
+                    # response only for the exact same assignment and model
+                    # route; the current continuation, sandbox, and admission
+                    # gates still decide whether any program is usable.
+                    state = resumable_response
+                    state.update(status="response_received", assignment=base_prompt)
+                    if not isinstance(state.get("author_request_signatures"), list):
+                        state["author_request_signatures"] = []
+                elif reusable_prior:
+                    prior, requests, candidate = reusable_prior[0]
+                    state["blocking_issue_ledger"] = _merge_prior_blocking_issues(
+                        prior.get("blocking_issue_ledger"),
+                        prior.get("validation_feedback"),
+                    )
                     candidate = {name: candidate[name] for name in ATTEMPT_FIELDS}
+                    prior_feedback = _candidate_bound_value(
+                        prior, candidate, "validation_feedback",
+                        "validation_feedback_candidate_sha256")
+                    prior_context = _candidate_bound_value(
+                        prior, candidate, "validation_context",
+                        "validation_context_candidate_sha256")
                     state.update(last_attempt=candidate, feedback=prior.get("feedback") or
                                  "Revalidate the retained program against the current admission contract.",
-                                 validation_context=prior.get("validation_context", {}),
-                                 validation_feedback=prior.get("validation_feedback") or {
-                                     "findings": prior.get("scientific_corrections", [])},
+                                 validation_context=prior_context,
+                                 validation_context_candidate_sha256=(
+                                     _authored_candidate_sha256(candidate) if prior_context else None),
+                                 validation_feedback=prior_feedback,
+                                 validation_feedback_candidate_sha256=(
+                                     _authored_candidate_sha256(candidate) if prior_feedback else None),
                                  candidate_seed_ref=prior["cache_ref"])
+                    prior_diagnostics = prior.get("model_diagnostics")
+                    if isinstance(prior_diagnostics, list):
+                        state["model_diagnostics"] = deepcopy_config(prior_diagnostics[-12:])
+                    prior_format_repair = prior.get("format_repair")
+                    if isinstance(prior_format_repair, dict):
+                        state["format_repair"] = deepcopy_config(prior_format_repair)
+                        reason = prior.get("feedback") or prior_format_repair.get("previous_error")
+                        if isinstance(reason, str) and (
+                                "finish_reason=length" in reason
+                                or "old text must match exactly once" in reason):
+                            state["format_repair"].update(
+                                previous_error=reason[:1200],
+                            instructions=_author_format_repair_instructions(
+                                reason, has_candidate=True),
+                            )
                     if prior.get("last_response", {}).get("finish_reason") == "stop":
                         response_base = prior.get("response_base", candidate)
                         if "response_base" not in prior:
@@ -969,7 +2249,6 @@ class CapabilityFoundry:
                             continue
                         if checked["status"] == "rejected":
                             state.setdefault("scientific_reviews", {})[identity] = deepcopy_config(review)
-                    break
 
         author_route_index = state.get("author_route_index", 0)
         if type(author_route_index) is not int or author_route_index < 0:
@@ -987,19 +2266,107 @@ class CapabilityFoundry:
                 on_progress(phase, deepcopy_config(state))
 
         def repair_exhausted_error():
-            """Return a structured blocker for Composer's experiment repair loop."""
+            """Keep a rejected scientific review authoritative over a later bad response."""
             error = ModelWorkBlocked(state["error"])
-            error.failure_class = "experiment_capability_repair"
             exhausted = state.get("repair_budget_exhausted")
             exhausted = exhausted if isinstance(exhausted, dict) else {}
-            error.repair_gate = exhausted.get("gate")
+            diagnostics = state.get("model_diagnostics")
+            diagnostics = diagnostics if isinstance(diagnostics, list) else []
+            latest = diagnostics[-1] if diagnostics and isinstance(diagnostics[-1], dict) else {}
+            failure_class = state.get("last_failure_class")
+            failure_gate = state.get("last_failure_gate")
+            retained_candidate = state.get("last_attempt")
+            validation_feedback = _candidate_bound_value(
+                state, retained_candidate, "validation_feedback",
+                "validation_feedback_candidate_sha256")
+            current_candidate_sha256 = _authored_candidate_sha256(retained_candidate)
+            ledger_is_current = (
+                current_candidate_sha256 is not None
+                and state.get("blocking_issue_ledger_candidate_sha256")
+                == current_candidate_sha256
+            )
+            blocking_issues = _merge_prior_blocking_issues(
+                (state.get("blocking_issue_ledger") if ledger_is_current else []),
+                validation_feedback)
+            findings = validation_feedback.get("findings")
+            findings = findings if isinstance(findings, list) else []
+            review_findings = [
+                item for item in findings
+                if isinstance(item, dict)
+                and item.get("severity") in {"blocking", "warning"}
+                and all(isinstance(item.get(key), str) and item[key].strip()
+                        for key in ("finding", "evidence", "required_change"))
+            ]
+            known_findings = {item.get("finding") for item in review_findings}
+            for issue in blocking_issues:
+                if issue["finding"] not in known_findings:
+                    review_findings.append({
+                        "severity": "blocking",
+                        "finding": issue["finding"],
+                        "evidence": issue["evidence"],
+                        "required_change": issue["required_change"],
+                    })
+            failed_checks = validation_feedback.get("failed_checks", [])
+            failed_checks = deepcopy_config(failed_checks) if isinstance(failed_checks, list) else []
+            known_checks = {item.get("id") for item in failed_checks if isinstance(item, dict)}
+            failed_checks.extend({
+                "id": issue["review_check_id"], "outcome": "failed",
+                "evidence": issue["evidence"],
+            } for issue in blocking_issues if issue["review_check_id"] not in known_checks)
+            active_scientific_repair = (
+                bool(blocking_issues)
+                and isinstance(retained_candidate, dict)
+                and ATTEMPT_FIELDS.issubset(retained_candidate)
+            )
+            format_failure = (
+                isinstance(state.get("format_repair"), dict)
+                or failure_class == "model_contract"
+                or latest.get("outcome") in {"incomplete_response", "inadmissible_finish_reason"}
+            )
+            error.failure_class = (
+                "model_contract" if format_failure else "experiment_capability_repair")
+            error.recovery_mode = (
+                "format_repair_then_rerun" if format_failure else "repair_then_rerun")
+            format_response_incomplete = latest.get("outcome") in {
+                "incomplete_response", "inadmissible_finish_reason",
+            }
+            error.repair_gate = (
+                ("author_response_format" if format_response_incomplete else
+                 failure_gate or "author_response_format") if format_failure else
+                validation_feedback.get("gate") or exhausted.get("gate"))
             error.repair_attempts = exhausted.get("failures", 0)
             error.repair_ledger = deepcopy_config(state.get("repair_ledger", [])[-8:])
+            summary = state.get("feedback")
+            if active_scientific_repair:
+                summary = (
+                    "Blocking scientific review remains unresolved after the attempted "
+                    "program-patch response was incomplete."
+                )
+                error.research_review = {
+                    "status": "rejected",
+                    "checks": failed_checks,
+                    "required_repairs": [
+                        {
+                            "repair": (
+                                f"{item['finding']} Evidence: {item['evidence']} "
+                                f"Required change: {item['required_change']}"
+                            )[:1800],
+                        }
+                        for item in review_findings
+                    ],
+                }
             error.repair_feedback = deepcopy_config({
                 "gate": error.repair_gate,
-                "feedback": state.get("feedback"),
-                "validation_context": state.get("validation_context", {}),
-                "validation_feedback": state.get("validation_feedback", {}),
+                "feedback": summary,
+                "validation_context": _candidate_bound_value(
+                    state, retained_candidate, "validation_context",
+                    "validation_context_candidate_sha256"),
+                "validation_feedback": validation_feedback,
+                "blocking_issue_ledger": blocking_issues,
+                "prior_issues_pending_reassessment": (
+                    deepcopy_config(state.get("blocking_issue_ledger", []))
+                    if not ledger_is_current else []),
+                "candidate_sha256": current_candidate_sha256,
             })
             error.model_diagnostics = {
                 "author_responses": deepcopy_config(
@@ -1024,7 +2391,7 @@ class CapabilityFoundry:
             save("author_format_route_fallback")
             return True
 
-        def prepare_author_format_retry(reason, prior_feedback):
+        def prepare_author_format_retry(reason, prior_feedback, *, output_contract_error=None):
             """Retry an invalid envelope without discarding an active repair."""
             nonlocal feedback
             switched = switch_author_route(reason)
@@ -1034,16 +2401,29 @@ class CapabilityFoundry:
             )
             feedback = prior_feedback if prior_feedback is not None and has_repair_base else None
             state["feedback"] = feedback
-            state["format_repair"] = {
-                "previous_error": str(reason)[:1200],
-                "instructions": (
-                    "The previous response was incomplete or not valid JSON. Preserve the existing "
-                    "scientific repair request and return only one complete JSON object matching the "
-                    "output contract; no markdown, prose, or analysis. When the contract requests "
-                    "updates, omit unchanged fields and use compact exact source edits instead of "
-                    "rewriting complete programs."
-                ),
-            }
+            if isinstance(output_contract_error, ExperimentProgramOutputContractError):
+                state["format_repair"] = {
+                    "repair_kind": "executor_output_contract",
+                    "previous_error": str(reason)[:1200],
+                    "required_fields": list(output_contract_error.required_fields),
+                    "observed_fields": list(output_contract_error.observed_fields),
+                    "missing_fields": list(output_contract_error.missing_fields),
+                    "unexpected_fields": list(output_contract_error.unexpected_fields),
+                    "instructions": (
+                        "The executor ran and emitted parseable JSON, but its top-level result "
+                        "violates experiment-program-output-1. Repair the executor source so it "
+                        "emits every required field and no undocumented field. Preserve the frozen "
+                        "experiment intent and scientific estimand; do not change observations, "
+                        "claims, or results outside a fresh sandbox replay. Return only the bounded "
+                        "source update envelope requested by output_contract."
+                    ),
+                }
+            else:
+                state["format_repair"] = {
+                    "previous_error": str(reason)[:1200],
+                    "instructions": _author_format_repair_instructions(
+                        reason, has_candidate=has_repair_base),
+                }
             save("author_format_repair_ready")
             return switched
 
@@ -1066,7 +2446,8 @@ class CapabilityFoundry:
                 "or continue from a fresh scoped work order instead of replaying the same candidate")
             state["budget_exhausted"] = {
                 "dimension": "model_calls", "limit": model_call_budget,
-                "observed": observed, "usage": deepcopy_config(state.get("usage", {})),
+                "observed": observed,
+                "usage": deepcopy_config(state.get("usage", {})),
             }
             save("model_call_budget_exhausted")
             raise CapabilityModelBudgetExceeded(
@@ -1080,42 +2461,363 @@ class CapabilityFoundry:
                 state["usage"][dimension] = state["usage"].get(dimension, 0) + amount - (
                     1 if dimension == "model_calls" else 0)
 
-        def review_program(candidate, document, verdict):
-            structural = self._review(candidate, document, verdict)
-            if structural["status"] != "admitted":
-                return structural
-            identity = hashlib.sha256(canonical_bytes(candidate)).hexdigest()
-            reviews = state.setdefault("scientific_reviews", {})
-            retained = reviews.setdefault(identity, {"status": "pending", "responses": []})
-            responses = retained.setdefault("responses", [retained["result"]] if retained.get("result") else [])
-            if retained["status"] in {"calling", "result_unknown"}:
-                raise ModelWorkBlocked("independent program review has an unobserved provider outcome")
-            for review_attempt in range(2):
-                if review_attempt < len(responses):
-                    result = ModelResult(**responses[review_attempt])
-                else:
-                    result = call_reviewer(candidate, document, identity, retained, review_attempt)
-                try:
-                    if result.finish_reason != "stop":
-                        raise ValidationError(f"independent program reviewer finish_reason={result.finish_reason}")
-                    review = validate_program_review(result.json_object(allow_missing_closers=True))
-                except ValidationError as exc:
-                    retained.update(status="repairing", error=str(exc))
-                    state["prefer_review_fallback"] = True
-                    save("scientific_review_format_repair")
-                    if review_attempt == 0:
-                        continue
-                    raise ModelWorkBlocked(f"independent program review response is invalid: {exc}") from exc
-                retained["status"] = "completed"
-                save("scientific_review_completed")
-                return {**review, "review_method": "independent_model", "role": "review.methods",
-                        "model": result.model, "candidate_sha256": identity}
+        def record_provider_rate_limit(request, error, *, phase, retry_state=None,
+                                       retry_status="response_received",
+                                       request_signature=None, attempt_before=None):
+            """Persist a known 429 as resumable provider backpressure, not unknown work."""
+            if (not isinstance(error, ModelCallError)
+                    or error.status_code != 429 or not error.outcome_known):
+                return False
+            dispatched = error.attempts > 0
+            request.update(
+                status="provider_rate_limited" if dispatched else "cooldown_not_dispatched",
+                status_code=429,
+                request_attempts=error.attempts,
+                retry_after_seconds=error.retry_after_seconds,
+                provider_error_kind=error.provider_error_kind,
+                error=str(error)[:1200],
+                usage={"model_calls": 1 if dispatched else 0},
+            )
+            if not dispatched:
+                state["usage"]["model_calls"] = max(
+                    0, state["usage"].get("model_calls", 0) - 1)
+            if request_signature is not None:
+                state["author_request_signatures"] = [
+                    signature for signature in state.get("author_request_signatures", [])
+                    if signature != request_signature
+                ]
+            if attempt_before is not None:
+                state["attempts"] = attempt_before
+            if isinstance(retry_state, dict):
+                retry_state.update(
+                    status="pending",
+                    last_provider_rate_limit={
+                        "status_code": 429,
+                        "retry_after_seconds": error.retry_after_seconds,
+                        "provider_error_kind": error.provider_error_kind,
+                    },
+                )
+            state["status"] = retry_status
+            save(phase)
+            error.usage = deepcopy_config(state.get("usage", {}))
+            return True
 
-        def call_reviewer(candidate, document, identity, retained, review_attempt):
+        def continue_truncated_author_response(result, attempt_number):
+            """Continue a length-limited JSON response without replaying its prefix."""
+            if result.finish_reason != "length":
+                return result
+
+            continuation = state.get("author_response_continuation")
+            if (isinstance(continuation, dict)
+                    and continuation.get("status") == "format_repair_required"):
+                return result
+
+            prefix_state = _author_json_prefix_state(result.text)
+            if prefix_state == "invalid" or prefix_state == "not_json":
+                error = (
+                    "length-limited experiment-author response was not a valid JSON object prefix; "
+                    "refusing to replay narrative or malformed text as a continuation")
+                prefix_digest = hashlib.sha256(result.text.encode("utf-8")).hexdigest()
+                state["author_response_continuation"] = {
+                    "status": "format_repair_required",
+                    "attempt": attempt_number,
+                    "route_index": author_route_index,
+                    "partial_response_sha256": prefix_digest,
+                    "partial_characters": len(result.text),
+                    "continuations": 0,
+                    "error": error,
+                    "usage": deepcopy_config(result.usage),
+                    "elapsed_seconds": result.elapsed_seconds,
+                    "request_attempts": result.request_attempts,
+                }
+                state.setdefault("model_diagnostics", []).append({
+                    "attempt": attempt_number,
+                    "role": author_role,
+                    "model": result.model,
+                    "finish_reason": result.finish_reason,
+                    "response_chars": len(result.text),
+                    "response_sha256": prefix_digest,
+                    "usage": deepcopy_config(result.usage),
+                    "outcome": "format_repair_required_not_json_prefix",
+                })
+                state["model_diagnostics"] = state["model_diagnostics"][-12:]
+                state.update(status="response_received", error=error)
+                save("author_response_not_json_prefix")
+                return result
+
+            try:
+                parse_complete_json_object(
+                    result.text, "program author response", model_envelope=False)
+            except ValidationError:
+                pass
+            else:
+                continuation = state.get("author_response_continuation")
+                if isinstance(continuation, dict):
+                    continuation["status"] = "completed"
+                    continuation["partial_response"] = result.text
+                    continuation["partial_response_sha256"] = hashlib.sha256(
+                        result.text.encode("utf-8")).hexdigest()
+                return result
+
+            prefix_digest = hashlib.sha256(result.text.encode("utf-8")).hexdigest()
+            continuation = state.get("author_response_continuation")
+            if (isinstance(continuation, dict)
+                    and continuation.get("status") == "pending"
+                    and continuation.get("route_index") == author_route_index
+                    and continuation.get("partial_response_sha256") == prefix_digest):
+                partial = continuation["partial_response"]
+                continuation_count = continuation.get("continuations", 0)
+                accumulated_usage = continuation.get("usage", result.usage)
+                elapsed = continuation.get("elapsed_seconds", result.elapsed_seconds)
+                request_attempts = continuation.get("request_attempts", result.request_attempts)
+            else:
+                partial = result.text
+                continuation_count = 0
+                accumulated_usage = result.usage
+                elapsed = result.elapsed_seconds
+                request_attempts = result.request_attempts
+                continuation = {
+                    "status": "pending",
+                    "attempt": attempt_number,
+                    "route_index": author_route_index,
+                    "partial_response": partial,
+                    "partial_response_sha256": prefix_digest,
+                    "continuations": 0,
+                    "usage": deepcopy_config(accumulated_usage),
+                    "elapsed_seconds": elapsed,
+                    "request_attempts": request_attempts,
+                }
+                state["author_response_continuation"] = continuation
+                save("author_response_continuation_pending")
+
+            continuation_limit = AUTHOR_MAX_CONTINUATIONS
+            if model_call_budget is not None:
+                observed_calls = state.get("usage", {}).get("model_calls", 0)
+                if type(observed_calls) is not int:
+                    observed_calls = 0
+                continuation_limit = continuation_count + max(
+                    0, model_call_budget - observed_calls - 1)
+
+            for continuation_index in range(continuation_count, continuation_limit):
+                try:
+                    parse_complete_json_object(
+                        partial, "continued program author response", model_envelope=False)
+                except ValidationError:
+                    pass
+                else:
+                    continuation.update(
+                        status="completed", partial_response=partial,
+                        partial_response_sha256=hashlib.sha256(
+                            partial.encode("utf-8")).hexdigest())
+                    combined = ModelResult(
+                        partial, result.model, accumulated_usage, elapsed,
+                        result.finish_reason, request_attempts)
+                    state.update(status="response_received", last_response=asdict(combined))
+                    save("author_response_continuation_completed")
+                    return combined
+
+                if model_call_budget is not None:
+                    observed_calls = state.get("usage", {}).get("model_calls", 0)
+                    if type(observed_calls) is not int:
+                        observed_calls = 0
+                    # Keep the experiment's independent program reviewer funded.
+                    if observed_calls + 2 > model_call_budget:
+                        break
+
+                continuation_marker, current_prefix_digest, prompt = (
+                    _author_continuation_prompt(partial))
+                route_model = (
+                    author_route_configs[author_route_index].get("model")
+                    if author_route_configs else
+                    getattr(client, "model", client.__class__.__name__)
+                )
+                current_output_limit = getattr(
+                    client, "max_output_tokens", self.author_max_output_tokens)
+                continuation_output_limit = min(
+                    int(current_output_limit), AUTHOR_CONTINUATION_MAX_OUTPUT_TOKENS)
+                request_signature = _author_request_signature(
+                    route_model, continuation_output_limit, prompt)
+                if _author_request_was_attempted(state, request_signature):
+                    continuation.update(status="failed", error=(
+                        "refusing to replay an identical author-response continuation"))
+                    state.update(status="response_received")
+                    save("author_response_continuation_duplicate_refused")
+                    break
+
+                original_output_limit = getattr(client, "max_output_tokens", None)
+                original_timeout = getattr(client, "timeout_seconds", None)
+                original_output_format = getattr(client, "output_format", None)
+                timeout_bounds = []
+                continuation_timeout = None
+                if self.model_timeout_seconds is not None:
+                    timeout_bounds.append(self.model_timeout_seconds)
+                if self.deadline is not None:
+                    remaining = self.deadline - time.monotonic()
+                    if remaining <= 0.2:
+                        continuation.update(
+                            status="pending",
+                            error="capability authoring reached its mission deadline")
+                        state["status"] = "response_received"
+                        save("author_response_continuation_deadline")
+                        raise CapabilityDeadlineError(
+                            "capability authoring reached its mission deadline")
+                    timeout_bounds.append(remaining)
+                if timeout_bounds and hasattr(client, "timeout_seconds"):
+                    continuation_timeout = effective_model_timeout(
+                        client.timeout_seconds, *timeout_bounds)
+
+                ensure_model_call_budget()
+                request = {
+                    "attempt": attempt_number,
+                    "role": author_role,
+                    "operation": "continue_truncated_response",
+                    "continuation_index": continuation_index + 1,
+                    "prefix_sha256": current_prefix_digest,
+                    "prefix_characters": len(partial),
+                    "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                    "request_signature": request_signature,
+                    "max_output_tokens": continuation_output_limit,
+                    "status": "started",
+                    "usage": {"model_calls": 1},
+                }
+                state.setdefault("author_request_signatures", []).append(request_signature)
+                state.setdefault("requests", []).append(request)
+                state["usage"]["model_calls"] = state["usage"].get("model_calls", 0) + 1
+                continuation.update(status="calling", request_signature=request_signature)
+                state["status"] = "calling"
+                save("author_response_continuation_calling")
+
+                if type(original_output_limit) is int:
+                    client.max_output_tokens = continuation_output_limit
+                if hasattr(client, "output_format"):
+                    client.output_format = None
+                if continuation_timeout is not None:
+                    client.timeout_seconds = continuation_timeout
+                try:
+                    segment = client.complete(
+                        system=AUTHOR_CONTINUATION_SYSTEM, prompt=prompt)
+                except ModelCallError as exc:
+                    if record_provider_rate_limit(
+                            request, exc,
+                            phase="author_response_continuation_rate_limited",
+                            retry_state=continuation,
+                            retry_status="response_received",
+                            request_signature=request_signature):
+                        raise
+                    request.update(
+                        status="result_unknown",
+                        error=f"{type(exc).__name__}: {exc}")
+                    continuation.update(status="result_unknown")
+                    save("author_response_continuation_unknown")
+                    raise
+                except BaseException as exc:
+                    request.update(
+                        status="result_unknown",
+                        error=f"{type(exc).__name__}: {exc}")
+                    continuation.update(status="result_unknown")
+                    save("author_response_continuation_unknown")
+                    raise
+                finally:
+                    if type(original_output_limit) is int:
+                        client.max_output_tokens = original_output_limit
+                    if hasattr(client, "timeout_seconds"):
+                        client.timeout_seconds = original_timeout
+                    if hasattr(client, "output_format"):
+                        client.output_format = original_output_format
+                record_result(request, segment)
+                request_attempts += segment.request_attempts
+                elapsed += segment.elapsed_seconds
+                accumulated_usage = _sum_model_usage(accumulated_usage, segment.usage)
+
+                try:
+                    suffix = _author_continuation_suffix(
+                        partial, segment, continuation_marker)
+                except ValidationError as exc:
+                    diagnostic = {
+                        "role": author_role,
+                        "model": segment.model,
+                        "finish_reason": segment.finish_reason,
+                        "continuation_index": continuation_index + 1,
+                        "prefix_sha256": current_prefix_digest,
+                        "response_chars": len(segment.text),
+                        "response_sha256": hashlib.sha256(
+                            segment.text.encode("utf-8")).hexdigest(),
+                        "outcome": "invalid_continuation_suffix",
+                        "parse_error": str(exc)[:800],
+                    }
+                    state.setdefault("model_diagnostics", []).append(diagnostic)
+                    state["model_diagnostics"] = state["model_diagnostics"][-12:]
+                    continuation.update(status="failed", error=str(exc)[:800])
+                    combined = ModelResult(
+                        partial, segment.model, accumulated_usage, elapsed,
+                        "length", request_attempts)
+                    state.update(status="response_received", last_response=asdict(combined))
+                    save("author_response_continuation_invalid")
+                    return combined
+
+                partial += suffix
+                continuation_count += 1
+                continuation.update(
+                    status="pending", partial_response=partial,
+                    partial_response_sha256=hashlib.sha256(
+                        partial.encode("utf-8")).hexdigest(),
+                    continuations=continuation_count,
+                    usage=deepcopy_config(accumulated_usage),
+                    elapsed_seconds=elapsed,
+                    request_attempts=request_attempts,
+                )
+                diagnostic = {
+                    "role": author_role,
+                    "model": segment.model,
+                    "finish_reason": segment.finish_reason,
+                    "continuation_index": continuation_count,
+                    "prefix_sha256": current_prefix_digest,
+                    "response_chars": len(segment.text),
+                    "response_sha256": hashlib.sha256(
+                        segment.text.encode("utf-8")).hexdigest(),
+                    "outcome": "continuation_segment_appended",
+                }
+                state.setdefault("model_diagnostics", []).append(diagnostic)
+                state["model_diagnostics"] = state["model_diagnostics"][-12:]
+                combined = ModelResult(
+                    partial, segment.model, accumulated_usage, elapsed,
+                    # The assembled response is still the same truncated
+                    # author response until it parses as a complete object.
+                    # Persisting `stop` from a continuation segment would make
+                    # a resumed process skip the remaining suffix requests.
+                    "length", request_attempts)
+                state.update(status="response_received", last_response=asdict(combined))
+                save("author_response_continuation_received")
+                try:
+                    parse_complete_json_object(
+                        partial, "continued program author response",
+                        model_envelope=False)
+                except ValidationError:
+                    pass
+                else:
+                    continuation.update(
+                        status="completed", partial_response=partial,
+                        partial_response_sha256=hashlib.sha256(
+                            partial.encode("utf-8")).hexdigest())
+                    save("author_response_continuation_completed")
+                    return combined
+                result = combined
+
+            continuation.update(status="exhausted", partial_response=partial,
+                partial_response_sha256=hashlib.sha256(partial.encode("utf-8")).hexdigest())
+            combined = ModelResult(
+                partial, result.model, accumulated_usage, elapsed,
+                "length", request_attempts)
+            state.update(status="response_received", last_response=asdict(combined))
+            save("author_response_continuation_exhausted")
+            return combined
+
+        def reviewer_for_attempt(review_attempt):
             reviewer = self.reviewer_client
             if reviewer is None:
                 model_config = deepcopy_config(self.model_config)
-                alternatives = model_config.get("role_model_fallbacks", {}).get("review.methods", [])
+                alternatives = model_config.get("role_model_fallbacks", {}).get(
+                    "review.methods", [])
                 if (review_attempt or state.get("prefer_review_fallback")) and alternatives:
                     model_config.setdefault("role_models", {})["review.methods"] = alternatives[0]
                 config = resolve_model_config(model_config, role="review.methods")
@@ -1157,6 +2859,307 @@ class CapabilityFoundry:
                 if timeout_bounds:
                     reviewer.timeout_seconds = effective_model_timeout(
                         reviewer.timeout_seconds, *timeout_bounds)
+            return reviewer
+
+        def continue_truncated_review_response(result, identity, retained, review_attempt):
+            """Continue only a truncated JSON suffix; never replay the review prompt."""
+            if result.finish_reason != "length":
+                return result
+            if not isinstance(result.text, str) or not result.text.lstrip().startswith("{"):
+                # A prose or markdown prefix is not a valid place to resume raw
+                # JSON. Use the bounded schema repair path without echoing it.
+                return result
+            try:
+                parse_complete_json_object(
+                    result.text, "independent program review", model_envelope=False)
+            except ValidationError:
+                pass
+            else:
+                retained["response_continuation"] = {
+                    "status": "complete_prefix",
+                    "candidate_sha256": identity,
+                    "review_attempt": review_attempt + 1,
+                    "prefix_sha256": hashlib.sha256(
+                        result.text.encode("utf-8")).hexdigest(),
+                    "partial_response": result.text,
+                }
+                return result
+
+            continuation = retained.get("response_continuation")
+            if isinstance(continuation, dict) and continuation.get("status") in {
+                    "calling", "result_unknown", "provider_rate_limited"}:
+                raise ModelWorkBlocked(
+                    "reviewer JSON continuation has an unobserved or rate-limited outcome; "
+                    "refusing to repeat it")
+            prefix_digest = hashlib.sha256(result.text.encode("utf-8")).hexdigest()
+            if (isinstance(continuation, dict)
+                    and continuation.get("prefix_sha256") == prefix_digest):
+                partial = continuation.get("partial_response", result.text)
+                usage = continuation.get("usage", result.usage)
+                elapsed = continuation.get("elapsed_seconds", result.elapsed_seconds)
+                request_attempts = continuation.get("request_attempts", result.request_attempts)
+                segments = continuation.get("segments", [])
+            else:
+                partial = result.text
+                usage = deepcopy_config(result.usage)
+                elapsed = result.elapsed_seconds
+                request_attempts = result.request_attempts
+                segments = []
+                continuation = {
+                    "status": "pending", "candidate_sha256": identity,
+                    "review_attempt": review_attempt + 1,
+                    "prefix_sha256": prefix_digest,
+                    "partial_response": partial, "segments": segments,
+                    "continuations": 0, "usage": deepcopy_config(usage),
+                    "elapsed_seconds": elapsed, "request_attempts": request_attempts,
+                    "request_signatures": [],
+                }
+                retained["response_continuation"] = continuation
+                save("scientific_review_continuation_pending")
+
+            reviewer = reviewer_for_attempt(review_attempt)
+            continuation_limit = min(AUTHOR_MAX_CONTINUATIONS, 3)
+            for continuation_index in range(continuation.get("continuations", 0),
+                                            continuation_limit):
+                try:
+                    parse_complete_json_object(
+                        partial, "continued independent program review", model_envelope=False)
+                except ValidationError:
+                    pass
+                else:
+                    completed = ModelResult(
+                        partial, result.model, usage, elapsed,
+                        result.finish_reason, request_attempts)
+                    continuation.update(
+                        status="completed", partial_response=partial,
+                        result=asdict(completed))
+                    retained["responses"][review_attempt] = asdict(completed)
+                    retained.update(status="response_received", result=asdict(completed))
+                    save("scientific_review_continuation_completed")
+                    return completed
+
+                calls = state.get("usage", {}).get("model_calls", 0)
+                if (model_call_budget is not None
+                        and (type(calls) is not int
+                             or calls + 2 > model_call_budget)):
+                    continuation.update(status="exhausted", partial_response=partial)
+                    retained.update(status="response_received", result=asdict(result))
+                    save("scientific_review_continuation_budget_exhausted")
+                    return ModelResult(
+                        partial, result.model, usage, elapsed, "length", request_attempts)
+
+                marker, current_prefix_digest, prompt = _review_continuation_prompt(partial)
+                model = getattr(reviewer, "model", reviewer.__class__.__name__)
+                current_limit = getattr(
+                    reviewer, "max_output_tokens", self.reviewer_max_output_tokens)
+                output_limit = min(max(int(current_limit), 1024),
+                                   AUTHOR_CONTINUATION_MAX_OUTPUT_TOKENS)
+                signature = _author_request_signature(model, output_limit, prompt)
+                if signature in continuation.get("request_signatures", []):
+                    continuation.update(
+                        status="failed",
+                        error="refusing to repeat an identical reviewer continuation")
+                    retained.update(status="response_received", result=asdict(result))
+                    save("scientific_review_continuation_duplicate_refused")
+                    return ModelResult(
+                        partial, result.model, usage, elapsed, "length", request_attempts)
+
+                request = {
+                    "role": "review.methods", "operation": "continue_truncated_review",
+                    "candidate_sha256": identity,
+                    "review_attempt": review_attempt + 1,
+                    "continuation_index": continuation_index + 1,
+                    "prefix_sha256": current_prefix_digest,
+                    "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                    "request_signature": signature, "max_output_tokens": output_limit,
+                    "status": "started", "usage": {"model_calls": 1},
+                }
+                state.setdefault("requests", []).append(request)
+                state["usage"]["model_calls"] = state["usage"].get("model_calls", 0) + 1
+                continuation["request_signatures"].append(signature)
+                continuation.update(status="calling", request_signature=signature)
+                retained["status"] = "calling"
+                save("scientific_review_continuation_calling")
+
+                original_limit = getattr(reviewer, "max_output_tokens", None)
+                original_timeout = getattr(reviewer, "timeout_seconds", None)
+                original_format = getattr(reviewer, "output_format", None)
+                timeout_bounds = []
+                if self.model_timeout_seconds is not None:
+                    timeout_bounds.append(self.model_timeout_seconds)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.2:
+                        continuation.update(status="pending", error="review deadline reached")
+                        retained["status"] = "response_received"
+                        save("scientific_review_continuation_deadline")
+                        raise CapabilityDeadlineError(
+                            "independent program review reached its mission deadline")
+                    timeout_bounds.append(remaining)
+                if timeout_bounds and hasattr(reviewer, "timeout_seconds"):
+                    reviewer.timeout_seconds = effective_model_timeout(
+                        reviewer.timeout_seconds, *timeout_bounds)
+                if type(original_limit) is int:
+                    reviewer.max_output_tokens = output_limit
+                if hasattr(reviewer, "output_format"):
+                    reviewer.output_format = None
+                ensure_model_call_budget()
+                try:
+                    segment = reviewer.complete(
+                        system=AUTHOR_CONTINUATION_SYSTEM, prompt=prompt)
+                except ModelCallError as exc:
+                    if record_provider_rate_limit(
+                            request, exc, phase="scientific_review_continuation_rate_limited",
+                            retry_status="response_received"):
+                        continuation.update(
+                            status="provider_rate_limited",
+                            provider_error={"status_code": 429,
+                                            "retry_after_seconds": exc.retry_after_seconds})
+                        retained["status"] = "provider_rate_limited"
+                        save("scientific_review_continuation_rate_limited")
+                        raise
+                    request.update(status="result_unknown",
+                                   error=f"{type(exc).__name__}: {exc}")
+                    continuation["status"] = "result_unknown"
+                    retained["status"] = "result_unknown"
+                    save("scientific_review_continuation_unknown")
+                    raise
+                except BaseException as exc:
+                    request.update(status="result_unknown",
+                                   error=f"{type(exc).__name__}: {exc}")
+                    continuation["status"] = "result_unknown"
+                    retained["status"] = "result_unknown"
+                    save("scientific_review_continuation_unknown")
+                    raise
+                finally:
+                    if type(original_limit) is int:
+                        reviewer.max_output_tokens = original_limit
+                    if hasattr(reviewer, "timeout_seconds"):
+                        reviewer.timeout_seconds = original_timeout
+                    if hasattr(reviewer, "output_format"):
+                        reviewer.output_format = original_format
+                record_result(request, segment)
+                suffix = _author_continuation_suffix(partial, segment, marker)
+                partial += suffix
+                usage = _sum_model_usage(usage, segment.usage)
+                elapsed += segment.elapsed_seconds
+                request_attempts += segment.request_attempts
+                continuation["segments"].append({
+                    "response_sha256": hashlib.sha256(
+                        segment.text.encode("utf-8")).hexdigest(),
+                    "finish_reason": segment.finish_reason,
+                    "suffix_characters": len(suffix),
+                })
+                continuation.update(
+                    status="pending", partial_response=partial,
+                    partial_response_sha256=hashlib.sha256(
+                        partial.encode("utf-8")).hexdigest(),
+                    continuations=continuation_index + 1,
+                    usage=deepcopy_config(usage), elapsed_seconds=elapsed,
+                    request_attempts=request_attempts)
+                retained["status"] = "response_received"
+                save("scientific_review_continuation_segment")
+                if segment.finish_reason != "length":
+                    break
+
+            try:
+                parse_complete_json_object(
+                    partial, "continued independent program review", model_envelope=False)
+            except ValidationError:
+                continuation.update(status="exhausted", partial_response=partial)
+                combined = ModelResult(
+                    partial, result.model, usage, elapsed, "length", request_attempts)
+            else:
+                continuation.update(status="completed", partial_response=partial)
+                combined = ModelResult(
+                    partial, result.model, usage, elapsed, "length", request_attempts)
+            continuation["result"] = asdict(combined)
+            retained["responses"][review_attempt] = asdict(combined)
+            retained.update(status="response_received", result=asdict(combined))
+            save("scientific_review_continuation_finished")
+            return combined
+
+        def review_program(candidate, document, verdict):
+            structural = self._review(candidate, document, verdict)
+            if structural["status"] != "admitted":
+                _retain_prior_blocking_issues(state, structural)
+                state["blocking_issue_ledger_candidate_sha256"] = (
+                    _authored_candidate_sha256(candidate))
+                save("structural_review_blocked")
+                return structural
+            prior_blocking_issues = _retain_prior_blocking_issues(
+                state, state.get("validation_feedback"))
+            identity = hashlib.sha256(canonical_bytes(candidate)).hexdigest()
+            reviews = state.setdefault("scientific_reviews", {})
+            retained = reviews.setdefault(identity, {"status": "pending", "responses": []})
+            responses = retained.setdefault("responses", [retained["result"]] if retained.get("result") else [])
+            if retained["status"] in {
+                    "calling", "result_unknown", "provider_rate_limited"}:
+                raise ModelWorkBlocked("independent program review has an unobserved provider outcome")
+            for review_attempt in range(2):
+                if review_attempt < len(responses):
+                    result = ModelResult(**responses[review_attempt])
+                else:
+                    result = call_reviewer(
+                        candidate, document, identity, retained, review_attempt,
+                        prior_blocking_issues)
+                result = continue_truncated_review_response(
+                    result, identity, retained, review_attempt)
+                try:
+                    if result.finish_reason not in {"stop", "length"}:
+                        raise ValidationError(f"independent program reviewer finish_reason={result.finish_reason}")
+                    review = validate_program_review(
+                        result.json_object(allow_missing_closers=True),
+                        prior_blocking_issues=prior_blocking_issues)
+                except ValidationError as exc:
+                    retained.update(status="repairing", error=str(exc))
+                    state["prefer_review_fallback"] = True
+                    save("scientific_review_format_repair")
+                    continuation_status = (
+                        retained.get("response_continuation", {}).get("status")
+                        if isinstance(retained.get("response_continuation"), dict)
+                        else None)
+                    if continuation_status in {"exhausted", "failed"}:
+                        blocked = ModelWorkBlocked(
+                            "independent program review remained incomplete after exact JSON continuation")
+                        blocked.failure_class = "model_contract"
+                        blocked.recovery_mode = "format_repair_then_rerun"
+                        blocked.repair_gate = "review_response_format"
+                        raise blocked from exc
+                    if review_attempt == 0:
+                        continue
+                    raise ModelWorkBlocked(f"independent program review response is invalid: {exc}") from exc
+                retained["status"] = "completed"
+                state["blocking_issue_ledger"] = _reconcile_prior_blocking_issues(
+                    prior_blocking_issues, review)
+                state["blocking_issue_ledger_candidate_sha256"] = (
+                    _authored_candidate_sha256(candidate))
+                state["validation_feedback"] = {}
+                state["validation_feedback_candidate_sha256"] = None
+                failed_check_ids = {
+                    item["id"] for item in review["checks"]
+                    if item.get("outcome") == "failed"
+                }
+                retained["resolved_prior_issue_ids"] = [
+                    item["id"] for item in prior_blocking_issues
+                    if item["review_check_id"] not in failed_check_ids
+                ]
+                retained["unresolved_prior_issue_ids"] = [
+                    item["id"] for item in state["blocking_issue_ledger"]
+                ]
+                save("scientific_review_completed")
+                return {**review, "review_method": "independent_model", "role": "review.methods",
+                        "model": result.model, "candidate_sha256": identity}
+
+        def call_reviewer(candidate, document, identity, retained, review_attempt,
+                          prior_blocking_issues):
+            required_check_ids = sorted(
+                PROGRAM_REVIEW_CHECKS | {
+                    item["review_check_id"] for item in prior_blocking_issues
+                    if isinstance(item, dict)
+                    and isinstance(item.get("review_check_id"), str)
+                })
+            reviewer = reviewer_for_attempt(review_attempt)
             ensure_model_call_budget()
             prompt = {"assignment": "independent_scientific_program_review",
                 "research_assignment": brief,
@@ -1164,17 +3167,27 @@ class CapabilityFoundry:
                 "executor_source": candidate["executor_source"],
                 "validator_source": candidate["validator_source"],
                 "observed_data": program_failure_context(document),
+                "prior_blocking_issues": prior_blocking_issues,
                 "findings": document["findings"], "limitations": document["limitations"],
                 "output_contract": {"status": "admitted|rejected",
                     "checks": [{"id": name, "outcome": "passed|failed", "evidence": "exact code or result evidence"}
-                               for name in sorted(PROGRAM_REVIEW_CHECKS)],
+                               for name in required_check_ids],
                     "findings": [{"severity": "blocking|warning", "finding": "specific defect",
                                   "evidence": "exact code or data", "required_change": "scoped correction"}],
                     "limitations": ["optional bounded limitations of this review"]}}
+            if prior_blocking_issues:
+                prompt["review_instructions"] = (
+                    "Reassess every prior_blocking_issues entry against this exact revised candidate "
+                    "and its recorded observations. A prior issue may be considered resolved only with "
+                    "specific code or result evidence. Include exactly one check row for each "
+                    "prior_blocking_issues review_check_id in addition to every base required check. "
+                    "Mark a check failed if the prior issue remains; every failed prior check is "
+                    "preserved as a blocking finding. Do not silently omit it or admit the candidate "
+                    "while any prior issue remains unresolved.")
             if review_attempt:
                 prompt["format_repair"] = {
                     "error": retained.get("error"),
-                    "required_check_ids": sorted(PROGRAM_REVIEW_CHECKS),
+                    "required_check_ids": required_check_ids,
                     "instructions": "Return the complete concise JSON verdict only. Do not repeat long reasoning. "
                                     "Judge the same evidence independently; do not relax the criteria. "
                                     "Include exactly one check row for every required_check_ids entry, even "
@@ -1189,6 +3202,15 @@ class CapabilityFoundry:
             save("scientific_review")
             try:
                 result = reviewer.complete(system=REVIEW_SYSTEM, prompt=request["prompt"])
+            except ModelCallError as exc:
+                if record_provider_rate_limit(
+                        request, exc, phase="scientific_review_rate_limited",
+                        retry_state=retained, retry_status="response_received"):
+                    raise
+                request.update(status="result_unknown", error=f"{type(exc).__name__}: {exc}")
+                retained["status"] = "result_unknown"
+                save("scientific_review_unknown")
+                raise
             except BaseException as exc:
                 request.update(status="result_unknown", error=f"{type(exc).__name__}: {exc}")
                 retained["status"] = "result_unknown"
@@ -1234,25 +3256,125 @@ class CapabilityFoundry:
                        for entry in load_registry(self.registry_root)["capabilities"]):
                 raise ValidationError("retained capability is no longer registered")
             return state["outcome"]
+        feedback = state.get("feedback")
         if state["status"] == "calling":
-            state["requests"][-1].update(status="result_unknown",
+            last_request = state.get("requests", [])[-1] if state.get("requests") else {}
+            last_request.update(status="result_unknown",
                 error="process exited before the provider result was recorded")
-            state["status"] = "repairing"
-            save("reconciled")
+            continuation = state.get("author_response_continuation")
+            if last_request.get("operation") == "continue_truncated_response":
+                if isinstance(continuation, dict):
+                    continuation.update(
+                        status="format_repair_required",
+                        error=("continuation result is unknown; the exact request is retained as "
+                               "unknown and will not be replayed"),
+                    )
+                else:
+                    state["author_response_continuation"] = {
+                        "status": "format_repair_required",
+                        "error": ("continuation result is unknown; the exact request is retained "
+                                  "as unknown and will not be replayed"),
+                        "continuations": 0,
+                    }
+                error = state["author_response_continuation"]["error"]
+                has_candidate = (
+                    isinstance(state.get("last_attempt"), dict)
+                    and ATTEMPT_FIELDS.issubset(state["last_attempt"])
+                )
+                state["format_repair"] = {
+                    "previous_error": error,
+                    "instructions": _author_format_repair_instructions(
+                        error, has_candidate=has_candidate),
+                }
+                state.update(
+                    status=("response_received" if isinstance(state.get("last_response"), dict)
+                            else "repairing"),
+                    error=error,
+                )
+                save("author_response_continuation_unknown_format_recovery")
+            else:
+                state["status"] = "repairing"
+                save("reconciled")
+        continuation = state.get("author_response_continuation")
+        if isinstance(continuation, dict) and continuation.get("status") == "result_unknown":
+            error_text = (
+                "continuation result is unknown; the exact request is retained as unknown and "
+                "will not be replayed")
+            continuation.update(status="format_repair_required", error=error_text)
+            has_candidate = (
+                isinstance(state.get("last_attempt"), dict)
+                and ATTEMPT_FIELDS.issubset(state["last_attempt"])
+            )
+            state["format_repair"] = {
+                "previous_error": error_text,
+                "instructions": _author_format_repair_instructions(
+                    error_text, has_candidate=has_candidate),
+            }
+            state.update(
+                status=("response_received" if isinstance(state.get("last_response"), dict)
+                        else "repairing"),
+                error=error_text,
+            )
+            save("author_response_continuation_unknown_format_recovery")
+        last_request = state.get("requests", [])[-1] if state.get("requests") else {}
+        if (last_request.get("status") == "result_unknown"
+                and last_request.get("operation") != "continue_truncated_response"):
+            error_text = (
+                "experiment-author response outcome is unknown; the original request is retained "
+                "as unknown and a distinct full-artifact recovery request will be used")
+            prepare_author_format_retry(error_text, feedback)
+            state.update(status="repairing", error=error_text)
+            save("author_request_unknown_format_recovery")
         feedback = state.get("feedback")
         last_error = feedback
         last_attempt = state.get("last_attempt")
         buffered = ModelResult(**state["last_response"]) if state["status"] == "response_received" else None
         first_attempt = state["attempts"] - (1 if buffered else 0)
-        for attempt in range(first_attempt, self.max_attempts):
+        author_attempt_limit = self.max_attempts + max(0, len(author_route_configs) - 1)
+        for attempt in range(first_attempt, author_attempt_limit):
             attempt_feedback = feedback
-            prompt_value = deepcopy_config(base_prompt)
-            if feedback is not None:
+            format_repair = state.get("format_repair")
+            has_repair_candidate = (
+                isinstance(last_attempt, dict)
+                and ATTEMPT_FIELDS.issubset(last_attempt)
+            )
+            bounded_patch_retry = (
+                has_repair_candidate
+                and (feedback is not None or isinstance(format_repair, dict))
+            )
+            if bounded_patch_retry:
+                patch_repair = (
+                    format_repair if isinstance(format_repair, dict) else {
+                        "repair_kind": "scientific_candidate_repair",
+                        "previous_error": _bounded_repair_text(feedback, 1400),
+                    }
+                )
+                prompt_value = authoring_patch_prompt(
+                    brief=brief if isinstance(brief, dict) else {},
+                    required_intent=required_intent,
+                    configured_input=configured_input,
+                    candidate=last_attempt,
+                    feedback=feedback,
+                    validation_context=_candidate_bound_value(
+                        state, last_attempt, "validation_context",
+                        "validation_context_candidate_sha256"),
+                    validation_feedback=_candidate_bound_value(
+                        state, last_attempt, "validation_feedback",
+                        "validation_feedback_candidate_sha256"),
+                    format_repair=patch_repair,
+                )
+            else:
+                prompt_value = deepcopy_config(base_prompt)
+            if feedback is not None and not bounded_patch_retry:
                 prompt_value["repair_request"] = {
                     "previous_error": str(feedback)[:4000],
                     "previous_attempt": last_attempt,
-                    "observed_failure_context": state.get("validation_context", {}),
-                    "validation_feedback": state.get("validation_feedback", {}),
+                    "observed_failure_context": _candidate_bound_value(
+                        state, last_attempt, "validation_context",
+                        "validation_context_candidate_sha256"),
+                    "validation_feedback": _candidate_bound_value(
+                        state, last_attempt, "validation_feedback",
+                        "validation_feedback_candidate_sha256"),
                     "repair_protocol": {
                         "sequence": [
                             "diagnose the first invalid scientific assumption from the exact trace",
@@ -1275,33 +3397,52 @@ class CapabilityFoundry:
                 }
                 if isinstance(last_attempt, dict) and ATTEMPT_FIELDS.issubset(last_attempt):
                     prompt_value["output_contract"] = {"updates": {
-                        "executor_source": "optional {'edits': [{'old': 'exact unique existing text', 'new': 'replacement text'}]}; complete source replacement is not accepted",
-                        "validator_source": "optional {'edits': [{'old': 'exact unique existing text', 'new': 'replacement text'}]}; complete source replacement is not accepted",
+                        "executor_source": (
+                            "optional exact edits {'edits':[{'old':'unique text','new':'replacement'}]} or "
+                            "duplicate-only structural patch {'source_sha256':...,"
+                            "'remove_duplicate_definitions':[{'name':...,'keep_line_start':...}],"
+                            "optional keep_entry_guard_line_start line number; removes at most "
+                            f"{AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS} duplicates; no complete replacement"),
+                        "validator_source": (
+                            "optional exact edits {'edits':[{'old':'unique text','new':'replacement'}]} or "
+                            "duplicate-only structural patch {'source_sha256':...,"
+                            "'remove_duplicate_definitions':[{'name':...,'keep_line_start':...}],"
+                            "optional keep_entry_guard_line_start line number; removes at most "
+                            f"{AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS} duplicates; no complete replacement"),
                         "experiment_intent": "optional JSON merge patch: include only changed fields; null deletes an object field; arrays replace whole arrays",
                     }}
                     prompt_value["repair_request"]["instructions"] += (
                         " Return only {updates:{...}}. Omit unchanged fields and source code. "
+                        "Do not include derivations, rationale, or a replacement program; reserve "
+                        "the response for the smallest exact source patch and its JSON envelope. "
                         "Use null to remove unwanted object fields; null values inside replacement arrays are preserved. "
                         "For an enum error, update only that intent field to one of the supplied allowed values. "
-                        "For source fixes prefer exact edits to rewriting entire programs. Each old text must match "
+                        "For duplicate top-level definitions or __main__ guards, choose the exact line_start "
+                        "to retain from the supplied duplicate metadata and use its source_sha256; the bounded "
+                        "structural patch removes only other duplicate declarations. Never select arbitrary "
+                        "line ranges. For other source fixes prefer exact edits to rewriting entire programs. Each old text must match "
                         "exactly once in the current source; edits apply in order, and empty new text deletes it. "
                         "Include enough surrounding code to make matches unique. If an edit is rejected as missing "
                         "or ambiguous, do not repeat it unchanged: for ambiguous matches, use the reported locations "
                         "to correct the excerpt; for a missing match, inspect the current source in the candidate and "
                         "use its exact text. Never return an entire source file. The assembled source still "
                         "passes every gate.")
-            if isinstance(state.get("format_repair"), dict):
+            if isinstance(format_repair, dict) and not bounded_patch_retry:
                 prompt_value["format_repair"] = deepcopy_config(state["format_repair"])
             prompt = json.dumps(prompt_value, ensure_ascii=False, sort_keys=True)
             seed_replay = buffered is not None and state.pop("seed_replay_pending", False)
             if buffered is not None:
                 result, buffered = buffered, None
             else:
-                if (author_route_configs and isinstance(last_attempt, dict)
+                if (isinstance(last_attempt, dict)
                         and ATTEMPT_FIELDS.issubset(last_attempt)
                         and type(getattr(client, "max_output_tokens", None)) is int):
+                    output_limit = self.author_max_output_tokens
+                    if feedback is not None or isinstance(format_repair, dict):
+                        output_limit = min(
+                            output_limit, AUTHOR_PATCH_MAX_OUTPUT_TOKENS)
                     client.max_output_tokens = min(
-                        client.max_output_tokens, AUTHOR_REPAIR_MAX_OUTPUT_TOKENS)
+                        client.max_output_tokens, output_limit)
                 timeout_bounds = []
                 if self.model_timeout_seconds is not None:
                     timeout_bounds.append(self.model_timeout_seconds)
@@ -1315,8 +3456,25 @@ class CapabilityFoundry:
                     client.timeout_seconds = effective_model_timeout(
                         client.timeout_seconds, *timeout_bounds)
                 ensure_model_call_budget()
+                route_model = (
+                    author_route_configs[author_route_index].get("model")
+                    if author_route_configs else
+                    getattr(client, "model", client.__class__.__name__)
+                )
+                output_tokens = getattr(client, "max_output_tokens", None)
+                request_signature = _author_request_signature(
+                    route_model, output_tokens, prompt)
+                if _author_request_was_attempted(state, request_signature):
+                    error = (
+                        "refusing to resend an unchanged experiment-author prompt to the same "
+                        "model route and output limit")
+                    state.update(status="blocked", error=error, feedback=error)
+                    save("duplicate_author_request_refused")
+                    raise ModelWorkBlocked(error)
+                state.setdefault("author_request_signatures", []).append(request_signature)
                 state["attempts"] = attempt + 1
                 request = {"attempt": attempt + 1, "role": "research.experiment-author", "status": "started", "prompt": prompt,
+                           "request_signature": request_signature,
                            "max_output_tokens": getattr(client, "max_output_tokens", None),
                            "usage": {"model_calls": 1}}
                 state["requests"].append(request)
@@ -1325,6 +3483,17 @@ class CapabilityFoundry:
                 save("calling")
                 try:
                     result = client.complete(system=SYSTEM, prompt=prompt)
+                except ModelCallError as exc:
+                    if record_provider_rate_limit(
+                            request, exc, phase="author_rate_limited",
+                            retry_status="repairing",
+                            request_signature=request_signature,
+                            attempt_before=attempt):
+                        raise
+                    request.update(status="result_unknown", error=f"{type(exc).__name__}: {exc}")
+                    state["status"] = "repairing"
+                    save("request_failed")
+                    raise
                 except BaseException as exc:
                     request.update(status="result_unknown", error=f"{type(exc).__name__}: {exc}")
                     state["status"] = "repairing"
@@ -1334,6 +3503,9 @@ class CapabilityFoundry:
                 state.update(status="response_received", last_response=asdict(result),
                              response_base=deepcopy_config(last_attempt))
                 save("response_received")
+            result = continue_truncated_author_response(result, attempt + 1)
+            state.update(status="response_received", last_response=asdict(result))
+            save("author_response_ready_for_validation")
             attempt_value = None
             if result.finish_reason != "stop":
                 if result.finish_reason == "length":
@@ -1344,6 +3516,13 @@ class CapabilityFoundry:
                         attempt_value = parse_complete_json_object(
                             result.text, "program author response", model_envelope=False)
                     except ValidationError as parse_error:
+                        continuation = state.get("author_response_continuation")
+                        continuation_error = (
+                            continuation.get("error")
+                            if isinstance(continuation, dict)
+                            and continuation.get("status") == "format_repair_required"
+                            else None
+                        )
                         diagnostic = {
                             "attempt": attempt + 1,
                             "role": author_role,
@@ -1361,6 +3540,7 @@ class CapabilityFoundry:
                         diagnostics.append(diagnostic)
                         state["model_diagnostics"] = diagnostics[-12:]
                         last_error = ValidationError(
+                            continuation_error or
                             f"program author response was incomplete "
                             f"(finish_reason={result.finish_reason}): {parse_error}")
                     else:
@@ -1398,7 +3578,13 @@ class CapabilityFoundry:
                         "only stop and a complete length response can enter program gates")
             if result.finish_reason != "stop" and attempt_value is None:
                 failures = state.setdefault("validation_errors", [])
-                repeated = str(last_error) in failures or str(last_error) == feedback
+                failure_signature = _author_response_format_failure_signature(
+                    attempt_value, result.finish_reason, author_route_index)
+                failure_signatures = state.setdefault("failure_signatures", [])
+                repeated = _is_repeated_repair_failure(
+                    last_error, failures, failure_signatures, failure_signature)
+                if failure_signature not in failure_signatures:
+                    failure_signatures.append(failure_signature)
                 feedback = str(last_error)
                 if feedback not in failures:
                     failures.append(feedback)
@@ -1442,6 +3628,18 @@ class CapabilityFoundry:
                             "kind": "controller_owned_intent_revision",
                             "required": required_intent["revision"],
                             "received": received_revision,
+                        })
+                    if (isinstance(intent, dict)
+                            and isinstance(required_intent.get("stage_seconds"), dict)
+                            and intent.get("stage_seconds") != required_intent["stage_seconds"]):
+                        received_stage_seconds = intent.get("stage_seconds")
+                        intent["stage_seconds"] = deepcopy_config(
+                            required_intent["stage_seconds"])
+                        state.setdefault("normalizations", []).append({
+                            "attempt": attempt + 1,
+                            "kind": "controller_owned_stage_seconds",
+                            "required": deepcopy_config(required_intent["stage_seconds"]),
+                            "received": received_stage_seconds,
                         })
                     if not isinstance(intent, dict) or any(
                             intent.get(key) != value for key, value in required_intent.items()):
@@ -1487,7 +3685,10 @@ class CapabilityFoundry:
                 except (ValueError, TypeError) as exc:
                     raise ValidationError("executor did not return a JSON document") from exc
                 document = validate_program_output(
-                    document, attempt_value["experiment_intent"])
+                    document, attempt_value["experiment_intent"],
+                    payload_value["configured_input"].get("work_orders", []))
+                _validate_source_observation_binding(
+                    document, payload_value["configured_input"])
                 digest = hashlib.sha256(canonical_bytes(document)).hexdigest()
                 candidate_value = {
                     "schema_version": "method-program-candidate-1",
@@ -1543,23 +3744,100 @@ class CapabilityFoundry:
                     state["status"] = "response_received"
                     save("validation_pending")
                     raise CapabilityDeadlineError("capability validation reached its mission deadline") from exc
+                partial_intent_response = (
+                    isinstance(attempt_value, dict)
+                    and set(attempt_value) - LEGACY_TRANSPORT_FIELDS
+                    in ({"executor_source", "validator_source"},
+                        {"executor_source", "validator_source", "experiment_intent"})
+                    and isinstance(attempt_value.get("executor_source"), str)
+                    and isinstance(attempt_value.get("validator_source"), str)
+                    and not isinstance(attempt_value.get("experiment_intent"), dict)
+                )
+                if partial_intent_response:
+                    response_base = {
+                        "experiment_intent": {},
+                        "executor_source": attempt_value["executor_source"],
+                        "validator_source": attempt_value["validator_source"],
+                        "runtime": runtime,
+                        "test_input": configured_input,
+                    }
+                    attempt_value = deepcopy_config(response_base)
+                    state["response_base"] = deepcopy_config(response_base)
                 normalized_error = _normalize_program_validation_error(exc)
                 last_error = (ValidationError(
                     f"generated program omitted required field {exc.args[0]!r}")
                     if isinstance(exc, KeyError) and exc.args
                     else normalized_error)
+                output_contract_failure = isinstance(
+                    exc, ExperimentProgramOutputContractError)
+                format_envelope = (
+                    partial_intent_response
+                    or (candidate_fingerprint is None
+                        and (attempt_value is None
+                             or not ATTEMPT_FIELDS.issubset(attempt_value)))
+                )
+                repairable_output_format = (
+                    format_envelope or isinstance(exc, (
+                        ModelContractError, AnalysisContractError,
+                        ExperimentProgramOutputContractError)))
+                state["last_failure_class"] = (
+                    "model_contract" if (
+                        format_envelope
+                        or isinstance(exc, ModelContractError)
+                        or isinstance(exc, AnalysisContractError)
+                        or output_contract_failure
+                        or (isinstance(candidate_fingerprint, str)
+                            and state.get("failed_candidate_failure_classes", {}).get(
+                                candidate_fingerprint) == "model_contract"))
+                    else "experiment_capability_repair")
+                state["last_failure_gate"] = (
+                    "author_response_format" if partial_intent_response
+                    else "author_response_contract" if isinstance(
+                        exc, ExperimentIntentContractError)
+                    else "analysis_output_contract" if isinstance(exc, AnalysisContractError)
+                    else "program_output_contract" if isinstance(
+                        exc, ExperimentProgramOutputContractError) or output_contract_failure
+                    else state.get("failed_candidate_failure_gates", {}).get(
+                        candidate_fingerprint, _repair_gate(exc)))
                 failures = state.setdefault("validation_errors", [])
-                repeated = isinstance(exc, ModelWorkBlocked) or (
-                    (str(last_error) in failures or str(last_error) == feedback) and not seed_replay)
+                failure_signature = _sandbox_failure_signature(last_error)
+                if failure_signature is None:
+                    failure_signature = _program_gate_failure_signature(exc)
+                if partial_intent_response:
+                    failure_signature = (
+                        f"author_response_format:missing_experiment_intent:route="
+                        f"{author_route_index}")
+                elif format_envelope and attempt_value is None:
+                    failure_signature = _author_response_format_failure_signature(
+                        attempt_value, result.finish_reason, author_route_index)
+                elif isinstance(exc, AnalysisContractError):
+                    failure_signature = "analysis_output_contract:analysis"
+                elif isinstance(exc, ExperimentProgramOutputContractError) or output_contract_failure:
+                    failure_signature = "program_output_contract:executor_output"
+                elif isinstance(exc, ExperimentIntentContractError):
+                    failure_signature = "author_response_contract:experiment_intent"
+                failure_signatures = state.setdefault("failure_signatures", [])
+                repeated = _is_repeated_repair_failure(
+                    exc, failures, failure_signatures, failure_signature,
+                    seed_replay=seed_replay)
+                if (failure_signature is not None
+                        and failure_signature not in failure_signatures):
+                    failure_signatures.append(failure_signature)
                 feedback = str(last_error)
                 if isinstance(exc, ProgramGateRejected):
-                    state["validation_feedback"] = deepcopy_config(exc.feedback)
+                    _record_program_gate_feedback(state, exc.feedback, attempt_value)
                 if feedback not in failures:
                     failures.append(feedback)
                 if candidate_fingerprint is not None:
                     state.setdefault("failed_candidates", {})[candidate_fingerprint] = feedback
+                    state.setdefault("failed_candidate_failure_classes", {})[
+                        candidate_fingerprint] = state["last_failure_class"]
+                    state.setdefault("failed_candidate_failure_gates", {})[
+                        candidate_fingerprint] = state["last_failure_gate"]
                 if document is not None:
                     state["validation_context"] = program_failure_context(document)
+                    state["validation_context_candidate_sha256"] = (
+                        _authored_candidate_sha256(attempt_value))
                 if isinstance(attempt_value, dict) and ATTEMPT_FIELDS.issubset(attempt_value):
                     # Keep only authored fields in the repair base. Invalid
                     # envelopes must not destroy a previously complete source
@@ -1569,12 +3847,19 @@ class CapabilityFoundry:
                 state.update(status="blocked" if repeated else "repairing", feedback=feedback,
                     last_attempt=last_attempt,
                     error=f"capability foundry did not admit a program: {feedback}")
-                gate = _repair_gate(exc)
+                gate = ("author_response_format" if partial_intent_response
+                        else "author_response_contract" if isinstance(
+                            exc, ExperimentIntentContractError)
+                        else "program_output_contract" if isinstance(
+                            exc, ExperimentProgramOutputContractError) or output_contract_failure
+                        else "analysis_output_contract" if isinstance(exc, AnalysisContractError)
+                        else _repair_gate(exc))
                 state.setdefault("repair_ledger", []).append({
                     "attempt": attempt + 1,
                     "gate": gate,
                     "candidate_sha256": candidate_fingerprint,
                     "error": feedback[:4000],
+                    "failure_signature": failure_signature,
                     "validation_context": deepcopy_config(state.get("validation_context", {})),
                     "validation_feedback": deepcopy_config(state.get("validation_feedback", {})),
                     "next_action": "source_level_repair_then_fresh_replay",
@@ -1586,13 +3871,11 @@ class CapabilityFoundry:
                 save("validation_failed")
                 if repeated:
                     raise repair_exhausted_error() from exc
-                format_envelope = (
-                    candidate_fingerprint is None
-                    and (attempt_value is None
-                         or not ATTEMPT_FIELDS.issubset(attempt_value))
-                )
-                if format_envelope:
-                    prepare_author_format_retry(last_error, attempt_feedback)
+                if repairable_output_format:
+                    prepare_author_format_retry(
+                        last_error, attempt_feedback,
+                        output_contract_error=(exc if output_contract_failure else None),
+                    )
                 continue
         state.update(status="blocked", error=(
             f"capability foundry did not admit a program in {state['attempts']} attempts: {last_error}"))

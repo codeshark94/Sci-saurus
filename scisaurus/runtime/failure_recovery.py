@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 import re
 
+from scisaurus.core.errors import ModelContractError
 from scisaurus.core.schema import canonical_bytes
 
 
@@ -34,8 +35,11 @@ _MODEL_CONTRACT_MARKERS = (
     "invalid json", "malformed json",
     "response contract", "output contract", "model output must contain",
     "model output omitted",
+    "experiment_intent requires", "experiment_intent stage_seconds",
+    "stage_seconds requires exactly",
     "did not finish normally", "finish_reason", "research argument review",
     "research argument was not accepted",
+    "unknown or duplicate required check",
 )
 _EXPERIMENT_PROGRAM_MARKERS = (
     # Keep this list specific to a generated program or its observed result.
@@ -47,6 +51,7 @@ _EXPERIMENT_PROGRAM_MARKERS = (
     "program admission", "independent recalculation", "results-package",
     "result package", "adversarial review rejected the candidate program",
     "adversarial_review repair budget exhausted",
+    "fewer than configured minimum run_count",
 )
 
 
@@ -94,11 +99,49 @@ def classify_failure(stage_kind, error, stage_result=None):
             (stage_result or {}).get("error") if isinstance(stage_result, dict) else None,
         )
     ).casefold()
-    # Sandbox executor/validator failures are failures of the generated
-    # experiment program, even when the envelope includes resource-looking
-    # fields such as ``timeout=False`` or ``truncated=True``.  The old order
-    # matched the substring ``timeout`` first and incorrectly replayed the
-    # same candidate as a provider/resource fence.
+    if getattr(error, "failure_class", None) == "evidence_input_unavailable":
+        return "evidence_input_unavailable"
+    if getattr(error, "failure_class", None) == "harness_bug":
+        return "harness_bug"
+    if (stage_kind == "topic_discovery"
+            and getattr(error, "retryable_topic_intake", False)
+            and status_code not in {408, 425, 429, 500, 502, 503, 504}):
+        # TopicDiscoveryRunner uses a bounded local envelope for proposal and
+        # review attempts.  Its exhaustion is actionable Composer work, not a
+        # provider quota fence; preserve the distinction from real model/API
+        # budget failures, which never carry this typed retry marker.
+        if getattr(error, "topic_retry_reason", None) == "intake_contract_failure":
+            return "model_contract"
+        if getattr(error, "topic_retry_reason", None) == "refinement_contract_failure":
+            return "topic_refinement_contract"
+        if getattr(error, "topic_retry_reason", None) == "scientific_candidate_rejected":
+            return "scientific_review"
+    if (error_type in {
+            "ProviderCooldownError", "ProviderConfigurationError", "QuotaExceededError",
+            "ComposerHardDeadlineExceeded", "ComposerLateStageResult",
+            "CapabilityDeadlineError", "CapabilityModelBudgetExceeded",
+            "ModelCallError",
+        }
+            or failure_kind in {"provider_cooldown", "provider_configuration",
+                                "process_interrupted"}
+            or status_code in {408, 425, 429, 500, 502, 503, 504}):
+        return "resource_fence"
+    if error_type in {
+            "AttributeError", "AssertionError", "IndexError", "KeyError",
+            "NameError", "TypeError", "UnboundLocalError",
+    }:
+        # These are failures in the harness/runtime contract, not evidence
+        # that a scientific claim or experiment design needs model review.
+        return "harness_bug"
+    if isinstance(error, ModelContractError):
+        return "model_contract"
+    if "work order requires its routing, objective, success and evidence fields" in text:
+        # Historical checkpoints contain this untyped validator error from a
+        # Composer recovery directive projected into the experiment input.
+        return "harness_bug"
+    # A concrete executor-output failure outranks a stale model-contract label
+    # copied from an earlier author response. Provider and quota fences above
+    # remain authoritative even if their message mentions an experiment error.
     if stage_kind == "experiment" and any(
             marker in text for marker in _EXPERIMENT_PROGRAM_MARKERS):
         return "experiment_failure"
@@ -113,26 +156,6 @@ def classify_failure(stage_kind, error, stage_result=None):
         # A bounded foundry rejection is not a response-format defect when its
         # typed gate is judging the generated program or its scientific result.
         return "experiment_failure"
-    if (stage_kind == "topic_discovery"
-            and getattr(error, "retryable_topic_intake", False)):
-        # TopicDiscoveryRunner uses a bounded local envelope for proposal and
-        # review attempts.  Its exhaustion is actionable Composer work, not a
-        # provider quota fence; preserve the distinction from real model/API
-        # budget failures, which never carry this typed retry marker.
-        if getattr(error, "topic_retry_reason", None) == "intake_contract_failure":
-            return "model_contract"
-        if getattr(error, "topic_retry_reason", None) == "scientific_candidate_rejected":
-            return "scientific_review"
-    if (error_type in {
-            "ProviderCooldownError", "ProviderConfigurationError", "QuotaExceededError",
-            "ComposerHardDeadlineExceeded", "ComposerLateStageResult",
-            "CapabilityDeadlineError", "CapabilityModelBudgetExceeded",
-            "ModelCallError",
-        }
-            or failure_kind in {"provider_cooldown", "provider_configuration",
-                                "process_interrupted"}
-            or status_code in {408, 425, 429, 500, 502, 503, 504}):
-        return "resource_fence"
     text = " ".join(
         str(item or "") for item in (
             getattr(error, "failure_class", None),
@@ -145,6 +168,8 @@ def classify_failure(stage_kind, error, stage_result=None):
         return "resource_fence"
     if any(marker in text for marker in _OPERATIONAL_MARKERS):
         return "operational_recovery"
+    if getattr(error, "failure_class", None) == "model_contract":
+        return "model_contract"
     # A malformed/truncated provider response must be repaired at the model
     # interface before any scientific continuation is opened.  It is not a
     # rejected hypothesis and it should not replay survey/interpretation work.
@@ -216,6 +241,9 @@ def _result_projection(stage_result):
         "results_package", "output_path", "execution_refs", "deterministic_validation_ref",
         "model_review_refs", "assessment_ref", "metrics", "findings", "limitations",
         "analysis", "blockers", "research_expansion_requests", "usage", "time_plan",
+        "stage_id", "kind", "attempt_id", "attempt_number", "topic_id", "topic_cycle",
+        "execution_observation", "results_status", "unresolved_prior_attempts",
+        "capability_failure_evidence", "research_review", "model_diagnostics",
     )
     projected = {key: stage_result.get(key) for key in keys if key in stage_result}
     # A runner may only return a path after a late validation failure. Include
@@ -242,7 +270,8 @@ def _error_diagnostics(error):
     for attribute in (
             "research_argument", "research_review", "research_feedback",
             "research_response", "review", "required_repairs",
-            "model_diagnostics", "topic_response_repair"):
+            "model_diagnostics", "topic_response_repair", "runtime_frames",
+            "capability_failure_evidence"):
         value = getattr(error, attribute, None)
         if value is not None:
             diagnostics[attribute] = _bounded(value, max_depth=7, max_items=24,
@@ -373,7 +402,7 @@ def failure_evidence_lineage_conflicts(value, *, attempt_number=None,
 
 def _review_directives(specialist_reports, diagnostics, *, attempt_number=None,
                        stage_id=None):
-    """Flatten bounded reviewer findings into executable, evidence-linked directions."""
+    """Preserve review input as hypotheses until independently verified."""
     directives = []
     seen = set()
 
@@ -404,22 +433,36 @@ def _review_directives(specialist_reports, diagnostics, *, attempt_number=None,
             values = response.get(key) if isinstance(response, dict) else None
             if isinstance(values, list):
                 for value in values[:8]:
-                    add(source, key, value)
+                    add(source, "reviewer_proposal_to_verify", value)
 
     review = diagnostics.get("research_review") if isinstance(diagnostics, dict) else None
     if (isinstance(review, dict)
             and not failure_evidence_lineage_conflicts(
                 review, attempt_number=attempt_number,
                 stage_id=stage_id)["conflicts"]):
-        for key in ("required_repairs", "checks"):
-            values = review.get(key)
-            if isinstance(values, list):
-                for value in values[:12]:
-                    if key == "checks" and isinstance(value, dict):
-                        if value.get("outcome") in {"failed", "insufficient_evidence"}:
-                            add("argument-adjudicator", key, value.get("evidence") or value)
-                    else:
-                        add("argument-adjudicator", key, value)
+        repairs = review.get("required_repairs")
+        if isinstance(repairs, list):
+            for value in repairs[:12]:
+                add("argument-adjudicator", "reviewer_proposal_to_verify", value)
+
+        checks = review.get("checks")
+        if isinstance(checks, list):
+            for check in checks[:12]:
+                if not isinstance(check, dict) or check.get("outcome") not in {
+                        "failed", "insufficient_evidence"}:
+                    continue
+                check_id = check.get("check_id") or check.get("id") or "unnamed-check"
+                outcome = check.get("outcome")
+                evidence = check.get("evidence") or check.get("finding") or ""
+                add(
+                    "argument-adjudicator",
+                    "review_claim_requires_independent_verification",
+                    f"Reviewer check {check_id!r} reported {outcome!r}. This is a reviewer claim, "
+                    "not an independently confirmed defect. Re-evaluate the check against the "
+                    "source observations and reproduce its calculation before changing code, "
+                    "data, or scientific claims. Reviewer-reported evidence: "
+                    f"{evidence if isinstance(evidence, str) else json.dumps(evidence, sort_keys=True, default=str)}",
+                )
     return directives[:24]
 
 
@@ -435,8 +478,11 @@ def _review_command(review_directives, *, stage_kind):
         "operation": "execute_review_directives",
         "target": f"{stage_kind or 'stage'} evidence, claims, and unresolved reviewer findings",
         "instruction": (
-            "Apply these evidence-backed directives as the repair brief, preserving supported findings "
-            "and recording any directive that remains unresolved; do not issue a generic retry: "
+            "Treat reviewer proposals and verdicts as hypotheses, not established facts. "
+            "First verify each against source observations, deterministic checks, and reproducible "
+            "calculations; change code, data, or claims only for a confirmed defect. Preserve "
+            "contradictory reviewer statements in the audit record, resolve them with evidence, "
+            "and record unresolved claims as bounded uncertainty; do not issue a generic retry: "
             + " | ".join(lines)
         )[:7000],
         "acceptance_check": (
@@ -465,6 +511,21 @@ def build_repair_commands(stage_kind, failure_class, *, stage_result=None,
             "instruction": "Create a fresh attempt namespace, retain the old checkpoint read-only, and bind the same immutable input without overwriting it.",
             "acceptance_check": "The runner starts in a unique attempt directory and the old run remains inspectable.",
         }]
+    if failure_class == "harness_bug":
+        return [{
+            "id": "repair-runtime-defect",
+            "operation": "patch_runtime",
+            "target": "the failing Sci-saurus source frame recorded in runtime_frames",
+            "instruction": (
+                "Patch the source defect and add a deterministic regression test. Preserve the admitted "
+                "topic and checkpoint; do not dispatch a model review or rerun research work until the "
+                "test passes. Then resume the same checkpoint once."
+            ),
+            "acceptance_check": (
+                "The regression test reproduces and prevents the runtime exception, and the same "
+                "checkpoint resumes without reopening topic discovery or duplicating an external operation."
+            ),
+        }]
     if failure_class == "model_contract":
         return [{
             "id": "repair-model-response-contract",
@@ -472,6 +533,41 @@ def build_repair_commands(stage_kind, failure_class, *, stage_result=None,
             "target": "the failed model response and its role contract",
             "instruction": "Preserve the scientific input and evidence; send a schema-only repair prompt to the configured fallback role with a bounded output budget, then validate the repaired object locally before reopening any scientific stage.",
             "acceptance_check": "The fallback response parses, satisfies the exact role schema, and no new scientific continuation is admitted for a formatting-only failure.",
+        }]
+    if failure_class == "evidence_input_unavailable":
+        return [{
+            "id": "acquire-controller-verified-source-data",
+            "operation": "acquire_source_data",
+            "target": "the admitted topic's empirical evidence dependency",
+            "instruction": (
+                "Keep the admitted research question unchanged. Search and acquire the source dataset "
+                "required by its declared evidence plan, then bind every row to an immutable source "
+                "artifact and controller-verified manifest. Do not infer scientific infeasibility from "
+                "a missing manifest, substitute synthetic data, or reformulate the question. If the "
+                "search actually establishes that no suitable data source exists, return the search "
+                "evidence for an explicit scientific feasibility decision."
+            ),
+            "acceptance_check": (
+                "The same topic has either a current, verified source-data manifest with immutable row "
+                "provenance, or a source-search report documenting repositories, queries, and results; "
+                "missing input alone does not create a topic-pivot decision."
+            ),
+        }]
+    if failure_class == "topic_refinement_contract":
+        return [{
+            "id": "repair-topic-refinement-scope",
+            "operation": "refine",
+            "target": "the parent's bounded salvage branch and the candidate's changed dimensions",
+            "instruction": (
+                "Use the recorded branch contract to make one material change on an assigned "
+                "scientific axis, preserve the parent phenomenon, and change only dependent "
+                "fields implied by that axis. Do not restart candidate discovery or reinterpret "
+                "a validator rejection as evidence against the research direction."
+            ),
+            "acceptance_check": (
+                "The refined candidate preserves the lineage, changes an allowed branch dimension, "
+                "and passes local feasibility and refinement validation."
+            ),
         }]
 
     if stage_kind == "experiment":
@@ -627,7 +723,7 @@ def build_failure_dossier(*, stage, attempt_stage, error, stage_result=None,
         "attempt_number": resolved_attempt_number,
         "project_dir": str(Path(project_dir).resolve()) if project_dir else None,
         "failure_class": failure_class,
-        "recoverable": failure_class not in {"resource_fence"},
+        "recoverable": failure_class not in {"resource_fence", "harness_bug"},
         "error": str(error)[:6000],
         "observed_result": observed,
         "project_inventory": inventory_project(project_dir),
@@ -650,6 +746,7 @@ def build_failure_dossier(*, stage, attempt_stage, error, stage_result=None,
         "acceptance_checks": [item["acceptance_check"] for item in commands],
         "next_action": (
             "resume_from_checkpoint" if failure_class == "resource_fence" else
+            "patch_harness_before_resume" if failure_class == "harness_bug" else
             "repair_model_contract_before_stage_retry" if failure_class == "model_contract" else
             "create_scoped_repair_work_order_and_repair_before_rerun"
         ),
@@ -658,7 +755,8 @@ def build_failure_dossier(*, stage, attempt_stage, error, stage_result=None,
     return dossier
 
 
-def build_repair_request(dossier, *, stage_id):
+def build_repair_request(dossier, *, stage_id, target_stage_id=None,
+                         target_stage_kind=None):
     """Project one valid department work order from a failure dossier."""
     stage_kind = dossier.get("stage_kind")
     mapping = {
@@ -669,7 +767,13 @@ def build_repair_request(dossier, *, stage_id):
         "argument": ("interpretation_expansion", "strategy.interpretation"),
         "paper": ("manuscript_revision", "editorial.composer"),
     }
-    kind, owner = mapping.get(stage_kind, ("recovery", "executive-command"))
+    evidence_acquisition = dossier.get("failure_class") == "evidence_input_unavailable"
+    if evidence_acquisition:
+        kind, owner = "full_text_retrieval", "research.source-acquirer"
+        target_stage_kind = target_stage_kind or "survey"
+    else:
+        kind, owner = mapping.get(stage_kind, ("recovery", "executive-command"))
+        target_stage_kind = target_stage_kind or stage_kind
     digest = dossier.get("input_sha256", "")[:16]
     commands = dossier.get("repair_commands", [])
     objective = (commands[0].get("instruction") if commands and isinstance(commands[0], dict)
@@ -681,7 +785,9 @@ def build_repair_request(dossier, *, stage_id):
             if isinstance(item, dict) and item.get("text")
         )
         if directive_text:
-            objective = (objective + " Apply these recorded reviewer directives: "
+            objective = (objective + " Reconcile these reviewer hypotheses against the retained "
+                         "failure, raw observations, and deterministic checks; change the program "
+                         "only for a reproduced defect: "
                          + directive_text)[:1800]
     checks = dossier.get("acceptance_checks", [])
     return {
@@ -695,8 +801,10 @@ def build_repair_request(dossier, *, stage_id):
         # Keep that execution address explicit instead of making the Composer
         # infer it from the owner and accidentally reopening an unrelated
         # stage.
-        "target_stage_id": stage_id,
-        "target_stage_kind": stage_kind,
+        **({"target_stage_id": target_stage_id}
+           if isinstance(target_stage_id, str) and target_stage_id else
+           ({} if evidence_acquisition else {"target_stage_id": stage_id})),
+        "target_stage_kind": target_stage_kind,
         "repair_priority": "immediate",
         "objective": objective[:1800],
         "why": f"{stage_id} produced {dossier.get('failure_class')} evidence: {dossier.get('error', '')[:1800]}",

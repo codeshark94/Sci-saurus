@@ -87,6 +87,35 @@ def _core(value, *, asset_version, base_dir):
                 or set(finding["metric_ids"]) - metric_ids):
             raise ValidationError("finding must bind exact package metrics")
         reserve_id(finding["id"], f"findings[{index}]")
+    for index, finding in enumerate(value.get("withheld_findings", [])):
+        _exact(finding, {"id", "statement", "metric_ids", "reviewer_assessments"},
+               "withheld finding")
+        _identifier(finding["id"], "withheld finding id")
+        _text(finding["statement"], "withheld finding statement")
+        if (not isinstance(finding["metric_ids"], list)
+                or not finding["metric_ids"]
+                or len(finding["metric_ids"]) != len(set(finding["metric_ids"]))
+                or set(finding["metric_ids"]) - metric_ids):
+            raise ValidationError("withheld finding must bind exact package metrics")
+        reserve_id(finding["id"], f"withheld_findings[{index}]")
+        reviews = finding["reviewer_assessments"]
+        if not isinstance(reviews, list) or not reviews:
+            raise ValidationError("withheld finding requires independent reviewer evidence")
+        reviewer_ids = set()
+        has_adverse_review = False
+        for review in reviews:
+            _exact(review, {"reviewer_id", "outcome", "rationale"},
+                   "withheld finding reviewer assessment")
+            _identifier(review["reviewer_id"], "withheld finding reviewer id")
+            if review["reviewer_id"] in reviewer_ids:
+                raise ValidationError("withheld finding reviewer IDs must be unique")
+            reviewer_ids.add(review["reviewer_id"])
+            if review["outcome"] not in {"supported", "overstated", "insufficient_evidence"}:
+                raise ValidationError("withheld finding reviewer outcome is invalid")
+            has_adverse_review |= review["outcome"] != "supported"
+            _text(review["rationale"], "withheld finding reviewer rationale")
+        if not has_adverse_review:
+            raise ValidationError("withheld finding requires at least one adverse review outcome")
     if not isinstance(value["limitations"], list) or not value["limitations"]:
         raise ValidationError("results package requires explicit limitations")
     for limitation in value["limitations"]:
@@ -128,9 +157,13 @@ def validate_results_package(value, *, base_dir=None):
     if schema == "results-package-1":
         _exact(value, core, "results package")
         asset_version = 1
-    elif schema == "results-package-2":
+    elif schema in {"results-package-2", "results-package-3"}:
         required = core | {"study_type", "question", "hypothesis", "provenance", "validation"}
-        allowed = required | {"analysis", "quality_contract", "quality_admission"}
+        if schema == "results-package-3":
+            required |= {"withheld_findings"}
+        allowed = required | {
+            "analysis", "quality_contract", "quality_admission", "work_order_assessments",
+        }
         if (set(value) - allowed) or not required.issubset(value):
             raise ValidationError(
                 f"results package requires {sorted(required)} and permits analysis, quality_contract")
@@ -164,6 +197,10 @@ def validate_results_package(value, *, base_dir=None):
                "results validation")
         if validation["decision"] not in {"accepted", "accepted_with_limitations", "rejected"}:
             raise ValidationError("results package validation decision is invalid")
+        if (schema == "results-package-3"
+                and validation["decision"] != "accepted_with_limitations"):
+            raise ValidationError(
+                "results-package-3 is reserved for scoped acceptance with explicit limitations")
         _ref(validation["deterministic_validation_ref"], "deterministic validation ref")
         _ref(validation["assessment_ref"], "result assessment ref")
         if (not isinstance(validation["model_review_refs"], list) or len(validation["model_review_refs"]) < 2
@@ -173,13 +210,70 @@ def validate_results_package(value, *, base_dir=None):
             _ref(ref, "model review ref")
         if "design_ref" in provenance:
             _ref(provenance["design_ref"], "results design_ref")
+        if "work_order_assessments" in value:
+            assessments = value["work_order_assessments"]
+            if not isinstance(assessments, list) or not assessments:
+                raise ValidationError("results work_order_assessments must be a nonempty list")
+            order_ids = set()
+            for order in assessments:
+                _exact(order, {"id", "kind", "owner", "objective", "success_condition",
+                               "disposition", "summary", "evidence_paths", "limitation",
+                               "reviewer_assessments"}, "results work-order assessment")
+                for key in ("id", "kind"):
+                    _identifier(order[key], f"results work order {key}")
+                if order["id"] in order_ids:
+                    raise ValidationError("results work-order IDs must be unique")
+                order_ids.add(order["id"])
+                for key in ("owner", "objective", "success_condition", "summary"):
+                    _text(order[key], f"results work order {key}")
+                if order["disposition"] not in {"completed", "bounded", "unresolved"}:
+                    raise ValidationError("results work-order disposition is invalid")
+                paths = order["evidence_paths"]
+                if (not isinstance(paths, list) or not paths
+                        or any(not isinstance(path, str) or not path.startswith("/") for path in paths)
+                        or len(paths) != len(set(paths))):
+                    raise ValidationError("results work order must retain unique JSON Pointer evidence paths")
+                if order["disposition"] == "bounded":
+                    _text(order["limitation"], "results bounded work-order limitation")
+                    if order["limitation"] not in value["limitations"]:
+                        raise ValidationError("bounded work-order limitation must remain in package limitations")
+                elif order["limitation"] is not None:
+                    raise ValidationError("only bounded work orders may carry a limitation")
+                if (order["disposition"] == "unresolved"
+                        and validation["decision"] != "rejected"):
+                    raise ValidationError("unresolved work orders cannot be admitted in an accepted package")
+                reviewer_assessments = order["reviewer_assessments"]
+                if not isinstance(reviewer_assessments, list) or len(reviewer_assessments) < 2:
+                    raise ValidationError("work-order outcomes require independent reviewer assessments")
+                reviewer_ids = set()
+                for reviewer in reviewer_assessments:
+                    _exact(reviewer, {"reviewer_id", "outcome", "evidence_paths", "rationale"},
+                           "work-order reviewer assessment")
+                    _identifier(reviewer["reviewer_id"], "work-order reviewer id")
+                    if reviewer["reviewer_id"] in reviewer_ids:
+                        raise ValidationError("work-order reviewer IDs must be distinct")
+                    reviewer_ids.add(reviewer["reviewer_id"])
+                    if reviewer["outcome"] not in {"resolved", "bounded", "not_resolved"}:
+                        raise ValidationError("work-order reviewer outcome is invalid")
+                    _text(reviewer["rationale"], "work-order reviewer rationale")
+                    cited = reviewer["evidence_paths"]
+                    if (not isinstance(cited, list) or not cited
+                            or any(path not in paths for path in cited)):
+                        raise ValidationError("reviewers must cite the work-order's declared evidence paths")
+                observed_outcomes = {item["outcome"] for item in reviewer_assessments}
+                expected_disposition = (
+                    "unresolved" if "not_resolved" in observed_outcomes else
+                    "bounded" if "bounded" in observed_outcomes else "completed"
+                )
+                if order["disposition"] != expected_disposition:
+                    raise ValidationError("work-order disposition must reconcile the independent reviewers")
     else:
         raise ValidationError("unsupported results package schema")
     _identifier(value["id"], "results package id")
     if type(value["revision"]) is not int or value["revision"] < 1:
         raise ValidationError("results package revision must be positive")
     _core(value, asset_version=asset_version, base_dir=base_dir)
-    if schema == "results-package-2":
+    if schema in {"results-package-2", "results-package-3"}:
         if "analysis" in value:
             validate_analysis(value["analysis"])
         if "quality_contract" in value:

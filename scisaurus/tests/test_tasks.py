@@ -32,6 +32,9 @@ class TestTaskLifecycle(unittest.TestCase):
         self.assertEqual(attempt["usage"]["actual"], {"tokens": 82})
         task = self.tm.get("t-1")
         self.assertEqual(task["state"], "running")
+        attempts = self.tm.attempts_for_task("t-1")
+        self.assertEqual([attempt["attempt_id"] for attempt in attempts], ["a-1"])
+        self.assertEqual(attempts[0]["usage"]["actual"], {"tokens": 82})
 
     def test_t05_unknown_outcome_is_not_zero_cost(self):
         self.tm.create("t-2", "retrieval", {"objective": "fetch source"}, "composer")

@@ -17,7 +17,7 @@ from scisaurus.runtime.models import (
     ModelClient, ModelCallError, ModelContextBudgetError, ModelResult,
     clear_model_provider_cooldown, complete_with_role_fallbacks, effective_model_timeout,
     estimate_input_tokens, model_context_budget, model_context_error,
-    is_local_qwen_route, model_route_candidates, role_config_for,
+    is_local_qwen_route, model_provider_cooldown_remaining, model_route_candidates, role_config_for,
     role_routes_for, resolve_model_config, with_runtime_cooldown_fallback,
 )
 
@@ -312,6 +312,28 @@ class TestModelClient(unittest.TestCase):
         self.assertEqual(result.json_object(), {'value': 4})
         self.assertEqual(self.request['options']['num_ctx'], 32768)
 
+    def test_native_ollama_json_mode_is_sent_as_format_json(self):
+        result = self.client('ollama', output_format='json_object').complete(
+            system='Return one JSON object.', prompt='data')
+        self.assertEqual(result.json_object(), {'value': 4})
+        self.assertEqual(self.request['format'], 'json')
+
+    def test_native_ollama_json_continuation_disables_whole_document_mode(self):
+        self.response = {
+            'model': 'served-model', 'message': {'content': '4}'}, 'done': True,
+            'done_reason': 'stop', 'prompt_eval_count': 20, 'eval_count': 2,
+        }
+        result = self.client('ollama', output_format='json_object').complete(
+            system='Return one JSON object.', prompt='Build the declared object.',
+            continuation_text='{"value": ',
+        )
+        self.assertEqual(result.text, '4}')
+        self.assertNotIn('format', self.request)
+        self.assertEqual(self.request['messages'][-2], {
+            'role': 'assistant', 'content': '{"value": ',
+        })
+        self.assertIn('missing suffix', self.request['messages'][-1]['content'])
+
     def test_openai_compatible_bridge_does_not_claim_dynamic_ollama_context(self):
         self.response = {'choices': [{'message': {'content': '{"ok":true}'}, 'finish_reason': 'stop'}]}
         self.client('openai_compatible', context_window_tokens=32768).complete(
@@ -329,6 +351,28 @@ class TestModelClient(unittest.TestCase):
         self.assertEqual(result.usage,{'model_calls':1})
         self.assertNotIn('input_tokens',result.usage)
 
+    def test_json_response_continuation_preserves_prefix_and_disables_json_mode(self):
+        self.response_sequence = [{
+            'model': 'served-model',
+            'choices': [{'message': {'content': '4}'}, 'finish_reason': 'stop'}],
+            'usage': {'prompt_tokens': 20, 'completion_tokens': 2},
+        }]
+        result = self.client(
+            'openai_compatible', output_format='json_object',
+            context_window_tokens=8192, max_input_tokens=2048,
+        ).complete(
+            system='Return a JSON object.', prompt='Build the declared object.',
+            continuation_text='{"value": ',
+        )
+        self.assertEqual(result.text, '4}')
+        self.assertEqual(result.usage['model_calls'], 1)
+        self.assertEqual([message['role'] for message in self.request['messages']],
+                         ['system', 'user', 'assistant', 'user'])
+        self.assertEqual(self.request['messages'][1]['content'], 'Build the declared object.')
+        self.assertEqual(self.request['messages'][2]['content'], '{"value": ')
+        self.assertIn('missing suffix', self.request['messages'][3]['content'])
+        self.assertNotIn('response_format', self.request)
+
     def test_compatible_reasoning_and_json_output_are_sent_exactly(self):
         self.response = {
             'choices': [{'message': {'content': '{"revised_text":"Association observed."}'}, 'finish_reason': 'stop'}],
@@ -343,6 +387,71 @@ class TestModelClient(unittest.TestCase):
         self.assertEqual(self.request['max_tokens'], 4096)
         self.assertEqual(result.json_object(), {'revised_text': 'Association observed.'})
         self.assertEqual(result.usage, {'model_calls': 1, 'input_tokens': 14, 'output_tokens': 28})
+
+    def test_role_fallback_dispatch_applies_json_mode_to_the_selected_route(self):
+        calls = []
+
+        class StructuredClient:
+            def __init__(self, **config):
+                calls.append(config)
+
+            def complete(self, *, system, prompt, images=None):
+                return ModelResult(
+                    text='{"ok":true}', model="deepseek-cloud",
+                    usage={"model_calls": 1}, elapsed_seconds=0.01,
+                    finish_reason="stop",
+                )
+
+        result, routes = complete_with_role_fallbacks(
+            {
+                "protocol": "openai_compatible",
+                "base_url": "http://structured-json.test/v1",
+                "model": "deepseek-cloud", "timeout_seconds": 2,
+                "max_output_tokens": 128,
+            },
+            role="strategy.argument", system="Return JSON.", prompt="Inspect.",
+            output_format="json_object", client_factory=StructuredClient,
+        )
+        self.assertEqual(result.json_object(), {"ok": True})
+        self.assertEqual(routes[0]["status_code"], 200)
+        self.assertEqual(calls[0]["output_format"], "json_object")
+
+    def test_continuation_uses_a_route_that_fits_the_accumulated_prefix(self):
+        calls = []
+
+        class ContinuationClient:
+            def __init__(self, **config):
+                self.config = config
+
+            def complete(self, *, system, prompt, images=None, continuation_text=None):
+                calls.append((self.config["model"], prompt, continuation_text))
+                return ModelResult(
+                    text='"complete":true}', model=self.config["model"],
+                    usage={"model_calls": 1}, elapsed_seconds=0.01,
+                    finish_reason="stop",
+                )
+
+        prefix = '{"complete":' + ("x" * 1800)
+        routes = [
+            {"protocol": "openai_compatible", "base_url": "https://models.test/v1",
+             "model": "gemma-small", "max_output_tokens": 64,
+             "context_window_tokens": 512, "max_input_tokens": 300},
+            {"protocol": "openai_compatible", "base_url": "https://models.test/v1",
+             "model": "deepseek-large", "max_output_tokens": 64,
+             "context_window_tokens": 8192, "max_input_tokens": 7000},
+        ]
+        result, history = complete_with_role_fallbacks(
+            {"model": "base"}, role="editorial.writer",
+            system="Continue JSON.", prompt="Return a JSON object.",
+            continuation_text=prefix, candidate_configs=routes,
+            client_factory=ContinuationClient,
+        )
+
+        self.assertEqual([item[0] for item in calls], ["deepseek-large"])
+        self.assertEqual(calls[0][1], "Return a JSON object.")
+        self.assertEqual(calls[0][2], prefix)
+        self.assertEqual(history[0]["model"], "deepseek-large")
+        self.assertEqual(result.text, '"complete":true}')
 
     def test_prompt_cache_hint_and_usage_are_preserved(self):
         self.response = {
@@ -605,9 +714,11 @@ class TestModelClient(unittest.TestCase):
             with self.subTest(output_format=value), self.assertRaises(ValidationError):
                 self.client('openai_compatible', output_format=value)
         for options in ({'reasoning_effort': 'none'}, {'reasoning_effort': 'high'},
-                        {'reasoning_effort': 'xhigh'}, {'output_format': 'json_object'}):
+                        {'reasoning_effort': 'xhigh'}):
             with self.subTest(ollama_options=options), self.assertRaises(ValidationError):
                 self.client('ollama', **options)
+        with self.assertRaises(ValidationError):
+            self.client('ollama', output_format='json_schema')
         self.assertFalse(hasattr(self, 'request'))
 
     def test_json_output_mode_accepts_an_exact_json_markdown_fence(self):
@@ -807,7 +918,7 @@ class TestModelClient(unittest.TestCase):
         with patch.dict('os.environ',{},clear=True), self.assertRaises(ValidationError):
             self.client(auth_env='TEST_MODEL_KEY')
 
-    def test_context_filtered_routes_keep_quota_fallback_cooldown_only(self):
+    def test_model_429_stops_route_fallback_and_opens_provider_cooldown(self):
         role = "editorial.writer"
         clear_model_provider_cooldown({
             "protocol": "openai_compatible", "base_url": "http://cloud.test/v1",
@@ -853,17 +964,18 @@ class TestModelClient(unittest.TestCase):
                     elapsed_seconds=0.01, finish_reason="stop",
                 )
 
-        result, history = complete_with_role_fallbacks(
-            model, role=role, system="review", prompt="bounded prompt",
-            candidate_configs=normal, output_token_cap=64,
-            client_factory=StubClient,
-        )
-        self.assertEqual(calls, ["deepseek-cloud", "gemma-local"])
-        self.assertEqual(result.model, "gemma-local")
-
-        self.assertEqual([entry["model"] for entry in history], [
-            "deepseek-cloud", "gemma-local",
-        ])
+        with self.assertRaises(ModelCallError) as caught:
+            complete_with_role_fallbacks(
+                model, role=role, system="review", prompt="bounded prompt",
+                candidate_configs=normal, output_token_cap=64,
+                client_factory=StubClient,
+            )
+        self.assertEqual(caught.exception.status_code, 429)
+        self.assertEqual(calls, ["deepseek-cloud"])
+        self.assertGreater(model_provider_cooldown_remaining({
+            "protocol": "openai_compatible", "base_url": "http://cloud.test/v1",
+            "auth_env": None,
+        }), 0)
 
         calls.clear()
         clear_model_provider_cooldown({

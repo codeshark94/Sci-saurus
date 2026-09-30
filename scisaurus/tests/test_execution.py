@@ -10,16 +10,18 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.store import ArtifactStore
 from scisaurus.runtime.config import MIN_WORKER_RESULT_BYTES, validate_config
 from scisaurus.runtime.execution import (
-    ExecutionRuntime, _NO_PROVIDER_CAPACITY, _ResultFile,
+    ExecutionRuntime, _NO_PROVIDER_CAPACITY, _ResultFile, _invoke_worker,
+    _worker_error_payload,
 )
 from scisaurus.runtime.models import (
-    DEFAULT_MODEL_RATE_LIMIT_COOLDOWN_SECONDS, ModelClient,
+    DEFAULT_MODEL_RATE_LIMIT_COOLDOWN_SECONDS, ModelCallError, ModelClient,
     model_provider_quota_scope, resolve_model_config,
 )
 from scisaurus.tests.test_runner import config
@@ -108,6 +110,146 @@ def same_pool_independent_quota_worker(kind, params, channel):
 
 
 class TestExecutionRuntime(unittest.TestCase):
+    def test_worker_failure_envelope_preserves_model_rate_limit_metadata(self):
+        error = ModelCallError(
+            "model HTTP request failed with status 429",
+            outcome_known=True,
+            attempts=2,
+            elapsed_seconds=1.25,
+            status_code=429,
+            retry_after_seconds=3600,
+            provider_error_kind="quota_exhausted",
+        )
+        self.assertEqual(_worker_error_payload(error, "model"), {
+            "ok": False,
+            "error": "model HTTP request failed with status 429",
+            "error_type": "ModelCallError",
+            "outcome_known": True,
+            "status_code": 429,
+            "retry_after_seconds": 3600.0,
+            "provider_error_kind": "quota_exhausted",
+            "attempts": 2,
+            "elapsed_seconds": 1.25,
+        })
+
+    def test_model_worker_continues_truncated_json_and_journals_each_provider_call(self):
+        from types import SimpleNamespace
+
+        class Channel:
+            def __init__(self):
+                self.value = None
+
+            def put(self, value):
+                self.value = value
+
+        class StubClient:
+            calls = []
+            responses = [
+                SimpleNamespace(text='{"reviewer_id":"claims",', model="fixture",
+                                usage={"model_calls": 1, "input_tokens": 20,
+                                       "output_tokens": 10},
+                                elapsed_seconds=0.1, finish_reason="length",
+                                request_attempts=1),
+                SimpleNamespace(text='"decision":"accepted"}', model="fixture",
+                                usage={"model_calls": 1, "input_tokens": 25,
+                                       "output_tokens": 8},
+                                elapsed_seconds=0.2, finish_reason="stop",
+                                request_attempts=1),
+            ]
+
+            def __init__(self, **config):
+                self.model = config["model"]
+
+            def complete(self, **kwargs):
+                self.calls.append(kwargs)
+                return self.responses.pop(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / "continuation.json"
+            channel = Channel()
+            params = {
+                "client": {
+                    "protocol": "openai_compatible",
+                    "base_url": "https://models.example/v1",
+                    "model": "fixture", "timeout_seconds": 2,
+                    "max_output_tokens": 64,
+                },
+                "prompt": "Return one JSON object.",
+                "_continuation_journal_path": str(journal),
+            }
+            with patch("scisaurus.runtime.execution.ModelClient", StubClient):
+                _invoke_worker("model", params, channel)
+
+            self.assertTrue(channel.value["ok"])
+            result = channel.value["result"]
+            self.assertEqual(result["text"], '{"reviewer_id":"claims","decision":"accepted"}')
+            self.assertEqual(result["finish_reason"], "stop")
+            self.assertEqual(result["usage"], {
+                "model_calls": 2, "input_tokens": 45, "output_tokens": 18,
+            })
+            self.assertEqual(len(StubClient.calls), 2)
+            self.assertEqual(StubClient.calls[0]["prompt"], StubClient.calls[1]["prompt"])
+            self.assertEqual(StubClient.calls[1]["continuation_text"],
+                             '{"reviewer_id":"claims",')
+            saved = json.loads(journal.read_text())
+            self.assertEqual(saved["status"], "completed")
+            self.assertEqual(len(saved["segments"]), 2)
+            self.assertEqual(saved["response"], result["text"])
+
+    def test_rate_limit_during_continuation_preserves_prefix_and_does_not_retry(self):
+        from types import SimpleNamespace
+
+        class Channel:
+            def __init__(self):
+                self.value = None
+
+            def put(self, value):
+                self.value = value
+
+        class StubClient:
+            calls = []
+
+            def __init__(self, **config):
+                self.model = config["model"]
+
+            def complete(self, **kwargs):
+                self.calls.append(kwargs)
+                if len(self.calls) > 1:
+                    raise ModelCallError(
+                        "model HTTP request failed with status 429",
+                        outcome_known=True, attempts=1, status_code=429,
+                        retry_after_seconds=3600, provider_error_kind="quota_exhausted",
+                    )
+                return SimpleNamespace(
+                    text='{"decision":', model="fixture",
+                    usage={"model_calls": 1, "input_tokens": 20, "output_tokens": 10},
+                    elapsed_seconds=0.1, finish_reason="length", request_attempts=1,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / "continuation.json"
+            channel = Channel()
+            params = {
+                "client": {"protocol": "openai_compatible",
+                           "base_url": "https://models.example/v1",
+                           "model": "fixture", "timeout_seconds": 2,
+                           "max_output_tokens": 64},
+                "prompt": "Return JSON.",
+                "_continuation_journal_path": str(journal),
+            }
+            with patch("scisaurus.runtime.execution.ModelClient", StubClient):
+                _invoke_worker("model", params, channel)
+
+            self.assertFalse(channel.value["ok"])
+            self.assertEqual(channel.value["status_code"], 429)
+            self.assertEqual(channel.value["provider_error_kind"], "quota_exhausted")
+            self.assertEqual(channel.value["partial_output_journal_path"], str(journal))
+            self.assertEqual(len(StubClient.calls), 2)
+            saved = json.loads(journal.read_text())
+            self.assertEqual(saved["status"], "continuing")
+            self.assertEqual(saved["response"], '{"decision":')
+            self.assertEqual(len(saved["segments"]), 1)
+
     def test_worker_result_limit_always_fits_its_own_overflow_envelope(self):
         path = self.root / "result.json"
         with self.assertRaisesRegex(ValueError, "minimum failure envelope"):
@@ -419,7 +561,7 @@ class TestExecutionRuntime(unittest.TestCase):
         self.assertEqual(selected["id"], "gemma")
         self.assertEqual(selected["_effective"]["model"], "gemma4:31b-cloud")
 
-    def test_provider_429_requeues_same_logical_task_on_healthy_route(self):
+    def test_provider_429_fences_run_without_replaying_on_a_healthy_route(self):
         value = config()
         value["model"].update(
             base_url="http://127.0.0.1:1/v1", protocol="openai_compatible", model="base-model")
@@ -445,22 +587,20 @@ class TestExecutionRuntime(unittest.TestCase):
             spec["params"]["client"] = value["model"]
             specs.append(spec)
         outcomes = runtime._call_batch(specs, max_parallel=2)
-        self.assertTrue(all(outcome["ok"] for outcome in outcomes.values()))
-        self.assertEqual({json.loads(item["result"]["text"])["provider_pool"]
-                          for item in outcomes.values()}, {"qwen"})
-        self.assertEqual(runtime.tasks.get("provider-retry-0")["state"], "awaiting_review")
-        self.assertEqual(runtime.tasks.get("provider-retry-1")["state"], "awaiting_review")
+        self.assertTrue(any(item.get("status_code") == 429 for item in outcomes.values()))
+        self.assertTrue(any(item["ok"] for item in outcomes.values()))
         technical = runtime.control._conn.execute(
-            "SELECT state FROM tasks WHERE task_id LIKE '%-provider-retry-1'"
+            "SELECT task_id FROM tasks WHERE task_id LIKE '%-provider-retry-%'"
         ).fetchall()
-        self.assertEqual([row[0] for row in technical], ["completed"])
-        retry_failures = runtime.control._conn.execute(
-            "SELECT COUNT(*) FROM artifacts WHERE logical_id LIKE 'command/failures/provider-retry-%'"
+        retry_attempts = runtime.control._conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE attempt_id LIKE '%-provider-retry-%'"
         ).fetchone()[0]
-        self.assertEqual(retry_failures, 1)
+        self.assertEqual(technical, [])
+        self.assertEqual(retry_attempts, 0)
+        self.assertIsNotNone(runtime.model_rate_limit_fence)
         self.assertEqual(runtime.provider_active, {"qwen": 0, "ollama": 0})
 
-    def test_same_pool_cooldown_fallback_uses_configured_route_after_known_429(self):
+    def test_known_429_stops_same_pool_fallback_until_explicit_resume_after_cooldown(self):
         value = config()
         endpoint = "http://127.0.0.1:11434/v1"
         value["model"].update(
@@ -502,39 +642,26 @@ class TestExecutionRuntime(unittest.TestCase):
             return spec
 
         first = runtime._call_batch([model_task("fallback-first")])
-        self.assertTrue(first["fallback-first"]["ok"])
-        first_result = json.loads(first["fallback-first"]["result"]["text"])
-        self.assertEqual(first_result["model"], "gemma-local")
-        self.assertEqual(first_result["route_id"], "ollama-local-cooldown-recovery")
-        self.assertEqual(first_result["provider_pool"], "ollama")
-        self.assertEqual(first_result["max_input_tokens"], 1024)
-        self.assertEqual(first_result["max_output_tokens"], 256)
-        self.assertEqual(runtime.tasks.get("fallback-first")["state"], "awaiting_review")
+        self.assertFalse(first["fallback-first"]["ok"])
+        self.assertEqual(first["fallback-first"]["status_code"], 429)
+        self.assertEqual(runtime.control._conn.execute(
+            "SELECT COUNT(*) FROM attempts").fetchone()[0], 1)
         failed_scope = model_provider_quota_scope({
             "protocol": "openai_compatible", "base_url": endpoint,
             "auth_env": None,
         })
         self.assertGreater(runtime.provider_cooldowns[failed_scope], time.monotonic())
+        self.assertFalse(runtime.provider_cooldown_fallback_allowed[failed_scope])
 
         retry_spec = model_task("fallback-client-construction")
         selected_route = runtime._provider_route(retry_spec)
-        effective = runtime._route_model_config(retry_spec, selected_route)
-        self.assertEqual(effective["model"], "gemma-local")
-        self.assertEqual(effective["max_input_tokens"], 1024)
-        self.assertEqual(effective["max_output_tokens"], 256)
-        self.assertNotIn("_cooldown_fallback", effective)
-        client = ModelClient(**resolve_model_config(
-            effective, role="methods.methodologist"))
-        self.assertEqual(client.model, "gemma-local")
+        self.assertIs(selected_route, _NO_PROVIDER_CAPACITY)
 
         second = runtime._call_batch([model_task("fallback-during-cooldown")])
-        self.assertTrue(second["fallback-during-cooldown"]["ok"])
-        second_result = json.loads(second["fallback-during-cooldown"]["result"]["text"])
-        self.assertEqual(second_result["model"], "gemma-local")
-        self.assertEqual(second_result["route_id"], "ollama-local-cooldown-recovery")
-        self.assertEqual(second_result["max_input_tokens"], 1024)
-        self.assertEqual(second_result["max_output_tokens"], 256)
-        self.assertEqual(runtime.tasks.get("fallback-during-cooldown")["state"], "awaiting_review")
+        self.assertFalse(second["fallback-during-cooldown"]["ok"])
+        self.assertEqual(second["fallback-during-cooldown"]["status_code"], 429)
+        self.assertEqual(runtime.control._conn.execute(
+            "SELECT COUNT(*) FROM attempts").fetchone()[0], 1)
         self.assertEqual(runtime.provider_active, {"ollama": 0})
 
         runtime.control.close()
@@ -551,8 +678,7 @@ class TestExecutionRuntime(unittest.TestCase):
         resumed_spec = model_task("fallback-after-resume")
         resumed_spec["params"]["client"] = resumed.config["model"]
         resumed_route = resumed._provider_route(resumed_spec)
-        self.assertEqual(resumed_route["id"], "ollama-local-cooldown-recovery")
-        self.assertEqual(resumed_route["_effective"]["model"], "gemma-local")
+        self.assertIs(resumed_route, _NO_PROVIDER_CAPACITY)
 
     def test_local_qwen_cooldown_fallback_is_removed_before_dispatch(self):
         value = config()
@@ -619,6 +745,10 @@ class TestExecutionRuntime(unittest.TestCase):
             entry, {"status_code": 429, "outcome_known": False,
                     "error": "ambiguous transport outcome"})
         self.assertIsNone(retry)
+        self.assertIsNone(runtime._provider_retry_spec(
+            entry, {"status_code": 503, "outcome_known": True,
+                    "partial_output_journal_path": "/tmp/model-continuation.json",
+                    "error": "suffix request unavailable after partial output"}))
         scope = model_provider_quota_scope(runtime._base_model_config(spec))
         self.assertFalse(runtime.provider_cooldown_fallback_allowed[scope])
         self.assertIs(runtime._provider_route(spec), _NO_PROVIDER_CAPACITY)
@@ -640,7 +770,7 @@ class TestExecutionRuntime(unittest.TestCase):
         self.assertIs(resumed._provider_route(resumed_spec), _NO_PROVIDER_CAPACITY)
         self.assertFalse(resumed.provider_cooldown_fallback_allowed[scope])
 
-    def test_same_pool_429_retries_an_independent_quota_scope_before_qwen(self):
+    def test_same_pool_429_does_not_retry_an_independent_quota_scope(self):
         value = config()
         endpoint = "http://127.0.0.1:11434/v1"
         value["model"].update(
@@ -674,15 +804,16 @@ class TestExecutionRuntime(unittest.TestCase):
             client=runtime.config["model"], role="methods.methodologist")
 
         outcome = runtime._call_batch([spec])["same-pool-independent-quota"]
-        self.assertTrue(outcome["ok"])
-        result = json.loads(outcome["result"]["text"])
-        self.assertEqual(result["route_id"], "quota-b")
-        self.assertEqual(result["model"], "quota-b-model")
-        self.assertNotIn("ollama-local-cooldown-recovery", result["route_id"])
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["status_code"], 429)
         self.assertIn("quota-a", runtime.provider_cooldowns)
         self.assertNotIn("quota-b", runtime.provider_cooldowns)
+        self.assertIsNotNone(runtime.model_rate_limit_fence)
+        self.assertIs(runtime._provider_route(spec), _NO_PROVIDER_CAPACITY)
+        self.assertEqual(runtime.control._conn.execute(
+            "SELECT COUNT(*) FROM attempts").fetchone()[0], 1)
 
-    def test_cooldown_fallback_respects_role_models_limits_after_resume_in_pool(self):
+    def test_model_429_fences_role_model_before_cooldown_fallback(self):
         value = config()
         endpoint = "http://127.0.0.1:11434/v1"
         value["model"].update(
@@ -728,17 +859,14 @@ class TestExecutionRuntime(unittest.TestCase):
         first = runtime._call_batch([
             model_task("role-model-fallback-first", runtime.config["model"])
         ])
-        self.assertTrue(first["role-model-fallback-first"]["ok"])
-        first_result = json.loads(first["role-model-fallback-first"]["result"]["text"])
-        self.assertEqual(first_result["model"], "gemma-local")
-        self.assertEqual(first_result["max_input_tokens"], 1024)
-        self.assertEqual(first_result["max_output_tokens"], 256)
+        self.assertFalse(first["role-model-fallback-first"]["ok"])
+        self.assertEqual(first["role-model-fallback-first"]["status_code"], 429)
+        self.assertEqual(runtime.control._conn.execute(
+            "SELECT COUNT(*) FROM attempts").fetchone()[0], 1)
 
         later = model_task("role-model-fallback-later", runtime.config["model"])
         selected = runtime._provider_route(later)
-        self.assertEqual(selected["id"], "ollama-local-cooldown-recovery")
-        self.assertEqual(selected["_effective"]["max_input_tokens"], 1024)
-        self.assertEqual(selected["_effective"]["max_output_tokens"], 256)
+        self.assertIs(selected, _NO_PROVIDER_CAPACITY)
 
     def test_cooldown_fallback_cannot_reuse_resolved_or_role_route_quota_scope(self):
         endpoint = "http://127.0.0.1:11434/v1"

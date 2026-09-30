@@ -10,6 +10,8 @@ before the result can enter a research-paper pipeline.
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
+import math
 import re
 
 from scisaurus.core.errors import ValidationError
@@ -27,20 +29,114 @@ ANALYSIS_FIELDS = {
 ANALYSIS_KINDS = {"uncertainty", "effect_size", "sensitivity", "ablation", "raw_data"}
 
 
+class AnalysisContractError(ValidationError):
+    """A generated analysis summary violated its declared output schema."""
+
+
 def _text(value, name):
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(f"{name} must be a nonempty string")
     return value.strip()
 
 
-def _strings(value, name, *, allow_empty=False):
-    if not isinstance(value, list) or (not allow_empty and not value):
-        raise ValidationError(f"{name} must be a nonempty string list")
-    if any(not isinstance(item, str) or not item.strip() for item in value):
-        raise ValidationError(f"{name} must contain nonempty strings")
-    if len(value) != len(set(value)):
-        raise ValidationError(f"{name} must not contain duplicates")
-    return value
+def _analysis_strings(value, name):
+    """Canonicalize blank or repeated display entries as absent evidence."""
+    if not isinstance(value, list):
+        raise ValidationError(f"{name} must be a string list")
+    result = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValidationError(f"{name} must contain only strings")
+        item = item.strip()
+        if item and item not in result:
+            result.append(item)
+    return result
+
+
+def _validate_uncertainty_numbers(record):
+    """Validate optional machine-readable estimates carried with uncertainty evidence."""
+    for field in {"mean", "estimate", "lower", "upper"} & record.keys():
+        value = record[field]
+        if (type(value) not in (int, float)
+                or (type(value) is float and not math.isfinite(value))):
+            raise ValidationError(
+                f"analysis.uncertainty.{field} must be a finite number")
+    has_lower = "lower" in record
+    has_upper = "upper" in record
+    if has_lower != has_upper:
+        raise ValidationError(
+            "analysis.uncertainty interval requires both lower and upper")
+    if has_lower and not ({"mean", "estimate"} & record.keys()):
+        raise ValidationError(
+            "analysis.uncertainty interval requires a machine-readable mean or estimate")
+    if has_lower and record["lower"] > record["upper"]:
+        raise ValidationError(
+            "analysis.uncertainty lower bound must not exceed upper bound")
+
+
+def _analysis_evidence(value, name, *, records=True):
+    """Preserve concise evidence entries while enforcing a shared record shape."""
+    if not isinstance(value, list):
+        raise ValidationError(f"{name} must be a list")
+    result = []
+    seen = set()
+    identifiers = set()
+    for item in value:
+        if isinstance(item, str):
+            normalized = item.strip()
+            if not normalized:
+                continue
+            identity = canonical_bytes(normalized)
+        elif records and isinstance(item, dict):
+            if not {"id", "description"}.issubset(item):
+                raise ValidationError(
+                    f"{name} evidence records require id and description")
+            _identifier(item["id"], f"{name} evidence id")
+            _text(item["description"], f"{name} evidence description")
+            normalized = deepcopy(item)
+            if name == "analysis.uncertainty":
+                _validate_uncertainty_numbers(normalized)
+            identity = canonical_bytes(normalized)
+            if normalized["id"] in identifiers:
+                raise ValidationError(f"{name} evidence IDs must be unique")
+            identifiers.add(normalized["id"])
+        else:
+            expected = "strings or {id,description} records" if records else "strings"
+            raise ValidationError(f"{name} must contain only {expected}")
+        if identity not in seen:
+            result.append(normalized)
+            seen.add(identity)
+    return result
+
+
+def analysis_output_contract():
+    """Describe the exact authoring shapes enforced by :func:`validate_analysis`."""
+    return {
+        "conditions": "list of nonempty strings naming observed conditions",
+        "independent_seeds": "list of unique nonnegative integers actually executed",
+        "controls": "list of nonempty strings or {id,description} evidence records",
+        "comparisons": (
+            "list of nonempty strings or {id,description} evidence records; strings are "
+            "normalized to records and additional JSON evidence fields are preserved"
+        ),
+        "uncertainty": (
+            "list of nonempty strings or {id,description} records; additional JSON evidence fields are preserved. "
+            "For a numeric estimate or interval, include finite machine-readable mean or estimate, lower, and upper "
+            "values in the same evidence record; lower must not exceed upper"
+        ),
+        "effect_sizes": (
+            "list of nonempty strings or {id,description} records; additional JSON evidence fields are preserved"
+        ),
+        "sensitivity": (
+            "list of nonempty strings or {id,description} records; additional JSON evidence fields are preserved"
+        ),
+        "ablation": (
+            "list of nonempty strings or {id,description} records; additional JSON evidence fields are preserved"
+        ),
+        "raw_data": (
+            "list of nonempty strings or {id,description} records identifying emitted observations"
+        ),
+    }
 
 
 def _identifier(value, name):
@@ -153,37 +249,57 @@ def build_research_design(experiment):
 
 def validate_analysis(value):
     """Validate the program's reader-facing analysis summary."""
-    if not isinstance(value, dict) or set(value) != ANALYSIS_FIELDS:
-        raise ValidationError(f"analysis requires exactly {sorted(ANALYSIS_FIELDS)}")
-    _strings(value["conditions"], "analysis.conditions")
-    seeds = value["independent_seeds"]
-    if (not isinstance(seeds, list) or not seeds
-            or len(seeds) != len(set(seeds))
-            or any(type(seed) is not int or seed < 0 for seed in seeds)):
-        raise ValidationError("analysis.independent_seeds must be unique nonnegative integers")
-    _strings(value["controls"], "analysis.controls", allow_empty=True)
-    comparisons = value["comparisons"]
-    if not isinstance(comparisons, list):
-        raise ValidationError("analysis.comparisons must be a list")
-    comparison_ids = set()
-    for comparison in comparisons:
-        if not isinstance(comparison, dict) or set(comparison) != {"id", "description"}:
-            raise ValidationError("analysis comparison has an invalid shape")
-        _identifier(comparison["id"], "analysis comparison id")
-        _text(comparison["description"], "analysis comparison description")
-        if comparison["id"] in comparison_ids:
-            raise ValidationError("analysis comparison IDs must be unique")
-        comparison_ids.add(comparison["id"])
-    for key in ("uncertainty", "effect_sizes", "sensitivity", "ablation", "raw_data"):
-        _strings(value[key], f"analysis.{key}", allow_empty=True)
-    canonical_bytes(value)
-    return deepcopy(value)
+    if not isinstance(value, dict):
+        raise AnalysisContractError("analysis must be an object")
+    unexpected = set(value) - ANALYSIS_FIELDS
+    if unexpected:
+        raise AnalysisContractError(
+            f"analysis contains unknown fields: {sorted(unexpected)}")
+
+    try:
+        # This summary is evidence supplied by the author, not the experiment's
+        # execution contract. Missing entries therefore mean "not reported" and
+        # must become explicit empty values so quality admission can issue scoped
+        # research work orders instead of rejecting otherwise replayable output.
+        value = {field: deepcopy(value.get(field, [])) for field in ANALYSIS_FIELDS}
+        value["conditions"] = _analysis_strings(value["conditions"], "analysis.conditions")
+        for key in ("controls", "uncertainty", "effect_sizes", "sensitivity",
+                    "ablation", "raw_data"):
+            value[key] = _analysis_evidence(value[key], f"analysis.{key}")
+        seeds = value["independent_seeds"]
+        if (not isinstance(seeds, list)
+                or any(type(seed) is not int or seed < 0 for seed in seeds)):
+            raise ValidationError("analysis.independent_seeds must be nonnegative integers")
+        value["independent_seeds"] = list(dict.fromkeys(seeds))
+        comparisons = value["comparisons"]
+        if not isinstance(comparisons, list):
+            raise ValidationError("analysis.comparisons must be a list")
+        comparison_records = _analysis_evidence(
+            comparisons, "analysis.comparisons", records=True)
+        normalized_comparisons = []
+        comparison_ids = set()
+        for item in comparison_records:
+            if isinstance(item, str):
+                description = item.strip()
+                digest = hashlib.sha256(description.encode("utf-8")).hexdigest()[:16]
+                item = {"id": f"comparison-{digest}", "description": description}
+            if item["id"] in comparison_ids:
+                raise ValidationError("analysis.comparisons evidence IDs must be unique")
+            comparison_ids.add(item["id"])
+            normalized_comparisons.append(item)
+        value["comparisons"] = normalized_comparisons
+        canonical_bytes(value)
+        return deepcopy(value)
+    except AnalysisContractError:
+        raise
+    except ValidationError as exc:
+        raise AnalysisContractError(str(exc)) from exc
 
 
 def check_analysis_contract(analysis, contract, *, figure_count=0):
     """Return scientific-work deficits without turning them into prose claims."""
     validate_quality_contract(contract)
-    validate_analysis(analysis)
+    analysis = validate_analysis(analysis)
     deficits = []
     checks = (
         ("conditions", len(analysis["conditions"]), contract["minimum_conditions"]),

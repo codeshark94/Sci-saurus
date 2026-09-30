@@ -746,7 +746,7 @@ class PaperReleaseBuilder(ManuscriptRenderer):
                 raise ValidationError(
                     "research expansion is required before paper composition: "
                     + ", ".join(item["id"] for item in preflight["expansion_requests"]))
-        if results["schema_version"] == "results-package-2":
+        if results["schema_version"] in {"results-package-2", "results-package-3"}:
             provenance = results["provenance"]
             if provenance["literature_survey_ref"] is not None and (
                     provenance["literature_survey_ref"] != survey["survey_ref"]
@@ -916,17 +916,22 @@ class PaperReleaseBuilder(ManuscriptRenderer):
                 continue
             identity = survey["identities"].get(reference.get("identity_ref"))
             source = survey["sources"][reference["source_ref"]]
-            if (identity is None or identity.get("status") != "verified"
+            if (identity is None
+                    or identity.get("status") not in {"verified", "verified_with_gaps"}
                     or normalize_doi(reference["doi"]) != normalize_doi(identity.get("doi"))
                     or identity.get("work_id") != source.get("work_id")):
                 raise ValidationError("DOI references require a verified survey bibliographic identity")
+            doi_check = next((check for check in identity.get("checks", [])
+                              if check.get("field") == "doi"), None)
             title = next((check for check in identity.get("checks", []) if check.get("field") == "title"), None)
             year = next((check for check in identity.get("checks", []) if check.get("field") == "year"), None)
-            if (title is None or title.get("outcome") != "match"
+            if (doi_check is None or doi_check.get("outcome") != "match"
+                    or title is None or title.get("outcome") != "match"
                     or normalize_title(reference["title"]) != normalize_title(title.get("openalex"))
-                    or year is None or year.get("outcome") != "match"
+                    or year is None or year.get("outcome") not in {
+                        "match", "compatible_variance", "unavailable"}
                     or str(year.get("openalex")) != reference["year"]):
-                raise ValidationError("reference fields must match the verified bibliographic identity")
+                raise ValidationError("reference fields must match the reconciled bibliographic identity")
         result = {"schema_version": "paper-claim-index-2", "claims": self.config["claims"],
                   "evidence": self.config["evidence"], "references": self.config["references"]}
         if self.config["schema_version"] == "paper-release-score-2":

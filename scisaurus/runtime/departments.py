@@ -21,7 +21,11 @@ from scisaurus.core.schema import canonical_bytes, now_iso
 
 
 LEGACY_SCHEMA_VERSION = "project-organization-1"
-SCHEMA_VERSION = "project-organization-2"
+V2_SCHEMA_VERSION = "project-organization-2"
+PREVIOUS_SCHEMA_VERSION = "project-organization-3"
+PRIOR_SCHEMA_VERSION = "project-organization-4"
+V5_SCHEMA_VERSION = "project-organization-5"
+SCHEMA_VERSION = "project-organization-6"
 LEGACY_CHARTER_SCHEMA_VERSION = "department-charter-1"
 CHARTER_SCHEMA_VERSION = "department-charter-2"
 WORK_ORDER_SCHEMA_VERSION = "department-work-order-1"
@@ -31,11 +35,29 @@ ROLE_APPOINTMENTS = frozenset({"specialist", "reviewer", "verifier"})
 ROLE_EXECUTION_KINDS = frozenset({"model", "review", "deterministic", "service"})
 ROLE_ACTIVATIONS = frozenset({"on_demand"})
 ROLE_QUOTA_FIELDS = frozenset({
+    "max_calls", "max_input_tokens", "max_output_tokens",
+    "max_output_tokens_per_call", "max_seconds",
+})
+LEGACY_ROLE_QUOTA_FIELDS = frozenset({
     "max_calls", "max_input_tokens", "max_output_tokens", "max_seconds",
 })
 # Per-call allowance leaves 16 Ki tokens inside a 256 Ki context window; the
 # selected provider route remains the hard ceiling and no prompt is padded.
 ROLE_INPUT_CONTEXT_ALLOWANCE = 245760
+# A final length continuation may need one request beyond the legacy call cap.
+# Keep the cumulative output-token allowance unchanged: the extra request is
+# usable only when a bounded response was truncated and output budget remains.
+ROLE_MAX_CALLS = 4
+ROLE_OUTPUT_TOKENS_PER_CALL = 8192
+ROLE_OUTPUT_TOKEN_ALLOWANCE = 3 * ROLE_OUTPUT_TOKENS_PER_CALL
+_V2_DEFAULT_ROLE_QUOTAS = (
+    {"max_calls": 2, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
+     "max_output_tokens": 4000, "max_seconds": 900},
+    {"max_calls": 1, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
+     "max_output_tokens": 6000, "max_seconds": 900},
+    {"max_calls": 2, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
+     "max_output_tokens": 6000, "max_seconds": 900},
+)
 ROLE_FIELDS = frozenset({
     "id", "label", "appointment", "execution_kind", "model_role", "system_contract",
     "input_projection", "stage_kinds", "proposal_kinds", "capability_scope",
@@ -85,7 +107,7 @@ DEFAULT_STAGE_ROUTES = (
     },
     {
         "stage_kind": "survey", "department": "research", "functional_role": "intelligence",
-        "required_role_ids": ["search-strategist", "academic-scout", "source-acquirer", "citation-mapper", "cataloger", "fact-verifier"],
+        "required_role_ids": ["search-strategist", "academic-scout", "technical-ecosystem-scout", "citation-mapper", "cataloger", "fact-verifier"],
         "verifier_role_id": "adversary", "max_active_agents": 6,
     },
     {
@@ -161,11 +183,62 @@ def _validate_role_quota(value, name="role quota"):
     _exact(value, ROLE_QUOTA_FIELDS, name)
     if type(value["max_calls"]) is not int or not 1 <= value["max_calls"] <= 16:
         raise ValidationError(f"{name} max_calls must be between one and sixteen")
-    for field in ("max_input_tokens", "max_output_tokens"):
+    for field in ("max_input_tokens", "max_output_tokens", "max_output_tokens_per_call"):
         if type(value[field]) is not int or value[field] < 1:
             raise ValidationError(f"{name} {field} must be a positive integer")
+    if value["max_output_tokens_per_call"] > value["max_output_tokens"]:
+        raise ValidationError(f"{name} per-call output limit cannot exceed its total output budget")
     _positive_number(value["max_seconds"], f"{name} max_seconds")
     return deepcopy(value)
+
+
+def _default_role_quota(*, max_seconds=900):
+    return {
+        "max_calls": ROLE_MAX_CALLS,
+        "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
+        "max_output_tokens": ROLE_OUTPUT_TOKEN_ALLOWANCE,
+        "max_output_tokens_per_call": ROLE_OUTPUT_TOKENS_PER_CALL,
+        "max_seconds": max_seconds,
+    }
+
+
+def _upgrade_role_quota(value, schema_version):
+    """Give legacy role output limits explicit per-call and cumulative meaning."""
+    if set(value) == ROLE_QUOTA_FIELDS:
+        v4_default = {
+            "max_calls": 2,
+            "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
+            "max_output_tokens": 2 * ROLE_OUTPUT_TOKENS_PER_CALL,
+            "max_output_tokens_per_call": ROLE_OUTPUT_TOKENS_PER_CALL,
+            "max_seconds": 900,
+        }
+        if schema_version == PRIOR_SCHEMA_VERSION and value == v4_default:
+            value = {
+                **value,
+                "max_calls": ROLE_MAX_CALLS,
+                "max_output_tokens": ROLE_OUTPUT_TOKEN_ALLOWANCE,
+            }
+        v5_default = {
+            "max_calls": 3,
+            "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
+            "max_output_tokens": ROLE_OUTPUT_TOKEN_ALLOWANCE,
+            "max_output_tokens_per_call": ROLE_OUTPUT_TOKENS_PER_CALL,
+            "max_seconds": 900,
+        }
+        if schema_version == V5_SCHEMA_VERSION and value == v5_default:
+            value = {**value, "max_calls": ROLE_MAX_CALLS}
+        return _validate_role_quota(value)
+    _exact(value, LEGACY_ROLE_QUOTA_FIELDS, "agent role quota")
+    quota = deepcopy(value)
+    if schema_version in {LEGACY_SCHEMA_VERSION, V2_SCHEMA_VERSION}:
+        if quota in _V2_DEFAULT_ROLE_QUOTAS:
+            return _default_role_quota(max_seconds=quota["max_seconds"])
+        per_call = quota["max_output_tokens"]
+        quota["max_output_tokens"] *= quota["max_calls"]
+    else:
+        per_call = min(ROLE_OUTPUT_TOKENS_PER_CALL, quota["max_output_tokens"])
+    quota["max_output_tokens_per_call"] = per_call
+    return _validate_role_quota(quota)
 
 
 def _role(
@@ -187,13 +260,7 @@ def _role(
         "reviewer_role_id": reviewer_role_id,
         "independent_review": True,
         "activation": "on_demand",
-        "quota": quota or {
-            # One ordinary response plus one bounded JSON-only repair when a
-            # provider truncates or malforms the response. Normal work still
-            # consumes one call; the second slot is not a standing worker.
-            "max_calls": 2, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
-            "max_output_tokens": 4000, "max_seconds": 900,
-        },
+        "quota": quota or _default_role_quota(),
         "internal_role_aliases": list(aliases),
     }
 
@@ -455,8 +522,7 @@ def agent_roster(charters):
             "reviewer_role_id": "adversary",
             "reviewer_agent": reviewer_agent,
             "activation": "on_demand",
-            "quota": {"max_calls": 1, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
-                      "max_output_tokens": 6000, "max_seconds": 900},
+            "quota": _default_role_quota(),
             "internal_role_aliases": [],
             "stage_kinds": list(charter["stage_kinds"]),
             "proposal_kinds": list(charter["proposal_kinds"]),
@@ -479,8 +545,7 @@ def agent_roster(charters):
             "activation": "on_demand",
             # Reserve one bounded repair/fallback call for malformed model
             # output; a verifier still has only one accepted verdict.
-            "quota": {"max_calls": 2, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
-                      "max_output_tokens": 6000, "max_seconds": 900},
+            "quota": _default_role_quota(),
             "internal_role_aliases": [],
             "stage_kinds": list(charter["stage_kinds"]),
             "proposal_kinds": list(charter["proposal_kinds"]),
@@ -586,7 +651,7 @@ def default_organization():
     }
 
 
-def validate_charter(value):
+def validate_charter(value, *, legacy_quota_schema=None):
     base_fields = {
         "id", "label", "chief", "adversary", "subscriptions", "proposal_kinds",
         "stage_kinds", "capability_scope",
@@ -656,14 +721,11 @@ def validate_charter(value):
             raise ValidationError("reviewer and verifier roles require independent_review")
         if role["activation"] not in ROLE_ACTIVATIONS:
             raise ValidationError("agent role activation is unsupported")
-        quota = role["quota"]
-        _exact(quota, ROLE_QUOTA_FIELDS, "agent role quota")
-        if type(quota["max_calls"]) is not int or not 1 <= quota["max_calls"] <= 16:
-            raise ValidationError("agent role quota max_calls must be between one and sixteen")
-        for field in ("max_input_tokens", "max_output_tokens"):
-            if type(quota[field]) is not int or quota[field] < 1:
-                raise ValidationError(f"agent role quota {field} must be a positive integer")
-        _positive_number(quota["max_seconds"], f"agent role quota max_seconds")
+        role["quota"] = (
+            _upgrade_role_quota(role["quota"], legacy_quota_schema)
+            if legacy_quota_schema is not None
+            else _validate_role_quota(role["quota"], "agent role quota")
+        )
         _strings(role["internal_role_aliases"], "agent role internal_role_aliases", empty=True)
         for alias in role["internal_role_aliases"]:
             if alias in aliases:
@@ -680,14 +742,23 @@ def validate_charter(value):
 def validate_organization(value):
     fields = {"schema_version", "template", "departments", "allow_dynamic_proposals", "max_open_work_orders"}
     _exact(value, fields, "project organization")
-    if value["schema_version"] not in {LEGACY_SCHEMA_VERSION, SCHEMA_VERSION}:
+    if value["schema_version"] not in {
+            LEGACY_SCHEMA_VERSION, V2_SCHEMA_VERSION,
+            PREVIOUS_SCHEMA_VERSION, PRIOR_SCHEMA_VERSION,
+            V5_SCHEMA_VERSION, SCHEMA_VERSION}:
         raise ValidationError(
-            f"project organization schema must be {LEGACY_SCHEMA_VERSION} or {SCHEMA_VERSION}")
+            "project organization schema must be "
+            f"{LEGACY_SCHEMA_VERSION}, {V2_SCHEMA_VERSION}, "
+            f"{PREVIOUS_SCHEMA_VERSION}, {PRIOR_SCHEMA_VERSION}, "
+            f"{V5_SCHEMA_VERSION}, or {SCHEMA_VERSION}")
     _text(value["template"], "organization template")
     departments = value["departments"]
     if not isinstance(departments, list) or not departments:
         raise ValidationError("project organization requires at least one department")
-    validated = [validate_charter(item) for item in departments]
+    quota_schema = (value["schema_version"]
+                    if value["schema_version"] != SCHEMA_VERSION else None)
+    validated = [validate_charter(item, legacy_quota_schema=quota_schema)
+                 for item in departments]
     ids = [item["id"] for item in validated]
     if len(ids) != len(set(ids)):
         raise ValidationError("project department IDs must be unique")
@@ -722,7 +793,9 @@ def validate_organization(value):
     return {
         **deepcopy(value),
         "schema_version": SCHEMA_VERSION,
-        "template": value["template"] if value["schema_version"] == SCHEMA_VERSION else "research-project-v2",
+        "template": (value["template"]
+                     if value["schema_version"] != LEGACY_SCHEMA_VERSION
+                     else "research-project-v2"),
         "departments": validated,
     }
 
@@ -847,8 +920,7 @@ class DepartmentRuntime:
                 "input_projection": ["objective", "stage_packet", "assignment_results", "review_verdict"],
                 "independent_review": False, "reviewer_role_id": "adversary",
                 "reviewer_agent": f"{department}.{charter['adversary']}",
-                "quota": {"max_calls": 1, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
-                          "max_output_tokens": 6000, "max_seconds": 900},
+                "quota": _default_role_quota(),
                 "activation": "on_demand", "internal_role_aliases": [],
             }
         if requested in {"adversary", charter["adversary"]}:
@@ -863,8 +935,7 @@ class DepartmentRuntime:
                 "reviewer_agent": None,
                 # Reserve one bounded repair/fallback call for malformed model
                 # output; a verifier still has only one accepted verdict.
-                "quota": {"max_calls": 2, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
-                          "max_output_tokens": 6000, "max_seconds": 900},
+                "quota": _default_role_quota(),
                 "activation": "on_demand", "internal_role_aliases": [],
             }
         # A department-only request is chief-owned.  Functional stage roles
@@ -974,7 +1045,7 @@ class DepartmentRuntime:
         stable = {key: body[key] for key in (
             "schema_version", "id", "kind", "owner", "objective", "why",
             "success_condition", "evidence_needed", "target_stage_id",
-            "target_stage_kind", "repair_priority") if key in body}
+            "target_stage_kind", "repair_priority", "recovery_generation") if key in body}
         digest = hashlib.sha256(canonical_bytes(stable)).hexdigest()[:20]
         return f"department-{department}-{order_id}-{digest}"
 
@@ -1010,7 +1081,8 @@ class DepartmentRuntime:
         # ledger keeps the dashboard and resume path aligned with the exact
         # stage the work order will execute.
         if isinstance(controller_metadata, dict):
-            for key in ("target_stage_id", "target_stage_kind", "repair_priority"):
+            for key in ("target_stage_id", "target_stage_kind", "repair_priority",
+                        "recovery_generation"):
                 if key in controller_metadata:
                     body[key] = deepcopy(controller_metadata[key])
         previous_body = {}
@@ -1023,7 +1095,7 @@ class DepartmentRuntime:
             substantive = (
                 "schema_version", "id", "kind", "owner", "objective", "why",
                 "success_condition", "evidence_needed", "target_stage_id",
-                "target_stage_kind", "repair_priority",
+                "target_stage_kind", "repair_priority", "recovery_generation",
             )
             same_generation = all(previous_body.get(key) == body.get(key) for key in substantive)
             if same_generation:
@@ -1227,6 +1299,20 @@ class DepartmentRuntime:
                 controller_metadata=request,
             )
             task = self.tasks.get(result["task_id"])
+            if task["state"] == "completed":
+                # Older Composer versions closed a scoped repair merely
+                # because its stage returned a provisional candidate. The
+                # restored checkpoint still carries that active request, so
+                # give the explicitly re-admitted repair a new task generation
+                # while preserving the terminal task and its history.
+                generation = request.get("recovery_generation", 0)
+                generation = generation + 1 if type(generation) is int else 1
+                request["recovery_generation"] = generation
+                result = self.propose(
+                    proposal, source_stage_id=request.get("source_stage_id"),
+                    controller_metadata=request,
+                )
+                task = self.tasks.get(result["task_id"])
             if task["state"] in {"blocked", "paused"}:
                 task = self.tasks.transition(
                     result["task_id"], "queued", actor,
@@ -1288,7 +1374,7 @@ class DepartmentRuntime:
             )
             task_id = result["task_id"]
             task = self.tasks.get(task_id)
-            if outcome in {"completed", "accepted", "candidate_needs_review"}:
+            if outcome in {"completed", "accepted"}:
                 if task["state"] in {"blocked", "paused"}:
                     task = self.tasks.transition(task_id, "queued", actor, reason="owning stage recovered work order")
                 if task["state"] == "queued":
@@ -1297,7 +1383,18 @@ class DepartmentRuntime:
                     task = self.tasks.transition(task_id, "awaiting_review", actor, reason="owning stage returned")
                 if task["state"] == "awaiting_review":
                     task = self.tasks.transition(task_id, "completed", actor, reason="owning stage accepted result")
-            elif outcome == "blocked" and task["state"] in {"queued", "running"}:
+            elif outcome == "candidate_needs_review":
+                if task["state"] in {"blocked", "paused", "awaiting_review"}:
+                    task = self.tasks.transition(
+                        task_id, "queued", actor,
+                        reason="provisional candidate leaves the scoped repair unresolved",
+                    )
+                if task["state"] == "queued":
+                    task = self.tasks.transition(
+                        task_id, "running", actor,
+                        reason="continue the scoped repair after provisional review",
+                    )
+            elif outcome == "blocked" and task["state"] in {"queued", "running", "awaiting_review"}:
                 task = self.tasks.transition(task_id, "blocked", actor, reason="owning stage blocked")
             self._set_work_order_state(result, task["state"], actor=actor)
             resolved.append({"task_id": task_id, "state": task["state"], "request_id": request.get("id")})
@@ -1422,6 +1519,14 @@ class DepartmentRuntime:
             result.append(item)
         return result
 
+    def stage_assignment_states(self, stage_id, attempt_number=None):
+        """Return bounded execution states for one stage or one stage attempt."""
+        return [{key: item.get(key) for key in (
+            "assignment_id", "task_id", "stage_id", "attempt_number", "role_id",
+            "assigned_role", "assignment_phase", "task_state", "attempt_id", "attempt_state",
+        )} for item in self._assignment_task_rows(
+            stage_id=stage_id, attempt_number=attempt_number)]
+
     def _durable_execution_report(self, payload):
         """Return a result only when its immutable execution artifact matches its assignment."""
         logical = payload.get("assignment_logical_id")
@@ -1437,6 +1542,10 @@ class DepartmentRuntime:
         if not isinstance(body, dict) or body.get("schema_version") not in {
                 "specialist-execution-1", "specialist-verifier-execution-1"}:
             return None
+        if body.get("schema_version") == "specialist-verifier-execution-1":
+            input_digest = body.get("input_digest")
+            if not isinstance(input_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", input_digest):
+                return None
         identity = ("stage_id", "stage_kind", "attempt_number", "assignment_id", "task_id",
                     "role_id", "assigned_role")
         if any(body.get(key) != payload.get(key) for key in identity):
@@ -1479,6 +1588,29 @@ class DepartmentRuntime:
                 "report": deepcopy(report),
             }
         return None
+
+    def find_durable_verifier_report(self, stage_id, attempt_number, *, input_digest):
+        """Return a verifier response only for its exact reviewed input."""
+        if not isinstance(input_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", input_digest):
+            return None
+        row = next((item for item in self._assignment_task_rows(
+            stage_id=stage_id, attempt_number=attempt_number)
+            if item.get("assignment_phase") == "verifier"), None)
+        if row is None:
+            return None
+        durable = self._durable_execution_report(row)
+        if not isinstance(durable, dict) or durable.get("input_digest") != input_digest:
+            return None
+        report = durable.get("report")
+        if not isinstance(report, dict) or report.get("status") not in {"succeeded", "failed"}:
+            return None
+        return {
+            "report": deepcopy(report),
+            "artifact_ref": durable["artifact_ref"],
+            "attempt_number": attempt_number,
+            "attempt_id": row.get("attempt_id"),
+            "task_id": row["task_id"],
+        }
 
     def _assignment_projection(self):
         rows = self._assignment_task_rows()
@@ -1700,6 +1832,7 @@ class DepartmentRuntime:
             raise ValidationError("specialist attempt_number must be a positive integer")
         _positive_number(deadline_seconds, "specialist stage deadline_seconds")
         route = self.stage_route(stage_kind)
+        specialist_roles = {role["id"]: role for role in route["required_roles"]}
         required_ids = list(route["required_role_ids"])
         selected_ids = list(active_role_ids) if active_role_ids is not None else required_ids
         if any(not isinstance(role_id, str) or not _ID.fullmatch(role_id)
@@ -1709,6 +1842,15 @@ class DepartmentRuntime:
             raise ValidationError("specialist active_role_ids must be unique")
         if set(selected_ids) - set(required_ids):
             raise ValidationError("specialist active_role_ids must be a subset of required stage roles")
+        unbound_services = sorted(
+            role_id for role_id in selected_ids
+            if specialist_roles[role_id].get("execution_kind") == "service"
+        )
+        if unbound_services:
+            raise ValidationError(
+                "specialist service roles cannot be activated without a registered executor: "
+                + ", ".join(unbound_services)
+            )
         if len(selected_ids) > route["max_active_agents"]:
             raise QuotaExceededError(
                 f"specialist stage pool exceeds max_active_agents={route['max_active_agents']}",
@@ -1730,7 +1872,6 @@ class DepartmentRuntime:
         input_projection_ref = self._bounded_input_ref(input_ref, stage_id)
         deadline_at_epoch = time.time() + float(deadline_seconds)
         assignment_rows = []
-        specialist_roles = {role["id"]: role for role in route["required_roles"]}
         resolved_quotas = {}
         for role_id in selected_ids:
             role = specialist_roles[role_id]
@@ -1749,6 +1890,7 @@ class DepartmentRuntime:
             attempt_id = self._assignment_attempt_id(assignment_id)
             task_payload = {
                 "assignment_id": assignment_id, "assignment_logical_id": logical,
+                "task_id": task_id,
                 "stage_id": stage_id, "stage_kind": stage_kind,
                 "attempt_number": attempt_number, "department": route["department"],
                 "role_id": role_id, "agent": role_id,
@@ -1789,6 +1931,20 @@ class DepartmentRuntime:
                 task = self.tasks.get(task_id)
             elif prior_attempt is not None and prior_attempt["state"] == "started":
                 task = self.tasks.get(task_id)
+            elif (prior_attempt is not None and prior_attempt["state"] == "succeeded"
+                  and task["state"] == "blocked"):
+                if self._durable_execution_report(task_payload) is None:
+                    raise StateError(
+                        f"successful specialist assignment has no durable result: {assignment_id}"
+                    )
+                self.tasks.transition(
+                    task_id, "queued", actor,
+                    reason="re-admit the durable specialist result after stage interruption",
+                )
+                task = self.tasks.transition(
+                    task_id, "running", actor,
+                    reason="replay the retained specialist result into stage synthesis",
+                )
             artifact_body = {
                 "schema_version": "department-assignment-1", "project_id": self.project_id,
                 **task_payload, "task_id": task_id, "task_state": task["state"],
@@ -1812,6 +1968,7 @@ class DepartmentRuntime:
         verifier_attempt_id = self._assignment_attempt_id(verifier_id)
         verifier_payload = {
             "assignment_id": verifier_id, "assignment_logical_id": verifier_logical,
+            "task_id": verifier_task_id,
             "stage_id": stage_id, "stage_kind": stage_kind,
             "attempt_number": attempt_number, "department": route["department"],
             "role_id": verifier_role, "agent": verifier_role,
@@ -1822,8 +1979,8 @@ class DepartmentRuntime:
             "input_ref": input_projection_ref,
             # Reserve one bounded repair/fallback call for malformed model
             # output; a verifier still has only one accepted verdict.
-            "quota": {"max_calls": 2, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
-                      "max_output_tokens": 6000, "max_seconds": min(900, float(deadline_seconds))},
+            "quota": _default_role_quota(
+                max_seconds=min(900, float(deadline_seconds))),
             "reserved_seconds": min(900.0, float(deadline_seconds)),
             "deadline_seconds": float(deadline_seconds), "deadline_at_epoch": deadline_at_epoch,
             "verifier_agent": route["verifier_agent"], "reviewer_agent": None,
@@ -1836,6 +1993,24 @@ class DepartmentRuntime:
             verifier_task = self.tasks.create(verifier_task_id, "verification", verifier_payload,
                                               route["verifier_agent"])
             verifier_task = self.tasks.admit(verifier_task_id, actor)
+        try:
+            verifier_attempt = self.tasks.get_attempt(verifier_attempt_id)
+        except NotFoundError:
+            verifier_attempt = None
+        if (verifier_attempt is not None and verifier_attempt.get("state") == "succeeded"
+                and verifier_task["state"] == "blocked"):
+            if self._durable_execution_report(verifier_payload) is None:
+                raise StateError(
+                    f"successful verifier assignment has no durable result: {verifier_id}"
+                )
+            verifier_task = self.tasks.transition(
+                verifier_task_id, "queued", actor,
+                reason="re-admit the durable verifier result after stage interruption",
+            )
+            verifier_task = self.tasks.transition(
+                verifier_task_id, "running", actor,
+                reason="replay the retained verifier result into stage synthesis",
+            )
         verifier_artifact = self._publish_idempotent(
             verifier_logical, "decision_note",
             {"schema_version": "department-assignment-1", "project_id": self.project_id,
@@ -1846,7 +2021,8 @@ class DepartmentRuntime:
         )
         verifier_payload["artifact_ref"] = verifier_artifact["artifact_ref"]
         assignment_rows.append({**verifier_payload, "task_id": verifier_task_id,
-                                "task_state": verifier_task["state"], "attempt_state": None,
+                                "task_state": verifier_task["state"],
+                                "attempt_state": (verifier_attempt or {}).get("state"),
                                 "artifact_ref": verifier_artifact["artifact_ref"]})
         plan = {
             "schema_version": "department-stage-assignment-1", "project_id": self.project_id,
@@ -1887,6 +2063,85 @@ class DepartmentRuntime:
             "task_ids": [item["task_id"] for item in assignment_rows],
             "role_quotas": deepcopy(plan["role_quotas"]),
             "plan_ref": plan_artifact["artifact_ref"], "deadline_seconds": float(deadline_seconds),
+        }
+
+    def start_verifier_attempt(self, assignment, *, actor="command.composer"):
+        """Persist a verifier attempt immediately before its provider dispatch."""
+        if (not isinstance(assignment, dict)
+                or assignment.get("assignment_phase") != "verifier"):
+            raise ValidationError("verifier dispatch requires a verifier assignment")
+        task_id = assignment.get("task_id")
+        attempt_id = assignment.get("attempt_id")
+        if not isinstance(task_id, str) or not isinstance(attempt_id, str):
+            raise ValidationError("verifier assignment is missing its task or attempt identity")
+        try:
+            prior_attempt = self.tasks.get_attempt(attempt_id)
+        except NotFoundError:
+            prior_attempt = None
+        if prior_attempt is not None:
+            if prior_attempt.get("state") == "started":
+                return prior_attempt
+            raise StateError(
+                f"verifier assignment already has a settled attempt: {prior_attempt.get('state')}"
+            )
+        task = self.tasks.get(task_id)
+        if task["state"] == "blocked":
+            task = self.tasks.transition(
+                task_id, "queued", actor,
+                reason="re-admit a verifier that was fenced before dispatch",
+            )
+        if task["state"] != "queued":
+            raise StateError(f"verifier task is not dispatchable: {task['state']}")
+        quota = assignment.get("quota")
+        if not isinstance(quota, dict):
+            raise ValidationError("verifier assignment is missing its call quota")
+        deadline = assignment.get("deadline_seconds")
+        ttl = min(float(deadline), float(quota.get("max_seconds", deadline)))
+        self.tasks.start_attempt(
+            task_id, attempt_id, owner=assignment.get("assigned_role") or "command.composer",
+            lease_ttl_seconds=max(1.0, ttl), reserved=quota, payload=assignment,
+        )
+        return self.tasks.get_attempt(attempt_id)
+
+    def reconcile_dispatched_verifier_unknown(
+            self, stage_id, stage_kind, attempt_number, *, dispatch_event,
+            actor="command.composer"):
+        """Account for a legacy verifier dispatch event with no attempt row."""
+        if (not isinstance(dispatch_event, dict)
+                or dispatch_event.get("event") != "dispatched"
+                or dispatch_event.get("stage_id") != stage_id):
+            raise ValidationError("unknown verifier reconciliation requires dispatch evidence")
+        row = next((item for item in self._assignment_task_rows(
+            stage_id=stage_id, attempt_number=attempt_number)
+            if item.get("assignment_phase") == "verifier"), None)
+        if row is None:
+            return None
+        if (dispatch_event.get("task_id") != row.get("task_id")
+                or dispatch_event.get("role_id") != row.get("role_id")):
+            raise ValidationError(
+                "verifier dispatch evidence does not match the persisted assignment")
+        if row.get("attempt_state") is not None or row.get("task_state") != "queued":
+            return None
+        self.start_verifier_attempt(row, actor=actor)
+        result = self.tasks.reconcile_unknown(row["attempt_id"], actor)
+        logical = row.get("assignment_logical_id")
+        head = self.store.head(logical) if isinstance(logical, str) else None
+        if head is not None:
+            body = json.loads(self.store.read_body(head["body_hash"]))
+            body.update({
+                "task_state": "blocked", "attempt_state": "result_unknown",
+                "outcome": "result_unknown",
+                "accounting": "legacy_verifier_dispatch_interrupted",
+                "updated_at": now_iso(),
+            })
+            self._publish_idempotent(
+                logical, "decision_note", body, author=row["assigned_role"],
+                subjects=[head["artifact_ref"]],
+            )
+        self._refresh_organization_manifest()
+        return {
+            "assignment_id": row["assignment_id"], "task_id": row["task_id"],
+            "attempt_id": row["attempt_id"], "state": result["state"],
         }
 
     def finish_stage(self, stage_id, stage_kind, *, attempt_number=1, outcome,
@@ -2209,7 +2464,9 @@ class DepartmentRuntime:
 
 
 __all__ = [
-    "LEGACY_SCHEMA_VERSION", "SCHEMA_VERSION", "LEGACY_CHARTER_SCHEMA_VERSION",
+    "LEGACY_SCHEMA_VERSION", "V2_SCHEMA_VERSION", "PREVIOUS_SCHEMA_VERSION",
+    "PRIOR_SCHEMA_VERSION", "V5_SCHEMA_VERSION", "SCHEMA_VERSION",
+    "LEGACY_CHARTER_SCHEMA_VERSION",
     "CHARTER_SCHEMA_VERSION", "WORK_ORDER_SCHEMA_VERSION", "PROPOSAL_KINDS",
     "DEFAULT_DEPARTMENTS", "DEFAULT_AGENT_ROLES", "DEFAULT_STAGE_ROUTES", "COMMAND_ADDRESSES",
     "default_organization", "default_stage_routes", "stage_role", "stage_route", "agent_roster",

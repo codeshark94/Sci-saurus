@@ -10,8 +10,11 @@ from scisaurus.core.store import ArtifactStore
 from scisaurus.core.tasks import TaskManager
 from scisaurus.core.errors import QuotaExceededError, ValidationError
 from scisaurus.runtime.departments import (
-    LEGACY_SCHEMA_VERSION, DepartmentRuntime, default_organization, stage_role,
-    validate_charter, validate_organization,
+    LEGACY_SCHEMA_VERSION, PREVIOUS_SCHEMA_VERSION, PRIOR_SCHEMA_VERSION,
+    V2_SCHEMA_VERSION, V5_SCHEMA_VERSION,
+    ROLE_MAX_CALLS, ROLE_OUTPUT_TOKENS_PER_CALL, ROLE_OUTPUT_TOKEN_ALLOWANCE,
+    DepartmentRuntime, default_organization,
+    stage_role, validate_charter, validate_organization,
 )
 
 
@@ -42,7 +45,7 @@ class DepartmentRuntimeTests(unittest.TestCase):
         manifest = json.loads(self.store.read_body(
             self.store.head("command/organization")["body_hash"]))
         self.assertGreater(len(manifest["agents"]), 30)
-        self.assertEqual(manifest["schema_version"], "project-organization-2")
+        self.assertEqual(manifest["schema_version"], "project-organization-6")
         self.assertTrue(any(item["id"] == "research.source-acquirer" for item in manifest["agents"]))
         self.assertEqual(manifest["active_assignments"], [])
         self.assertEqual(
@@ -76,11 +79,133 @@ class DepartmentRuntimeTests(unittest.TestCase):
         legacy["departments"][0]["chief"] = "research-lead"
         legacy["departments"][0]["adversary"] = "research-red-team"
         migrated = validate_organization(legacy)
-        self.assertEqual(migrated["schema_version"], "project-organization-2")
+        self.assertEqual(migrated["schema_version"], "project-organization-6")
         research = next(item for item in migrated["departments"] if item["id"] == "research")
         self.assertEqual(research["chief"], "research-lead")
         self.assertEqual(research["adversary"], "research-red-team")
         self.assertTrue(any(item["id"] == "source-acquirer" for item in research["agent_roles"]))
+
+    def test_v2_organization_migrates_default_output_budgets_and_preserves_custom_ones(self):
+        legacy = default_organization()
+        legacy["schema_version"] = V2_SCHEMA_VERSION
+        old_default = {
+            "max_calls": 2, "max_input_tokens": 245760,
+            "max_output_tokens": 4000, "max_seconds": 900,
+        }
+        for charter in legacy["departments"]:
+            for role in charter["agent_roles"]:
+                role["quota"] = dict(old_default)
+        research = next(item for item in legacy["departments"] if item["id"] == "research")
+        custom = next(item for item in research["agent_roles"] if item["id"] == "cataloger")
+        custom_quota = {
+            "max_calls": 1, "max_input_tokens": 32000,
+            "max_output_tokens": 1800, "max_seconds": 120,
+        }
+        custom["quota"] = dict(custom_quota)
+
+        migrated = validate_organization(legacy)
+
+        self.assertEqual(migrated["schema_version"], "project-organization-6")
+        migrated_research = next(
+            item for item in migrated["departments"] if item["id"] == "research")
+        migrated_cataloger = next(
+            item for item in migrated_research["agent_roles"] if item["id"] == "cataloger")
+        migrated_scout = next(
+            item for item in migrated_research["agent_roles"] if item["id"] == "search-strategist")
+        self.assertEqual(migrated_cataloger["quota"], {
+            **custom_quota, "max_output_tokens": 1800,
+            "max_output_tokens_per_call": 1800,
+        })
+        self.assertEqual(migrated_scout["quota"]["max_calls"], ROLE_MAX_CALLS)
+        self.assertEqual(
+            migrated_scout["quota"]["max_output_tokens"], ROLE_OUTPUT_TOKEN_ALLOWANCE)
+        self.assertEqual(migrated_scout["quota"]["max_output_tokens_per_call"],
+                         ROLE_OUTPUT_TOKENS_PER_CALL)
+
+    def test_v3_organization_splits_cumulative_and_per_request_output_limits(self):
+        legacy = default_organization()
+        legacy["schema_version"] = PREVIOUS_SCHEMA_VERSION
+        old_quota = {
+            "max_calls": 3, "max_input_tokens": 245760,
+            "max_output_tokens": 24576, "max_seconds": 900,
+        }
+        for charter in legacy["departments"]:
+            for role in charter["agent_roles"]:
+                role["quota"] = dict(old_quota)
+
+        migrated = validate_organization(legacy)
+        self.assertEqual(migrated["schema_version"], "project-organization-6")
+        role = next(item for item in migrated["departments"]
+                    if item["id"] == "methods")["agent_roles"][0]
+        self.assertEqual(role["quota"]["max_output_tokens"], 24576)
+        self.assertEqual(role["quota"]["max_output_tokens_per_call"], 8192)
+
+    def test_v4_default_review_quota_migrates_for_length_continuation(self):
+        legacy = default_organization()
+        legacy["schema_version"] = PRIOR_SCHEMA_VERSION
+        old_default = {
+            "max_calls": 2, "max_input_tokens": 245760,
+            "max_output_tokens": 16384, "max_output_tokens_per_call": 8192,
+            "max_seconds": 900,
+        }
+        for charter in legacy["departments"]:
+            for role in charter["agent_roles"]:
+                role["quota"] = dict(old_default)
+        research = next(item for item in legacy["departments"] if item["id"] == "research")
+        custom = next(item for item in research["agent_roles"] if item["id"] == "cataloger")
+        custom["quota"] = {
+            "max_calls": 1, "max_input_tokens": 32000,
+            "max_output_tokens": 1800, "max_output_tokens_per_call": 1800,
+            "max_seconds": 120,
+        }
+
+        migrated = validate_organization(legacy)
+
+        self.assertEqual(migrated["schema_version"], "project-organization-6")
+        methods = next(item for item in migrated["departments"] if item["id"] == "methods")
+        reviewer = next(item for item in methods["agent_roles"]
+                        if item["id"] == "analysis-reviewer")
+        self.assertEqual(reviewer["quota"]["max_calls"], 4)
+        self.assertEqual(reviewer["quota"]["max_output_tokens"], 24576)
+        migrated_cataloger = next(item for item in migrated["departments"]
+                                  if item["id"] == "research")["agent_roles"]
+        migrated_cataloger = next(item for item in migrated_cataloger
+                                  if item["id"] == "cataloger")
+        self.assertEqual(migrated_cataloger["quota"], {
+            "max_calls": 1, "max_input_tokens": 32000,
+            "max_output_tokens": 1800, "max_output_tokens_per_call": 1800,
+            "max_seconds": 120,
+        })
+
+    def test_v5_default_review_quota_adds_completion_call_without_expanding_token_budget(self):
+        legacy = default_organization()
+        legacy["schema_version"] = V5_SCHEMA_VERSION
+        old_default = {
+            "max_calls": 3, "max_input_tokens": 245760,
+            "max_output_tokens": 24576, "max_output_tokens_per_call": 8192,
+            "max_seconds": 900,
+        }
+        for charter in legacy["departments"]:
+            for role in charter["agent_roles"]:
+                role["quota"] = dict(old_default)
+        research = next(item for item in legacy["departments"] if item["id"] == "research")
+        custom = next(item for item in research["agent_roles"] if item["id"] == "cataloger")
+        custom["quota"] = {**old_default, "max_calls": 2, "max_output_tokens": 9000}
+
+        migrated = validate_organization(legacy)
+
+        self.assertEqual(migrated["schema_version"], "project-organization-6")
+        methods = next(item for item in migrated["departments"] if item["id"] == "methods")
+        reviewer = next(item for item in methods["agent_roles"]
+                        if item["id"] == "analysis-reviewer")
+        self.assertEqual(reviewer["quota"], {
+            "max_calls": 4, "max_input_tokens": 245760,
+            "max_output_tokens": 24576, "max_output_tokens_per_call": 8192,
+            "max_seconds": 900,
+        })
+        migrated_cataloger = next(item for item in research["agent_roles"]
+                                  if item["id"] == "cataloger")
+        self.assertEqual(migrated_cataloger["quota"], custom["quota"])
 
     def test_specialist_owner_is_recorded_and_functional_owner_remains_chief(self):
         with self.assertRaisesRegex(ValidationError, "does not admit topic_refinement"):
@@ -114,13 +239,19 @@ class DepartmentRuntimeTests(unittest.TestCase):
     def test_stage_dispatch_isolated_pool_and_adversarial_artifact(self):
         plan = self.runtime.begin_stage(
             "survey", "survey", attempt_number=2, input_ref={"ref": "artifact:input", "secret": "not copied"},
-            deadline_seconds=30, active_role_ids=["search-strategist", "source-acquirer"],
+            deadline_seconds=30, active_role_ids=["search-strategist", "technical-ecosystem-scout"],
         )
-        self.assertEqual(plan["active_agents"], ["research.search-strategist", "research.source-acquirer"])
+        self.assertEqual(plan["active_agents"], ["research.search-strategist", "research.technical-ecosystem-scout"])
         self.assertEqual(plan["verifier_agent"], "research.adversarial-reviewer")
         self.assertEqual(len(plan["assignments"]), 3)
         self.assertTrue(all(item["assigned_role"] != plan["verifier_agent"] for item in plan["assignments"][:2]))
         self.assertEqual(plan["assignments"][0]["input_ref"], {"ref": "artifact:input"})
+        for assignment in plan["assignments"]:
+            self.assertEqual(assignment["quota"]["max_calls"], ROLE_MAX_CALLS)
+            self.assertEqual(
+                assignment["quota"]["max_output_tokens"], ROLE_OUTPUT_TOKEN_ALLOWANCE)
+            self.assertEqual(assignment["quota"]["max_output_tokens_per_call"],
+                             ROLE_OUTPUT_TOKENS_PER_CALL)
         result = self.runtime.finish_stage(
             "survey", "survey", attempt_number=2, outcome="completed",
             output_ref="/tmp/survey.json", usage={"model_calls": 2},
@@ -132,6 +263,24 @@ class DepartmentRuntimeTests(unittest.TestCase):
             self.store.head(verdict_logical)["body_hash"]))
         self.assertTrue(verdict["independence_check"])
         self.assertEqual(verdict["verifier_agent"], "research.adversarial-reviewer")
+        self.assertEqual(self.runtime.snapshot()["active_assignments"], [])
+
+    def test_unbound_service_role_is_rejected_before_stage_admission(self):
+        route = self.runtime.stage_route("survey")
+        service_role = next(
+            role for role in self.runtime.charters["research"]["agent_roles"]
+            if role["id"] == "source-acquirer")
+        route["required_role_ids"].append(service_role["id"])
+        route["required_roles"].append(service_role)
+        route["required_agents"].append("research.source-acquirer")
+
+        with patch.object(self.runtime, "stage_route", return_value=route):
+            with self.assertRaisesRegex(ValidationError, "without a registered executor"):
+                self.runtime.begin_stage(
+                    "survey-service-preflight", "survey", attempt_number=1,
+                    deadline_seconds=30, active_role_ids=["source-acquirer"],
+                )
+
         self.assertEqual(self.runtime.snapshot()["active_assignments"], [])
 
     def test_stage_can_dispatch_only_its_internal_runner_and_verifier(self):
@@ -147,19 +296,19 @@ class DepartmentRuntimeTests(unittest.TestCase):
     def test_stage_failure_preserves_known_specialist_outcomes(self):
         self.runtime.begin_stage(
             "survey", "survey", attempt_number=3,
-            deadline_seconds=30, active_role_ids=["search-strategist", "source-acquirer"],
+            deadline_seconds=30, active_role_ids=["search-strategist", "technical-ecosystem-scout"],
         )
         result = self.runtime.finish_stage(
             "survey", "survey", attempt_number=3, outcome="blocked",
             output_ref=None, error=ValidationError("chief stage output was blocked"),
             specialist_results={
                 "search-strategist": {"status": "succeeded", "usage": {}},
-                "source-acquirer": {"status": "result_unknown", "usage": {}},
+                "technical-ecosystem-scout": {"status": "result_unknown", "usage": {}},
             },
         )
         outcomes = {item["role_id"]: item["outcome"] for item in result["assignments"]}
         self.assertEqual(outcomes["search-strategist"], "succeeded")
-        self.assertEqual(outcomes["source-acquirer"], "result_unknown")
+        self.assertEqual(outcomes["technical-ecosystem-scout"], "result_unknown")
 
     def test_stage_failure_does_not_mark_undispatched_specialists_failed(self):
         plan = self.runtime.begin_stage(
@@ -203,7 +352,9 @@ class DepartmentRuntimeTests(unittest.TestCase):
                 "survey", "survey", deadline_seconds=20,
                 active_role_ids=["search-strategist"],
                 quotas={"search-strategist": {"max_calls": 0, "max_input_tokens": 1,
-                                               "max_output_tokens": 1, "max_seconds": 1}},
+                                               "max_output_tokens": 1,
+                                               "max_output_tokens_per_call": 1,
+                                               "max_seconds": 1}},
             )
 
     def test_interrupted_specialist_attempt_is_reconciled_as_unknown(self):
@@ -218,6 +369,154 @@ class DepartmentRuntimeTests(unittest.TestCase):
         self.assertEqual(assignment["attempt_state"], "result_unknown")
         self.assertEqual(assignment["task_state"], "blocked")
         self.assertEqual(self.runtime.snapshot()["active_assignments"], [])
+
+    def test_interrupted_panel_reuses_durable_specialist_and_starts_verifier_once(self):
+        stage_id = "experiment-repair-panel-resume"
+        plan = self.runtime.begin_stage(
+            stage_id, "experiment", attempt_number=1, deadline_seconds=30,
+            active_role_ids=["methodologist"],
+        )
+        specialist = next(item for item in plan["assignments"]
+                          if item["assignment_phase"] == "specialist")
+        verifier = next(item for item in plan["assignments"]
+                        if item["assignment_phase"] == "verifier")
+        response = {"decision": "repair", "summary": "bounded repair", "findings": []}
+        report = {"status": "succeeded", "response": response,
+                  "usage": {"model_calls": 1, "input_tokens": 3, "output_tokens": 2}}
+        self.tasks.finish_attempt(
+            specialist["attempt_id"], "succeeded", usage=report["usage"])
+        execution = self.runtime._publish_idempotent(
+            f"{specialist['assignment_logical_id']}/execution", "report",
+            {
+                "schema_version": "specialist-execution-1",
+                **{key: specialist[key] for key in (
+                    "stage_id", "stage_kind", "attempt_number", "assignment_id",
+                    "task_id", "role_id", "assigned_role")},
+                "report": report,
+            }, author=specialist["assigned_role"],
+        )
+
+        self.runtime.reconcile_interrupted_assignments()
+        self.assertEqual(self.tasks.get(specialist["task_id"])["state"], "blocked")
+        self.assertEqual(self.tasks.get(verifier["task_id"])["state"], "blocked")
+
+        resumed = self.runtime.begin_stage(
+            stage_id, "experiment", attempt_number=1, deadline_seconds=30,
+            active_role_ids=["methodologist"],
+        )
+        specialist = next(item for item in resumed["assignments"]
+                          if item["assignment_phase"] == "specialist")
+        verifier = next(item for item in resumed["assignments"]
+                        if item["assignment_phase"] == "verifier")
+        self.assertEqual(specialist["task_state"], "running")
+        self.assertEqual(specialist["attempt_state"], "succeeded")
+        self.assertEqual(self.tasks.get_attempt(specialist["attempt_id"])["state"], "succeeded")
+
+        started = self.runtime.start_verifier_attempt(verifier)
+        self.assertEqual(started["state"], "started")
+        result = self.runtime.finish_stage(
+            stage_id, "experiment", attempt_number=1, outcome="completed",
+            output_ref="artifact:test-result",
+            specialist_results={"methodologist": {
+                "status": "succeeded", "provider_call_reused": True,
+                "artifact_ref": execution["artifact_ref"], "usage": {},
+            }},
+            verifier_result={"status": "succeeded", "response": {
+                "decision": "accept", "rationale": "The repair plan is bounded.",
+                "critical_findings": [],
+            }, "usage": {"model_calls": 1}},
+        )
+        self.assertEqual(result["verifier_outcome"], "accepted")
+        specialist_attempts = self.control._conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE task_id = ?", (specialist["task_id"],)
+        ).fetchone()[0]
+        verifier_attempts = self.control._conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE task_id = ?", (verifier["task_id"],)
+        ).fetchone()[0]
+        self.assertEqual(specialist_attempts, 1)
+        self.assertEqual(verifier_attempts, 1)
+        self.assertEqual(self.tasks.get(verifier["task_id"])["state"], "completed")
+
+    def test_untracked_verifier_dispatch_is_unknown_and_retry_gets_a_new_assignment(self):
+        stage_id = "experiment-repair-panel-legacy-dispatch"
+        first = self.runtime.begin_stage(
+            stage_id, "experiment", attempt_number=1, deadline_seconds=30,
+            active_role_ids=[],
+        )
+        verifier = first["assignments"][0]
+        with self.assertRaisesRegex(ValidationError, "does not match"):
+            self.runtime.reconcile_dispatched_verifier_unknown(
+                stage_id, "experiment", 1,
+                dispatch_event={
+                    "event": "dispatched", "stage_id": stage_id,
+                    "task_id": "another-verifier-task", "role_id": verifier["role_id"],
+                },
+            )
+        unknown = self.runtime.reconcile_dispatched_verifier_unknown(
+            stage_id, "experiment", 1,
+            dispatch_event={
+                "event": "dispatched", "stage_id": stage_id,
+                "task_id": verifier["task_id"], "role_id": verifier["role_id"],
+            },
+        )
+        self.assertEqual(unknown["state"], "result_unknown")
+        self.assertEqual(self.tasks.get_attempt(verifier["attempt_id"])["state"], "result_unknown")
+        self.assertEqual(self.tasks.get(verifier["task_id"])["state"], "blocked")
+
+        retry = self.runtime.begin_stage(
+            stage_id, "experiment", attempt_number=2, deadline_seconds=30,
+            active_role_ids=[],
+        )
+        retry_verifier = retry["assignments"][0]
+        self.assertNotEqual(retry_verifier["task_id"], verifier["task_id"])
+        self.assertEqual(self.tasks.get(verifier["task_id"])["state"], "blocked")
+        self.assertEqual(self.runtime.start_verifier_attempt(retry_verifier)["state"], "started")
+
+    def test_durable_verifier_result_is_re_admitted_without_a_second_call(self):
+        stage_id = "experiment-repair-panel-verifier-recovery"
+        plan = self.runtime.begin_stage(
+            stage_id, "experiment", attempt_number=1, deadline_seconds=30,
+            active_role_ids=[],
+        )
+        verifier = plan["assignments"][0]
+        response = {
+            "decision": "accept", "rationale": "The evidence-bound repair is sound.",
+            "critical_findings": [],
+        }
+        report = {"status": "succeeded", "response": response,
+                  "usage": {"model_calls": 1, "input_tokens": 5, "output_tokens": 4}}
+        input_digest = "a" * 64
+        self.runtime.start_verifier_attempt(verifier)
+        execution = self.runtime._publish_idempotent(
+            f"{verifier['assignment_logical_id']}/execution", "report",
+            {
+                "schema_version": "specialist-verifier-execution-1",
+                **{key: verifier[key] for key in (
+                    "stage_id", "stage_kind", "attempt_number", "assignment_id",
+                    "task_id", "role_id", "assigned_role")},
+                "input_digest": input_digest,
+                "report": report,
+            }, author=verifier["assigned_role"],
+        )
+        self.tasks.finish_attempt(
+            verifier["attempt_id"], "succeeded", usage=report["usage"])
+        self.runtime.reconcile_interrupted_assignments()
+        self.assertEqual(self.tasks.get(verifier["task_id"])["state"], "blocked")
+        retained = self.runtime.find_durable_verifier_report(
+            stage_id, 1, input_digest=input_digest)
+        self.assertEqual(retained["artifact_ref"], execution["artifact_ref"])
+        self.assertEqual(retained["report"], report)
+        self.assertIsNone(self.runtime.find_durable_verifier_report(
+            stage_id, 1, input_digest="b" * 64))
+
+        resumed = self.runtime.begin_stage(
+            stage_id, "experiment", attempt_number=1, deadline_seconds=30,
+            active_role_ids=[],
+        )
+        verifier = resumed["assignments"][0]
+        self.assertEqual(verifier["task_state"], "running")
+        self.assertEqual(verifier["attempt_state"], "succeeded")
+        self.assertEqual(self.tasks.get_attempt(verifier["attempt_id"])["state"], "succeeded")
 
     def test_interrupted_specialist_with_durable_report_is_recovered_as_succeeded(self):
         plan = self.runtime.begin_stage(
@@ -336,15 +635,17 @@ class DepartmentRuntimeTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.runtime.begin_stage(
                 "survey", "survey", deadline_seconds=20,
-                active_role_ids=["search-strategist", "source-acquirer"],
+                active_role_ids=["search-strategist", "technical-ecosystem-scout"],
                 quotas={
                     "research.search-strategist": {
                         "max_calls": 1, "max_input_tokens": 100,
-                        "max_output_tokens": 100, "max_seconds": 1,
+                        "max_output_tokens": 100,
+                        "max_output_tokens_per_call": 100, "max_seconds": 1,
                     },
-                    "source-acquirer": {
+                    "technical-ecosystem-scout": {
                         "max_calls": 0, "max_input_tokens": 100,
-                        "max_output_tokens": 100, "max_seconds": 1,
+                        "max_output_tokens": 100,
+                        "max_output_tokens_per_call": 100, "max_seconds": 1,
                     },
                 },
             )
@@ -520,6 +821,40 @@ class DepartmentRuntimeTests(unittest.TestCase):
             [request], stage_kind="experiment", outcome="completed")
         self.assertEqual(resolved[0]["state"], "completed")
         self.assertEqual(self.runtime.snapshot()["backlog_counts"]["methods"]["completed"], 1)
+
+    def test_candidate_needs_review_keeps_work_order_open(self):
+        request = {
+            "id": "review-held-experiment", "kind": "additional_experiment",
+            "owner": "methods.validation", "objective": "Resolve the reviewed defect.",
+            "why": "The candidate remains provisional.",
+            "success_condition": "Independent reviewers verify the repair.",
+            "evidence_needed": "A fresh replay and cited result evidence.",
+        }
+        active = self.runtime.activate_work_orders([request])
+        result = self.runtime.resolve_work_orders(
+            [request], stage_kind="experiment", outcome="candidate_needs_review")
+        self.assertEqual(result[0]["state"], "running")
+        self.assertEqual(self.tasks.get(active[0]["task_id"])["state"], "running")
+        self.assertEqual(len(self.runtime.snapshot()["open_work_orders"]), 1)
+
+    def test_reactivated_legacy_completed_order_gets_a_new_task_generation(self):
+        request = {
+            "id": "legacy-review-order", "kind": "additional_experiment",
+            "owner": "methods.validation", "objective": "Resolve the reviewed defect.",
+            "why": "An older Composer incorrectly closed provisional work.",
+            "success_condition": "Independent reviewers verify the repair.",
+            "evidence_needed": "A fresh replay and cited result evidence.",
+        }
+        first = self.runtime.activate_work_orders([request])[0]
+        self.runtime.resolve_work_orders([request], stage_kind="experiment", outcome="completed")
+        old_task = self.tasks.get(first["task_id"])
+        self.assertEqual(old_task["state"], "completed")
+
+        reopened = self.runtime.activate_work_orders([request])[0]
+        self.assertNotEqual(reopened["task_id"], first["task_id"])
+        self.assertEqual(self.tasks.get(first["task_id"])["state"], "completed")
+        self.assertEqual(self.tasks.get(reopened["task_id"])["state"], "running")
+        self.assertEqual(request["recovery_generation"], 1)
 
     def test_malformed_request_is_rejected_as_durable_workflow_state(self):
         note = self.store.publish_artifact(

@@ -10,10 +10,12 @@ immutable mission deadline.
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 import math
 import multiprocessing
 from pathlib import Path
+import re
 import sqlite3
 import time
 
@@ -72,17 +74,84 @@ def _result_fingerprint(result):
     compact = {
         stage_id: {
             "status": value.get("status"),
-            "attempt_count": value.get("attempt_count"),
-            "error": str(value.get("error", ""))[:512],
+            "error": _normalize_semantic_value(str(value.get("error", ""))[:512]),
+            "review_status": value.get("review_status"),
+            "release_blocking": value.get("release_blocking"),
+            "result_sha256": value.get("result_sha256"),
+            "output_sha256": value.get("output_sha256"),
         }
         for stage_id, value in sorted(stages.items())
         if isinstance(value, dict)
     }
+    requests = result.get("active_research_requests", []) if isinstance(result, dict) else []
+    request_signatures = sorted({
+        _research_request_fingerprint(request)
+        for request in requests if isinstance(request, dict)
+    }) if isinstance(requests, list) else []
+    blockers = result.get("active_blockers", []) if isinstance(result, dict) else []
+    if not isinstance(blockers, list):
+        blockers = []
+    blocker_state = []
+    for blocker in blockers:
+        if not isinstance(blocker, dict):
+            continue
+        rate_limit = blocker.get("rate_limit")
+        blocker_state.append({
+            key: _normalize_semantic_value(blocker.get(key))
+            for key in ("stage_id", "reason", "stop_reason", "dimension", "limit",
+                        "observed", "recoverable", "failure_class", "watchdog")
+            if key in blocker
+        } | ({"rate_limit": {
+            key: rate_limit.get(key)
+            for key in ("provider", "status_code", "provider_error_kind")
+            if key in rate_limit
+        }} if isinstance(rate_limit, dict) else {}))
     return json.dumps({
         "status": result.get("status") if isinstance(result, dict) else None,
         "stop_reason": result.get("stop_reason") if isinstance(result, dict) else None,
         "stages": compact,
+        "active_research_requests": request_signatures,
+        "active_blockers": blocker_state,
     }, ensure_ascii=False, sort_keys=True)
+
+
+def _normalize_semantic_value(value):
+    """Drop volatile attempt identity while keeping recovery intent stable."""
+    if isinstance(value, str):
+        normalized = re.sub(
+            r"artifact:[A-Za-z0-9._/-]+@[1-9][0-9]*", "artifact:<version>", value.strip())
+        normalized = re.sub(
+            r"\b(attempt|cycle|continuation)[-_ ]\d+\b",
+            lambda match: match.group(1).casefold() + "-<n>", normalized,
+            flags=re.IGNORECASE)
+        normalized = re.sub(r"\b[0-9a-f]{32,64}\b", "<digest>", normalized,
+                            flags=re.IGNORECASE)
+        return re.sub(r"\s+", " ", normalized)
+    if isinstance(value, list):
+        return [_normalize_semantic_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _normalize_semantic_value(item)
+            for key, item in sorted(value.items())
+            if key not in {"id", "created_at", "updated_at", "timestamp"}
+        }
+    return value
+
+
+def _research_request_fingerprint(request):
+    fields = (
+        "kind", "owner", "objective", "success_condition", "evidence_needed",
+        "source_stage_id", "target_stage_id", "target_stage_kind", "recovery_mode",
+        "repair_policy_revision",
+        "repair_commands", "acceptance_checks", "review_directives",
+        "experiment_repair_plan", "repair_strategy",
+    )
+    stable = {
+        key: _normalize_semantic_value(request[key])
+        for key in fields if key in request
+    }
+    payload = json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _remaining(result):
@@ -107,6 +176,79 @@ def _stop_reason(result):
     if isinstance(result.get("interim_report"), dict):
         return result["interim_report"].get("stop_reason")
     return result.get("stop_reason")
+
+
+def _has_active_model_rate_limit(result):
+    """Keep a model 429 paused until an explicit operator resume."""
+    if not isinstance(result, dict):
+        return False
+    blockers = (result.get("active_blockers") if "active_blockers" in result
+                else result.get("blockers", []))
+    if not isinstance(blockers, list):
+        return False
+    for blocker in blockers:
+        if (not isinstance(blocker, dict)
+                or not isinstance(blocker.get("rate_limit"), dict)
+                or blocker["rate_limit"].get("provider") != "model"
+                or blocker["rate_limit"].get("status_code") != 429):
+            continue
+        return True
+    return False
+
+
+def _has_pending_foundry_scientific_repair(result, workflow):
+    """Whether resume can turn a durable truncated-patch review into work."""
+    if not isinstance(result, dict):
+        return False
+    context = result.get("context")
+    stages = result.get("stages")
+    if not isinstance(context, dict) or not isinstance(stages, dict):
+        return False
+    experiment = context.get("experiment")
+    stage = stages.get("experiment")
+    if not isinstance(experiment, dict) or not isinstance(stage, dict):
+        return False
+    recovery = experiment.get("failure_recovery")
+    if not isinstance(recovery, dict):
+        return False
+    dossier_ref = recovery.get("dossier_ref") or experiment.get("failure_dossier_ref")
+    error = str(experiment.get("error") or stage.get("error") or "").casefold()
+    attempts = stage.get("attempts")
+    latest = attempts[-1] if isinstance(attempts, list) and attempts else None
+    if not (
+            experiment.get("failure_class") == "model_contract"
+            and recovery.get("failure_class") == "model_contract"
+            and recovery.get("recovery_mode") == "format_repair_then_rerun"
+            and experiment.get("format_recovery_dispatched") is True
+            and experiment.get("results_status") in (None, "not_executed")
+            and isinstance(dossier_ref, str)
+            and dossier_ref.startswith(
+                "artifact:command/composer/failure-recovery/experiment/attempt-")
+            and stage.get("status") in {"blocked", "failed", "paused"}
+            and isinstance(latest, dict)
+            and latest.get("state") == "failed"
+            and latest.get("failure_class") == "model_contract"
+            and all(phrase in error for phrase in (
+                "capability foundry did not admit a program",
+                "program author response was incomplete",
+                "finish_reason=length",
+            ))):
+        return False
+    if ComposerRunner._persisted_blocking_foundry_feedback(experiment) is None:
+        return False
+    workflow_stages = workflow.get("stages") if isinstance(workflow, dict) else None
+    experiment_stage = next((item for item in workflow_stages
+                             if isinstance(item, dict)
+                             and item.get("id") == "experiment"
+                             and item.get("kind") == "experiment"), None) \
+        if isinstance(workflow_stages, list) else None
+    expected_capability_id = ComposerRunner._stage_experiment_capability_id_from_context(
+        workflow, context, experiment_stage)
+    latest_project_dir = latest.get("project_dir")
+    if ComposerRunner._has_executed_experiment_result(
+            experiment, expected_capability_id, project_dir=latest_project_dir):
+        return False
+    return True
 
 
 class ComposerSupervisor:
@@ -549,14 +691,93 @@ class ComposerSupervisor:
     def _should_resume(self, result):
         if not isinstance(result, dict):
             return True
+        if _has_active_model_rate_limit(result):
+            return False
+        active_blockers = result.get("active_blockers")
+        if not isinstance(active_blockers, list):
+            active_blockers = result.get("blockers", [])
+        if isinstance(active_blockers, list) and any(
+                isinstance(blocker, dict)
+                and blocker.get("failure_class") == "harness_bug"
+                for blocker in active_blockers):
+            # Runtime defects require a source fix and a fresh process import.
+            # Re-forking the same loaded supervisor would repeat the defect
+            # and could burn more provider calls without changing evidence.
+            return False
         status = result.get("status")
+        if _remaining(result) <= 0:
+            return False
+        pending_foundry_repair = _has_pending_foundry_scientific_repair(
+            result, self.workflow)
+        # A repeated blocked summary is normally terminal for this supervisor
+        # invocation. A persisted methods finding plus a truncated author
+        # response is different: Composer can reconcile that checkpoint into
+        # a source-repair order without replaying the experiment. Do not let
+        # the generic identical-exit guard hide that one durable recovery.
+        if self.identical_exit_count >= 1 and not pending_foundry_repair:
+            return False
+        stop_reason = _stop_reason(result)
+        if stop_reason == "stage_quota_exhausted":
+            context = result.get("context")
+            stages = result.get("stages")
+            if not isinstance(context, dict) or not isinstance(stages, dict):
+                return False
+            pending_quota_recovery = any(
+                isinstance(stage_context, dict)
+                and stage_context.get("review_status") == "stage_quota_exhausted"
+                and isinstance(stage_context.get("quota_recovery"), dict)
+                and stage_context["quota_recovery"].get("status") == "required"
+                and stage_id in stages
+                for stage_id, stage_context in context.items()
+            )
+            if not pending_quota_recovery:
+                return False
+        elif stop_reason in STOP_REASONS:
+            return False
+        if status in {
+                "candidate_needs_review", "research_expansion_required", "review_rejected"}:
+            requests = result.get("active_research_requests")
+            return isinstance(requests, list) and any(
+                isinstance(request, dict)
+                and isinstance(request.get("objective"), str)
+                and request["objective"].strip()
+                for request in requests
+            )
         if status in TERMINAL_STATUSES:
             return False
-        if _remaining(result) <= 0 or _stop_reason(result) in STOP_REASONS:
+        if status not in {"blocked", "paused", "failed"}:
             return False
-        if status in {"research_expansion_required", "review_rejected"}:
-            return bool(result.get("active_research_requests"))
-        return status in {"blocked", "paused", "failed"}
+        requests = result.get("active_research_requests")
+        if isinstance(requests, list) and any(
+                isinstance(request, dict)
+                and isinstance(request.get("objective"), str)
+                and request["objective"].strip()
+                for request in requests):
+            return True
+        if self._admitted_survey_fallback_ready(result):
+            return True
+        blockers = (result.get("active_blockers") if "active_blockers" in result
+                    else result.get("blockers", []))
+        if isinstance(blockers, list):
+            for blocker in blockers:
+                if not isinstance(blocker, dict):
+                    continue
+                rate_limit = blocker.get("rate_limit")
+                if (blocker.get("reason") == "provider_cooldown"
+                        and isinstance(rate_limit, dict)
+                        and rate_limit.get("provider") == "model"):
+                    return False
+                if blocker.get("reason") == "provider_cooldown":
+                    retry_epoch = _finite_number(blocker.get("retry_after_epoch"))
+                    retry_seconds = _finite_number(blocker.get("retry_after_seconds"))
+                    if ((retry_epoch is not None and retry_epoch > time.time())
+                            or (retry_seconds is not None and retry_seconds > 0)):
+                        return True
+                if blocker.get("watchdog") is True and blocker.get("active_attempts"):
+                    return True
+                if blocker.get("recoverable") is True:
+                    return True
+        return pending_foundry_repair
 
     def _child_exception_text(self, message):
         """Convert a child exception message without reviving an interrupt."""
@@ -578,6 +799,8 @@ class ComposerSupervisor:
         blocker = {"stage_id": "workflow", "reason": error}
         if stop_reason is not None:
             blocker.update({"stop_reason": stop_reason, "recoverable": False})
+        else:
+            blocker.update({"recoverable": True, "failure_class": "child_exception"})
         return {
             "status": "blocked",
             "stop_reason": stop_reason,
@@ -609,7 +832,10 @@ class ComposerSupervisor:
                     "status": "blocked",
                     "remaining_seconds": max(
                     0.0, float(self.workflow.get("time_policy", {}).get("hard_seconds", 0))),
-                    "blockers": [{"stage_id": "workflow", "reason": f"{type(exc).__name__}: {exc}"}],
+                    "blockers": [{"stage_id": "workflow",
+                                  "reason": f"{type(exc).__name__}: {exc}",
+                                  "recoverable": not isinstance(exc, ValidationError),
+                                  "failure_class": "child_exception"}],
                 }
                 if isinstance(exc, ValidationError):
                     result["stop_reason"] = "workflow_validation"
@@ -637,6 +863,12 @@ class ComposerSupervisor:
     def _mark_interrupted_checkpoint(self):
         """Make a foreground stop visible before the next explicit resume."""
         output = self.project_root / "output"
+        progress_path = output / "progress.json"
+        try:
+            progress = json.loads(progress_path.read_text())
+        except (OSError, TypeError, ValueError):
+            progress = None
+        active_run_id = progress.get("run_id") if isinstance(progress, dict) else None
         for name in ("progress.json", "run.json", "interim_report.json"):
             path = output / name
             try:
@@ -644,6 +876,12 @@ class ComposerSupervisor:
             except (OSError, TypeError, ValueError):
                 continue
             if not isinstance(value, dict):
+                continue
+            if (name != "progress.json" and isinstance(active_run_id, str)
+                    and value.get("run_id") != active_run_id):
+                # A prior terminal report is not the interrupted checkpoint.
+                # Leave it as an honest historical record instead of making
+                # it appear to describe the newest run.
                 continue
             value["status"] = "paused"
             if name == "progress.json":

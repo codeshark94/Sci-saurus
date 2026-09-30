@@ -63,18 +63,33 @@ def reconcile(openalex, crossref=None, *, lookup_execution_ref=None):
     else:
         if openalex["work_id"] != crossref["work_id"]:
             raise ValidationError("bibliographic observations must target the same work")
+        doi_matches = normalize_doi(openalex["doi"]) == crossref["doi"]
+        title_matches = normalize_title(openalex["title"]) == normalize_title(crossref["title"])
         checks = [
-            {"field": "doi", "outcome": "match" if normalize_doi(openalex["doi"]) == crossref["doi"] else "conflict",
+            {"field": "doi", "outcome": "match" if doi_matches else "conflict",
              "openalex": openalex["doi"], "crossref": crossref["doi"]},
-            {"field": "title", "outcome": "match" if normalize_title(openalex["title"]) == normalize_title(crossref["title"]) else "conflict",
+            {"field": "title", "outcome": "match" if title_matches else "conflict",
              "openalex": openalex["title"], "crossref": crossref["title"]},
         ]
         if openalex["year"] is None or crossref["year"] is None:
             checks.append({"field": "year", "outcome": "unavailable",
                            "openalex": openalex["year"], "crossref": crossref["year"]})
         else:
-            checks.append({"field": "year", "outcome": "match" if openalex["year"] == crossref["year"] else "conflict",
-                           "openalex": openalex["year"], "crossref": crossref["year"]})
+            year_delta = abs(openalex["year"] - crossref["year"])
+            if year_delta == 0:
+                year_outcome = "match"
+            elif year_delta == 1 and doi_matches and title_matches:
+                # Online-first and issue-publication dates can straddle a
+                # calendar year. Keep both observations; the exact DOI and
+                # title establish identity while the date remains a gap.
+                year_outcome = "compatible_variance"
+            else:
+                year_outcome = "conflict"
+            year_check = {"field": "year", "outcome": year_outcome,
+                          "openalex": openalex["year"], "crossref": crossref["year"]}
+            if year_delta == 1 and doi_matches and title_matches:
+                year_check["variance_years"] = year_delta
+            checks.append(year_check)
         status = "conflicted" if any(check["outcome"] == "conflict" for check in checks) else (
             "verified" if all(check["outcome"] == "match" for check in checks) else "verified_with_gaps")
         refs = [openalex["provider_record_ref"], crossref["provider_record_ref"]]

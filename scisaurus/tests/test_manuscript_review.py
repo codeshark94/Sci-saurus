@@ -87,6 +87,43 @@ class MissingStageClient(FakeClient):
 
 
 class ManuscriptReviewTests(unittest.TestCase):
+    def test_long_editorial_prompt_selects_context_capable_cloud_fallback(self):
+        runner = object.__new__(ManuscriptReviewRunner)
+        runner.model_config = {
+            "protocol": "openai_compatible",
+            "base_url": "https://models.example/v1",
+            "model": "gemma4:31b-cloud",
+            "context_window_tokens": 65_536,
+            "max_input_tokens": 56_000,
+            "max_output_tokens": 8_192,
+            "timeout_seconds": 1_800,
+            "role_models": {"editorial.writer": {
+                "model": "gemma4:31b-cloud",
+                "context_window_tokens": 65_536,
+                "max_input_tokens": 56_000,
+                "max_output_tokens": 8_192,
+                "timeout_seconds": 1_800,
+            }},
+            "role_model_fallbacks": {"editorial.writer": [{
+                "protocol": "openai_compatible",
+                "base_url": "https://models.example/v1",
+                "model": "deepseek-v4.1-flash:cloud",
+                "context_window_tokens": 262_144,
+                "max_input_tokens": 245_760,
+                "max_output_tokens": 8_192,
+                "timeout_seconds": 1_800,
+            }]},
+        }
+        runner.max_output_tokens = 8_192
+        runner.call_timeout_seconds = 1_800
+        runner.reasoning_effort = "none"
+
+        candidates = runner._candidate_configs(
+            "editorial.writer", "x" * 200_000)
+
+        self.assertEqual([candidate["model"] for candidate in candidates],
+                         ["deepseek-v4.1-flash:cloud"])
+
     def test_review_request_uses_route_timeout_bounded_by_review_deadline(self):
         model = {"base_url": "http://example.invalid/v1", "model": "reviewer",
                  "protocol": "openai_compatible", "timeout_seconds": 1800,

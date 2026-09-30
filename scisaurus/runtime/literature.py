@@ -402,10 +402,12 @@ def full_text_url_candidates(locations):
     return result
 
 
-def preferred_oa_pdf_url(locations):
-    """Return one openly indexed PDF URL for a single fallback attempt."""
+def preferred_oa_pdf_url(locations, *, exclude_urls=()):
+    """Return the first openly indexed PDF not already selected for this work."""
+    excluded = set(exclude_urls)
     for candidate in full_text_url_candidates(locations):
-        if candidate["is_oa"] and candidate["kind"] == "pdf":
+        if (candidate["is_oa"] and candidate["kind"] == "pdf"
+                and candidate["url"] not in excluded):
             return candidate["url"]
     return None
 
@@ -939,6 +941,16 @@ class OpenAlexClient:
             last.setdefault("metadata", {})["attempts"] = attempt + 1
             status = (last.get("metadata") or {}).get("http_status")
             provider_throttle = last.get("outcome") == "rate_limited"
+            provider_response = last.get("raw_response")
+            if (operation == "search" and status == 504
+                    and isinstance(provider_response, dict)
+                    and provider_response.get("reason") == "query_timeout"):
+                last["metadata"].update(
+                    retry_wait_seconds=retry_wait_seconds,
+                    pacing_wait_seconds=pacing_wait_seconds,
+                    retry_suppressed_reason="query_timeout_requires_a_different_search",
+                )
+                return last
             delay = self.retry_backoff_seconds * (2 ** attempt)
             if provider_throttle:
                 rate_limit = (last.get("metadata") or {}).get("rate_limit") or {}
@@ -1108,7 +1120,7 @@ class OpenAlexClient:
                                          parse_float=_float) if body else None
                 except (ValueError, TypeError, RecursionError):
                     payload = None
-                if payload is not None and response.status == 429:
+                if payload is not None:
                     result["raw_response"] = payload
                 metadata["rate_limit"] = _rate_limit_metadata(
                     metadata["headers"], payload, authenticated=credential is not None)

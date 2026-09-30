@@ -145,6 +145,10 @@ def reject_local_qwen_route(config):
 CONTEXT_ESTIMATOR_BYTES_PER_TOKEN = 3
 CONTEXT_ESTIMATOR_OVERHEAD_TOKENS = 128
 IMAGE_CONTEXT_TOKEN_RESERVE = 4096
+MODEL_CONTINUATION_INSTRUCTION = (
+    "Continue the preceding assistant response exactly from its final character. "
+    "Return only the missing suffix; do not repeat or summarize any preceding text."
+)
 
 
 def effective_model_timeout(configured_timeout, *deadline_bounds):
@@ -918,15 +922,25 @@ def clear_model_provider_cooldown(config, *, expected_generation=None):
 
 def complete_with_role_fallbacks(model, *, role, system, prompt, images=None,
                                  deadline=None, prefer_fallback=False,
-                                 output_token_cap=None, client_factory=None,
+                                 output_token_cap=None, output_format=None,
+                                 continuation_text=None,
+                                 client_factory=None,
                                  candidate_configs=None):
-    """Try configured routes only after a known pre-generation HTTP 429.
+    """Dispatch once and return provider 429s to the workflow scheduler.
 
-    Rate limits are an availability failure, not a scientific result. A
-    configured alternative can therefore receive the same immutable prompt
-    without spending a content-repair attempt. Unknown outcomes and all other
-    errors remain on the ordinary failure path.
+    A rate limit or exhausted quota is an availability failure, not a
+    scientific result. Replaying the same prompt against another configured
+    model on the same provider can spend more quota without changing the
+    blocker, so the scheduler must pause the mission instead.
     """
+    if output_format is not None and output_format != "json_object":
+        raise ValidationError("role output_format must be json_object when configured")
+    if continuation_text is not None and (
+            not isinstance(continuation_text, str) or not continuation_text):
+        raise ValidationError("continuation_text must be a nonempty string when supplied")
+    request_prompt = prompt
+    if continuation_text is not None:
+        request_prompt += "\n\n" + continuation_text + "\n\n" + MODEL_CONTINUATION_INSTRUCTION
     regular_candidates = model_route_candidates(
         model, role=role, prefer_fallback=prefer_fallback)
     all_candidates = model_route_candidates(
@@ -987,29 +1001,54 @@ def complete_with_role_fallbacks(model, *, role, system, prompt, images=None,
         bounded["max_retries"] = 0
         if (model_call_budget_available(bounded)
                 and model_context_error(
-                    bounded, system=system, prompt=prompt,
+                    bounded, system=system, prompt=request_prompt,
                     image_count=len(images or [])) is None):
             candidates.append(bounded)
     if not candidates:
         raise ModelCallError("no configured model route is available", outcome_known=True)
+    context_candidates = []
+    context_failures = []
+    for candidate in candidates:
+        bounded = dict(candidate)
+        if type(output_token_cap) is int and output_token_cap > 0:
+            bounded["max_output_tokens"] = min(
+                int(bounded["max_output_tokens"]), output_token_cap)
+        budget = model_context_budget(
+            bounded, system=system, prompt=request_prompt,
+            image_count=len(images or []))
+        if budget["fits"]:
+            context_candidates.append(candidate)
+        else:
+            context_failures.append(budget)
+    if not context_candidates:
+        budget = max(context_failures, key=lambda item: item["allowed_input_tokens"] or 0)
+        raise ModelContextBudgetError(
+            f"model context budget exceeded for {budget['model']}: conservative input estimate "
+            f"{budget['estimated_input_tokens']} tokens exceeds "
+            f"{budget['allowed_input_tokens']} input tokens; context window "
+            f"{budget['context_window_tokens']} with max output {budget['max_output_tokens']}",
+            model=budget["model"],
+            estimated_input_tokens=budget["estimated_input_tokens"],
+            allowed_input_tokens=budget["allowed_input_tokens"],
+            context_window_tokens=budget["context_window_tokens"],
+            max_input_tokens=budget["max_input_tokens"],
+            max_output_tokens=budget["max_output_tokens"],
+            image_count=budget["image_count"],
+        )
+    candidates = context_candidates
     make_client = client_factory or ModelClient
     route_history = []
     failed_request_attempts = 0
     retry_after_hints = []
-    last_error = None
-    exhausted_quota_scopes = set()
-    failed_429s_by_scope = {}
-    candidate_count_by_scope = {}
-    for candidate in candidates:
-        scope = model_provider_quota_scope(candidate)
-        candidate_count_by_scope[scope] = candidate_count_by_scope.get(scope, 0) + 1
     cooldown_skips = 0
     longest_cooldown = 0.0
     for index, config in enumerate(candidates):
         bounded = dict(config)
+        if output_format is not None:
+            bounded["output_format"] = output_format
         quota_scope = model_provider_quota_scope(bounded)
         global_cooldown = model_provider_cooldown_remaining(quota_scope)
-        if quota_scope in exhausted_quota_scopes or global_cooldown > 0:
+        if global_cooldown > 0:
             cooldown_skips += 1
             longest_cooldown = max(longest_cooldown, global_cooldown)
             continue
@@ -1032,8 +1071,10 @@ def complete_with_role_fallbacks(model, *, role, system, prompt, images=None,
             longest_cooldown = max(longest_cooldown, admission_wait)
             continue
         try:
-            result = make_client(**bounded).complete(
-                system=system, prompt=prompt, images=images)
+            call_kwargs = {"system": system, "prompt": prompt, "images": images}
+            if continuation_text is not None:
+                call_kwargs["continuation_text"] = continuation_text
+            result = make_client(**bounded).complete(**call_kwargs)
         except ModelCallError as exc:
             route_history.append({
                 "route": route_name,
@@ -1047,56 +1088,16 @@ def complete_with_role_fallbacks(model, *, role, system, prompt, images=None,
                     and math.isfinite(exc.retry_after_seconds)
                     and exc.retry_after_seconds > 0):
                 retry_after_hints.append(float(exc.retry_after_seconds))
-            last_error = exc
-            if (exc.status_code == 429 and exc.outcome_known):
-                failed_429s_by_scope[quota_scope] = (
-                    failed_429s_by_scope.get(quota_scope, 0) + 1)
-                if (exc.provider_error_kind == "quota_exhausted"
-                        or candidate_count_by_scope.get(quota_scope, 0) == 1
-                        or (candidate_count_by_scope.get(quota_scope, 0) > 1
-                            and failed_429s_by_scope[quota_scope]
-                            >= candidate_count_by_scope[quota_scope])):
-                    record_model_provider_cooldown(
-                        quota_scope,
-                        retry_after_seconds=max(retry_after_hints, default=0.0),
-                    )
-            if (exc.status_code != 429 or not exc.outcome_known
-                    or index + 1 >= len(candidates)):
-                exc.attempts = failed_request_attempts
-                exc.route_history = route_history
-                if retry_after_hints:
-                    exc.retry_after_seconds = max(retry_after_hints)
-                if (len(route_history) > 1
-                        or any(entry.get("provider_error_kind") for entry in route_history)):
-                    summary = ", ".join(
-                        f"{entry['model']}={entry['status_code']}"
-                        + (f"[{entry['provider_error_kind']}]"
-                           if entry.get("provider_error_kind") else "")
-                        for entry in route_history
-                    )
-                    exc.args = (f"{exc}: configured model routes tried: {summary}",)
-                raise
-            if exc.provider_error_kind == "quota_exhausted":
-                exhausted_quota_scopes.add(quota_scope)
-                has_independent_route = any(
-                    model_provider_quota_scope(candidate) not in exhausted_quota_scopes
-                    for candidate in candidates[index + 1:]
+            if exc.status_code == 429:
+                record_model_provider_cooldown(
+                    quota_scope,
+                    retry_after_seconds=max(retry_after_hints, default=0.0),
                 )
-                if not has_independent_route:
-                    exc.attempts = failed_request_attempts
-                    exc.route_history = route_history
-                    if retry_after_hints:
-                        exc.retry_after_seconds = max(retry_after_hints)
-                    if len(route_history) > 1:
-                        summary = ", ".join(
-                            f"{entry['model']}={entry['status_code']}"
-                            + (f"[{entry['provider_error_kind']}]"
-                               if entry.get("provider_error_kind") else "")
-                            for entry in route_history
-                        )
-                        exc.args = (f"{exc}: configured model routes tried: {summary}",)
-                    raise
-            continue
+            exc.attempts = failed_request_attempts
+            exc.route_history = route_history
+            if retry_after_hints:
+                exc.retry_after_seconds = max(retry_after_hints)
+            raise
         route_history.append({
             "route": route_name,
             "model": bounded.get("model"),
@@ -1111,8 +1112,6 @@ def complete_with_role_fallbacks(model, *, role, system, prompt, images=None,
                 request_attempts=result.request_attempts + failed_request_attempts,
             )
         return result, route_history
-    if last_error is not None:
-        raise last_error
     if cooldown_skips:
         raise ModelCallError(
             "all configured model routes are inside a provider cooldown",
@@ -1127,8 +1126,8 @@ class ModelCallError(RuntimeError):
 
     ``status_code`` and ``retry_after_seconds`` are deliberately kept on the
     typed error instead of being inferred from the rendered message.  The
-    orchestration layer can then distinguish a provider-wide 429 from a
-    malformed response and reroute the same logical assignment safely.
+    orchestration layer can distinguish a rate-limit stop from a retryable
+    transport failure without parsing provider-specific error text.
     """
     def __init__(self, message, *, outcome_known=False, attempts=0,
                  elapsed_seconds=None, status_code=None,
@@ -1345,8 +1344,8 @@ class ModelClient:
             }.items() if value is not None
         }
         _validate_sampling_options(sampling)
-        if protocol != "openai_compatible" and (reasoning_effort is not None or output_format is not None):
-            raise ValidationError("reasoning_effort and output_format require the openai_compatible protocol")
+        if protocol != "openai_compatible" and reasoning_effort is not None:
+            raise ValidationError("reasoning_effort requires the openai_compatible protocol")
         if auth_env is not None and (not isinstance(auth_env, str) or not auth_env or not os.environ.get(auth_env)):
             raise ValidationError("configured model authentication environment variable is absent")
         self.base_url, self.model, self.protocol = base_url.rstrip("/"), model, protocol
@@ -1392,12 +1391,16 @@ class ModelClient:
             raise ValidationError("model image media type does not match JPEG bytes")
         return body, media_type
 
-    def complete(self, *, system: str, prompt: str, images=None) -> ModelResult:
+    def complete(self, *, system: str, prompt: str, images=None,
+                 continuation_text: str | None = None) -> ModelResult:
         request_model = self.model
         request_base_url = self.base_url
         reject_local_qwen_route({"base_url": request_base_url, "model": request_model})
         if not isinstance(system, str) or not isinstance(prompt, str):
             raise ValidationError("model system and prompt content must be strings")
+        if continuation_text is not None and (
+                not isinstance(continuation_text, str) or not continuation_text):
+            raise ValidationError("continuation_text must be a nonempty string when supplied")
         images = [] if images is None else images
         if not isinstance(images, list) or len(images) > 16:
             raise ValidationError("model images must be a list containing at most 16 items")
@@ -1408,11 +1411,14 @@ class ModelClient:
             "context_window_tokens": self.context_window_tokens,
             "max_input_tokens": self.max_input_tokens,
         }
+        budget_prompt = prompt
+        if continuation_text is not None:
+            budget_prompt += "\n\n" + continuation_text + "\n\n" + MODEL_CONTINUATION_INSTRUCTION
         context_budget = model_context_budget(
-            context_config, system=system, prompt=prompt, image_count=len(images))
+            context_config, system=system, prompt=budget_prompt, image_count=len(images))
         if not context_budget["fits"]:
             context_error = model_context_error(
-                context_config, system=system, prompt=prompt,
+                context_config, system=system, prompt=budget_prompt,
                 image_count=len(images))
             raise ModelContextBudgetError(
                 context_error,
@@ -1435,6 +1441,11 @@ class ModelClient:
                 "url": f"data:{media_type};base64,{encoded}"}})
         user_content = parts if images else prompt
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user_content}]
+        if continuation_text is not None:
+            messages.extend([
+                {"role": "assistant", "content": continuation_text},
+                {"role": "user", "content": MODEL_CONTINUATION_INSTRUCTION},
+            ])
         body = {"model": request_model, "messages": messages, "stream": False}
         sampling = {
             key: value for key, value in {
@@ -1451,6 +1462,8 @@ class ModelClient:
                 "num_predict": self.max_output_tokens,
                 **{key: value for key, value in sampling.items() if key in OLLAMA_SAMPLING_FIELDS},
             }
+            if self.output_format is not None and continuation_text is None:
+                body["format"] = "json"
             # ``num_ctx`` is a server-side context allocation, not merely an
             # admission hint.  Keep it role/model-specific by deriving it
             # from the selected route's context window.  The OpenAI-compatible
@@ -1464,7 +1477,7 @@ class ModelClient:
             body.update(sampling)
             if self.reasoning_effort is not None:
                 body["reasoning_effort"] = self.reasoning_effort
-            if self.output_format is not None:
+            if self.output_format is not None and continuation_text is None:
                 body["response_format"] = {"type": self.output_format}
         if self.cache_prompt is not None:
             # Ollama/llama.cpp-compatible servers use this hint to reuse the

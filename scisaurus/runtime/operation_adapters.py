@@ -573,19 +573,34 @@ def _inspect_openalex(profile, result, params, *, representative=True):
           and metadata.get("adapter_version") == literature.ADAPTER_VERSION
           and schema_identity["schema_version"] == literature.SCHEMA_VERSION,
           "OpenAlex metadata representation and adapter schema are recorded")
-    capture = result.get("capture") or {}
-    try:
-        raw = base64.b64decode(capture["body"], validate=True)
-        integrity = (capture["encoding"] == "base64" and type(capture["bytes"]) is int
-                     and capture["bytes"] == len(raw) and bool(raw)
-                     and sha256_hex(raw) == capture["sha256"] == result.get("capture_sha256")
-                     and capture.get("media_type") == metadata["headers"]["content-type"])
-    except (KeyError, TypeError, ValueError):
-        raw, integrity = b"", False
-    check("capture-integrity", integrity, "Captured HTTP body matches its declared length, media type and hashes")
-    check("completeness", metadata.get("capture_truncated") is False
-          and metadata.get("capture_incomplete") is False and len(raw) <= profile["client"]["max_bytes"],
-          "The entire response fits the configured byte limit")
+    transport_failure = (
+        not representative
+        and result.get("outcome") in {"provider_error", "timeout"}
+        and metadata.get("capture_incomplete") is True
+    )
+    capture = result.get("capture")
+    if transport_failure and capture is None:
+        raw = b""
+        integrity = result.get("capture_sha256") is None
+    else:
+        capture = capture if isinstance(capture, dict) else {}
+        try:
+            raw = base64.b64decode(capture["body"], validate=True)
+            integrity = (capture["encoding"] == "base64" and type(capture["bytes"]) is int
+                         and capture["bytes"] == len(raw)
+                         and sha256_hex(raw) == capture["sha256"] == result.get("capture_sha256")
+                         and capture.get("media_type") == metadata["headers"]["content-type"])
+        except (KeyError, TypeError, ValueError):
+            raw, integrity = b"", False
+    check("capture-integrity", integrity,
+          "Captured response bytes match their declared length, media type and hashes")
+    completeness = (
+        metadata.get("capture_truncated") is False
+        and len(raw) <= profile["client"]["max_bytes"]
+        and (metadata.get("capture_incomplete") is False or transport_failure)
+    )
+    check("completeness", completeness,
+          "Incomplete transport responses are explicitly typed and never admitted as scholarly data")
 
     def require(condition):
         if not condition:
@@ -624,7 +639,7 @@ def _inspect_openalex(profile, result, params, *, representative=True):
         # capability; search and citing requests still require HTTP 200.
         missing_work = (not representative and expected["operation"] == "work"
                         and status == 404 and result.get("outcome") == "not_found")
-        require(type(status) is int and (status == 200 or missing_work))
+        require(transport_failure or (type(status) is int and 100 <= status <= 599))
         endpoint = profile["client"]["endpoint"]
         if expected["operation"] == "work":
             url = endpoint + "/" + expected["work_id"]
@@ -633,21 +648,62 @@ def _inspect_openalex(profile, result, params, *, representative=True):
             wire["search" if expected["operation"] == "search" else "filter"] = (
                 expected["query"] if expected["operation"] == "search" else "cites:" + expected["work_id"])
             url = endpoint + "?" + urlencode(wire)
-        require(result.get("source_url") == metadata.get("final_url") == url)
+        require(result.get("source_url") == url)
+        if transport_failure:
+            require((status is None and metadata.get("final_url") is None)
+                    or (type(status) is int and metadata.get("final_url") == url))
+        else:
+            require(metadata.get("final_url") == url)
         request_valid = True
     except (KeyError, TypeError, ValueError, ValidationError):
         request_valid = False
     check("openalex-request", request_valid, "The exact operation arguments and HTTP URL match the execution context")
 
     expected_works, expected_sources, expected_text, expected_abstract_gaps = [], [], "", []
-    if missing_work:
-        response_valid = (request_valid and integrity and result.get("raw_response") is None
-                          and result.get("works") == [] and result.get("sources") == []
-                          and result.get("text") == "" and metadata.get("capture_truncated") is False
-                          and metadata.get("capture_incomplete") is False)
+    provider_http_failure = (
+        not representative and type(metadata.get("http_status")) is int
+        and metadata.get("http_status") != 200 and not transport_failure
+    )
+    if transport_failure:
+        response_valid = (
+            request_valid and integrity and result.get("outcome") in {"provider_error", "timeout"}
+            and isinstance(result.get("error"), str) and bool(result["error"].strip())
+            and result.get("raw_response") is None and result.get("works") == []
+            and result.get("sources") == [] and result.get("text") == ""
+            and metadata.get("capture_incomplete") is True
+            and metadata.get("capture_truncated") is False
+        )
+    elif provider_http_failure:
+        try:
+            payload = (json.loads(raw, object_pairs_hook=object_pairs, parse_constant=reject_constant,
+                                  parse_float=finite_float) if raw else None)
+            expected_outcome = (
+                "not_found" if missing_work else
+                "rate_limited" if metadata.get("http_status") == 429
+                or (metadata.get("rate_limit") or {}).get("kind") in literature.PROVIDER_THROTTLE_KINDS
+                else {401: "auth_required", 403: "access_denied", 404: "not_found"}.get(
+                    metadata["http_status"], "provider_error")
+            )
+            provider_message = payload.get("message") if isinstance(payload, dict) else None
+            expected_error = (
+                provider_message if isinstance(provider_message, str) and provider_message.strip()
+                else f"OpenAlex returned HTTP {metadata['http_status']}"
+            )
+            response_valid = (
+                request_valid and integrity and metadata.get("capture_incomplete") is False
+                and metadata.get("capture_truncated") is False
+                and (payload is None or isinstance(payload, dict))
+                and canonical_bytes(result.get("raw_response")) == canonical_bytes(payload)
+                and result.get("outcome") == expected_outcome
+                and result.get("error") == expected_error
+                and result.get("works") == [] and result.get("sources") == []
+                and result.get("text") == ""
+            )
+        except (KeyError, TypeError, ValueError, ValidationError, RecursionError):
+            response_valid = False
     else:
         try:
-            require(request_valid and integrity)
+            require(request_valid and integrity and metadata.get("http_status") == 200)
             payload = json.loads(raw, object_pairs_hook=object_pairs, parse_constant=reject_constant, parse_float=finite_float)
             require(isinstance(payload, dict) and canonical_bytes(payload) == canonical_bytes(result.get("raw_response")))
             if expected["operation"] == "work":
@@ -739,12 +795,18 @@ def _inspect_openalex(profile, result, params, *, representative=True):
             response_valid = False
     check("openalex-response", response_valid,
           "Normalized works, citation links, abstracts, locations and pagination match independently reconstructed captured JSON")
-    empty = response_valid and not expected_works and not representative and params["operation"] in {"search", "citing"}
-    expected_outcome = "not_found" if missing_work else ("empty" if empty else "ok")
+    empty = (response_valid and metadata.get("http_status") == 200 and not expected_works
+             and not representative and params["operation"] in {"search", "citing"})
+    if transport_failure or provider_http_failure:
+        expected_outcome = result.get("outcome")
+    else:
+        expected_outcome = "not_found" if missing_work else ("empty" if empty else "ok")
     check("outcome", response_valid and result.get("outcome") == expected_outcome,
           f"Observed outcome: {result.get('outcome')}")
-    check("usable-output", response_valid and (missing_work or empty or bool(expected_works and expected_text)),
-          "Readiness requires usable scholarly records; a routine no-match page is a valid empty result")
+    unavailable_is_explicit = transport_failure or provider_http_failure
+    check("usable-output", response_valid and (
+        missing_work or empty or bool(expected_works and expected_text) or unavailable_is_explicit),
+        "Provider failures are retained as unavailable, never normalized into empty scholarly results")
     return checks, schema_identity
 
 

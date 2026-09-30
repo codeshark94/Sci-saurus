@@ -1,10 +1,11 @@
 import unittest
 from copy import deepcopy
 
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import ModelContractError, ValidationError
 from scisaurus.runtime.program_admission import (
     SCHEMA_VERSION,
     scan_program_source,
+    validate_experiment_intent,
     validate_program_candidate,
 )
 
@@ -83,6 +84,17 @@ def candidate():
 
 
 class ProgramAdmissionTests(unittest.TestCase):
+    def test_model_authored_stage_seconds_requires_the_runtime_stage_set(self):
+        self.assertEqual(validate_experiment_intent(deepcopy(INTENT)), INTENT)
+        for stage_seconds in (
+                {key: value for key, value in INTENT["stage_seconds"].items()
+                 if key != "reassessment"},
+                {**INTENT["stage_seconds"], "unrecognized": 10},
+        ):
+            with self.subTest(stage_seconds=stage_seconds), self.assertRaisesRegex(
+                    ModelContractError, "experiment_intent stage_seconds requires exactly"):
+                validate_experiment_intent({**INTENT, "stage_seconds": stage_seconds})
+
     def test_novel_capability_schema_preserves_its_quality_contract(self):
         from scisaurus.runtime.research_quality import default_research_quality_contract
         value = candidate()
@@ -96,6 +108,28 @@ class ProgramAdmissionTests(unittest.TestCase):
         value = candidate()
         self.assertEqual(validate_program_candidate(value), value)
         self.assertEqual(scan_program_source(EXECUTOR, "program executor"), {"json", "sys", "numpy"})
+
+    def test_duplicate_top_level_definitions_are_rejected_before_execution(self):
+        source = "def calculate():\n    return 1\n\ndef calculate():\n    return 2\n"
+        with self.assertRaisesRegex(ValidationError, "duplicate top-level definitions"):
+            scan_program_source(source, "program executor")
+
+    def test_duplicate_main_guards_are_rejected(self):
+        source = (
+            "def main():\n    return None\n\n"
+            "if __name__ == '__main__':\n    main()\n\n"
+            "if __name__ == '__main__':\n    main()\n"
+        )
+        with self.assertRaisesRegex(ValidationError, "multiple __main__ entry guards"):
+            scan_program_source(source, "program executor")
+
+    def test_duplicate_main_guards_are_rejected_with_reversed_comparison(self):
+        source = (
+            "if '__main__' == __name__:\n    first()\n\n"
+            "if '__main__' == __name__:\n    second()\n"
+        )
+        with self.assertRaisesRegex(ValidationError, "multiple __main__ entry guards"):
+            scan_program_source(source, "program executor")
 
     def test_forbidden_module_is_rejected(self):
         value = candidate()

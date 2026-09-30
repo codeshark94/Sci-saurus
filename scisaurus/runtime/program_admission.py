@@ -24,11 +24,16 @@ import re
 import sys
 from pathlib import Path
 
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import ModelContractError, ValidationError
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.experiment_config import validate_experiment_config
+from scisaurus.runtime.time_policy import STAGES
 
 SCHEMA_VERSION = "method-program-candidate-1"
+
+
+class ExperimentIntentContractError(ModelContractError):
+    """A model-authored experiment intent violated its frozen response contract."""
 
 # The sandbox (P3.2) is the real boundary; this allowlist keeps the admission
 # surface small and reviewable and is the first of the five gates.
@@ -79,6 +84,24 @@ def _identifier(value, name):
     return value
 
 
+def is_main_entry_guard(node):
+    """Recognize either operand order of Python's main-module equality guard."""
+    if not (isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and len(node.test.ops) == 1
+            and isinstance(node.test.ops[0], ast.Eq)
+            and len(node.test.comparators) == 1):
+        return False
+    left, right = node.test.left, node.test.comparators[0]
+    return (
+        isinstance(left, ast.Name) and left.id == "__name__"
+        and isinstance(right, ast.Constant) and right.value == "__main__"
+    ) or (
+        isinstance(right, ast.Name) and right.id == "__name__"
+        and isinstance(left, ast.Constant) and left.value == "__main__"
+    )
+
+
 def scan_program_source(source, name):
     """Static admission gate for one program source.  Returns the module roots."""
     _text(source, f"{name} source")
@@ -86,6 +109,21 @@ def scan_program_source(source, name):
         tree = ast.parse(source)
     except SyntaxError as exc:
         raise ValidationError(f"{name} source is not valid Python: {exc.msg}") from exc
+    top_level_names = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            top_level_names.setdefault(node.name, []).append(node.lineno)
+    duplicates = {key: lines for key, lines in top_level_names.items() if len(lines) > 1}
+    if duplicates:
+        details = ", ".join(
+            f"{key} at lines {','.join(map(str, lines))}"
+            for key, lines in sorted(duplicates.items()))
+        raise ValidationError(f"{name} source has duplicate top-level definitions: {details}")
+    entry_guards = [node for node in tree.body if is_main_entry_guard(node)]
+    if len(entry_guards) > 1:
+        lines = ",".join(str(node.lineno) for node in entry_guards)
+        raise ValidationError(
+            f"{name} source has multiple __main__ entry guards at lines {lines}")
     roots = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -144,7 +182,7 @@ def _validate_test_vector(value):
     return value
 
 
-def validate_experiment_intent(intent):
+def _validate_experiment_intent(intent):
     if (not isinstance(intent, dict) or not INTENT_FIELDS.issubset(intent)
             or set(intent) - (INTENT_FIELDS | {"quality_contract"})):
         observed = sorted(intent) if isinstance(intent, dict) else type(intent).__name__
@@ -220,8 +258,9 @@ def validate_experiment_intent(intent):
         ids.add(reviewer["id"])
         _text(reviewer["focus"], "reviewer focus")
     stage_seconds = intent["stage_seconds"]
-    if not isinstance(stage_seconds, dict) or not stage_seconds:
-        raise ValidationError("experiment_intent stage_seconds must be a nonempty object")
+    if not isinstance(stage_seconds, dict) or set(stage_seconds) != set(STAGES):
+        raise ValidationError(
+            f"experiment_intent stage_seconds requires exactly {list(STAGES)}")
     for value in stage_seconds.values():
         if type(value) not in (int, float) or value <= 0:
             raise ValidationError("experiment_intent stage_seconds values must be positive")
@@ -257,6 +296,16 @@ def validate_experiment_intent(intent):
     }
     validate_experiment_config(trial, require_literature_gate=False)
     return intent
+
+
+def validate_experiment_intent(intent):
+    """Validate model-authored intent and preserve its response-contract type."""
+    try:
+        return _validate_experiment_intent(intent)
+    except ModelContractError:
+        raise
+    except ValidationError as exc:
+        raise ExperimentIntentContractError(str(exc)) from exc
 
 
 def validate_program_candidate(value):

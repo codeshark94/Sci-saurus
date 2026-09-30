@@ -6,10 +6,74 @@ from pathlib import Path
 from scisaurus.runtime.failure_recovery import (
     build_failure_dossier, build_repair_request, classify_failure,
 )
-from scisaurus.core.errors import QuotaExceededError, ValidationError
+from scisaurus.runtime.capability_foundry import SourceDataUnavailable
+from scisaurus.core.errors import ModelContractError, QuotaExceededError, ValidationError
+from scisaurus.runtime.experiment import ExperimentProgramOutputContractError
+from scisaurus.runtime.model_work import ModelWorkBlocked
+from scisaurus.runtime.models import ModelCallError
 
 
 class FailureRecoveryTests(unittest.TestCase):
+    def test_missing_empirical_input_is_same_topic_source_acquisition(self):
+        error = SourceDataUnavailable("controller-supplied raw rows are unavailable")
+        self.assertEqual(classify_failure("experiment", error),
+                         "evidence_input_unavailable")
+        dossier = build_failure_dossier(
+            stage={"id": "experiment", "kind": "experiment"},
+            attempt_stage={"attempt_number": 7, "project_dir": None},
+            error=error,
+            stage_result={"status": "blocked", "results_status": "not_executed"},
+        )
+        self.assertEqual(dossier["failure_class"], "evidence_input_unavailable")
+        self.assertEqual(
+            [item["operation"] for item in dossier["repair_commands"]],
+            ["acquire_source_data"],
+        )
+        request = build_repair_request(
+            dossier, stage_id="experiment", target_stage_id="survey",
+            target_stage_kind="survey")
+        self.assertEqual(request["kind"], "full_text_retrieval")
+        self.assertEqual(request["owner"], "research.source-acquirer")
+        self.assertEqual(request["target_stage_id"], "survey")
+        self.assertEqual(request["target_stage_kind"], "survey")
+
+    def test_survey_evidence_shape_failure_is_model_contract_not_scientific_rejection(self):
+        error = ModelWorkBlocked(
+            "survey output contract failed: required assessment fields are missing")
+        self.assertEqual(classify_failure("survey", error), "model_contract")
+
+    def test_explicit_analysis_output_contract_failure_is_not_scientific_failure(self):
+        error = ModelWorkBlocked(
+            "capability foundry did not admit a program: analysis comparison has an invalid shape")
+        error.failure_class = "model_contract"
+        self.assertEqual(classify_failure("experiment", error), "model_contract")
+
+    def test_legacy_stage_seconds_shape_error_is_a_model_contract_failure(self):
+        error = ModelWorkBlocked(
+            "Unchanged experiment input failed: ModelWorkBlocked: capability foundry did not "
+            "admit a program: stage_seconds requires exactly "
+            "['setup', 'supervision', 'production', 'unit_review', 'integrated_review', 'reassessment']")
+        self.assertEqual(classify_failure("experiment", error), "model_contract")
+
+    def test_executor_output_shape_contract_routes_to_format_recovery(self):
+        error = ExperimentProgramOutputContractError(
+            required_fields=["observations", "metrics"],
+            observed_fields=["metrics", "analysis"],
+            missing_fields=["observations"],
+            unexpected_fields=[],
+        )
+        self.assertEqual(classify_failure("experiment", error), "model_contract")
+        dossier = build_failure_dossier(
+            stage={"id": "experiment", "kind": "experiment"},
+            attempt_stage={"attempt_number": 3, "project_dir": None},
+            error=error,
+            stage_result={"status": "blocked", "results_status": "not_executed"},
+        )
+        self.assertEqual(dossier["failure_class"], "model_contract")
+        self.assertEqual(dossier["next_action"], "repair_model_contract_before_stage_retry")
+        self.assertFalse(any("additional_experiment" in item.get("operation", "")
+                             for item in dossier["repair_commands"]))
+
     def test_experiment_failure_becomes_code_and_result_repair_plan(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -69,6 +133,22 @@ class FailureRecoveryTests(unittest.TestCase):
             "operational_recovery",
         )
 
+    def test_python_runtime_exception_is_a_nonrecoverable_harness_bug(self):
+        error = AttributeError("'NoneType' object has no attribute 'get'")
+        error.runtime_frames = [{"file": "composer.py", "line": 9012, "function": "run"}]
+        dossier = build_failure_dossier(
+            stage={"id": "experiment", "kind": "experiment"},
+            attempt_stage={"attempt_number": 488, "project_dir": None},
+            error=error,
+        )
+
+        self.assertEqual(dossier["failure_class"], "harness_bug")
+        self.assertFalse(dossier["recoverable"])
+        self.assertEqual(dossier["next_action"], "patch_harness_before_resume")
+        self.assertEqual(dossier["model_diagnostics"]["runtime_frames"], error.runtime_frames)
+        self.assertEqual(
+            [item["operation"] for item in dossier["repair_commands"]], ["patch_runtime"])
+
     def test_resource_dossier_is_resume_only(self):
         dossier = build_failure_dossier(
             stage={"id": "survey", "kind": "survey"},
@@ -97,10 +177,16 @@ class FailureRecoveryTests(unittest.TestCase):
             ["reroute_and_compact"],
         )
 
+    def test_typed_model_contract_precedes_experiment_text_markers(self):
+        error = ModelContractError(
+            "experiment result package response contract was incomplete")
+        self.assertEqual(classify_failure("experiment", error), "model_contract")
+
     def test_local_topic_intake_exhaustion_is_not_a_provider_quota_fence(self):
         cases = (
             ("scientific_candidate_rejected", "scientific_review"),
             ("intake_contract_failure", "model_contract"),
+            ("refinement_contract_failure", "topic_refinement_contract"),
         )
         for retry_reason, expected_class in cases:
             with self.subTest(retry_reason=retry_reason):
@@ -122,6 +208,11 @@ class FailureRecoveryTests(unittest.TestCase):
                 self.assertEqual(dossier["failure_class"], expected_class)
                 self.assertTrue(dossier["recoverable"])
                 self.assertNotEqual(dossier["next_action"], "resume_from_checkpoint")
+                if retry_reason == "refinement_contract_failure":
+                    self.assertEqual(
+                        [item["operation"] for item in dossier["repair_commands"]],
+                        ["refine"],
+                    )
 
     def test_experiment_program_author_truncation_is_model_contract_repair(self):
         error = ValidationError(
@@ -141,6 +232,39 @@ class FailureRecoveryTests(unittest.TestCase):
             [item["operation"] for item in dossier["repair_commands"]],
             ["reroute_and_compact"],
         )
+
+    def test_zero_observation_failure_overrides_stale_format_label(self):
+        error = ModelWorkBlocked(
+            "Unchanged experiment input failed 1 time(s): capability foundry did not admit a "
+            "program: experiment emitted 0 observation rows, fewer than configured minimum "
+            "run_count=1000 rows"
+        )
+        error.failure_class = "model_contract"
+
+        self.assertEqual(classify_failure("experiment", error), "experiment_failure")
+        dossier = build_failure_dossier(
+            stage={"id": "experiment", "kind": "experiment"},
+            attempt_stage={"attempt_number": 464, "project_dir": None},
+            error=error,
+            stage_result={"status": "blocked", "results_status": "not_executed"},
+        )
+        self.assertEqual(dossier["failure_class"], "experiment_failure")
+        self.assertEqual(
+            dossier["next_action"],
+            "create_scoped_repair_work_order_and_repair_before_rerun",
+        )
+        self.assertEqual(
+            {item["operation"] for item in dossier["repair_commands"]},
+            {"inspect", "recalculate", "edit_program", "execute"},
+        )
+
+    def test_provider_429_precedes_experiment_output_failure_marker(self):
+        error = ModelCallError(
+            "experiment emitted 0 observation rows, fewer than configured minimum run_count=1000 rows",
+            status_code=429,
+        )
+        error.failure_class = "model_contract"
+        self.assertEqual(classify_failure("experiment", error), "resource_fence")
 
     def test_model_diagnostics_survive_failure_dossier_boundary(self):
         error = ValidationError("program author response was incomplete (finish_reason=length)")
@@ -235,6 +359,44 @@ class FailureRecoveryTests(unittest.TestCase):
         self.assertIn("downgrade to an association", request["objective"])
         self.assertEqual(request["target_stage_id"], "argument")
         self.assertEqual(request["target_stage_kind"], "argument")
+
+    def test_failed_review_check_is_hypothesis_not_authoritative_repair(self):
+        error = ValidationError("independent recalculation found a null mismatch")
+        error.research_review = {
+            "decision": "revise",
+            "checks": [{
+                "check_id": "primary-metrics-from-observations",
+                "outcome": "failed",
+                "evidence": "All primary metrics recalculated from observations agree within tolerance.",
+            }],
+            "required_repairs": [{
+                "target": "control-null",
+                "problem": "reported numeric zero but independent result is null",
+                "repair": "Recalculate control-null from explicit condition-labelled observations.",
+            }],
+        }
+        dossier = build_failure_dossier(
+            stage={"id": "experiment", "kind": "experiment"},
+            attempt_stage={"attempt_number": 470, "project_dir": None},
+            error=error,
+        )
+
+        check_directive = next(
+            item for item in dossier["review_directives"]
+            if item["kind"] == "review_claim_requires_independent_verification"
+        )
+        repair_proposal = next(
+            item for item in dossier["review_directives"]
+            if "Recalculate control-null" in item["text"]
+        )
+        self.assertIn("not an independently confirmed defect", check_directive["text"])
+        self.assertIn("agree within tolerance", check_directive["text"])
+        self.assertEqual(repair_proposal["kind"], "reviewer_proposal_to_verify")
+        review_command = next(
+            item for item in dossier["repair_commands"]
+            if item["id"] == "execute-review-directed-repairs"
+        )
+        self.assertIn("hypotheses, not established facts", review_command["instruction"])
 
     def test_failure_dossier_does_not_promote_stale_attempt_reviews_to_repairs(self):
         reports = [{

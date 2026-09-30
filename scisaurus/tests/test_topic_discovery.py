@@ -702,14 +702,14 @@ class TopicDiscoveryTests(unittest.TestCase):
     def test_salvage_scope_validation_errors_are_contract_not_scientific_rejections(self):
         self.assertEqual(
             _topic_validation_rejection_type(
-                "topic salvage branch evidence-boundary must materially change at least two "
+                "topic salvage branch evidence-boundary must materially change at least one "
                 "of its assigned dimensions: evidence_mode, research_form, scope, comparison_type"),
             "refinement_contract",
         )
         self.assertEqual(
             _topic_validation_rejection_type(
                 "topic salvage branch evidence-boundary changed dimensions outside its assigned "
-                "repair scope: mechanism, theory_target"),
+                "repair scope: mechanism"),
             "refinement_contract",
         )
         self.assertEqual(
@@ -1190,6 +1190,18 @@ class TopicDiscoveryTests(unittest.TestCase):
             "scientific_candidate_rejected",
         )
 
+    def test_salvage_scope_rejection_remains_a_refinement_contract_failure(self):
+        error = ValidationError(
+            "topic salvage branch evidence-boundary must materially change at least one "
+            "of its assigned dimensions: evidence_mode, research_form, scope, comparison_type")
+        trace = [{
+            "status": "refinement_rejected",
+            "rejection_type": "refinement_contract",
+            "error": str(error),
+        }]
+        self.assertEqual(
+            _topic_retry_reason(error, trace, []), "refinement_contract_failure")
+
     def test_salvage_anchor_survives_local_reparenting_during_repair(self):
         original = package("Choose a feasible research direction")["candidates"][1]
         original["phenomenon"] = "Ionotropic receptor desensitization"
@@ -1289,9 +1301,37 @@ class TopicDiscoveryTests(unittest.TestCase):
             "scope": "the supported nitrogen-methane frost regime only",
             "disconfirmation_test": "the ordering remains unchanged across all supported bins",
         }
-        with self.assertRaisesRegex(ValidationError, "must materially change at least two"):
+        with self.assertRaisesRegex(ValidationError, "must materially change at least one"):
             validate_topic_refinement(
                 mechanism_parent, dependent_only, salvage_plan=mechanism_plan)
+
+        evidence_parent = {
+            **mechanism_parent,
+            "phenomenon": "confined cornstarch thickening onset",
+            "research_question": (
+                "Does the onset-gap slope remain negative under a fixed analytical operator?"),
+            "evidence_mode": "analytical_derivation",
+            "research_form": "scaling_boundary",
+            "scope": "the supported confined-cornstarch model regime",
+            "comparison_type": "operator_sensitivity",
+        }
+        evidence_refinement = {
+            **evidence_parent,
+            "research_question": (
+                "Does the confined-cornstarch onset-gap slope remain negative under a "
+                "synthetic operator calibration?"),
+            "evidence_mode": "synthetic_simulation",
+            "theory_target": "operator sensitivity of the onset-gap slope",
+            "experiment_capability_id": "synthetic_onset_operator_calibration",
+        }
+        evidence_plan = topic_salvage_plan([
+            "mechanism-observable", "comparison-baseline",
+        ])
+        changed = validate_topic_refinement(
+            evidence_parent, evidence_refinement, salvage_plan=evidence_plan)
+        self.assertEqual(changed, [
+            "research_question", "theory_target", "evidence_mode", "experiment_capability_id",
+        ])
 
         child["phenomenon"] = "plant glutamate receptor cavity selectivity"
         for plan in (
@@ -1398,6 +1438,8 @@ class TopicDiscoveryTests(unittest.TestCase):
                 type(self).calls += 1
                 payload = json.loads(prompt)
                 response = package(payload["principal_objective"])
+                for candidate in response["candidates"]:
+                    candidate["domain"] = "Unrelated domain"
                 return ModelResult(
                     text=json.dumps(response), model="fake",
                     usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
@@ -2596,6 +2638,20 @@ class TopicDiscoveryTests(unittest.TestCase):
             "intake_contract_failure",
         )
 
+    def test_repeated_semantically_rejected_candidate_is_a_contract_failure_not_a_new_pivot(self):
+        error = ValidationError(
+            "topic discovery repeated the byte-identical rejected response after a repair request")
+        trace = [
+            {"status": "rejected", "rejection_type": "novelty"},
+            {"status": "repeated_response"},
+        ]
+        rejected_history = [{"topic_id": "direction_3", "rejection_type": "novelty"}]
+
+        self.assertEqual(
+            _topic_retry_reason(error, trace, rejected_history),
+            "intake_contract_failure",
+        )
+
     def test_feasibility_contract_failure_before_attempt_record_stops_local_intake(self):
         runner = TopicDiscoveryRunner({
             "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
@@ -2616,7 +2672,7 @@ class TopicDiscoveryTests(unittest.TestCase):
         error = raised.exception
         self.assertEqual(len(error.candidate_attempt_trace), 1)
         self.assertEqual(error.candidate_attempt_trace[0]["status"], "rejected")
-        self.assertEqual(error.topic_retry_reason, "scientific_candidate_rejected")
+        self.assertEqual(error.topic_retry_reason, "intake_contract_failure")
         self.assertEqual(error.topic_budget["usage"]["model_calls"], 1)
 
     def test_novelty_failure_before_attempt_record_stops_local_intake(self):
@@ -2656,7 +2712,7 @@ class TopicDiscoveryTests(unittest.TestCase):
                 runner.run("Choose a feasible research direction")
         caught = raised.exception
         self.assertTrue(caught.topic_intake_recoverable)
-        self.assertEqual(caught.topic_retry_reason, "scientific_candidate_rejected")
+        self.assertEqual(caught.topic_retry_reason, "intake_contract_failure")
         self.assertEqual(caught.topic_budget["usage"]["model_calls"], 2)
         self.assertEqual(caught.usage["openalex_requests"], 3)
         self.assertEqual(caught.candidate_attempt_trace, [{"status": "rejected"}])
@@ -3194,6 +3250,7 @@ class TopicDiscoveryTests(unittest.TestCase):
                 value = json.loads(result.text)
                 for candidate in value["candidates"]:
                     candidate["resource_plan"] = ""
+                    candidate["evidence_mode"] = "synthetic_simulation"
                     candidate["feasibility_plan"] = foundry_feasibility_plan()
                 return ModelResult(
                     text=json.dumps(value), model="fake", usage=result.usage,
@@ -3599,13 +3656,14 @@ class TopicDiscoveryTests(unittest.TestCase):
         )
         self.assertEqual(selected["feasibility_plan"]["data_access"], "closed_world")
 
-    def test_incompatible_feasibility_plan_is_a_candidate_pivot_not_a_format_retry(self):
+    def test_incompatible_feasibility_plan_is_a_repairable_contract_failure(self):
         error = ValidationError(
             "feasibility_plan.project_artifact must declare a project_artifact input")
-        self.assertEqual(_topic_validation_rejection_type(error), "feasibility")
+        self.assertEqual(
+            _topic_validation_rejection_type(error), "feasibility_contract")
         self.assertEqual(
             _topic_retry_reason(error, [{"status": "rejected"}], []),
-            "scientific_candidate_rejected",
+            "intake_contract_failure",
         )
 
     def test_feasibility_input_repair_does_not_invent_an_unsupported_input(self):
@@ -3627,6 +3685,77 @@ class TopicDiscoveryTests(unittest.TestCase):
         }
         self.assertEqual(_repair_feasibility_input_contract(value, context), [])
         self.assertEqual(selected["feasibility_plan"], original)
+
+    def test_topic_admission_rejects_empirical_data_hidden_in_self_contained_plan(self):
+        value = package("Choose an executable research direction")
+        selected = value["candidates"][1]
+        selected["feasibility_plan"] = foundry_feasibility_plan()
+        with self.assertRaisesRegex(ValidationError, "controller-verified source rows"):
+            validate_topic_package(value, objective=value["objective"])
+
+        selected["evidence_mode"] = "analytical_derivation"
+        selected["resource_plan"] = "Digitize the published trend from Figure 3 and fit its points."
+        with self.assertRaisesRegex(ValidationError, "digitized or measured source data"):
+            validate_topic_package(value, objective=value["objective"])
+
+        selected["resource_plan"] = "Use the analytic model equations and fit the declared grid."
+        selected["data_regime"] = (
+            "Analytical evaluation over confinement ratios 2-100; reference trend from "
+            "the published onset shear-rate-versus-gap data is digitized from W2162644906.")
+        with self.assertRaisesRegex(ValidationError, "controller-verified source-data input"):
+            validate_topic_package(value, objective=value["objective"])
+
+    def test_literature_equations_do_not_require_empirical_source_rows(self):
+        from scisaurus.runtime.topic_discovery import (
+            scope_maturity_requirements_to_topic_evidence,
+            topic_requires_source_data,
+        )
+
+        topic = {
+            "evidence_mode": "analytical_derivation",
+            "research_question": "Which term changes the analytic onset scaling?",
+            "scope": "A self-contained parameter sweep of the derived equations.",
+            "data_regime": "Synthetic/analytic grid; no fitted observations.",
+            "resource_plan": "Use equations and parameter ranges reported in published studies.",
+            "feasibility_plan": foundry_feasibility_plan(evidence_inputs=[
+                {"kind": "analytical_parameters", "status": "available",
+                 "source": "Published reentrant-jamming flow curves and onset-gap description."},
+                {"kind": "synthetic", "status": "available",
+                 "source": "Derived onset grid; no measured observations."},
+            ]),
+        }
+        self.assertFalse(topic_requires_source_data(topic))
+
+        requirements = [
+            "Supply digitized onset-versus-gap table with uncertainties",
+            "Locate and verify the reference dataset in the literature survey",
+            "Provide W4379162019 extract supporting rough-contact threshold",
+            "State functional forms and matched parameter counts",
+            "Run synthetic-recovery power check on declared grid",
+        ]
+        scoped = scope_maturity_requirements_to_topic_evidence(
+            topic, requirements, evidence_boundary_changed=True)
+        self.assertEqual(scoped["out_of_scope"], [requirements[0]])
+        self.assertEqual(scoped["active"], requirements[1:])
+
+        unchanged = scope_maturity_requirements_to_topic_evidence(
+            topic, requirements, evidence_boundary_changed=False)
+        self.assertEqual(unchanged["active"], requirements)
+        self.assertEqual(unchanged["out_of_scope"], [])
+
+        empirical = dict(topic)
+        empirical["evidence_mode"] = "published_observations"
+        still_required = scope_maturity_requirements_to_topic_evidence(
+            empirical, requirements, evidence_boundary_changed=True)
+        self.assertEqual(still_required["active"], requirements)
+        self.assertEqual(still_required["out_of_scope"], [])
+
+        empirical_input = dict(topic)
+        empirical_input["feasibility_plan"] = foundry_feasibility_plan(evidence_inputs=[
+            {"kind": "public_dataset", "status": "available",
+             "source": "Published flow-curve observations."},
+        ])
+        self.assertTrue(topic_requires_source_data(empirical_input))
 
     def test_feasibility_numeric_repair_runs_before_optional_input_inventory(self):
         value = package("Choose a feasible research direction")

@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import ModelContractError, ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.schema import canonical_bytes, sha256_hex
 from scisaurus.core.store import ArtifactStore
@@ -25,8 +25,10 @@ from scisaurus.runtime.capability_registry import (
     experiment_program_payload, experiment_validation_payload,
 )
 from scisaurus.runtime.config import configured_worker_slots
-from scisaurus.runtime.experiment_config import ASSET_MEDIA_TYPES, validate_experiment_config
-from scisaurus.runtime.models import ModelResult
+from scisaurus.runtime.experiment_config import (
+    ASSET_MEDIA_TYPES, validate_experiment_config, validate_work_orders,
+)
+from scisaurus.runtime.models import ModelCallError, ModelResult
 from scisaurus.runtime.operations import OperationsCell
 from scisaurus.runtime.results import validate_results_package
 from scisaurus.runtime.research_quality import (
@@ -36,6 +38,41 @@ from scisaurus.runtime.research_quality import (
 )
 from scisaurus.runtime.scores import exact, identifier, output_path
 from scisaurus.runtime.time_policy import TimePolicy
+
+
+PROGRAM_OUTPUT_FIELDS = (
+    "schema_version", "study_id", "revision", "procedures", "observations",
+    "metrics", "findings", "limitations", "assets",
+)
+PROGRAM_OUTPUT_OPTIONAL_FIELDS = ("analysis",)
+PROGRAM_OUTPUT_LEGACY_FIELDS = ("work_order_assessments",)
+
+
+class ExperimentProgramOutputContractError(ModelContractError):
+    """A generated executor emitted valid JSON with an invalid output envelope."""
+
+    failure_class = "model_contract"
+    recovery_mode = "format_repair_then_rerun"
+    repair_gate = "program_output_contract"
+
+    def __init__(self, *, required_fields, observed_fields, missing_fields,
+                 unexpected_fields, observed_type=None):
+        self.required_fields = tuple(required_fields)
+        self.observed_fields = tuple(observed_fields)
+        self.missing_fields = tuple(missing_fields)
+        self.unexpected_fields = tuple(unexpected_fields)
+        self.observed_type = observed_type
+        details = [
+            f"required={list(self.required_fields)}",
+            f"observed={list(self.observed_fields)}",
+            f"missing={list(self.missing_fields)}",
+            f"unexpected={list(self.unexpected_fields)}",
+        ]
+        if observed_type is not None:
+            details.append(f"observed_type={observed_type}")
+        super().__init__(
+            "experiment program output requires the declared top-level contract "
+            "and permits only documented optional fields (" + "; ".join(details) + ")")
 
 
 REVIEW_CHECKS = {"method_alignment", "calculation_trace", "inference_scope", "limitation_coverage"}
@@ -117,13 +154,102 @@ def _finite_scalar(value, name):
     return value
 
 
-def validate_program_output(value, experiment):
-    output_fields = {"schema_version", "study_id", "revision", "procedures", "observations",
-                     "metrics", "findings", "limitations", "assets"}
-    if (not isinstance(value, dict) or set(value) - (output_fields | {"analysis"})
-            or not output_fields.issubset(value)):
-        raise ValidationError(
-            f"experiment program output requires {sorted(output_fields)} and permits analysis")
+def _json_pointer_value(document, pointer):
+    if not isinstance(pointer, str) or not pointer.startswith("/"):
+        raise ValidationError("work-order evidence paths must be absolute JSON Pointers")
+    value = document
+    for raw_token in pointer[1:].split("/"):
+        if re.search(r"~(?![01])", raw_token):
+            raise ValidationError(
+                f"work-order evidence path has invalid JSON Pointer escaping: {pointer!r}")
+        token = raw_token.replace("~1", "/").replace("~0", "~")
+        if isinstance(value, dict) and token in value:
+            value = value[token]
+        elif isinstance(value, list) and token.isdigit() and (token == "0" or not token.startswith("0")):
+            index = int(token)
+            if index >= len(value):
+                raise ValidationError(
+                    f"work-order evidence path does not resolve in the result: {pointer!r}")
+            value = value[index]
+        elif isinstance(value, list):
+            # Reviewer evidence commonly names a stable finding, metric, or check ID.
+            # Accept that selector alongside ordinary JSON Pointer array indices.
+            matches = [item for item in value if isinstance(item, dict)
+                       and any((key == "id" or key.endswith("_id")) and candidate == token
+                               for key, candidate in item.items())]
+            if len(matches) == 1:
+                value = matches[0]
+            elif len(matches) > 1:
+                raise ValidationError(
+                    f"work-order evidence path is ambiguous for stable ID {token!r}: {pointer!r}")
+            else:
+                raise ValidationError(
+                    f"work-order evidence path does not resolve in the result: {pointer!r}")
+        else:
+            raise ValidationError(
+                f"work-order evidence path does not resolve in the result: {pointer!r}")
+    return value
+
+
+def _validate_censored_event_observations(observations):
+    """Do not admit a censoring boundary as though an event was observed."""
+    censored_terms = (
+        "censor", "non_cross", "not_observed", "no_cross", "undefined",
+    )
+    bound_terms = ("bound", "limit", "lower", "upper", "threshold", "window")
+    for row_index, observation in enumerate(observations, start=1):
+        for status_key, status_value in observation.items():
+            if status_key.endswith("_status") and isinstance(status_value, str):
+                status = status_value.casefold().replace("-", "_").replace(" ", "_")
+                if not any(term in status for term in censored_terms):
+                    continue
+                event_prefix = status_key[:-len("_status")]
+                status_text = status_value
+            elif status_key.endswith("_censored") and status_value is True:
+                event_prefix = status_key[:-len("_censored")]
+                status_text = "censored"
+            else:
+                continue
+
+            point_values = [
+                key for key, value in observation.items()
+                if (key == event_prefix or key.startswith(event_prefix + "_"))
+                and not any(term in key.casefold() for term in bound_terms)
+                and type(value) in (int, float)
+                and math.isfinite(value)
+            ]
+            if point_values:
+                raise ValidationError(
+                    f"observation row {row_index} marks {event_prefix!r} as "
+                    f"{status_text!r} but supplies numeric event value(s) "
+                    f"{point_values[:4]}; retain the censoring bound separately "
+                    "and do not use it as an observed event")
+
+
+def validate_program_output(value, experiment, work_orders=None):
+    work_orders = validate_work_orders(work_orders)
+    output_fields = set(PROGRAM_OUTPUT_FIELDS)
+    allowed_output_fields = output_fields | set(PROGRAM_OUTPUT_OPTIONAL_FIELDS)
+    if work_orders:
+        # Backward compatibility only: a program's self-assessment is ignored;
+        # independent reviewers determine whether the work order is evidenced.
+        allowed_output_fields.update(PROGRAM_OUTPUT_LEGACY_FIELDS)
+    if not isinstance(value, dict):
+        raise ExperimentProgramOutputContractError(
+            required_fields=sorted(output_fields), observed_fields=[],
+            missing_fields=sorted(output_fields), unexpected_fields=[],
+            observed_type=type(value).__name__,
+        )
+    observed_fields = {str(key) for key in value}
+    missing_fields = output_fields - set(value)
+    unexpected_fields = set(value) - allowed_output_fields
+    if missing_fields or unexpected_fields:
+        raise ExperimentProgramOutputContractError(
+            required_fields=sorted(output_fields),
+            observed_fields=sorted(observed_fields),
+            missing_fields=sorted(str(key) for key in missing_fields),
+            unexpected_fields=sorted(str(key) for key in unexpected_fields),
+        )
     if value["schema_version"] != "experiment-program-output-1":
         raise ValidationError("unsupported experiment program output schema")
     if value["study_id"] != experiment["id"] or value["revision"] != experiment["revision"]:
@@ -147,6 +273,7 @@ def validate_program_output(value, experiment):
         if not isinstance(observation, dict):
             raise ValidationError("every experiment observation must be an object")
         canonical_bytes(observation)
+    _validate_censored_event_observations(observations)
 
     assets = value["assets"]
     if not isinstance(assets, list):
@@ -218,7 +345,7 @@ def validate_program_output(value, experiment):
         if len(matches) < requirement["min_count"]:
             raise ValidationError("experiment output omits a required asset")
     if "analysis" in value:
-        validate_analysis(value["analysis"])
+        value["analysis"] = validate_analysis(value["analysis"])
     # The executable result is admitted on reproducibility and independent
     # recalculation first.  A quality contract is a substantive publication
     # floor, not a pre-execution response-format gate: an author may omit the
@@ -331,37 +458,188 @@ def bind_deterministic_validation(value, candidate, experiment):
     return value
 
 
-def validate_model_review(value, reviewer_id, finding_ids):
-    exact(value, {"reviewer_id", "decision", "checks", "finding_assessments", "limitations"},
-          "experiment model review")
+def validate_model_review(value, reviewer_id, finding_ids, work_orders=None,
+                          program_output=None, deterministic_validation=None):
+    work_orders = validate_work_orders(work_orders)
+    required_fields = [
+        "reviewer_id", "decision", "checks", "finding_assessments", "limitations",
+    ]
+    if work_orders:
+        required_fields.append("work_order_assessments")
+    if not isinstance(value, dict) or set(required_fields) - set(value):
+        raise ValidationError(
+            "experiment model review omits required contract fields")
+    # Model-call artifacts preserve the complete provider response. The
+    # scientific review contract consumes only its required fields so harmless
+    # supplemental summaries do not discard otherwise valid assessments.
+    value = {key: value[key] for key in required_fields}
     if value["reviewer_id"] != reviewer_id or value["decision"] not in REVIEW_DECISIONS:
         raise ValidationError("experiment review identity or decision is invalid")
-    if not isinstance(value["checks"], list) or len(value["checks"]) != len(REVIEW_CHECKS):
+    required_checks = REVIEW_CHECKS | ({"work_order_resolution"} if work_orders else set())
+    if not isinstance(value["checks"], list) or len(value["checks"]) != len(required_checks):
         raise ValidationError("experiment review must execute every required check")
     seen = set()
     for check in value["checks"]:
         exact(check, {"check_id", "outcome", "evidence"}, "experiment review check")
-        if check["check_id"] in seen or check["check_id"] not in REVIEW_CHECKS:
+        if check["check_id"] in seen or check["check_id"] not in required_checks:
             raise ValidationError("experiment review check is unknown or duplicated")
         seen.add(check["check_id"])
         if check["outcome"] not in {"passed", "failed", "insufficient_evidence"}:
             raise ValidationError("experiment review check outcome is invalid")
         _text(check["evidence"], "experiment review check evidence")
     assessments = value["finding_assessments"]
-    if not isinstance(assessments, list) or {item.get("finding_id") for item in assessments} != finding_ids:
-        raise ValidationError("experiment review must assess every finding exactly once")
-    if len(assessments) != len(finding_ids):
-        raise ValidationError("experiment finding assessments cannot contain duplicates")
+    if not isinstance(assessments, list):
+        raise ValidationError("experiment finding assessments must be a list")
+    observed_ids = []
+    malformed_assessments = []
+    for item in assessments:
+        finding_id = item.get("finding_id") if isinstance(item, dict) else None
+        if isinstance(finding_id, str):
+            observed_ids.append(finding_id)
+        else:
+            malformed_assessments.append(str(item)[:160])
+    counts = {finding_id: observed_ids.count(finding_id) for finding_id in set(observed_ids)}
+    missing_ids = sorted(finding_ids - set(observed_ids))
+    unknown_ids = sorted(set(observed_ids) - finding_ids, key=str)
+    duplicate_ids = sorted((finding_id for finding_id, count in counts.items()
+                            if count > 1), key=str)
+    if (malformed_assessments or missing_ids or unknown_ids
+            or duplicate_ids or len(assessments) != len(finding_ids)):
+        raise ValidationError(
+            "experiment review finding IDs must match the required IDs exactly once; "
+            f"missing={missing_ids}; unknown={unknown_ids}; duplicates={duplicate_ids}; "
+            f"malformed={malformed_assessments[:4]}; required_ids={sorted(finding_ids)}")
     for item in assessments:
         exact(item, {"finding_id", "outcome", "rationale"}, "finding assessment")
         if item["outcome"] not in {"supported", "overstated", "insufficient_evidence"}:
             raise ValidationError("finding assessment outcome is invalid")
         _text(item["rationale"], "finding assessment rationale")
+    if work_orders:
+        expected = {item["id"] for item in work_orders}
+        order_assessments = value["work_order_assessments"]
+        ids = [item.get("work_order_id") for item in order_assessments
+               if isinstance(item, dict)] if isinstance(order_assessments, list) else []
+        if (not isinstance(order_assessments, list) or len(ids) != len(order_assessments)
+                or any(not isinstance(item, str) for item in ids)
+                or set(ids) != expected or len(ids) != len(set(ids))
+                or not isinstance(program_output, dict)):
+            raise ValidationError("review work-order assessments must match active orders exactly once")
+        for item in order_assessments:
+            exact(item, {"work_order_id", "outcome", "evidence_paths", "limitation_path", "rationale"},
+                  "review work-order assessment")
+            if item["outcome"] not in {"resolved", "bounded", "not_resolved"}:
+                raise ValidationError("review work-order outcome is invalid")
+            _text(item["rationale"], "review work-order rationale")
+            evidence_paths = item["evidence_paths"]
+            if (not isinstance(evidence_paths, list) or not evidence_paths
+                    or any(not isinstance(path, str) for path in evidence_paths)
+                    or len(evidence_paths) != len(set(evidence_paths))):
+                raise ValidationError("review work-order evidence must cite unique result paths")
+            for pointer in evidence_paths:
+                parts = pointer[1:].split("/", 1) if pointer.startswith("/") else []
+                root = (parts[0].replace("~1", "/").replace("~0", "~")
+                        if parts else None)
+                if root == "deterministic_validation":
+                    if not isinstance(deterministic_validation, dict):
+                        raise ValidationError(
+                            "review work-order evidence cites unavailable independent validation")
+                    cited = _json_pointer_value(
+                        {"deterministic_validation": deterministic_validation}, pointer)
+                elif root in {"procedures", "observations", "metrics", "findings",
+                              "assets", "analysis"}:
+                    cited = _json_pointer_value(program_output, pointer)
+                else:
+                    raise ValidationError(
+                        "review work-order evidence must point to program output or independent validation")
+                if cited is None or cited == "" or cited == [] or cited == {}:
+                    raise ValidationError("review work-order evidence path points to empty result data")
+            limitation_path = item["limitation_path"]
+            if item["outcome"] == "bounded" or limitation_path is not None:
+                if (not isinstance(limitation_path, str)
+                        or not limitation_path.startswith("/limitations/")):
+                    raise ValidationError(
+                        "bounded or unresolved work orders require a result limitation path")
+                limitation = _json_pointer_value(program_output, limitation_path)
+                if not isinstance(limitation, str) or not limitation.strip():
+                    raise ValidationError("work-order limitation path must resolve to nonempty text")
+            if item["outcome"] == "resolved" and limitation_path is not None:
+                raise ValidationError("resolved work orders cannot cite a limitation path")
+        order_check = next(item for item in value["checks"]
+                           if item["check_id"] == "work_order_resolution")
+        unresolved = any(item["outcome"] == "not_resolved" for item in order_assessments)
+        if unresolved and order_check["outcome"] == "passed":
+            raise ValidationError("work-order check cannot pass while a scoped order is unresolved")
+        if not unresolved and order_check["outcome"] != "passed":
+            raise ValidationError("work-order check must pass only after every order is evidenced or bounded")
     if not isinstance(value["limitations"], list):
         raise ValidationError("experiment review limitations must be a list")
     for limitation in value["limitations"]:
         _text(limitation, "experiment review limitation")
     return value
+
+
+def _review_repair_directives(reviews):
+    """Carry adverse reviewer claims forward without treating them as verified defects."""
+    directives = []
+    for review in reviews if isinstance(reviews, list) else []:
+        if not isinstance(review, dict):
+            continue
+        reviewer_id = review.get("reviewer_id")
+        if not isinstance(reviewer_id, str) or not reviewer_id.strip():
+            continue
+        for check in review.get("checks", []):
+            if not isinstance(check, dict) or check.get("outcome") == "passed":
+                continue
+            check_id = check.get("check_id")
+            evidence = check.get("evidence")
+            if not isinstance(check_id, str) or not isinstance(evidence, str):
+                continue
+            directives.append({
+                "id": f"{reviewer_id}-{check_id}",
+                "kind": "review_check_to_verify",
+                "source": reviewer_id,
+                "text": (
+                    f"{reviewer_id} reported check {check_id} as {check.get('outcome')!r}. "
+                    "This is a reviewer verdict, not an independently confirmed defect. "
+                    "Reproduce the check from the retained observations and deterministic "
+                    "validation before changing code, data, or claims; if the reported outcome "
+                    "conflicts with its evidence, record and resolve that contradiction rather "
+                    f"than assuming a repair is needed. Reported evidence: {evidence.strip()}"
+                )[:2200],
+            })
+        for assessment in review.get("finding_assessments", []):
+            if not isinstance(assessment, dict) or assessment.get("outcome") == "supported":
+                continue
+            finding_id = assessment.get("finding_id")
+            rationale = assessment.get("rationale")
+            if not isinstance(finding_id, str) or not isinstance(rationale, str):
+                continue
+            directives.append({
+                "id": f"{reviewer_id}-{finding_id}",
+                "kind": "review_finding_to_verify",
+                "source": reviewer_id,
+                "text": (
+                    f"{reviewer_id} assessed finding {finding_id} as "
+                    f"{assessment.get('outcome')!r}. Verify that scope judgment against the "
+                    "linked observations and the stated claim before changing the analysis; "
+                    f"reviewer rationale: {rationale.strip()}"
+                )[:2200],
+            })
+    if not directives:
+        rejected = [item.get("reviewer_id") for item in reviews
+                    if isinstance(item, dict) and item.get("decision") == "rejected"]
+        if rejected:
+            directives.append({
+                "id": "review-rejected-disposition",
+                "kind": "rejected_disposition",
+                "source": ", ".join(str(item) for item in rejected),
+                "text": (
+                    "An independent reviewer rejected the result without a machine-readable failed "
+                    "check or unsupported finding. Inspect the retained review artifact and establish "
+                    "the concrete scientific reason from the observations before changing the analysis."
+                ),
+            })
+    return directives[:16]
 
 
 def reconcile_model_review_disposition(value):
@@ -385,10 +663,93 @@ def reconcile_model_review_disposition(value):
     }
 
 
-def validate_assessment(value, study_id, evidence_refs, review_outcomes, finding_ids, expected_limitations):
-    exact(value, {"schema_version", "study_id", "decision", "summary", "evidence_refs",
-                  "reviewer_outcomes", "accepted_findings", "limitations"}, "experiment assessment")
-    if value["schema_version"] != "experiment-assessment-1" or value["study_id"] != study_id:
+def _scoped_review_assessment(reviews, finding_ids):
+    """Admit only findings supported by every reviewer when only scope is disputed."""
+    if not isinstance(reviews, list) or not reviews:
+        return None
+    if not any(item.get("decision") == "rejected" for item in reviews
+               if isinstance(item, dict)):
+        return None
+
+    scope_checks = {"inference_scope", "limitation_coverage"}
+    adverse_checks = []
+    for review in reviews:
+        if not isinstance(review, dict):
+            return None
+        for check in review.get("checks", []):
+            if not isinstance(check, dict) or check.get("outcome") == "passed":
+                continue
+            if check.get("check_id") not in scope_checks:
+                return None
+            adverse_checks.append({
+                "reviewer_id": review.get("reviewer_id"),
+                "check_id": check.get("check_id"),
+                "outcome": check.get("outcome"),
+                "evidence": check.get("evidence"),
+            })
+
+    assessments = {}
+    for review in reviews:
+        reviewer_id = review.get("reviewer_id")
+        by_id = {item.get("finding_id"): item
+                 for item in review.get("finding_assessments", [])
+                 if isinstance(item, dict)}
+        if set(by_id) != finding_ids:
+            return None
+        for finding_id in finding_ids:
+            assessments.setdefault(finding_id, []).append({
+                "reviewer_id": reviewer_id,
+                "outcome": by_id[finding_id].get("outcome"),
+                "rationale": by_id[finding_id].get("rationale"),
+            })
+    accepted = sorted(
+        finding_id for finding_id, outcomes in assessments.items()
+        if all(item["outcome"] == "supported" for item in outcomes)
+    )
+    if not accepted:
+        return None
+    withheld = sorted(finding_ids - set(accepted))
+    if not withheld and not adverse_checks:
+        return None
+    disagreement_notes = [
+        f"{item['reviewer_id']}:{item['check_id']}={item['outcome']}"
+        for item in adverse_checks
+    ]
+    disagreement_notes.extend(
+        f"{reviewer_id}:{finding_id}={item['outcome']}"
+        for finding_id, outcomes in assessments.items()
+        for item in outcomes if item["outcome"] != "supported"
+        for reviewer_id in (item["reviewer_id"],)
+    )
+    summary = (
+        "Independent deterministic checks and numerical recalculation passed. The assessment admits only "
+        "findings supported by every assigned reviewer; disputed inference-scope findings are withheld. "
+        "Unresolved scope evidence: " + "; ".join(disagreement_notes)
+    )
+    return {
+        "accepted_findings": accepted,
+        "withheld_findings": [
+            {"finding_id": finding_id,
+             "reviewer_assessments": assessments[finding_id]}
+            for finding_id in withheld
+        ],
+        "scope_review_evidence": {"adverse_checks": adverse_checks},
+        "summary": summary[:4000],
+    }
+
+
+def validate_assessment(value, study_id, evidence_refs, review_outcomes, finding_ids,
+                        expected_limitations, *, reviews=None):
+    base_fields = {"schema_version", "study_id", "decision", "summary", "evidence_refs",
+                   "reviewer_outcomes", "accepted_findings", "limitations"}
+    schema_version = value.get("schema_version") if isinstance(value, dict) else None
+    if schema_version == "experiment-assessment-2":
+        exact(value, base_fields | {"withheld_findings", "scope_review_evidence"},
+              "scoped experiment assessment")
+    else:
+        exact(value, base_fields, "experiment assessment")
+    if schema_version not in {"experiment-assessment-1", "experiment-assessment-2"} \
+            or value["study_id"] != study_id:
         raise ValidationError("experiment assessment does not match the study")
     if value["decision"] not in REVIEW_DECISIONS:
         raise ValidationError("experiment assessment decision is invalid")
@@ -403,10 +764,61 @@ def validate_assessment(value, study_id, evidence_refs, review_outcomes, finding
         raise ValidationError("experiment assessment must preserve the exact program limitations")
     for limitation in value["limitations"]:
         _text(limitation, "experiment assessment limitation")
-    if value["decision"] != "rejected" and (
-            set(value["accepted_findings"]) != finding_ids
-            or any(item["decision"] == "rejected" for item in review_outcomes)):
-        raise ValidationError("accepted assessment must retain every independently supported finding")
+    accepted = set(value["accepted_findings"])
+    if value["decision"] == "rejected":
+        if accepted:
+            raise ValidationError("rejected assessment cannot admit findings")
+    elif value["decision"] == "accepted":
+        if (accepted != finding_ids
+                or any(item["decision"] == "rejected" for item in review_outcomes)):
+            raise ValidationError("accepted assessment must retain every finding without a rejected review")
+    elif reviews is None:
+        if (accepted != finding_ids
+                or any(item["decision"] == "rejected" for item in review_outcomes)):
+            raise ValidationError(
+                "legacy accepted_with_limitations assessment must retain every independently reviewed finding")
+    elif schema_version == "experiment-assessment-2":
+        if value["decision"] != "accepted_with_limitations" or reviews is None:
+            raise ValidationError("scoped acceptance requires the validated independent reviews")
+        expected = _scoped_review_assessment(reviews, finding_ids)
+        observed = {
+            "accepted_findings": value["accepted_findings"],
+            "withheld_findings": value["withheld_findings"],
+            "scope_review_evidence": value["scope_review_evidence"],
+            "summary": value["summary"],
+        }
+        if expected is None or canonical_bytes(observed) != canonical_bytes(expected):
+            raise ValidationError(
+                "scoped assessment must preserve the exact unanimous findings and review evidence")
+    else:
+        scope_checks = {"inference_scope", "limitation_coverage"}
+        evidence_by_finding = {finding_id: [] for finding_id in finding_ids}
+        adverse_checks = []
+        for review in reviews:
+            for check in review.get("checks", []):
+                if check.get("outcome") != "passed":
+                    if check.get("check_id") not in scope_checks:
+                        raise ValidationError(
+                            "limited acceptance cannot override a methods or calculation failure")
+                    adverse_checks.append(check)
+            for item in review.get("finding_assessments", []):
+                evidence_by_finding[item["finding_id"]].append(item["outcome"])
+        if not accepted or any(
+                evidence_by_finding[finding_id]
+                and any(outcome != "supported" for outcome in evidence_by_finding[finding_id])
+                for finding_id in accepted):
+            raise ValidationError(
+                "limited acceptance may include only findings supported by every reviewer")
+        withheld = finding_ids - accepted
+        if any(all(outcome == "supported" for outcome in evidence_by_finding[finding_id])
+               for finding_id in withheld):
+            raise ValidationError(
+                "withheld findings must have a recorded reviewer disagreement")
+        if (any(item["decision"] == "rejected" for item in review_outcomes)
+                and not adverse_checks
+                and not withheld):
+            raise ValidationError(
+                "limited acceptance must preserve the rejected review's scoped concern")
     return value
 
 
@@ -415,6 +827,7 @@ class ExperimentRunner(ExecutionRuntime):
         config = validate_experiment_config(config)
         super().__init__(project_dir, config, worker_target=_invoke_worker, on_progress=on_progress)
         self.experiment = config["experiment"]
+        self.work_orders = config.get("work_orders", [])
         self.operations = OperationsCell(self.control, self.store, project_id=config["project_id"])
         self.bindings = {}
         self.profile_refs = {}
@@ -528,7 +941,10 @@ class ExperimentRunner(ExecutionRuntime):
         self._checkpoint("experiment_capabilities_ready", force=True)
 
     def _program_input(self):
-        return experiment_program_payload(self.experiment, self.experiment["execution"]["input"])
+        configured_input = deepcopy(self.experiment["execution"]["input"])
+        if self.work_orders:
+            configured_input["work_orders"] = deepcopy(self.work_orders)
+        return experiment_program_payload(self.experiment, configured_input)
 
     def _execute_once(self):
         decision = self.time_policy.admit("production", task_count=1)
@@ -538,7 +954,7 @@ class ExperimentRunner(ExecutionRuntime):
         result, ref = self.operations.run(self.bindings["execution"], {"input": self._program_input()}, self._call,
             operator="methods.experiment-operator")
         self.time_policy.observe("production", time.monotonic() - started)
-        candidate = validate_program_output(result["document"], self.experiment)
+        candidate = validate_program_output(result["document"], self.experiment, self.work_orders)
         self.execution_refs.append(ref)
         return candidate
 
@@ -597,69 +1013,172 @@ class ExperimentRunner(ExecutionRuntime):
 
     def _review_assignment(self, reviewer, candidate, deterministic, evidence_refs):
         summary = {key: candidate[key] for key in (
-            "schema_version", "study_id", "revision", "procedures", "metrics", "findings", "limitations", "assets")}
+            "schema_version", "study_id", "revision", "procedures", "observations",
+            "metrics", "findings", "limitations", "assets")}
         if "analysis" in candidate:
             summary["analysis"] = candidate["analysis"]
-        return {"phase": "experiment_result_review", "reviewer": reviewer,
+        required_checks = REVIEW_CHECKS | ({"work_order_resolution"} if self.work_orders else set())
+        instructions = (
+            "Inspect the summarized output and every attached figure. Return only the complete JSON object with reviewer_id, decision, checks, finding_assessments, limitations; no preamble, markdown, or chain-of-thought. "
+            "Copy reviewer.id as reviewer_id. Execute each required check exactly once as {check_id,outcome,evidence}; outcomes are passed, failed, or insufficient_evidence. "
+            "Assess every ID in required_finding_ids exactly once as {finding_id,outcome,rationale}; outcomes are supported, overstated, or insufficient_evidence. Do not invent suffixes, placeholders, or summary IDs. "
+            "Decision is accepted, accepted_with_limitations, or rejected. Both accepted decisions require every check passed and every finding supported. Use accepted_with_limitations only for limitations that do not contradict a check or finding outcome. If any check is failed or insufficient_evidence, or any finding is overstated or insufficient_evidence, choose rejected and preserve those outcomes; never soften adverse evidence to make the decision acceptable. "
+            "Treat program numbers as observations only after the independent recalculation passes. Check method-contract alignment, calculation trace, inference scope, and limitation coverage. "
+            "Do not infer general scientific truth, novelty, or external validity from one finite computational study. Preserve negative and mixed results. Keep each evidence or rationale field concise (at most 400 characters) and include no more than six limitations."
+        )
+        if self.work_orders:
+            instructions += (
+                " For every supplied work order, independently assess its exact result evidence and return one "
+                "work_order_assessments row with work_order_id, outcome, evidence_paths, limitation_path, rationale. "
+                "The experiment program must not self-certify work orders; do not treat an absent "
+                "producer-authored work_order_assessments field as a defect. These assessments belong in your "
+                "review response only. "
+                "Use outcome=resolved only when its success_condition is demonstrated, outcome=bounded only when "
+                "the remaining scope is explicitly supported by a result limitation, and outcome=not_resolved "
+                "when the objective or success condition is not demonstrated. Cite evidence paths rooted at "
+                "program output or the supplied independent recalculation. Array segments may be numeric indices "
+                "or a unique stable object identifier (an `id` or `*_id` field), for example /metrics/0, "
+                "/findings/finding_kill_condition, or /deterministic_validation/checks/independent_recalculation; "
+                "producer-authored assessments are not evidence. A bounded "
+                "outcome must cite its exact limitation_path. "
+                "The work_order_resolution check must pass iff all orders are resolved or explicitly bounded; otherwise "
+                "mark it insufficient_evidence or failed and reject the review. Do not treat a narrative assertion "
+                "as evidence when the cited observations, metrics, findings, procedures, or analysis do not support it."
+            )
+        assignment = {"phase": "experiment_result_review", "reviewer": reviewer,
             "study": {key: self.experiment[key] for key in (
                 "id", "study_type", "domain", "research_question", "hypothesis", "method", "parameters",
                 "seed", "run_count", "stopping_rule", "primary_outcomes", "limitations")},
             "program_output_summary": summary, "deterministic_validation": deterministic,
-            "evidence_refs": evidence_refs, "required_checks": sorted(REVIEW_CHECKS),
-            "instructions": (
-                "Inspect the summarized output and every attached figure. Return exactly reviewer_id, decision, checks, finding_assessments, limitations. "
-                "Copy reviewer.id as reviewer_id. Execute each required check exactly once as {check_id,outcome,evidence}; outcomes are passed, failed, or insufficient_evidence. "
-                "Assess each finding exactly once as {finding_id,outcome,rationale}; outcomes are supported, overstated, or insufficient_evidence. "
-                "Decision is accepted, accepted_with_limitations, or rejected. Both accepted decisions require every check passed and every finding supported. Use accepted_with_limitations only for limitations that do not contradict a check or finding outcome. If any check is failed or insufficient_evidence, or any finding is overstated or insufficient_evidence, choose rejected and preserve those outcomes; never soften adverse evidence to make the decision acceptable. "
-                "Treat program numbers as observations only after the independent recalculation passes. Check method-contract alignment, calculation trace, inference scope, and limitation coverage. "
-                "Do not infer general scientific truth, novelty, or external validity from one finite computational study. Preserve negative and mixed results." )}
+            "evidence_refs": evidence_refs, "required_checks": sorted(required_checks),
+            "required_finding_ids": sorted(item["id"] for item in candidate["findings"]),
+            "instructions": instructions}
+        if self.work_orders:
+            assignment["work_orders"] = deepcopy(self.work_orders)
+            assignment["required_work_order_ids"] = [item["id"] for item in self.work_orders]
+        return assignment
 
     def _model_checked(self, jobs, *, images, stage):
         pending, accepted, feedback = list(jobs), {}, {}
         repair_mode = self.config["limits"].get("repair_mode", "bounded")
         rounds = (itertools.count() if repair_mode == "until_deadline"
                   else range(self.config["limits"]["max_rounds"]))
+        continuation_prefixes = {}
+        continuation_rounds = {}
+        continuation_no_progress = []
         for _ in rounds:
             self._ensure_active()
             admission = self.time_policy.admit(stage, task_count=len(pending))
             if not admission["allowed"]:
                 raise ValidationError(f"time admission deferred experiment review: {admission['reason']}")
+            review_model = deepcopy(self.config["model"])
+            if review_model.get("protocol") == "openai_compatible":
+                review_model["output_format"] = "json_object"
             specs = []
             for job in pending:
                 self.serial += 1
                 assignment = deepcopy(job["assignment"])
-                if job["name"] in feedback:
+                if job["name"] in feedback and job["name"] not in continuation_prefixes:
                     assignment["validation_feedback"] = feedback[job["name"]]
+                params = {"client": review_model,
+                          "prompt": json.dumps(assignment, ensure_ascii=False)}
+                if job["name"] in continuation_prefixes:
+                    params["continuation_text"] = continuation_prefixes[job["name"]]
                 specs.append({"task_id": f"experiment-{job['name']}-{self.serial}", "kind": "model",
                               "actor": job["actor"], "task_kind": "verification",
-                              "params": {"client": self.config["model"],
-                                         "prompt": json.dumps(assignment, ensure_ascii=False),
-                                         **({"images": images} if images else {})}})
+                              "params": {**params, **({"images": images} if images else {})}})
             outcomes = self._call_batch(specs, max_parallel=self.worker_slots)
             rejected = []
             for job, spec in zip(pending, specs):
                 outcome = outcomes[spec["task_id"]]
                 if not outcome["ok"]:
+                    if outcome.get("error_type") == "ModelCallError":
+                        raise ModelCallError(
+                            outcome.get("error", "experiment model dispatch failed"),
+                            outcome_known=outcome.get("outcome_known", False),
+                            attempts=outcome.get("attempts", 0),
+                            elapsed_seconds=outcome.get("elapsed_seconds"),
+                            status_code=outcome.get("status_code"),
+                            retry_after_seconds=outcome.get("retry_after_seconds"),
+                            provider_error_kind=outcome.get("provider_error_kind"),
+                        )
                     raise ValidationError(f"experiment model dispatch failed: {job['name']}: {outcome['error']}")
                 result = ModelResult(**outcome["result"])
                 self.time_policy.observe(stage, result.elapsed_seconds)
+                prior_prefix = continuation_prefixes.get(job["name"])
                 try:
                     if result.finish_reason != "stop":
-                        raise ValidationError("experiment model generation did not finish normally")
+                        raise ValidationError(
+                            f"review response remains incomplete after continuation: {result.finish_reason}")
                     value = result.json_object()
                     job["validator"](value)
                 except (ValidationError, TypeError, ValueError, KeyError) as exc:
+                    made_progress = (
+                        isinstance(result.text, str) and bool(result.text)
+                        and (prior_prefix is None or len(result.text) > len(prior_prefix))
+                    )
+                    if (result.finish_reason == "length" and made_progress
+                            and continuation_rounds.get(job["name"], 0) < 2):
+                        continuation_prefixes[job["name"]] = result.text
+                        continuation_rounds[job["name"]] = (
+                            continuation_rounds.get(job["name"], 0) + 1)
+                        feedback.pop(job["name"], None)
+                        self.tasks.transition(
+                            spec["task_id"], "blocked", "command.controller",
+                            reason="review response is still truncated; continue the same provider output")
+                        rejected.append(job)
+                        continue
+                    if result.finish_reason == "length":
+                        continuation_no_progress.append({
+                            "reviewer": job["name"],
+                            "response_ref": outcome.get("record_ref"),
+                            "prior_prefix_chars": len(prior_prefix or ""),
+                            "response_chars": len(result.text or ""),
+                        })
+                        continuation_prefixes.pop(job["name"], None)
+                        feedback[job["name"]] = {
+                            "error": "continuation returned no additional text or exhausted its bounded continuation rounds",
+                            "response_ref": outcome.get("record_ref"),
+                            "finish_reason": result.finish_reason,
+                            "scope": "Do not replay unchanged content; preserve this response as an incomplete reviewer artifact.",
+                        }
+                        self.tasks.transition(
+                            spec["task_id"], "blocked", "command.controller",
+                            reason="review continuation made no progress")
+                        rejected.append(job)
+                        continue
+                    continuation_prefixes.pop(job["name"], None)
                     feedback[job["name"]] = {"error": str(exc),
-                        "scope": "Repair only the response schema or unsupported acceptance. Return the complete requested JSON object."}
+                        "response_ref": outcome.get("record_ref"),
+                        "finish_reason": result.finish_reason,
+                        "scope": (
+                            "Complete the previously truncated reviewer response without changing the review assignment."
+                            if result.finish_reason == "length" else
+                            "Repair only the response schema or unsupported acceptance. Return the complete requested JSON object."
+                        )}
                     self.tasks.transition(spec["task_id"], "blocked", "command.controller", reason=str(exc))
                     rejected.append(job)
                     continue
                 self._complete(spec["task_id"])
+                continuation_prefixes.pop(job["name"], None)
+                continuation_rounds.pop(job["name"], None)
                 accepted[job["name"]] = (value, outcome["record_ref"])
             if not rejected:
                 return accepted
+            if continuation_no_progress:
+                detail = json.dumps(continuation_no_progress, ensure_ascii=False, sort_keys=True)[:6000]
+                raise ModelContractError(
+                    "experiment model review continuation made no progress; "
+                    f"incomplete outputs={detail}")
             pending = rejected
-        raise ValidationError("experiment model review did not satisfy its contract")
+        failures = [
+            {"reviewer": job["name"], **feedback[job["name"]]}
+            for job in pending if job["name"] in feedback
+        ]
+        detail = json.dumps(failures, ensure_ascii=False, sort_keys=True)[:6000]
+        raise ModelContractError(
+            "experiment model review did not satisfy its contract; "
+            f"rejected responses={detail}")
 
     def _model_reviews(self, candidate, deterministic, deterministic_record):
         finding_ids = {item["id"] for item in candidate["findings"]}
@@ -671,7 +1190,9 @@ class ExperimentRunner(ExecutionRuntime):
                          *[item["artifact_ref"] for item in self.asset_records]]
         jobs = [{"name": reviewer["id"], "actor": f"methods.experiment-reviewer.{reviewer['id']}",
                  "assignment": self._review_assignment(reviewer, candidate, deterministic, evidence_refs),
-                 "validator": lambda value, rid=reviewer["id"]: validate_model_review(value, rid, finding_ids)}
+                 "validator": lambda value, rid=reviewer["id"]: validate_model_review(
+                     value, rid, finding_ids, self.work_orders, candidate,
+                     deterministic_validation=deterministic)}
                 for reviewer in self.experiment["reviewers"]]
         values = self._model_checked(jobs, images=images, stage="integrated_review")
         reviews = []
@@ -685,6 +1206,41 @@ class ExperimentRunner(ExecutionRuntime):
             reviews.append(value)
         return reviews, images
 
+    def _work_order_package_assessments(self, candidate, reviews):
+        if not self.work_orders:
+            return []
+        reviewer_by_id = {review["reviewer_id"]: review for review in reviews}
+        packages = []
+        for order in self.work_orders:
+            reviewers = [next(item for item in review["work_order_assessments"]
+                              if item["work_order_id"] == order["id"])
+                         for review in reviewer_by_id.values()]
+            outcomes = {item["outcome"] for item in reviewers}
+            disposition = (
+                "unresolved" if "not_resolved" in outcomes else
+                "bounded" if "bounded" in outcomes else "completed"
+            )
+            evidence_paths = list(dict.fromkeys(
+                path for item in reviewers for path in item["evidence_paths"]))
+            rationales = [f"{reviewer['reviewer_id']}: {item['rationale']}"
+                          for reviewer, item in zip(reviewer_by_id.values(), reviewers)]
+            limitation_values = list(dict.fromkeys(
+                _json_pointer_value(candidate, item["limitation_path"])
+                for item in reviewers if item["limitation_path"] is not None))
+            limitation = "; ".join(limitation_values) if disposition == "bounded" else None
+            packages.append({
+                "id": order["id"], "kind": order["kind"], "owner": order["owner"],
+                "objective": order["objective"], "success_condition": order["success_condition"],
+                "disposition": disposition, "summary": "; ".join(rationales),
+                "evidence_paths": evidence_paths, "limitation": limitation,
+                "reviewer_assessments": [
+                    {"reviewer_id": reviewer["reviewer_id"], "outcome": item["outcome"],
+                     "evidence_paths": list(item["evidence_paths"]), "rationale": item["rationale"]}
+                    for reviewer, item in zip(reviewer_by_id.values(), reviewers)
+                ],
+            })
+        return packages
+
     def _assess(self, candidate, deterministic_record, reviews, images):
         review_refs = [record["artifact_ref"] for record in self.review_records]
         evidence_refs = [*self.execution_refs, deterministic_record["artifact_ref"], *review_refs,
@@ -693,6 +1249,29 @@ class ExperimentRunner(ExecutionRuntime):
         finding_ids = {item["id"] for item in candidate["findings"]}
         rejected_reviews = [item for item in reviews if item["decision"] == "rejected"]
         if rejected_reviews:
+            scoped = _scoped_review_assessment(reviews, finding_ids)
+            if scoped is not None:
+                value = {
+                    "schema_version": "experiment-assessment-2",
+                    "study_id": self.experiment["id"],
+                    "decision": "accepted_with_limitations",
+                    "summary": scoped["summary"],
+                    "evidence_refs": evidence_refs,
+                    "reviewer_outcomes": outcomes,
+                    "accepted_findings": scoped["accepted_findings"],
+                    "limitations": list(candidate["limitations"]),
+                    "withheld_findings": scoped["withheld_findings"],
+                    "scope_review_evidence": scoped["scope_review_evidence"],
+                }
+                value = validate_assessment(
+                    value, self.experiment["id"], evidence_refs, outcomes,
+                    finding_ids, candidate["limitations"], reviews=reviews)
+                record = self._publish(
+                    "methods/experiment-assessment", "verification",
+                    {**value, "execution_ref": None,
+                     "decision_basis": "unanimous_finding_intersection"},
+                    "methods.experiment-arbiter", subjects=evidence_refs)
+                return value, record
             # A model arbiter can repeatedly soften an independent rejection,
             # then consume its bounded retries failing the same deterministic
             # gate. Reconcile the disposition from the validated reviews.
@@ -751,7 +1330,7 @@ class ExperimentRunner(ExecutionRuntime):
         return value, record
 
     def _package(self, candidate, candidate_sha256, validation_record, validator_execution_ref,
-                 assessment, assessment_record):
+                 assessment, assessment_record, reviews):
         package_dir = self.dir / "output" / "results-package"
         package_dir.mkdir(parents=True, exist_ok=True)
         raw = canonical_bytes({"schema_version": "experiment-observations-1", "study_id": self.experiment["id"],
@@ -770,12 +1349,46 @@ class ExperimentRunner(ExecutionRuntime):
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(item["body"])
             assets.append(dict(asset))
-        package = {"schema_version": "results-package-2", "id": self.experiment["id"],
+        scoped_assessment = assessment.get("schema_version") == "experiment-assessment-2"
+        accepted_findings = set(assessment["accepted_findings"])
+        candidate_findings = {item["id"]: item for item in candidate["findings"]}
+        withheld_findings = [
+            {
+                **deepcopy(candidate_findings[item["finding_id"]]),
+                "reviewer_assessments": deepcopy(item["reviewer_assessments"]),
+            }
+            for item in assessment.get("withheld_findings", [])
+        ]
+        limitations = list(candidate["limitations"])
+        for item in withheld_findings:
+            rationales = "; ".join(
+                f"{review['reviewer_id']} ({review['outcome']}): {review['rationale']}"
+                for review in item["reviewer_assessments"]
+                if review["outcome"] != "supported")
+            limitations.append(
+                f"A candidate finding was withheld from the admitted results: {item['statement']} "
+                f"Independent review: {rationales}"
+            )
+        scope_evidence = assessment.get("scope_review_evidence", {})
+        for check in scope_evidence.get("adverse_checks", []):
+            limitations.append(
+                f"The inference scope remains bounded: {check['evidence']}"
+            )
+        limitations = list(dict.fromkeys(limitations))
+        work_order_assessments = self._work_order_package_assessments(candidate, reviews)
+        for item in work_order_assessments:
+            if (item["disposition"] == "bounded" and item["limitation"]
+                    and item["limitation"] not in limitations):
+                limitations.append(item["limitation"])
+        package = {"schema_version": "results-package-3" if scoped_assessment
+                   else "results-package-2", "id": self.experiment["id"],
             "revision": self.experiment["revision"], "study_type": self.experiment["study_type"],
             "question": self.experiment["research_question"], "hypothesis": self.experiment["hypothesis"],
             "procedures": candidate["procedures"], "metrics": candidate["metrics"],
-            "findings": candidate["findings"],
-            "limitations": list(candidate["limitations"]),
+            "findings": ([deepcopy(item) for item in candidate["findings"]
+                          if item["id"] in accepted_findings]
+                         if scoped_assessment else deepcopy(candidate["findings"])),
+            "limitations": limitations,
             "assets": assets,
             "provenance": {"score_ref": self.score_ref,
                 "literature_survey_ref": self.literature["survey_ref"],
@@ -789,6 +1402,10 @@ class ExperimentRunner(ExecutionRuntime):
                 "deterministic_validation_ref": validation_record["artifact_ref"],
                 "model_review_refs": [record["artifact_ref"] for record in self.review_records],
                 "assessment_ref": assessment_record["artifact_ref"]}}
+        if scoped_assessment:
+            package["withheld_findings"] = withheld_findings
+        if work_order_assessments:
+            package["work_order_assessments"] = work_order_assessments
         if self.experiment.get("quality_contract") is not None:
             package["quality_contract"] = deepcopy(self.experiment["quality_contract"])
             if "analysis" in candidate:
@@ -850,7 +1467,8 @@ class ExperimentRunner(ExecutionRuntime):
                 reviews, images = self._model_reviews(candidate, deterministic, validation_record)
                 assessment, assessment_record = self._assess(candidate, validation_record, reviews, images)
                 package, package_path = self._package(candidate, candidate_sha256, validation_record,
-                                                      validator_execution_ref, assessment, assessment_record)
+                                                      validator_execution_ref, assessment, assessment_record,
+                                                      reviews)
                 quality = package.get("quality_admission")
                 requests = [deepcopy(item) for item in self.research_expansion_requests
                             if isinstance(item, dict)]
@@ -864,24 +1482,64 @@ class ExperimentRunner(ExecutionRuntime):
                         repair = {"id": repair_id, "kind": "additional_experiment",
                                   "owner": "methods.validation"}
                         requests.append(repair)
+                    review_directives = _review_repair_directives(reviews)
+                    directive_ids = [item["id"] for item in review_directives]
+                    directive_evidence = " | ".join(
+                        item["text"] for item in review_directives)
                     repair.update({
                         "objective": (
-                            "Repair the rejected experiment on its current research direction. Use the independent "
-                            "review findings to fix the implementation or comparison; if the broad inference is "
-                            "unsupported, narrow the claim to the strongest result the existing evidence supports "
-                            "and rerun only the necessary analysis. Do not replace the phenomenon with an unrelated topic."),
+                            "Diagnose the rejected experiment on its current research direction. Treat each "
+                            "review directive below as a hypothesis to verify, not as an established defect. "
+                            "Reproduce adverse checks against retained observations and deterministic validation; "
+                            "change source or analysis only for a confirmed issue, otherwise reconcile the "
+                            "contradiction and state a narrowly bounded limitation. Do not alter measured data "
+                            "or substitute an unrelated topic. Reviewer reports: "
+                            + directive_evidence[:4200]),
                         "why": (
                             "The independent assessment rejected this package, so none of its findings may be used "
                             "as verified paper evidence. The raw observations, executable sources, and review "
                             "findings are retained for a targeted Methods repair."),
                         "success_condition": (
-                            "A fresh, reproducible result addresses each blocking review finding, or the manuscript "
-                            "claim is narrowed to what the observed data actually establish; an independent "
-                            "assessment records the resulting disposition and limitations."),
+                            "Every review directive is evidenced by a changed executable analysis, a corrected "
+                            "claim supported by unchanged observations, or an explicit bounded limitation. A fresh "
+                            "replay, independent recalculation, and assessment verify the repair."),
                         "evidence_needed": (
                             "Independent reviewer findings, current executor and validator sources, raw observations, "
                             "targeted repaired or narrowed analysis, deterministic replay, and a fresh result package. "
                             f"Assessment={assessment_record.get('artifact_ref')}; package={package_path}."),
+                        "review_directives": review_directives,
+                        "acceptance_checks": [
+                            f"Disposition {directive_id} with an executable change, a result-backed claim correction, "
+                            "or an explicit bounded limitation; prose comments alone do not satisfy this check."
+                            for directive_id in directive_ids
+                        ] + [
+                            "Preserve measured observations; correct interpretation or analysis without editing a result package.",
+                            "Replay the fresh program and independently recalculate the primary outcomes.",
+                        ],
+                        "experiment_repair_plan": {
+                            "schema_version": "experiment-repair-plan-1",
+                            "mode": "diagnose_patch_execute_recalculate",
+                            "design_axis": "review_directed",
+                            "root_causes": [],
+                            "review_hypotheses": [item["text"] for item in review_directives[:8]],
+                            "required_changes": [
+                                f"Verify review hypothesis {item['id']} against retained evidence; "
+                                "make a source or claim change only if the defect is confirmed, otherwise "
+                                "record the reconciled contradiction or a bounded limitation."
+                                for item in review_directives[:8]
+                            ],
+                            "must_change": directive_ids[:8],
+                            "must_preserve": [
+                                "the admitted scientific phenomenon and the measured observations",
+                                "independent replay and recalculation",
+                            ],
+                            "prohibited": [
+                                "comment-only repairs with unchanged scientific behavior",
+                                "editing result JSON instead of source or analysis",
+                                "claiming a failed or unresolved check passed",
+                            ],
+                        },
+                        "repair_strategy": "review_directed",
                     })
                 unique_requests = {}
                 for item in requests:
@@ -953,6 +1611,15 @@ class ExperimentRunner(ExecutionRuntime):
             lines += ["", "## Limitations", ""]
             for limitation in package["limitations"]:
                 lines.append(f"- {limitation}")
+            if package.get("withheld_findings"):
+                lines += ["", "## Withheld candidate findings", ""]
+                for finding in package["withheld_findings"]:
+                    lines.append(f"- **Not admitted:** {finding['statement']}")
+                    for review in finding["reviewer_assessments"]:
+                        if review["outcome"] != "supported":
+                            lines.append(
+                                f"  - {review['reviewer_id']}: {review['rationale']}"
+                            )
         elif result["error"]:
             lines += ["## Blocker", "", result["error"]]
         (output / "experiment.md").write_text("\n".join(lines) + "\n")

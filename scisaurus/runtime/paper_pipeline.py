@@ -2133,89 +2133,152 @@ class PaperPipelineRunner:
         last_error = None
         attempts = []
         usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
-        for attempt in range(2):
-            payload = {}
-            # Give the model a useful preferred shape, while stating that this
-            # is a transport convenience rather than the scientific gate.
-            payload["writer_output_contract"] = {
-                "exact_top_level_keys": ["schema_version", "title", "sections", "citation"],
-                "schema_version": DRAFT_SCHEMA_VERSION,
-                "format_policy": (
-                    "Content is primary. The harness normalizes wrappers, key order, section/unit IDs, "
-                    "citation-policy omissions, Markdown fences, and harmless unit-kind labels."
-                ),
-                "title": "nonempty string",
-                "citation": "nonempty string describing the citation marker policy",
-                "sections": [{
-                    "id": "section id from writer_contract.section_order",
-                    "title": "section title from writer_contract.section_order",
-                    "units": [{"id": "unit id from section_order", "kind": "heading|paragraph|table|figure|caption", "text": "nonempty string"}],
-                }],
-                "depth": deepcopy(self.packet.get("writer_contract", {}).get("depth", {})),
-                "constraints": [
-                    "return exactly one JSON object with no markdown fence or wrapper key",
-                    "include every section and unit ID in writer_contract.section_order exactly once",
-                    "use reader-facing scientific prose in unit text",
-                    "write the full declared section set; never satisfy a word floor by repeating a result or a limitation",
-                    "Results report observations, Scientific interpretation connects patterns to mechanisms, and Discussion compares explanations and proposes discriminating tests",
-                    "place each figure reading in the prose unit that interprets it; the renderer will place the figure beside that argument",
-                ],
-            }
-            if previous is not None:
-                payload["writer_repair"] = {
-                    "assignment": "repair_invalid_manuscript_draft",
-                    "candidate_response": _bounded_response(previous),
-                    "validation_error": str(last_error),
-                    "instructions": [
-                        "Return the complete scientific manuscript content; the exact JSON wrapper is optional.",
-                        "Preserve all valid scientific content while repairing the reported substantive gap.",
-                        "Do not shorten the manuscript to satisfy formatting; retain the requested depth and sections.",
-                    ],
+        route_history = []
+        continuation_prefix = None
+        active_prompt = None
+        max_continuations = 16
+        max_repair_calls = 1
+        continuation_count = 0
+        repair_count = 0
+        last_finish_reason = None
+        max_calls = 1 + max_continuations + max_repair_calls
+        for attempt in range(max_calls):
+            continuing = continuation_prefix is not None
+            if not continuing:
+                payload = {
+                    # Content is primary; this shape is a transport convenience,
+                    # not a scientific acceptance gate.
+                    "writer_output_contract": {
+                        "exact_top_level_keys": ["schema_version", "title", "sections", "citation"],
+                        "schema_version": DRAFT_SCHEMA_VERSION,
+                        "format_policy": (
+                            "Content is primary. The harness normalizes wrappers, key order, section/unit IDs, "
+                            "citation-policy omissions, Markdown fences, and harmless unit-kind labels."
+                        ),
+                        "title": "nonempty string",
+                        "citation": "nonempty string describing the citation marker policy",
+                        "sections": [{
+                            "id": "section id from writer_contract.section_order",
+                            "title": "section title from writer_contract.section_order",
+                            "units": [{"id": "unit id from section_order", "kind": "heading|paragraph|table|figure|caption", "text": "nonempty string"}],
+                        }],
+                        "depth": deepcopy(self.packet.get("writer_contract", {}).get("depth", {})),
+                        "constraints": [
+                            "return exactly one JSON object with no markdown fence or wrapper key",
+                            "include every section and unit ID in writer_contract.section_order exactly once",
+                            "use reader-facing scientific prose in unit text",
+                            "write the full declared section set; never satisfy a word floor by repeating a result or a limitation",
+                            "Results report observations, Scientific interpretation connects patterns to mechanisms, and Discussion compares explanations and proposes discriminating tests",
+                            "place each figure reading in the prose unit that interprets it; the renderer will place the figure beside that argument",
+                        ],
+                    },
                 }
-            prompt, projection_audit = self._writer_context_projection(payload, system)
+                if previous is not None:
+                    if repair_count >= max_repair_calls:
+                        break
+                    repair_count += 1
+                    payload["writer_repair"] = {
+                        "assignment": "repair_invalid_manuscript_draft",
+                        "candidate_response": _bounded_response(previous),
+                        "validation_error": str(last_error),
+                        "instructions": [
+                            "Return the complete scientific manuscript content; the exact JSON wrapper is optional.",
+                            "Preserve all valid scientific content while repairing the reported substantive gap.",
+                            "Do not shorten the manuscript to satisfy formatting; retain the requested depth and sections.",
+                        ],
+                    }
+                active_prompt, projection_audit = self._writer_context_projection(payload, system)
+            else:
+                projection_audit = {
+                    "schema_version": "writer-continuation-projection-1",
+                    "mode": "continue_exact_truncated_response",
+                    "prefix_chars": len(continuation_prefix),
+                    "prefix_sha256": hashlib.sha256(
+                        continuation_prefix.encode("utf-8")).hexdigest(),
+                    "prompt_sha256": hashlib.sha256(
+                        active_prompt.encode("utf-8")).hexdigest(),
+                }
             projection_audit.update({
                 "attempt": attempt + 1,
-                "repair": previous is not None,
+                "repair": repair_count > 0,
+                "continuation": continuing,
+                "continuation_count": continuation_count,
             })
             projection_path = self.output / f"writer-context-projection-{attempt + 1}.json"
             projection_path.write_bytes(canonical_bytes(projection_audit))
             result, provider_route_history = complete_with_role_fallbacks(
                 self.model_config, role="editorial.writer", system=system,
-                prompt=prompt, deadline=self.deadline,
+                prompt=active_prompt, continuation_text=continuation_prefix,
+                deadline=self.deadline,
                 candidate_configs=self._writer_candidate_configs,
                 client_factory=lambda **route: self._client(
                     deadline=self.deadline, role="editorial.writer",
                     model_config=route),
             )
             attempts.append(result)
-            # Preserve every failed candidate as a durable feedback input.  A
-            # later composer retry can inspect the exact contract failure
-            # without mutating the manuscript or guessing what the provider
-            # returned.
+            route_history.extend(provider_route_history)
+            for key in usage:
+                usage[key] += result.usage.get(key, 0)
+            response_text = result.text or ""
+            complete_response = (continuation_prefix or "") + response_text
+            continuation_hash = (
+                hashlib.sha256(continuation_prefix.encode("utf-8")).hexdigest()
+                if continuing else None
+            )
+            # Each chunk is durable and ordered. A long response can be
+            # reconstructed without copying an unbounded prefix into every file.
             (self.output / f"writer-attempt-{attempt + 1}.json").write_bytes(canonical_bytes({
                 "attempt": attempt + 1,
                 "finish_reason": result.finish_reason,
-                "response": result.text,
+                "response_mode": "continuation" if continuing else "complete_response",
+                "continuation_prefix_sha256": continuation_hash,
+                "continuation_prefix_chars": len(continuation_prefix or ""),
+                "response": response_text,
                 "usage": result.usage,
                 "provider_route_history": provider_route_history,
             }))
-            for key in usage:
-                usage[key] += result.usage.get(key, 0)
+            last_finish_reason = result.finish_reason
+            if result.finish_reason == "length" and not response_text:
+                last_error = ValidationError(
+                    "manuscript provider returned no text at the output limit; unchanged retries were stopped")
+                break
             parse_error = None
+            combined_result = ModelResult(
+                text=complete_response, model=result.model, usage=result.usage,
+                elapsed_seconds=result.elapsed_seconds,
+                finish_reason=result.finish_reason,
+            )
             try:
-                raw_draft = result.json_object(allow_missing_closers=True)
+                raw_draft = combined_result.json_object(
+                    allow_missing_closers=result.finish_reason != "length")
             except ValidationError as exc:
-                # A plain-text or truncated response can still contain a
-                # complete scientific surface.  Let the content adapter map
-                # headings/paragraphs into the stable internal document shape.
-                raw_draft = result.text
                 parse_error = str(exc)
+                if result.finish_reason == "length":
+                    last_error = ValidationError(
+                        "manuscript response was syntactically incomplete at the provider output limit")
+                    previous = complete_response
+                    if not response_text:
+                        last_error = ValidationError(
+                            "manuscript provider returned an empty truncated response")
+                        break
+                    if continuation_count >= max_continuations:
+                        last_error = ValidationError(
+                            "manuscript writer exhausted its bounded continuation allowance "
+                            "while the provider continued to report output length")
+                        break
+                    continuation_prefix = complete_response
+                    continuation_count += 1
+                    continue
+                # A completed plain-text response can still contain a usable
+                # scientific surface; the adapter maps it into the stable form.
+                raw_draft = complete_response
             draft, normalization_audit = normalise_manuscript_draft(
                 raw_draft, packet=self.packet, paper_config=self.paper_config)
             normalization_audit.update({
                 "attempt": attempt + 1,
                 "finish_reason": result.finish_reason,
                 "parse_error": parse_error,
+                "continuation": continuing,
             })
             (self.output / f"writer-content-normalization-{attempt + 1}.json").write_bytes(
                 canonical_bytes(normalization_audit))
@@ -2223,20 +2286,32 @@ class PaperPipelineRunner:
                 validate_manuscript_draft(draft)
                 self._validate_composition(draft)
             except ValidationError as exc:
-                last_error, previous = exc, result.text
+                last_error, previous = exc, complete_response
+                if (result.finish_reason == "length" and response_text
+                        and parse_error is not None):
+                    if continuation_count >= max_continuations:
+                        last_error = ValidationError(
+                            "manuscript writer exhausted its bounded continuation allowance "
+                            "while the provider continued to report output length")
+                        break
+                    continuation_prefix = complete_response
+                    continuation_count += 1
+                    continue
+                continuation_prefix = None
                 continue
             response = {
                 "model": result.model, "finish_reason": result.finish_reason,
                 "usage": usage, "attempts": len(attempts),
+                "continuation_segments": continuation_count,
                 "elapsed_seconds": sum(item.elapsed_seconds for item in attempts),
                 "argument_sha256": (hashlib.sha256(canonical_bytes(argument)).hexdigest()
                                     if argument is not None else None),
-                "provider_route_history": provider_route_history,
+                "provider_route_history": route_history,
                 "draft": draft,
             }
             (self.output / "writer-response.json").write_bytes(canonical_bytes(response))
             (self.output / "manuscript-draft-v1.json").write_bytes(canonical_bytes(draft))
-            result = ModelResult(text=result.text, model=result.model, usage=usage,
+            result = ModelResult(text=complete_response, model=result.model, usage=usage,
                                  elapsed_seconds=response["elapsed_seconds"],
                                  finish_reason=result.finish_reason)
             return draft, result
@@ -2244,6 +2319,8 @@ class PaperPipelineRunner:
             "status": "blocked",
             "error": str(last_error or ValidationError("manuscript writer did not produce a valid draft")),
             "attempts": len(attempts),
+            "continuation_segments": continuation_count,
+            "last_finish_reason": last_finish_reason,
             "attempt_files": [str(self.output / f"writer-attempt-{index}.json")
                               for index in range(1, len(attempts) + 1)],
         }
