@@ -30,6 +30,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from scisaurus.core.errors import ModelContractError, ValidationError
+from scisaurus.runtime.evidence import scientific_input_recovery_contract
 from scisaurus.core.schema import canonical_bytes, json_object as parse_complete_json_object
 from scisaurus.runtime.capability_registry import (
     experiment_program_payload, experiment_validation_payload,
@@ -739,6 +740,7 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             "outside it; keep descriptions concise and place implementation only in the source fields."
         ),
         "capability_brief": brief,
+        "scientific_input_recovery": scientific_input_recovery_contract(),
         "repair_check_phase_rule": REPAIR_CHECK_PHASE_RULE,
         "output_contract": {
             "executor_source": "complete Python source; reads {'configured_input','experiment'} from stdin, "
@@ -3207,6 +3209,7 @@ class CapabilityFoundry:
             reviewer = reviewer_for_attempt(review_attempt)
             ensure_model_call_budget()
             prompt = {"assignment": "independent_scientific_program_review",
+                "scientific_input_recovery": scientific_input_recovery_contract(),
                 "research_assignment": brief,
                 "experiment_intent": candidate["experiment_intent"],
                 "executor_source": candidate["executor_source"],

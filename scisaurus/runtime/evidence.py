@@ -5,6 +5,22 @@ import hashlib
 from scisaurus.core.source_spans import index_evidence
 
 
+def scientific_input_recovery_contract():
+    """Separate source access from the inputs needed for a scientific result."""
+    return {
+        "objective": "Resolve the equations, parameters and observations needed for the declared question, rather than requiring one particular paper's full text.",
+        "requirements": "Identify each decision-critical missing input, its units, applicable conditions and intended use. Record its evidence basis and remaining uncertainty in the method, parameters or limitations; a citation without captured supporting content does not resolve an input.",
+        "routes": {
+            "captured_source": "Search for public evaluated datasets, supplementary material, author manuscripts and independent measurements. Use declared acquisition tools and register the captured content before treating it as evidence. Check units, temperature, phase, species and measurement conditions; a gas-phase value does not automatically apply to a surface or particle.",
+            "independent_calibration": "Estimate from captured independent observations only when the proposed model is identifiable. Declare the estimator, units, uncertainty and held-out validation. Do not fit on the target outcome and then present agreement with that outcome as independent validation.",
+            "bounded_design": "If an absolute value is unavailable, determine whether a derivation, nondimensional comparison, identifiability analysis or sensitivity experiment can answer a bounded part of the same question. Justify the domain from evidence or explicitly label it as a mathematical assumption; distinguish simulated outcomes from measured observations. If conclusions depend on an unsupported range, leave the physical conclusion unresolved.",
+            "unresolved": "Retain an input that cannot be justified as unresolved. Specify the discriminating measurement or acquisition needed, what it would resolve and the success condition. A proposed laboratory experiment is not an executed measurement; unavailable equipment, data or network access cannot be silently assumed.",
+        },
+        "handoff": "Use existing evidence work orders for acquisition and experiment work orders for calibration or analysis. Carry the exact missing input, evidence needed and success condition downstream. Preserve the question, captured sources and access failures; do not repeatedly request the same denied locator or invent constants, data or successful resolution.",
+        "acceptance": "Independently review applicability, identifiability, uncertainty and claim scope. Source fidelity and completion of the scientific input requirements are separate judgments; faithful abstract-only literature may pass while an experiment input remains unresolved.",
+    }
+
+
 def maturity_requirement_id(requirement):
     return hashlib.sha256(requirement.encode("utf-8")).hexdigest()
 

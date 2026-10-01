@@ -166,6 +166,9 @@ def _add_prior_review_checks(payload, prompt):
             or not isinstance(payload.get("checks"), list)):
         return payload
     result = deepcopy(payload)
+    from scisaurus.runtime.evidence import scientific_input_recovery_contract
+    if request.get("scientific_input_recovery") != scientific_input_recovery_contract():
+        raise AssertionError("program reviewers require the scientific input recovery contract")
     check_ids = {
         item["id"] for item in result["checks"]
         if isinstance(item, dict) and isinstance(item.get("id"), str)
@@ -2159,6 +2162,17 @@ class CapabilityFoundryTests(unittest.TestCase):
         self.assertIn("'configured_input','experiment','candidate'",
                       prompt["output_contract"]["validator_source"])
         self.assertIn("request['experiment']", " ".join(prompt["constraints"]))
+
+    def test_candidate_contract_separates_input_recovery_from_paper_access(self):
+        from scisaurus.runtime.evidence import scientific_input_recovery_contract
+        prompt = candidate_prompt("bounded comparison", [], {"probe": True})
+        self.assertEqual(prompt["scientific_input_recovery"], scientific_input_recovery_contract())
+        routes = prompt["scientific_input_recovery"]["routes"]
+        self.assertEqual(set(routes), {"captured_source", "independent_calibration",
+                                      "bounded_design", "unresolved"})
+        self.assertIn("held-out validation", routes["independent_calibration"])
+        self.assertIn("mathematical assumption", routes["bounded_design"])
+        self.assertIn("not an executed measurement", routes["unresolved"])
 
     def test_candidate_contract_delivers_scoped_work_orders_to_generated_program(self):
         order = {

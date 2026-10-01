@@ -669,6 +669,7 @@ class TestSurveyRunner(unittest.TestCase):
         runner._nominate()
         assignment = {"phase": "counter_plan", "nomination_ref": runner.nomination_record["artifact_ref"],
                       "gap": runner.nomination}
+        assignment = runner._follow_up_assignment(assignment)
         role, name = "methods.novelty-challenger", "counter-plan"
         cache = ModelWorkCache(runner.store, runner._publish)
         key = cache.key(scope=f"survey:{name}", role=role, system=SYSTEM,
@@ -1303,6 +1304,8 @@ class TestSurveyRunner(unittest.TestCase):
                 phases.add(prompt["phase"])
                 self.assertEqual(prompt["work_orders"], [order])
                 self.assertEqual(prompt["follow_up_ref"], result["follow_up_ref"])
+                from scisaurus.runtime.evidence import scientific_input_recovery_contract
+                self.assertEqual(prompt["scientific_input_recovery"], scientific_input_recovery_contract())
         self.assertEqual(phases, {"blind_plan", "map", "gap_assessment", "survey_follow_up"})
         report = json.loads(store.read_body(store.get(result["follow_up_result"]["ref"])["body_hash"]))
         self.assertEqual(report["survey_ref"], result["survey_ref"])
@@ -1578,6 +1581,7 @@ class TestSurveyRunner(unittest.TestCase):
         runner = self.runtime()
         base = {"phase": "gap_assessment", "survey_ref": "artifact:kb/surveys/current@1",
                 "question": "Does the bounded model explain the transition?"}
+        base = runner._follow_up_assignment(base)
         prior_assignment = {**base, "resume_boundary": "gap-assessment-resume-1"}
         current_assignment = {**base, "resume_boundary": "gap-assessment-resume-2"}
         prior_response = {"state": "insufficient_evidence", "evidence": []}
@@ -3022,6 +3026,8 @@ class TestSurveyRunner(unittest.TestCase):
             if assignment.get("phase") in {"map", "work_review", "survey_review", "gap_assessment", "survey_follow_up"}:
                 phases.add(assignment["phase"])
                 self.assertEqual(assignment["source_evidence_policy"], result["coverage"]["source_evidence_policy"])
+                self.assertEqual(assignment["scientific_input_recovery"],
+                                 result["coverage"]["scientific_input_recovery"])
                 for source in assignment.get("sources", []):
                     if source.get("work_id") == "W401":
                         self.assertEqual(source["source_availability"], availability)
@@ -3656,6 +3662,8 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertNotIn("raw_text", json.dumps(projected))
         self.assertNotIn("previous_response", projected["validation_feedback"])
         self.assertIn("same work_id", projected["instructions"])
+        from scisaurus.runtime.evidence import scientific_input_recovery_contract
+        self.assertEqual(projected["scientific_input_recovery"], scientific_input_recovery_contract())
 
     def test_retained_contract_blocker_gets_one_fresh_resume_cache_identity(self):
         from scisaurus.runtime.model_work import ModelWorkCache

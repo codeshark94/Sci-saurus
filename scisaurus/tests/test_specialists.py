@@ -154,6 +154,8 @@ class SpecialistDispatcherTests(unittest.TestCase):
                       "quota": {"max_input_tokens": 24000, "max_output_tokens": 2000,
                                 "max_calls": 1, "max_seconds": 10}}
         prompt = build_repair_evidence_prompt(assignment, packet, request)
+        from scisaurus.runtime.evidence import scientific_input_recovery_contract
+        self.assertEqual(json.loads(prompt)["scientific_input_recovery"], scientific_input_recovery_contract())
         payload = json.loads(prompt)
         self.assertEqual(payload["repair_evidence_request"], request)
         self.assertEqual("".join(payload["candidate_program"]["exact_execution_sources"]["executor"]["source_chunks"]), source)
@@ -488,9 +490,14 @@ class SpecialistDispatcherTests(unittest.TestCase):
             "dependencies": {"survey": {"topic": "x" * 40000}, "experiment": {"results": "y" * 40000}},
             "runtime_context": {"project_files": [f"file-{i}" for i in range(100)]},
         }
+        from scisaurus.runtime.evidence import scientific_input_recovery_contract
+        packet["stage_acceptance_contract"] = {
+            "scientific_input_recovery": scientific_input_recovery_contract()}
         prompt = build_specialist_prompt(assignment, packet)
         self.assertLessEqual(estimate_input_tokens(SPECIALIST_SYSTEM, prompt), 12000)
         self.assertNotIn("dependencies", json.loads(prompt)["shared_stage_context"])
+        self.assertEqual(json.loads(prompt)["shared_stage_context"]["stage_acceptance_contract"],
+                         packet["stage_acceptance_contract"])
         self.assertEqual(json.loads(prompt)["projected_input"]["topic"]["question"], "A bounded question")
         contract = json.loads(prompt)["output_contract"]
         self.assertIn("ranked findings naming supplied evidence and its consequence",
@@ -1089,6 +1096,8 @@ class SpecialistDispatcherTests(unittest.TestCase):
             }
         lead = json.loads(build_repair_adjudication_prompt(
             {"quota": {"max_input_tokens": 24000}}, packet, []))
+        from scisaurus.runtime.evidence import scientific_input_recovery_contract
+        self.assertEqual(lead["scientific_input_recovery"], scientific_input_recovery_contract())
         self.assertNotIn("topic_id", lead["decision_contract"]["output_schema"]["repair_plan"])
         expected = lead["repair_adjudication_packet"]["candidate_program"]
         self.assertEqual(lead["repair_adjudication_packet"]["validation_context"]["observation_count"], 70)

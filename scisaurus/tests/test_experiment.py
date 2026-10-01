@@ -33,6 +33,9 @@ def fixture_worker(kind, params, channel):
         return _invoke_worker(kind, params, channel)
     assignment = json.loads(params["prompt"])
     if assignment["phase"] == "experiment_result_review":
+        from scisaurus.runtime.evidence import scientific_input_recovery_contract
+        if assignment.get("scientific_input_recovery") != scientific_input_recovery_contract():
+            raise AssertionError("experiment reviewers require the scientific input recovery contract")
         findings = assignment["program_output_summary"]["findings"]
         if assignment["required_finding_ids"] != sorted(item["id"] for item in findings):
             raise AssertionError("review prompt did not enumerate exact required finding IDs")

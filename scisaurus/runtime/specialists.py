@@ -21,6 +21,7 @@ import time
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.source_spans import SPAN_EVIDENCE_FIELDS
+from scisaurus.runtime.evidence import scientific_input_recovery_contract
 from scisaurus.runtime.models import (
     ModelCallError,
     ModelClient,
@@ -1196,7 +1197,7 @@ def build_specialist_prompt(assignment, stage_packet):
         # defeated role isolation and routinely exceeded 12k specialist caps.
         "shared_stage_context": {
             key: stage_packet.get(key)
-            for key in ("objective", "stage_id", "stage_kind", "work_orders")
+            for key in ("objective", "stage_id", "stage_kind", "work_orders", "stage_acceptance_contract")
             if key in stage_packet
         },
         "output_contract": {
@@ -1328,6 +1329,7 @@ def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports
             "stage_id": assignment.get("stage_id"),
             "system_contract": assignment.get("system_contract"),
         },
+        "scientific_input_recovery": scientific_input_recovery_contract(),
         "repair_adjudication_packet": {
             "failure_lineage": {
                 "stage_id": lineage.get("stage_id"),
@@ -1449,6 +1451,7 @@ def build_repair_evidence_prompt(assignment, repair_packet, request, *, prior_re
     return _json_with_budget({
         "assignment": {key: assignment.get(key) for key in ("assigned_role", "stage_id", "task_id")},
         "repair_evidence_request": _preserve_response_value(request),
+        "scientific_input_recovery": scientific_input_recovery_contract(),
         "topic": _preserve_response_value(repair_packet.get("topic", {})),
         "evidence_experiment_intent": _preserve_response_value(last.get("experiment_intent", {})),
         "candidate_program": _repair_candidate_program(repair_packet),

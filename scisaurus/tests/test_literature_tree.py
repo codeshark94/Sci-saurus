@@ -5,7 +5,8 @@ import unittest
 
 from scisaurus.core.errors import ValidationError, StateError
 from scisaurus.core.source_spans import bind
-from scisaurus.runtime.literature_tree import validate_plan, validate_reading_selection, reading_selection_parts
+from scisaurus.runtime.literature_tree import (validate_plan, validate_reading_selection,
+                                             reading_selection_parts, bind_plan_parents)
 from scisaurus.tests import test_survey as fixtures
 from scisaurus.tests.test_survey import simulated_survey_worker, source_quote, survey_config
 
@@ -25,6 +26,9 @@ def chain_worker(kind, params, channel):
     if assignment.get("phase") != "exploration_plan":
         return simulated_survey_worker(kind, params, channel)
     parent = assignment["parents"][0]
+    if any(item["id"] != f"parent-{index}" or "parent_id" in item
+           for index, item in enumerate(assignment["parents"])):
+        raise AssertionError("planner must receive local handles without competing ancestry IDs")
     branches = []
     if params["client"]["model"] == "local-stop" and parent["kind"] == "read":
         parent = next((item for item in assignment["parents"] if item["work_id"] == "W201"), parent)
@@ -80,6 +84,27 @@ class TestExplorationContract(unittest.TestCase):
 
     def test_grounded_reference_branch(self):
         self.validate(self.plan)
+
+    def test_local_parent_handle_is_bound_idempotently(self):
+        proposal = deepcopy(self.plan)
+        proposal["branches"][0]["parent_id"] = "parent-0"
+        aliases = {"parent-0": "parent"}
+        bound = bind_plan_parents(proposal, aliases)
+        self.assertEqual(bound["branches"][0]["parent_id"], "parent")
+        self.assertEqual(bind_plan_parents(bound, aliases), bound)
+        self.assertEqual(proposal["branches"][0]["parent_id"], "parent-0")
+        self.validate(bound)
+
+    def test_incoming_acquisition_id_is_not_a_parent_handle(self):
+        self.plan["branches"][0]["parent_id"] = "incoming-acquisition"
+        with self.assertRaisesRegex(ValidationError, "branch 0.*unassigned.*parent-0"):
+            bind_plan_parents(self.plan, {"parent-0": "parent"})
+
+    def test_parent_binding_does_not_transfer_foreign_evidence(self):
+        self.plan["branches"][0]["parent_id"] = "parent-0"
+        bound = bind_plan_parents(self.plan, {"parent-0": "other-read"})
+        with self.assertRaisesRegex(ValidationError, "unassigned parent"):
+            self.validate(bound)
 
     def test_rejects_unassigned_parent(self):
         self.plan["branches"][0]["parent_id"] = "other"

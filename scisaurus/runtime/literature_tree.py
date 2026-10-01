@@ -20,6 +20,20 @@ def node_id(value):
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
+def bind_plan_parents(value, parent_aliases):
+    """Resolve exact handles while retaining already-bound canonical parents."""
+    value = deepcopy(value)
+    if not isinstance(value, dict) or not isinstance(value.get("branches"), list):
+        raise ModelContractError("exploration plan must provide a branches list")
+    for index, branch in enumerate(value["branches"]):
+        alias = branch.get("parent_id") if isinstance(branch, dict) else None
+        if not isinstance(alias, str) or (alias not in parent_aliases and alias not in parent_aliases.values()):
+            raise ModelContractError(f"branch {index} parent_id {alias!r} is unassigned; "
+                                     f"use one of {list(parent_aliases)}")
+        branch["parent_id"] = parent_aliases.get(alias, alias)
+    return value
+
+
 def validate_plan(value, parents, sources, *, max_branches):
     if not isinstance(value, dict) or set(value) != {"decision", "rationale", "branches"}:
         raise ValidationError("exploration plan requires decision, rationale, and branches")
@@ -503,11 +517,13 @@ class LiteratureTree:
                    if any(ref in node.get("source_refs", []) for node in parents)}
         context = [source for source in self._source_context() if source["source_ref"] in sources]
         windows = {source["source_ref"]: source["window"] for source in context}
-        assignments = [{**node, **({"work": self._body(self.store.get(node["work_ref"])), "entry": self._body(self.store.get(node["entry_ref"])),
+        parent_aliases = {f"parent-{index}": node["id"] for index, node in enumerate(parents)}
+        assignments = [{**{key: value for key, value in node.items() if key not in {"id", "parent_id"}},
+                                  "id": alias, **({"work": self._body(self.store.get(node["work_ref"])), "entry": self._body(self.store.get(node["entry_ref"])),
                                   "review": self._body(self.store.get(node["review_ref"])),
                                   "allowed_evidence": {"work_id": node["work_id"], "source_refs": node["source_refs"]},
                                   "sources": [source for source in context if source["source_ref"] in node["source_refs"]]}
-                                 if node["kind"] == "read" else {})} for node in parents]
+                                 if node["kind"] == "read" else {})} for alias, node in zip(parent_aliases, parents)]
         branch_limit = None
         remaining, scopes = self._remaining_model_capacity(["research.search-planner", "research.literature-mapper", "methods.work-reviewer"])
         assignment = {"phase": "exploration_plan", "question": self.score["question"],
@@ -524,7 +540,8 @@ class LiteratureTree:
             "instructions": "Choose prioritized inquiries that advance the declared research question. "
                 "Return exactly {decision:expand|stop,rationale:string,branches:[{parent_id,question,rationale,"
                 "operation:search|work|citing,query:string|null,work_id:string|null,"
-                "evidence:[{work_id,source_ref,quote}]}]}. Use assigned parent IDs. "
+                "evidence:[{work_id,source_ref,quote}]}]}. Copy parent_id exactly from the assigned parent's id handle. "
+                "These handles are local to this assignment; work IDs and acquisition history IDs are not parent handles. "
                 "For a root, choose initial searches or direct canonical OpenAlex work lookups from the scientific intake, with empty evidence. "
                 "For a read, explain what its checked findings suggest investigating next, with exact parent quotations. "
                 "Each branch parent_id must identify the work supplying its evidence: use that parent's allowed_evidence and sources. "
@@ -539,19 +556,21 @@ class LiteratureTree:
                 "max_branches is null: prioritize scientifically justified inquiries. "
                 "Remaining calls bound actual uncached dispatch, while captured receipts can be reused. "
                 "Stop with a reason when further acquisition would not improve their evidence. No novelty verdict."}
-        identity = node_id({key: value for key, value in assignment.items() if key != "resources"})
+        identity = node_id({"assignment": {key: value for key, value in assignment.items() if key != "resources"},
+                            "parent_ids": list(parent_map)})
         retained_input = self.store.head("kb/exploration-inputs/" + identity)
         if retained_input:
             assignment = self._body(retained_input)
         else:
             self._record("kb/exploration-inputs/" + identity, "note", assignment, "research.search-planner",
                          subjects=[self.protocol["artifact_ref"], *[node["review_ref"] for node in parents if node.get("review_ref")]])
-        normalizer = lambda value: bind(value, sources, windows=windows)
+        normalizer = lambda value: bind(bind_plan_parents(value, parent_aliases), sources, windows=windows)
         validator = lambda value: validate_plan(value, parent_map, sources, max_branches=branch_limit)
         value, execution = self._model_checked("exploration-" + identity, "research.search-planner",
             assignment, validator, normalizer=normalizer, stage="supervision", task_kind="service")
         record = self._record("kb/exploration-plans/" + identity, "note",
             {**value, "question": self.score["question"], "parent_ids": list(parent_map),
+             "parent_bindings": parent_aliases,
              "queries": [branch["query"] for branch in value["branches"] if branch["operation"] == "search"],
              **({"follow_up_ref": self.follow_up_ref} if self.work_orders else {}),
              "assignment_sha256": identity, "execution_ref": execution},

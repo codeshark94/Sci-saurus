@@ -56,6 +56,7 @@ from scisaurus.runtime.specialists import (
     _normalise_verdict,
 )
 from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
+from scisaurus.runtime.evidence import scientific_input_recovery_contract
 from scisaurus.runtime.experiment_config import (
     EXPERIMENT_WORK_ORDER_KINDS, project_executable_work_orders,
 )
@@ -19630,6 +19631,7 @@ class ComposerRunner:
         target = ("bounded admission to literature survey, not final journal maturity or experiment admission"
                   if stage["kind"] == "topic_discovery" else "independent acceptance of the declared " + stage["kind"] + " output")
         return {"current_stage_id": stage["id"],
+            "scientific_input_recovery": scientific_input_recovery_contract(),
             "downstream_stage_ids": [item["id"] for item in self.workflow["stages"] if item["id"] in descendants],
             "acceptance_target": target, "current_requirements": deepcopy(requirements[stage["kind"]]),
             "downstream_requirements": [{"target_stage_id": item["id"], "stage_kind": item["kind"],

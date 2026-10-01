@@ -21,6 +21,7 @@ from scisaurus.core.schema import canonical_bytes, sha256_hex
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.surveys import SurveyGate
 from scisaurus.runtime.execution import ExecutionRuntime, _invoke_worker
+from scisaurus.runtime.evidence import scientific_input_recovery_contract
 from scisaurus.runtime.capability_registry import (
     experiment_program_payload, experiment_validation_payload,
 )
@@ -1054,6 +1055,7 @@ class ExperimentRunner(ExecutionRuntime):
                 "as evidence when the cited observations, metrics, findings, procedures, or analysis do not support it."
             )
         assignment = {"phase": "experiment_result_review", "reviewer": reviewer,
+            "scientific_input_recovery": scientific_input_recovery_contract(),
             "study": {key: self.experiment[key] for key in (
                 "id", "study_type", "domain", "research_question", "hypothesis", "method", "parameters",
                 "seed", "run_count", "stopping_rule", "primary_outcomes", "limitations")},

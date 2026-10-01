@@ -2,10 +2,20 @@
 import unittest
 
 from scisaurus.core.errors import ValidationError
-from scisaurus.runtime.evidence import evidence_ids_from_packet, survey_evidence_projection
+from scisaurus.runtime.evidence import (evidence_ids_from_packet, survey_evidence_projection,
+                                      scientific_input_recovery_contract)
 
 
 class EvidenceProjectionTests(unittest.TestCase):
+    def test_input_recovery_contract_is_fresh_and_does_not_resolve_missing_data(self):
+        contract = scientific_input_recovery_contract()
+        contract["routes"].clear()
+        fresh = scientific_input_recovery_contract()
+        self.assertEqual(len(fresh["routes"]), 4)
+        self.assertIn("does not automatically apply", fresh["routes"]["captured_source"])
+        self.assertIn("leave the physical conclusion unresolved", fresh["routes"]["bounded_design"])
+        self.assertIn("success condition", fresh["handoff"])
+
     def test_decisive_quotation_survives_background_and_excerpt_limits(self):
         sources = {f"artifact:kb/abstract/W{i}@1": {"work_id": f"W{i}", "abstract": "Background."}
                    for i in range(60)}

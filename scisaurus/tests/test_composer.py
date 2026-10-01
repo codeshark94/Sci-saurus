@@ -164,6 +164,8 @@ class ComposerWorkflowTests(unittest.TestCase):
             runner, topic, descriptor = self._owned_held_topic(Path(path))
             survey, experiment = runner.workflow["stages"][1:]
             contract = runner._stage_acceptance_contract(topic)
+            from scisaurus.runtime.evidence import scientific_input_recovery_contract
+            self.assertEqual(contract["scientific_input_recovery"], scientific_input_recovery_contract())
             self.assertEqual(contract["downstream_stage_ids"], ["survey", "experiment"])
             self.assertIn("bounded admission to literature survey", contract["acceptance_target"])
             packet = runner._specialist_stage_packet(topic, descriptor, stage_result=runner.context["topic"])

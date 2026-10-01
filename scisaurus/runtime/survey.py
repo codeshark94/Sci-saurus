@@ -18,6 +18,7 @@ from scisaurus.core.source_spans import (bind as bind_source_spans, contains_leg
 from scisaurus.core.surveys import (ABSTENTION_REASONS, RELATIONSHIP_SEMANTICS, SurveyGate,
                                    is_explicit_abstention, work_review_checks)
 from scisaurus.runtime.execution import SYSTEM, ExecutionRuntime, _invoke_worker
+from scisaurus.runtime.evidence import scientific_input_recovery_contract
 from scisaurus.runtime.literature_tree import LiteratureTree, SEARCH_PLANNERS
 from scisaurus.runtime.config import configured_worker_slots
 from scisaurus.runtime.bibliographic_identity import normalize_doi, project_crossref_work, reconcile_result
@@ -589,6 +590,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             self._restore()
 
     def _follow_up_assignment(self, assignment):
+        assignment = {**assignment, "scientific_input_recovery": scientific_input_recovery_contract()}
         if "sources" in assignment or "coverage" in assignment:
             assignment = {**assignment, "source_evidence_policy": _SOURCE_EVIDENCE_POLICY}
         if not getattr(self, "work_orders", None):
@@ -1383,6 +1385,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             ),
             "source_evidence_policy": _SOURCE_EVIDENCE_POLICY,
             **({"validation_feedback": feedback} if feedback else {}),
+            "scientific_input_recovery": scientific_input_recovery_contract(),
             **({"resume_boundary": assignment["resume_boundary"]}
                if "resume_boundary" in assignment else {}),
             **({"_contract_repair_boundary": assignment["_contract_repair_boundary"]}
@@ -3558,6 +3561,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "saturated": bool(self.expansion_log and self.expansion_log[-1]["quiet_rounds"] >= self.bounds["saturation_rounds"]),
             "scope": "Recorded finite queries and citation expansion; no exhaustive-coverage claim",
             "source_evidence_policy": _SOURCE_EVIDENCE_POLICY,
+            "scientific_input_recovery": scientific_input_recovery_contract(),
             "source_availability": [self._source_availability(wid) for wid in sorted({
                 gap["work_id"] for gap in self.gaps if gap.get("kind") == "full_text_failure"
                 and gap.get("work_id") in self.works})],
