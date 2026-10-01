@@ -1653,7 +1653,6 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
     def _required_model_work(self):
         """Describe uncompleted first decisions without promising a positive verdict."""
         required = []
-        source_context = self._source_context()
         if self._survey_acceptance_pending or not self.survey_ref:
             for wid, record in self.analysis_records.items():
                 entry = self._body(record)
@@ -1661,16 +1660,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 abstention = self.store.head(f"command/survey-abstentions/{wid}")
                 if abstention and not relations and is_explicit_abstention(entry, self._body(abstention)):
                     continue
-                review = self.work_reviews.get(wid)
-                refs = [relation["artifact_ref"] for relation in relations]
-                owners = {wid, *[relation["target"] for relation in relations]}
-                basis = [record["artifact_ref"], *refs,
-                         *[source["source_ref"] for source in source_context if source["work_id"] in owners]]
-                if review:
-                    body = self._body(review)
-                    if (self.reviewed_basis.get(wid) == basis and body.get("entry_ref") == record["artifact_ref"]
-                            and body.get("relationship_refs") == refs and self._review_protocol_matches(body)):
-                        continue
+                if self._work_review_current(wid):
+                    continue
                 required.append({"name": f"work-review-{wid}", "phase": "work_review", "actor": "methods.work-reviewer", "work_id": wid})
             required.append({"name": "survey-review", "phase": "survey_review", "actor": "methods.survey-reviewer"})
         if not self.assessment_ref:
@@ -3925,7 +3916,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "Titles, years, and citation links are provider-reported catalog metadata, not textual evidence for substantive claims. "
                 "Do not infer confirmed chronology, conceptual inheritance, identity claims, or superiority from metadata or shared terminology alone. "
                 "When no captured source belongs to the assigned work, set inclusion to uncertain and make reason a narrow availability note: state that the catalog record is relevant by metadata but no abstract or verified full text was available, so substantive content could not be assessed. Do not put other work IDs, quotations, chronology, evolution, extension, comparison, or superiority in that reason. "
-                "Keep each statement text concise (at most 240 characters), return at most one outgoing relationship, and omit any relationship that is not directly supported by both displayed works. Return only the requested JSON object."
+                "Keep statement text concise while retaining the conditions, uncertainty, and assumptions required by source_fidelity_contract. "
+                "Return at most one outgoing relationship, and omit any relationship that is not directly supported by both displayed works. Return only the requested JSON object."
         }
         # ModelClient sends this assignment JSON verbatim. Keep the stable
         # corpus and contract before per-work state so provider prefix caches

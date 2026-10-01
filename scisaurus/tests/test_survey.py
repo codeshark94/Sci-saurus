@@ -2931,6 +2931,7 @@ class TestSurveyRunner(unittest.TestCase):
         runner.review_obligations = runner._validate_review_obligations([obligation])
         runner._review_work_claims()
         self.assertTrue(runner._work_review_current("W101"))
+        self.assertNotIn("work-review-W101", {job["name"] for job in runner._required_model_work()})
         prompt = next(prompt for _, prompt in reversed(self.model_contexts(runner.control, runner.store))
                       if prompt.get("phase") == "work_review" and prompt["entry"]["work_id"] == "W101")
         comparison = prompt["critique_contexts"][0]["comparison_entries"][0]
@@ -2956,6 +2957,7 @@ class TestSurveyRunner(unittest.TestCase):
         runner.analysis_records["W102"] = runner._record("kb/work-analyses/W102", "note", changed,
                                                         "research.literature-mapper")
         self.assertFalse(runner._work_review_current("W101"))
+        self.assertIn("work-review-W101", {job["name"] for job in runner._required_model_work()})
         with self.assertRaisesRegex(ValidationError, "exact current peer"):
             entries = {row["artifact_ref"]: (row, runner._body(row)) for row in runner.analysis_records.values()}
             runner.gate._work_review_comparisons(prompt, [obligation], entries, visible, require_spans=True)
@@ -3172,6 +3174,8 @@ class TestSurveyRunner(unittest.TestCase):
         mapper = next(p for p in prompts if p["phase"] == "map")
         reviewer = next(p for p in prompts if p["phase"] == "work_review")
         self.assertEqual(mapper["source_fidelity_contract"], source_fidelity_review_contract())
+        self.assertNotIn("at most 240 characters", mapper["instructions"])
+        self.assertIn("conditions, uncertainty, and assumptions", mapper["instructions"])
         numerical = mapper["source_fidelity_contract"]["numerical_scope"]
         self.assertIn("temperature for a reaction-rate coefficient", numerical)
         self.assertIn("plus/minus magnitude alone", numerical)
