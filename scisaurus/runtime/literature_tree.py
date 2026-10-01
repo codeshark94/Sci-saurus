@@ -472,13 +472,13 @@ class LiteratureTree:
             self._tree_admitted_reads = None
             self._tree_read_order = None
         for node in self.exploration_tree["nodes"]:
-            if node["kind"] == "read" and (
-                    self.work_records.get(node["work_id"], {}).get("artifact_ref") != node["work_ref"]
-                    or self.analysis_records.get(node["work_id"], {}).get("artifact_ref") != node["entry_ref"]
-                    or self.work_reviews.get(node["work_id"], {}).get("artifact_ref") != node["review_ref"]):
+            if node["kind"] == "read" and not self._tree_parent_current(node):
                 node["state"] = "superseded"
         existing = {node["id"] for node in self.exploration_tree["nodes"]}
-        for action in actions:
+        retained = {node["id"]: node for node in self.exploration_tree["nodes"]
+                    if node["kind"] == "acquisition" and node["state"] == "read"}
+        retained.update({action["id"]: action for action in actions})
+        for action in retained.values():
             for observed in action.get("selected_work_ids", []):
                 wid = self.aliases.get(observed, observed)
                 entry = self.analysis_records.get(wid)
@@ -518,7 +518,8 @@ class LiteratureTree:
         if not self._tree_admitted_read_success(actions):
             for action in actions:
                 parent = next(node for node in self.exploration_tree["nodes"] if node["id"] == action["parent_id"])
-                if parent.get("decision") == "expand" and parent.get("follow_up_ref") == self.follow_up_ref:
+                if (parent.get("decision") == "expand" and parent.get("follow_up_ref") == self.follow_up_ref
+                        and self._tree_parent_current(parent)):
                     parent["state"] = "pending"
         self._tree_save()
         self._checkpoint("exploration_read_reviewed", force=True)
@@ -582,6 +583,11 @@ class LiteratureTree:
         for action in pending:
             if self._tree_recover_action(action):
                 continue
+            parent = next(node for node in self.exploration_tree["nodes"] if node["id"] == action["parent_id"])
+            if not self._tree_parent_current(parent):
+                action.update(state="deferred", reason="the planning parent no longer has a current reviewed basis")
+                self._tree_save()
+                continue
             request = action["request"]
             if self._tree_catalog_capacity() <= 0:
                 action.update(state="deferred", reason="declared catalog storage allowance reached")
@@ -629,13 +635,25 @@ class LiteratureTree:
             "query_refs": [action["query_ref"] for action in captured]})
         self._tree_read(captured)
 
+    def _tree_work_current(self, wid):
+        return (wid in self.analyzed_basis and wid in self.reviewed_basis
+                and self.analyzed_basis[wid] == self._analysis_basis(wid)
+                and self._work_review_current(wid))
+
+    def _tree_parent_current(self, node):
+        if node["kind"] != "read":
+            return node["kind"] == "root"
+        wid = node["work_id"]
+        return (self._tree_work_current(wid)
+                and self.work_records.get(wid, {}).get("artifact_ref") == node["work_ref"]
+                and self.analysis_records.get(wid, {}).get("artifact_ref") == node["entry_ref"]
+                and self.work_reviews.get(wid, {}).get("artifact_ref") == node["review_ref"])
+
     def _tree_plan(self, parents, *, suggestions):
         for node in parents:
             if node["kind"] != "read":
                 continue
-            if (self.work_records.get(node["work_id"], {}).get("artifact_ref") != node["work_ref"]
-                    or self.analysis_records.get(node["work_id"], {}).get("artifact_ref") != node["entry_ref"]
-                    or self.work_reviews.get(node["work_id"], {}).get("artifact_ref") != node["review_ref"]):
+            if not self._tree_parent_current(node):
                 raise StateError("exploration parent read basis changed; re-read before branching")
         parent_map = {node["id"]: deepcopy(node) for node in parents}
         sources = {ref: source for ref, source in self.source_docs.items()
@@ -724,9 +742,17 @@ class LiteratureTree:
     def _explore(self):
         self._tree_load()
         tree = self.exploration_tree
-        if self.resume_session and set(self.resume_session["reopened_scopes"]) & {"mapping", "focused_review", "retrieval"}:
+        reopened = (set(self.resume_session["reopened_scopes"]) if self.resume_session else set())
+        stale_parents = {node["parent_id"] for node in tree["nodes"]
+                         if node["kind"] == "read" and node["state"] != "superseded"
+                         and not self._tree_parent_current(node)}
+        reads = [node for node in tree["nodes"] if node["kind"] == "acquisition" and node["state"] == "read"
+                 and (reopened & {"mapping", "focused_review", "retrieval"} or node["id"] in stale_parents
+                      or any(not self._tree_work_current(self.aliases.get(wid, wid))
+                             for wid in node.get("selected_work_ids", [])))]
+        if reads:
             previous_ids = {node["id"] for node in tree["nodes"]}
-            self._tree_read([node for node in tree["nodes"] if node["kind"] == "acquisition" and node["state"] == "read"])
+            self._tree_read(reads)
             if any(node["id"] not in previous_ids and node["kind"] == "read" for node in tree["nodes"]):
                 tree["termination"] = None
                 self._tree_save()

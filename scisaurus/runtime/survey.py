@@ -1037,9 +1037,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 checks = body.get("checks", [])
                 relations = [relation for relation in self.relationships.values() if relation["source"] == wid]
                 refs = [relation["artifact_ref"] for relation in relations]
-                sources = [ref for ref, source in self.source_docs.items()
-                           if source["work_id"] in {wid, *[relation["target"] for relation in relations]}]
-                basis = [body["entry_ref"], *refs, *sources]
+                basis = self._work_review_basis(wid)
                 subjects = {item["ref"] for item in record.get("inputs", []) if item.get("purpose") == "subject"}
                 if (wid in self.analyzed_basis
                         and self._review_evidence_scope(wid, review=body) == self._review_evidence_scope(wid)
@@ -4271,6 +4269,23 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         }, "command.controller", subjects=[previous["artifact_ref"], feedback["review_ref"],
                                            self.analysis_records[wid]["artifact_ref"]])
 
+    def _work_review_basis(self, wid):
+        entry = self.analysis_records.get(wid)
+        if entry is None:
+            return None
+        relations = [relation for relation in self.relationships.values() if relation["source"] == wid]
+        owners = {wid, *[relation["target"] for relation in relations]}
+        return [entry["artifact_ref"], *[relation["artifact_ref"] for relation in relations],
+                *[ref for ref, source in self.source_docs.items() if source["work_id"] in owners]]
+
+    def _work_review_current(self, wid):
+        review = self.work_reviews.get(wid)
+        if (review is None or wid not in self.analyzed_basis or wid not in self.reviewed_basis
+                or self.reviewed_basis[wid] != self._work_review_basis(wid)):
+            return False
+        return (self._review_evidence_scope(wid, review=self._body(review))
+                == self._review_evidence_scope(wid))
+
     def _review_work_claims(self):
         repair_rounds = self.config["limits"]["max_rounds"]
         while True:
@@ -4281,9 +4296,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 refs = [relation["artifact_ref"] for relation in relations]
                 source_ids = {wid, *[relation["target"] for relation in relations]}
                 sources = [source for source in self._source_context() if source["work_id"] in source_ids]
-                basis = [entry_record["artifact_ref"], *refs, *[source["source_ref"] for source in sources]]
-                if (self.reviewed_basis.get(wid) == basis and wid in self.work_reviews
-                        and self._review_protocol_matches(self._body(self.work_reviews[wid]))):
+                basis = self._work_review_basis(wid)
+                if self._work_review_current(wid):
                     continue
                 entry = json.loads(self.store.read_body(entry_record["body_hash"]))
                 abstention = self.store.head(f"command/survey-abstentions/{wid}")

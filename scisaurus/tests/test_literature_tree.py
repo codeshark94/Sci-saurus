@@ -224,6 +224,129 @@ class TestExplorationContract(unittest.TestCase):
         self.plan["decision"] = "stop"
         with self.assertRaises(ValidationError): self.validate(self.plan)
 
+    def test_parent_checks_current_owner_and_relationship_source_dependencies(self):
+        from scisaurus.runtime.survey import SurveyRunner
+        runner = object.__new__(SurveyRunner)
+        runner.work_records = {"W1": {"artifact_ref": "work-1"}}
+        runner.analysis_records = {"W1": {"artifact_ref": "entry-1"}}
+        runner.work_reviews = {"W1": {"artifact_ref": "review-1"}}
+        runner.identity_records = {}
+        runner.source_docs = {"source-1": {"work_id": "W1"}, "source-2": {"work_id": "W2"}}
+        runner.relationships = {"relation": {"source": "W1", "target": "W2", "artifact_ref": "relation-1"}}
+        runner.analyzed_basis = {"W1": runner._analysis_basis("W1")}
+        runner.reviewed_basis = {"W1": runner._work_review_basis("W1")}
+        runner._body = lambda record: {}
+        runner._review_evidence_scope = lambda wid, review=None: {"protocol": "fixture"}
+        parent = {"kind": "read", "work_id": "W1", "work_ref": "work-1", "entry_ref": "entry-1",
+                  "review_ref": "review-1"}
+        self.assertTrue(runner._tree_parent_current(parent))
+        for owner in ("W1", "W2"):
+            with self.subTest(owner=owner):
+                runner.source_docs["new-source"] = {"work_id": owner}
+                self.assertFalse(runner._tree_parent_current(parent))
+                runner.source_docs.pop("new-source")
+        self.assertTrue(runner._tree_parent_current(parent))
+
+    def test_parent_requires_current_target_identity_and_work_scope(self):
+        from scisaurus.runtime.survey import SurveyRunner
+        runner = object.__new__(SurveyRunner)
+        runner.work_records = {"W1": {"artifact_ref": "work-1"}, "W2": {"artifact_ref": "work-2"}}
+        runner.analysis_records = {"W1": {"artifact_ref": "entry-1"}}
+        runner.work_reviews = {"W1": {"artifact_ref": "review-1"}}
+        runner.identity_records = {"W2": {"artifact_ref": "identity-2"}}
+        runner.source_docs = {"source-1": {"work_id": "W1"}, "source-2": {"work_id": "W2"}}
+        runner.relationships = {"relation": {"source": "W1", "target": "W2", "artifact_ref": "relation-1"}}
+        runner.analyzed_basis = {"W1": runner._analysis_basis("W1")}
+        runner.reviewed_basis = {"W1": runner._work_review_basis("W1")}
+        from scisaurus.runtime.survey import source_fidelity_review_contract
+        scope = {"review_protocol": source_fidelity_review_contract()["protocol"], "question": "fixture",
+                 "owner_basis": sorted(runner.analyzed_basis["W1"]),
+                 "targets": {"W2": sorted(["work-2", "identity-2", "source-2"])}}
+        runner.score = {"question": "fixture"}
+        runner.review_obligations = []
+        review = {"evidence_scope": deepcopy(scope), "review_protocol": scope["review_protocol"]}
+        runner._body = lambda record: review
+        runner._review_protocol_matches = lambda body: True
+        parent = {"kind": "read", "work_id": "W1", "work_ref": "work-1", "entry_ref": "entry-1",
+                  "review_ref": "review-1"}
+        self.assertTrue(runner._tree_parent_current(parent))
+        for records in (runner.work_records, runner.identity_records):
+            old = records["W2"]["artifact_ref"]
+            records["W2"]["artifact_ref"] = old + "-changed"
+            self.assertFalse(runner._tree_parent_current(parent))
+            self.assertFalse(runner._work_review_current("W1"))
+            records["W2"]["artifact_ref"] = old
+        self.assertTrue(runner._tree_parent_current(parent))
+
+    def test_paid_capture_without_admitted_child_does_not_revive_superseded_parent(self):
+        from unittest.mock import Mock
+        from scisaurus.runtime.literature_tree import LiteratureTree
+        runner = object.__new__(LiteratureTree)
+        runner.follow_up_ref = "follow-up"
+        parent = {"id": "parent", "parent_id": "original-acquisition", "kind": "read", "work_id": "W1", "state": "superseded",
+                  "decision": "expand", "follow_up_ref": "follow-up"}
+        capture = {"id": "capture", "kind": "acquisition", "state": "captured", "parent_id": "parent",
+                   "selection_ref": "selection", "selected_work_ids": []}
+        runner.exploration_tree = {"nodes": [parent, capture]}
+        runner.analyzed_basis = {}; runner.reviewed_basis = {}
+        runner.analysis_records = {}; runner.work_reviews = {}; runner.source_docs = {}; runner.aliases = {}
+        runner.store = Mock(); runner._body = Mock(return_value={"candidates": []})
+        for method in ("_tree_select_reads", "_full_texts", "_reconcile_identities", "_map",
+                       "_review_work_claims", "_tree_save", "_checkpoint"):
+            setattr(runner, method, Mock())
+        runner._tree_finish_acquisitions = runner._tree_read
+        runner._bibliographic_call = Mock(side_effect=AssertionError("paid capture cannot be redispatched"))
+        runner._tree_acquire([capture])
+        self.assertEqual(capture["state"], "screened")
+        self.assertEqual(parent["state"], "superseded")
+        runner._bibliographic_call.assert_not_called()
+
+    def test_revised_owner_read_is_rebuilt_when_another_capture_is_read(self):
+        from unittest.mock import Mock
+        from scisaurus.runtime.survey import SurveyRunner
+        runner = object.__new__(SurveyRunner)
+        runner.follow_up_ref = None
+        runner.work_records = {wid: {"artifact_ref": "work-" + wid} for wid in ("W1", "W2")}
+        runner.works = {wid: {"referenced_works": []} for wid in ("W1", "W2")}
+        runner.analysis_records = {wid: {"artifact_ref": "entry-" + wid} for wid in ("W1", "W2")}
+        runner.work_reviews = {wid: {"artifact_ref": "review-" + wid} for wid in ("W1", "W2")}
+        runner.identity_records = {}; runner.aliases = {}; runner.relationships = {}
+        runner.source_docs = {"source-" + wid: {"work_id": wid, "text": "A supported finding.",
+                              "representation": "abstract"} for wid in ("W1", "W2")}
+        runner.analyzed_basis = {wid: runner._analysis_basis(wid) for wid in ("W1", "W2")}
+        runner.reviewed_basis = {wid: runner._work_review_basis(wid) for wid in ("W1", "W2")}
+        runner._work_review_current = lambda wid: wid in runner.reviewed_basis
+        root = {"id": "root", "kind": "root", "state": "decided"}
+        original = {"id": "original", "kind": "acquisition", "parent_id": "root", "state": "read",
+                    "selection_ref": "selected", "selected_work_ids": ["W1"], "question": "Question",
+                    "rationale": "Investigate.", "depth": 1}
+        old = {"id": "old-read", "kind": "read", "parent_id": "original", "state": "pending",
+               "work_id": "W1", "work_ref": "work-W1", "entry_ref": "entry-W1", "review_ref": "old-review"}
+        capture = {**original, "id": "capture", "state": "captured", "selected_work_ids": ["W2"]}
+        runner.exploration_tree = {"nodes": [root, original, old, capture]}
+        runner.store = Mock(); runner.store.get.side_effect = lambda ref: {"artifact_ref": ref}
+        def body(record):
+            ref = record["artifact_ref"]
+            if ref == "selected":
+                return {"candidates": [{"work_id": "W2", "decision": "read"}]}
+            wid = ref.split("-")[-1]
+            if ref.startswith("entry-"):
+                return {field: {"text": "A supported finding.", "evidence": []}
+                        for field in ("problem", "approach", "finding", "limitations")}
+            return {"entry_ref": "entry-" + wid, "checks": [{"outcome": "passed"}]}
+        runner._body = body
+        for method in ("_tree_select_reads", "_full_texts", "_reconcile_identities", "_map",
+                       "_review_work_claims", "_tree_save", "_checkpoint"):
+            setattr(runner, method, Mock())
+        runner._tree_read([capture])
+        self.assertEqual(old["state"], "superseded")
+        replacements = [node for node in runner.exploration_tree["nodes"]
+                        if node["kind"] == "read" and node.get("work_id") == "W1" and node["id"] != "old-read"]
+        self.assertEqual(len(replacements), 1)
+        self.assertEqual(replacements[0]["parent_id"], "original")
+        self.assertEqual(replacements[0]["state"], "pending")
+        self.assertTrue(runner._tree_parent_current(replacements[0]))
+
     def test_reading_selection_accounts_for_candidates_without_paper_quota(self):
         value = {"rationale": "Investigate each unresolved mechanism.", "candidates": [
             {"work_id": wid, "decision": "read", "rationale": "Resolve an independent evidence gap."}
@@ -405,6 +528,92 @@ class TestExplorationExecution(unittest.TestCase):
             self.assertEqual(child["question"], acquisition["question"])
             self.assertEqual(child["inquiry_evidence"], acquisition["evidence"])
         self.assertFalse(tree["termination"]["exhaustive_coverage"])
+
+    def test_durable_critique_refreshes_read_basis_before_resumed_branching(self):
+        from unittest.mock import patch
+        first = self.runner()
+        plan = first._tree_plan
+        def pause(parents, **kwargs):
+            if parents[0]["kind"] == "read":
+                raise KeyboardInterrupt()
+            return plan(parents, **kwargs)
+        with patch.object(first, "_tree_plan", side_effect=pause):
+            stopped = first.run()
+        self.assertEqual(stopped["status"], "paused", stopped["error"])
+        control, store = self.fixture.open_store()
+        first.store = store
+        obligation = {key: value for key, value in self.fixture.review_obligation(first, "W101").items()
+                      if key not in {"receipt_ref", "receipt_body_sha256"}}
+        receipt = store.publish_artifact(logical_id="command/independent-literature-critiques/read-audit",
+            artifact_type="decision_note", body=json.dumps({"schema_version": "independent-literature-critique-1",
+                "question": first.score["question"], "obligations": [obligation]}).encode(),
+            author="command.operator", media_type="application/json")
+        old_review = first.work_reviews["W101"]["artifact_ref"]
+        before = [request for request in fixtures.SurveyHTTPFixture.requests
+                  if request["query"].get("filter") == ["openalex_id:W101"]]
+        policy = {**self.policy(), "source_changes": {"mode": "reopen", "reopen_scopes": ["production"]}}
+        resumed = self.runner(resume_policy=policy)
+        self.assertNotIn("W101", resumed.work_reviews)
+        seen = []
+        next_plan = resumed._tree_plan
+        def checked(parents, **kwargs):
+            self.assertTrue(all(node["kind"] != "read" or resumed._tree_parent_current(node) for node in parents))
+            seen.extend(node["review_ref"] for node in parents if node.get("work_id") == "W101")
+            return next_plan(parents, **kwargs)
+        with patch.object(resumed, "_tree_plan", side_effect=checked):
+            result = resumed.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertTrue(seen)
+        self.assertNotIn(old_review, seen)
+        after = [request for request in fixtures.SurveyHTTPFixture.requests
+                 if request["query"].get("filter") == ["openalex_id:W101"]]
+        self.assertEqual(before, after)
+        self.assertTrue(any(node["state"] == "superseded" and node.get("review_ref") == old_review
+                            for node in result["coverage"]["exploration_tree"]["nodes"]))
+        review = json.loads(store.read_body(resumed.work_reviews["W101"]["body_hash"]))
+        execution = store.get(review["execution_ref"])
+        context = store.get(execution["inputs"][0]["ref"])
+        prompt = json.loads(json.loads(store.read_body(context["body_hash"]))["prompt"])
+        self.assertEqual(prompt["review_obligations"][0]["receipt_ref"], receipt["artifact_ref"])
+
+    def test_critique_defers_unexecuted_children_of_superseded_read(self):
+        from unittest.mock import patch
+        first = self.runner()
+        checkpoint = first._checkpoint
+        def pause(phase, *args, **kwargs):
+            checkpoint(phase, *args, **kwargs)
+            if phase == "exploration_branches_planned" and first.exploration_tree["round"] == 2:
+                raise KeyboardInterrupt()
+        with patch.object(first, "_checkpoint", side_effect=pause):
+            stopped = first.run()
+        self.assertEqual(stopped["status"], "paused", stopped["error"])
+        old_actions = {node["id"] for node in first.exploration_tree["nodes"]
+                       if node["kind"] == "acquisition" and node["state"] == "pending"}
+        self.assertTrue(old_actions)
+        control, store = self.fixture.open_store()
+        first.store = store
+        obligation = {key: value for key, value in self.fixture.review_obligation(first, "W101").items()
+                      if key not in {"receipt_ref", "receipt_body_sha256"}}
+        store.publish_artifact(logical_id="command/independent-literature-critiques/child-audit",
+            artifact_type="decision_note", body=json.dumps({"schema_version": "independent-literature-critique-1",
+                "question": first.score["question"], "obligations": [obligation]}).encode(),
+            author="command.operator", media_type="application/json")
+        policy = {**self.policy(), "source_changes": {"mode": "reopen", "reopen_scopes": ["production"]}}
+        resumed = self.runner(resume_policy=policy)
+        acquire = resumed._bibliographic_call
+        def checked(*args, **kwargs):
+            active = getattr(resumed, "_active_tree_action", None)
+            if active:
+                action = next(node for node in resumed.exploration_tree["nodes"] if node["id"] == active)
+                parent = next(node for node in resumed.exploration_tree["nodes"] if node["id"] == action["parent_id"])
+                self.assertTrue(resumed._tree_parent_current(parent))
+            return acquire(*args, **kwargs)
+        with patch.object(resumed, "_bibliographic_call", side_effect=checked):
+            result = resumed.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        actions = {node["id"]: node for node in result["coverage"]["exploration_tree"]["nodes"]}
+        self.assertTrue(all(actions[identity]["state"] == "deferred" for identity in old_actions))
+        self.assertEqual(sum(row["path"] == "/works/W102" for row in fixtures.SurveyHTTPFixture.requests), 1)
 
     def test_resume_after_child_plan_reuses_parent_and_pending_query(self):
         from unittest.mock import patch
