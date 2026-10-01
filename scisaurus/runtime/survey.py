@@ -4237,7 +4237,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             return False
         if review.get("verification_kind") == "deterministic_abstention":
             wid = self._body(self.store.get(review["entry_ref"]))["work_id"]
-            return not self._review_obligations_for(wid)
+            abstention = self.store.head(f"command/survey-abstentions/{wid}")
+            return (not self._review_obligations_for(wid) and abstention is not None
+                    and review.get("execution_ref") == abstention["artifact_ref"]
+                    and is_explicit_abstention(self._body(self.store.get(review["entry_ref"])), self._body(abstention)))
         try:
             wid = self._body(self.store.get(review["entry_ref"]))["work_id"]
             obligations = self._review_obligations_for(wid)

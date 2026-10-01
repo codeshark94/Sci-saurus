@@ -2189,6 +2189,29 @@ class TestSurveyRunner(unittest.TestCase):
                 "source_pins": [{"ref": ref, "body_hash": runner.store.get(ref)["body_hash"]} for ref in sorted(source_refs)],
                 "hypothesis": "Independently determine whether every qualification in this screening rationale is supported by the pinned source text."}
 
+    def test_new_abstention_receipt_invalidates_old_deterministic_review_without_model_calls(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        for wid in ("W101", "W102"):
+            runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+        runner._map()
+        runner._materialize_source_less_map("W102", runner.analyzed_basis["W102"], scope="reading_deferred")
+        runner._review_work_claims()
+        old_review = runner.work_reviews["W102"]["artifact_ref"]
+        abstention = runner.store.head("command/survey-abstentions/W102")
+        renewed = runner._publish("command/survey-abstentions/W102", "note", runner._body(abstention),
+                                 "command.controller", subjects=runner.analyzed_basis["W102"])
+        self.assertNotEqual(renewed["artifact_ref"], abstention["artifact_ref"])
+        self.assertFalse(runner._work_review_current("W102"))
+        calls = runner.model_calls_dispatched
+        runner._review_work_claims()
+        self.assertEqual(runner.model_calls_dispatched, calls)
+        self.assertNotEqual(runner.work_reviews["W102"]["artifact_ref"], old_review)
+        self.assertEqual(runner._body(runner.work_reviews["W102"])["execution_ref"], renewed["artifact_ref"])
+        runner._accept_survey()
+        self.assertIsNotNone(runner.survey_ref)
+        runner.gate.require_current(runner.survey_ref)
+
     def test_scoped_read_reviews_only_completed_analysis_then_finalizes_remaining_map(self):
         runner = self.runtime()
         runner._initialize(); runner._setup()
