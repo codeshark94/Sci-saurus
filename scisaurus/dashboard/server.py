@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from scisaurus.core.schema import SCHEMA_VERSION, GENESIS_HASH, canonical_bytes, sha256_hex
+from scisaurus.core.errors import ValidationError
 
 
 APP_VERSION = "1"
@@ -56,6 +57,8 @@ MAX_PROJECTS = 64
 MAX_WORKSPACE_RECENT_PROJECTS = 12
 MIN_PROJECT_HARD_SECONDS = 3_600
 MAX_PROJECT_HARD_SECONDS = 604_800
+MAX_LITERATURE_RECORDS = 20_000
+MAX_LITERATURE_PAGE = 100
 
 STAGE_LABELS = {
     "topic": "Topic discovery",
@@ -354,8 +357,6 @@ class DashboardSnapshot:
             for stage_id, record in progress_stages.items():
                 if not isinstance(stage_id, str) or not isinstance(record, dict):
                     continue
-                if record.get("status") not in {"running", "retrying"}:
-                    continue
                 project_dir = record.get("project_dir")
                 if not isinstance(project_dir, str) or not project_dir:
                     # Composer retries historically lived below attempts/ and
@@ -519,6 +520,548 @@ class DashboardSnapshot:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
         return conn
+
+    def _owned_artifact(self, root_key, row):
+        """Read a content-addressed artifact only through its configured owner root."""
+        if row is None:
+            return None
+        row = dict(row)
+        digest = row.get("body_hash")
+        record = {"artifact_ref": row.get("artifact_ref"), "body_sha256": digest,
+                  "artifact_type": row.get("artifact_type"), "file_ref": None,
+                  "author": row.get("author"),
+                  "created_at": row.get("created_at"), "integrity": "unknown"}
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            return record
+        file_ref = _ref(root_key, Path("objects/sha256") / digest)
+        try:
+            path, _, _ = self.resolve_file(file_ref)
+            if path.stat().st_size > MAX_RAW_FILE_BYTES:
+                record["integrity"] = "too_large"
+                return record
+            raw = path.read_bytes()
+            manifest = _json(row.get("manifest_json"), None)
+            if (sha256_hex(raw) != digest or len(raw) != row.get("body_size_bytes")
+                    or not isinstance(manifest, dict)
+                    or sha256_hex(canonical_bytes(manifest)) != row.get("manifest_hash")
+                    or manifest.get("artifact_ref") != row.get("artifact_ref")
+                    or manifest.get("body_hash") != digest
+                    or manifest.get("artifact_id") != row.get("logical_id")
+                    or manifest.get("artifact_type") != row.get("artifact_type")
+                    or manifest.get("author") != row.get("author")):
+                record["integrity"] = "invalid"
+                return record
+            body = _json(raw, None)
+            if not isinstance(body, dict):
+                record["integrity"] = "invalid"
+                return record
+            record.update({"file_ref": file_ref, "integrity": "verified", "body": body})
+        except (OSError, ValueError):
+            record["integrity"] = "unavailable"
+        return record
+
+    @staticmethod
+    def _artifact_link(record):
+        return {key: record.get(key) for key in (
+            "artifact_ref", "file_ref", "body_sha256", "created_at", "integrity")} if record else None
+
+    def _literature_root(self):
+        spec = next((item for item in self._stage_specs()
+                     if item.get("kind") in {"survey", "literature_survey"} or item.get("id") == "survey"), None)
+        if spec:
+            stage_id = spec["id"]
+            for key in (f"stage:{stage_id}:active", f"stage:{stage_id}"):
+                if key in self.roots:
+                    return stage_id, key
+            return stage_id, None
+        # A standalone Survey directory is also an explicit dashboard owner.
+        if not self.workflow and (self.root / "state/control.sqlite").is_file():
+            return "survey", "project"
+        return "survey", None
+
+    def _literature_catalog(self):
+        stage_id, root_key = self._literature_root()
+        summary = {"stage_id": stage_id, "status": "not_started", "source_root": root_key,
+                   "total": 0, "counts": {key: 0 for key in ("full_text", "abstract_only", "no_abstract", "unknown")},
+                   "survey_ref": None, "gap_ref": None, "survey_current": None, "gap_current": None,
+                   "notices": []}
+        if root_key is None or not (self.roots[root_key] / "state/control.sqlite").is_file():
+            return summary, []
+        try:
+            conn = self._db_connection(self.roots[root_key] / "state/control.sqlite")
+            try:
+                # Latest records are selected per logical identity. Activity limits must
+                # never determine whether a retained scientific source is visible.
+                rows = conn.execute("SELECT a.* FROM artifacts a JOIN "
+                    "(SELECT logical_id,MAX(version) version FROM artifacts GROUP BY logical_id) h "
+                    "ON a.logical_id=h.logical_id AND a.version=h.version WHERE "
+                    "a.logical_id LIKE 'kb/%' OR a.logical_id LIKE 'command/source-attempts/full-text/%' "
+                    "ORDER BY a.logical_id LIMIT ?", (MAX_LITERATURE_RECORDS + 1,)).fetchall()
+                if len(rows) > MAX_LITERATURE_RECORDS:
+                    summary.update(status="unavailable", notices=["Literature index exceeds its bounded read limit."])
+                    return summary, []
+                latest = {row["logical_id"]: row for row in rows}
+                records = {}
+                def record(logical):
+                    if logical not in records:
+                        records[logical] = self._owned_artifact(root_key, latest.get(logical))
+                    return records[logical]
+                def exact(ref):
+                    if not isinstance(ref, str):
+                        return None
+                    row = conn.execute("SELECT * FROM artifacts WHERE artifact_ref=?", (ref,)).fetchone()
+                    return self._owned_artifact(root_key, row)
+                register = record("kb/work-register")
+                body = register.get("body", {}) if register else {}
+                if not register or register.get("integrity") != "verified":
+                    if latest:
+                        summary.update(status="unknown", notices=["No valid current work register is available."])
+                    return summary, []
+                refs = body.get("work_refs")
+                source_refs = body.get("source_refs")
+                if not isinstance(refs, list) or not isinstance(source_refs, list):
+                    summary.update(status="unknown", notices=["The work register has no explicit source and work references."])
+                    return summary, []
+                sources = {}
+                invalid_sources = set()
+                for ref in source_refs:
+                    source = exact(ref)
+                    if source and source.get("integrity") == "verified" and source.get("artifact_type") == "source_capture":
+                        source_body = source["body"]
+                        if isinstance(source_body.get("work_id"), str):
+                            sources.setdefault(source_body["work_id"], []).append(source)
+                    elif isinstance(ref, str):
+                        invalid_sources.add(ref.rsplit("/", 1)[-1].split("@", 1)[0])
+                mapped = record("kb/literature-map")
+                map_body = mapped.get("body", {}) if mapped else {}
+                map_refs = set(map_body.get("entry_refs", []))
+                failures = {}
+                access_attempts = {}
+                coverage = record("kb/coverage")
+                for failure in (coverage.get("body", {}).get("gaps", []) if coverage else []):
+                    if isinstance(failure, dict) and failure.get("kind") in {"full_text_failure", "full_text_identity_or_scope"}:
+                        failures.setdefault(failure.get("work_id"), []).append(failure)
+                for logical in latest:
+                    if logical.startswith("command/source-attempts/full-text/"):
+                        attempt = record(logical)
+                        attempt_body = attempt.get("body", {}) if attempt else {}
+                        if isinstance(attempt_body.get("work_id"), str):
+                            access_attempts[attempt_body["work_id"]] = {**self._artifact_link(attempt),
+                                "status": attempt_body.get("status"), "url": attempt_body.get("url")}
+                        failure = attempt_body.get("failure")
+                        if isinstance(failure, dict):
+                            failures.setdefault(failure.get("work_id"), []).append(failure)
+                items = []
+                for ref in refs:
+                    work = exact(ref)
+                    data = work.get("body", {}) if work else {}
+                    wid = data.get("work_id") or data.get("id")
+                    if not isinstance(wid, str) and isinstance(ref, str):
+                        wid = ref.rsplit("/", 1)[-1].split("@", 1)[0]
+                    if not isinstance(wid, str):
+                        summary["notices"].append("A registered work cannot be verified.")
+                        continue
+                    captured = sources.get(wid, [])
+                    abstracts, full_texts = [], []
+                    for source in captured:
+                        sb = source["body"]
+                        link = {**self._artifact_link(source), "identity_verified": sb.get("identity_verified") is True,
+                                "representation": sb.get("representation"), "url": sb.get("url"),
+                                "characters": len(sb.get("text", "")) if isinstance(sb.get("text"), str) else 0}
+                        if link["characters"] and sb.get("representation") == "abstract":
+                            abstracts.append(link)
+                        elif link["characters"] and sb.get("representation") == "full_text" and sb.get("identity_verified") is True:
+                            full_texts.append(link)
+                    evidence_status = "full_text" if full_texts else "abstract_only" if abstracts else "no_abstract"
+                    if not work or work.get("integrity") != "verified" or wid in invalid_sources:
+                        evidence_status = "unknown"
+                    analysis = record(f"kb/work-analyses/{wid}")
+                    review = record(f"kb/work-reviews/{wid}")
+                    analysis_body = analysis.get("body", {}) if analysis else {}
+                    review_body = review.get("body", {}) if review else {}
+                    analysis_current = bool(analysis and analysis.get("integrity") == "verified"
+                                            and analysis.get("artifact_ref") in map_refs)
+                    review_current = bool(review and review.get("integrity") == "verified" and analysis_current
+                                          and review_body.get("entry_ref") == analysis.get("artifact_ref"))
+                    scope = review_body.get("evidence_scope")
+                    if review_current and not isinstance(scope, dict):
+                        review_current = None
+                    if review_current and isinstance(scope, dict):
+                        basis = scope.get("owner_basis", [])
+                        targets = scope.get("targets", {})
+                        if isinstance(targets, dict):
+                            basis = [*basis, *(ref for refs in targets.values() if isinstance(refs, list) for ref in refs)] if isinstance(basis, list) else None
+                        else:
+                            basis = None
+                        review_current = (isinstance(basis, list) and bool(basis)
+                            and all(isinstance(ref, str) for ref in basis)
+                            and scope.get("question") == map_body.get("question")
+                            and scope.get("review_protocol") == review_body.get("review_protocol"))
+                        for basis_ref in basis if review_current else []:
+                            pinned_row = conn.execute("SELECT a.* FROM artifacts a WHERE a.artifact_ref=? AND a.version="
+                                "(SELECT MAX(h.version) FROM artifacts h WHERE h.logical_id=a.logical_id)", (basis_ref,)).fetchone()
+                            pinned_record = self._owned_artifact(root_key, pinned_row)
+                            review_current = review_current and bool(pinned_record and pinned_record.get("integrity") == "verified")
+                    checks = review_body.get("checks", [])
+                    checks = checks if isinstance(checks, list) else []
+                    review_status = ("unknown" if review and review_current is None else "stale" if review and not review_current else "passed" if review_current
+                        and isinstance(checks, list) and checks and all(isinstance(c, dict) and c.get("outcome") == "passed" for c in checks)
+                        else "held" if review_current else "not_reviewed")
+                    work_failures = failures.get(wid, [])
+                    outcome = next((f.get("outcome") for f in reversed(work_failures) if f.get("outcome")), None)
+                    attempt_status = access_attempts.get(wid, {}).get("status")
+                    access_status = "verified_full_text" if full_texts else outcome or attempt_status or ("not_attempted")
+                    items.append({"work_id": wid, "title": data.get("title") or wid, "doi": data.get("doi"),
+                        "year": data.get("year"), "url": next((s.get("url") for s in full_texts + abstracts if s.get("url")), None),
+                        "evidence_status": evidence_status, "access_status": access_status,
+                        "work": self._artifact_link(work), "abstracts": abstracts, "full_texts": full_texts,
+                        "abstract_ref": abstracts[0]["file_ref"] if abstracts else None,
+                        "full_text_ref": full_texts[0]["file_ref"] if full_texts else None,
+                        "analysis_ref": analysis.get("file_ref") if analysis else None,
+                        "review_ref": review.get("file_ref") if review else None,
+                        "analysis": {**(self._artifact_link(analysis) or {}), "current": analysis_current,
+                                     "status": "current" if analysis_current else "stale" if analysis else "not_analyzed",
+                                     "inclusion": analysis_body.get("inclusion"), "reason": analysis_body.get("reason")},
+                        "review": {**(self._artifact_link(review) or {}), "current": review_current, "status": review_status,
+                                   "verification_kind": review_body.get("verification_kind"), "checks": checks,
+                                   "scientific_support": False if review_body.get("verification_kind") == "deterministic_abstention" else None,
+                                   "source_fidelity_checks": [check for check in checks if isinstance(check, dict) and check.get("check_id") not in {"inclusion", "reason"}],
+                                   "question_relevance_checks": [check for check in checks if isinstance(check, dict) and check.get("check_id") in {"inclusion", "reason"}],
+                                   "rationale": review_body.get("rationale"), "review_protocol": review_body.get("review_protocol")},
+                        "access_failures": deepcopy(work_failures), "access_attempt": access_attempts.get(wid)})
+                    items[-1]["analysis_output"] = items[-1]["analysis"]
+                    items[-1]["review_output"] = items[-1]["review"]
+                def acceptance(logical, event_type, field):
+                    head = record(logical)
+                    accepted = conn.execute("SELECT accepted_version FROM accepted_heads WHERE logical_id=?", (logical,)).fetchone()
+                    if not head or not accepted:
+                        return head, False
+                    row = conn.execute("SELECT * FROM artifacts WHERE logical_id=? AND version=?", (logical, accepted[0])).fetchone()
+                    admitted = self._owned_artifact(root_key, row)
+                    if not admitted or admitted.get("integrity") != "verified":
+                        return admitted, None
+                    if head["artifact_ref"] != admitted["artifact_ref"]:
+                        return admitted, False
+                    event = conn.execute("SELECT payload_json FROM events WHERE event_type=? "
+                        "AND json_extract(payload_json,?)=? ORDER BY seq DESC LIMIT 1",
+                        (event_type, f"$.{field}", admitted["artifact_ref"])).fetchone()
+                    payload = _json(event[0], {}) if event else {}
+                    dependencies = admitted["body"].get("dependency_refs", [])
+                    if logical == "kb/gap-assessments/current":
+                        dependencies = [admitted["body"].get("survey_ref"), admitted["body"].get("nomination_ref")]
+                    dependency_pins, evidence_pins = payload.get("dependency_pins", []), payload.get("evidence_pins", [])
+                    if not isinstance(dependency_pins, list) or not isinstance(evidence_pins, list):
+                        return admitted, None
+                    pins = dependency_pins + evidence_pins
+                    pinned = bool(event)
+                    if logical == "kb/surveys/current":
+                        pinned = pinned and isinstance(dependencies, list) and bool(dependencies) and all(
+                            isinstance(pin, dict) and isinstance(pin.get("ref"), str) for pin in pins)
+                        pinned = pinned and set(dependencies) == {pin["ref"] for pin in dependency_pins if isinstance(pin, dict) and isinstance(pin.get("ref"), str)}
+                    else:
+                        pinned = pinned and payload == {"assessment_ref": admitted["artifact_ref"],
+                            "survey_ref": admitted["body"].get("survey_ref"), "nomination_ref": admitted["body"].get("nomination_ref"),
+                            "state": admitted["body"].get("state"), "body_hash": admitted["body_sha256"]}
+                        pins = [{"ref": ref} for ref in dependencies]
+                    current = pinned
+                    for pin in pins:
+                        row = conn.execute("SELECT a.* FROM artifacts a WHERE a.artifact_ref=? AND a.version="
+                            "(SELECT MAX(h.version) FROM artifacts h WHERE h.logical_id=a.logical_id)", (pin["ref"],)).fetchone()
+                        pinned_record = self._owned_artifact(root_key, row)
+                        if (not pinned_record or pinned_record.get("integrity") != "verified"
+                                or ("body_hash" in pin and pin["body_hash"] != pinned_record["body_sha256"])):
+                            current = False
+                    return admitted, current
+                survey, survey_current = acceptance("kb/surveys/current", "survey.accepted", "survey_ref")
+                gap, gap_current = acceptance("kb/gap-assessments/current", "assessment.accepted", "assessment_ref")
+                summary.update(status="available", total=len(items), survey_ref=survey.get("artifact_ref") if survey else None,
+                    gap_ref=gap.get("artifact_ref") if gap else None, survey_current=survey_current,
+                    gap_current=bool(gap_current and survey_current), map=self._artifact_link(mapped),
+                    survey=self._artifact_link(survey), gap=self._artifact_link(gap))
+                summary["survey_output"] = {**(self._artifact_link(survey) or {}), "current": survey_current,
+                    "status": "current" if survey_current else "historical" if survey else "not_accepted"}
+                summary["gap_output"] = {**(self._artifact_link(gap) or {}), "current": summary["gap_current"],
+                    "status": "current" if summary["gap_current"] else "historical" if gap else "not_assessed",
+                    "state": gap.get("body", {}).get("state") if gap else None}
+                for item in items:
+                    summary["counts"][item["evidence_status"]] += 1
+                return summary, sorted(items, key=lambda item: (str(item["title"]).casefold(), item["work_id"]))
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError, ValueError, TypeError):
+            summary.update(status="unavailable", notices=["Literature records could not be read from the owned database."])
+            return summary, []
+
+    def literature(self, *, q="", evidence="all", offset=0, limit=25, work_id=None):
+        if evidence not in {"all", "full_text", "abstract_only", "no_abstract", "unknown"}:
+            raise ValueError("unknown literature evidence filter")
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= MAX_LITERATURE_PAGE:
+            raise ValueError("invalid literature page")
+        if not isinstance(q, str) or len(q) > 500:
+            raise ValueError("literature search is too long")
+        summary, items = self._literature_catalog()
+        if work_id is not None:
+            if not isinstance(work_id, str) or len(work_id) > 200:
+                raise ValueError("invalid literature work ID")
+            item = next((item for item in items if item["work_id"] == work_id), None)
+            if item is None:
+                raise FileNotFoundError("work is not registered in this mission's literature stage")
+            return {**summary, "item": item}
+        query = q.casefold().strip()
+        filtered = [item for item in items if (evidence == "all" or item["evidence_status"] == evidence)
+                    and (not query or query in " ".join(str(item.get(key) or "") for key in ("work_id", "title", "doi")).casefold())]
+        return {**summary, "filtered_total": len(filtered), "offset": offset, "limit": limit,
+                "has_more": offset + limit < len(filtered), "items": filtered[offset:offset+limit]}
+
+    def _paired_topic_output(self, outputs, producer, current):
+        """Bind producer science through its document, apart from run status."""
+        if not isinstance(producer, dict) or not isinstance(current, dict):
+            return None
+        composer = self.workflow.get("project_id")
+        if not isinstance(composer, str):
+            return None
+        base = Path(composer).expanduser().resolve()
+        root_key = next((key for key, root in self.roots.items() if root == base), None)
+        if root_key is None or not (base / "state/control.sqlite").is_file():
+            return None
+        try:
+            conn = self._db_connection(base / "state/control.sqlite")
+            try:
+                rows = conn.execute("SELECT a.* FROM artifacts a WHERE a.logical_id LIKE 'command/model-work/%' "
+                    "AND a.version=(SELECT MAX(h.version) FROM artifacts h WHERE h.logical_id=a.logical_id) "
+                    "ORDER BY a.created_at DESC LIMIT ?", (MAX_LITERATURE_RECORDS + 1,)).fetchall()
+                if len(rows) > MAX_LITERATURE_RECORDS:
+                    return None
+                retained = []
+                for row in rows:
+                    record = self._owned_artifact(root_key, row)
+                    if (not record or record.get("integrity") != "verified"
+                            or record.get("author") != "command.controller" or record.get("artifact_type") != "note"):
+                        continue
+                    body = record["body"]
+                    result = body.get("result")
+                    if (body.get("status") != "succeeded" or not isinstance(result, dict)
+                            or result.get("status") != "completed"
+                            or result.get("stage_id") != producer.get("stage_id")
+                            or result.get("kind") != producer.get("kind")):
+                        continue
+                    science = {key: item for key, item in result.items() if key not in {"status", "usage"}}
+                    if all(key in candidate and candidate[key] == item
+                           for candidate in (producer, current) for key, item in science.items()):
+                        retained.append(body)
+            finally:
+                conn.close()
+        except (OSError, sqlite3.Error, ValueError):
+            return None
+        for output in outputs:
+            if not output.get("file_ref") or not output.get("body_sha256"):
+                continue
+            if not any(body.get("output_sha256") == output["body_sha256"] for body in retained):
+                continue
+            try:
+                path, _, _ = self.resolve_file(output["file_ref"])
+                if (path.stat().st_size > MAX_RAW_FILE_BYTES
+                        or path != Path(producer.get("output_path", "")).resolve()):
+                    continue
+                raw = path.read_bytes()
+                value = _json(raw, None)
+                if (sha256_hex(raw) != output["body_sha256"] or not isinstance(value, dict)
+                        or value.get("schema_version") != "topic-discovery-1"
+                        or value.get("status") != "completed"):
+                    continue
+                science = {key: item for key, item in value.items() if key not in {"status", "usage"}}
+                if all(key in result and result[key] == item
+                       for result in (producer, current) for key, item in science.items()):
+                    return output, value
+            except (OSError, ValueError, TypeError):
+                continue
+        return None
+
+    def _stage_results(self, stages, live_value, literature):
+        context = live_value.get("context", {})
+        context = context if isinstance(context, dict) else {}
+        result = []
+        for stage in stages:
+            sid = stage["id"]
+            root_key = next((key for key in (f"stage:{sid}:active", f"stage:{sid}") if key in self.roots), None)
+            outputs = []
+            child = context.get(sid, {})
+            child = child if isinstance(child, dict) else {}
+            if root_key:
+                base = self.roots[root_key]
+                output_dir = base / "output"
+                if output_dir.is_dir():
+                    for path in sorted(output_dir.iterdir())[:MAX_FILES]:
+                        if not path.is_file() or path.name in CHECKPOINT_NAMES:
+                            continue
+                        try:
+                            resolved = path.resolve()
+                            if not resolved.is_relative_to(base):
+                                continue
+                            raw = path.read_bytes() if path.stat().st_size <= MAX_RAW_FILE_BYTES else None
+                            value = _json(raw, {}) if raw else {}
+                            outputs.append({"label": path.name, "file_ref": _ref(root_key, path.relative_to(base)),
+                                "artifact_ref": None, "body_sha256": sha256_hex(raw) if raw is not None else None,
+                                "status": value.get("status", "available") if isinstance(value, dict) else "available",
+                                "current": None})
+                        except OSError:
+                            continue
+            if sid == literature["stage_id"]:
+                for name, key in (("Literature map", "map"), ("Accepted survey", "survey_output"), ("Gap assessment", "gap_output")):
+                    descriptor = literature.get(key)
+                    if isinstance(descriptor, dict) and descriptor.get("artifact_ref"):
+                        outputs.append({"label": name, **descriptor})
+            review = {"status": "not_reviewed", "decision": None, "rationale": None,
+                      "summary": None, "file_ref": None, "artifact_ref": None}
+            composer_path = self.workflow.get("project_id")
+            composer_base = Path(composer_path).expanduser().resolve() if isinstance(composer_path, str) else None
+            composer_key = next((key for key, base in self.roots.items() if base == composer_base), None)
+            if composer_key and (self.roots[composer_key] / "state/control.sqlite").is_file():
+                try:
+                    conn = self._db_connection(self.roots[composer_key] / "state/control.sqlite")
+                    try:
+                        attempt = stage.get("attempt_number")
+                        prefix = f"command/departments/research/assignments/{sid}/"
+                        if type(attempt) is int:
+                            prefix += f"attempt-{attempt}/"
+                        row = conn.execute("SELECT * FROM artifacts WHERE logical_id LIKE ? "
+                            "AND logical_id LIKE '%/verifier-%/execution' ORDER BY created_at DESC LIMIT 1", (prefix + "%",)).fetchone()
+                        record = self._owned_artifact(composer_key, row)
+                        if record:
+                            owned = record.get("body", {})
+                            owned_chief = owned.get("chief_result")
+                            expected_role = stage.get("verifier_agent")
+                            bound = (record.get("integrity") == "verified" and record.get("artifact_type") == "report"
+                                and owned.get("stage_id") == sid
+                                and owned.get("stage_kind") == stage.get("kind")
+                                and owned.get("project_id") == composer_path
+                                and owned.get("assigned_role") == record.get("author")
+                                and (expected_role is None or owned.get("assigned_role") == expected_role)
+                                and (type(attempt) is not int or owned.get("attempt_number") == attempt)
+                                and isinstance(owned_chief, dict) and bool(child))
+                            if bound:
+                                if stage.get("kind") in {"topic", "topic_discovery"}:
+                                    bound = self._paired_topic_output(outputs, owned_chief, child) is not None
+                                else:
+                                    bound = all(owned_chief.get(key) == value for key, value in child.items()
+                                        if key not in {"usage", "attempt_number", "specialist_verifier", "specialist_verifier_usage"})
+                            report = owned.get("report", {}) if bound else {}
+                            verdict = report.get("response", {}) if isinstance(report, dict) else {}
+                            verdict = verdict if isinstance(verdict, dict) else {}
+                            initial = owned.get("initial_review_input", {})
+                            try:
+                                prompt = initial.get("prompt") if isinstance(initial, dict) else None
+                                wire = _json(prompt, {})
+                                declared = wire.get("verifier_contract", {}).get("stage_acceptance_contract", {})
+                                targets = declared.get("downstream_stage_ids")
+                                request = report.get("request_inputs", [])[0].get("input", {})
+                                bound = (bound and isinstance(prompt, str)
+                                    and sha256_hex(prompt.encode("utf-8")) == initial.get("prompt_sha256")
+                                    and wire.get("stage", {}).get("id") == sid
+                                    and declared.get("current_stage_id") == sid
+                                    and isinstance(targets, list) and set(targets).issubset({item["id"] for item in stages})
+                                    and request.get("prompt") == prompt and request.get("system") == initial.get("system"))
+                                if bound:
+                                    from scisaurus.runtime.specialists import _normalise_verdict, _verifier_chief_result
+                                    bound = any(wire.get("chief_result") == _verifier_chief_result(owned_chief, detail=detail)
+                                                for detail in ("full", "compact", "minimal", "focused"))
+                                    verdict = _normalise_verdict(verdict, current_stage_id=sid, valid_target_stage_ids=targets) if bound else {}
+                                else:
+                                    verdict = {}
+                            except (IndexError, AttributeError, TypeError, ValueError, ValidationError):
+                                bound, verdict = False, {}
+                            review.update(self._artifact_link(record) or {})
+                            review.update(status=report.get("status", "unbound") if bound else "unbound", decision=verdict.get("decision"),
+                                rationale=verdict.get("rationale"), summary=verdict.get("summary"),
+                                deferred_obligations=deepcopy(verdict.get("deferred_obligations", [])),
+                                blocking_findings=deepcopy(verdict.get("blocking_findings", [])),
+                                required_revisions=deepcopy(verdict.get("required_revisions", [])), bound=bool(bound))
+                    finally:
+                        conn.close()
+                except (sqlite3.Error, OSError, ValueError):
+                    review["status"] = "unavailable"
+            status = stage.get("status", "unknown")
+            if status in {"unknown", "pending"} and not outputs and not stage.get("attempts"):
+                status = "not_started"
+            obligations = child.get("work_orders", child.get("deferred_obligations", [])) if review.get("bound") else []
+            result.append({"id": sid, "kind": stage.get("kind"), "label": stage.get("label"),
+                "status": status, "source_root": root_key, "outputs": outputs, "review": review,
+                "open_obligations": deepcopy(obligations) if isinstance(obligations, list) else []})
+        stage_ids = {item["id"] for item in result}
+        for origin in result:
+            review = origin["review"]
+            if not review.get("bound"):
+                continue
+            carried = review.get("deferred_obligations", [])
+            for obligation in carried if isinstance(carried, list) else []:
+                if (not isinstance(obligation, dict)
+                        or set(obligation) != {"target_stage_id", "requirement", "completion_check", "evidence_needed"}
+                        or obligation.get("target_stage_id") not in stage_ids
+                        or obligation.get("target_stage_id") == origin["id"]):
+                    continue
+                # Keep the issuing stage's full record and the target stage's
+                # exact requirement visible; acceptance does not discharge it.
+                for target in result:
+                    if target["id"] in {origin["id"], obligation["target_stage_id"]}:
+                        if obligation not in target["open_obligations"]:
+                            target["open_obligations"].append(deepcopy(obligation))
+        return result
+
+    def _topic_papers(self, stage_results, live_value):
+        topic_stage = next((stage for stage in stage_results if stage.get("kind") in {"topic", "topic_discovery"}), None)
+        summary = {"stage_id": topic_stage["id"] if topic_stage else None, "total": 0, "items": [], "status": "not_started",
+                   "search_summary": {"query_count": 0, "returned_work_count": 0, "keyword_matched_work_count": 0}}
+        if not topic_stage:
+            return summary
+        context = live_value.get("context", {})
+        child = context.get(topic_stage["id"], {}) if isinstance(context, dict) else {}
+        if not isinstance(child, dict) or not topic_stage["review"].get("bound"):
+            if topic_stage["outputs"] or child:
+                summary["status"] = "unavailable"
+            return summary
+        document = None
+        try:
+            review = topic_stage["review"]
+            path, _, _ = self.resolve_file(review["file_ref"])
+            if path.stat().st_size <= MAX_RAW_FILE_BYTES:
+                raw = path.read_bytes()
+                if sha256_hex(raw) == review.get("body_sha256"):
+                    producer = _json(raw, {}).get("chief_result")
+                    document = self._paired_topic_output(topic_stage["outputs"], producer, child)
+        except (KeyError, AttributeError, OSError, ValueError):
+            pass
+        if document is None:
+            summary["status"] = "unavailable"
+            return summary
+        output, value = document
+        traces = [item for key in ("sampling_trace", "candidate_sampling_trace")
+                  for item in value.get(key, []) if isinstance(item, dict)]
+        summary["search_summary"] = {"query_count": len(traces),
+            "returned_work_count": len({wid for item in traces for wid in item.get("returned_work_ids", []) if isinstance(wid, str)}),
+            "keyword_matched_work_count": len({wid for item in traces for wid in item.get("relevant_work_ids", []) if isinstance(wid, str)})}
+        rows = {}
+        for origin in ("recent_papers", "candidate_prior_work"):
+            papers = value.get(origin, [])
+            if not isinstance(papers, list):
+                continue
+            for paper in papers:
+                if not isinstance(paper, dict) or not isinstance(paper.get("work_id"), str):
+                    continue
+                wid = paper["work_id"]
+                if wid not in rows:
+                    abstract = paper.get("abstract") if isinstance(paper.get("abstract"), str) else ""
+                    rows[wid] = {key: deepcopy(paper.get(key)) for key in (
+                        "work_id", "title", "year", "doi", "authors", "matched_query", "source_url")}
+                    rows[wid].update(url=paper.get("source_url"), abstract=abstract, abstract_is_excerpt=True,
+                        source_stage_kind="topic_discovery", origins=[],
+                        evidence_status="abstract_excerpt" if abstract.strip() else "metadata_only",
+                        output_file_ref=output["file_ref"], output_sha256=output["body_sha256"],
+                        review_artifact_ref=topic_stage["review"]["artifact_ref"])
+                if origin not in rows[wid]["origins"]:
+                    rows[wid]["origins"].append(origin)
+        summary.update(total=len(rows), items=list(rows.values()), status="available",
+            output_file_ref=output["file_ref"], output_sha256=output["body_sha256"])
+        return summary
 
     def _db_records(self):
         dbs = []
@@ -2148,6 +2691,8 @@ class DashboardSnapshot:
             }
         recent_work = self._recent_work(db, organization_raw)
         organization = self._organization_view(organization_raw)
+        literature, _ = self._literature_catalog()
+        stage_results = self._stage_results(stages, live_value, literature)
         return {
             "schema_version": f"dashboard-snapshot-{APP_VERSION}",
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -2176,6 +2721,9 @@ class DashboardSnapshot:
                 "completion_ratio": completed / len(stages) if stages else 0,
             },
             "research": self._research_view(live_value, stages),
+            "stage_results": stage_results,
+            "topic_papers": self._topic_papers(stage_results, live_value),
+            "literature": literature,
             "counts": db["counts"],
             "specialists": specialists,
             "specialists_active": sum(item.get("engaged") is True for item in specialists),
@@ -2937,6 +3485,9 @@ class DashboardService:
     def file_payload(self, file_ref, project_ref=None):
         return DashboardSnapshot(self._resolve_project(project_ref)).file_payload(file_ref)
 
+    def literature(self, project_ref=None, **query):
+        return DashboardSnapshot(self._resolve_project(project_ref)).literature(**query)
+
     def raw_file(self, file_ref, project_ref=None):
         path, _, _ = DashboardSnapshot(self._resolve_project(project_ref)).resolve_file(file_ref)
         stat = path.stat()
@@ -2978,6 +3529,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return self._json_response(self.server.service.workspace())
             if parsed.path == "/api/projects":
                 return self._json_response(self.server.service.projects())
+            if parsed.path in {"/api/literature", "/api/literature/detail"}:
+                options = {"q": query.get("q", [""])[0], "evidence": query.get("evidence", ["all"])[0],
+                           "offset": int(query.get("offset", ["0"])[0]), "limit": int(query.get("limit", ["25"])[0])}
+                if parsed.path.endswith("/detail"):
+                    options["work_id"] = query.get("work_id", [""])[0]
+                return self._json_response(self.server.service.literature(query.get("project", [None])[0], **options))
             if parsed.path == "/api/file":
                 ref = query.get("ref", [""])[0]
                 project_ref = query.get("project", [None])[0]

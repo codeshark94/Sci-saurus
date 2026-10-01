@@ -4,6 +4,7 @@
   const initialProject = new URLSearchParams(window.location.search).get("project");
   const state = {
     view: initialProject === null ? "workspace" : "project",
+    inspectorRequest: 0,
     snapshot: null,
     workspace: null,
     projects: [],
@@ -11,6 +12,9 @@
     filter: "all",
     query: "",
     inventoryPage: 0,
+    stageId: new URLSearchParams(window.location.search).get("stage"),
+    topicPaperQuery: "",
+    literatureQuery: "", literatureEvidence: "all", literatureOffset: 0, literatureRequest: 0,
   };
   const INVENTORY_PAGE_SIZE = 24;
   const $ = (selector) => document.querySelector(selector);
@@ -134,12 +138,12 @@
 
   function syncProjectNav() {
     navSyncFrame = null;
-    if (state.view !== "project") return;
+    if (state.view !== "project" || !$("#operations-details").open) return;
     const links = $$("#project-nav .nav-link");
     const sections = links.map((link) => {
       const id = link.getAttribute("href")?.replace(/^#/, "");
       const section = id ? document.getElementById(id) : null;
-      return section ? { id, section, link } : null;
+      return section?.getClientRects().length ? { id, section, link } : null;
     }).filter(Boolean);
     if (!sections.length) return;
     const threshold = ($(".topbar")?.offsetHeight || 54) + 26;
@@ -189,6 +193,7 @@
   }
 
   function navigateWorkspace() {
+    closeInspector();
     const url = new URL(window.location.href);
     url.searchParams.delete("project");
     url.hash = "workspace";
@@ -199,12 +204,17 @@
   }
 
   function navigateProject(projectRef) {
+    closeInspector();
     const ref = projectRef || ".";
     const url = new URL(window.location.href);
     url.searchParams.set("project", ref);
+    url.searchParams.delete("stage");
     url.hash = "research";
     window.history.pushState({}, "", `${url.pathname}${url.search}${url.hash}`);
     state.snapshot = null;
+    state.stageId = null; state.literatureOffset = 0; state.literatureQuery = "";
+    state.literatureEvidence = "all";
+    $("#literature-search").value = ""; $("#literature-evidence").value = "all";
     setView("project", ref);
     window.scrollTo(0, 0);
     fetchSnapshot();
@@ -291,12 +301,139 @@
     $("#last-updated").textContent = `Updated ${relativeDate(snapshot.generated_at)}`;
   }
 
+  const STAGE_LABELS = {topic_discovery: "Topic discovery", survey: "Literature", experiment: "Experiment", interpretation: "Interpretation", argument: "Argument", paper: "Paper and PDF"};
+  const EVIDENCE_LABELS = {full_text: "Verified full text", abstract_only: "Abstract only", no_abstract: "No abstract", unknown: "Unconfirmed"};
+  const STAGE_STATUS = {completed: "Complete", running: "Running", retrying: "Repairing", paused: "Paused", blocked: "Blocked", candidate_needs_review: "Review held", review_rejected: "Rejected", research_expansion_required: "More research required", not_started: "Not started", unknown: "Unknown", planned: "Not started"};
+
+  function stageLabel(stage) { return STAGE_LABELS[stage.kind] || stage.label || stage.id; }
+  function selectedStage(snapshot) {
+    const stages = snapshot.stage_results || snapshot.pipeline?.stages || [];
+    return stages.find((stage) => stage.id === state.stageId) ||
+      stages.find((stage) => stage.id === snapshot.live?.current_stage) || stages[0];
+  }
+  function inspectionButton(label, output) {
+    const ref = typeof output === "string" ? output : output?.file_ref;
+    return ref?.includes("::") ? `<button class="button button--quiet" type="button" data-output-title="${escapeHtml(typeof output === "object" && output?.label ? window.ScisaurusOutputView.label(output.label.replace(/\.json$/, "")) : label)}" data-output-ref="${escapeHtml(ref)}">${escapeHtml(label)}</button>` : "";
+  }
+  function bindOutputInspection(container) {
+    container.querySelectorAll("[data-output-ref]").forEach((button) => button.addEventListener("click", () => openInspector(button.dataset.outputRef, button.dataset.outputTitle)));
+  }
+  function selectStage(id, updateUrl = true) {
+    state.stageId = id;
+    if (updateUrl) {
+      const url = new URL(window.location.href); url.searchParams.set("stage", id); url.hash = "stage-workspace";
+      window.history.pushState({}, "", `${url.pathname}${url.search}${url.hash}`);
+    }
+    if (state.snapshot) renderStageResults(state.snapshot);
+    $("#stage-workspace").scrollIntoView({block: "start"});
+  }
+  function renderStageResults(snapshot) {
+    const stages = snapshot.stage_results || snapshot.pipeline?.stages || [];
+    const stage = selectedStage(snapshot);
+    if (!stage) return;
+    state.stageId = stage.id;
+    $("#stage-navigation").innerHTML = stages.map((item,index) => `<button type="button" class="stage-nav-item${item.id === stage.id ? " is-active" : ""}" data-stage-id="${escapeHtml(item.id)}"><span class="nav-index">${String(index + 1).padStart(2, "0")}</span><span>${escapeHtml(stageLabel(item))}</span><span class="stage-nav-mark ${item.status === "completed" ? "is-complete" : ""}" aria-label="${escapeHtml(STAGE_STATUS[item.status] || text(item.status))}"></span></button>`).join("");
+    $$('[data-stage-id]').forEach((button) => button.addEventListener("click", () => selectStage(button.dataset.stageId)));
+    $("#stage-heading").textContent = stageLabel(stage);
+    $("#stage-caption").textContent = stage.kind === "topic_discovery" && stage.status === "completed" ? "Candidate selected" : STAGE_STATUS[stage.status] || text(stage.status);
+    const review = stage.review || {};
+    const decision = review.decision;
+    const decisions = {accept: "Accepted", pass: "Passed", hold: "Held", repair: "Repair required", reject: "Rejected"};
+    $("#stage-result-summary").innerHTML = `<article class="stage-summary-card"><div class="research-label">Execution result</div><strong>${escapeHtml(STAGE_STATUS[stage.status] || text(stage.status))}</strong><p>${escapeHtml(text(stage.deliverable, "Inspect the actual outputs and independent verdict for this stage."))}</p></article><article class="stage-summary-card"><div class="research-label">Independent review</div><strong>${escapeHtml((stage.kind === "topic_discovery" && decision === "accept" ? "Admitted to literature survey" : decisions[decision]) || (decision ? text(decision) : "Not reviewed"))}</strong><p>${escapeHtml(text(review.summary || review.rationale, "The review will record its evidence and outstanding requirements."))}</p>${inspectionButton("Read review", review)}</article>`;
+    bindOutputInspection($("#stage-result-summary"));
+    const outputs = stage.outputs || [];
+    $("#stage-result-outputs").innerHTML = `<div class="section-heading"><h3>Stage outputs</h3><span class="section-caption">${outputs.length} outputs</span></div>` + (outputs.length ? `<div class="stage-output-grid">${outputs.map((output) => `<article class="stage-output-card"><div><strong>${escapeHtml(window.ScisaurusOutputView.label((output.label || "Output").replace(/\.json$/, "")))}</strong><span>${output.current === false ? "Historical output · not current evidence" : escapeHtml(text(output.status, "Produced"))}</span></div>${inspectionButton("Open",output)}</article>`).join("")}</div>` : '<div class="stage-empty">No output has been produced for this stage yet.</div>');
+    bindOutputInspection($("#stage-result-outputs"));
+    const obligations = stage.open_obligations || [];
+    $("#stage-obligations").hidden = !obligations.length;
+    $("#stage-obligation-count").textContent = `${obligations.length}`;
+    $("#stage-obligation-list").innerHTML = obligations.map((item) => {
+      const requirement = typeof item === "string" ? item : item.requirement || item.objective;
+      const owner = stages.find((candidate) => candidate.id === item.target_stage_id);
+      return `<article class="stage-obligation"><span>${escapeHtml(owner ? stageLabel(owner) : text(item.target_stage_id, "This stage"))}</span><p>${escapeHtml(text(requirement))}</p>${item.completion_check || item.success_condition ? `<small>Completion check: ${escapeHtml(item.completion_check || item.success_condition)}</small>` : ""}</article>`;
+    }).join("");
+    $("#research").hidden = stage.kind !== "topic_discovery";
+    $("#topic-papers").hidden = stage.kind !== "topic_discovery";
+    if (stage.kind === "topic_discovery") renderTopicPapers(snapshot.topic_papers || {});
+    const argument = $("#argument-defense-panel");
+    if (argument.parentElement !== $("#stage-argument-context")) $("#stage-argument-context").appendChild(argument);
+    $("#stage-argument-context").hidden = stage.kind !== "argument";
+    $("#literature-results").hidden = stage.kind !== "survey";
+    if (stage.kind === "survey") {
+      renderLiteratureOverview(snapshot.literature || {});
+      fetchLiterature();
+    }
+  }
+  function renderTopicPapers(data) {
+    const query = state.topicPaperQuery.toLowerCase();
+    const papers = (data.items || []).filter((item)=>[item.title,item.doi,item.work_id].some((value)=>String(value || "").toLowerCase().includes(query)));
+    const summary = data.search_summary || {};
+    $("#topic-papers-count").textContent = `${papers.length} of ${data.total || 0} retained sources`;
+    $("#topic-search-summary").textContent = summary.query_count !== undefined ? `${summary.query_count} searches · ${summary.returned_work_count} returned records · ${summary.keyword_matched_work_count} keyword matches · ${data.total} retained excerpts` : "Discovery excerpts retained in the stage output";
+    $("#topic-paper-list").innerHTML = papers.length ? papers.map((item)=>`<article class="literature-paper"><div class="literature-paper-heading"><div><h3>${escapeHtml(text(item.title,item.work_id))}</h3><div class="literature-paper-meta">${escapeHtml([item.year,item.work_id,item.doi].filter(Boolean).join(" · "))}</div></div><span class="evidence-badge">${item.abstract ? "Abstract excerpt" : "Metadata only"}</span></div><div class="literature-paper-status"><span>${escapeHtml((item.origins || []).join(" · ").replaceAll("_"," "))}</span></div>${item.abstract ? `<details class="paper-abstract"><summary>Read abstract excerpt</summary><p>${escapeHtml(item.abstract)}</p><small>Stored discovery excerpt; completeness is not certified.</small></details>` : ""}<div class="literature-paper-actions"><button class="button button--quiet" type="button" data-topic-paper-id="${escapeHtml(item.work_id)}">Details and provenance</button>${inspectionButton("Discovery output",item.output_file_ref)}</div></article>`).join("") : '<div class="stage-empty">No discovery papers match this filter.</div>';
+    bindOutputInspection($("#topic-paper-list"));
+    $$('[data-topic-paper-id]').forEach((button)=>button.addEventListener("click",()=>{
+      beginInspector();
+      const item = (data.items || []).find((paper)=>paper.work_id === button.dataset.topicPaperId);
+      $("#inspector-title").textContent = text(item.title,item.work_id); $("#inspector-meta").textContent = "Topic discovery source";
+      setInspectorContent(JSON.stringify(item,null,2)); $("#inspector-note").textContent = "Discovery metadata and stored excerpt; not a full-text or literature-review verdict.";
+      setInspectorRaw(null); $("#inspector").showModal();
+    }));
+  }
+  function renderLiteratureOverview(data) {
+    $("#literature-source").textContent = data.status === "not_started" ? "Survey not started" : text(data.source_root, "Source repository not recorded");
+    const counts = data.counts || {};
+    $("#literature-counts").innerHTML = [["Captured papers",data.total ?? 0],...Object.entries(EVIDENCE_LABELS).map(([key,label]) => [label,counts[key] ?? 0])].map(([label,value]) => `<div class="literature-count"><span>${escapeHtml(label)}</span><strong>${number(value)}</strong></div>`).join("");
+    const outputs = [["Literature synthesis",data.survey_output || data.survey_ref,data.survey_current],["Gap assessment",data.gap_output || data.gap_ref,data.gap_current]];
+    $("#literature-synthesis").innerHTML = outputs.map(([label,output,current]) => `<div class="literature-synthesis-card"><strong>${label}</strong><span>${output?.file_ref || output?.artifact_ref ? (current ? "Current output" : "Historical output · review required") : "Not produced"}</span>${inspectionButton("Open result",output)}</div>`).join("") + (data.notices || []).map((notice) => `<p class="stage-notice">${escapeHtml(typeof notice === "string" ? notice : notice.message || JSON.stringify(notice))}</p>`).join("");
+    bindOutputInspection($("#literature-synthesis"));
+  }
+  async function fetchLiterature() {
+    if (state.view !== "project" || selectedStage(state.snapshot || {})?.kind !== "survey") return;
+    const request = ++state.literatureRequest;
+    const params = new URLSearchParams({project:state.projectRef || ".",q:state.literatureQuery,evidence:state.literatureEvidence,offset:String(state.literatureOffset),limit:"25"});
+    try {
+      const response = await fetch(`/api/literature?${params}`,{cache:"no-store"});
+      if (!response.ok) throw new Error(`Unable to read the literature list (${response.status})`);
+      const data = await response.json();
+      if (request !== state.literatureRequest || selectedStage(state.snapshot || {})?.kind !== "survey") return;
+      renderLiteratureOverview(data);
+      const items = data.items || [];
+      $("#discovery-source-link").hidden = !(state.snapshot?.topic_papers?.total > 0 && data.status === "not_started");
+      $("#discovery-source-link").textContent = `View ${state.snapshot?.topic_papers?.total || 0} discovery sources`;
+      $("#literature-list").innerHTML = items.length ? items.map((item) => `<article class="literature-paper"><div class="literature-paper-heading"><div><h3>${escapeHtml(text(item.title,item.work_id))}</h3><div class="literature-paper-meta">${escapeHtml([item.year,item.work_id,item.doi].filter(Boolean).join(" · "))}</div></div><span class="evidence-badge evidence-badge--${statusClass(item.evidence_status)}">${escapeHtml(EVIDENCE_LABELS[item.evidence_status] || "Unconfirmed")}</span></div><div class="literature-paper-status"><span>Access: ${escapeHtml(text(item.access_status,"Not recorded"))}</span><span>Evidence review: ${escapeHtml(text(item.review?.outcome || item.review?.status,"Not reviewed"))}</span><span>Source fidelity: ${item.review?.source_fidelity_checks?.length ? `${item.review.source_fidelity_checks.length} checks recorded` : "Not reviewed"}</span><span>Question relevance: ${item.review?.question_relevance_checks?.length ? `${item.review.question_relevance_checks.length} checks recorded` : "Not reviewed"}</span></div><div class="literature-paper-actions">${inspectionButton("Abstract",(item.abstracts || []).find((entry)=>entry.file_ref) || item.abstract_ref)}${inspectionButton("Full text",(item.full_texts || []).find((entry)=>entry.identity_verified && entry.file_ref) || item.full_text_ref)}${inspectionButton("Analysis",item.analysis_output || item.analysis_ref)}${inspectionButton("Evidence review",item.review_output || item.review_ref)}<button class="button button--quiet" type="button" data-literature-id="${escapeHtml(item.work_id)}">Details and lineage</button></div></article>`).join("") : `<div class="stage-empty">${data.status === "not_started" ? "The literature survey has not started. Captured papers, abstracts, full texts, and reviews will appear here." : "No papers match these filters."}</div>`;
+      bindOutputInspection($("#literature-list"));
+      $$('[data-literature-id]').forEach((button)=>button.addEventListener("click",()=>openLiteratureDetail(button.dataset.literatureId)));
+      $("#literature-page-meta").textContent = items.length ? `${data.offset+1}–${data.offset+items.length} / ${number(data.filtered_total)} papers` : "0 papers";
+      $("#literature-prev").disabled = data.offset <= 0;
+      $("#literature-next").disabled = !data.has_more;
+    } catch(error) {
+      if (request !== state.literatureRequest) return;
+      $("#literature-list").innerHTML = `<div class="stage-empty stage-error">${escapeHtml(error.message)}</div>`;
+      $("#literature-prev").disabled = true; $("#literature-next").disabled = true;
+    }
+  }
+  async function openLiteratureDetail(workId) {
+    const request = beginInspector();
+    const dialog = $("#inspector");
+    $("#inspector-title").textContent = workId; $("#inspector-meta").textContent = "Paper and evidence lineage";
+    setInspectorContent("Loading…"); $("#inspector-note").textContent = "Captured evidence and review records";
+    setInspectorRaw(null); dialog.showModal();
+    try {
+      const response = await fetch(`/api/literature/detail?work_id=${encodeURIComponent(workId)}${projectQuery()}`,{cache:"no-store"});
+      if (!response.ok) throw new Error(`Unable to read the paper record (${response.status})`);
+      const record = await response.json();
+      if (request !== state.inspectorRequest) return;
+      $("#inspector-title").textContent = text(record.item?.title,workId);
+      setInspectorContent(JSON.stringify(record,null,2));
+    } catch(error) { if (request === state.inspectorRequest) setInspectorContent(error.message); }
+  }
+
   function renderResearch(snapshot) {
     const research = snapshot.research || {};
     const topic = research.topic || {};
     const selection = research.selection || {};
     const experiment = research.experiment || {};
-    const stages = research.stage_progress || [];
     const currentStage = snapshot.live?.current_stage;
     const currentStageLabel = currentStage ? stageName(snapshot, currentStage) : "no stage running";
     const title = topic.title || "Research direction not recorded";
@@ -329,41 +466,6 @@
     renderResearchProgram(research.research_program);
     renderArgumentDefense(research.argument_defense);
 
-    const survey = research.survey || {};
-    const coverage = survey.coverage || {};
-    const priorSurvey = survey.last_result_status && survey.last_result_status !== survey.current_status
-      ? `prior ${String(survey.last_result_status).replaceAll("_", " ")}` : "latest checkpoint";
-    const gapState = survey.current ? text(survey.gap_state, "not assessed") : "rebuilding";
-    const gapNote = survey.current ? "current assessment" : priorSurvey;
-    const evidenceItems = [
-      ["SURVEY GATE", text(survey.current_status, "not recorded").replaceAll("_", " "), priorSurvey],
-      ["LAST RECORDED WORKS", number(coverage.unique_works), "literature map"],
-      ["VERIFIED FULL TEXTS", number(coverage.verified_full_texts), "source spans"],
-      ["GAP STATE", gapState, gapNote],
-      ["RELEASE GATE", text(survey.release_status, "not recorded").replaceAll("_", " "), "human release remains required"],
-    ];
-    $("#research-evidence").innerHTML = evidenceItems.map(([label, value, note]) => `<div class="research-evidence-cell"><div class="research-evidence-label">${escapeHtml(label)}</div><strong>${escapeHtml(value)}</strong><div class="research-evidence-note">${escapeHtml(note)}</div></div>`).join("");
-
-    $("#research-progress-caption").textContent = `${number(stages.filter((item) => item.status === "completed").length)} of ${number(stages.length)} gates complete`;
-    if (!stages.length) {
-      $("#research-progress").innerHTML = '<div class="loading-block">No stage progress recorded.</div>';
-      return;
-    }
-    setGridColumns("#research-progress", "--research-progress-columns", stages.length, layoutPreference("research"));
-    $("#research-progress").innerHTML = stages.map((stage, index) => {
-      const currentStatus = stage.status || "unknown";
-      const displayStatus = currentStatus === "unknown" ? "planned" : currentStatus;
-      const resultNoteLabel = stage.current ? "previous attempt" : "last recorded result";
-      const lastResult = stage.last_result_status && stage.last_result_status !== currentStatus
-        ? `<div class="research-progress-note">${resultNoteLabel}: ${escapeHtml(String(stage.last_result_status).replaceAll("_", " "))}</div>` : "";
-      return `<article class="research-progress-card research-progress-card--${statusClass(currentStatus)}">
-        <div class="research-progress-number">0${index + 1}</div>
-        <div class="research-progress-name">${escapeHtml(text(stage.label, stage.id))}</div>
-        <div class="research-progress-deliverable">${escapeHtml(text(stage.deliverable, "Stage result"))}</div>
-        ${lastResult}
-        <div class="research-progress-footer"><span>${statusPill(displayStatus)}</span><span>${stage.current ? "current gate" : escapeHtml(text(stage.gate, "acceptance gate"))}</span></div>
-      </article>`;
-    }).join("");
   }
 
   function renderResearchProgram(program) {
@@ -853,6 +955,7 @@
     state.snapshot = snapshot;
     renderHeader(snapshot);
     renderResearch(snapshot);
+    renderStageResults(snapshot);
     renderMetrics(snapshot);
     renderProviderWork(snapshot);
     renderModelCalls(snapshot);
@@ -997,27 +1100,62 @@
     await Promise.all([fetchWorkspace(), state.view === "project" ? fetchSnapshot() : Promise.resolve()]);
   }
 
-  async function openInspector(ref) {
+  function setInspectorRaw(href) {
+    const link = $("#inspector-raw");
+    link.classList.toggle("is-disabled", !href);
+    link.setAttribute("aria-disabled", String(!href));
+    if (href) { link.setAttribute("href", href); link.removeAttribute("tabindex"); }
+    else { link.removeAttribute("href"); link.setAttribute("tabindex", "-1"); }
+  }
+
+  function beginInspector() {
+    setInspectorRaw(null);
+    return ++state.inspectorRequest;
+  }
+
+  function closeInspector() {
+    ++state.inspectorRequest;
+    $("#inspector").close();
+  }
+
+  function setInspectorView(raw) {
+    $("#inspector-content").hidden = !raw;
+    $("#inspector-readable").hidden = raw;
+    $("#inspector-readable-button").setAttribute("aria-pressed", String(!raw));
+    $("#inspector-json-button").setAttribute("aria-pressed", String(raw));
+  }
+
+  function setInspectorContent(content) {
+    const original = typeof content === "string" ? content : JSON.stringify(content, null, 2);
+    let value = original;
+    try { value = JSON.parse(original); } catch (_) { /* Preserve plain text previews. */ }
+    $("#inspector-content").textContent = original;
+    $("#inspector-readable").innerHTML = window.ScisaurusOutputView.document(value);
+    setInspectorView(false);
+  }
+
+  async function openInspector(ref, title = null) {
+    const request = beginInspector();
     const dialog = $("#inspector");
     $("#inspector-title").textContent = "Loading file";
     $("#inspector-meta").textContent = ref;
-    $("#inspector-content").textContent = "Loading…";
-    $("#inspector-raw").classList.add("is-disabled");
+    setInspectorContent("Loading…");
+    setInspectorRaw(null);
     if (typeof dialog.showModal === "function") dialog.showModal();
     else dialog.setAttribute("open", "");
     try {
       const response = await fetch(`/api/file?ref=${encodeURIComponent(ref)}${projectQuery()}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`file request failed (${response.status})`);
       const file = await response.json();
-      $("#inspector-title").textContent = text(file.name, "File");
+      if (request !== state.inspectorRequest) return;
+      $("#inspector-title").textContent = title || window.ScisaurusOutputView.label(text(file.name, "File").replace(/\.json$/, ""));
       $("#inspector-meta").textContent = `${text(file.root_key)} · ${text(file.path)} · ${bytes(file.size)} · ${relativeDate(file.updated_at)}`;
-      $("#inspector-content").textContent = text(file.text, "No preview available.");
+      setInspectorContent(text(file.text, "No preview available."));
       $("#inspector-note").textContent = file.truncated ? "Preview truncated at 800 KB." : "Preview is bounded and read-only.";
-      const raw = $("#inspector-raw");
-      raw.href = `/api/raw?ref=${encodeURIComponent(ref)}${projectQuery()}`;
-      raw.classList.remove("is-disabled");
+      setInspectorRaw(`/api/raw?ref=${encodeURIComponent(ref)}${projectQuery()}`);
     } catch (error) {
-      $("#inspector-content").textContent = error.message;
+      if (request !== state.inspectorRequest) return;
+      setInspectorContent(error.message);
       $("#inspector-note").textContent = "The file could not be read.";
     }
   }
@@ -1066,6 +1204,7 @@
   }
 
   async function openAgentInspector(role, taskId = null) {
+    const request = beginInspector();
     const snapshot = state.snapshot || {};
     const agent = (snapshot.specialists || []).find((item) => item.role === role) || { role };
     const roleTasks = (snapshot.tasks || []).filter((item) => item.role === role || item.payload?.assigned_role === role || item.payload?.role === role);
@@ -1086,10 +1225,9 @@
     const dialog = $("#inspector");
     $("#inspector-title").textContent = text(agent.role, "Agent");
     $("#inspector-meta").textContent = `${text(agent.department)} · ${text(agent.appointment, "agent")} · ${text(agent.status, "idle")} · ${selectedTask?.payload?.stage_id ? stageName(snapshot, selectedTask.payload.stage_id) : (agent.stage_id ? stageName(snapshot, agent.stage_id) : "not assigned")} · ${text(selectedTask?.task_id, "no task selected")}`;
-    $("#inspector-content").textContent = "Loading agent record…";
+    setInspectorContent("Loading agent record…");
     $("#inspector-note").textContent = "Task, attempt, and response artifact are read-only.";
-    const raw = $("#inspector-raw");
-    raw.classList.add("is-disabled");
+    setInspectorRaw(null);
     if (typeof dialog.showModal === "function") dialog.showModal();
     else dialog.setAttribute("open", "");
     try {
@@ -1120,6 +1258,7 @@
         }
       }
 
+      if (request !== state.inspectorRequest) return;
       let responseText;
       if (selected) {
         const displayFile = selected.responseFile || selected.file;
@@ -1131,14 +1270,14 @@
             response_ref: selected.responseRef,
             response: parsedResponse || selected.responseFile.text,
           }, null, 2);
-          raw.href = `/api/raw?ref=${encodeURIComponent(selected.responseRef)}${projectQuery()}`;
+          setInspectorRaw(`/api/raw?ref=${encodeURIComponent(selected.responseRef)}${projectQuery()}`);
           $("#inspector-note").textContent = `Response file · ${text(selected.responseRef)}${displayFile.truncated ? " · preview truncated" : ""}`;
         } else {
           responseText = displayFile.text;
-          raw.href = `/api/raw?ref=${encodeURIComponent(selected.artifact.file_ref)}${projectQuery()}`;
+          setInspectorRaw(`/api/raw?ref=${encodeURIComponent(selected.artifact.file_ref)}${projectQuery()}`);
           $("#inspector-note").textContent = `${assignmentRecord(selected.record) ? "Latest result record" : "Latest response artifact"} · ${text(selected.artifact.artifact_ref)}${displayFile.truncated ? " · preview truncated" : ""}`;
         }
-        raw.classList.remove("is-disabled");
+
       } else {
         responseText = JSON.stringify({
           role: agent.role,
@@ -1155,9 +1294,10 @@
         }, null, 2);
         $("#inspector-note").textContent = "No response artifact recorded yet; current task and assignment state are shown.";
       }
-      $("#inspector-content").textContent = responseText || "No response content.";
+      setInspectorContent(responseText || "No response content.");
     } catch (error) {
-      $("#inspector-content").textContent = error.message;
+      if (request !== state.inspectorRequest) return;
+      setInspectorContent(error.message);
       $("#inspector-note").textContent = "The response record could not be read.";
     }
   }
@@ -1189,6 +1329,16 @@
       event.preventDefault();
       createProject(event.submitter?.dataset.start === "true");
     });
+    $("#discovery-source-link").addEventListener("click",()=>{const topic=(state.snapshot?.stage_results || []).find((item)=>item.kind === "topic_discovery");if(topic){selectStage(topic.id);$("#topic-papers").scrollIntoView({block:"start"});}});
+    $("#topic-paper-search").addEventListener("input",(event)=>{state.topicPaperQuery=event.target.value;renderTopicPapers(state.snapshot?.topic_papers || {});});
+    let literatureSearchTimer;
+    $("#literature-search").addEventListener("input", (event) => {
+      state.literatureQuery = event.target.value; state.literatureOffset = 0;
+      window.clearTimeout(literatureSearchTimer); literatureSearchTimer = window.setTimeout(fetchLiterature, 250);
+    });
+    $("#literature-evidence").addEventListener("change",(event)=>{state.literatureEvidence=event.target.value;state.literatureOffset=0;fetchLiterature();});
+    $("#literature-prev").addEventListener("click",()=>{state.literatureOffset=Math.max(0,state.literatureOffset-25);fetchLiterature();});
+    $("#literature-next").addEventListener("click",()=>{state.literatureOffset+=25;fetchLiterature();});
     $("#inventory-search").addEventListener("input", (event) => {
       state.query = event.target.value;
       state.inventoryPage = 0;
@@ -1208,15 +1358,22 @@
       state.inventoryPage += 1;
       if (state.snapshot) renderInventory(state.snapshot);
     });
-    $("#inspector-close").addEventListener("click", () => $("#inspector").close());
+    $("#inspector-readable-button").addEventListener("click", () => setInspectorView(false));
+    $("#inspector-json-button").addEventListener("click", () => setInspectorView(true));
+    $("#inspector-close").addEventListener("click", closeInspector);
+    $("#inspector").addEventListener("close", () => { if (!$("#inspector").open) ++state.inspectorRequest; });
+    $("#inspector").addEventListener("cancel", () => { ++state.inspectorRequest; });
     $("#inspector").addEventListener("click", (event) => {
-      if (event.target === $("#inspector")) $("#inspector").close();
+      if (event.target === $("#inspector")) closeInspector();
     });
     $$("#project-nav .nav-link").forEach((link) => link.addEventListener("click", () => {
+      $("#operations-details").open = true;
       $$("#project-nav .nav-link").forEach((item) => item.classList.toggle("is-active", item === link));
       window.setTimeout(scheduleProjectNavSync, 80);
     }));
     window.addEventListener("popstate", () => {
+      closeInspector();
+      state.stageId = new URLSearchParams(window.location.search).get("stage");
       const project = new URLSearchParams(window.location.search).get("project");
       if (project === null) {
         setView("workspace");
