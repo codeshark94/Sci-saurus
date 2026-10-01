@@ -7767,7 +7767,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                 self.assertEqual(runner.context["survey"]["resume_scope"], "gap_assessment")
                 self.assertEqual(
                     runner.context["survey"]["research_requests"][0]["kind"],
-                    "literature_expansion",
+                    "recovery",
                 )
                 self.assertEqual(runner.context["survey"]["research_requests"][0]["target_stage_id"], "survey")
                 self.assertEqual(runner.reopened_stage_ids, {"survey", "experiment"})
@@ -7848,7 +7848,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                 self.assertEqual(ComposerRunner._active_stage_role_ids(
                     workflow["stages"][1], stage_context=runner.context["survey"]), [])
                 self.assertEqual(runner.context["survey"]["research_requests"][0]["kind"],
-                                 "literature_expansion")
+                                 "recovery")
             finally:
                 runner.close()
 
@@ -8749,7 +8749,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                 self.assertEqual(runner.context["topic"]["status"], "completed")
                 self.assertEqual(
                     runner.context["survey"]["research_requests"][0]["kind"],
-                    "literature_expansion",
+                    "recovery",
                 )
                 self.assertEqual(runner.context["survey"]["resume_scope"], "gap_assessment")
             finally:
@@ -10377,6 +10377,32 @@ class ComposerWorkflowTests(unittest.TestCase):
         for prior in ({}, {"survey_current": True},
                       {"survey_current": False, "survey_ref": "artifact:kb/surveys/current@4"}):
             self.assertEqual(ComposerRunner._survey_resume_scope(prior), "focused_review")
+
+    def test_scoped_survey_repairs_are_control_work_and_require_current_evidence(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path))); self.addCleanup(runner.close)
+            stage = runner.workflow["stages"][0]
+            control = {"id": "review-repair", "kind": "recovery", "repair_strategy": "gap_assessment"}
+            legacy = {**control, "kind": "literature_expansion"}
+            acquisition = {"id": "new-evidence", "kind": "literature_expansion", "owner": "research.intelligence",
+                "objective": "Acquire evidence", "why": "Missing source", "success_condition": "Source captured",
+                "evidence_needed": "Captured text"}
+            with patch.object(runner, "_requests_for_stage", return_value=[control, legacy, acquisition]), \
+                 patch.object(runner, "_survey_revalidation_recovery", return_value=None):
+                self.assertEqual([item["id"] for item in runner._survey_producer_work_orders(stage)], ["new-evidence"])
+            result = {"status": "completed", "survey_current": True, "assessment_current": True}
+            for request in (control, legacy):
+                with patch.object(runner, "_survey_references_are_current", return_value=True):
+                    self.assertTrue(runner._survey_request_was_fulfilled(path, result, request))
+                    self.assertFalse(runner._survey_request_was_fulfilled(path, {**result, "assessment_current": False}, request))
+                with patch.object(runner, "_survey_references_are_current", return_value=False):
+                    self.assertFalse(runner._survey_request_was_fulfilled(path, result, request))
+            explicit = {**acquisition, "repair_strategy": "gap_assessment",
+                        "target_stage_id": stage["id"], "target_stage_kind": "survey",
+                        "resume_scopes": ["gap_assessment"]}
+            self.assertFalse(runner._is_scoped_survey_review_repair(explicit))
+            with patch.object(runner, "_survey_references_are_current", return_value=True):
+                self.assertFalse(runner._survey_request_was_fulfilled(path, result, explicit))
 
     def test_reopened_survey_reuses_latest_current_checkpoint(self):
         with tempfile.TemporaryDirectory() as path:

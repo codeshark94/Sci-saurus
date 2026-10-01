@@ -2298,6 +2298,33 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(nomination["survey_ref"], nomination["prerequisite_survey_ref"])
         self.assertNotEqual(nomination["survey_ref"], result["survey_ref"])
 
+    def test_nomination_resume_retains_accepted_discovery_for_exact_work_orders(self):
+        config = survey_config(self.endpoint)
+        config["survey"]["proposed_gap"] = None
+        orders = [self.follow_up_order()]
+        first = self.runtime(config, work_orders=orders)
+        with patch.object(first, "_nominate", side_effect=ModelContractError("nomination response malformed")):
+            failed = first.run()
+        self.assertTrue(failed["survey_current"])
+        self.assertFalse(failed["assessment_current"])
+        self.assertIsNone(failed["nomination"])
+        policy = {"additional_seconds": config["limits"]["wall_clock_seconds"],
+                  "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["gap_assessment"]}}
+        second = self.runtime(config, resume_policy=policy, work_orders=orders)
+        self.assertTrue(second.follow_up_discovery_current)
+        self.assertFalse(second.counter_queries_complete)
+        with patch.object(second, "_prepare_follow_up", side_effect=AssertionError("discovery already accepted")), \
+             patch.object(second, "_explore", side_effect=AssertionError("discovery must not repeat")):
+            completed = second.run()
+        self.assertEqual(completed["status"], "completed", completed["error"])
+        self.assertTrue(completed["assessment_current"])
+        changed = self.runtime(config, resume_policy=policy, work_orders=[{**orders[0], "id": "new-evidence"}])
+        self.assertFalse(changed.follow_up_discovery_current)
+        self.assertFalse(changed.counter_queries_complete)
+        changed.control.close()
+
+
     def test_nomination_identifier_drift_reaches_countersearch_and_assessment(self):
         config = survey_config(self.endpoint, "nomination-id-drift")
         config["survey"]["proposed_gap"] = None

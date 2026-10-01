@@ -683,6 +683,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         self.counter_query_refs = []
         self.counter_queries_complete = False
         self.countersearch_complete = False
+        self.follow_up_discovery_current = False
         if self.work_orders:
             digest = hashlib.sha256(canonical_bytes(self.work_orders)).hexdigest()
             logical = f"command/survey-follow-up/{digest}"
@@ -1259,6 +1260,11 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     if prompt.get("review_contract") != self._survey_review_packet()["review_contract"]:
                         raise ValidationError("accepted survey requires the current review contract")
                     self.survey_ref = self.incumbent = accepted["artifact_ref"]
+                    self.follow_up_discovery_current = (
+                        self.follow_up_ref is not None
+                        and prompt.get("follow_up_ref") == self.follow_up_ref
+                        and prompt.get("work_orders") == self.work_orders
+                    )
                     self.time_policy.mark_retained_result(self.survey_ref)
                 except Exception:
                     pass
@@ -5183,7 +5189,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 raise ValidationError("configured survey stages do not fit the hard deadline; no external work dispatched")
             retained_follow_up_discovery = (
                 bool(self.work_orders) and self.resume_session is not None
-                and self.counter_queries_complete
+                and (self.counter_queries_complete or self.follow_up_discovery_current)
                 and not {"retrieval", "production"}.intersection(self.resume_session["reopened_scopes"])
             )
             needs_operations = (bool(self.work_orders) and not retained_follow_up_discovery

@@ -14574,7 +14574,14 @@ class ComposerRunner:
         requests = self._requests_for_stage(stage)
         if self._survey_revalidation_recovery(stage) is not None:
             return []
-        return self._follow_up_projection([item for item in requests if "resume_scopes" not in item])
+        return self._follow_up_projection([item for item in requests
+            if "resume_scopes" not in item and not self._is_scoped_survey_review_repair(item)])
+
+    @staticmethod
+    def _is_scoped_survey_review_repair(request):
+        return (request.get("kind") in {"recovery", "literature_expansion"}
+                and "resume_scopes" not in request
+                and request.get("repair_strategy") in {"integrated_review", "gap_assessment"})
 
     @staticmethod
     def _survey_resume_scope(prior, *, stage_context=None):
@@ -17201,6 +17208,11 @@ class ComposerRunner:
         return {"ref": head["artifact_ref"], "body_sha256": head["body_hash"]} if head else None
 
     def _survey_request_was_fulfilled(self, project_dir, run, request):
+        if self._is_scoped_survey_review_repair(request):
+            return (run.get("status") in {"completed", "accepted"}
+                    and run.get("survey_current") is True
+                    and run.get("assessment_current") is True
+                    and self._survey_references_are_current(project_dir, run))
         if "resume_scopes" not in request:
             return self._survey_work_order_was_fulfilled(project_dir, run, request)
         try:
@@ -24397,7 +24409,7 @@ class ComposerRunner:
             )
         request = {
             "id": request_id,
-            "kind": "literature_expansion",
+            "kind": "recovery",
             "owner": "research.intelligence",
             "objective": objective,
             "why": (
