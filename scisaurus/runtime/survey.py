@@ -1914,6 +1914,16 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 if self.resume_session is None:
                     self._raise_dispatch_failures([resource], "retained model resource failure")
                 return None
+            if (self.resume_session is not None and retained
+                    and retained.get("status") in {"blocked", "repairing"}
+                    and retained.get("failure_origin") == "dispatch"
+                    and isinstance(retained.get("dispatch_failure"), dict)
+                    and retained["dispatch_failure"].get("ok") is False
+                    and retained["dispatch_failure"].get("outcome_known") is True):
+                # An explicit resume may retry a settled dispatch failure.
+                # Unknown outcomes and checked responses retain their own
+                # reconciliation and evidence-validation boundaries.
+                return None
             if (retained and retained.get("status") in {"blocked", "repairing"}
                     and not response_validation_failure(job, retained)):
                 raise ModelWorkBlocked.from_states([retained])

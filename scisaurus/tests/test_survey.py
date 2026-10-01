@@ -761,6 +761,52 @@ class TestSurveyRunner(unittest.TestCase):
             resumed.assert_not_called()
         self.assertEqual(deferred, [])
 
+    def test_explicit_resume_retries_only_known_dispatch_failures_and_keeps_checked_siblings(self):
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        runner._initialize()
+        runner._complete = lambda task_id: None
+        job = {"name": "settled-worker-failure", "actor": "methods.evidence-verifier",
+               "assignment": {"phase": "fixture"}, "validator": lambda value: None}
+        sibling = {**job, "name": "checked-sibling"}
+        cache = ModelWorkCache(runner.store, runner._publish)
+        key = cache.key(scope=f"survey:{job['name']}", role=job["actor"],
+                        system=SYSTEM, prompt=runner._follow_up_assignment(job["assignment"]), model=runner.config["model"])
+        sibling_key = cache.key(scope=f"survey:{sibling['name']}", role=sibling["actor"],
+                                system=SYSTEM, prompt=runner._follow_up_assignment(sibling["assignment"]), model=runner.config["model"])
+        execution = runner._publish("command/executions/checked-sibling", "report", {}, job["actor"])
+        cache.put(sibling_key, {"status": "succeeded", "value": {}, "execution_ref": execution["artifact_ref"]})
+        for status in ("blocked", "repairing"):
+            for known in (False, None, True):
+                failure = {"ok": False, "error": "worker startup failed"}
+                if known is not None:
+                    failure["outcome_known"] = known
+                state = {"status": status, "failure_origin": "dispatch", "dispatch_failure": failure,
+                         "repair_attempts": 1, "error": failure["error"]}
+                cache.put(key, state)
+                runner.resume_session = None
+                with patch.object(runner, "_call_batch") as dispatch, self.assertRaises(ModelWorkBlocked):
+                    runner._models_checked([deepcopy(job), deepcopy(sibling)])
+                dispatch.assert_not_called()
+                runner.resume_session = {"session": 1}
+                if known is not True:
+                    with patch.object(runner, "_call_batch") as dispatch, self.assertRaises(ModelWorkBlocked):
+                        runner._models_checked([deepcopy(job), deepcopy(sibling)])
+                    dispatch.assert_not_called()
+                    continue
+                def succeed(specs, **kwargs):
+                    self.assertEqual(len(specs), 1)
+                    task_id = specs[0]["task_id"]
+                    self.assertIn(job["name"], task_id)
+                    result = runner._publish(f"command/executions/{task_id}", "report", {}, job["actor"])
+                    return {task_id: {"ok": True, "record_ref": result["artifact_ref"],
+                        "result": {"text": "{}", "model": "fixture", "usage": {"model_calls": 1},
+                                   "elapsed_seconds": .01, "finish_reason": "stop"}}}
+                with patch.object(runner, "_call_batch", side_effect=succeed):
+                    results = runner._models_checked([deepcopy(job), deepcopy(sibling)])
+                self.assertEqual(results[sibling["name"]][1], execution["artifact_ref"])
+                self.assertEqual(cache.get(key)["status"], "succeeded")
+
     def test_follow_up_source_binding_repair_preserves_checked_sibling_and_frontier(self):
         from scisaurus.runtime.composer import ComposerRunner
         from scisaurus.runtime.model_work import ModelWorkCache
