@@ -4423,6 +4423,30 @@ class TestSurveyContracts(unittest.TestCase):
         next(row for row in value["checks"] if row["check_id"] == "finding")["outcome"] = "failed"
         validate_work_review(value, [], review_obligations=obligations)
 
+    def test_passed_critique_empty_links_are_canonical_without_changing_verdicts(self):
+        obligation = {"receipt_ref": "artifact:command/critique/captured@1", "receipt_body_sha256": "a" * 64,
+                      "work_id": "W101", "entry_ref": "artifact:kb/work-analyses/W101@1",
+                      "entry_body_sha256": "b" * 64, "relationship_pins": [], "source_pins": [],
+                      "hypothesis": "Check the retained assertion."}
+        required = work_review_checks([], [obligation])
+        value = {"checks": check_rows(required), "rationale": "All current assertions are supported."}
+        critique = value["checks"][-1]
+        critique.pop("affected_check_ids")
+        before = deepcopy(value)
+        normalized = normalize_check_envelope(value, required)
+        validate_work_review(normalized, [], review_obligations=[obligation])
+        self.assertEqual(value, before)
+        self.assertEqual(normalized["checks"][-1], {**critique, "affected_check_ids": []})
+        self.assertEqual(normalize_check_envelope(normalized, required), normalized)
+        critique["outcome"] = "failed"
+        with self.assertRaises(ValidationError):
+            validate_work_review(normalize_check_envelope(value, required), [], review_obligations=[obligation])
+        critique.update(outcome="passed", affected_check_ids=["reason"])
+        with self.assertRaises(ValidationError):
+            validate_work_review(normalize_check_envelope(value, required), [], review_obligations=[obligation])
+        missing = {"checks": before["checks"][1:], "rationale": before["rationale"]}
+        self.assertIs(normalize_check_envelope(missing, required), missing)
+
     def test_each_failed_critique_requires_its_own_nonpassed_claim_check(self):
         obligations = [{"work_id": "W1", "hypothesis": hypothesis} for hypothesis in ("Finding scope.", "Limitations scope.")]
         required = work_review_checks([], obligations)

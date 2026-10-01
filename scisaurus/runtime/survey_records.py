@@ -57,7 +57,9 @@ def normalize_check_envelope(value, required):
     required row after completing the requested checks. Those extra rows are
     outside the assignment contract and cannot affect admission. Projection is
     allowed only when every required ID occurs exactly once; missing required
-    checks still fail normally.
+    checks still fail normally. A passed critique has no affected failed check;
+    its omitted empty list is structurally determined by that explicit verdict.
+    Unresolved critique links are never inferred.
     """
     if not isinstance(value, dict) or not isinstance(value.get("checks"), list):
         return value
@@ -81,6 +83,11 @@ def normalize_check_envelope(value, required):
     projected["checks"] = [row for row in rows
                             if isinstance(row.get("check_id"), str)
                             and row["check_id"] in required_ids]
+    projected["checks"] = [
+        {**row, "affected_check_ids": []}
+        if row["check_id"].startswith("critique:") and row.get("outcome") == "passed"
+        and "affected_check_ids" not in row else row
+        for row in projected["checks"]]
     return projected
 
 
