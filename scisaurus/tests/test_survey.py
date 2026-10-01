@@ -253,6 +253,15 @@ def simulated_survey_worker(kind, params, channel):
             "limitation": "The configured sources lack the requested measurement.",
             "next_action": "Keep the measurement claim provisional and narrow the study.",
         } for order in assignment["work_orders"]]}
+        if mode in {"follow-up-records", "follow-up-records-only"}:
+            for row in value["orders"]:
+                if mode == "follow-up-records-only":
+                    row["query_refs"] = []
+                    row["status"] = "unresolved"
+                row["record_evidence"] = [assignment["survey_inventory"]["works"][0]["work_ref"]]
+                row["rationale"] = "Current catalog membership is established by the pinned record."
+                row["limitation"] = "The earlier upstream projection is not captured."
+                row["next_action"] = "Inspect the upstream projection without repeating acquisition."
         if mode == "follow-up-source-binding":
             for row in value["orders"]:
                 if row["id"] != "evidence-2":
@@ -1829,6 +1838,37 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertLessEqual(estimate_input_tokens(SYSTEM, json.dumps(captured[0], ensure_ascii=False)), 56000)
         self.assertEqual(captured[0]["work_orders"], [self.follow_up_order()])
         self.assertEqual(runner.source_docs, original)
+
+    def test_record_follow_up_is_consumed_only_with_recalculated_pinned_inventory(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        from scisaurus.runtime.survey_records import follow_up_inventory
+        order = self.follow_up_order("Check the registered membership of W101.")
+        runner = self.runtime(survey_config(self.endpoint, "follow-up-records"), work_orders=[order])
+        result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        disposition = result["follow_up_result"]["orders"][0]
+        self.assertEqual(disposition["status"], "limited")
+        self.assertTrue(disposition["query_refs"])
+        self.assertTrue(disposition["record_evidence"])
+        self.assertTrue(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, order))
+        def changed_inventory(store, ref):
+            value = follow_up_inventory(store, ref)
+            value["works"][0]["title"] = "A different catalog record"
+            return value
+        with patch("scisaurus.runtime.survey_records.follow_up_inventory", side_effect=changed_inventory):
+            self.assertFalse(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, order))
+
+    def test_record_only_follow_up_keeps_scientific_acquisition_order_open(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        order = self.follow_up_order("Check the registered membership of W101.")
+        runner = self.runtime(survey_config(self.endpoint, "follow-up-records-only"), work_orders=[order])
+        result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        disposition = result["follow_up_result"]["orders"][0]
+        self.assertEqual(disposition["status"], "unresolved")
+        self.assertEqual(disposition["query_refs"], [])
+        self.assertTrue(disposition["record_evidence"])
+        self.assertFalse(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, order))
 
     def test_follow_up_inventory_projection_keeps_exact_named_ids_and_discloses_scope(self):
         inventory = {"survey_ref": "artifact:kb/surveys/current@1", "works": [

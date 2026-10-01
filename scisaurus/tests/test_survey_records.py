@@ -100,6 +100,22 @@ class TestSurveyEvidence(unittest.TestCase):
         with self.assertRaises(ModelContractError):
             runner._normalize_follow_up_result(indexed, forged)
 
+    def test_record_provenance_requires_pinned_metadata_and_never_closes_science(self):
+        inventory = {"works": [{"work_id": "W1", "work_ref": "artifact:kb/works/W1@2",
+                                "map_entry_ref": "artifact:kb/work-analyses/W1@3"}]}
+        row = {"id": "one", "status": "unresolved", "rationale": "Current record retained; earlier projection absent.",
+               "evidence": [], "record_evidence": [inventory["works"][0]["work_ref"]], "query_refs": [],
+               "limitation": "Earlier projection provenance is not captured.", "next_action": "Inspect upstream projection."}
+        validate_follow_up_result({"orders": [row]}, [{"id": "one"}], {}, [], windows={}, record_inventory=inventory)
+        for field, value in [("record_evidence", ["artifact:kb/works/W1@1"]),
+                             ("record_evidence", ["artifact:kb/works/W2@2"]), ("record_evidence", row["record_evidence"]*2),
+                             ("record_evidence", "artifact:kb/works/W1@2"), ("status", "limited"), ("status", "resolved")]:
+            with self.subTest(field=field, value=value), self.assertRaises(ModelContractError):
+                validate_follow_up_result({"orders": [{**row, field: value}]}, [{"id": "one"}], {}, [],
+                                          windows={}, record_inventory=inventory)
+        with self.assertRaises(ModelContractError):
+            validate_follow_up_result({"orders": [row]}, [{"id": "one"}], {}, [], windows={})
+
     def test_follow_up_schema_errors_retain_model_contract_type(self):
         order = {"id": "one"}
         row = {"id": "one", "status": "unresolved", "rationale": "Absent evidence.", "evidence": [],

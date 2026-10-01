@@ -741,12 +741,12 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "survey_ref": self.survey_ref, **self.nomination},
                 "research.gap-proposer", subjects=[self.survey_ref])
 
-    def _validate_follow_up_result(self, value, *, sources=None, work_orders=None):
+    def _validate_follow_up_result(self, value, *, sources=None, work_orders=None, record_inventory=None):
         from scisaurus.runtime.survey_records import validate_follow_up_result
         displayed = self._assessment_source_context() if sources is None else sources
         windows = {source["source_ref"]: source["window"] for source in displayed}
         validate_follow_up_result(value, self.work_orders if work_orders is None else work_orders, self.source_docs,
-                                  self._follow_up_query_refs(), windows=windows)
+                                  self._follow_up_query_refs(), windows=windows, record_inventory=record_inventory)
         _, survey = self.gate._note(self.survey_ref)
         works = {}
         for ref in survey["work_refs"]:
@@ -803,44 +803,13 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         return refs
 
     def _follow_up_inventory(self):
-        """Expose catalog and map membership from the accepted survey version."""
-        survey = self._body(self.store.get(self.survey_ref))
-        map_body = self._body(self.store.get(survey["map_ref"]))
-        coverage = self._body(self.store.get(survey["coverage_ref"]))
-        entries, entry_refs = {}, {}
-        for ref in map_body["entry_refs"]:
-            entry = self._body(self.store.get(ref))
-            entries[entry["work_id"]] = entry
-            entry_refs[entry["work_id"]] = ref
-        abstentions = {row["work_id"]: row for row in coverage.get("abstentions", [])}
-        sources = {}
-        for ref in survey["source_refs"]:
-            source = self._body(self.store.get(ref))
-            sources.setdefault(source["work_id"], []).append({
-                "source_ref": ref, "representation": source["representation"],
-                "identity_verified": source.get("identity_verified") is True})
-        works = []
-        for ref in survey["work_refs"]:
-            work = self._body(self.store.get(ref))
-            wid = work["work_id"]
-            entry = entries.get(wid)
-            works.append({
-                "work_id": wid, "work_ref": ref, "title": work["title"],
-                "map_entry_ref": entry_refs.get(wid),
-                "screening": entry["inclusion"] if entry is not None else None,
-                "abstention": abstentions.get(wid), "sources": sources.get(wid, [])})
-        return {"survey_ref": self.survey_ref, "map_ref": survey["map_ref"],
-                "coverage_ref": survey["coverage_ref"], "works": works}
+        from scisaurus.runtime.survey_records import follow_up_inventory
+        return follow_up_inventory(self.store, self.survey_ref)
 
     @staticmethod
     def _project_follow_up_inventory(inventory, order):
-        """Keep exact named records visible without repeating the whole catalog."""
-        order_text = json.dumps(order, ensure_ascii=False)
-        named = [row for row in inventory["works"]
-                 if re.search(r"(?<!\w)" + re.escape(row["work_id"]) + r"(?!\w)", order_text)]
-        return {**inventory, "catalog_work_count": len(inventory["works"]),
-                "projection_scope": "named_records" if named else "catalog",
-                "works": named or inventory["works"]}
+        from scisaurus.runtime.survey_records import project_follow_up_inventory
+        return project_follow_up_inventory(inventory, order)
 
     def _resolve_follow_up(self):
         if not self.work_orders:
@@ -861,7 +830,13 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "Return {orders:[{id,status,rationale,evidence:[{work_id,source_ref,quote}],query_refs,limitation,next_action}]}. "
                 "Account for each assigned order exactly once against its success condition. "
                 "resolved requires captured quotations supporting fulfillment; limited requires a bounded recorded "
-                "search, an explicit remaining evidence limitation, and a justified next scientific action. "
+                "search, an explicit remaining evidence limitation, "
+                "and a justified next scientific action. Optional record_evidence is a list of exact work_ref "
+                "or map_entry_ref values from survey_inventory. These references establish only membership "
+                "and reading status; resolved scientific requirements still require captured quotations. "
+                "When only current record provenance is available and an earlier projection remains absent, "
+                "use unresolved with record_evidence; do not invent a targeted search or treat current membership "
+                "as proof that the earlier projection was restored. "
                 "Use unresolved when neither condition holds. Quote only exact displayed source passages. "
                 "Use survey_inventory to check current catalog, map membership, retained source availability, "
                 "and explicit reading abstentions. A retained unread entry is distinct from an unavailable "
@@ -887,7 +862,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             identity = hashlib.sha256(canonical_bytes(order)).hexdigest()
             value, execution = self._model_checked(
                 f"follow-up-disposition-{identity}", "methods.evidence-verifier", scoped,
-                lambda value: self._validate_follow_up_result(value, sources=displayed, work_orders=[order]),
+                lambda value: self._validate_follow_up_result(value, sources=displayed, work_orders=[order],
+                                                             record_inventory=scoped["survey_inventory"]),
                 normalizer=self._normalize_follow_up_result, normalizer_uses_assignment=True,
                 stage="supervision", task_kind="review")
             orders.extend(value["orders"])

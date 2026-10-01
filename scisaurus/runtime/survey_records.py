@@ -1,6 +1,7 @@
 """Evidence-bound literature statements and scoped map updates."""
 from copy import deepcopy
 import hashlib
+import json
 import re
 import unicodedata
 
@@ -605,7 +606,46 @@ def evidence(items, sources, *, required=False, require_spans=False, windows=Non
         raise ValidationError("; ".join(errors))
 
 
-def validate_follow_up_result(value, work_orders, sources, query_refs, *, windows):
+def follow_up_inventory(store, survey_ref):
+    """Read immutable record membership and reading status for one survey."""
+    def body(ref):
+        return json.loads(store.read_body(store.get(ref)["body_hash"]))
+    survey = body(survey_ref)
+    map_body, coverage = body(survey["map_ref"]), body(survey["coverage_ref"])
+    entries, entry_refs = {}, {}
+    for ref in map_body["entry_refs"]:
+        entry = body(ref)
+        entries[entry["work_id"]], entry_refs[entry["work_id"]] = entry, ref
+    abstentions = {row["work_id"]: row for row in coverage.get("abstentions", [])}
+    sources = {}
+    for ref in survey["source_refs"]:
+        source = body(ref)
+        sources.setdefault(source["work_id"], []).append({
+            "source_ref": ref, "representation": source["representation"],
+            "identity_verified": source.get("identity_verified") is True})
+    works = []
+    for ref in survey["work_refs"]:
+        work = body(ref)
+        wid = work["work_id"]
+        entry = entries.get(wid)
+        works.append({"work_id": wid, "work_ref": ref, "title": work["title"],
+                      "map_entry_ref": entry_refs.get(wid),
+                      "screening": entry["inclusion"] if entry is not None else None,
+                      "abstention": abstentions.get(wid), "sources": sources.get(wid, [])})
+    return {"survey_ref": survey_ref, "map_ref": survey["map_ref"],
+            "coverage_ref": survey["coverage_ref"], "works": works}
+
+
+def project_follow_up_inventory(inventory, order):
+    """Expose exact named records while disclosing the full catalog size."""
+    order_text = json.dumps(order, ensure_ascii=False)
+    named = [row for row in inventory["works"]
+             if re.search(r"(?<!\w)" + re.escape(row["work_id"]) + r"(?!\w)", order_text)]
+    return {**inventory, "catalog_work_count": len(inventory["works"]),
+            "projection_scope": "named_records" if named else "catalog", "works": named or inventory["works"]}
+
+
+def validate_follow_up_result(value, work_orders, sources, query_refs, *, windows, record_inventory=None):
     def response_exact(value, fields, name):
         try:
             exact(value, fields, name)
@@ -624,7 +664,8 @@ def validate_follow_up_result(value, work_orders, sources, query_refs, *, window
         raise ModelContractError("survey follow-up must account for every work order")
     expected, seen = {order["id"] for order in work_orders}, set()
     for row in rows:
-        response_exact(row, {"id", "status", "rationale", "evidence", "query_refs", "limitation", "next_action"},
+        response_exact(row, {"id", "status", "rationale", "evidence", "query_refs", "limitation", "next_action"}
+                       | ({"record_evidence"} if "record_evidence" in row else set()),
               "survey follow-up disposition")
         response_text(row["id"], "survey follow-up order ID")
         response_text(row["status"], "survey follow-up status")
@@ -641,6 +682,13 @@ def validate_follow_up_result(value, work_orders, sources, query_refs, *, window
             raise ModelContractError("survey follow-up query_refs must be a list of references")
         if any(ref not in query_refs for ref in row["query_refs"]):
             raise ModelContractError("survey follow-up cites an unrecorded targeted search")
+        record_refs = row.get("record_evidence", [])
+        allowed_records = {ref for work in (record_inventory or {}).get("works", [])
+                           for ref in (work["work_ref"], work["map_entry_ref"]) if ref is not None}
+        if (not isinstance(record_refs, list) or any(not isinstance(ref, str) for ref in record_refs)
+                or len(record_refs) != len(set(record_refs))
+                or any(ref not in allowed_records for ref in record_refs)):
+            raise ModelContractError("survey follow-up record evidence must cite exact displayed accepted inventory records")
         if not isinstance(row["evidence"], list) or any(
                 not isinstance(proof, dict)
                 or set(proof) != {"work_id", "source_ref", "quote", "start", "end", "quote_sha256"}
@@ -654,7 +702,8 @@ def validate_follow_up_result(value, work_orders, sources, query_refs, *, window
         except ValidationError as exc:
             raise ModelContractError(str(exc)) from exc
         if row["status"] == "limited" and (not row["query_refs"] or not row["limitation"].strip()):
-            raise ModelContractError("limited survey follow-up requires targeted searches and an explicit limitation")
+            raise ModelContractError("limited survey follow-up requires targeted searches and an explicit limitation; "
+                                     "record-only provenance must remain unresolved")
 
 
 def statement(value, sources, *, work_id=None, require_spans=False):

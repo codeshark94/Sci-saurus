@@ -17346,7 +17346,8 @@ class ComposerRunner:
         from scisaurus.core.surveys import SurveyGate
         from scisaurus.runtime.models import ModelResult
         from scisaurus.runtime.survey import acquisition_succeeded
-        from scisaurus.runtime.survey_records import validate_follow_up_result
+        from scisaurus.runtime.survey_records import (follow_up_inventory, project_follow_up_inventory,
+                                                      validate_follow_up_result)
         result = run.get("follow_up_result")
         if (not isinstance(result, dict) or not isinstance(result.get("ref"), str)
                 or any(not isinstance(run.get(key), str) for key in ("survey_ref", "assessment_ref"))):
@@ -17416,7 +17417,13 @@ class ComposerRunner:
                                                allow_missing_closers=True)
                     response = expand_evidence(response, assignment.get("evidence_catalog", []), sources, windows=windows)
                     response = bind_spans(response, sources, windows=windows)
-                    validate_follow_up_result(response, assigned, sources, query_refs, windows=windows)
+                    record_inventory = assignment.get("survey_inventory")
+                    if any(row.get("record_evidence") for row in response.get("orders", [])):
+                        if (len(assigned) != 1 or record_inventory != project_follow_up_inventory(
+                                follow_up_inventory(store, run["survey_ref"]), assigned[0])):
+                            return False
+                    validate_follow_up_result(response, assigned, sources, query_refs, windows=windows,
+                                              record_inventory=record_inventory)
                     for row in response["orders"]:
                         if row["id"] in checked:
                             return False
