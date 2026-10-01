@@ -426,6 +426,37 @@ class TestSurveyChecks(unittest.TestCase):
         self.assertEqual(value["findings"][0]["quote_field"], "inclusion")
         validate_survey_review(value, current_map=current)
 
+    def test_nested_findings_lift_without_changing_checks_quotes_or_repair_authority(self):
+        current, raw = self.quote_location_fixture()
+        finding = raw.pop("findings")[0]
+        target = next(row for row in raw["checks"] if row["check_id"] == finding["check_id"])
+        target["findings"] = [{key: item for key, item in finding.items() if key != "check_id"}]
+        original = deepcopy(raw)
+        value = normalize_survey_review_envelope(raw, current_map=current)
+        validate_survey_review(value, current_map=current)
+        self.assertEqual(value["findings"], [{**finding, "quote_field": "reason"}])
+        self.assertEqual(value["checks"], [{key: item for key, item in row.items() if key != "findings"}
+                                            for row in raw["checks"]])
+        self.assertEqual(raw, original)
+        self.assertEqual(normalize_survey_review_envelope(value, current_map=current), value)
+        target["findings"][0]["check_id"] = "source-fidelity"
+        with self.assertRaisesRegex(ModelContractError, "conflicts with its containing check"):
+            normalize_survey_review_envelope(raw, current_map=current)
+
+    def test_nested_findings_cannot_hide_passed_unknown_or_unbound_assertions(self):
+        for mutation in ("passed", "extra_field", "stale", "invalid_list"):
+            with self.subTest(mutation=mutation):
+                current, raw = self.quote_location_fixture()
+                finding = raw.pop("findings")[0]
+                target = next(row for row in raw["checks"] if row["check_id"] == finding["check_id"])
+                target["findings"] = [finding]
+                if mutation == "passed": target["outcome"] = "passed"
+                elif mutation == "extra_field": finding["unsupported"] = True
+                elif mutation == "stale": finding["target_ref"] = finding["target_ref"].replace("@2", "@1")
+                else: target["findings"] = None
+                with self.assertRaises(ModelContractError):
+                    validate_survey_review(normalize_survey_review_envelope(raw, current_map=current), current_map=current)
+
     def test_assignment_replay_migration_preserves_every_scientific_input_and_instruction(self):
         current, _ = self.quote_location_fixture()
         prior = {"phase": "survey_review", "map": current, "question": "A scoped question?",

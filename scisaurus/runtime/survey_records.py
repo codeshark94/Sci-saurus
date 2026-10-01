@@ -13,7 +13,7 @@ MAP_FIELDS = ("problem", "approach", "finding", "limitations")
 SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
 GAP_CHECKS = ("closest-prior-work", "scope-comparability", "counterevidence", "full-text-support")
 REVIEW_CHECK_FIELDS = frozenset({"check_id", "outcome", "method", "result"})
-SURVEY_RESPONSE_CONTRACT_REVISION = "survey-finding-repair-target-catalog-2"
+SURVEY_RESPONSE_CONTRACT_REVISION = "survey-finding-envelope-3"
 SURVEY_QUOTE_LOCATION_INSTRUCTION = (
     "Finding field identifies the affected decision or assertion and controls repair authority; "
     "quote_field separately identifies the field containing the exact quote on the same target_ref. "
@@ -98,6 +98,25 @@ def _survey_review_targets(current_map):
 def normalize_survey_review_envelope(value, *, current_map):
     """Bind unchanged legacy quotes to unambiguous fields on their exact target."""
     value = deepcopy(normalize_check_envelope(value, SURVEY_CHECKS))
+    if isinstance(value, dict) and isinstance(value.get("checks"), list):
+        nested = []
+        for index, check in enumerate(value["checks"]):
+            if not isinstance(check, dict) or "findings" not in check:
+                continue
+            if check.get("check_id") not in SURVEY_CHECKS or not isinstance(check["findings"], list):
+                raise ModelContractError(f"checks[{index}].findings must be a list bound to a required check")
+            for finding in check["findings"]:
+                if not isinstance(finding, dict):
+                    raise ModelContractError(f"checks[{index}].findings requires finding objects")
+                if finding.get("check_id", check["check_id"]) != check["check_id"]:
+                    raise ModelContractError(f"checks[{index}].findings check_id conflicts with its containing check")
+                nested.append({**finding, "check_id": check["check_id"]})
+        if any(isinstance(check, dict) and "findings" in check for check in value["checks"]):
+            if not isinstance(value.get("findings", []), list):
+                raise ModelContractError("survey findings must be a list")
+            value["findings"] = [*value.get("findings", []), *nested]
+            value["checks"] = [{key: item for key, item in check.items() if key != "findings"}
+                               if isinstance(check, dict) else check for check in value["checks"]]
     if not isinstance(value, dict) or not isinstance(value.get("findings"), list):
         return value
     targets = _survey_review_targets(current_map)
