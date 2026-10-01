@@ -8,7 +8,7 @@ import tempfile
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.errors import ProviderRateLimitError, StateError, ValidationError
 from scisaurus.core.source_spans import bind, validate as validate_span
-from scisaurus.runtime.survey_config import search_query
+from scisaurus.runtime.survey_config import search_query, work_id
 from scisaurus.runtime.survey_records import MAP_FIELDS, authoritative_source
 
 
@@ -47,13 +47,16 @@ def validate_plan(value, parents, sources, *, max_branches):
             if branch["work_id"] is not None:
                 raise ValidationError("search branch cannot identify a work lookup")
         elif operation in {"work", "citing"}:
-            if parent["kind"] != "read" or not isinstance(branch["work_id"], str) or not branch["work_id"]:
-                raise ValidationError("citation branches require a concrete reviewed parent work")
+            work_id(branch["work_id"])
             if branch["query"] is not None:
-                raise ValidationError("citation branch cannot supply a search query")
-            allowed = parent.get("referenced_works", []) if operation == "work" else [parent.get("work_id")]
-            if branch["work_id"] not in allowed:
-                raise ValidationError("citation branch must follow its parent's actual citation metadata")
+                raise ValidationError("work and citing branches cannot supply a search query")
+            if parent["kind"] == "root":
+                if operation != "work":
+                    raise ValidationError("citing branches require a concrete reviewed parent work")
+            else:
+                allowed = parent.get("referenced_works", []) if operation == "work" else [parent.get("work_id")]
+                if branch["work_id"] not in allowed:
+                    raise ValidationError("citation branch must follow its parent's actual citation metadata")
         else:
             raise ValidationError("unsupported exploration acquisition operation")
         evidence = branch["evidence"]
@@ -315,6 +318,7 @@ class LiteratureTree:
         assignment = {"phase": "exploration_plan", "question": self.score["question"],
             "parents": assignments, "sources": context, "suggestions": suggestions,
             "max_branches": branch_limit, "search_syntax": self._tree_search_syntax(),
+            "allowed_operations": {"root": ["search", "work"], "read": ["search", "work", "citing"]},
             "remaining_analysis_slots": self._tree_remaining_slots(),
             "acquisition_history": [{key: node.get(key) for key in ("request", "state", "question", "parent_id", "query_ref", "reason")}
                                     for node in self.exploration_tree["nodes"] if node["kind"] == "acquisition"],
@@ -322,10 +326,10 @@ class LiteratureTree:
                 "Return exactly {decision:expand|stop,rationale:string,branches:[{parent_id,question,rationale,"
                 "operation:search|work|citing,query:string|null,work_id:string|null,"
                 "evidence:[{work_id,source_ref,quote}]}]}. Use assigned parent IDs. "
-                "For a root, choose initial searches from the scientific intake and return no evidence. "
+                "For a root, choose initial searches or direct canonical OpenAlex work lookups from the scientific intake, with empty evidence. "
                 "For a read, explain what its checked findings suggest investigating next, with exact parent quotations. "
                 "An unresolved research question is not a source-stated limitation; abstract silence cannot prove absence. "
-                "Work lookups must follow actual parent references; citing must use the parent work ID. "
+                "For a read, work lookups follow actual parent references; citing uses the checked parent work ID. "
                 "Use diverse terminology or mechanism-specific searches when needed, not only citation neighbors. "
                 "Continue each parent incoming inquiry using its question, rationale and evidence. "
                 "Branches are ordered by scientific priority. Stop closes only the assigned parents. "

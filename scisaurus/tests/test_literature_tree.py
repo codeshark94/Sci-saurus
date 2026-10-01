@@ -36,6 +36,8 @@ def chain_worker(kind, params, channel):
             "query": "recall timing", "work_id": None, "evidence": []}]
         if params["client"]["model"] == "queued-search":
             branches.append({**branches[0], "query": "independent terminology"})
+        if params["client"]["model"] == "direct-intake":
+            branches[0].update(operation="work", query=None, work_id="W101")
     elif parent["work_id"] in {"W101", "W102"}:
         # Citation metadata is supplied by the actual fixture work response.
         source = next(s for s in assignment["sources"] if s["work_id"] == parent["work_id"])
@@ -91,6 +93,16 @@ class TestExplorationContract(unittest.TestCase):
     def test_root_cannot_request_null_citation(self):
         self.parents["parent"] = {"kind": "root", "source_refs": []}
         self.plan["branches"][0].update(operation="citing", work_id=None, evidence=[])
+        with self.assertRaises(ValidationError): self.validate(self.plan)
+
+    def test_root_direct_work_lookup_is_valid_acquisition(self):
+        self.parents["parent"] = {"kind": "root", "source_refs": []}
+        self.plan["branches"][0].update(work_id="W2", evidence=[])
+        self.validate(self.plan)
+
+    def test_root_work_lookup_requires_canonical_provider_identifier(self):
+        self.parents["parent"] = {"kind": "root", "source_refs": []}
+        self.plan["branches"][0].update(work_id="invented-paper", evidence=[])
         with self.assertRaises(ValidationError): self.validate(self.plan)
 
     def test_stop_cannot_contain_acquisition(self):
@@ -427,3 +439,14 @@ class TestExplorationExecution(unittest.TestCase):
         runner._active_tree_action = None
         with self.assertRaises(StateError): runner._tree_recover_action(third)
         runner.control.close()
+
+    def test_direct_intake_lookup_enters_checked_reference_exploration(self):
+        self.config["model"]["model"] = "direct-intake"
+        self.config["survey"]["seed_work_ids"] = []
+        result = self.runner().run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        nodes = result["coverage"]["exploration_tree"]["nodes"]
+        self.assertTrue({"W101", "W102", "W103"} <= {n["work_id"] for n in nodes if n["kind"] == "read"})
+        root = next(n for n in nodes if n["kind"] == "root")
+        self.assertTrue(any(n["kind"] == "acquisition" and n["parent_id"] == root["id"]
+                            and n["request"]["operation"] == "work" for n in nodes))
