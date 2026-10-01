@@ -24,7 +24,7 @@ from scisaurus.runtime.config import configured_worker_slots
 from scisaurus.runtime.bibliographic_identity import normalize_doi, project_crossref_work, reconcile_result
 from scisaurus.runtime.execution_policy import enforce_model_cost_limits
 from scisaurus.runtime.models import (
-    ModelCallError, ModelResult, estimate_input_tokens, is_local_qwen_route,
+    ModelCallError, ModelContextBudgetError, ModelResult, estimate_input_tokens, is_local_qwen_route,
     model_call_budget_remaining, model_token_budget_usage, model_token_budget_limits, role_config_for, role_routes_for,
 )
 from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
@@ -3249,7 +3249,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         projected["window"] = {"start": start, "end": start + len(projected["text"])}
         return projected
 
-    def _map_input_limit(self, role):
+    def _map_input_limit(self, role, *, include_route=False):
         """Return the strictest input limit any route for ``role`` permits.
 
         A map job is serialized before the execution runtime selects a
@@ -3278,7 +3278,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 window_limit = window - output_limit
                 allowed = window_limit if allowed is None else min(allowed, window_limit)
             if isinstance(allowed, int) and allowed > 0:
-                candidates.append(allowed)
+                candidates.append((allowed, effective))
 
         role_models = base.get("role_models", {})
         selected = role_config_for(role_models, role)
@@ -3304,7 +3304,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             effective.update({key: value for key, value in route.items()
                               if key not in {"id", "pool"}})
             add(effective)
-        return min(candidates) if candidates else None
+        if not candidates:
+            return None
+        strictest = min(candidates, key=lambda item: item[0])
+        return strictest if include_route else strictest[0]
 
     @staticmethod
     def _project_map_catalog(works, *, visible_ids, target_ids, max_items):
@@ -3316,19 +3319,11 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             return required
         return [*required, *optional[:max_items - len(required)]]
 
-    def _project_map_sources(self, sources, *, owner_id, owner_chars,
+    def _project_map_sources(self, sources, *, required_ids,
                              comparison_chars, comparison_count):
-        """Project owner and comparison source windows under two budgets."""
-        owner_sources = [source for source in sources if source.get("work_id") == owner_id]
-        comparison_sources = [source for source in sources if source.get("work_id") != owner_id]
-        projected_owner, remaining = [], max(0, int(owner_chars))
-        for source in owner_sources:
-            if remaining <= 0:
-                break
-            projected = self._project_source_window(source, remaining)
-            if projected["text"]:
-                projected_owner.append(projected)
-                remaining -= len(projected["text"])
+        """Preserve required captures while reducing optional comparison context."""
+        required = [deepcopy(source) for source in sources if source.get("work_id") in required_ids]
+        comparison_sources = [source for source in sources if source.get("work_id") not in required_ids]
         selected = comparison_sources[:max(0, int(comparison_count))]
         if selected and comparison_chars > 0:
             each = max(1, int(comparison_chars) // len(selected))
@@ -3338,7 +3333,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             ]
         else:
             projected_comparisons = []
-        return [*projected_owner, *projected_comparisons]
+        return [*required, *projected_comparisons]
 
     def _fit_map_assignment(self, assignment, *, owner_id):
         """Fit a map assignment to every possible provider route.
@@ -3373,75 +3368,48 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             target for target in assignment.get("editable_relationship_targets", [])
             if isinstance(target, str)
         )
-        source_work_ids = []
-        for source in sources:
-            work_id = source.get("work_id") if isinstance(source, dict) else None
-            if isinstance(work_id, str) and work_id not in source_work_ids:
-                source_work_ids.append(work_id)
-
-        context_chars = int(self.bounds["context_chars"])
-        comparison_budget = min(int(self.bounds["max_text_chars"]), context_chars * 2)
-        profiles = (
-            # The first profile generally only removes unrelated catalog rows.
-            (len(source_work_ids), context_chars, comparison_budget, len(works)),
-            (64, min(context_chars, 24000), min(comparison_budget, 40000), 80),
-            (48, min(context_chars, 18000), min(comparison_budget, 30000), 64),
-            (32, min(context_chars, 12000), min(comparison_budget, 24000), 48),
-            (24, min(context_chars, 8000), min(comparison_budget, 18000), 36),
-            (16, min(context_chars, 5000), min(comparison_budget, 12000), 28),
-            (8, min(context_chars, 3000), min(comparison_budget, 8000), 16),
-            (4, min(context_chars, 2000), min(comparison_budget, 4000), 10),
-            (1, min(context_chars, 1024), 0, 4),
-        )
-        candidate = assignment
-        for comparison_count, owner_chars, comparison_chars, max_items in profiles:
+        required_ids = {owner_id, *target_ids}
+        optional_sources = [source for source in sources if source.get("work_id") not in required_ids]
+        comparison_count = len(optional_sources)
+        comparison_chars = sum(len(source.get("text", "")) for source in optional_sources)
+        max_items = len(works)
+        while True:
             projected_sources = self._project_map_sources(
-                sources, owner_id=owner_id, owner_chars=owner_chars,
-                comparison_chars=comparison_chars,
-                comparison_count=comparison_count)
-            visible_ids = {
-                source.get("work_id") for source in projected_sources
-                if isinstance(source, dict) and isinstance(source.get("work_id"), str)
-            }
+                sources, required_ids=required_ids,
+                comparison_chars=comparison_chars, comparison_count=comparison_count)
+            visible_ids = {source["work_id"] for source in projected_sources}
             projected_works = self._project_map_catalog(
-                works, visible_ids=visible_ids | {owner_id}, target_ids=target_ids,
+                works, visible_ids=visible_ids | required_ids, target_ids=target_ids,
                 max_items=max_items)
-            candidate = {**assignment, "works": projected_works,
-                         "sources": projected_sources}
+            candidate = {**assignment, "works": projected_works, "sources": projected_sources}
             if fits(candidate):
                 return candidate
+            if comparison_count == comparison_chars == max_items == 0:
+                break
+            comparison_count //= 2
+            comparison_chars //= 2
+            max_items //= 2
 
-        # Provider metadata should already be bounded by normalization, but a
-        # malformed or unusually verbose catalog must not bypass admission.
-        # Retain only the assigned work's catalog card and a small owner window
-        # in the final fail-closed projection.
-        minimal_works = [work for work in works if work.get("id") == owner_id]
-        if minimal_works:
-            minimal = {**assignment, "works": minimal_works,
-                       "sources": self._project_map_sources(
-                           sources, owner_id=owner_id, owner_chars=1024,
-                           comparison_chars=0, comparison_count=0)}
-            if fits(minimal):
-                return minimal
-        raise ValidationError(
-            "literature-map assignment cannot fit any configured provider context budget: "
-            f"estimated input exceeds {limit} tokens after bounded projection")
+        allowed, route = self._map_input_limit("research.literature-mapper", include_route=True)
+        raise ModelContextBudgetError(
+            "source-complete literature-map assignment exceeds the strictest configured route",
+            model=route.get("model"),
+            estimated_input_tokens=estimate_input_tokens(SYSTEM, json.dumps(candidate, ensure_ascii=False)),
+            allowed_input_tokens=allowed, context_window_tokens=route.get("context_window_tokens"),
+            max_input_tokens=route.get("max_input_tokens"), max_output_tokens=route.get("max_output_tokens"))
 
     def _map_sources(self, wid, *, old_relationships=None, review_feedback=None):
-        """Build a bounded source projection for one literature-map assignment.
+        """Expose complete assigned captures and optional comparison excerpts.
 
         A map worker owns one work, while comparison abstracts are only needed
         to justify an optional outgoing relationship. Sending every captured
         abstract at the full survey context limit makes the same assignment
-        exceed a 64k provider window as the corpus grows. Keep the assigned
-        work's source budget intact, then divide a separate comparison budget
-        across stable, relevant excerpts. The displayed windows are persisted
-        in the assignment and remain the evidence boundary for validation.
+        exceed a provider window as the corpus grows. Owner and existing
+        relationship-target captures remain complete; optional comparisons
+        share a separate context allocation. Exact route admission may remove
+        optional context but cannot hide part of a required capture.
         """
-        all_sources = [source for source in self._source_context() if authoritative_source(source)]
-        owner_sources = [source for source in all_sources if source["work_id"] == wid]
-        comparison_sources = [source for source in all_sources
-                              if source["work_id"] != wid and source["representation"] == "abstract"]
+        all_sources = self._assessment_source_context()
 
         target_ids = set()
         for relation in old_relationships or []:
@@ -3456,6 +3424,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             for reference in self.works.get(wid, {}).get("referenced_works", [])
             if isinstance(reference, str)
         }
+        required_ids = {wid, *target_ids}
+        required_sources = [source for source in all_sources if source["work_id"] in required_ids]
+        comparison_sources = [source for source in all_sources
+                              if source["work_id"] not in required_ids and source["representation"] == "abstract"]
         comparison_ids = self._analysis_selection() | target_ids | referenced_ids
         comparison_sources = [source for source in comparison_sources
                               if source["work_id"] in comparison_ids]
@@ -3467,17 +3439,6 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         ))
 
         context_chars = self.bounds["context_chars"]
-        owner_budget = context_chars
-        projected_owner = []
-        for source in sorted(owner_sources, key=lambda item: (
-                0 if item["representation"] == "full_text" else 1)):
-            if owner_budget <= 0:
-                break
-            projected = self._project_source_window(source, owner_budget)
-            if projected["text"]:
-                projected_owner.append(projected)
-                owner_budget -= len(projected["text"])
-
         # This budget is independent of the number of captured works. Dividing
         # it across the comparison set keeps map prompts bounded while still
         # exposing every candidate work to the model for optional linking.
@@ -3489,7 +3450,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             for source in comparison_sources
             if comparison_limit > 0 and source["text"][:comparison_limit]
         ]
-        return [*projected_owner, *projected_comparisons]
+        return [*required_sources, *projected_comparisons]
 
     def _assessment_source_context(self):
         """Expose authoritative captures before evidence-aware context budgeting."""
@@ -5178,6 +5139,13 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                            "credential_env": exc.credential_env}
             elif isinstance(exc, ModelCallError):
                 failure = exc.failure_details()
+            elif isinstance(exc, ModelContextBudgetError):
+                failure = {"kind": "context_budget", "failure_class": exc.failure_class,
+                           "model": exc.model, "estimated_input_tokens": exc.estimated_input_tokens,
+                           "allowed_input_tokens": exc.allowed_input_tokens,
+                           "context_window_tokens": exc.context_window_tokens,
+                           "max_input_tokens": exc.max_input_tokens, "max_output_tokens": exc.max_output_tokens,
+                           "outcome_known": True, "attempts": 0}
             elif isinstance(exc, QuotaExceededError):
                 failure = {"kind": "quota_exceeded", "dimension": exc.dimension,
                            "limit": exc.limit, "observed": exc.observed,

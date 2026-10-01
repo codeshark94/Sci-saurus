@@ -485,6 +485,56 @@ def survey_config(endpoint, mode="pass"):
 
 
 class TestSurveyRunner(unittest.TestCase):
+    def test_map_capacity_cannot_truncate_required_capture_or_target_catalog(self):
+        from scisaurus.runtime.models import ModelContextBudgetError
+        runner = self.runtime()
+        runner.config["model"].update(max_input_tokens=2048, context_window_tokens=8192,
+                                      max_output_tokens=4096)
+        assignment = {"sources": [{"work_id": "W1", "text": "Complete owner evidence. " * 1500,
+                                    "window": {"start": 0, "end": 36000}},
+                                   {"work_id": "W2", "text": "Complete target evidence.",
+                                    "window": {"start": 0, "end": 25}}],
+                      "works": [{"id": "W1", "title": "Owner"}, {"id": "W2", "title": "Target"},
+                                {"id": "W3", "title": "Optional " * 500}],
+                      "previous_entries": [{"protected": "unchanged"}],
+                      "previous_affected_relationships": [{"source": "W1", "target": "W2"}],
+                      "semantic_feedback": {"protected": "unchanged"}}
+        original = deepcopy(assignment)
+        with patch.object(runner, "_project_map_sources", wraps=runner._project_map_sources) as projection:
+            with self.assertRaises(ModelContextBudgetError) as blocked:
+                runner._fit_map_assignment(assignment, owner_id="W1")
+        self.assertEqual(blocked.exception.failure_class, "context_budget")
+        self.assertGreater(blocked.exception.estimated_input_tokens, blocked.exception.allowed_input_tokens)
+        self.assertEqual(projection.call_args.kwargs["required_ids"], {"W1", "W2"})
+        self.assertEqual(assignment, original)
+        with patch.object(runner, "_setup", side_effect=blocked.exception):
+            report = runner.run()
+        self.assertEqual(report["status"], "blocked")
+        self.assertEqual(report["failure"]["kind"], "context_budget")
+        self.assertEqual(report["failure"]["attempts"], 0)
+        self.assertEqual(report["usage"]["cumulative_usage"], {})
+
+    def test_map_capacity_compacts_optional_context_preserving_required_sources(self):
+        runner = self.runtime()
+        runner.config["model"].update(max_input_tokens=4096, context_window_tokens=8192,
+                                      max_output_tokens=4096)
+        mandatory = [{"work_id": wid, "text": "Complete captured evidence. " * 30,
+                      "window": {"start": 0, "end": 840}} for wid in ("W1", "W2")]
+        assignment = {"sources": [*mandatory, {"work_id": "W3", "text": "Optional context. " * 3000,
+                                               "window": {"start": 0, "end": 54000}}],
+                      "works": [{"id": wid, "title": wid} for wid in ("W1", "W2", "W3")],
+                      "previous_entries": [{"protected": "unchanged"}],
+                      "previous_affected_relationships": [{"source": "W1", "target": "W2"}],
+                      "semantic_feedback": {"protected": "unchanged"}}
+        original = deepcopy(assignment)
+        fitted = runner._fit_map_assignment(assignment, owner_id="W1")
+        self.assertLessEqual(estimate_input_tokens(SYSTEM, json.dumps(fitted, ensure_ascii=False)), 4096)
+        self.assertEqual([item for item in fitted["sources"] if item["work_id"] in {"W1", "W2"}], mandatory)
+        self.assertTrue({"W1", "W2"}.issubset({work["id"] for work in fitted["works"]}))
+        for key in ("previous_entries", "previous_affected_relationships", "semantic_feedback"):
+            self.assertEqual(fitted[key], assignment[key])
+        self.assertEqual(assignment, original)
+
     def test_focused_review_exposes_complete_capture_and_rejects_prefix_provenance(self):
         runner = self.runtime()
         runner._initialize(); runner._setup()
@@ -496,6 +546,11 @@ class TestSurveyRunner(unittest.TestCase):
         capture = runner._record("kb/full-text/W101", "source_capture", source, "methods.source-verifier")
         runner.source_docs[capture["artifact_ref"]] = source
         runner._map(); runner._review_work_claims()
+        mapping = next(value for _, value in self.model_contexts(runner.control, runner.store)
+                       if value.get("phase") == "map")
+        mapped_source = next(item for item in mapping["sources"] if item["source_ref"] == capture["artifact_ref"])
+        self.assertEqual(mapped_source["text"], text)
+        self.assertEqual(mapped_source["window"], {"start": 0, "end": len(text)})
         review = runner._body(runner.work_reviews["W101"])
         context, prompt = next((manifest, value) for manifest, value in self.model_contexts(runner.control, runner.store)
                                if value.get("phase") == "work_review")
@@ -1299,7 +1354,8 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertLessEqual(estimate, 56000)
         owner = next(source for source in assignment["sources"] if source["work_id"] == "W000")
         comparisons = [source for source in assignment["sources"] if source["work_id"] != "W000"]
-        self.assertEqual(len(owner["text"]), 30000)
+        self.assertEqual(owner["text"], runner.source_docs["source-W000-full"]["text"])
+        self.assertEqual(owner["window"], {"start": 0, "end": len(owner["text"])})
         self.assertEqual({source["work_id"] for source in comparisons}, {"W001", "W002", "W003", "W004", "W070"})
         self.assertEqual({work["id"] for work in assignment["works"]}, {"W000", "W001", "W002", "W003", "W004", "W070"})
         self.assertLessEqual(sum(len(source["text"]) for source in comparisons), 60000)
