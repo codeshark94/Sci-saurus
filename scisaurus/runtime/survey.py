@@ -212,14 +212,15 @@ _SOURCE_EVIDENCE_POLICY = (
 
 
 _CRITIQUE_CONTEXT_PROTOCOL = "literature-critique-transition-2"
-_CURRENT_MAP_REVIEW_PROTOCOL = "literature-current-map-review-1"
+_CURRENT_MAP_REVIEW_PROTOCOL = "literature-current-map-review-2"
 
 
 def source_fidelity_review_contract():
     return {
-        "protocol": "literature-source-fidelity-3",
+        "protocol": "literature-source-fidelity-4",
+        "analyst_mapping_scope": "Separate article-reported facts from analyst relevance judgments. A bounded relevance or method-analogy judgment must identify a captured source-supported property, the specific question component it informs, and limits on transfer across species, phases, conditions, or models. The article need not discuss the future question itself. Shared terms or an unrelated accurate summary alone are insufficient. Do not attribute a proposed experiment, parameter transfer, or analyst inference to the article. Background citing prior work is not a measurement or investigation performed by the current study.",
         "question_status": "A research question is not an established claim or a required survey conclusion. Its answer remains undecided by this acceptance decision.",
-        "source_fidelity_scope": "Assess whether every clause of each assertion actually retained in the map is entailed by its cited source. Do not require any captured source to answer or directly address the research question. An unanswered question is a downstream gap, not a failure of an accurately represented source-supported claim.",
+        "source_fidelity_scope": "Assess whether every clause reported as an article fact is entailed by its cited source. Assess analyst relevance judgments separately under analyst_mapping_scope, including the source entailment of their stated premises. Do not require any captured source to answer or directly address the research question. An unanswered question is a downstream gap, not a failure of an accurately represented source-supported claim.",
         "screening_scope": "Check inclusion and reason separately from claim entailment. Every included work must have a source-supported connection to the declared question's mechanism, phenomenon, or method, and the reason must identify that connection. Matching the work's own topic, shared terminology, or a correctly summarized but unrelated source does not establish relevance. A relevant source may support a partial or general claim without answering the research question; do not reject it solely for that absence. Exclude or defer a work whose evidentiary connection cannot be established from its captured source.",
         "non_assertions": "Uncertain screening is an unresolved decision, not a claim that a work is irrelevant or lacks sources. Excluded, deferred, and null fields do not assert scientific support. Missing support for an absent assertion is not a source-fidelity failure. An exclusion reason that asserts irrelevance still requires evidence-based screening review.",
         "controller_status_scope": "A hash-bound controller_abstention records procedural non-admission, not a scientific exclusion or source-unavailability claim. Verify its entry binding and retained status against that receipt, not article text. Do not require an uncertain non-admitted entry to supply an affirmative relevance claim. Independently adjudicate every critique: withdrawal can remove an unsupported current assertion, but does not resolve the original scientific question or prove the original assertion correct. Fail a remaining assertion, false status, or unsupported exclusion; do not fail merely because an assertion remains unmade.",
@@ -1169,13 +1170,23 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         ).fetchall()]
         suffixes = [int(match.group(1)) for task_id in task_ids if (match := re.search(r"-([0-9]+)$", task_id))]
         self.serial = max(suffixes, default=0)
-        critiques_current = all(item["work_id"] in self.reviewed_basis for item in self.review_obligations)
-        if (critiques_current and "integrated_review" not in scopes
+        reviews_current = all(wid in self.reviewed_basis for wid in self.analysis_records)
+        if (reviews_current and "integrated_review" not in scopes
                 and "mapping" not in scopes and "focused_review" not in scopes):
             accepted = self.store.accepted("kb/surveys/current")
             if accepted:
                 try:
                     self.gate.require_current(accepted["artifact_ref"])
+                    events = self.control._conn.execute(
+                        "SELECT payload_json FROM events WHERE event_type='survey.accepted' ORDER BY seq DESC").fetchall()
+                    acceptance = next((json.loads(row[0]) for row in events
+                                       if json.loads(row[0]).get("survey_ref") == accepted["artifact_ref"]), None)
+                    if acceptance is None:
+                        raise ValidationError("accepted survey has no current review contract")
+                    review = self._body(self.store.get(acceptance["review_ref"]))
+                    _, _, prompt, _ = self.gate._model_review_execution(review["execution_ref"], "methods.survey-reviewer")
+                    if prompt.get("review_contract") != self._survey_review_packet()["review_contract"]:
+                        raise ValidationError("accepted survey requires the current review contract")
                     self.survey_ref = self.incumbent = accepted["artifact_ref"]
                     self.time_policy.mark_retained_result(self.survey_ref)
                 except Exception:
@@ -4163,6 +4174,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             relation = self.relationships[key]
             claim = relation.get("claim") or {}
             relationships.append({
+                "artifact_ref": relation["artifact_ref"],
                 "source": relation.get("source"),
                 "target": relation.get("target"),
                 "kind": relation.get("kind"),
@@ -4629,12 +4641,19 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         review = self._body(review_record)
         entries = {wid: record["artifact_ref"] for wid, record in self.analysis_records.items()}
         relations = {value["artifact_ref"]: value for value in self.relationships.values()}
+        permitted_fields, permitted_relations = {}, set()
+        for finding in review.get("findings", []):
+            if finding["target_ref"] in relations:
+                permitted_relations.add(finding["target_ref"])
+            else:
+                permitted_fields.setdefault(finding["target_ref"], set()).add(finding["field"])
         scope = {"protocol": "literature-survey-repair-1", "question": self.score["question"],
                  "sources": sorted(self.source_docs),
                  "analysis_basis": {wid: sorted(self._analysis_basis(wid)) for wid in sorted(self.work_records)},
                  "review_obligations": self.review_obligations,
                  "critique_context_protocol": _CRITIQUE_CONTEXT_PROTOCOL,
-                 "review_context_protocol": _CURRENT_MAP_REVIEW_PROTOCOL}
+                 "review_context_protocol": _CURRENT_MAP_REVIEW_PROTOCOL,
+                 "review_contract": source_fidelity_review_contract()}
         digest = hashlib.sha256(canonical_bytes(scope)).hexdigest()
         logical = "command/survey-review-repairs/" + digest
         retained = self.store.head(logical)
@@ -4650,12 +4669,14 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 {**self._body(record), "artifact_ref": record["artifact_ref"]}
                 for record in self.analysis_records.values()]}, "entry_refs": entries,
             "review_contract": source_fidelity_review_contract(),
+            "sources": self._survey_review_packet()["sources"],
             "review_context_protocol": _CURRENT_MAP_REVIEW_PROTOCOL,
             "instructions": "Return exactly {repairs:[{entry_ref,entry_fields,relationship_refs,rationale}]}. "
                 "Each entry_ref must be a current supplied entry; entry_fields is a list drawn from inclusion, reason, problem, approach, finding, limitations. "
                 "Copy the artifact_ref value, not the work_id key, for entry_ref. A known work ID can be resolved only to its supplied current entry; an explicit stale artifact_ref is never advanced. "
                 "relationship_refs must be exact current outgoing relationship refs for that entry. "
                 "Grant only the fields and relationships implicated by a concrete failed check; preserve all other assertions. "
+                "Scientific grants must be a subset of review.findings target_ref/field bindings. A relationship grant belongs to that relationship's source work. Coverage-only diagnoses may return no claim repairs. "
                 "The failed review is a disputed diagnosis, not proof. Compare its concrete allegations against the supplied current map; do not treat a withdrawn historical assertion as current. "
                 "If no current claim needs correction, return repairs:[] and let an independent aggregate reviewer reconsider the current packet. "
                 "A repair grant permits the mapper to narrow, substantiate, or withdraw the disputed assertion; it does not prescribe a scientific verdict."
@@ -4680,6 +4701,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     raise ModelContractError("aggregate repair requires explicit unique scoped fields or relationships")
                 if any(ref not in relations or relations[ref]["source"] != by_ref[item["entry_ref"]] for ref in refs):
                     raise ModelContractError("aggregate repair relationship has a different owner or version")
+                if not set(fields) <= permitted_fields.get(ref, set()) or not set(refs) <= permitted_relations:
+                    raise ModelContractError("aggregate repair must bind the rejected review's exact current findings")
                 if not isinstance(item["rationale"], str) or not item["rationale"].strip():
                     raise ModelContractError("aggregate repair needs a concrete diagnosis")
         value, execution = self._model_checked("survey-repair-plan", "research.literature-mapper",
@@ -4776,7 +4799,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "relationship_semantics": RELATIONSHIP_SEMANTICS,
             "required_checks": sorted(SURVEY_CHECKS),
             "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
-            "instructions": "Return exactly one compact JSON object {checks:[{check_id,outcome,method,result}],rationale}; no preamble, markdown, or analysis transcript. Execute exactly the required checks. "
+            "instructions": "Return exactly one JSON object {checks:[{check_id,outcome,method,result}],rationale,findings:[{check_id,target_ref,field,quote,rationale}]}; no preamble, markdown, or analysis transcript. Execute exactly the required checks. "
+                "For each non-passed source-fidelity or map-support check supply at least one finding identifying an exact CURRENT entry_ref or relationship artifact_ref, its field and an exact substring quote from that field. Explain the concrete defect against the captured sources. Do not invent a current statement or screening status. Entry fields are inclusion, reason, problem, approach, finding, limitations; relationship field is claim. Passed checks have no findings. Coverage-accounting may be explained in its check result. "
                 "Outcomes passed/failed/insufficient_evidence/check_failed. Passing approves a faithful bounded survey, not novelty or exhaustive coverage. "
                 "Check accurate coverage/accounting, faithful quotations and source scope, and support for every asserted map claim. "
                 "The question is a hypothesis for later investigation, not a claim that this survey must prove or disprove. "
@@ -4821,7 +4845,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             raise ValidationError("integrated survey review cannot fit all mandatory source evidence within its configured input budget")
         value, execution = self._model_checked(
             "survey-review", "methods.survey-reviewer", review_assignment,
-            validate_survey_review,
+            lambda value: validate_survey_review(value, current_map=review_packet["map"]),
             normalizer=lambda value: normalize_check_envelope(value, SURVEY_CHECKS),
             model_overrides={"max_output_tokens": 2048, "temperature": 0.1},
             stage="unit_review", task_kind="verification")

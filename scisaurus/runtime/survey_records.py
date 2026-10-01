@@ -541,10 +541,37 @@ def checks(value, names, *, critique_checks=()):
         raise ValidationError("required checks were omitted")
 
 
-def validate_survey_review(value):
-    exact(value, {"checks", "rationale"}, "survey review")
+def validate_survey_review(value, *, current_map=None):
+    exact(value, {"checks", "rationale", *({"findings"} if "findings" in value else set())}, "survey review")
     checks(value["checks"], SURVEY_CHECKS)
     _text(value["rationale"], "survey review rationale")
+    if current_map is None:
+        return
+    failed = {row["check_id"] for row in value["checks"] if row["outcome"] != "passed"}
+    findings = value.get("findings", [])
+    if not isinstance(findings, list):
+        raise ModelContractError("survey findings must be a list")
+    targets = {}
+    for entry in current_map["entries"]:
+        ref = current_map["entry_refs"][entry["work_id"]]
+        targets[ref] = {field: entry[field] if field in {"inclusion", "reason"} else entry[field]["text"]
+                        for field in ("inclusion", "reason", *MAP_FIELDS)}
+    for relation in current_map["relationships"]:
+        targets[relation["artifact_ref"]] = {"claim": relation["claim"]["text"]}
+    grounded = set()
+    for finding in findings:
+        exact(finding, {"check_id", "target_ref", "field", "quote", "rationale"}, "survey finding")
+        check_id, ref, field, quote = (finding[key] for key in ("check_id", "target_ref", "field", "quote"))
+        if not all(isinstance(item, str) for item in (check_id, ref, field)) or check_id not in failed:
+            raise ModelContractError("survey finding must bind a non-passed required check")
+        _text(quote, "current assertion quote")
+        _text(finding["rationale"], "survey finding rationale")
+        text = targets.get(ref, {}).get(field)
+        if not isinstance(text, str) or quote not in text:
+            raise ModelContractError("survey finding must quote an exact current target field")
+        grounded.add(check_id)
+    if not (failed & {"source-fidelity", "map-support"}) <= grounded:
+        raise ModelContractError("negative scientific survey checks require exact current assertion findings")
 
 
 def validate_work_review(value, relationship_refs, *, entry=None, review_obligations=()):

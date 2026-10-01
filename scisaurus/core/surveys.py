@@ -19,7 +19,7 @@ from scisaurus.runtime.bibliographic_identity import normalize_doi, project_cros
 from scisaurus.runtime.operation_adapters import get_adapter
 from scisaurus.runtime.survey_records import (
     normalize_check_envelope, normalize_gap_assessment_envelope, authoritative_source, has_section_heading,
-    validate_work_review,
+    validate_work_review, validate_survey_review,
 )
 
 
@@ -472,7 +472,11 @@ class SurveyGate:
             return review, execution, None
         execution, context, reply = self._execution(body.get("execution_ref"), review["author"], survey["artifact_ref"])
         reply = normalize_check_envelope(reply, SURVEY_CHECKS)
-        if reply.get("checks") != checks or reply.get("rationale") != body["rationale"]:
+        _, _, prompt, _ = self._model_review_execution(body["execution_ref"], review["author"])
+        if prompt.get("review_contract", {}).get("context_protocol") == "literature-current-map-review-2":
+            validate_survey_review(reply, current_map=prompt["map"])
+        if (reply.get("checks") != checks or reply.get("rationale") != body["rationale"]
+                or reply.get("findings") != body.get("findings")):
             raise ValidationError("survey review does not match the completed model reply")
         return review, execution, context
 

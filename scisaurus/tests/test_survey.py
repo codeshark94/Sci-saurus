@@ -329,6 +329,14 @@ def simulated_survey_worker(kind, params, channel):
                 outcome="failed",
                 result="The second version has a deliberately unsupported included claim.",
             )
+        if isinstance(value.get("checks"), list):
+            target = next(iter(assignment["map"]["entries"]), None)
+            value["findings"] = [{"check_id": row["check_id"],
+                "target_ref": assignment["map"]["entry_refs"][target["work_id"]],
+                "field": "reason", "quote": target["reason"],
+                "rationale": row["result"]}
+                for row in value["checks"] if target is not None
+                and row["outcome"] != "passed" and row["check_id"] in {"source-fidelity", "map-support"}]
     elif phase == "work_review":
         if mode == "review-malformed" and assignment["entry"]["work_id"] == "W101":
             value = {"checks": [{"check_id": "duplicate-check", "outcome": "passed",
@@ -2771,6 +2779,26 @@ class TestSurveyRunner(unittest.TestCase):
         for key, value in mapper["source_fidelity_contract"].items():
             self.assertEqual(reviewer["review_contract"][key], value)
 
+    def test_aggregate_findings_use_refs_from_actual_relationship_projection(self):
+        from scisaurus.runtime.survey_records import validate_survey_review
+        runner = self.runtime(survey_config(self.endpoint, "map-links"))
+        self.addCleanup(runner.control.close)
+        runner._initialize(); runner._setup()
+        for wid in ("W101", "W102"):
+            runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+        runner._map()
+        packet = runner._survey_review_packet()
+        self.assertTrue(packet["map"]["relationships"])
+        relation = packet["map"]["relationships"][0]
+        self.assertIn(relation["artifact_ref"], packet["map"]["relationship_refs"])
+        value = {"checks": check_rows(SURVEY_CHECKS), "rationale": "Audit the current relationship."}
+        validate_survey_review(value, current_map=packet["map"])
+        value["checks"][1]["outcome"] = "failed"
+        value["findings"] = [{"check_id": "source-fidelity", "target_ref": relation["artifact_ref"],
+                              "field": "claim", "quote": relation["claim"]["text"],
+                              "rationale": "The shared pathway requires narrower evidence."}]
+        validate_survey_review(value, current_map=packet["map"])
+
     def test_gap_only_resume_retains_accepted_survey_and_countersearch(self):
         config = survey_config(self.endpoint)
         with patch.object(SurveyRunner, "_assess", side_effect=KeyboardInterrupt("before gap assessment")):
@@ -2797,6 +2825,22 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertNotIn("map", assessment)
         self.assertTrue(all("text" in source and "window" in source
                             for source in assessment["sources"]))
+
+    def test_changed_review_policy_reopens_acceptance_without_discarding_sources(self):
+        config = survey_config(self.endpoint)
+        first = self.runtime(config).run()
+        self.assertEqual(first["status"], "completed", first.get("error"))
+        policy = {"additional_seconds": 40, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["gap_assessment"]}}
+        contract = {**source_fidelity_review_contract(), "analyst_mapping_scope": "Require newly specified attribution checks."}
+        with patch("scisaurus.runtime.survey.source_fidelity_review_contract", return_value=contract):
+            resumed = self.runtime(config, resume_policy=policy)
+            self.addCleanup(resumed.control.close)
+            self.assertIsNone(resumed.survey_ref)
+            self.assertIsNone(resumed.assessment_ref)
+            self.assertTrue(resumed.source_docs)
+            self.assertFalse(resumed.reviewed_basis)
+            self.assertEqual(resumed.store.accepted("kb/surveys/current")["artifact_ref"], first["survey_ref"])
 
     def test_acceptance_retry_reuses_exact_survey_and_completed_review(self):
         runner = self.runtime()
@@ -2896,7 +2940,7 @@ class TestSurveyRunner(unittest.TestCase):
             self.assertEqual(outcomes["inclusion"], expected)
             self.assertEqual(outcomes["reason"], expected)
             self.assertEqual(outcomes["problem"], "passed")
-        self.assertEqual(source_fidelity_review_contract()["protocol"], "literature-source-fidelity-3")
+        self.assertEqual(source_fidelity_review_contract()["protocol"], "literature-source-fidelity-4")
 
     def test_focused_relationship_qualifier_is_a_separate_entailed_clause(self):
         runner = self.runtime(survey_config(self.endpoint, "relationship-qualifier-adversary"))

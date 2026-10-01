@@ -364,6 +364,30 @@ class TestGapAssessment(unittest.TestCase):
 
 
 class TestSurveyChecks(unittest.TestCase):
+    def test_negative_survey_checks_bind_exact_current_assertions(self):
+        row = entry()
+        ref = "artifact:kb/work-analyses/W1@2"
+        rel = {**relationship(), "artifact_ref": "artifact:kb/relationships/one@3"}
+        current = {"entries": [row], "entry_refs": {"W1": ref}, "relationships": [rel]}
+        value = {"checks": required_checks(SURVEY_CHECKS), "rationale": "Inspect captured evidence."}
+        value["checks"][1]["outcome"] = "failed"
+        with self.assertRaises(ModelContractError):
+            validate_survey_review(value, current_map=current)
+        finding = {"check_id": "source-fidelity", "target_ref": ref, "field": "reason",
+                   "quote": row["reason"], "rationale": "The asserted scope is unsupported."}
+        value["findings"] = [finding]
+        validate_survey_review(value, current_map=current)
+        for changes in ({"target_ref": ref.replace("@2", "@1")},
+                        {"quote": "An absent hydration ablation claim."},
+                        {"field": "inclusion", "quote": "excluded"},
+                        {"target_ref": []}, {"field": "finding", "quote": row["reason"]},
+                        {"check_id": "map-support"}):
+            with self.subTest(changes=changes), self.assertRaises(ValidationError):
+                validate_survey_review({**value, "findings": [{**finding, **changes}]}, current_map=current)
+        value["findings"] = [{**finding, "target_ref": rel["artifact_ref"], "field": "claim",
+                              "quote": rel["claim"]["text"]}]
+        validate_survey_review(value, current_map=current)
+
     def test_every_check_is_required_once_in_each_review_contract(self):
         for kind in ("survey", "gap"):
             for mutation in ("omitted", "duplicate", "unknown", "unknown-outcome"):
