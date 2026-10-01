@@ -486,7 +486,6 @@ def survey_config(endpoint, mode="pass"):
 
 class TestSurveyRunner(unittest.TestCase):
     def test_retained_critique_omission_uses_current_revalidation_diagnostic(self):
-        from scisaurus.runtime.models import ModelResult
         runner = self.runtime(survey_config(self.endpoint, "missing-critique-section"))
         runner._initialize(); runner._setup()
         runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
@@ -498,17 +497,19 @@ class TestSurveyRunner(unittest.TestCase):
         contexts = self.model_contexts(runner.control, runner.store)
         manifest, _ = next((manifest, prompt) for manifest, prompt in reversed(contexts)
                            if prompt.get("phase") == "work_review")
-        execution_ref = manifest["artifact_ref"].replace("command/contexts/", "command/executions/")
-        raw = ModelResult(**runner._body(runner.store.get(execution_ref))).json_object(allow_missing_closers=True)
-        retained = {"error": "required checks were omitted", "previous_response": raw,
-                    "execution_ref": execution_ref, "finish_reason": "stop"}
+        validation = runner.store.head(manifest["artifact_id"].replace(
+            "command/contexts/", "command/validation/"))
+        retained = runner._body(validation)
+        retained["error"] = "required checks were omitted"
+        historical = runner._publish(validation["artifact_id"], "note", retained,
+                                     "command.controller",
+                                     subjects=[item["ref"] for item in validation["inputs"]])
         runner.resume_session = {"session": 9}
-        with patch.object(runner, "_retained_validation_feedback", return_value=retained):
-            runner._review_work_claims()
-        self.assertIn("critique_adjudications", retained["error"])
+        runner._review_work_claims()
+        self.assertEqual(runner._body(historical)["error"], "required checks were omitted")
         prompt = [value for _, value in self.model_contexts(runner.control, runner.store)
                   if value.get("phase") == "work_review"][-1]
-        self.assertEqual(prompt["validation_feedback"]["error"], retained["error"])
+        self.assertIn("critique_adjudications", prompt["validation_feedback"]["error"])
         self.assertEqual(prompt["_contract_repair_boundary"], "model-contract-repair-9")
         self.assertTrue(runner._work_review_current("W101"))
 
@@ -4381,14 +4382,28 @@ class TestSurveyRunner(unittest.TestCase):
             first._models_checked([job])
         count = first.control._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0]
         self.assertEqual(count, 2)
+        with patch.object(first, "_call_batch") as call:
+            with self.assertRaises(ModelWorkBlocked):
+                first._models_checked([job])
+            call.assert_not_called()
         first.control.close()
         policy = {"additional_seconds": 20, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
                   "source_changes": {"mode": "reject", "reopen_scopes": []}}
         resumed = SurveyRunner(self.root / "run", config, resume_policy=policy)
         self.addCleanup(resumed.control.close)
+        resumed.worker_target = simulated_survey_worker
+        with self.assertRaises(ModelWorkBlocked):
+            resumed._models_checked([job])
+        self.assertEqual(resumed.control._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 4)
         with patch.object(resumed, "_call_batch") as call:
             with self.assertRaises(ModelWorkBlocked):
                 resumed._models_checked([job])
+            call.assert_not_called()
+        fresh_job = {"name": "invalid-plan", "actor": "research.search-planner",
+                     "assignment": {"phase": "blind_plan"}, "validator": reject}
+        with patch.object(resumed, "_call_batch") as call:
+            with self.assertRaises(ModelWorkBlocked):
+                resumed._models_checked([fresh_job])
             call.assert_not_called()
 
     def test_repair_echo_is_bounded_without_truncating_source_assignment(self):

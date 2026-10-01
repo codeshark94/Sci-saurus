@@ -1932,9 +1932,13 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             pending.append(job)
         if not pending:
             return results
-        feedback.update({job["name"]: retained for job in pending
-                         if (retained := states[job["name"]].get("feedback") or
-                             self._retained_validation_feedback(job["name"], job["assignment"])) is not None})
+        for job in pending:
+            if job["name"] in feedback:
+                continue
+            retained = (states[job["name"]].get("feedback") or
+                        self._retained_validation_feedback(job["name"], job["assignment"]))
+            if retained is not None:
+                feedback[job["name"]] = retained
         rounds = range(self.config["limits"]["max_rounds"])
         # A multi-provider run uses a small rolling dispatch buffer.  The
         # execution runtime already backfills a returned slot immediately;
