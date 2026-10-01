@@ -4855,7 +4855,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "survey-review", "methods.survey-reviewer", review_assignment,
             lambda value: validate_survey_review(value, current_map=review_packet["map"]),
             normalizer=lambda value: normalize_check_envelope(value, SURVEY_CHECKS),
-            model_overrides={"max_output_tokens": 2048, "temperature": 0.1},
+            model_overrides={"temperature": 0.1},
             stage="unit_review", task_kind="verification")
         review_body = {"survey_ref": bundle["artifact_ref"], "execution_ref": execution, **value}
         review = self._publish(f"kb/survey-reviews/{self.survey_revision}", "note", review_body,

@@ -2832,6 +2832,19 @@ class TestSurveyRunner(unittest.TestCase):
         for key, value in mapper["source_fidelity_contract"].items():
             self.assertEqual(reviewer["review_contract"][key], value)
 
+    def test_aggregate_review_preserves_configured_output_capacity(self):
+        config = survey_config(self.endpoint)
+        runner = self.runtime(config)
+        result = runner.run()
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        control, store = self.open_store()
+        contexts = [context for context, prompt in self.model_contexts(control, store)
+                    if prompt.get("phase") == "survey_review"]
+        self.assertTrue(contexts)
+        self.assertTrue(all(json.loads(store.read_body(context["body_hash"]))["client"]["max_output_tokens"]
+                            == config["model"]["max_output_tokens"]
+                            for context in contexts))
+
     def test_aggregate_findings_use_refs_from_actual_relationship_projection(self):
         from scisaurus.runtime.survey_records import validate_survey_review
         runner = self.runtime(survey_config(self.endpoint, "map-links"))
