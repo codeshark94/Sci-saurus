@@ -4426,6 +4426,49 @@ class TestSurveyRunner(unittest.TestCase):
                 self.assertIn("identity", runner.bindings)
                 self.assertEqual(runner.identity_records, {})
 
+    def test_crossref_response_limits_pace_probe_and_workload_without_changing_config(self):
+        runner = self.runtime()
+        configured = deepcopy(runner.config)
+        runner.provider_intervals = {"identity": 0.5, "bibliography": 0.25}
+        runner.next_provider_at = {"identity": 0, "bibliography": 0}
+        result = {"metadata": {"headers": {"X-Rate-Limit-Limit": "1", "X-Rate-Limit-Interval": "1s"}}}
+        with patch("scisaurus.runtime.execution.ExecutionRuntime._call", return_value=(result, "execution")), \
+             patch("scisaurus.runtime.survey.time.monotonic", return_value=100):
+            self.assertEqual(runner._call("probe", "crossref", {}, actor="operations.operator",
+                                         task_kind="retrieval"), (result, "execution"))
+        self.assertEqual(runner.provider_intervals["identity"], 1)
+        self.assertEqual(runner.next_provider_at["identity"], 101)
+        self.assertEqual(runner.next_provider_at["bibliography"], 0)
+        runner.bibliography_mode = "crossref"
+        with patch("scisaurus.runtime.survey.time.monotonic", return_value=101):
+            runner._observe_crossref_limits({"metadata": {"headers": {
+                "x-rate-limit-limit": "3", "x-rate-limit-interval": "1s", "retry-after": "4"}}})
+        self.assertEqual(runner.provider_intervals["identity"], 1)
+        self.assertEqual(runner.next_provider_at["identity"], 105)
+        self.assertEqual(runner.next_provider_at["bibliography"], 105)
+        self.assertEqual(runner.config, configured)
+        for limit, interval in [("nan", "1s"), ("0", "1s"), ("2", "nan"), ("inf", "1s")]:
+            with patch("scisaurus.runtime.survey.time.monotonic", return_value=101):
+                runner._observe_crossref_limits({"metadata": {"headers": {
+                    "x-rate-limit-limit": limit, "x-rate-limit-interval": interval}}})
+        self.assertEqual(runner.provider_intervals["identity"], 1)
+        self.assertEqual(runner.next_provider_at["identity"], 105)
+
+    def test_crossref_retry_after_is_honored_without_recurring_interval(self):
+        runner = self.runtime()
+        runner.provider_intervals = {}
+        runner.next_provider_at = {"identity": 0}
+        now = [100.0]
+        def sleep(seconds):
+            now[0] += seconds
+        with patch("scisaurus.runtime.survey.time.monotonic", side_effect=lambda: now[0]), \
+             patch("scisaurus.runtime.survey.time.sleep", side_effect=sleep):
+            runner._observe_crossref_limits({"metadata": {"headers": {"retry-after": "2"}}})
+            runner._wait_provider("identity")
+        self.assertEqual(now[0], 102)
+        self.assertEqual(runner.provider_waits[-1]["waited_seconds"], 2)
+        self.assertEqual(runner.provider_intervals, {})
+
     def test_identity_rate_limit_resume_settles_recorded_failure_without_losing_usage(self):
         for missing_receipt in (False, True):
             with self.subTest(missing_receipt=missing_receipt):

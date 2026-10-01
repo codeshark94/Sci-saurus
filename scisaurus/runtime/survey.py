@@ -4,6 +4,7 @@ from collections import Counter
 import hashlib
 import itertools
 import json
+import math
 import re
 import signal
 import threading
@@ -1045,9 +1046,9 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
     def _wait_provider(self, capability):
         """Wait until the next paced provider slot, bounded by the run deadline."""
         interval = self.provider_intervals.get(capability, 0.0)
-        if interval <= 0:
-            return
         due = self.next_provider_at.get(capability, self.started)
+        if interval <= 0 and due <= time.monotonic():
+            return
         waited = 0.0
         while True:
             self._ensure_active()
@@ -1062,6 +1063,37 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         self.next_provider_at[capability] = time.monotonic() + interval
         self.provider_waits.append({"capability": capability, "waited_seconds": round(waited, 3),
                                     "interval_seconds": interval})
+
+    def _call(self, task_id, kind, params, *, actor, task_kind, reservation_id=None):
+        result, execution = super()._call(task_id, kind, params, actor=actor,
+            task_kind=task_kind, reservation_id=reservation_id)
+        if kind == "crossref":
+            self._observe_crossref_limits(result)
+        return result, execution
+
+    def _observe_crossref_limits(self, result):
+        from scisaurus.runtime.retrieval import CrossrefClient
+        metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
+        raw_headers = metadata.get("headers", {}) if isinstance(metadata, dict) else {}
+        headers = {key.lower(): value for key, value in raw_headers.items()} if isinstance(raw_headers, dict) else {}
+        interval = None
+        try:
+            window = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)s\s*", str(headers.get("x-rate-limit-interval", "")))
+            limit = float(headers.get("x-rate-limit-limit", ""))
+            if window and math.isfinite(limit) and limit > 0:
+                interval = float(window[1]) / limit
+                if not math.isfinite(interval) or interval <= 0:
+                    interval = None
+        except (TypeError, ValueError, OverflowError):
+            pass
+        cooldown = CrossrefClient._retry_after_seconds(headers) or 0.0
+        keys = ["identity", *(["bibliography"] if self.bibliography_mode == "crossref" else [])]
+        for key in keys:
+            if interval is not None:
+                self.provider_intervals[key] = max(self.provider_intervals.get(key, 0.0), interval)
+            delay = max(self.provider_intervals.get(key, 0.0), cooldown)
+            self.next_provider_at[key] = max(self.next_provider_at.get(key, self.started),
+                                            time.monotonic() + delay)
 
     def _heads(self, prefix):
         rows = self.control._conn.execute(
