@@ -217,11 +217,13 @@ _CURRENT_MAP_REVIEW_PROTOCOL = "literature-current-map-review-1"
 
 def source_fidelity_review_contract():
     return {
-        "protocol": "literature-source-fidelity-2",
+        "protocol": "literature-source-fidelity-3",
         "question_status": "A research question is not an established claim or a required survey conclusion. Its answer remains undecided by this acceptance decision.",
         "source_fidelity_scope": "Assess whether every clause of each assertion actually retained in the map is entailed by its cited source. Do not require any captured source to answer or directly address the research question. An unanswered question is a downstream gap, not a failure of an accurately represented source-supported claim.",
         "screening_scope": "Check inclusion and reason separately from claim entailment. Every included work must have a source-supported connection to the declared question's mechanism, phenomenon, or method, and the reason must identify that connection. Matching the work's own topic, shared terminology, or a correctly summarized but unrelated source does not establish relevance. A relevant source may support a partial or general claim without answering the research question; do not reject it solely for that absence. Exclude or defer a work whose evidentiary connection cannot be established from its captured source.",
-        "non_assertions": "Excluded, deferred, and null fields do not assert scientific support. Missing support for an absent assertion is not a source-fidelity failure.",
+        "non_assertions": "Uncertain screening is an unresolved decision, not a claim that a work is irrelevant or lacks sources. Excluded, deferred, and null fields do not assert scientific support. Missing support for an absent assertion is not a source-fidelity failure. An exclusion reason that asserts irrelevance still requires evidence-based screening review.",
+        "controller_status_scope": "A hash-bound controller_abstention records procedural non-admission, not a scientific exclusion or source-unavailability claim. Verify its entry binding and retained status against that receipt, not article text. Do not require an uncertain non-admitted entry to supply an affirmative relevance claim. Independently adjudicate every critique: withdrawal can remove an unsupported current assertion, but does not resolve the original scientific question or prove the original assertion correct. Fail a remaining assertion, false status, or unsupported exclusion; do not fail merely because an assertion remains unmade.",
+        "claim_coverage_scope": "Evaluate the assertions actually retained. A source-supported limitation does not fail because other limitations are omitted unless the retained text claims completeness. Omitted qualifiers or exceptions that alter a retained assertion remain entailment defects. Non-null scientific fields require source support even on excluded or uncertain entries. A general mechanism or method analogy may establish bounded relevance despite differences in species or experimental conditions; those differences restrict transferability and must not be converted into an exact-question answer.",
         "downstream_decisions": "Gap nomination and counter-search assess novelty and question coverage; experiments test the research question; manuscript peer review judges the final contribution.",
         "failure_basis": "Identify a specific unsupported assertion, misrepresented source, evidence-based screening error, or inconsistent accounting. Fail unsupported minor clauses as well as unsupported main claims, including qualifiers in relationship claims; each relationship clause must be supported by its cited works. Record incomplete coverage honestly without requiring exhaustive retrieval or an answer to the research question.",
     }
@@ -629,11 +631,6 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         self.work_reviews, self.reviewed_basis = {}, {}
         self._survey_acceptance_pending = False
         self._countersearch_active = False
-        # A malformed focused-review envelope is a local evidence problem,
-        # not a reason to discard the rest of a bounded survey.  Keep this
-        # marker in the current runner so the review loop can withdraw only
-        # the affected work before continuing with its siblings.
-        self._contract_exhausted_work_reviews = set()
         self.query_refs, self.search_log, self.expansion_log, self.gaps, self.time_decisions = [], [], [], [], []
         self.api_calls, self.identity_calls, self.serial, self.survey_revision = 0, 0, 0, 0
         self.expanded, self.full_text_attempted = set(), set()
@@ -4346,20 +4343,13 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             wid = self._body(self.store.get(review["entry_ref"]))["work_id"]
             obligations = self._review_obligations_for(wid)
             execution_ref = review["execution_ref"]
-            execution = self.store.get(execution_ref)
-            report = self._body(execution)
-            if (execution["author"] == "command.controller" and report.get("operation") == "focused-work-review"
-                    and report.get("outcome") == "contract_exhausted"):
-                return (report.get("review_contract") == contract
-                    and report.get("entry_ref") == review.get("entry_ref")
-                    and report.get("evidence_scope") == review.get("evidence_scope")
-                        and report.get("relationship_refs") == review.get("relationship_refs")
-                        and report.get("review_obligations", []) == obligations)
             _, _, prompt, reply = self.gate._model_review_execution(execution_ref, "methods.work-reviewer")
             reply = normalize_check_envelope(reply, work_review_checks(review["relationship_refs"], obligations))
             validate_work_review(reply, review["relationship_refs"], entry=prompt.get("entry"), review_obligations=obligations)
             return (prompt.get("phase") == "work_review" and prompt.get("review_contract") == contract
                     and prompt.get("entry_ref") == review.get("entry_ref")
+                    and prompt.get("controller_abstention") == self._work_abstention_context(
+                        self.store.get(review["entry_ref"]), review["relationship_refs"])
                     and prompt.get("review_obligations", []) == obligations
                     and prompt.get("critique_contexts", []) == self._review_critique_contexts(
                         wid, entry_ref=review["entry_ref"], relationship_refs=review["relationship_refs"])
@@ -4439,14 +4429,27 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         }, "command.controller", subjects=[previous["artifact_ref"], feedback["review_ref"],
                                            self.analysis_records[wid]["artifact_ref"]])
 
+    def _work_abstention_context(self, entry_record, relationship_refs):
+        entry = self._body(entry_record)
+        abstention = self.store.head(f"command/survey-abstentions/{entry['work_id']}")
+        if (relationship_refs or abstention is None or abstention["author"] != "command.controller"
+                or not is_explicit_abstention(entry, self._body(abstention))
+                or self._body(abstention).get("reason") != entry["reason"]
+                or ABSTENTION_REASONS.get(self._body(abstention).get("scope")) != entry["reason"]):
+            return None
+        return {"ref": abstention["artifact_ref"], "body_hash": abstention["body_hash"],
+                "body": self._body(abstention)}
+
     def _work_review_basis(self, wid):
         entry = self.analysis_records.get(wid)
         if entry is None:
             return None
         relations = [relation for relation in self.relationships.values() if relation["source"] == wid]
         owners = {wid, *[relation["target"] for relation in relations]}
+        abstention = self._work_abstention_context(entry, [relation["artifact_ref"] for relation in relations])
         return [entry["artifact_ref"], *[relation["artifact_ref"] for relation in relations],
-                *[ref for ref, source in self.source_docs.items() if source["work_id"] in owners]]
+                *[ref for ref, source in self.source_docs.items() if source["work_id"] in owners],
+                *([abstention["ref"]] if abstention is not None else [])]
 
     def _work_review_current(self, wid):
         review = self.work_reviews.get(wid)
@@ -4502,7 +4505,17 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     "relationship_semantics": RELATIONSHIP_SEMANTICS,
                     "sources": sources, "required_checks": list(work_review_checks(refs, obligations)),
                     "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
-                    "instructions": "Return exactly {checks:[{check_id,outcome,method,result}],rationale:string}. "
+                    "response_contract": {
+                        "top_level_fields": ["checks", "rationale"],
+                        "checks": [{"check_id": key,
+                                    "required_fields": ["check_id", "outcome", "method", "result",
+                                        *(["affected_check_ids"] if key.startswith("critique:") else [])]}
+                                   for key in work_review_checks(refs, obligations)],
+                        "outcome_enum": ["passed", "failed", "insufficient_evidence", "check_failed"],
+                        "text_fields": ["method", "result", "rationale"],
+                        "affected_check_ids": "Only critique rows contain this field: [] if passed, otherwise a nonempty list of affected ordinary check IDs whose outcomes are non-passed.",
+                    },
+                    "instructions": "Return only the final JSON object matching response_contract, without preamble. "
                         "Run each required check separately; outcome is passed/failed/insufficient_evidence/check_failed. "
                         "Judge whether the supplied text entails the ENTIRE claim, not whether its quotation merely exists or the topic sounds plausible. "
                         "A passed check requires support for every clause. Fail unsupported minor clauses too; a correct main point does not excuse them. "
@@ -4512,12 +4525,17 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                         "A newer date, citation, shared terminology, or similar application does not establish extension, conceptual inheritance, or superiority. "
                         "For a claimed extends relationship require text establishing the specific dependency; otherwise fail it and identify the unsupported part. "
                         "Do not fill missing text from model memory or titles. A proceedings preface is not architectural research evidence. "
-                        "Check inclusion and reason against actual scope and source content. "
+                        "Check included or scientifically excluded entries against actual scope and source content. "
+                        "Uncertain is non-admission, not evidence of irrelevance or unavailable sources. "
+                        "For a supplied controller_abstention, verify the procedural reason against that hash-bound receipt; no article quotation establishes controller status. "
                         "Statement {text:null,evidence:[]} means no fact is known or asserted for that field. "
                         "It never asserts absence of limitations, problems, approaches, or findings in the paper. "
                         "For such a field verify the empty nonassertion representation and return passed; no affirmative quotation is required for an unasserted fact. "
                         "A claim may be scientifically plausible yet unsupported by these sources. Fail each unsupported assertion and state the narrowest evidence-grounded correction."
                 }
+                controller_abstention = self._work_abstention_context(entry_record, refs)
+                if controller_abstention is not None:
+                    assignment["controller_abstention"] = controller_abstention
                 if obligations:
                     assignment["review_obligations"] = obligations
                     assignment["critique_contexts"] = self._review_critique_contexts(wid)
@@ -4556,48 +4574,12 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                                                                  if check["check_id"].startswith("relationship:")],
                                            "relationship_targets": targets, "checks": failed, "rationale": value["rationale"]}))
 
-                def contract_exhausted(state, *, wid=wid, basis=basis, refs=refs, entry=entry,
-                                       entry_ref=entry_record["artifact_ref"], evidence_scope=evidence_scope,
-                                       obligations=obligations):
-                    """Withdraw one unreviewable work without another provider call."""
-                    self._contract_exhausted_work_reviews.add(wid)
-                    required = work_review_checks(refs, obligations)
-                    checks = [{
-                        "check_id": check_id,
-                        "outcome": ("passed" if check_id in MAP_FIELDS and entry[check_id] == {"text": None, "evidence": []} else "check_failed"),
-                        "method": ("Deterministic nonassertion integrity." if check_id in MAP_FIELDS and entry[check_id] == {"text": None, "evidence": []}
-                                   else "Controller recorded that the focused reviewer did not return the required contract."),
-                        "result": ("No scientific assertion is admitted for this field." if check_id in MAP_FIELDS and entry[check_id] == {"text": None, "evidence": []}
-                                   else "The work is withdrawn from substantive evidence until a later scoped review reopens it."),
-                        **({"affected_check_ids": [key for key in required
-                                                   if not key.startswith("critique:")
-                                                   and not (key in MAP_FIELDS and entry[key] == {"text": None, "evidence": []})]}
-                           if check_id.startswith("critique:") else {}),
-                    } for check_id in required]
-                    execution = self._record(
-                        f"command/executions/survey-review-contract-exhausted-{wid}", "report", {
-                            "operation": "focused-work-review",
-                            "review_contract": source_fidelity_review_contract(),
-                            "review_obligations": obligations,
-                            "entry_ref": entry_ref, "evidence_scope": evidence_scope,
-                            "outcome": "contract_exhausted",
-                            "work_id": wid,
-                            "relationship_refs": list(refs),
-                            "error": state.get("error"),
-                            "model_calls": 0,
-                            "scope": "review_exhausted",
-                        }, "command.controller", subjects=basis)
-                    return {
-                        "checks": checks,
-                        "rationale": "The focused reviewer response was not contract-valid; substantive claims remain unknown.",
-                    }, execution["artifact_ref"]
-
                 jobs.append({"name": f"work-review-{wid}", "actor": "methods.work-reviewer", "assignment": assignment,
                              "normalizer": lambda value, refs=refs, obligations=obligations: normalize_check_envelope(
                                  value, work_review_checks(refs, obligations)),
                              "validator": lambda value, refs=refs, entry=entry, obligations=obligations: validate_work_review(
                                  value, refs, entry=entry, review_obligations=obligations),
-                             "on_valid": integrate, "on_exhausted": contract_exhausted})
+                             "on_valid": integrate})
             if jobs:
                 self._models_checked(jobs, stage="unit_review", task_kind="verification")
             if not rejected:
@@ -4605,8 +4587,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             failure_counts = {wid: self._work_review_failure_count(wid, feedback) for wid, feedback in rejected}
             exhausted = [(wid, feedback) for wid, feedback in rejected
                          if (failure_counts[wid] > repair_rounds
-                             or self._work_review_exhausted(wid, feedback)
-                             or wid in self._contract_exhausted_work_reviews)]
+                             or self._work_review_exhausted(wid, feedback))]
             if exhausted:
                 for wid, feedback in exhausted:
                     abstention = self.store.head(f"command/survey-abstentions/{wid}")
@@ -4614,7 +4595,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                             and is_explicit_abstention(self._body(self.analysis_records[wid]), self._body(abstention))):
                         raise ModelWorkBlocked(
                             f"independent critique for {wid} remains unresolved after substantive review",
-                            failure_class="model_contract" if wid in self._contract_exhausted_work_reviews else "scientific_review")
+                            failure_class="scientific_review")
                     self._exclude_unresolved_work(wid, feedback)
                 self._map()
                 excluded_ids = {wid for wid, _ in exhausted}
@@ -4776,6 +4757,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             *[self._body(r)["lookup_execution_ref"] for r in self.identity_records.values()
               if self._body(r).get("lookup_execution_ref")],
             *[r["artifact_ref"] for r in self.analysis_records.values()], *[r["artifact_ref"] for r in self.relationships.values()],
+            *[ref for wid in self.work_reviews for ref in self._work_review_basis(wid)],
             *[r["artifact_ref"] for r in self.work_reviews.values()],
             *[json.loads(self.store.read_body(r["body_hash"]))["execution_ref"] for r in self.work_reviews.values()],
             *[source["execution_ref"] for source in self.source_docs.values()]]

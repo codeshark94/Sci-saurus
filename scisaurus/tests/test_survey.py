@@ -1742,17 +1742,80 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertIsNotNone(retained["problem"]["text"])
         self.assertEqual(store.versions("kb/work-analyses/W201"), [1])
 
-    def test_malformed_focused_review_withdraws_one_work_without_blocking_survey(self):
+    def test_malformed_focused_review_blocks_and_preserves_scientific_claims(self):
         config = survey_config(self.endpoint, "review-malformed")
         config["survey"]["seed_work_ids"] = ["W101", "W102", "W201", "W301"]
         result = self.runtime(config).run()
-        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(result["status"], "blocked", result)
+        self.assertFalse(result["survey_current"])
+        self.assertEqual(result["failure"]["kind"], "unchanged_assignment_exhausted")
         _, store = self.open_store()
         entry = json.loads(store.read_body(store.head("kb/work-analyses/W101")["body_hash"]))
-        self.assertEqual(entry["inclusion"], "uncertain")
-        self.assertTrue(all(entry[field]["text"] is None for field in MAP_FIELDS))
-        self.assertIsNotNone(store.head("kb/work-exclusions/W101"))
-        self.assertIsNotNone(store.head("kb/work-reviews/W201"))
+        self.assertEqual(entry["inclusion"], "included")
+        self.assertIsNotNone(entry["problem"]["text"])
+        self.assertIsNone(store.head("kb/work-exclusions/W101"))
+        self.assertIsNone(store.head("kb/work-reviews/W101"))
+        self.assertIsNone(store.head("command/work-review-repairs/W101"))
+        self.assertIsNone(store.head("command/executions/survey-review-contract-exhausted-W101"))
+
+    def test_critiqued_abstention_supplies_bound_status_and_exact_check_contract(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W102")
+        runner._map()
+        obligation = self.review_obligation(runner, "W101")
+        runner.review_obligations = runner._validate_review_obligations([obligation])
+        runner._materialize_source_less_map("W101", runner.analyzed_basis["W101"], scope="review_exhausted",
+                                           reason=ABSTENTION_REASONS["review_exhausted"])
+        runner._review_work_claims()
+        prompt = [value for _, value in self.model_contexts(runner.control, runner.store)
+                  if value.get("phase") == "work_review" and value["entry"]["work_id"] == "W101"][-1]
+        receipt = runner.store.head("command/survey-abstentions/W101")
+        self.assertEqual(prompt["controller_abstention"], {"ref": receipt["artifact_ref"],
+            "body_hash": receipt["body_hash"], "body": runner._body(receipt)})
+        self.assertIn(receipt["artifact_ref"], runner._work_review_basis("W101"))
+        contracts = prompt["response_contract"]["checks"]
+        self.assertEqual([row["check_id"] for row in contracts], prompt["required_checks"])
+        for row in contracts:
+            self.assertEqual("affected_check_ids" in row["required_fields"], row["check_id"].startswith("critique:"))
+        old_review = runner._body(runner.work_reviews["W101"])
+        self.assertTrue(runner._review_protocol_matches(old_review))
+        renewed = runner._publish("command/survey-abstentions/W101", "note", runner._body(receipt),
+                                 "command.controller", subjects=runner.analyzed_basis["W101"])
+        self.assertNotEqual(renewed["artifact_ref"], receipt["artifact_ref"])
+        self.assertFalse(runner._work_review_current("W101"))
+        self.assertFalse(runner._review_protocol_matches(old_review))
+        runner._review_work_claims()
+        self.assertTrue(runner._work_review_current("W101"))
+
+        runner._accept_survey()
+        runner.gate.require_current(runner.survey_ref)
+        original_execution = runner.gate._model_review_execution
+        def false_status(execution_ref, actor):
+            execution, context, prompt, reply = original_execution(execution_ref, actor)
+            if prompt.get("controller_abstention") is not None:
+                prompt = deepcopy(prompt)
+                prompt["controller_abstention"]["body"]["reason"] = "No abstract was captured."
+            return execution, context, prompt, reply
+        with patch.object(runner.gate, "_model_review_execution", side_effect=false_status):
+            with self.assertRaisesRegex(ValidationError, "controller abstention"):
+                runner.gate.require_current(runner.survey_ref)
+
+    def test_controller_abstention_context_rejects_false_status_and_surviving_relationship(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        runner._materialize_source_less_map("W101", runner.analyzed_basis["W101"], scope="review_exhausted",
+                                           reason=ABSTENTION_REASONS["review_exhausted"])
+        entry = runner.analysis_records["W101"]
+        self.assertIsNotNone(runner._work_abstention_context(entry, []))
+        self.assertIsNone(runner._work_abstention_context(entry, ["artifact:kb/relationships/retained@1"]))
+        receipt = runner.store.head("command/survey-abstentions/W101")
+        runner._publish("command/survey-abstentions/W101", "note",
+                        {**runner._body(receipt), "scope": "source_unavailable"}, "command.controller")
+        self.assertIsNone(runner._work_abstention_context(entry, []))
 
     def test_resume_does_not_replenish_exhausted_scientific_repair(self):
         config = survey_config(self.endpoint, "review-never-resolves")
@@ -2527,6 +2590,7 @@ class TestSurveyRunner(unittest.TestCase):
                  **{field: {"text": None, "evidence": []} for field in MAP_FIELDS}}
         record = {"work_id": "W101", "scope": "deep_analysis_budget", "entry_sha256": sha256_hex(canonical_bytes(entry))}
         self.assertTrue(is_explicit_abstention(entry, record))
+        self.assertFalse(is_explicit_abstention(entry, {**record, "scope": "source_unavailable"}))
         for replacement in ({"finding": {"text": "This proves superiority", "evidence": []}},
                             {"reason": "This proves superiority"}, {"inclusion": "included"}):
             changed = {**entry, **replacement}
@@ -2833,7 +2897,7 @@ class TestSurveyRunner(unittest.TestCase):
             self.assertEqual(outcomes["inclusion"], expected)
             self.assertEqual(outcomes["reason"], expected)
             self.assertEqual(outcomes["problem"], "passed")
-        self.assertEqual(source_fidelity_review_contract()["protocol"], "literature-source-fidelity-2")
+        self.assertEqual(source_fidelity_review_contract()["protocol"], "literature-source-fidelity-3")
 
     def test_focused_relationship_qualifier_is_a_separate_entailed_clause(self):
         runner = self.runtime(survey_config(self.endpoint, "relationship-qualifier-adversary"))

@@ -41,7 +41,7 @@ def is_explicit_abstention(entry, record):
     """A mechanical review is valid only when no scientific assertion remains."""
     return (record.get("scope") in ABSTENTION_REASONS
             and entry.get("inclusion") == "uncertain"
-            and entry.get("reason") in ABSTENTION_REASONS.values()
+            and entry.get("reason") == ABSTENTION_REASONS[record["scope"]]
             and record.get("work_id") == entry.get("work_id")
             and record.get("entry_sha256") == sha256_hex(canonical_bytes(entry))
             and all(entry.get(field) == {"text": None, "evidence": []} for field in WORK_CHECKS[2:]))
@@ -338,6 +338,20 @@ class SurveyGate:
                 if (not isinstance(contract, dict) or contract.get("protocol") != protocol
                         or not isinstance(scope, dict) or scope.get("review_protocol") != protocol):
                     raise ValidationError("focused review protocol must match its exact dispatch and evidence scope")
+            controller_abstention = prompt.get("controller_abstention")
+            if controller_abstention is not None:
+                if not isinstance(controller_abstention, dict) or set(controller_abstention) != {"ref", "body_hash", "body"}:
+                    raise ValidationError("focused review controller abstention must contain an exact bound receipt")
+                status, status_body = self._note(controller_abstention["ref"])
+                if (relationships or status["author"] != "command.controller"
+                        or status["artifact_id"] != f"command/survey-abstentions/{work_id}"
+                        or status["artifact_ref"] not in dependencies
+                        or status["body_hash"] != controller_abstention["body_hash"]
+                        or status_body != controller_abstention["body"]
+                        or not is_explicit_abstention(entry_body, status_body)
+                        or status_body.get("reason") != entry_body["reason"]
+                        or ABSTENTION_REASONS.get(status_body.get("scope")) != entry_body["reason"]):
+                    raise ValidationError("focused review controller abstention does not bind this exact non-admitted entry")
             self._work_review_context(survey, prompt, entry_body,
                 [{**relationship_bodies[ref], "artifact_ref": ref} for ref in relationships])
             if reply.get("checks") != checks or reply.get("rationale") != body["rationale"]:
