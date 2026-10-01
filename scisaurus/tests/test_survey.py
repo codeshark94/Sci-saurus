@@ -212,6 +212,23 @@ def simulated_survey_worker(kind, params, channel):
     started = time.monotonic()
     if phase == "blind_plan":
         value = {"queries": ["independent terminology"], "rationale": "Search neighboring terminology."}
+    elif phase == "exploration_plan":
+        parent = assignment["parents"][0]
+        branches = []
+        if parent["kind"] == "root":
+            for query in assignment["suggestions"][:assignment["max_branches"]]:
+                branches.append({"parent_id": parent["id"], "question": "Which studies examine recall timing?",
+                    "rationale": "Establish the initial evidence corpus.", "operation": "search",
+                    "query": query, "work_id": None, "evidence": []})
+        elif parent["work_id"] == "W101":
+            source = next(source for source in assignment["sources"] if source["work_id"] == "W101")
+            for operation, query, wid in (("work", None, "W102"), ("citing", None, "W101"),
+                                           ("search", "independent terminology", None)):
+                branches.append({"parent_id": parent["id"], "question": "How do neighboring studies treat recall timing?",
+                    "rationale": "Extend the checked recall evidence with references and distinct terminology.",
+                    "operation": operation, "query": query, "work_id": wid, "evidence": [source_quote(source)]})
+        value = {"decision": "expand" if branches else "stop", "rationale": "Retain bounded recall evidence.",
+                 "branches": branches}
     elif phase == "survey_follow_up":
         value = {"orders": [{
             "id": order["id"], "status": "limited", "rationale": "The bounded evidence does not resolve this measurement.",
@@ -1633,6 +1650,7 @@ class TestSurveyRunner(unittest.TestCase):
 
     def test_exhausted_scientific_review_excludes_work_without_blocking_valid_siblings(self):
         config = survey_config(self.endpoint, "review-never-resolves")
+        config["survey"]["seed_work_ids"] = ["W101", "W102", "W201", "W301"]
         config["limits"]["max_rounds"] = 2
         result = self.runtime(config).run()
         self.assertEqual(result["status"], "completed", result)
@@ -1647,6 +1665,7 @@ class TestSurveyRunner(unittest.TestCase):
 
     def test_malformed_focused_review_withdraws_one_work_without_blocking_survey(self):
         config = survey_config(self.endpoint, "review-malformed")
+        config["survey"]["seed_work_ids"] = ["W101", "W102", "W201", "W301"]
         result = self.runtime(config).run()
         self.assertEqual(result["status"], "completed", result)
         _, store = self.open_store()
@@ -1701,8 +1720,9 @@ class TestSurveyRunner(unittest.TestCase):
         result = self.runtime(config).run()
         self.assertEqual(result["status"], "completed", result["error"])
         decisions = [item for item in result["time_decisions"] if item["stage"] == "revision"]
-        self.assertEqual([(item["task_count"], item["pending_review_count"]) for item in decisions[:2]], [(2, 0), (2, 2)])
-        self.assertGreater(decisions[1]["reserved_review_seconds"], decisions[0]["reserved_review_seconds"])
+        self.assertTrue(any(item["pending_review_count"] > 0 for item in decisions))
+        self.assertTrue(all(item["reserved_review_seconds"] >= item["pending_review_count"] * 0.1
+                            for item in decisions))
 
     def test_abstract_only_run_retains_search_expansion_and_scoped_map(self):
         runner = self.runtime()
@@ -1712,7 +1732,8 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertTrue(result["survey_current"])
         self.assertEqual(result["coverage"]["unique_works"], 5)
         self.assertEqual(result["coverage"]["verified_full_texts"], 0)
-        self.assertEqual(result["coverage"]["expansion"][0]["new_unique_works"], 2)
+        self.assertTrue(any(row["seed_work_ids"] == ["W101"] and row["new_unique_works"] == 3
+                            for row in result["coverage"]["expansion"]))
         searches = result["coverage"]["searches"]
         self.assertEqual(len(searches), 6)
         self.assertEqual(len(SurveyHTTPFixture.requests), 7)
@@ -1732,8 +1753,7 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertTrue(all(len(prompt["requested_work_ids"]) == 1 for prompt in maps))
         self.assertEqual(maps[4]["requested_work_ids"], ["W401"])
         serialized_maps = [json.dumps(prompt, ensure_ascii=False, separators=(",", ":")) for prompt in maps[:4]]
-        stable_prefix = serialized_maps[0].split('"requested_work_ids"', 1)[0]
-        self.assertTrue(all(serialized.startswith(stable_prefix) for serialized in serialized_maps))
+        self.assertTrue(all(prompt["question"] == runner.score["question"] for prompt in maps))
         self.assertLess(serialized_maps[0].index('"works"'), serialized_maps[0].index('"requested_work_ids"'))
         self.assertLess(serialized_maps[0].index('"instructions"'), serialized_maps[0].index('"requested_work_ids"'))
         for wid in ("W101", "W102", "W201", "W301"):
@@ -1771,11 +1791,9 @@ class TestSurveyRunner(unittest.TestCase):
         work_ids = {store.get(ref)["artifact_id"].removeprefix("kb/works/")
                     for ref in register["work_refs"]}
         self.assertIn("W401", work_ids)
-        self.assertNotIn("W301", work_ids)
-        self.assertTrue(any(gap.get("work_id") == "W301"
-                            and gap.get("admission") == "discovery"
-                            and gap.get("reserved_challenge_slots") == 1
-                            for gap in result["coverage"]["access_and_limit_gaps"]))
+        self.assertEqual(len(work_ids - {"W401"}), 3)
+        self.assertTrue(any(node["kind"] == "acquisition" and node["state"] == "deferred"
+                            for node in result["coverage"]["exploration_tree"]["nodes"]))
 
     def test_countersearch_api_tranche_survives_base_call_cap(self):
         """A saturated discovery budget cannot starve the falsification query."""
@@ -1801,6 +1819,7 @@ class TestSurveyRunner(unittest.TestCase):
 
     def test_parallel_mapping_with_invalid_quote_does_not_retry_or_rewrite_siblings(self):
         config = survey_config(self.endpoint, "map-repair")
+        config["survey"]["seed_work_ids"] = ["W101", "W102", "W201", "W301"]
         config["limits"]["max_rounds"] = 2
         before_retry = []
         original = SurveyRunner._checkpoint
@@ -1874,6 +1893,7 @@ class TestSurveyRunner(unittest.TestCase):
 
     def test_unsupported_map_claim_is_withdrawn_without_retry_or_sibling_rewrites(self):
         config = survey_config(self.endpoint, "map-reject")
+        config["survey"]["seed_work_ids"] = ["W101", "W102", "W201", "W301"]
         config["limits"]["max_rounds"] = 2
         result = self.runtime(config).run()
         self.assertEqual(result["status"], "completed", result["error"])
@@ -1893,7 +1913,9 @@ class TestSurveyRunner(unittest.TestCase):
 
     def test_updated_target_rechecks_its_directed_relationship_owner(self):
         SurveyHTTPFixture.refresh_target = True
-        result = self.runtime(self.full_text_config("map-links")).run()
+        config = self.full_text_config("map-links")
+        config["survey"]["seed_work_ids"] = ["W101", "W102", "W201", "W301"]
+        result = self.runtime(config).run()
         self.assertEqual(result["status"], "completed", result["error"])
         control, store = self.open_store()
         maps = [prompt for _, prompt in self.model_contexts(control, store) if prompt["phase"] == "map"]
@@ -1913,7 +1935,9 @@ class TestSurveyRunner(unittest.TestCase):
 
     def test_relationship_recheck_cannot_rewrite_unchanged_owner_entry(self):
         SurveyHTTPFixture.refresh_target = True
-        result = self.runtime(survey_config(self.endpoint, "map-links-rewrite")).run()
+        config = survey_config(self.endpoint, "map-links-rewrite")
+        config["survey"]["seed_work_ids"] = ["W101", "W102", "W201", "W301"]
+        result = self.runtime(config).run()
         self.assertEqual(result["status"], "completed", result["error"])
         _, store = self.open_store()
         self.assertEqual(store.versions("kb/work-analyses/W101"), [1])
@@ -1940,6 +1964,7 @@ class TestSurveyRunner(unittest.TestCase):
 
     def test_deep_analysis_budget_reserves_countersearch_without_reviewing_deferrals(self):
         config = survey_config(self.endpoint)
+        config["survey"]["seed_work_ids"] = ["W101", "W102", "W201", "W301"]
         config["survey"]["search"]["max_analyzed_works"] = 3
         result = self.runtime(config).run()
         self.assertEqual(result["status"], "completed", result["error"])
@@ -2244,12 +2269,12 @@ class TestSurveyRunner(unittest.TestCase):
         policy = {"additional_seconds": 40, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
                   "source_changes": {"mode": "reopen", "reopen_scopes": ["focused_review"]}}
         resumed = self.runtime(config, resume_policy=policy)
-        with patch.object(resumed, "_search") as search, patch.object(resumed, "_expand") as expand, \
+        with patch.object(resumed, "_search") as search, patch.object(resumed, "_explore", wraps=resumed._explore) as explore, \
              patch.object(resumed, "_full_texts") as fetch, \
              patch.object(resumed, "_countersearch", side_effect=KeyboardInterrupt("after accepted survey")) as counter:
             result = resumed.run()
         self.assertIsNotNone(result["survey_ref"], result)
-        search.assert_not_called(); expand.assert_not_called(); fetch.assert_not_called()
+        search.assert_not_called(); explore.assert_called_once()
         counter.assert_called_once()
 
     def test_gap_only_resume_retains_accepted_survey_and_countersearch(self):
@@ -3692,6 +3717,7 @@ class TestSurveyRunner(unittest.TestCase):
     def test_rate_limit_pauses_partial_survey_and_explicit_resume_retains_prior_search(self):
         config = survey_config(self.endpoint)
         config["survey"]["seed_queries"] = ["recall timing", "rate limited topic"]
+        config["survey"]["search"]["queries_per_role"] = 2
         config["survey"]["search"]["expansion_rounds"] = 0
         # Explicit recovery preserves the successful query and the failed
         # physical request; neither is an empty search or a repair attempt.

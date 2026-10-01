@@ -18,6 +18,7 @@ from scisaurus.core.source_spans import (bind as bind_source_spans, contains_leg
 from scisaurus.core.surveys import (ABSTENTION_REASONS, RELATIONSHIP_SEMANTICS, SurveyGate,
                                    is_explicit_abstention, work_review_checks)
 from scisaurus.runtime.execution import SYSTEM, ExecutionRuntime, _invoke_worker
+from scisaurus.runtime.literature_tree import LiteratureTree, SEARCH_PLANNERS
 from scisaurus.runtime.config import configured_worker_slots
 from scisaurus.runtime.bibliographic_identity import normalize_doi, project_crossref_work, reconcile_result
 from scisaurus.runtime.models import (
@@ -480,7 +481,7 @@ def overlay_post_checkpoint_relationships(relationships, checkpoint_created_at, 
     return restored
 
 
-class SurveyRunner(ExecutionRuntime):
+class SurveyRunner(LiteratureTree, ExecutionRuntime):
     def __init__(self, project_dir, config, *, on_progress=None, resume_policy=None,
                  provider_fallback=None, model_call_budget_scopes=None, model_budget_delegation=None,
                  work_orders=None, review_obligations=None):
@@ -557,6 +558,9 @@ class SurveyRunner(ExecutionRuntime):
         self.query_refs, self.search_log, self.expansion_log, self.gaps, self.time_decisions = [], [], [], [], []
         self.api_calls, self.identity_calls, self.serial, self.survey_revision = 0, 0, 0, 0
         self.expanded, self.full_text_attempted = set(), set()
+        self.exploration_tree = None
+        self._tree_admitted_reads = set()
+        self._active_tree_action = None
         self.survey_ref, self.assessment_ref, self.register_ref = None, None, None
         self.map_record = None
         self.nomination = None
@@ -605,11 +609,15 @@ class SurveyRunner(ExecutionRuntime):
         self.counter_plan_record = None
         self.counter_queries_complete = False
         self.countersearch_complete = False
-        plans = self._initial_plans()
-        for role, queries, ref in plans:
-            self._search(queries, role, ref)
-        self._complete_search_pages()
-        self._full_texts()
+        retained_tree = self.store.head("kb/exploration-tree")
+        if retained_tree is not None:
+            self._explore()
+        else:
+            plans = self._initial_plans()
+            for role, queries, ref in plans:
+                self._search(queries, role, ref)
+            self._complete_search_pages()
+            self._full_texts()
         self._accept_survey()
         if self.nomination is not None:
             self.nomination_record = self._publish("kb/gap-nomination", "note", {
@@ -895,10 +903,16 @@ class SurveyRunner(ExecutionRuntime):
                 self.aliases[provider_id] = wid
             if body.get("doi"):
                 self.dois[body["doi"]] = wid
-        for ref in register_body.get("identity_refs", []):
+        identity_refs = list(dict.fromkeys([*register_body.get("identity_refs", []),
+            *[r["artifact_ref"] for r in self._heads("kb/identities/")]]))
+        for ref in identity_refs:
             record = self.store.get(ref)
             self.identity_records[self._body(record)["work_id"]] = record
-        for ref in register_body.get("source_refs", []):
+        source_heads = {self.store.get(ref)["artifact_id"]: ref for ref in register_body.get("source_refs", [])}
+        source_heads.update({r["artifact_id"]: r["artifact_ref"] for prefix in ("kb/abstracts/", "kb/full-text/")
+                             for r in self._heads(prefix)})
+        source_refs = list(source_heads.values())
+        for ref in source_refs:
             record = self.store.get(ref)
             body = self._body(record)
             self.source_docs[ref] = body
@@ -906,7 +920,8 @@ class SurveyRunner(ExecutionRuntime):
             self.source_records[f"{key}/{body['work_id']}"] = record
             if key == "full_text":
                 self.full_text_attempted.add(body["work_id"])
-        self.query_refs = list(register_body.get("query_refs", []))
+        self.query_refs = list(dict.fromkeys([*register_body.get("query_refs", []),
+            *[r["artifact_ref"] for r in sorted(self._heads("kb/queries/"), key=lambda r: r["created_at"])]]))
         self.search_log = [self._body(self.store.get(ref)) for ref in self.query_refs]
         reservations = [self._body(record) for record in self._heads("command/api-calls/")]
         self.identity_calls = max(
@@ -978,6 +993,15 @@ class SurveyRunner(ExecutionRuntime):
                 body = self._body(record)
                 if record["created_at"] > map_record["created_at"] and body["work_id"] in self.works:
                     self.analysis_records[body["work_id"]] = record
+        if map_record is None:
+            for record in self._heads("kb/work-analyses/"):
+                body = self._body(record)
+                if body["work_id"] in self.works:
+                    self.analysis_records[body["work_id"]] = record
+            for record in self._heads("kb/relationships/"):
+                relation = self._body(record)
+                key = "-".join(relation[field] for field in ("source", "target", "kind"))
+                self.relationships[key] = {**relation, "artifact_ref": record["artifact_ref"]}
         scopes = set(self.resume_session["reopened_scopes"])
         if "mapping" not in scopes:
             for wid, record in self.analysis_records.items():
@@ -1097,7 +1121,8 @@ class SurveyRunner(ExecutionRuntime):
             f"command/api-calls/{number}",
             "note",
             {"number": number, "identity_number": identity_number,
-             "capability": capability, "request": request},
+             "capability": capability, "request": request,
+             **({"tree_action_id": self._active_tree_action} if self._active_tree_action else {})},
             actor,
             subjects=[self.score_ref],
         )
@@ -2080,6 +2105,8 @@ class SurveyRunner(ExecutionRuntime):
             "has_more": result.get("outcome") == "ok" and (
                 metadata.get("result_set_complete") is False),
         }
+        if self._active_tree_action is not None:
+            body["tree_action_id"] = self._active_tree_action
         record = self._publish(f"kb/queries/{self.api_calls}", "query_record", body, role,
                                subjects=[execution, *([plan_ref] if plan_ref else [])])
         self.query_refs.append(record["artifact_ref"])
@@ -2089,12 +2116,16 @@ class SurveyRunner(ExecutionRuntime):
         return body
         self.time_policy.observe("setup", time.monotonic() - started)
 
+    def _initial_plan_id(self, role):
+        identity = role.replace(".", "-")
+        if self.work_orders:
+            identity += "-" + hashlib.sha256(canonical_bytes(self.work_orders)).hexdigest()
+        return identity
+
     def _initial_plans(self):
         plans, jobs = [], []
-        for role in ("research.search-planner", "methods.blind-search-planner"):
-            plan_id = role.replace(".", "-")
-            if self.work_orders:
-                plan_id += "-" + hashlib.sha256(canonical_bytes(self.work_orders)).hexdigest()
+        for role in SEARCH_PLANNERS:
+            plan_id = self._initial_plan_id(role)
             retained = self.store.head(f"kb/search-plans/{plan_id}") if self.resume_session else None
             if retained is not None:
                 value = self._body(retained)
@@ -2287,7 +2318,9 @@ class SurveyRunner(ExecutionRuntime):
                 "returned_work_ids": [w["id"] for w in result["works"]], "new_unique_works": added,
                 "count": page["count"], "next_cursor": page["next_cursor"], "has_more": page["has_more"],
                 "outcome": outcome, "provider_error": result.get("error") if provider_failure else None,
-                "provider_http_status": metadata.get("http_status") if provider_failure else None}
+                "provider_http_status": metadata.get("http_status")}
+        if self._active_tree_action is not None:
+            body["tree_action_id"] = self._active_tree_action
         record = self._publish(f"kb/queries/{self.api_calls}", "query_record", body, role,
                                subjects=[execution, *([plan_ref] if plan_ref else [])])
         self.query_refs.append(record["artifact_ref"])
@@ -2349,14 +2382,14 @@ class SurveyRunner(ExecutionRuntime):
         successful_pages = {
             (row.get("provider", "openalex"), row.get("request", {}).get("operation"),
              row.get("request", {}).get("query"), row.get("request", {}).get("work_id"),
-             row.get("request", {}).get("cursor"))
+             row.get("request", {}).get("cursor"), row.get("request", {}).get("limit"))
             for row in self.search_log if acquisition_succeeded(row)}
         pending = {}
         for row in self.search_log:
             request = row.get("request", {})
             cursor = row.get("next_cursor")
             key = (row.get("provider", "openalex"), request.get("operation"),
-                   request.get("query"), request.get("work_id"), cursor)
+                   request.get("query"), request.get("work_id"), cursor, request.get("limit"))
             if (acquisition_succeeded(row) and row.get("has_more")
                     and (cursor is None or key not in successful_pages)):
                 pending[key] = row
@@ -2392,50 +2425,6 @@ class SurveyRunner(ExecutionRuntime):
                     admission=admission, result_limit=min(self.bounds["results_per_query"], remaining))
                 progressed |= acquisition_succeeded(page)
             if not progressed:
-                break
-
-    def _expand(self):
-        quiet = 0
-        candidates = self._expansion_candidates()
-        # ``expansion_seed_count`` is a total precision budget, not a fresh
-        # allowance for every round.  The old interpretation multiplied a
-        # three- or four-seed citation crawl by every expansion round and
-        # admitted whole, weakly related citing pages into the catalog.
-        seed_budget = max(1, min(
-            self.bounds["expansion_seed_count"],
-            self.bounds.get("max_analyzed_works", self.bounds["max_works"]),
-        ))
-        citing_limit = self._expansion_result_limit()
-        for number in range(self.bounds["expansion_rounds"]):
-            before = len(self.works)
-            expanded_selected = len(set(candidates) & self.expanded)
-            remaining = max(0, seed_budget - expanded_selected)
-            seeds = [wid for wid in candidates if wid not in self.expanded][:remaining]
-            if not seeds:
-                break
-            completed = True
-            completed_seeds = []
-            for wid in seeds:
-                seed_completed = True
-                for reference in self.works[wid]["referenced_works"][:self.bounds["references_per_work"]]:
-                    if reference not in self.aliases:
-                        seed_completed &= acquisition_succeeded(self._bibliographic_call(
-                            "work", role="research.citation-tracer", work_id=reference,
-                            result_limit=1))
-                seed_completed &= acquisition_succeeded(self._bibliographic_call(
-                    "citing", role="research.citation-tracer", work_id=wid,
-                    result_limit=citing_limit))
-                completed &= seed_completed
-                if seed_completed:
-                    self.expanded.add(wid)
-                    completed_seeds.append(wid)
-            new = len(self.works) - before
-            quiet = quiet + 1 if completed and new < self.bounds["min_new_works"] else 0
-            self.expansion_log.append({"round": number + 1, "seed_work_ids": seeds, "new_unique_works": new,
-                                       "completed": completed, "quiet_rounds": quiet,
-                                       "completed_seed_work_ids": completed_seeds,
-                                       "selection": "relevance_gated", "citing_result_limit": citing_limit})
-            if quiet >= self.bounds["saturation_rounds"]:
                 break
 
     def _full_texts(self):
@@ -2764,15 +2753,15 @@ class SurveyRunner(ExecutionRuntime):
             self._update_register()
 
     def _reconcile_retained_identity(self, wid, work, record):
-        """Re-evaluate a retained conflict from its pinned Crossref response.
+        """Rebuild changed provider observations from their pinned DOI lookup.
 
-        Older checkpoints treated every publication-year difference as an
-        identity conflict. Rebuild only conflicted records from the original
-        successful lookup; never spend another provider call or rewrite the
-        prior immutable artifact.
+        A changed work card or reconciliation rule changes the observation
+        basis. The recorded Crossref response remains reusable for the same
+        DOI without another provider call.
         """
         previous = self._body(record)
-        if previous.get("status") != "conflicted":
+        if (previous.get("status") != "conflicted"
+                and self.work_records.get(wid, {}).get("artifact_ref") in previous.get("observation_refs", [])):
             return None
         lookup_ref = previous.get("lookup_execution_ref")
         work_record = self.work_records.get(wid)
@@ -2798,6 +2787,27 @@ class SurveyRunner(ExecutionRuntime):
         except (KeyError, TypeError, ValueError, ValidationError):
             return None
 
+    def _recover_identity_lookup(self, arguments):
+        if not self.resume_session:
+            return None
+        capability = self.score.get("identity")
+        if not capability:
+            return None
+        for record in reversed(self._heads("command/executions/ops-work-" + capability["id"] + "-")):
+            try:
+                _, _, result, params = self.gate._recorded_execution(
+                    record["artifact_ref"], "research.identity-checker", operation="crossref", task_kinds={"retrieval"})
+                if ({key: value for key, value in params.items() if key != "client"} != arguments
+                        or params.get("client") != capability["client"]):
+                    continue
+                checks, _ = get_adapter("crossref").inspect_result(
+                    {"adapter": "crossref", "client": params["client"]}, result, params, representative=False)
+                if checks and all(check["outcome"] == "passed" for check in checks):
+                    return result, record["artifact_ref"]
+            except (KeyError, TypeError, ValueError, ValidationError, StateError):
+                continue
+        return None
+
     def _reconcile_identities(self):
         if "identity" not in self.bindings:
             retained = True
@@ -2817,7 +2827,8 @@ class SurveyRunner(ExecutionRuntime):
                 continue
             existing = self.identity_records.get(wid)
             if existing is not None:
-                if self._body(existing).get("status") == "conflicted":
+                if (self._body(existing).get("status") == "conflicted"
+                        or self.work_records[wid]["artifact_ref"] not in self._body(existing).get("observation_refs", [])):
                     revised = self._reconcile_retained_identity(wid, work, existing)
                     if revised is not None and revised != self._body(existing):
                         prior_ref = existing["artifact_ref"]
@@ -2844,26 +2855,40 @@ class SurveyRunner(ExecutionRuntime):
                 continue
             if retained or wid in self.identity_records:
                 continue
-            if self.api_calls >= self.bounds["max_api_calls"]:
-                self.gaps.append({"kind": "identity_call_limit", "work_id": wid})
-                break
             arguments = {"query": work["doi"], "limit": 3}
-            self._wait_provider("identity")
-            self._reserve_api_call("identity", arguments, "research.identity-checker")
-            try:
-                result, execution = self.operations.run(
-                    self.bindings["identity"], arguments, self._call,
-                    operator="research.identity-checker")
-            except ProviderRateLimitError:
-                raise
-            except Exception as exc:
-                self._ensure_active()
-                self._stop_provider_rate_limit(
-                    {"kind": "identity_lookup_failure", "work_id": wid, "reason": str(exc),
-                     **self._failure_detail(self.score["identity"]["id"])}, provider="crossref")
-                self.gaps.append({"kind": "identity_lookup_failure", "work_id": wid, "reason": str(exc)})
-                self.bindings.pop("identity", None)
-                break
+            recovered = self._recover_identity_lookup(arguments)
+            if recovered is not None:
+                result, execution = recovered
+            else:
+                failed = {self._body(record)["number"] for record in self._heads("command/identity-rate-limits/")}
+                uncertain = [self._body(record) for record in self._heads("command/api-calls/")
+                             if self._body(record).get("capability") == "identity"
+                             and self._body(record).get("request") == arguments
+                             and self._body(record)["number"] not in failed]
+                if uncertain:
+                    raise StateError("identity lookup has an unresolved charged reservation; redispatch prohibited")
+                if self.api_calls >= self.bounds["max_api_calls"]:
+                    self.gaps.append({"kind": "identity_call_limit", "work_id": wid})
+                    break
+                self._wait_provider("identity")
+                self._reserve_api_call("identity", arguments, "research.identity-checker")
+                try:
+                    result, execution = self.operations.run(
+                        self.bindings["identity"], arguments, self._call,
+                        operator="research.identity-checker")
+                except ProviderRateLimitError:
+                    self._record(f"command/identity-rate-limits/{self.api_calls}", "note",
+                                 {"number": self.api_calls, "request": arguments, "work_id": wid},
+                                 "research.identity-checker")
+                    raise
+                except Exception as exc:
+                    self._ensure_active()
+                    self._stop_provider_rate_limit(
+                        {"kind": "identity_lookup_failure", "work_id": wid, "reason": str(exc),
+                         **self._failure_detail(self.score["identity"]["id"])}, provider="crossref")
+                    self.gaps.append({"kind": "identity_lookup_failure", "work_id": wid, "reason": str(exc)})
+                    self.bindings.pop("identity", None)
+                    break
             if isinstance(result, dict):
                 self._stop_provider_rate_limit(
                     {**result, "kind": "identity_lookup_failure", "work_id": wid,
@@ -2958,32 +2983,6 @@ class SurveyRunner(ExecutionRuntime):
         title_hits = len(terms & title_tokens)
         text_hits = len(terms & text_tokens)
         return (phrase_hits, title_hits, text_hits, bool(work.get("abstract")))
-
-    def _expansion_candidates(self):
-        selected = self._analysis_selection()
-        discovery_order = {wid: index for index, wid in enumerate(self.works)}
-        ranked = sorted(
-            selected,
-            key=lambda wid: (self._work_relevance(wid), -discovery_order.get(wid, 0)),
-            reverse=True,
-        )
-        # Citation expansion is a precision operation.  Keep weak catalog hits
-        # available for coverage, but do not let a title that shares one broad
-        # word seed a citation flood.  If the relevance gate has no positive
-        # candidate, retain the best ranked candidate so a sparse survey still
-        # makes progress.
-        relevant = [wid for wid in ranked
-                    if self._work_relevance(wid)[0] > 0
-                    or self._work_relevance(wid)[1] >= 2]
-        return relevant or ranked
-
-    def _expansion_result_limit(self):
-        analysis_limit = max(1, int(self.bounds.get(
-            "max_analyzed_works", self.bounds["max_works"])))
-        return max(1, min(
-            self.bounds["results_per_query"],
-            max(5, analysis_limit // 8),
-        ))
 
     def _update_register(self):
         body = {"work_refs": [r["artifact_ref"] for r in self.work_records.values()],
@@ -3534,6 +3533,8 @@ class SurveyRunner(ExecutionRuntime):
                                   if status not in {"verified", "verified_with_gaps", "conflicted"}),
                 "by_status": dict(sorted(identity_counts.items()))},
             "searches": self.search_log, "expansion": self.expansion_log, "access_and_limit_gaps": self.gaps,
+            "exploration_tree": self.exploration_tree,
+            "exploration_tree_ref": ((self.store.head("kb/exploration-tree") or {}).get("artifact_ref")),
             "pagination_remaining": bool(self._pending_bibliographic_pages()),
             "saturated": bool(self.expansion_log and self.expansion_log[-1]["quiet_rounds"] >= self.bounds["saturation_rounds"]),
             "scope": "Recorded finite queries and citation expansion; no exhaustive-coverage claim",
@@ -3620,12 +3621,14 @@ class SurveyRunner(ExecutionRuntime):
         basis = {}
         selected = self._analysis_selection()
         promotion_allowed = (not self.resume_session or "mapping" in self.resume_session["reopened_scopes"]
-                             or self._countersearch_active)
+                             or self._countersearch_active or bool(self._tree_admitted_reads))
         for wid, work in self.work_records.items():
             basis[wid] = self._analysis_basis(wid)
             previous = self._body(self.analysis_records[wid]) if wid in self.analysis_records else None
             relationships = [relation for relation in self.relationships.values() if relation["source"] == wid]
             reopened = promotion_allowed and wid in selected and self._is_deferred_analysis(wid)
+            if self._tree_admitted_reads and wid not in self._tree_admitted_reads:
+                reopened = False
             if (self.analyzed_basis.get(wid) != basis[wid] or previous is None or reopened
                     or contains_legacy(previous) or contains_legacy(relationships)):
                 requested.append(wid)
@@ -4423,7 +4426,9 @@ class SurveyRunner(ExecutionRuntime):
         coverage = self._record("kb/coverage", "coverage_report", self._coverage(), "command.search-coordinator",
                                 subjects=[self.register_ref, *self.query_refs])
         dependencies = [self.score_ref, self.protocol["artifact_ref"], self.map_record["artifact_ref"], coverage["artifact_ref"],
-            self.register_ref, *[r["artifact_ref"] for r in self.work_records.values()], *self.source_docs, *self.query_refs,
+            self.register_ref, *([self.store.head("kb/exploration-tree")["artifact_ref"]]
+                                if self.exploration_tree is not None else []),
+            *[r["artifact_ref"] for r in self.work_records.values()], *self.source_docs, *self.query_refs,
             *[r["artifact_ref"] for r in self.identity_records.values()],
             *[ref for r in self.identity_records.values() for ref in self._body(r).get("observation_refs", [])],
             *[self._body(r)["lookup_execution_ref"] for r in self.identity_records.values()
@@ -4701,38 +4706,13 @@ class SurveyRunner(ExecutionRuntime):
             else:
                 if not self.survey_ref:
                     review_checkpoint = (self.resume_session and self.map_record is not None
-                                         and "retrieval" not in self.resume_session["reopened_scopes"])
+                                         and "retrieval" not in self.resume_session["reopened_scopes"]
+                                         and self.store.head("kb/exploration-tree") is None)
                     if self.nomination is not None or review_checkpoint:
                         self._accept_survey()
                         self._refresh_countersearch_state()
                     else:
-                        plans = self._initial_plans()
-                        for wid in self.score["seed_work_ids"]:
-                            if wid not in self.aliases:
-                                self._bibliographic_call("work", role="research.seed-reader", work_id=wid)
-                        # Do not let the first broad seed query consume the
-                        # entire discovery work budget.  The seed search and
-                        # each blind planner represent independent terminology
-                        # families; reserve a small, deterministic slice for
-                        # every family before expansion or challenge work.
-                        search_families = [
-                            ("research.seed-searcher", self.score["seed_queries"], self.protocol["artifact_ref"]),
-                            *plans,
-                        ]
-                        query_count = sum(
-                            len({query_identity(query) for query in queries if isinstance(query, str) and query.strip()})
-                            for _, queries, _ in search_families)
-                        discovery_slots = max(
-                            1,
-                            self.bounds["max_works"] - self.bounds.get("challenge_reserve", 0) - len(self.works),
-                        )
-                        family_limit = self._balanced_query_limit(
-                            discovery_slots, query_count, self.bounds["results_per_query"])
-                        for role, queries, ref in search_families:
-                            self._search(queries, role, ref, result_limit=family_limit)
-                        self._complete_search_pages()
-                        self._expand()
-                        self._full_texts()
+                        self._explore()
                         self._accept_survey()
                 if self.nomination is None:
                     self._nominate()
@@ -4852,4 +4832,6 @@ class SurveyRunner(ExecutionRuntime):
         for gap in self.gaps + self.blockers:
             lines.append("- " + json.dumps(gap, ensure_ascii=False))
         lines.extend(["", "Release status: not_released.", ""])
+        if self.exploration_tree is not None:
+            (output / "exploration-tree.json").write_text(json.dumps(self.exploration_tree, indent=2) + "\n", encoding="utf-8")
         (output / "survey.md").write_text("\n".join(lines), encoding="utf-8", newline="")
