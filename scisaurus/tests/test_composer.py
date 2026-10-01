@@ -10391,6 +10391,64 @@ class ComposerWorkflowTests(unittest.TestCase):
                 self.assertEqual(runner._latest_resumable_survey_project(stage), Path(projects[0]).resolve())
             self.assertEqual(runner._survey_resume_scope({"coverage": {"map_entry_count": 12}}), "operations")
 
+    def test_partial_survey_without_nomination_requires_owned_attempt_and_exact_question(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path))); self.addCleanup(runner.close)
+            stage = runner.workflow["stages"][0]
+            runner.workflow["stages"].append({**deepcopy(stage), "id": "topic", "kind": "topic_discovery"})
+            runner.context["topic"] = {"topic": {"id": "active", "research_question": "Exact question"}, "topic_cycle": 0}
+            project = Path(stage["project_dir"])
+            control = ControlStore(project); store = ArtifactStore(control); store.init_project(principal_note="Research")
+            store.publish_artifact(logical_id="inputs/run-config", artifact_type="note", author="principal",
+                body=canonical_bytes({"survey": {"proposed_gap": None, "question": "Exact question"}}), media_type="application/json")
+            control.close(); (project/"output").mkdir()
+            (project/"output/run.json").write_text(json.dumps({"status": "blocked", "coverage": {"map_entry_count": 13}}))
+            runner.tasks.create("survey-owned", "production", {}, "command.composer")
+            runner.tasks.transition("survey-owned", "queued", "command.composer")
+            runner.tasks.start_attempt("survey-owned", "owned-attempt", owner="command.composer", lease_ttl_seconds=60,
+                payload={"stage_id": stage["id"], "project_dir": str(project)})
+            runner.tasks.finish_attempt("owned-attempt", "failed")
+            runner.stage_records[stage["id"]] = {"attempts": [{"attempt_id": "owned-attempt", "project_dir": str(project),
+                "topic_id": "active", "topic_cycle": 0}]}
+            runner.context[stage["id"]] = {"project_dir": str(project)}
+            self.assertEqual(runner._latest_resumable_survey_project(stage), project)
+            runner.context["topic"]["topic"]["research_question"] = "Different question"
+            self.assertIsNone(runner._latest_resumable_survey_project(stage))
+
+    def test_budget_checkpoint_never_opens_a_scientific_continuation(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path))); self.addCleanup(runner.close)
+            stage = runner.workflow["stages"][0]
+            runner.stage_records[stage["id"]] = {"status": "blocked", "failure_class": "scientific_review",
+                "error": "ModelBudgetExceededError: model token budget exhausted"}
+            with patch.object(runner, "_admit_scientific_blocker_recovery", side_effect=AssertionError("resource treated as science")):
+                self.assertFalse(runner._reopen_blocked_checkpoint(set(), {stage["id"]: stage}))
+
+    def test_misclassified_budget_order_is_retired_without_refunding_usage(self):
+        from scisaurus.runtime.models import ModelBudgetExceededError
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path))); self.addCleanup(runner.close)
+            stage = runner.workflow["stages"][0]; runner.continuation_cycles = 1
+            error = ModelBudgetExceededError("admission rejected", outcome_known=True,
+                budget_admission={"path": "/tmp/owner.sqlite", "key": "stage", "dimension": "input_tokens",
+                    "limit": 100, "observed": 90, "reserved": 0, "requested": 11})
+            dossier = runner._publish("command/composer/budget-dossier", "note", {"stage_id": stage["id"],
+                "project_dir": stage["project_dir"], "input_sha256": "pinned", "observed_result": {
+                    "error": str(error), "failure": error.failure_details()}}, "command.composer")
+            runner.stage_records[stage["id"]] = {"attempts": [{"project_dir": stage["project_dir"],
+                "failure_dossier_ref": dossier["artifact_ref"]}]}
+            request = {"id": "bad-science-order", "source_stage_id": stage["id"],
+                "failure_dossier_ref": dossier["artifact_ref"], "failure_input_sha256": "pinned"}
+            runner.context[stage["id"]] = {"status": "completed", "project_dir": "later-accepted-project",
+                "failure_dossier_ref": dossier["artifact_ref"]}
+            current = deepcopy(runner.context[stage["id"]])
+            runner.active_research_requests = [request]; before = deepcopy(runner.usage)
+            self.assertEqual(runner._reconcile_misclassified_model_budget_orders(), [request["id"]])
+            self.assertEqual(runner.active_research_requests, [])
+            self.assertEqual(runner.continuation_cycles, 1); self.assertEqual(runner.usage, before)
+            self.assertEqual(runner.context[stage["id"]], current)
+            self.assertEqual(runner._reconcile_misclassified_model_budget_orders(), [])
+
     def test_stage_state_failure_remains_operational(self):
         result = {"status": "blocked", "error": "stale binding", "failure": {"kind": "operational_state"},
                   "usage": {"model_calls": 3}}

@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 import re
 
-from scisaurus.core.errors import ModelContractError
+from scisaurus.core.errors import ModelContractError, QuotaExceededError
 from scisaurus.core.schema import canonical_bytes
 
 
@@ -118,7 +118,7 @@ def classify_failure(stage_kind, error, stage_result=None):
             return "topic_refinement_contract"
         if getattr(error, "topic_retry_reason", None) == "scientific_candidate_rejected":
             return "scientific_review"
-    if (error_type in {
+    if (isinstance(error, QuotaExceededError) or error_type in {
             "ProviderCooldownError", "ProviderConfigurationError", "ProviderRateLimitError", "QuotaExceededError",
             "ComposerHardDeadlineExceeded", "ComposerLateStageResult",
             "CapabilityDeadlineError", "CapabilityModelBudgetExceeded",

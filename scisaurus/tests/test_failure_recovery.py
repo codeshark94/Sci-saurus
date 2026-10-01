@@ -14,6 +14,14 @@ from scisaurus.runtime.models import ModelCallError
 
 
 class FailureRecoveryTests(unittest.TestCase):
+    def test_model_budget_subclass_is_a_resource_fence(self):
+        from scisaurus.runtime.models import ModelBudgetExceededError
+        error = ModelBudgetExceededError("model token budget exhausted", outcome_known=True,
+            budget_admission={"path": "/tmp/owner.sqlite", "key": "stage", "dimension": "input_tokens",
+                "limit": 100, "observed": 90, "reserved": 0, "requested": 11})
+        for value in (error, ModelCallError.from_failure(str(error), error.failure_details())):
+            self.assertEqual(classify_failure("survey", value), "resource_fence")
+
     def test_missing_empirical_input_is_same_topic_source_acquisition(self):
         error = SourceDataUnavailable("controller-supplied raw rows are unavailable")
         self.assertEqual(classify_failure("experiment", error),

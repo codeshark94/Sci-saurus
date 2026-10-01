@@ -1146,6 +1146,7 @@ class ComposerRunner:
                 0, int(self.continuation_cycles or 0))
             self.active_research_requests = self._scope_active_research_requests(
                 self.active_research_requests)
+            self._reconcile_misclassified_model_budget_orders()
             by_id = {item["id"]: item for item in self.workflow.get("stages", [])
                      if isinstance(item, dict) and isinstance(item.get("id"), str)}
             survey_evidence_routes = self._reconcile_experiment_survey_evidence_routes(by_id)
@@ -5846,26 +5847,34 @@ class ComposerRunner:
                 context.get("project_dir"),
                 context.get("topic_id") or lineage.get("topic_id"),
                 context.get("topic_cycle") or lineage.get("topic_cycle"),
+                None,
             ))
         record = self.stage_records.get(stage.get("id"), {})
         attempts = record.get("attempts", []) if isinstance(record, dict) else []
         if isinstance(attempts, list):
             candidates.extend(
                 (attempt.get("project_dir"), attempt.get("topic_id"),
-                 attempt.get("topic_cycle"))
+                 attempt.get("topic_cycle"), attempt)
                 for attempt in reversed(attempts)
                 if isinstance(attempt, dict)
             )
-        candidates.append((stage.get("project_dir"), None, None))
+        candidates.append((stage.get("project_dir"), None, None, None))
         seen = set()
         partials = []
-        for candidate, candidate_topic_id, candidate_topic_cycle in candidates:
+        for candidate, candidate_topic_id, candidate_topic_cycle, owned_attempt in candidates:
             if not isinstance(candidate, str):
                 continue
             resolved = str(Path(candidate).resolve())
             if resolved in seen:
                 continue
             seen.add(resolved)
+            if owned_attempt is None and isinstance(attempts, list):
+                owned_attempt = next((item for item in reversed(attempts)
+                    if isinstance(item, dict) and item.get("project_dir") == resolved
+                    and isinstance(item.get("attempt_id"), str)), None)
+                if owned_attempt is not None:
+                    candidate_topic_id = owned_attempt.get("topic_id")
+                    candidate_topic_cycle = owned_attempt.get("topic_cycle")
             if isinstance(topic_identity, dict):
                 if (isinstance(candidate_topic_id, str)
                         and candidate_topic_id != topic_identity["topic_id"]):
@@ -5892,6 +5901,24 @@ class ComposerRunner:
                 continue
             if (isinstance(topic_identity, dict)
                     and not self._survey_checkpoint_matches_topic(checkpoint, topic_identity)):
+                bound_partial = False
+                if (partial and self._survey_checkpoint_topic_id(checkpoint) is None
+                        and isinstance(owned_attempt, dict) and isinstance(owned_attempt.get("attempt_id"), str)
+                        and candidate_topic_id == topic_identity["topic_id"]
+                        and type(candidate_topic_cycle) is int and candidate_topic_cycle == topic_identity["topic_cycle"]):
+                    attempt = self.tasks.get_attempt(owned_attempt["attempt_id"])
+                    payload = attempt.get("payload") or {}
+                    topic = next((self.context.get(item["id"], {}).get("topic", {})
+                                  for item in self.workflow["stages"] if item.get("kind") == "topic_discovery"), {})
+                    bound_partial = (payload.get("stage_id") == stage["id"]
+                        and payload.get("project_dir") == resolved
+                        and isinstance(checkpoint.get("question"), str)
+                        and checkpoint["question"] == topic.get("research_question"))
+                if bound_partial:
+                    coverage = checkpoint.get("coverage", {})
+                    partials.append(((coverage.get("map_entry_count", 0), coverage.get("verified_full_texts", 0),
+                                      coverage.get("unique_works", 0)), Path(resolved)))
+                    continue
                 already_recorded = any(
                     isinstance(item, dict)
                     and item.get("action") == "skip_survey_checkpoint_other_topic"
@@ -5940,7 +5967,8 @@ class ComposerRunner:
         config = cls._durable_stage_config(root)
         if not isinstance(config, dict):
             return None
-        return {**payload, "nomination": config.get("survey", {}).get("proposed_gap")}
+        return {**payload, "nomination": config.get("survey", {}).get("proposed_gap"),
+                "question": config.get("survey", {}).get("question")}
 
     @staticmethod
     def _survey_checkpoint_topic_id(checkpoint):
@@ -23913,6 +23941,55 @@ class ComposerRunner:
         })
         return True
 
+    def _reconcile_misclassified_model_budget_orders(self):
+        """Retire scientific orders whose immutable cause was admission failure."""
+        retired = set()
+        for request in self.active_research_requests:
+            ref = request.get("failure_dossier_ref") if isinstance(request, dict) else None
+            if not isinstance(ref, str):
+                continue
+            manifest, _, dossier = self._read_verified_artifact_json(ref)
+            observed = dossier.get("observed_result") or {}
+            failure = observed.get("failure") or {}
+            if not isinstance(failure.get("budget_admission"), dict):
+                continue
+            error = ModelCallError.from_failure(observed.get("error") or dossier.get("error", "budget admission"), failure)
+            stage_id = dossier.get("stage_id")
+            record = self.stage_records.get(stage_id, {})
+            owner = next((attempt for attempt in record.get("attempts", [])
+                          if attempt.get("failure_dossier_ref") == ref), None)
+            if (manifest.get("author") != "command.composer" or owner is None
+                    or owner.get("project_dir") != dossier.get("project_dir")
+                    or request.get("source_stage_id") != stage_id
+                    or request.get("failure_input_sha256") != dossier.get("input_sha256")
+                    or getattr(error, "outcome_known", False) is not True):
+                raise StateError("model-budget reconciliation has no owned known-outcome failure")
+            decision_id = "command/composer/resource-reconciliation/" + request["id"]
+            decision = self.store.head(decision_id)
+            if decision is None:
+                continuation = self.store.head(f"command/composer/continuation/{self.continuation_cycles}")
+                self._publish(decision_id, "note", {"action": "supersede_scientific_resource_order",
+                    "request_id": request["id"], "failure_dossier_ref": ref, "stage_id": stage_id,
+                    "failure_class": "resource_fence", "project_dir": owner["project_dir"],
+                    "cycle": self.continuation_cycles}, "command.composer",
+                    subjects=[ref, *([continuation["artifact_ref"]] if continuation else [])])
+            retired.add(request["id"])
+            context = self.context.setdefault(stage_id, {})
+            if (context.get("failure_dossier_ref") == ref
+                    and context.get("status") in {"research_expansion_required", "blocked"}
+                    and record.get("status") in {"blocked", "running", "retrying", "paused"}):
+                context.update(status="blocked", failure_class="resource_fence", review_status="resource_capacity_recovery")
+            for field in ("research_requests", "research_expansion_requests", "deferred_research_requests"):
+                if field in context:
+                    context[field] = [item for item in context[field] if item.get("id") != request["id"]]
+        if retired:
+            self.active_research_requests = [item for item in self.active_research_requests if item.get("id") not in retired]
+            self.departments.retire_superseded_work_orders(
+                {item["id"] for item in self.active_research_requests}, reason="immutable failure was model-budget admission")
+            self.department_activity.append({"cycle": self.continuation_cycles,
+                "action": "reconcile_model_budget_work_orders", "request_ids": sorted(retired), "model_calls": 0})
+        return sorted(retired)
+
     def _reopen_blocked_checkpoint(self, completed, by_id):
         """Turn a recoverable stop checkpoint into one fresh work cycle.
 
@@ -23931,6 +24008,9 @@ class ComposerRunner:
                 continue
             error_text = str(record.get("error") or "")
             lowered = error_text.casefold()
+            if (record.get("failure_class") == "resource_fence"
+                    or "modelbudgetexceedederror" in lowered):
+                continue
             if any(token in lowered for token in (
                     "hard deadline", "provider cooldown", "result_unknown",
                     "unknown_external_outcome", "process_interrupted")):
