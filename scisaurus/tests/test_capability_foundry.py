@@ -545,6 +545,33 @@ class CapabilityFoundryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "frontier must be an object"):
             prompt({"repair_evidence_frontier": []})
 
+    def test_patch_prompt_preserves_exact_topic_review_closure(self):
+        obligations = [{"obligation": {"attempt_lineage": {
+            "verifier_execution_ref": "artifact:topic/verifier@2",
+            "verifier_execution_sha256": "a" * 64,
+            "research_question": "question " + "\u03b1" * 2500,
+            "blocking_findings": ["evidence " + "x" * 5000]}},
+            "reviewed_closure": {"receipt_ref": "artifact:survey/fulfillment@1",
+                                 "body_sha256": "b" * 64, "status": "resolved"}}]
+        digest = hashlib.sha256(canonical_bytes(obligations)).hexdigest()
+        brief = {"topic_review_obligations": obligations,
+                 "topic_review_obligations_sha256": digest}
+        candidate = {"executor_source": "def run(): return 1", "validator_source": "def check(): pass",
+                     "experiment_intent": {"id": "study"}}
+        def prompt(value):
+            return authoring_patch_prompt(
+                brief=value, required_intent={}, configured_input={}, candidate=candidate,
+                feedback="repair", validation_context={}, validation_feedback={}, format_repair={})
+        result = json.loads(json.dumps(prompt(brief)))["repair_request"]
+        self.assertEqual(result["topic_review_obligations"], obligations)
+        self.assertEqual(result["topic_review_obligations_sha256"], digest)
+        self.assertEqual(brief["topic_review_obligations"], obligations)
+        with self.assertRaisesRegex(ValidationError, "fingerprint does not match"):
+            prompt({**brief, "topic_review_obligations_sha256": "0" * 64})
+        for invalid in [{}, ["unreviewed"]]:
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValidationError, "list of objects"):
+                prompt({"topic_review_obligations": invalid})
+
     def test_duplicate_structure_patch_preserves_unicode_strings_and_physical_lines(self):
         for newline in ["\n", "\r\n", "\r"]:
             with self.subTest(newline=repr(newline)):

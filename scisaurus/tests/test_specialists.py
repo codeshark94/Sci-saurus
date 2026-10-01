@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from scisaurus.core.errors import ValidationError
+from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.models import (
     ModelCallError, ModelResult, admit_model_provider_call,
     clear_model_provider_cooldown,
@@ -14,9 +15,10 @@ from scisaurus.runtime.models import (
     record_model_provider_cooldown,
 )
 from scisaurus.runtime.specialists import (
-    REPAIR_ADJUDICATION_SYSTEM, SPECIALIST_SYSTEM, VERIFIER_SYSTEM,
+    REPAIR_ADJUDICATION_SYSTEM, REPAIR_EVIDENCE_SYSTEM, SPECIALIST_SYSTEM, VERIFIER_SYSTEM,
     SpecialistDispatcher,
     _normalise_report, _normalise_verdict,
+    _specialist_repair_prompt, _verifier_repair_prompt,
     build_specialist_prompt, build_verifier_prompt, redact_sensitive_text,
 )
 
@@ -281,6 +283,9 @@ class SpecialistDispatcherTests(unittest.TestCase):
                  "follow_up_result": {"ref": "artifact:disposition@1", "orders": [{"id": "one", "status": "limited",
                     "rationale": "Coverage remains bounded.", "evidence": [proof], "query_refs": ["artifact:query@1"],
                     "limitation": "No independent measurement.", "next_action": "Test an exploratory model."}]}}
+        orders = [{"id": "one", "objective": "Exact evidence obligation α\r\n" * 100,
+                   "completion_check": "Compare every source-supported clause.", "source_refs": ["artifact:source@1"]}]
+        chief["work_orders"] = orders
         from scisaurus.runtime.specialists import _verifier_chief_result
         for detail in ("full", "compact", "minimal", "focused"):
             with self.subTest(detail=detail):
@@ -289,6 +294,13 @@ class SpecialistDispatcherTests(unittest.TestCase):
                 self.assertEqual(projected["coverage"]["verified_full_texts"], 4)
                 self.assertEqual(projected["survey_evidence"]["searches"], searches)
                 self.assertEqual(projected["survey_evidence"]["follow_up_result"], chief["follow_up_result"])
+                self.assertEqual(projected["survey_evidence"]["work_orders"], orders)
+                self.assertEqual(projected["survey_evidence"]["work_orders_sha256"],
+                                 hashlib.sha256(canonical_bytes(orders)).hexdigest())
+                packet = json.loads(build_verifier_prompt({"id": "survey", "kind": "survey"},
+                    {"work_orders": orders}, [], chief))
+                self.assertEqual(packet["work_orders"], orders)
+                self.assertEqual(packet["work_orders_sha256"], hashlib.sha256(canonical_bytes(orders)).hexdigest())
                 self.assertEqual(projected["survey_evidence"]["revalidation"], chief["revalidation"])
                 self.assertEqual(projected["survey_evidence"]["source_evidence_policy"],
                                  coverage["source_evidence_policy"])
@@ -1163,6 +1175,83 @@ class SpecialistDispatcherTests(unittest.TestCase):
         self.assertIn("literature survey", contract["acceptance_target"])
         self.assertIn("not by themselves grounds to hold", contract["provisional_rule"])
 
+    def test_topic_acceptance_scope_is_stage_owned_without_producer_admission_label(self):
+        declared = {"current_stage_id": "question-design", "downstream_stage_ids": ["source-audit", "measurement"],
+                    "acceptance_target": "A bounded searchable research question for source audit.",
+                    "current_requirements": ["Preserve the question and bounded feasibility plan."],
+                    "downstream_requirements": [{"target_stage_id": "source-audit", "requirement": "Corroborate baseline provenance."}]}
+        from scisaurus.runtime.specialists import _verifier_body
+        for label in (None, "provisional_for_survey", "another producer label"):
+            chief = {"status": "completed", "admission_state": label,
+                     "topic": {"id": "bounded", "research_question": "Does A alter B?"}}
+            for detail in ("full", "compact", "minimal", "focused"):
+                value = _verifier_body({"id": "question-design", "kind": "topic_discovery"},
+                    {"stage_acceptance_contract": declared}, [], chief, detail=detail)
+                contract = value["verifier_contract"]
+                self.assertEqual(contract["stage_acceptance_contract"], declared)
+                self.assertEqual(contract["acceptance_target"], declared["acceptance_target"])
+                self.assertIn("parameter files, capability admission, execution", contract["provisional_rule"])
+                self.assertIn("Hold when current evidence", contract["provisional_rule"])
+            unlabelled = json.loads(build_verifier_prompt({"id": "question-design", "kind": "topic_discovery"}, {}, [], chief))
+            self.assertIn("literature survey", unlabelled["verifier_contract"]["acceptance_target"])
+
+    def test_typed_deferred_obligations_keep_complete_scope_and_reject_invalid_owners(self):
+        obligation = {"target_stage_id": "source-audit", "requirement": "Exact later requirement λ\r\n" * 120,
+                      "completion_check": "Verify every required clause." * 80,
+                      "evidence_needed": ["Hash-bound source spans." * 80, "Captured provenance."]}
+        verdict = {"decision": "accept", "rationale": "Current stage is supported.",
+                   "deferred_gates": ["Legacy later gate."], "repair_scope": ["Nonblocking note."],
+                   "deferred_obligations": [obligation]}
+        normalized = _normalise_verdict(verdict, current_stage_id="question-design", valid_target_stage_ids=["source-audit", "measurement"])
+        self.assertEqual(normalized["deferred_obligations"], [obligation])
+        self.assertEqual(normalized["deferred_gates"], verdict["deferred_gates"])
+        from scisaurus.runtime.specialists import _verifier_body
+        for detail in ("full", "compact", "minimal", "focused"):
+            body = _verifier_body({"id": "question-design", "kind": "topic_discovery"}, {},
+                [{"response": normalized}], normalized, detail=detail)
+            self.assertEqual(body["chief_result"]["deferred_obligations"], [obligation])
+            self.assertEqual(body["specialist_reports"][0]["response"]["deferred_obligations"], [obligation])
+        prompt = json.dumps({"verdict": normalized}, ensure_ascii=False)
+        repaired = json.loads(_verifier_repair_prompt(prompt, "Own schema diagnostic", "", max_input_tokens=20000))
+        self.assertEqual(repaired["evidence_packet"]["verdict"]["deferred_obligations"], [obligation])
+        self.assertIn("deferred_obligations", repaired["response_format_repair"]["instruction"])
+        with self.assertRaisesRegex(ValidationError, "input quota"):
+            build_verifier_prompt({"id": "question-design", "kind": "topic_discovery"}, {}, [], normalized, max_input_tokens=100)
+        for bad in ({**obligation, "target_stage_id": "question-design"},
+                    {**obligation, "target_stage_id": "unowned"}, {**obligation, "requirement": ""},
+                    {**obligation, "completion_check": None}, {**obligation, "evidence_needed": []},
+                    {**obligation, "unexpected": "field"}, "legacy string"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValidationError):
+                    _normalise_verdict({**verdict, "deferred_obligations": [bad]},
+                        current_stage_id="question-design", valid_target_stage_ids=["source-audit"])
+
+    def test_typed_deferred_owner_validation_survives_generic_response_retry(self):
+        model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1", "model": "fixture",
+                 "timeout_seconds": 5, "max_output_tokens": 1000, "context_window_tokens": 16000, "max_input_tokens": 15000}
+        declared = {"current_stage_id": "question-design", "downstream_stage_ids": ["source-audit"],
+                    "acceptance_target": "Bounded question."}
+        prompt = build_verifier_prompt({"id": "question-design", "kind": "topic_discovery"},
+            {"stage_acceptance_contract": declared}, [], {"status": "completed"})
+        assignment = {"assigned_role": "research.adversarial-reviewer", "model_role": "review.arbiter",
+                      "stage_id": "question-design", "quota": {"max_calls": 2, "max_input_tokens": 15000,
+                      "max_output_tokens": 2000, "max_seconds": 5}, "_prompt": prompt}
+        for target in ("question-design", "unowned"):
+            obligation = {"target_stage_id": target, "requirement": "Corroborate sources.",
+                          "completion_check": "Check exact claims.", "evidence_needed": "Captured source spans."}
+            bad = {"decision": "accept", "rationale": "Current support.", "deferred_obligations": [obligation]}
+            good = {**bad, "deferred_obligations": [{**obligation, "target_stage_id": "source-audit"}]}
+            with patch("scisaurus.runtime.specialists.ModelClient") as client:
+                client.return_value.complete.side_effect = [ModelResult(json.dumps(value), "fixture",
+                    {"model_calls": 1, "input_tokens": 10, "output_tokens": 20}, .01, "stop") for value in (bad, good)]
+                report = SpecialistDispatcher(model, deadline=time.monotonic()+10).dispatch([assignment], {}, verifier=True)[0]
+            self.assertEqual(report["status"], "succeeded", report.get("error"))
+            self.assertEqual(report["response"]["deferred_obligations"], good["deferred_obligations"])
+            self.assertEqual(report["usage"], {"model_calls": 2, "input_tokens": 20, "output_tokens": 40})
+            retry = json.loads(report["request_inputs"][1]["input"]["prompt"])
+            self.assertEqual(retry["evidence_packet"], json.loads(prompt))
+            self.assertIs(retry["response_format_repair"]["stage_failure_evidence"], False)
+
     def test_provider_pool_capacity_is_real_and_reports_are_role_scoped(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), _SpecialistHandler)
         server.lock = threading.Lock()
@@ -1360,8 +1449,163 @@ class SpecialistDispatcherTests(unittest.TestCase):
                     self.assertEqual(len(report["request_inputs"]), 2)
                     for call in client.return_value.complete.call_args_list:
                         self.assertNotIn("continuation_text", call.kwargs)
-                    self.assertIn("repair_instruction", json.loads(
-                        client.return_value.complete.call_args_list[1].kwargs["prompt"]))
+                    repaired = json.loads(client.return_value.complete.call_args_list[1].kwargs["prompt"])
+                    self.assertNotIn("repair_instruction", repaired)
+                    self.assertNotIn("validation_error", repaired)
+                    self.assertEqual(repaired["evidence_packet"], {"objective": "bounded repair"})
+                    self.assertEqual(repaired["response_format_repair"]["response_owner"], {
+                        "kind": "verifier" if verifier else "specialist",
+                        "role": assignment["assigned_role"],
+                    })
+
+    def test_response_repair_transport_preserves_original_errors_and_contracts(self):
+        original = {"chief_result": {"status": "failed", "error": "Captured executor failure"},
+                    "validation_error": "Genuine stage validation error",
+                    "repair_instruction": "An original evidence field", "source": "α\r\nβ\u2028γ"}
+        prompt = json.dumps(original, ensure_ascii=False)
+        diagnostic = "Own output schema error " + "δ" * 600
+        for kind, contract in (("verifier", None), ("specialist", None),
+                               ("specialist", "repair_evidence"), ("specialist", "repair_adjudication")):
+            with self.subTest(kind=kind, contract=contract):
+                if kind == "verifier":
+                    repaired = _verifier_repair_prompt(prompt, diagnostic, "irrelevant prior output",
+                        max_input_tokens=20000, output_role="research.adversarial-reviewer")
+                else:
+                    repaired = _specialist_repair_prompt(prompt, diagnostic, "irrelevant prior output",
+                        max_input_tokens=20000, response_contract=contract, output_role="methods.methodologist")
+                payload = json.loads(repaired)
+                self.assertEqual(payload["evidence_packet"], original)
+                self.assertEqual(set(payload), {"evidence_packet", "response_format_repair"})
+                transport = payload["response_format_repair"]
+                self.assertEqual(transport["diagnostic"], {"kind": "output_contract", "message": diagnostic})
+                self.assertEqual(transport["response_owner"]["kind"], kind)
+                self.assertEqual(transport["subject"], "previous_model_response")
+                self.assertIs(transport["stage_failure_evidence"], False)
+                if contract == "repair_adjudication":
+                    self.assertIn("repair_plan", transport["instruction"])
+                if contract == "repair_evidence":
+                    self.assertIn("evidence_note", transport["instruction"])
+        for system in (SPECIALIST_SYSTEM, VERIFIER_SYSTEM, REPAIR_EVIDENCE_SYSTEM, REPAIR_ADJUDICATION_SYSTEM):
+            self.assertIn("only your own previous model response", system)
+            self.assertIn("Assess genuine errors", system)
+
+    def test_response_repair_quota_fence_retains_original_packet_without_crop(self):
+        for original in ({"chief_result": {"status": "completed", "source": "λ" * 500}},
+                         ["complete source", {"validation_error": "original evidence"}], "raw source packet"):
+            prompt = json.dumps(original, ensure_ascii=False)
+            for repair in (_verifier_repair_prompt, _specialist_repair_prompt):
+                self.assertEqual(repair(prompt, "Own output error", "", max_input_tokens=1), prompt)
+                payload = json.loads(repair(prompt, "Own output error", "", max_input_tokens=20000))
+                self.assertEqual(payload["evidence_packet"], original)
+
+    def test_verifier_retry_owns_its_diagnostic_without_excusing_stage_errors(self):
+        model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+                 "model": "fixture", "timeout_seconds": 5, "max_output_tokens": 1000,
+                 "context_window_tokens": 16000, "max_input_tokens": 15000}
+        own_error = "truncated structured response has no JSON object prefix"
+        for genuine_failure in (False, True):
+            with self.subTest(genuine_failure=genuine_failure):
+                original = {"chief_result": {"status": "completed", "topic": {"id": "selected", "question": "A bounded question"}}}
+                if genuine_failure:
+                    original["chief_result"]["error"] = "The captured producer output did not validate"
+                assignment = {"assigned_role": "research.adversarial-reviewer", "role_id": "adversarial-reviewer",
+                              "model_role": "review.arbiter", "stage_id": "topic", "stage_kind": "topic_discovery",
+                              "quota": {"max_calls": 2, "max_input_tokens": 15000,
+                                        "max_output_tokens": 2000, "max_seconds": 5},
+                              "_prompt": json.dumps(original)}
+                calls = []
+                def evidence_error(packet):
+                    evidence = packet.get("evidence_packet", packet)
+                    return evidence.get("validation_error") or evidence["chief_result"].get("error")
+                def reply(*, system, prompt, **kwargs):
+                    calls.append(prompt)
+                    if len(calls) == 1:
+                        return ModelResult("Let me reason before writing JSON", "fixture",
+                            {"model_calls": 1, "input_tokens": 10, "output_tokens": 20}, .01, "length")
+                    packet = json.loads(prompt)
+                    self.assertEqual(packet["evidence_packet"], original)
+                    self.assertEqual(packet["response_format_repair"]["response_owner"],
+                                     {"kind": "verifier", "role": assignment["assigned_role"]})
+                    self.assertEqual(packet["response_format_repair"]["diagnostic"]["message"], own_error)
+                    self.assertNotIn("validation_error", packet)
+                    self.assertIn("Never cite that diagnostic as evidence against the stage", system)
+                    captured_error = evidence_error(packet)
+                    value = {"decision": "hold" if captured_error else "accept", "rationale": "Original stage evidence independently reviewed.",
+                             "blocking_findings": [captured_error] if captured_error else [],
+                             "required_revisions": [], "deferred_gates": [], "repair_scope": []}
+                    return ModelResult(json.dumps(value), "fixture", {"model_calls": 1, "input_tokens": 11,
+                        "output_tokens": 21}, .01, "stop")
+                # An unowned top-level diagnostic reproduces the misleading stage-failure premise.
+                legacy = {**original, "validation_error": own_error}
+                self.assertEqual(evidence_error(legacy), own_error)
+                self.assertEqual(evidence_error({"evidence_packet": original}),
+                                 original["chief_result"].get("error"))
+                with patch("scisaurus.runtime.specialists.ModelClient") as client:
+                    client.return_value.complete.side_effect = reply
+                    result = SpecialistDispatcher(model, max_parallel=1, deadline=time.monotonic() + 10).dispatch(
+                        [assignment], {}, verifier=True)[0]
+                self.assertEqual(result["status"], "succeeded")
+                self.assertEqual(result["response"]["decision"], "hold" if genuine_failure else "accept")
+                self.assertEqual(result["usage"], {"model_calls": 2, "input_tokens": 21, "output_tokens": 41})
+                self.assertEqual(len(result["request_inputs"]), 2)
+                self.assertEqual(result["retry_history"][0]["error"], own_error)
+
+    def test_accepted_verdict_cannot_carry_unresolved_material_findings(self):
+        accepted = {"decision": "accept", "rationale": "Current evidence checked.",
+                    "blocking_findings": [], "required_revisions": [], "critical_findings": [],
+                    "deferred_gates": ["Recalculate the observation after execution."],
+                    "repair_scope": ["Clarify the reporting note."]}
+        normalized = _normalise_verdict(accepted)
+        self.assertEqual(normalized["decision"], "accept")
+        self.assertEqual(normalized["deferred_gates"], accepted["deferred_gates"])
+        self.assertEqual(normalized["repair_scope"], accepted["repair_scope"])
+        for field in ("blocking_findings", "required_revisions", "critical_findings"):
+            for value in (["Unresolved source-supported defect."], "Unresolved defect.", False):
+                with self.subTest(field=field, value=value):
+                    contradictory = {**accepted, field: value}
+                    with self.assertRaisesRegex(ValidationError, "unresolved " + field):
+                        _normalise_verdict(contradictory)
+            held = {**accepted, "decision": "hold", field: ["Unresolved defect."]}
+            self.assertEqual(_normalise_verdict(held)["decision"], "hold")
+
+    def test_contradictory_verifier_acceptance_uses_owned_bounded_format_repair(self):
+        model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+                 "model": "fixture", "timeout_seconds": 5, "max_output_tokens": 1000,
+                 "context_window_tokens": 16000, "max_input_tokens": 15000}
+        original = {"chief_result": {"status": "completed", "evidence": "Exact stage packet λ"}}
+        assignment = {"assigned_role": "research.adversarial-reviewer", "role_id": "adversarial-reviewer",
+                      "model_role": "review.arbiter", "stage_id": "topic", "stage_kind": "topic_discovery",
+                      "quota": {"max_calls": 2, "max_input_tokens": 15000,
+                                "max_output_tokens": 2000, "max_seconds": 5},
+                      "_prompt": json.dumps(original, ensure_ascii=False)}
+        for field in ("blocking_findings", "required_revisions", "critical_findings"):
+            for final_decision in ("accept", "hold"):
+                with self.subTest(field=field, final_decision=final_decision):
+                    bad = {"decision": "accept", "rationale": "Checked.", field: ["Material defect."]}
+                    corrected = {"decision": final_decision, "rationale": "Independently reconsidered.",
+                                 "blocking_findings": ["Material defect."] if final_decision == "hold" else [],
+                                 "required_revisions": [], "deferred_gates": ["Verify later observations."],
+                                 "repair_scope": []}
+                    results = [ModelResult(json.dumps(value), "fixture", usage, .01, "stop")
+                               for value, usage in ((bad, {"model_calls": 1, "input_tokens": 10, "output_tokens": 20}),
+                                                    (corrected, {"model_calls": 1, "input_tokens": 11, "output_tokens": 21}))]
+                    with patch("scisaurus.runtime.specialists.ModelClient") as client:
+                        client.return_value.complete.side_effect = results
+                        report = SpecialistDispatcher(model, max_parallel=1, deadline=time.monotonic() + 10).dispatch(
+                            [assignment], {}, verifier=True)[0]
+                    self.assertEqual(report["status"], "succeeded")
+                    self.assertEqual(report["response"]["decision"], final_decision)
+                    self.assertEqual(report["usage"], {"model_calls": 2, "input_tokens": 21, "output_tokens": 41})
+                    self.assertEqual(client.return_value.complete.call_count, 2)
+                    self.assertEqual(report["validation_retries"], 1)
+                    diagnostic = "accepted verifier response cannot contain unresolved " + field
+                    self.assertEqual(report["retry_history"][0]["error"], diagnostic)
+                    repaired = json.loads(report["request_inputs"][1]["input"]["prompt"])
+                    self.assertEqual(repaired["evidence_packet"], original)
+                    self.assertEqual(repaired["response_format_repair"]["diagnostic"]["message"], diagnostic)
+                    self.assertEqual(repaired["response_format_repair"]["response_owner"],
+                                     {"kind": "verifier", "role": assignment["assigned_role"]})
+                    self.assertIs(repaired["response_format_repair"]["stage_failure_evidence"], False)
 
     def test_repeated_prose_truncation_stops_after_one_schema_repair(self):
         model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",

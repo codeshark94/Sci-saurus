@@ -53,6 +53,7 @@ from scisaurus.runtime.specialists import (
     specialist_system,
     build_repair_adjudication_prompt, build_repair_evidence_prompt, build_specialist_prompt,
     build_verifier_prompt, redact_sensitive_text, _preserve_response_value, _repair_candidate_program,
+    _normalise_verdict,
 )
 from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
 from scisaurus.runtime.experiment_config import (
@@ -924,19 +925,24 @@ class ComposerRunner:
 
 
     def __init__(self, workflow, *, resume=False, clock=time.monotonic, on_progress=None,
-                 additional_seconds=None):
+                 additional_seconds=None, stop_after_stage=None):
         self.control = None
         self._runtime_environment_before = None
         self._runtime_environment_after = None
         try:
             self._initialize_composer(workflow, resume=resume, clock=clock,
-                                      on_progress=on_progress, additional_seconds=additional_seconds)
+                                      on_progress=on_progress, additional_seconds=additional_seconds,
+                                      stop_after_stage=stop_after_stage)
         except BaseException:
             self.close()
             raise
 
-    def _initialize_composer(self, workflow, *, resume, clock, on_progress, additional_seconds):
+    def _initialize_composer(self, workflow, *, resume, clock, on_progress, additional_seconds, stop_after_stage):
         self.workflow = deepcopy(validate_workflow(workflow))
+        if stop_after_stage is not None and (not isinstance(stop_after_stage, str)
+                or stop_after_stage not in {stage["id"] for stage in self.workflow["stages"]}):
+            raise ValidationError("stop_after_stage must name a declared workflow stage")
+        self.stop_after_stage = stop_after_stage
         self._runtime_environment_before = dict(os.environ)
         self._runtime_environment_after = None
         try:
@@ -4872,6 +4878,11 @@ class ComposerRunner:
                     and blocker_attempt < current_attempt
                     and item.get("reason") != "provider_cooldown"):
                 continue
+            if (item.get("stop_reason") == "operator_stage_boundary"
+                    and self.status == "paused" and stage_id == "workflow"
+                    and item.get("boundary_stage_id") == self.stop_after_stage):
+                active.append(deepcopy(item))
+                continue
             if (item.get("stop_reason") == "process_interrupted"
                     and self.status == "paused" and stage_id == "workflow"):
                 active.append(deepcopy(item))
@@ -7142,7 +7153,290 @@ class ComposerRunner:
                     target_kind == "interpretation" and stage_kind == "paper") or (
                     stage_kind is None and target_kind == stage_id):
                 requests.append(deepcopy(item))
+        if stage_kind == "survey":
+            obligation = self._topic_review_obligation(stage)
+            if obligation is not None and all(item.get("id") != obligation["id"] for item in requests):
+                requests.append(obligation)
+        for item in self._topic_deferred_obligations(stage):
+            if all(existing.get("id") != item["id"] for existing in requests):
+                requests.append(item)
         return requests
+
+    def _owned_topic_review(self, topic_stage):
+        context = self.context.get(topic_stage["id"], {})
+        verifier = context.get("specialist_verifier") if isinstance(context, dict) else None
+        ref = verifier.get("artifact_ref") if isinstance(verifier, dict) else None
+        if not isinstance(ref, str):
+            if context.get("deferred_review_findings"):
+                raise StateError("carried topic review has no immutable verifier execution")
+            return None
+        record = self.stage_records.get(topic_stage["id"], {})
+        plan_ref = verifier.get("assignment_plan_ref") or record.get("assignment_plan_ref")
+        if not isinstance(plan_ref, str) or self._stage_specialist_payment_proof(topic_stage, plan_ref, ref) is None:
+            raise StateError("carried topic review has no owned specialist assignment")
+        manifest, digest, body = self._read_verified_artifact_json(ref)
+        report = body.get("report", {})
+        response = report.get("response", {})
+        if response.get("decision") == "accept" and any(response.get(key) for key in ("blocking_findings", "required_revisions", "critical_findings")):
+            raise StateError("accepted topic review retains blocking admission obligations")
+        if (body.get("schema_version") != "specialist-verifier-execution-1"
+                or body.get("stage_kind") != "topic_discovery"
+                or body.get("chief_result", {}).get("topic") != context.get("topic")
+                or report.get("status") != "succeeded"):
+            raise StateError("carried topic review changes its owned scientific input")
+        return context, plan_ref, ref, digest, response
+
+    def _topic_review_obligation(self, survey_stage):
+        """Bind a carried topic review to its exact scientific input and execution."""
+        topic_stage = self._topic_stage_for_survey(survey_stage)
+        if topic_stage is None:
+            return None
+        owned = self._owned_topic_review(topic_stage)
+        if owned is None:
+            return None
+        context, plan_ref, ref, digest, response = owned
+        if response.get("decision") == "accept":
+            return None
+        if response.get("decision") != "hold":
+            raise StateError("carried topic review has no explicit independent decision")
+        findings, revisions = (response.get(key, []) for key in ("blocking_findings", "required_revisions"))
+        if any(not isinstance(values, list) or any(not isinstance(item, str) or not item.strip() for item in values)
+               for values in (findings, revisions)):
+            raise StateError("carried topic review has malformed admission obligations")
+        if not findings and not revisions:
+            raise ModelWorkBlocked("independent topic review remains held without an actionable admission obligation")
+        origin = {"verifier_execution_ref": ref, "verifier_execution_sha256": digest,
+                  "assignment_plan_ref": plan_ref, "topic_stage_id": topic_stage["id"],
+                  "topic_sha256": hashlib.sha256(canonical_bytes(context["topic"])).hexdigest(),
+                  "research_question": context["topic"]["research_question"],
+                  "blocking_findings": deepcopy(findings), "required_revisions": deepcopy(revisions)}
+        identity = hashlib.sha256(canonical_bytes(origin)).hexdigest()
+        return {"id": "topic-review-" + identity[:32], "kind": "literature_expansion",
+                "owner": "research.intelligence", "target_stage_id": survey_stage["id"],
+                "target_stage_kind": "survey",
+                "objective": "Independently adjudicate the carried topic admission obligations: "
+                    + json.dumps({"blocking_findings": findings, "required_revisions": revisions}, ensure_ascii=False),
+                "why": "An independent topic review remains held; its findings are hypotheses to test, not assumed facts.",
+                "success_condition": "Every material obligation is independently resolved with authoritative evidence showing it is satisfied, refuted, or outside the declared topic acceptance scope. A literature answer cannot claim that a later-stage file, calculation, or experiment was produced. Unmet requirements and uncertain or limited dispositions remain open.",
+                "evidence_needed": "Exact current captured source spans and query receipts, with explicit evidence-linked adjudication of the original findings and revisions.",
+                "attempt_lineage": origin}
+
+    def _topic_deferred_obligations(self, target_stage):
+        """Route agent-declared future requirements by the exact workflow owner."""
+        if not isinstance(target_stage, dict):
+            return []
+        requests = []
+        kinds = {"topic_discovery": "topic_refinement", "survey": "literature_expansion", "experiment": "additional_experiment",
+                 "interpretation": "interpretation_expansion", "argument": "interpretation_expansion",
+                 "paper": "manuscript_revision"}
+        for topic_stage in self.workflow["stages"]:
+            if topic_stage["kind"] != "topic_discovery":
+                continue
+            contract = self._stage_acceptance_contract(topic_stage)
+            if target_stage["id"] not in contract["downstream_stage_ids"]:
+                continue
+            owned = self._owned_topic_review(topic_stage)
+            if owned is None:
+                continue
+            context, plan_ref, ref, digest, response = owned
+            normalized = _normalise_verdict(response, current_stage_id=topic_stage["id"],
+                valid_target_stage_ids=contract["downstream_stage_ids"])
+            for obligation in normalized.get("deferred_obligations", []):
+                if obligation["target_stage_id"] != target_stage["id"]:
+                    continue
+                origin = {"verifier_execution_ref": ref, "verifier_execution_sha256": digest,
+                    "assignment_plan_ref": plan_ref, "topic_stage_id": topic_stage["id"],
+                    "topic_sha256": hashlib.sha256(canonical_bytes(context["topic"])).hexdigest(),
+                    "research_question": context["topic"]["research_question"],
+                    "deferred_obligation": deepcopy(obligation)}
+                requests.append({"id": "topic-deferred-" + hashlib.sha256(canonical_bytes(origin)).hexdigest()[:32],
+                    "kind": kinds[target_stage["kind"]], "owner": STAGE_ROLES[target_stage["kind"]],
+                    "source_stage_id": topic_stage["id"], "target_stage_id": target_stage["id"],
+                    "target_stage_kind": target_stage["kind"], "objective": obligation["requirement"],
+                    "why": "An independent topic review assigns this requirement to its declared downstream owner.",
+                    "success_condition": obligation["completion_check"],
+                    "evidence_needed": (obligation["evidence_needed"] if isinstance(obligation["evidence_needed"], str)
+                        else json.dumps(obligation["evidence_needed"], ensure_ascii=False)), "attempt_lineage": origin})
+        return requests
+
+    def _topic_review_obligation_is_closed(self, stage, result, obligation, *, require_independent=False):
+        """A limited search is retained evidence, not closure of an admission debt."""
+        rows = (result.get("follow_up_result") or {}).get("orders", [])
+        project = self.stage_records.get(stage["id"], {}).get("project_dir") or result.get("project_dir") or stage["project_dir"]
+        record = self.stage_records.get(stage["id"], {})
+        return ((not require_independent or self._survey_attempt_was_accepted(stage["id"], record, result))
+                and any(isinstance(row, dict) and row.get("id") == obligation["id"]
+                    and row.get("status") == "resolved" for row in rows)
+                and self._survey_work_order_was_fulfilled(project, result, obligation))
+
+    def _topic_review_revalidation_input(self, stage):
+        """Replay owned production and peer evidence for a changed verifier contract."""
+        context = self.context.get(stage["id"], {})
+        verifier = context.get("specialist_verifier") or {}
+        ref = verifier.get("artifact_ref")
+        if not isinstance(ref, str):
+            return None
+        manifest, digest, execution = self._read_verified_artifact_json(ref)
+        if execution.get("initial_review_input", {}).get("system") == VERIFIER_SYSTEM:
+            return None
+        record = self.stage_records.get(stage["id"], {})
+        plan_ref = verifier.get("assignment_plan_ref") or record.get("assignment_plan_ref")
+        if (execution.get("schema_version") != "specialist-verifier-execution-1"
+                or execution.get("stage_kind") != "topic_discovery"
+                or execution.get("chief_result", {}).get("topic") != context.get("topic")
+                or not isinstance(plan_ref, str)
+                or self._stage_specialist_payment_proof(stage, plan_ref, ref) is None):
+            raise StateError("topic review revalidation has no exact owned verifier input")
+        output = Path(context["output_path"]).resolve()
+        output_hash = hashlib.sha256(output.read_bytes()).hexdigest()
+        candidates = []
+        cache = ModelWorkCache(self.store, self._publish)
+        for cached in cache.entries():
+            result = cached.get("result") or {}
+            if (cached.get("status") != "succeeded" or result.get("stage_id") != stage["id"]
+                    or result.get("kind") != "topic_discovery" or result.get("status") != "completed"
+                    or result.get("output_path") != str(output)
+                    or cached.get("output_sha256") != output_hash
+                    or result.get("topic") != context.get("topic")):
+                continue
+            producer_record, producer_digest, _ = self._read_verified_artifact_json(cached["cache_ref"])
+            if producer_record.get("author") != "command.controller":
+                raise StateError("topic review revalidation producer cache is not controller owned")
+            candidates.append((cached, producer_digest))
+        if not candidates or any(item[0]["result"] != candidates[0][0]["result"] for item in candidates):
+            raise StateError("topic review revalidation has no unique immutable completed producer")
+        cached, producer_digest = candidates[0]
+        peers = deepcopy(execution.get("specialist_reports"))
+        if not isinstance(peers, list) or not peers:
+            raise StateError("topic review revalidation has no retained independent peer reports")
+        for peer in peers:
+            peer_ref = peer.get("artifact_ref")
+            if not isinstance(peer_ref, str) or self._stage_specialist_payment_proof(stage, plan_ref, peer_ref) is None:
+                raise StateError("topic review revalidation peer is not assignment owned")
+            _, _, peer_execution = self._read_verified_artifact_json(peer_ref)
+            retained = peer_execution.get("report", {})
+            if (peer_execution.get("schema_version") != "specialist-execution-1"
+                    or any(peer.get(key) != retained.get(key) for key in ("status", "role_id", "assigned_role", "response", "usage"))):
+                raise StateError("topic review revalidation changes retained peer evidence")
+            assignment = next(item for item in self.departments._assignment_task_rows(
+                stage_id=stage["id"], attempt_number=peer_execution["attempt_number"])
+                if item["task_id"] == peer_execution["task_id"])
+            peer["input_scope"] = {"declared_fields": deepcopy(assignment.get("input_projection", [])),
+                                   "assignment_phase": assignment.get("assignment_phase"),
+                                   "assignment_plan_ref": plan_ref,
+                                   "execution_ref": peer_ref, "contract_state": "retained_original"}
+        return {"producer_cache_ref": cached["cache_ref"], "producer_cache_sha256": producer_digest,
+                "output_path": str(output), "output_sha256": output_hash,
+                "result": deepcopy(cached["result"]), "peer_reports": deepcopy(peers),
+                "prior_verifier_execution_ref": ref, "prior_verifier_execution_sha256": digest,
+                "prior_assignment_plan_ref": plan_ref}
+
+    def revalidate_topic_review(self, stage_id):
+        """Re-review exact paid topic production when the verifier contract changes."""
+        stage = next((item for item in self.workflow["stages"] if item["id"] == stage_id), None)
+        if stage is None or stage.get("kind") != "topic_discovery":
+            raise StateError("review revalidation requires a topic stage")
+        retained = self._topic_review_revalidation_input(stage)
+        if retained is None:
+            return None
+        if self._execution_started:
+            raise StateError("topic review revalidation must precede workflow execution")
+        _, stopped = self._stopped_execution_checkpoint()
+        for producer in self.workflow["stages"]:
+            record = stopped.get("stages", {}).get(producer["id"], {})
+            if record.get("status") not in {"running", "retrying"} or producer["id"] == stage_id:
+                continue
+            project = record.get("project_dir") or producer["project_dir"]
+            progress = self._read_json_object(Path(project) / "output/progress.json") or {}
+            if (self._producer_checkpoint_evidence(project, progress) is None
+                    or progress.get("phase") not in {"calls_settled", "paused"}
+                    or progress.get("active_tasks") or progress.get("active_operations")):
+                raise StateError("topic review revalidation requires idle captured downstream production")
+        self.context[stage_id]["specialist_verifier"]["assignment_plan_ref"] = retained["prior_assignment_plan_ref"]
+        self._reconcile_interrupted_stage_attempts()
+        remaining = min(float(stage["deadline_seconds"]), self._remaining())
+        attempt_deadline = min(self.deadline_epoch, time.time() + remaining)
+        prior = deepcopy(self.stage_records[stage_id])
+        history = self._archive_stage_attempt(prior, cycle=self.continuation_cycles,
+                                               default_project_dir=stage["project_dir"])
+        number = max(prior.get("attempt_count", 0), prior.get("attempt_number", 0)) + 1
+        identity = hashlib.sha256(canonical_bytes({"input": retained,
+            "verifier_system": VERIFIER_SYSTEM, "cycle": self.continuation_cycles})).hexdigest()
+        admission = self._publish(f"command/composer/topic-review-revalidations/{identity}", "decision_note", {
+            "schema_version": "topic-review-revalidation-1", "stage_id": stage_id,
+            "cycle": self.continuation_cycles, "producer": retained,
+            "verifier_system_sha256": hashlib.sha256(VERIFIER_SYSTEM.encode()).hexdigest(),
+        }, "command.composer", subjects=[retained["producer_cache_ref"], retained["prior_verifier_execution_ref"],
+            *[peer["artifact_ref"] for peer in retained["peer_reports"]]])
+        task_id = "topic-review-revalidation-" + identity[:24] + "-" + str(number)
+        task = self.tasks.create(task_id, "review", {"stage_id": stage_id, "admission_ref": admission["artifact_ref"]}, "command.composer")
+        if task["state"] not in {"proposed", "queued"}:
+            raise StateError("topic review revalidation requires reconciliation of its existing attempt")
+        if task["state"] == "proposed":
+            self.tasks.transition(task_id, "queued", "command.composer")
+        attempt_id = task_id + "-" + uuid.uuid4().hex
+        self.tasks.start_attempt(task_id, attempt_id, owner="command.composer", lease_ttl_seconds=remaining,
+            payload={"stage_id": stage_id, "kind": "topic_discovery", "attempt_number": number,
+                     "model_budget_cycle": self.continuation_cycles if stage_id in self.reopened_stage_ids else 0,
+                     "project_dir": stage["project_dir"], "admission_ref": admission["artifact_ref"],
+                     "attempt_deadline_at_epoch": attempt_deadline})
+        plan = self.departments.begin_stage(stage_id, "topic_discovery", attempt_number=number,
+            input_ref={"kind": "composer_stage_task", "ref": task_id, "digest": identity},
+            deadline_seconds=remaining, active_role_ids=[])
+        self.stage_records[stage_id] = {**prior, "status": "running", "task_id": task_id,
+            "attempt_id": attempt_id, "attempt_number": number, "attempt_count": number,
+            "attempts": history, "project_dir": stage["project_dir"],
+            "attempt_deadline_at_epoch": attempt_deadline,
+            "review_revalidation_admission_ref": admission["artifact_ref"], **self._stage_assignment_fields(plan)}
+        self._checkpoint(f"{stage_id}:review_revalidation_admitted", force=True)
+        descriptor = json.loads(Path(stage["config_path"]).read_text())
+        chief = deepcopy(retained["result"])
+        bundle = {"reports": retained["peer_reports"], "usage": {}, "model_enabled": True}
+        try:
+            report = self._run_specialist_verifier(stage, plan, descriptor, bundle, chief, stage_result=chief)
+            if not isinstance(report, dict) or report.get("status") != "succeeded":
+                if isinstance(report, dict) and isinstance(report.get("failure"), dict):
+                    raise ModelCallError.from_failure(report.get("error") or "topic verifier request failed", report["failure"])
+                raise ModelWorkBlocked("topic review revalidation did not produce a complete independent decision")
+            response = report.get("response", {})
+            if (response.get("decision") not in {"accept", "hold"}
+                    or (response["decision"] == "accept" and any(response.get(key) for key in ("blocking_findings", "required_revisions", "critical_findings")))):
+                raise ModelWorkBlocked("topic review revalidation has contradictory admission obligations", failure_class="model_contract")
+        except Exception as error:
+            usage = self._specialist_usage([report]) if "report" in locals() and isinstance(report, dict) else deepcopy(getattr(error, "usage", {}))
+            failed = self.departments.finish_stage(stage_id, "topic_discovery", attempt_number=number,
+                outcome="failed", output_ref=chief["output_path"], usage=usage, error=str(error),
+                verifier_result=report if "report" in locals() and isinstance(report, dict) else None)
+            self.tasks.finish_attempt(attempt_id, "failed", usage=usage)
+            self.tasks.transition(task_id, "blocked", "command.composer")
+            self.stage_records[stage_id].update(status="review_revalidation_failed", error=str(error),
+                                               **self._stage_assignment_fields(plan, failed))
+            self.status = "paused"
+            self._checkpoint(f"{stage_id}:review_revalidation_failed", force=True)
+            raise
+        response = report.get("response", {})
+        outcome = "completed" if response.get("decision") == "accept" else "candidate_needs_review"
+        finished = self.departments.finish_stage(stage_id, "topic_discovery", attempt_number=number,
+            outcome=outcome, output_ref=chief["output_path"], usage=report.get("usage", {}), verifier_result=report)
+        self.tasks.finish_attempt(attempt_id, "succeeded", usage=report.get("usage", {}))
+        self.tasks.transition(task_id, "awaiting_review", "command.composer")
+        self.tasks.transition(task_id, "completed", "command.composer")
+        context = deepcopy(self.context[stage_id])
+        context.update(status=outcome, specialist_verifier=deepcopy(report),
+            review_revalidation={"admission_ref": admission["artifact_ref"], "producer_calls_replayed": 0,
+                                "peer_calls_replayed": 0, "prior_verifier_execution_ref": retained["prior_verifier_execution_ref"]})
+        if response.get("decision") == "accept":
+            context.pop("deferred_review_findings", None)
+        else:
+            context["deferred_review_findings"] = deepcopy(response)
+        self.context[stage_id] = context
+        self.stage_records[stage_id].update(status=outcome, **self._stage_assignment_fields(plan, finished))
+        self.stage_records[stage_id]["usage"] = deepcopy(report.get("usage", {}))
+        self.stage_records[stage_id].pop("error", None)
+        self._archive_stage_attempt(self.stage_records[stage_id], cycle=self.continuation_cycles,
+                                    default_project_dir=stage["project_dir"])
+        self._checkpoint(f"{stage_id}:review_revalidation_completed", force=True)
+        return deepcopy(context)
 
     @staticmethod
     def _normalize_research_request_value(value):
@@ -8062,6 +8356,16 @@ class ComposerRunner:
             return result
         if result.get("status") not in {"completed", "accepted"}:
             return result
+        if stage is not None:
+            obligation = self._topic_review_obligation(stage)
+            if obligation is not None and not self._topic_review_obligation_is_closed(stage, result, obligation):
+                held = deepcopy(result)
+                held.update(status="research_expansion_required", review_status="topic_review_obligations_unresolved",
+                            preserve_work_orders=True, topic_review_obligation=deepcopy(obligation))
+                for key in ("research_requests", "research_expansion_requests"):
+                    held[key] = [*deepcopy([item for item in result.get(key, [])
+                                           if item.get("id") != obligation["id"]]), deepcopy(obligation)]
+                return held
         state = result.get("gap_state")
         if state == "eligible_for_experiment":
             topic_context = self.context.get(topic_stage["id"], {})
@@ -8400,6 +8704,10 @@ class ComposerRunner:
                 "Rebuild the literature map around the current question and preserve only evidence "
                 "that is relevant to the selected study.\n" + topic["research_question"]
                 + program_context)
+            obligation = self._topic_review_obligation(stage)
+            if obligation is not None:
+                config["supplied_context"] += "\nOwned independent topic review obligations:\n" + json.dumps(
+                    obligation["attempt_lineage"], ensure_ascii=False, sort_keys=True)
         return config
 
     @staticmethod
@@ -8732,6 +9040,9 @@ class ComposerRunner:
         output = []
         for item in requests if isinstance(requests, list) else []:
             if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("attempt_lineage"), dict) and isinstance(item["attempt_lineage"].get("deferred_obligation"), dict):
+                output.append(_preserve_response_value(item))
                 continue
             entry = {
                 key: (item.get(key)[:2400] if isinstance(item.get(key), str)
@@ -11705,6 +12016,18 @@ class ComposerRunner:
                 "dispatch_usage": usage, "blocked_origin": blocked_origin}
 
     def _require_capability_evidence_before_authoring(self, stage, topic_result, descriptor):
+        for survey_stage in self.workflow.get("stages", []):
+            if survey_stage.get("kind") != "survey":
+                continue
+            ancestor = self._topic_stage_for_survey(survey_stage)
+            if ancestor is None or self.context.get(ancestor["id"], {}).get("topic") != topic_result.get("topic"):
+                continue
+            obligation = self._topic_review_obligation(survey_stage)
+            if obligation is not None:
+                survey = self._survey_context_for_topic(ancestor)
+                project = survey.get("project_dir") or survey_stage["project_dir"]
+                if not self._topic_review_obligation_is_closed({**survey_stage, "project_dir": project}, survey, obligation, require_independent=True):
+                    raise ModelWorkBlocked("carried topic review obligations require independent evidence closure before source authoring")
         if not self._retained_capability_evidence_actions(stage, {"topic": topic_result.get("topic")}):
             return None
         prior = self.context.get(stage["id"], {})
@@ -12640,6 +12963,19 @@ class ComposerRunner:
             }
             review_contract = self._capability_authoring_review_contract(
                 brief["continuation"]["requests"])
+            topic_obligations = []
+            for survey_stage in self.workflow["stages"]:
+                if survey_stage.get("kind") != "survey":
+                    continue
+                topic_stage = self._topic_stage_for_survey(survey_stage)
+                if topic_stage is None or self.context.get(topic_stage["id"], {}).get("topic") != result.get("topic"):
+                    continue
+                obligation = self._topic_review_obligation(survey_stage)
+                if obligation is not None:
+                    topic_obligations.append({"obligation": obligation,
+                        "reviewed_closure": deepcopy(self.context.get(survey_stage["id"], {}).get("follow_up_result"))})
+            if topic_obligations:
+                brief["topic_review_obligations"] = _preserve_response_value(topic_obligations)
             if review_contract is not None:
                 brief["review_directive_contract"] = review_contract
             program_projection = self._topic_program_projection(result, max_alternatives=8)
@@ -14091,8 +14427,8 @@ class ComposerRunner:
                 record.pop("specialist_live", None)
         return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
-    def _survey_review_recovery_idle_frontier(self, stage):
-        """Require a durable stopped owner and an idle captured producer."""
+    def _stopped_execution_checkpoint(self):
+        """Replay the immutable owner of a stopped supervisor projection."""
         restored = self._restored_execution_frontier
         if (not isinstance(restored, dict) or restored.get("cycle") != self.continuation_cycles
                 or restored.get("status") not in {"paused", "blocked"}):
@@ -14120,11 +14456,17 @@ class ComposerRunner:
             manifest, body = matches[0]
         else:
             manifest, _, body = self._read_verified_artifact_json(row["artifact_ref"])
-        record = body.get("stages", {}).get(stage["id"], {})
         if (manifest.get("author") != "command.composer"
                 or body.get("workflow_id") != self.workflow["id"]
-                or body.get("continuation_cycles") != self.continuation_cycles
-                or stage["id"] not in body.get("continuation_pending_stage_ids", [])
+                or body.get("continuation_cycles") != self.continuation_cycles):
+            raise StateError("restored checkpoint does not own this workflow cycle")
+        return manifest, body
+
+    def _survey_review_recovery_idle_frontier(self, stage):
+        """Require a durable stopped owner and an idle captured producer."""
+        manifest, body = self._stopped_execution_checkpoint()
+        record = body.get("stages", {}).get(stage["id"], {})
+        if (stage["id"] not in body.get("continuation_pending_stage_ids", [])
                 or stage["id"] not in body.get("reopened_stage_ids", [])
                 or record.get("project_dir") != str(Path(stage["project_dir"]).resolve())):
             raise StateError("restored survey checkpoint does not own this pending producer")
@@ -19269,12 +19611,38 @@ class ComposerRunner:
             "failure_recovery": failure_recovery_projection,
         }
 
+    def _stage_acceptance_contract(self, stage):
+        descendants = set()
+        frontier = {stage["id"]}
+        while frontier:
+            children = {item["id"] for item in self.workflow["stages"]
+                        if frontier.intersection(item["depends_on"])} - descendants
+            descendants.update(children)
+            frontier = children
+        requirements = {
+            "topic_discovery": ["A structurally valid, bounded, searchable scientific question and a feasible literature-testing plan."],
+            "survey": ["Current captured sources support the declared literature claims and comparison; unresolved evidence limits and assigned obligations remain explicit."],
+            "experiment": ["The declared design, source-bound parameters and executable capability are independently reviewed; actual observations and primary outcomes have valid independent recalculation."],
+            "interpretation": ["Interpretations follow the admitted evidence and outcomes without changing the question or promoting unsupported claims."],
+            "argument": ["Every material scientific claim is supported by current evidence and the declared limitations."],
+            "paper": ["The manuscript faithfully presents the admitted claims, results, evidence and limitations under its editorial acceptance contract."],
+        }
+        target = ("bounded admission to literature survey, not final journal maturity or experiment admission"
+                  if stage["kind"] == "topic_discovery" else "independent acceptance of the declared " + stage["kind"] + " output")
+        return {"current_stage_id": stage["id"],
+            "downstream_stage_ids": [item["id"] for item in self.workflow["stages"] if item["id"] in descendants],
+            "acceptance_target": target, "current_requirements": deepcopy(requirements[stage["kind"]]),
+            "downstream_requirements": [{"target_stage_id": item["id"], "stage_kind": item["kind"],
+                "requirements": deepcopy(requirements[item["kind"]])}
+                for item in self.workflow["stages"] if item["id"] in descendants]}
+
     def _specialist_stage_packet(self, stage, descriptor, *, stage_result=None):
         """Build a bounded, non-secret packet for specialist input projection."""
         packet = {
             "objective": self.workflow["objective"],
             "stage_id": stage["id"],
             "stage_kind": stage["kind"],
+            "stage_acceptance_contract": self._stage_acceptance_contract(stage),
             "work_orders": self._follow_up_projection(self._requests_for_stage(stage)),
             "dependencies": deepcopy(self.context),
             "stage_result": self._specialist_stage_result_projection(
@@ -20011,8 +20379,9 @@ class ComposerRunner:
                           if isinstance(item, dict)}
         for report in reports:
             role = assigned_roles.get(report.get("role_id"), {})
-            report["input_scope"] = {"declared_fields": deepcopy(role.get("input_projection", [])),
-                                     "assignment_phase": role.get("assignment_phase")}
+            if role:
+                report["input_scope"] = {"declared_fields": deepcopy(role.get("input_projection", [])),
+                                         "assignment_phase": role.get("assignment_phase")}
         packet["specialist_reports"] = reports
         if stage.get("kind") == "topic_discovery":
             topic = (stage_result.get("topic")
@@ -20077,6 +20446,7 @@ class ComposerRunner:
                     if type(value) in (int, float) and math.isfinite(value) and value >= 0
                 },
                 "artifact_ref": retained["artifact_ref"],
+                "assignment_plan_ref": stage_assignment["plan_ref"],
             })
             self._specialist_progress(stage["id"], {
                 "event": "reused_durable_result",
@@ -20120,6 +20490,7 @@ class ComposerRunner:
             verifier["assigned_role"],
         )
         report["artifact_ref"] = artifact["artifact_ref"]
+        report["assignment_plan_ref"] = stage_assignment["plan_ref"]
         self._settle_stage_specialist_payment(stage, stage_assignment["plan_ref"], artifact["artifact_ref"])
         self._specialist_progress(stage["id"], {
             "event": "completed", "role": verifier.get("assigned_role"),
@@ -25978,10 +26349,33 @@ class ComposerRunner:
                 blocker["superseded_by_dossier_ref"] = corrected_manifest["artifact_ref"]
         return True
 
+    def _pause_at_stage_boundary(self, stage_id):
+        if self.stop_after_stage != stage_id:
+            return False
+        self.status = "paused"
+        self.blockers.append({"stage_id": "workflow", "boundary_stage_id": stage_id, "reason": "declared operator stage boundary reached",
+                              "stop_reason": "operator_stage_boundary"})
+        self._checkpoint(f"{stage_id}:operator_stage_boundary", force=True)
+        return True
+
     def run(self):
-        self._execution_started = True
-        self.status = "running"
         try:
+            for stage in self.workflow["stages"]:
+                if stage.get("kind") != "topic_discovery" or self._topic_review_revalidation_input(stage) is None:
+                    continue
+                try:
+                    self.revalidate_topic_review(stage["id"])
+                except Exception as error:
+                    self.status = "paused"
+                    self.blockers.append({"stage_id": stage["id"], "reason": f"{type(error).__name__}: {error}",
+                                          "stop_reason": "operational_state", "review_revalidation_required": True})
+                    self._checkpoint("paused:topic_review_revalidation", force=True)
+                    return self._finish()
+            if self.stop_after_stage is not None and self.stage_records.get(self.stop_after_stage, {}).get("status") in {"completed", "candidate_needs_review", "research_expansion_required", "review_rejected"}:
+                if self._pause_at_stage_boundary(self.stop_after_stage):
+                    return self._finish()
+            self._execution_started = True
+            self.status = "running"
             self._reconcile_interrupted_stage_attempts()
             by_id = {stage["id"]: stage for stage in self.workflow["stages"]}
             foundry_rejections = self._reconcile_interrupted_foundry_rejection(by_id)
@@ -27521,6 +27915,8 @@ class ComposerRunner:
                         self._record_feedback(stage, context)
                         self.stage_records[stage_id] = self._retire_stage_assignment(
                             self.stage_records.get(stage_id, {}))
+                        if self._pause_at_stage_boundary(stage_id):
+                            return self._finish()
                         if context.get("status") in STAGE_HOLD_STATUSES:
                             # A hold is a control decision, not a successful
                             # dependency.  Start the owning continuation now;
@@ -27762,7 +28158,7 @@ class ComposerRunner:
                     stop_reason = next((
                         item["stop_reason"] for item in active_blockers
                         if isinstance(item, dict) and item.get("stop_reason") in {
-                            "provider_configuration", "provider_rate_limit"}
+                            "provider_configuration", "provider_rate_limit", "operator_stage_boundary"}
                     ), None)
                 if stop_reason is None and self.status in {"paused", "blocked"} and any(
                         isinstance(item, dict)

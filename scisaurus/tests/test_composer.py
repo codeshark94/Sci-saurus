@@ -67,6 +67,310 @@ class _ComposerTestSpecialistClient:
 
 
 class ComposerWorkflowTests(unittest.TestCase):
+    def _owned_held_topic(self, root, *, include_experiment=True):
+        workflow = self._workflow(root)
+        workflow["time_policy"]["hard_seconds"] = 120
+        workflow["retry_policy"] = {"mode": "bounded", "max_attempts": 1, "backoff_seconds": 0}
+        workflow["continuation_policy"] = {"mode": "bounded", "max_cycles": 1}
+        workflow["progression_policy"] = "forward_first"
+        descriptor = {"model": {"base_url": "http://unused.invalid", "model": "test", "timeout_seconds": 10}}
+        Path(workflow["stages"][0]["config_path"]).write_bytes(canonical_bytes(descriptor))
+        topic_dir = root / "topic"; topic_dir.mkdir()
+        stage = {**deepcopy(workflow["stages"][0]), "id": "topic", "kind": "topic_discovery",
+                 "project_dir": str(topic_dir), "deadline_seconds": 60, "depends_on": []}
+        workflow["stages"].insert(0, stage)
+        workflow["stages"][1]["depends_on"] = ["topic"]
+        workflow["completion"]["required_stage_ids"].insert(0, "topic")
+        if not include_experiment:
+            workflow["stages"] = workflow["stages"][:-1]
+            workflow["completion"]["required_stage_ids"].remove("experiment")
+        runner = ComposerRunner(workflow)
+        self.addCleanup(runner.close)
+        output = (topic_dir / "topic.json").resolve(); output.write_bytes(canonical_bytes(topic_package()))
+        result = {"stage_id": "topic", "kind": "topic_discovery", "status": "completed",
+                  "project_dir": str(topic_dir), "output_path": str(output), "usage": {},
+                  "topic": deepcopy(topic_package()["candidates"][1])}
+        cache = ModelWorkCache(runner.store, runner._publish)
+        cache.put("owned-topic-production", {"status": "succeeded", "result": result,
+                    "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest()})
+        runner.tasks.create("topic-stage", "production", {}, "command.composer")
+        runner.tasks.transition("topic-stage", "queued", "command.composer")
+        runner.tasks.start_attempt("topic-stage", "topic-stage-attempt", owner="command.composer", lease_ttl_seconds=60,
+            payload={"stage_id": "topic", "kind": "topic_discovery", "attempt_number": 1,
+                     "project_dir": str(topic_dir), "model_budget_cycle": 0})
+        plan = runner.departments.begin_stage("topic", "topic_discovery", attempt_number=1,
+            input_ref={"kind": "composer_stage_task", "ref": "topic-stage", "digest": "a" * 64},
+            deadline_seconds=60, active_role_ids=["frontier-scout"])
+        runner.stage_records["topic"] = {"kind": "topic_discovery", "status": "running",
+            "task_id": "topic-stage", "attempt_id": "topic-stage-attempt", "attempt_number": 1,
+            "attempt_count": 1, "project_dir": str(topic_dir), **runner._stage_assignment_fields(plan)}
+        class HeldClient(_ComposerTestSpecialistClient):
+            def complete(self, *, system, prompt, images=None):
+                packet = json.loads(prompt)
+                if "verifier_contract" in packet:
+                    body = {"decision": "hold", "rationale": "Bounded admission evidence is absent.",
+                        "blocking_findings": ["The selected comparator is not established by the cited source."],
+                        "required_revisions": ["Supply independently checked provenance for the selected numerical inputs."],
+                        "repair_scope": ["A different branch might be useful."],
+                        "deferred_gates": ["Recalculate the later experiment outputs."]}
+                    return ModelResult(text=json.dumps(body), model="test", usage={"model_calls": 1, "input_tokens": 1, "output_tokens": 1}, elapsed_seconds=.001, finish_reason="stop")
+                return super().complete(system=system, prompt=prompt, images=images)
+        with patch("scisaurus.runtime.specialists.ModelClient", HeldClient), \
+             patch("scisaurus.runtime.composer.VERIFIER_SYSTEM", "legacy-verifier-contract"), \
+             patch("scisaurus.runtime.specialists.VERIFIER_SYSTEM", "legacy-verifier-contract"):
+            bundle = runner._publish_specialist_reports(stage, plan,
+                runner._run_specialist_pool(stage, plan, descriptor, stage_result=result))
+            verifier = runner._run_specialist_verifier(stage, plan, descriptor, bundle, result, stage_result=result)
+        self.assertEqual(verifier.get("status"), "succeeded", verifier)
+        finished = runner.departments.finish_stage("topic", "topic_discovery", attempt_number=1,
+            outcome="candidate_needs_review", output_ref=str(output), usage=runner._specialist_usage([*bundle["reports"], verifier]),
+            specialist_results=bundle["reports"], verifier_result=verifier)
+        runner.tasks.finish_attempt("topic-stage-attempt", "succeeded", usage={})
+        runner.tasks.transition("topic-stage", "awaiting_review", "command.composer")
+        runner.tasks.transition("topic-stage", "completed", "command.composer")
+        runner.context["topic"] = {**result, "status": "candidate_needs_review", "specialist_reports": bundle["reports"],
+                                   "specialist_verifier": verifier, "deferred_review_findings": verifier["response"]}
+        runner.stage_records["topic"].update(status="candidate_needs_review", **runner._stage_assignment_fields(plan, finished))
+        return runner, stage, descriptor
+
+    def test_owned_topic_hold_reaches_source_and_blocks_unsupported_authoring(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner, topic_stage, _ = self._owned_held_topic(Path(path)); self.addCleanup(runner.close)
+            source, experiment = runner.workflow["stages"][1:]
+            request = runner._topic_review_obligation(source)
+            self.assertEqual(runner._requests_for_stage(source), [request])
+            self.assertIn("selected comparator", request["objective"])
+            self.assertIn("numerical inputs", request["objective"])
+            self.assertNotIn("different branch", request["objective"])
+            self.assertNotIn("later experiment outputs", request["objective"])
+            self.assertEqual(request["attempt_lineage"]["research_question"], runner.context["topic"]["topic"]["research_question"])
+            completed = {"status": "completed", "gap_state": "eligible_for_experiment"}
+            self.assertEqual(runner._gate_free_topic_survey(completed, stage=source)["status"], "research_expansion_required")
+            limited = {**completed, "follow_up_result": {"orders": [{"id": request["id"], "status": "limited"}]}}
+            with patch.object(runner, "_survey_work_order_was_fulfilled", return_value=True):
+                self.assertFalse(runner._topic_review_obligation_is_closed(source, limited, request))
+                resolved = {**completed, "follow_up_result": {"orders": [{"id": request["id"], "status": "resolved"}]}}
+                self.assertEqual(runner._gate_free_topic_survey(resolved, stage=source), resolved)
+            runner.context["survey"] = limited
+            with self.assertRaisesRegex(ModelWorkBlocked, "topic review obligations"):
+                runner._require_capability_evidence_before_authoring(experiment, runner.context["topic"], {})
+            forged = deepcopy(runner.context["topic"]); forged["topic"]["research_question"] = "Different question"
+            runner.context["topic"] = forged
+            with self.assertRaisesRegex(StateError, "scientific input"):
+                runner._topic_review_obligation(source)
+
+    def test_topic_deferred_obligations_have_exact_dag_owners_and_literal_transport(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner, topic, descriptor = self._owned_held_topic(Path(path))
+            survey, experiment = runner.workflow["stages"][1:]
+            contract = runner._stage_acceptance_contract(topic)
+            self.assertEqual(contract["downstream_stage_ids"], ["survey", "experiment"])
+            self.assertIn("bounded admission to literature survey", contract["acceptance_target"])
+            packet = runner._specialist_stage_packet(topic, descriptor, stage_result=runner.context["topic"])
+            self.assertEqual(packet["stage_acceptance_contract"], contract)
+            prompt = json.loads(build_verifier_prompt(topic, packet, [], runner.context["topic"]))
+            self.assertEqual(prompt["verifier_contract"]["stage_acceptance_contract"], contract)
+            self.assertNotIn("admission_state", runner.context["topic"])
+            requirement = "Create a source-bound numeric parameter file. " + "Complete literal requirement. " * 150
+            deferred = [{"target_stage_id": "survey", "requirement": "Independently check the declared comparator.",
+                         "completion_check": "Cited captures establish or refute the comparator.", "evidence_needed": ["Exact captured source spans."]},
+                        {"target_stage_id": "experiment", "requirement": requirement,
+                         "completion_check": "The file exists and every input traces to a cited source location.",
+                         "evidence_needed": ["Versioned parameter file.", "Independent recalculation."]}]
+            verifier = runner.context["topic"]["specialist_verifier"]
+            record, _, execution = runner._read_verified_artifact_json(verifier["artifact_ref"])
+            response = {"decision": "accept", "rationale": "Searchable bounded question.",
+                        "blocking_findings": [], "required_revisions": [], "deferred_obligations": deferred,
+                        "deferred_gates": [], "repair_scope": []}
+            execution["report"]["response"] = deepcopy(response)
+            updated = runner._publish(verifier["artifact_ref"].removeprefix("artifact:").rsplit("@", 1)[0], "report", execution, record["author"])
+            runner.context["topic"]["specialist_verifier"].update(artifact_ref=updated["artifact_ref"], response=response)
+            source_orders = runner._requests_for_stage(survey)
+            experiment_orders = runner._requests_for_stage(experiment)
+            self.assertEqual(len(source_orders), 1); self.assertEqual(len(experiment_orders), 1)
+            self.assertEqual(source_orders[0]["objective"], deferred[0]["requirement"])
+            self.assertEqual(experiment_orders[0]["objective"], requirement)
+            self.assertEqual(experiment_orders[0]["attempt_lineage"]["deferred_obligation"], deferred[1])
+            self.assertEqual(runner._capability_authoring_follow_up_projection(experiment_orders), experiment_orders)
+            self.assertEqual(runner._follow_up_projection(experiment_orders)[0]["objective"], requirement)
+            self.assertEqual(experiment_orders[0]["attempt_lineage"]["verifier_execution_sha256"], updated["body_hash"])
+            validate_work_orders(runner._follow_up_projection(experiment_orders))
+            self.assertEqual(runner._requests_for_stage(topic), [])
+            for invalid in ("topic", "unknown", "sibling"):
+                bad = deepcopy(execution); bad["report"]["response"]["deferred_obligations"][0]["target_stage_id"] = invalid
+                changed = runner._publish(verifier["artifact_ref"].removeprefix("artifact:").rsplit("@", 1)[0], "report", bad, record["author"])
+                runner.context["topic"]["specialist_verifier"]["artifact_ref"] = changed["artifact_ref"]
+                with self.assertRaisesRegex(ValidationError, "downstream|current stage"):
+                    runner._requests_for_stage(survey)
+
+    def test_topic_debt_producer_closure_cannot_bypass_outer_source_hold(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner, _, _ = self._owned_held_topic(Path(path))
+            source, experiment = runner.workflow["stages"][1:]
+            order = runner._topic_review_obligation(source)
+            result = {"status": "completed", "survey_ref": "artifact:fixture/survey@1",
+                      "assessment_ref": "artifact:fixture/assessment@1", "project_dir": source["project_dir"],
+                      "follow_up_result": {"orders": [{"id": order["id"], "status": "resolved"}]}}
+            runner.context[source["id"]] = result
+            runner.stage_records[source["id"]] = {"attempt_number": 1}
+            self._survey_receipt(runner, source["id"], 1, result, outcome="candidate_needs_review", decision="hold")
+            with patch.object(runner, "_survey_work_order_was_fulfilled", return_value=True):
+                self.assertTrue(runner._topic_review_obligation_is_closed(source, result, order))
+                self.assertFalse(runner._topic_review_obligation_is_closed(source, result, order, require_independent=True))
+                with self.assertRaisesRegex(ModelWorkBlocked, "independent evidence closure"):
+                    runner._require_capability_evidence_before_authoring(experiment, runner.context["topic"], {})
+                self._survey_receipt(runner, source["id"], 2, result)
+                runner.stage_records[source["id"]]["attempt_number"] = 2
+                self.assertTrue(runner._topic_review_obligation_is_closed(source, result, order, require_independent=True))
+                runner._require_capability_evidence_before_authoring(experiment, runner.context["topic"], {})
+                substituted = {**result, "assessment_ref": "artifact:fixture/assessment@2"}
+                self.assertFalse(runner._topic_review_obligation_is_closed(source, substituted, order, require_independent=True))
+
+    def test_stop_after_stage_is_an_owned_pause_before_any_next_producer(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path); workflow = self._workflow(root)
+            for invalid in ("missing", True, ""):
+                with self.assertRaisesRegex(ValidationError, "declared workflow stage"):
+                    ComposerRunner(workflow, stop_after_stage=invalid)
+            runner = ComposerRunner(workflow, stop_after_stage="survey")
+            calls = []
+            def produce(stage, **kwargs):
+                calls.append(stage["id"])
+                output = root / (stage["id"] + "-result.json"); output.write_text("{}")
+                return {"status": "completed", "output_path": str(output), "project_dir": stage["project_dir"], "stage_id": stage["id"]}
+            with patch.object(runner, "_run_stage", side_effect=produce), patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient):
+                result = runner.run()
+            self.assertEqual(calls, ["survey"])
+            self.assertEqual(result["status"], "paused")
+            self.assertEqual(result["interim_report"]["stop_reason"], "operator_stage_boundary")
+            self.assertEqual(result["stages"]["survey"]["status"], "completed")
+            self.assertIn("verifier_artifact_ref", result["stages"]["survey"])
+            deadline, usage = result["deadline_at_epoch"], result["usage"]
+            resumed = ComposerRunner(workflow, resume=True, stop_after_stage="survey")
+            with patch.object(resumed, "_run_stage", side_effect=AssertionError("boundary must not dispatch")):
+                repeated = resumed.run()
+            self.assertEqual(repeated["status"], "paused")
+            self.assertEqual(repeated["usage"], usage); self.assertEqual(repeated["deadline_at_epoch"], deadline)
+            resumed = ComposerRunner(workflow, resume=True)
+            with patch.object(resumed, "_run_stage", side_effect=produce), patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient):
+                advanced = resumed.run()
+            self.assertEqual(calls, ["survey", "experiment"])
+            self.assertEqual(advanced["status"], "completed")
+
+    def test_topic_review_contract_revalidation_reuses_paid_production_and_peers_after_native_resume(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner, stage, _ = self._owned_held_topic(Path(path))
+            workflow = deepcopy(runner.workflow); before = deepcopy(runner.usage); deadline = runner.deadline_epoch
+            producer = Path(runner.context["topic"]["output_path"]).read_bytes()
+            old = deepcopy(runner.context["topic"]["specialist_verifier"])
+            peers = deepcopy(runner.context["topic"]["specialist_reports"])
+            runner.stage_records["topic"]["attempt_deadline_at_epoch"] = time.time() - 1
+            runner.status = "paused"; runner._checkpoint("paused", force=True); runner.close()
+            resumed = ComposerRunner(workflow, resume=True); self.addCleanup(resumed.close)
+            with patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient), \
+                 patch("scisaurus.runtime.topic_discovery.TopicDiscoveryRunner.run", side_effect=AssertionError("must not regenerate topic")):
+                current = resumed.revalidate_topic_review("topic")
+                self.assertEqual(current["status"], "completed")
+                self.assertNotIn("deferred_review_findings", current)
+                self.assertIsNone(resumed.revalidate_topic_review("topic"))
+            self.assertEqual(resumed.usage["model_calls"], before["model_calls"] + 1)
+            self.assertEqual(resumed.deadline_epoch, deadline); self.assertEqual(resumed.continuation_cycles, 0)
+            self.assertEqual(Path(current["output_path"]).read_bytes(), producer)
+            self.assertEqual(current["specialist_reports"], peers)
+            self.assertEqual(resumed._read_verified_artifact_json(old["artifact_ref"])[2]["report"]["response"]["decision"], "hold")
+            new_execution = resumed._read_verified_artifact_json(current["specialist_verifier"]["artifact_ref"])[2]
+            for report, peer in zip(new_execution["specialist_reports"], peers):
+                self.assertEqual({key: value for key, value in report.items() if key != "input_scope"}, peer)
+                self.assertEqual(report["input_scope"]["contract_state"], "retained_original")
+                self.assertEqual(report["input_scope"]["execution_ref"], peer["artifact_ref"])
+            self.assertEqual(new_execution["chief_result"]["topic"], current["topic"])
+            self.assertEqual(current["review_revalidation"]["producer_calls_replayed"], 0)
+            self.assertIsNone(resumed._topic_review_obligation(resumed.workflow["stages"][1]))
+
+    def test_topic_review_revalidation_preserves_known_failed_cost_and_routes_fresh_hold_on_native_run(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner, stage, _ = self._owned_held_topic(Path(path), include_experiment=False)
+            workflow = deepcopy(runner.workflow); before = deepcopy(runner.usage); deadline = runner.deadline_epoch
+            runner.status = "paused"; runner._checkpoint("paused", force=True); runner.close()
+            failed = ComposerRunner(workflow, resume=True)
+            class FailedClient(_ComposerTestSpecialistClient):
+                def complete(self, **kwargs):
+                    error = ModelCallError("known bad request", outcome_known=True, attempts=1, status_code=400)
+                    error.usage = {"model_calls": 1, "input_tokens": 3, "output_tokens": 2}
+                    raise error
+            with patch("scisaurus.runtime.specialists.ModelClient", FailedClient):
+                with self.assertRaises(ModelCallError):
+                    failed.revalidate_topic_review("topic")
+            self.assertEqual(failed.usage["model_calls"], before["model_calls"] + 1)
+            self.assertEqual(failed.context["topic"]["specialist_verifier"]["response"]["decision"], "hold")
+            failed.close()
+            resumed = ComposerRunner(workflow, resume=True); self.addCleanup(resumed.close)
+            prompts = []
+            class CurrentHold(_ComposerTestSpecialistClient):
+                def complete(self, *, system, prompt, images=None):
+                    prompts.append(json.loads(prompt))
+                    return ModelResult(text=json.dumps({"decision": "hold", "rationale": "One evidence obligation remains.",
+                        "blocking_findings": ["Current source evidence does not establish the comparator."],
+                        "required_revisions": [], "deferred_gates": [], "repair_scope": []}), model="test",
+                        usage={"model_calls": 1, "input_tokens": 1, "output_tokens": 1}, elapsed_seconds=.001, finish_reason="stop")
+            boundary = []
+            def source_boundary(current, **kwargs):
+                self.assertEqual(current["kind"], "survey")
+                boundary.extend(resumed._survey_producer_work_orders(current))
+                raise KeyboardInterrupt("source boundary")
+            with patch("scisaurus.runtime.specialists.ModelClient", CurrentHold), \
+                 patch.object(resumed, "_run_stage", side_effect=source_boundary), \
+                 patch.object(resumed, "_run_specialist_pool", return_value={"model_enabled": False, "reports": [], "by_role": {}, "usage": {}}):
+                result = resumed.run()
+            self.assertEqual(result["status"], "paused", result.get("blockers"))
+            self.assertEqual(len(prompts), 1)
+            self.assertEqual(len(boundary), 1, result.get("blockers"))
+            self.assertIn("Current source evidence", boundary[0]["objective"])
+            self.assertEqual(result["usage"]["model_calls"], before["model_calls"] + 2)
+            self.assertEqual(resumed.continuation_cycles, 0, result.get("department_activity")); self.assertEqual(resumed.deadline_epoch, deadline)
+
+    def test_topic_review_revalidation_rejects_changed_production_and_contradictory_owned_accept(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner, stage, _ = self._owned_held_topic(Path(path)); self.addCleanup(runner.close)
+            source = runner.workflow["stages"][1]
+            original = deepcopy(runner.context["topic"]["specialist_verifier"])
+            _, _, body = runner._read_verified_artifact_json(original["artifact_ref"])
+            for field in ("blocking_findings", "required_revisions", "critical_findings"):
+                changed = deepcopy(body); changed["report"]["response"] = {"decision": "accept", field: ["Unresolved material debt."]}
+                artifact = runner._publish(original["artifact_ref"].removeprefix("artifact:").rsplit("@", 1)[0],
+                    "report", changed, body["assigned_role"])
+                runner.context["topic"]["specialist_verifier"] = {**original, "artifact_ref": artifact["artifact_ref"]}
+                with self.assertRaisesRegex(StateError, "blocking admission obligations"):
+                    runner._topic_review_obligation(source)
+            runner.context["topic"]["specialist_verifier"] = original
+            Path(runner.context["topic"]["output_path"]).write_text("{}")
+            with self.assertRaisesRegex(StateError, "immutable completed producer"):
+                runner._topic_review_revalidation_input(stage)
+
+    def test_interrupted_topic_revalidation_reuses_the_paid_verifier_without_recreating_topic(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner, _, _ = self._owned_held_topic(Path(path), include_experiment=False)
+            workflow = deepcopy(runner.workflow); before = deepcopy(runner.usage); deadline = runner.deadline_epoch
+            runner.status = "paused"; runner._checkpoint("paused", force=True); runner.close()
+            first = ComposerRunner(workflow, resume=True)
+            settle = first._settle_stage_specialist_payment
+            def stop_after_payment(*args):
+                paid = settle(*args)
+                raise KeyboardInterrupt("review payment boundary")
+            with patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient), \
+                 patch.object(first, "_settle_stage_specialist_payment", side_effect=stop_after_payment):
+                stopped = first.run()
+            self.assertEqual(stopped["status"], "paused")
+            self.assertEqual(stopped["usage"]["model_calls"], before["model_calls"] + 1)
+            second = ComposerRunner(workflow, resume=True); self.addCleanup(second.close)
+            with patch("scisaurus.runtime.specialists.ModelClient", side_effect=AssertionError("paid review must be reused")), \
+                 patch("scisaurus.runtime.topic_discovery.TopicDiscoveryRunner.run", side_effect=AssertionError("paid topic must be reused")):
+                current = second.revalidate_topic_review("topic")
+            self.assertEqual(current["status"], "completed")
+            self.assertEqual(second.usage["model_calls"], before["model_calls"] + 1)
+            self.assertEqual(second.continuation_cycles, 0); self.assertEqual(second.deadline_epoch, deadline)
+            self.assertEqual(current["specialist_verifier"]["usage"], {})
+
     def test_admitted_legacy_format_digest_resolves_only_its_owned_immutable_dossier(self):
         with tempfile.TemporaryDirectory() as path:
             runner = ComposerRunner(self._workflow(Path(path)))

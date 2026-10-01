@@ -220,6 +220,8 @@ def main(argv=None) -> int:
         "--workflow", required=True,
         help="composer workflow JSON; resume supports a bounded-to-deadline continuation update",
     )
+    p_composer.add_argument(
+        "--stop-after-stage", help="pause after the named workflow stage settles for inspection")
     p_composer.add_argument("--resume", action="store_true", help="resume the matching composer project")
     p_composer.add_argument(
         "--extend-deadline-seconds", type=float,
@@ -285,11 +287,13 @@ def main(argv=None) -> int:
                 result = supervise_composer(
                     workflow, initial_resume=args.resume,
                     initial_additional_seconds=args.extend_deadline_seconds,
-                    poll_seconds=args.watch_interval, on_progress=on_progress)
+                    poll_seconds=args.watch_interval, on_progress=on_progress,
+                    stop_after_stage=args.stop_after_stage)
             else:
                 result = ComposerRunner(workflow, resume=args.resume,
                                         additional_seconds=args.extend_deadline_seconds,
-                                        on_progress=on_progress).run()
+                                        on_progress=on_progress,
+                                        stop_after_stage=args.stop_after_stage).run()
         except (OSError, ValueError, ValidationError) as exc:
             print(f"composer workflow rejected: {exc}", file=sys.stderr)
             return 2

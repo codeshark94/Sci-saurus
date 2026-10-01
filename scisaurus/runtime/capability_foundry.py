@@ -1674,6 +1674,16 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
     if (isinstance(brief, dict) and "repair_evidence_frontier_sha256" in brief
             and brief["repair_evidence_frontier_sha256"] != frontier_sha256):
         raise ValidationError("repair evidence frontier fingerprint does not match its exact content")
+    obligations = brief.get("topic_review_obligations") if isinstance(brief, dict) else None
+    if obligations is not None and (
+            not isinstance(obligations, list) or any(not isinstance(item, dict) for item in obligations)):
+        raise ValidationError("topic review obligations must be a list of objects")
+    obligations = _preserve_response_value(obligations) if obligations is not None else None
+    obligations_sha256 = (hashlib.sha256(canonical_bytes(obligations)).hexdigest()
+                          if obligations is not None else None)
+    if (isinstance(brief, dict) and "topic_review_obligations_sha256" in brief
+            and brief["topic_review_obligations_sha256"] != obligations_sha256):
+        raise ValidationError("topic review obligation fingerprint does not match its exact content")
     output_contract = {"updates": {
         "executor_source": (
             "optional {'edits':[{'old':unique_text,'new':replacement}]} or a fingerprinted duplicate-only "
@@ -1746,6 +1756,8 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
             "repair_plan": selected_plan,
             "repair_evidence_frontier": frontier,
             "repair_evidence_frontier_sha256": frontier_sha256,
+            "topic_review_obligations": obligations,
+            "topic_review_obligations_sha256": obligations_sha256,
             "repair_plan_sha256": (hashlib.sha256(canonical_bytes(selected_plan)).hexdigest()
                                    if selected_plan is not None else None),
         },

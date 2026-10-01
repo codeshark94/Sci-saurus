@@ -65,6 +65,7 @@ class SlowFixtureRunner(_FixtureRunner):
 
 class CompletedFixtureRunner(_FixtureRunner):
     def __init__(self, value, *, resume, on_progress, **kwargs):
+        self.stop_after_stage = kwargs.get("stop_after_stage")
         self.additional_seconds = kwargs.get("additional_seconds")
         self.on_progress = on_progress
         self.root = Path(value["project_id"])
@@ -78,10 +79,60 @@ class CompletedFixtureRunner(_FixtureRunner):
         self.on_progress({"fixture_pid": os.getpid(), "fresh_model_lock": acquired})
         time.sleep(self.delay)
         return {"status": "completed", "remaining_seconds": 10, "stages": {}, "blockers": [],
-                "continuation_cycles": 0, "additional_seconds": self.additional_seconds}
+                "continuation_cycles": 0, "additional_seconds": self.additional_seconds,
+                "stop_after_stage": self.stop_after_stage}
 
 
 class ComposerSupervisorTests(unittest.TestCase):
+    def test_stage_boundary_is_forwarded_in_inline_and_spawn_paths(self):
+        for watchdog in (False, True):
+            with self.subTest(watchdog=watchdog), tempfile.TemporaryDirectory() as path:
+                workflow = {"id": "boundary-wire", "project_id": path,
+                            "stages": [{"id": "topic"}]}
+                with patch("scisaurus.runtime.composer_supervisor.ComposerRunner", CompletedFixtureRunner):
+                    result = supervise_composer(workflow, stop_after_stage="topic",
+                                                process_watchdog=watchdog, poll_seconds=0)
+                self.assertEqual(result["stop_after_stage"], "topic")
+
+    def test_stage_boundary_stops_before_recoverable_requests(self):
+        supervisor = ComposerSupervisor({"project_id": "/unused"})
+        base = {"status": "paused", "remaining_seconds": 100,
+                "active_research_requests": [{"objective": "Resolve evidence"}]}
+        blocker = {"stop_reason": "operator_stage_boundary", "recoverable": True}
+        self.assertFalse(supervisor._should_resume({**base, "active_blockers": [blocker]}))
+        self.assertFalse(supervisor._should_resume({**base, "active_blockers": [],
+                         "interim_report": {"stop_reason": "operator_stage_boundary"}}))
+        self.assertTrue(supervisor._should_resume({**base, "active_blockers": [],
+                                                  "blockers": [blocker]}))
+
+    def test_unknown_stage_boundary_rejected_without_state_creation(self):
+        with tempfile.TemporaryDirectory() as path:
+            project = Path(path) / "unused"
+            for target in ("unknown", 1, ""):
+                with self.subTest(target=target), self.assertRaises(ValidationError):
+                    ComposerSupervisor({"project_id": str(project), "stages": [{"id": "topic"}]},
+                                       stop_after_stage=target)
+            self.assertFalse(project.exists())
+
+    def test_cli_forwards_stage_boundary_in_both_execution_modes(self):
+        from scisaurus.cli import main
+        with tempfile.TemporaryDirectory() as path:
+            workflow = Path(path) / "workflow.json"
+            workflow.write_text(json.dumps({"id": "cli-wire", "project_id": path}))
+            result = {"status": "paused", "elapsed_seconds": 1,
+                      "stages": {}, "release_status": "held"}
+            for watch in (False, True):
+                with self.subTest(watch=watch), patch("builtins.print"), \
+                        patch("scisaurus.runtime.composer.ComposerRunner") as runner, \
+                        patch("scisaurus.runtime.composer_supervisor.supervise_composer", return_value=result) as supervise:
+                    runner.return_value.run.return_value = result
+                    args = ["run-composer", "--workflow", str(workflow), "--stop-after-stage", "topic"]
+                    if watch:
+                        args.append("--watch")
+                    self.assertEqual(main(args), 3)
+                    call = supervise.call_args if watch else runner.call_args
+                    self.assertEqual(call.kwargs["stop_after_stage"], "topic")
+
     def test_spawn_does_not_inherit_thread_locks_and_calls_progress_in_parent(self):
         from scisaurus.runtime.models import _MODEL_PROVIDER_COOLDOWN_LOCK
         with tempfile.TemporaryDirectory() as path:

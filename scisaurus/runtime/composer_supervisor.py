@@ -38,14 +38,14 @@ TERMINAL_STATUSES = frozenset({"completed", "candidate_needs_review"})
 STOP_REASONS = frozenset({
     "hard_deadline", "required_stage_window_does_not_fit_remaining_deadline",
     "provider_configuration", "provider_rate_limit", "missing_stage_input", "stage_quota_exhausted",
-    "workflow_validation", "operational_state",
+    "workflow_validation", "operational_state", "operator_stage_boundary",
 })
 SUPERVISOR_SCHEMA_VERSION = "composer-supervisor-3"
 DEFAULT_WATCHDOG_SECONDS = 300.0
 
 
 def _composer_child_entry(workflow, resume, result_pipe,
-                          additional_seconds=None, runner_type=ComposerRunner):
+                          additional_seconds=None, runner_type=ComposerRunner, stop_after_stage=None):
     """Run one Composer attempt in a killable process.
 
     The parent owns supervision.  A provider or a library call that ignores
@@ -62,6 +62,8 @@ def _composer_child_entry(workflow, resume, result_pipe,
 
     try:
         runner_options = {"resume": resume, "on_progress": lambda state: publish({"kind": "progress", "state": state})}
+        if stop_after_stage is not None:
+            runner_options["stop_after_stage"] = stop_after_stage
         if additional_seconds is not None:
             runner_options["additional_seconds"] = additional_seconds
         runner = runner_type(workflow, **runner_options)
@@ -271,7 +273,7 @@ class ComposerSupervisor:
     """Keep a Composer process alive across recoverable child exits."""
 
     def __init__(self, workflow, *, initial_resume=False, initial_additional_seconds=None,
-                 poll_seconds=5.0,
+                 poll_seconds=5.0, stop_after_stage=None,
                  on_progress=None, process_watchdog=True,
                  watchdog_seconds=DEFAULT_WATCHDOG_SECONDS):
         if not isinstance(workflow, dict):
@@ -288,6 +290,11 @@ class ComposerSupervisor:
                      or initial_additional_seconds <= 0)):
             raise ValidationError(
                 "supervisor initial_additional_seconds must be finite and positive")
+        if stop_after_stage is not None and (not isinstance(stop_after_stage, str)
+                or stop_after_stage not in {stage.get("id") for stage in workflow.get("stages", [])
+                                            if isinstance(stage, dict)}):
+            raise ValidationError("stop_after_stage must name a declared workflow stage")
+        self.stop_after_stage = stop_after_stage
         self.workflow = deepcopy(workflow)
         self.initial_resume = bool(initial_resume)
         self.initial_additional_seconds = (
@@ -750,7 +757,7 @@ class ComposerSupervisor:
         if isinstance(active_blockers, list) and any(
                 isinstance(blocker, dict)
                 and (blocker.get("failure_class") == "harness_bug"
-                     or blocker.get("stop_reason") == "operational_state")
+                     or blocker.get("stop_reason") in {"operational_state", "operator_stage_boundary"})
                 for blocker in active_blockers):
             # Retrying a runtime defect without a source fix consumes provider
             # calls while preserving the same failed execution path.
@@ -866,6 +873,8 @@ class ComposerSupervisor:
             self._write_state(child_status="starting", action="dispatch", result=None)
             try:
                 runner_options = {"resume": resume, "on_progress": self.on_progress}
+                if self.stop_after_stage is not None:
+                    runner_options["stop_after_stage"] = self.stop_after_stage
                 if additional_seconds is not None:
                     runner_options["additional_seconds"] = additional_seconds
                 runner = ComposerRunner(self.workflow, **runner_options)
@@ -1031,7 +1040,7 @@ class ComposerSupervisor:
                 authorized_deadline = prior_deadline + additional_seconds
         child = context.Process(
             target=_composer_child_entry,
-            args=(self.workflow, resume, child_pipe, additional_seconds, ComposerRunner),
+            args=(self.workflow, resume, child_pipe, additional_seconds, ComposerRunner, self.stop_after_stage),
             name=f"scisaurus-composer-{self.workflow.get('id', 'run')}",
         )
         try:
@@ -1160,6 +1169,8 @@ class ComposerSupervisor:
     def _run_one_in_process(self, resume, *, additional_seconds=None):
         try:
             runner_options = {"resume": resume, "on_progress": self.on_progress}
+            if self.stop_after_stage is not None:
+                runner_options["stop_after_stage"] = self.stop_after_stage
             if additional_seconds is not None:
                 runner_options["additional_seconds"] = additional_seconds
             runner = ComposerRunner(self.workflow, **runner_options)
@@ -1226,14 +1237,14 @@ class ComposerSupervisor:
 
 
 def supervise_composer(workflow, *, initial_resume=False, initial_additional_seconds=None,
-                       poll_seconds=5.0,
+                       poll_seconds=5.0, stop_after_stage=None,
                        on_progress=None, process_watchdog=True,
                        watchdog_seconds=DEFAULT_WATCHDOG_SECONDS):
     """Convenience entry point used by the CLI and the local launch script."""
     return ComposerSupervisor(
         workflow, initial_resume=initial_resume,
         initial_additional_seconds=initial_additional_seconds,
-        poll_seconds=poll_seconds,
+        poll_seconds=poll_seconds, stop_after_stage=stop_after_stage,
         on_progress=on_progress, process_watchdog=process_watchdog,
         watchdog_seconds=watchdog_seconds,
     ).run()
