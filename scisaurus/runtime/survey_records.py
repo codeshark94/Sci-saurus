@@ -13,6 +13,12 @@ MAP_FIELDS = ("problem", "approach", "finding", "limitations")
 SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
 GAP_CHECKS = ("closest-prior-work", "scope-comparability", "counterevidence", "full-text-support")
 REVIEW_CHECK_FIELDS = frozenset({"check_id", "outcome", "method", "result"})
+CRITIQUE_DISPOSITIONS = {
+    "current_defect": "The critique identifies an unsupported or unverified current assertion.",
+    "corrected": "The original defect was corrected in the current entry or relationships.",
+    "rejected": "The hypothesis is not corroborated as a defect in the current assertions.",
+    "nonassertion": "The disputed assertion is absent; the original scientific question may remain open.",
+}
 
 
 def survey_review_response_contract(current_map):
@@ -83,11 +89,36 @@ def normalize_check_envelope(value, required):
     Unresolved critique links are never inferred. Explicit links to passed
     ordinary checks can be removed only when a known non-passed link remains;
     check outcomes and scientific assertions are never changed.
+    Typed critique dispositions distinguish rejecting an allegation from
+    finding a current defect. Their canonical checks record admission status;
+    the original dispositions remain in the immutable model execution.
     """
     if not isinstance(value, dict) or not isinstance(value.get("checks"), list):
         return value
     required = tuple(required)
     required_ids = frozenset(required)
+    if "critique_adjudications" in value:
+        if set(value) != {"checks", "rationale", "critique_adjudications"}:
+            return value
+        adjudications = value["critique_adjudications"]
+        critique_ids = {key for key in required_ids if key.startswith("critique:")}
+        fields = {"check_id", "disposition", "method", "result", "affected_check_ids"}
+        if (not critique_ids or not isinstance(adjudications, list)
+                or any(not isinstance(row, dict) or set(row) != fields
+                       or not isinstance(row["check_id"], str) or row["check_id"] not in critique_ids
+                       or not isinstance(row["disposition"], str) or row["disposition"] not in CRITIQUE_DISPOSITIONS
+                       for row in adjudications)
+                or len(adjudications) != len(critique_ids)
+                or {row["check_id"] for row in adjudications} != critique_ids
+                or any(isinstance(row, dict) and isinstance(row.get("check_id"), str)
+                       and row["check_id"] in critique_ids for row in value["checks"])):
+            return value
+        value = {"rationale": value["rationale"], "checks": [*value["checks"], *[
+            {"check_id": row["check_id"],
+             "outcome": "failed" if row["disposition"] == "current_defect" else "passed",
+             "method": row["method"], "result": row["result"],
+             "affected_check_ids": row["affected_check_ids"]}
+            for row in adjudications]]}
     rows = value["checks"]
     counts = {}
     for row in rows:

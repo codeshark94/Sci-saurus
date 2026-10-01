@@ -272,6 +272,11 @@ def simulated_survey_worker(kind, params, channel):
             fields["problem"] = {"text": "Recall timing is examined.", "evidence": [proof]}
             entries.append({"work_id": wid, "inclusion": "included", "reason": "Explicitly examines recall timing.", **fields})
         value = {"entries": entries, "relationships": []}
+        if mode == "isolated-review-block" and assignment["requested_work_ids"] == ["W102"]:
+            if assignment.get("semantic_feedback"):
+                value = {"entry_updates": {"reason": "The captured study examines recall timing."}, "relationships": []}
+            else:
+                value["entries"][0]["reason"] = "The method generalizes to every task."
         if mode.startswith("semantic-") and (assignment["requested_work_ids"] == ["W101"] or mode == "semantic-many"):
             repair = assignment.get("semantic_feedback") is not None
             if repair:
@@ -338,12 +343,22 @@ def simulated_survey_worker(kind, params, channel):
                 for row in value["checks"] if target is not None
                 and row["outcome"] != "passed" and row["check_id"] in {"source-fidelity", "map-support"}]
     elif phase == "work_review":
-        if mode == "review-malformed" and assignment["entry"]["work_id"] == "W101":
+        if mode in {"review-malformed", "isolated-review-block"} and assignment["entry"]["work_id"] == "W101":
             value = {"checks": [{"check_id": "duplicate-check", "outcome": "passed",
                                   "method": "Malformed fixture response.", "result": "Not a valid focused review."}],
                      "rationale": "Malformed fixture response."}
         else:
             value = {"checks": check_rows(assignment["required_checks"]), "rationale": "Each scoped claim is supported or explicitly unknown."}
+        if mode == "isolated-review-block" and assignment["entry"]["work_id"] == "W102" and assignment["entry"]["reason"] == "The method generalizes to every task.":
+            next(row for row in value["checks"] if row["check_id"] == "reason").update(
+                outcome="failed", result="The screening rationale asserts unsupported generalization.")
+        if mode == "typed-critique-review" and assignment.get("review_obligations"):
+            critique_rows = [row for row in value["checks"] if row["check_id"].startswith("critique:")]
+            value["checks"] = [row for row in value["checks"] if not row["check_id"].startswith("critique:")]
+            value["critique_adjudications"] = [{"check_id": row["check_id"], "disposition": "rejected",
+                "method": "Compare the current entry with its captured source.",
+                "result": "The current claim is supported; the disputed allegation is rejected.",
+                "affected_check_ids": []} for row in critique_rows]
         if mode == "review-never-resolves" and assignment["entry"]["work_id"] == "W101":
             next(check for check in value["checks"] if check["check_id"] == "reason").update(
                 outcome="insufficient_evidence", result="The screening rationale remains unresolved.")
@@ -468,6 +483,116 @@ def survey_config(endpoint, mode="pass"):
 
 
 class TestSurveyRunner(unittest.TestCase):
+    def test_typed_critique_rejection_replays_through_independent_survey_gate(self):
+        from scisaurus.runtime.models import ModelResult
+        runner = self.runtime(survey_config(self.endpoint, "typed-critique-review"))
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        obligation = self.review_obligation(runner, "W101")
+        runner.review_obligations = runner._validate_review_obligations([obligation])
+        runner._review_work_claims()
+        body = runner._body(runner.work_reviews["W101"])
+        execution = runner._body(runner.store.get(body["execution_ref"]))
+        raw = ModelResult(**execution).json_object(allow_missing_closers=True)
+        self.assertEqual(raw["critique_adjudications"][0]["disposition"], "rejected")
+        self.assertEqual(body["checks"][-1]["outcome"], "passed")
+        prompt = [prompt for _, prompt in self.model_contexts(runner.control, runner.store)
+                  if prompt.get("phase") == "work_review"][-1]
+        self.assertIn("critique_adjudications", prompt["response_contract"]["top_level_fields"])
+        self.assertTrue(all(not row["check_id"].startswith("critique:") for row in prompt["response_contract"]["checks"]))
+        runner._accept_survey()
+        runner.gate.require_current(runner.survey_ref)
+
+    def test_malformed_review_does_not_block_valid_sibling_correction(self):
+        config = survey_config(self.endpoint, "isolated-review-block")
+        config["limits"]["max_rounds"] = 2
+        runner = self.runtime(config)
+        runner._initialize(); runner._setup()
+        for wid in ("W101", "W102"):
+            runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+        runner._map()
+        with self.assertRaises(ModelWorkBlocked):
+            runner._review_work_claims()
+        self.assertEqual(runner._body(runner.analysis_records["W102"])["reason"], "The captured study examines recall timing.")
+        self.assertTrue(runner._work_review_current("W102"))
+        self.assertFalse(runner._work_review_current("W101"))
+        self.assertIsNone(runner.survey_ref)
+        with self.assertRaises(ModelWorkBlocked):
+            runner._accept_survey()
+        prompts = [prompt for _, prompt in self.model_contexts(runner.control, runner.store)
+                   if prompt.get("phase") == "work_review" and prompt["entry"]["work_id"] == "W101"]
+        self.assertEqual(len(prompts), runner.config["limits"]["max_rounds"])
+
+    def test_cached_unknown_dispatch_never_defers_with_prior_contract_feedback(self):
+        config = survey_config(self.endpoint)
+        config["limits"]["max_rounds"] = 2
+        runner = self.runtime(config)
+        runner._initialize()
+        runner._complete = lambda task_id: None
+        job = {"name": "work-review-W101", "actor": "methods.work-reviewer",
+               "assignment": {"phase": "work_review"},
+               "validator": lambda value: (_ for _ in ()).throw(ValidationError("invalid checks"))}
+        unknown = {"ok": False, "error": "worker timeout", "outcome_known": False, "usage": {}}
+        calls = []
+        def dispatch(specs, **kwargs):
+            calls.append(specs)
+            if len(calls) == 1:
+                task_id = specs[0]["task_id"]
+                runner.tasks.create(task_id, "production", {}, job["actor"])
+                runner.tasks.admit(task_id, job["actor"])
+                runner.tasks.transition(task_id, "running", job["actor"])
+                execution = runner._publish(f"command/executions/{task_id}", "report", {}, job["actor"])
+                return {task_id: {"ok": True, "record_ref": execution["artifact_ref"],
+                    "result": {"text": "{}", "model": "fixture", "usage": {"model_calls": 1},
+                               "elapsed_seconds": 0.01, "finish_reason": "stop"}}}
+            return {spec["task_id"]: deepcopy(unknown) for spec in specs}
+        deferred = []
+        with patch.object(runner, "_call_batch", side_effect=dispatch):
+            with self.assertRaises(ModelWorkBlocked):
+                runner._models_checked([deepcopy(job)], on_contract_blocked=lambda *args: deferred.append(args))
+        self.assertEqual(deferred, [])
+        retained = next(row for row in ModelWorkCache(runner.store, runner._publish).entries()
+                        if row.get("dispatch_failure") == unknown)
+        self.assertEqual(retained["failure_origin"], "dispatch")
+        self.assertEqual(retained["feedback"]["error"], "invalid checks")
+        sibling = {"name": "work-review-W102", "actor": job["actor"],
+                   "assignment": {"phase": "work_review", "work_id": "W102"}, "validator": lambda value: None}
+        for status in ("blocked", "repairing"):
+            for legacy in (False, True):
+                cache = ModelWorkCache(runner.store, runner._publish)
+                body = {key: value for key, value in retained.items()
+                        if key != "cache_ref" and (not legacy or key not in {"failure_origin", "dispatch_failure"})}
+                body["status"] = status
+                cache.put(retained["cache_ref"].split("/")[-1].split("@")[0], body)
+                with self.subTest(status=status, legacy=legacy), patch.object(runner, "_call_batch") as resumed:
+                    with self.assertRaises(ModelWorkBlocked):
+                        runner._models_checked([deepcopy(job), sibling],
+                                              on_contract_blocked=lambda *args: deferred.append(args))
+                    resumed.assert_not_called()
+        self.assertEqual(deferred, [])
+
+        cache = ModelWorkCache(runner.store, runner._publish)
+        base_key = retained["cache_ref"].split("/")[-1].split("@")[0]
+        cache.put(base_key, {"status": "blocked", "failure_origin": "response_validation",
+            "failure_class": "model_contract", "repair_attempts": 2,
+            "error": f"{job['name']} did not satisfy its evidence contract: invalid checks",
+            "feedback": {"error": "invalid checks"}})
+        runner.resume_session = {"session": 7}
+        repair_assignment = runner._follow_up_assignment(job["assignment"])
+        repair_assignment["_contract_repair_boundary"] = "model-contract-repair-7"
+        repair_key = cache.key(scope=f"survey:{job['name']}", role=job["actor"], system=SYSTEM,
+                               prompt=repair_assignment, model=runner.config["model"])
+        cache.put(repair_key, {"status": "repairing", "failure_origin": "dispatch",
+            "dispatch_failure": unknown, "repair_attempts": 1,
+            "error": f"{job['name']}: worker timeout", "feedback": {"error": "invalid checks"}})
+        with patch.object(runner, "_call_batch") as resumed:
+            with self.assertRaises(ModelWorkBlocked):
+                runner._models_checked([deepcopy(job), sibling],
+                                      on_contract_blocked=lambda *args: deferred.append(args))
+            resumed.assert_not_called()
+        self.assertEqual(deferred, [])
+
     def test_follow_up_source_binding_repair_preserves_checked_sibling_and_frontier(self):
         from scisaurus.runtime.composer import ComposerRunner
         from scisaurus.runtime.model_work import ModelWorkCache
@@ -2484,7 +2609,7 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertNotIn("prior_review_response", aggregate[-1])
         self.assertEqual(set(aggregate[-1]["prior_review_receipts"]), {"review_ref", "plan_ref"})
         ledgers = [runner._body(record) for record in runner._heads("command/survey-review-repairs/")]
-        self.assertTrue(any(record["scope"]["critique_context_protocol"] == "literature-critique-transition-2"
+        self.assertTrue(any(record["scope"]["critique_context_protocol"] == "literature-critique-transition-3"
                             and record["rounds"] == 1 for record in ledgers))
 
     def test_aggregate_repair_rejects_ungranted_fields(self):
@@ -4486,6 +4611,49 @@ class TestSurveyRunner(unittest.TestCase):
 
 
 class TestSurveyContracts(unittest.TestCase):
+    def test_typed_critique_rejection_is_separate_from_claim_admission(self):
+        obligations = [{"work_id": "W1", "hypothesis": "The current finding is unsupported."}]
+        required = work_review_checks([], obligations)
+        raw = {"checks": check_rows(work_review_checks([])), "rationale": "The hypothesis is rejected on source evidence.",
+               "critique_adjudications": [{"check_id": required[-1], "disposition": "rejected",
+                   "method": "Compare the current claim with captured evidence.",
+                   "result": "The captured source supports the current finding; the allegation is not corroborated.",
+                   "affected_check_ids": []}]}
+        original = deepcopy(raw)
+        normalized = normalize_check_envelope(raw, required)
+        validate_work_review(normalized, [], review_obligations=obligations)
+        self.assertEqual(normalized["checks"][-1]["outcome"], "passed")
+        self.assertEqual(normalized["checks"][-1]["result"], raw["critique_adjudications"][0]["result"])
+        self.assertEqual(raw, original)
+        for disposition in ("corrected", "nonassertion"):
+            raw["critique_adjudications"][0]["disposition"] = disposition
+            validate_work_review(normalize_check_envelope(raw, required), [], review_obligations=obligations)
+
+    def test_typed_critique_defects_require_explicit_current_failure_links(self):
+        obligations = [{"work_id": "W1", "hypothesis": "The finding may omit its temperature."}]
+        required = work_review_checks([], obligations)
+        raw = {"checks": check_rows(work_review_checks([])), "rationale": "Check the missing condition.",
+               "critique_adjudications": [{"check_id": required[-1], "disposition": "current_defect",
+                   "method": "Inspect the measured source conditions.", "result": "The finding omits temperature.",
+                   "affected_check_ids": ["finding"]}]}
+        with self.assertRaises(ValidationError):
+            validate_work_review(normalize_check_envelope(raw, required), [], review_obligations=obligations)
+        next(row for row in raw["checks"] if row["check_id"] == "finding")["outcome"] = "insufficient_evidence"
+        normalized = normalize_check_envelope(raw, required)
+        validate_work_review(normalized, [], review_obligations=obligations)
+        self.assertEqual(normalized["checks"][-1]["outcome"], "failed")
+        for mutation in ("unknown", "missing", "duplicate", "mixed", "unlinked", "false_resolved"):
+            value = deepcopy(raw)
+            row = value["critique_adjudications"][0]
+            if mutation == "unknown": row["disposition"] = "unsupported-alias"
+            elif mutation == "missing": value["critique_adjudications"] = []
+            elif mutation == "duplicate": value["critique_adjudications"].append(deepcopy(row))
+            elif mutation == "mixed": value["checks"].append(check_rows([required[-1]])[0])
+            elif mutation == "unlinked": row["affected_check_ids"] = []
+            else: row["disposition"] = "rejected"
+            with self.subTest(mutation=mutation), self.assertRaises(ValidationError):
+                validate_work_review(normalize_check_envelope(value, required), [], review_obligations=obligations)
+
     def test_repair_entry_work_id_resolves_only_to_supplied_current_version(self):
         entries = {"W1": "artifact:kb/entry/W1@3"}
         raw = {"repairs": [{"entry_ref": "W1", "entry_fields": ["reason"], "relationship_refs": [], "rationale": "Narrow the current reason."}]}

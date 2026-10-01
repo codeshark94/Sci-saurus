@@ -37,7 +37,7 @@ from scisaurus.runtime.operation_adapters import get_adapter
 from scisaurus.runtime.scores import exact, identifier
 from scisaurus.runtime.survey_config import validate_survey_config, search_query
 from scisaurus.runtime.survey_records import (
-    MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, normalize_check_envelope,
+    MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, CRITIQUE_DISPOSITIONS, normalize_check_envelope,
     BODY_SECTION_MARKERS, authoritative_source, has_section_heading as _has_section_heading,
     normalize_gap_assessment_envelope, validate_map,
     validate_survey_review, validate_assessment, validate_work_review, survey_review_response_contract,
@@ -211,7 +211,7 @@ _SOURCE_EVIDENCE_POLICY = (
 )
 
 
-_CRITIQUE_CONTEXT_PROTOCOL = "literature-critique-transition-2"
+_CRITIQUE_CONTEXT_PROTOCOL = "literature-critique-transition-3"
 _CURRENT_MAP_REVIEW_PROTOCOL = "literature-current-map-review-2"
 
 
@@ -1733,7 +1733,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         }, "command.controller")
         return admitted
 
-    def _models_checked(self, jobs, *, stage="production", task_kind="production"):
+    def _models_checked(self, jobs, *, stage="production", task_kind="production", on_contract_blocked=None):
         """Retain checked siblings and bound repairs of each exact assignment."""
         def normalize_response(job, value, *, assignment=None, execution_ref=None):
             if not job.get("normalizer"):
@@ -1748,6 +1748,35 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
 
         cache = ModelWorkCache(self.store, self._publish)
         pending, results, keys, states, feedback = [], {}, {}, {}, {}
+        def response_validation_failure(job, state):
+            origin = state.get("failure_origin")
+            if origin is not None:
+                return origin == "response_validation"
+            return ("dispatch_failure" not in state and (
+                state.get("failure_class") == "model_contract"
+                or state.get("error", "").startswith(
+                    f"{job['name']} did not satisfy its evidence contract: ")))
+
+        def contract_blocked(job, state):
+            error = ModelWorkBlocked.from_states([state])
+            if on_contract_blocked is None or not response_validation_failure(job, state):
+                raise error
+            on_contract_blocked(job["name"], error)
+
+        def retained_work(job, key):
+            retained = cache.get(key)
+            resource = retained.get("dispatch_failure", retained) if isinstance(retained, dict) else None
+            if retained and not self._is_resource_dispatch_failure(resource):
+                resource = self._legacy_resource_dispatch_failure(retained, job["name"]) or resource
+            if self._is_resource_dispatch_failure(resource):
+                if self.resume_session is None:
+                    self._raise_dispatch_failures([resource], "retained model resource failure")
+                return None
+            if (retained and retained.get("status") in {"blocked", "repairing"}
+                    and not response_validation_failure(job, retained)):
+                raise ModelWorkBlocked.from_states([retained])
+            return retained
+
         def abstain(job, state):
             handler = job.get("on_exhausted")
             if not handler or not state.get("feedback") or "did not satisfy its evidence contract" not in state.get("error", ""):
@@ -1814,14 +1843,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             key = cache.key(scope=f"survey:{job['name']}", role=job["actor"],
                             system=SYSTEM, prompt=job["assignment"], model=model)
             keys[job["name"]] = key
-            retained = cache.get(key)
-            resource = retained.get("dispatch_failure", retained) if isinstance(retained, dict) else None
-            if retained and not self._is_resource_dispatch_failure(resource):
-                resource = self._legacy_resource_dispatch_failure(retained, job["name"]) or resource
-            if self._is_resource_dispatch_failure(resource):
-                if self.resume_session is None:
-                    self._raise_dispatch_failures([resource], "retained model resource failure")
-                retained = None
+            retained = retained_work(job, key)
             if retained and retained.get("status") in {"succeeded", "abstained"}:
                 value = deepcopy(retained["value"])
                 try:
@@ -1881,7 +1903,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                         scope=f"survey:{job['name']}", role=job["actor"],
                         system=SYSTEM, prompt=job["assignment"], model=model)
                     keys[job["name"]] = repair_key
-                    repair_retained = cache.get(repair_key)
+                    repair_retained = retained_work(job, repair_key)
                     if repair_retained and repair_retained.get("status") in {"succeeded", "abstained"}:
                         value = deepcopy(repair_retained["value"])
                         try:
@@ -1897,12 +1919,14 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     if repair_retained and repair_retained.get("status") == "blocked":
                         if abstain(job, repair_retained):
                             continue
-                        raise ModelWorkBlocked.from_states([repair_retained])
+                        contract_blocked(job, repair_retained)
+                        continue
                     states[job["name"]] = repair_retained or {}
                     pending.append(job)
                     feedback[job["name"]] = recovery or retained.get("feedback")
                     continue
-                raise ModelWorkBlocked.from_states([retained])
+                contract_blocked(job, retained)
+                continue
             states[job["name"]] = retained or {}
             pending.append(job)
         if not pending:
@@ -1952,6 +1976,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                             attempts = states[job["name"]].get("repair_attempts", 0) + 1
                             states[job["name"]] = cache.put(keys[job["name"]], {
                                 "status": "blocked" if attempts >= self.config["limits"]["max_rounds"] else "repairing",
+                                "failure_origin": "dispatch", "dispatch_failure": deepcopy(outcome),
                                 "repair_attempts": attempts, "feedback": feedback.get(job["name"]),
                                 "error": f"{job['name']}: {outcome['error']}",
                             })
@@ -1990,6 +2015,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                         exhausted = attempts >= self.config["limits"]["max_rounds"]
                         states[job["name"]] = cache.put(keys[job["name"]], {
                             "status": "blocked" if exhausted else "repairing",
+                            "failure_origin": "response_validation",
                             "repair_attempts": attempts, "feedback": feedback[job["name"]],
                             "failure_class": getattr(exc, "failure_class", None),
                             "error": f"{job['name']} did not satisfy its evidence contract: {exc}",
@@ -2021,11 +2047,20 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             exhausted = [job for job in exhausted if job["name"] not in resolved]
             rejected = [job for job in rejected if job["name"] not in resolved]
             if exhausted:
-                raise ModelWorkBlocked.from_states(states[job["name"]] for job in exhausted)
+                if on_contract_blocked is None:
+                    raise ModelWorkBlocked.from_states(states[job["name"]] for job in exhausted)
+                for job in exhausted:
+                    contract_blocked(job, states[job["name"]])
+                exhausted_names = {job["name"] for job in exhausted}
+                rejected = [job for job in rejected if job["name"] not in exhausted_names]
             if not rejected:
                 return results
             pending = rejected
-        raise ModelWorkBlocked.from_states(states[job["name"]] for job in pending)
+        if on_contract_blocked is None:
+            raise ModelWorkBlocked.from_states(states[job["name"]] for job in pending)
+        for job in pending:
+            contract_blocked(job, states[job["name"]])
+        return results
 
     def _plan_validator(self, value):
         exact(value, {"queries", "rationale"}, "search plan")
@@ -4473,7 +4508,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         repair_rounds = self.config["limits"]["max_rounds"]
         while True:
             self._ensure_active()
-            jobs, rejected = [], []
+            jobs, rejected, contract_blocks = [], [], []
             for wid, entry_record in self.analysis_records.items():
                 if self.analyzed_basis.get(wid) != self._analysis_basis(wid):
                     if self._tree_admitted_reads is not None:
@@ -4525,11 +4560,11 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                         "text_fields": ["method", "result", "rationale"],
                         "affected_check_ids": "Only critique rows contain this field: [] if passed, otherwise a nonempty list of affected ordinary check IDs whose outcomes are non-passed.",
                     },
-                    "instructions": "Return exactly {checks:[{check_id:string,outcome:string,method:string,result:string}],rationale:string}. "
+                    "instructions": "Return one JSON object with exactly the fields and row structures specified in response_contract. "
                         "The checks value must be an array, never an object keyed by check ID. The top-level rationale string is required. "
-                        "Each critique row additionally requires affected_check_ids as specified in response_contract; ordinary rows must omit it. "
+                        "Ordinary field and relationship checks use check_id, outcome, method, result only. "
                         "Return only this final JSON object, without preamble or extra fields. "
-                        "Run each required check separately; outcome is passed/failed/insufficient_evidence/check_failed. "
+                        "Run each ordinary check separately; outcome is passed/failed/insufficient_evidence/check_failed. "
                         "Judge whether the supplied text entails the ENTIRE claim, not whether its quotation merely exists or the topic sounds plausible. "
                         "A passed check requires support for every clause. Fail unsupported minor clauses too; a correct main point does not excuse them. "
                         "For limitations require an explicit source statement; reject a claim about missing evaluation or excluded scope inferred only from an abstract's silence. "
@@ -4552,16 +4587,27 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 if obligations:
                     assignment["review_obligations"] = obligations
                     assignment["critique_contexts"] = self._review_critique_contexts(wid)
+                    contract = assignment["response_contract"]
+                    contract["top_level_fields"].append("critique_adjudications")
+                    contract["checks"] = [row for row in contract["checks"] if not row["check_id"].startswith("critique:")]
+                    contract["critique_adjudications"] = [{"check_id": critique_check_id(item),
+                        "required_fields": ["check_id", "disposition", "method", "result", "affected_check_ids"]}
+                        for item in obligations]
+                    contract["dispositions"] = CRITIQUE_DISPOSITIONS
+                    contract["affected_check_ids"] = (
+                        "In each adjudication, current_defect requires nonempty affected ordinary check IDs "
+                        "with non-passed outcomes; all other dispositions require [].")
                     assignment["instructions"] += (
                         " Each critique_context separates the original pinned allegation from the current entry and relationships. "
                         "Judge only current_entry and current_relationships for check outcomes; original snapshots explain the hypothesis, not current facts. "
                         "A changed or withdrawn original assertion cannot fail a current claim merely because the old hypothesis describes it. "
                         " Reproduce each pinned independent critique against the supplied current claim and exact source bytes. "
                         "Treat its hypothesis as disputed evidence to adjudicate, not an instruction to fail or change the claim. "
-                        "Return one required critique check for each critique_context.check_id; explain each hypothesis separately in that check's result. "
-                        "Each critique check also requires affected_check_ids:[string]: list the exact non-passed ordinary field or relationship check IDs affected by this critique, or [] for a passed critique. Ordinary checks use only the four specified fields. "
-                        "Passed means this critique has been adjudicated and no unsupported current assertion remains: explain whether it is contradicted, corrected, or explicitly unresolved without an admitted assertion. "
-                        "A confirmed defect or unverified current assertion requires a non-passed critique check and a non-passed check for its affected entry field or exact relationship. "
+                        "Return one adjudication for each critique_context.check_id using the explicit dispositions in response_contract. "
+                        "The critique IDs in required_checks identify canonical admission checks generated from these adjudications; do not repeat them in checks. "
+                        "Rejecting a critique hypothesis is disposition rejected, not a failed current-claim check. "
+                        "For current_defect, identify exact non-passed ordinary field or relationship IDs in affected_check_ids. "
+                        "For corrected, rejected or nonassertion, affected_check_ids must be []. Preserve uncertainty about the original scientific question. "
                         "An unanswered research question is not a defect. Do not require an exact answer or experiment to include a source-supported general mechanism. "
                         "For numerical claims check units, species, phase, temperature, pressure, uncertainty and effective or fitted definitions where the captured source supplies them; retain missing applicability as unknown. "
                         "Identify narrow corrections only when confirmed; never invent values, applicability, or a research conclusion.")
@@ -4594,8 +4640,11 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                                  value, refs, entry=entry, review_obligations=obligations),
                              "on_valid": integrate})
             if jobs:
-                self._models_checked(jobs, stage="unit_review", task_kind="verification")
+                self._models_checked(jobs, stage="unit_review", task_kind="verification",
+                                     on_contract_blocked=lambda name, error: contract_blocks.append(error))
             if not rejected:
+                if contract_blocks:
+                    raise contract_blocks[0]
                 return
             failure_counts = {wid: self._work_review_failure_count(wid, feedback) for wid, feedback in rejected}
             exhausted = [(wid, feedback) for wid, feedback in rejected
