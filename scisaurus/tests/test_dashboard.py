@@ -21,6 +21,32 @@ from scisaurus.tests.test_research_program import topic_package
 
 
 class DashboardTests(unittest.TestCase):
+    def test_partial_execution_keeps_the_complete_research_lifecycle(self):
+        temporary, root = self.make_project()
+        self.addCleanup(temporary.cleanup)
+        original = (root / "workflow.json").read_bytes()
+        data = DashboardSnapshot(root).payload()
+        self.assertEqual([stage["kind"] for stage in data["stage_results"]],
+                         ["topic", "survey", "experiment", "interpretation", "argument", "paper"])
+        self.assertEqual(len(data["pipeline"]["stages"]), 2)
+        self.assertEqual(data["pipeline"]["total"], 2)
+        future = data["stage_results"][2:]
+        self.assertTrue(all(stage["status"] == "not_scheduled" for stage in future))
+        self.assertTrue(all(not stage["scheduled"] and not stage["outputs"]
+                            and not stage["review"]["bound"] for stage in future))
+        self.assertEqual((root / "workflow.json").read_bytes(), original)
+
+    def test_lifecycle_retains_custom_execution_stage_ids(self):
+        from scisaurus.dashboard.server import _research_lifecycle_results
+        original = [{"id": "lab_a", "kind": "experiment", "status": "completed"},
+                    {"id": "lab_b", "kind": "experiment", "status": "pending"}]
+        before = deepcopy(original)
+        result = _research_lifecycle_results(original)
+        experiments = [stage for stage in result if stage["kind"] == "experiment"]
+        self.assertEqual([stage["id"] for stage in experiments], ["lab_a", "lab_b"])
+        self.assertTrue(all(stage["scheduled"] for stage in experiments))
+        self.assertEqual(original, before)
+
     def make_literature_project(self):
         from scisaurus.core.events import ControlStore
         from scisaurus.core.store import ArtifactStore
@@ -1118,10 +1144,12 @@ assert(wrapped.includes('Internal transport'));
         static = Path(__file__).parents[1] / "dashboard/static"
         html = (static / "index.html").read_text()
         javascript = (static / "app.js").read_text()
+        stylesheet = (static / "styles.css").read_text()
         self.assertIn('<html lang="en">', html)
         self.assertEqual(html.count('id="stage-navigation"'), 1)
         self.assertNotIn('id="stage-strip"', html)
         self.assertNotRegex(html + javascript, r'[가-힣]')
+        self.assertNotRegex(stylesheet, r'\.project-nav\s*\{[^}]*display\s*:\s*none')
 
 
 if __name__ == "__main__":

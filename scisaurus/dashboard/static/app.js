@@ -269,7 +269,7 @@
     $("#workspace-project-list").innerHTML = projects.length ? projects.map((project) => `<button class="workspace-project-row" type="button" data-workspace-project-ref="${escapeHtml(project.ref)}">
       <span class="workspace-project-main"><span class="workspace-project-name">${escapeHtml(text(project.name, project.ref))}</span><span class="workspace-project-id mono">${escapeHtml(text(project.workflow_id, project.ref))}</span><span class="workspace-project-objective">${escapeHtml(text(project.objective, "No objective recorded."))}</span></span>
       <span class="workspace-project-stage"><span class="workspace-row-label">PHASE</span><strong>${escapeHtml(projectStage(project))}</strong><small>${escapeHtml(projectPhase(project))}</small></span>
-      <span class="workspace-project-progress"><span class="workspace-row-label">PIPELINE</span><strong>${number(project.completed_stages)} / ${number(project.total_stages)}</strong><span class="workspace-progress-bar"><i style="width:${Math.round((Number(project.progress_ratio) || 0) * 100)}%"></i></span><small>${relativeDate(project.last_updated)}</small></span>
+      <span class="workspace-project-progress"><span class="workspace-row-label">SCHEDULED STAGES</span><strong>${number(project.completed_stages)} / ${number(project.total_stages)}</strong><span class="workspace-progress-bar"><i style="width:${Math.round((Number(project.progress_ratio) || 0) * 100)}%"></i></span><small>${relativeDate(project.last_updated)}</small></span>
       <span class="workspace-project-state">${statusPill(project.status)}${project.pid ? `<small>PID ${escapeHtml(project.pid)}</small>` : `<small>${escapeHtml(text(project.source, "not initialized"))}</small>`}</span>
     </button>`).join("") : '<div class="loading-block">No managed projects found.</div>';
     $("#workspace-run-list").innerHTML = data.active_runs?.length ? data.active_runs.map((project) => `<button class="workspace-run-card" type="button" data-workspace-project-ref="${escapeHtml(project.ref)}">
@@ -313,7 +313,7 @@
 
   const STAGE_LABELS = {topic_discovery: "Topic discovery", survey: "Literature", experiment: "Experiment", interpretation: "Interpretation", argument: "Argument", paper: "Paper and PDF"};
   const EVIDENCE_LABELS = {full_text: "Verified full text", abstract_only: "Abstract only", no_abstract: "No abstract", unknown: "Unconfirmed"};
-  const STAGE_STATUS = {completed: "Complete", running: "Running", retrying: "Repairing", paused: "Paused", blocked: "Blocked", candidate_needs_review: "Review held", review_rejected: "Rejected", research_expansion_required: "More research required", not_started: "Not started", unknown: "Unknown", planned: "Not started"};
+  const STAGE_STATUS = {completed: "Complete", running: "Running", retrying: "Repairing", paused: "Paused", blocked: "Blocked", candidate_needs_review: "Review held", review_rejected: "Rejected", research_expansion_required: "More research required", not_started: "Not started", not_scheduled: "Not scheduled", unknown: "Unknown", planned: "Not started"};
 
   function stageLabel(stage) { return STAGE_LABELS[stage.kind] || stage.label || stage.id; }
   function selectedStage(snapshot) {

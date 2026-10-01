@@ -69,6 +69,43 @@ STAGE_LABELS = {
     "paper": "Paper release",
 }
 STAGE_ORDER = tuple(STAGE_LABELS)
+STAGE_KINDS = {stage_id: ("topic_discovery" if stage_id == "topic" else stage_id)
+               for stage_id in STAGE_ORDER}
+STAGE_DELIVERABLES = {
+    "topic": "Accepted research question and source challenge",
+    "survey": "Literature map, coverage, and gap assessment",
+    "experiment": "Pinned executable comparison and independent recalculation",
+    "interpretation": "Mechanism interpretation with alternatives",
+    "argument": "Claim-to-evidence argument package",
+    "paper": "Reviewed LaTeX source and rendered PDF",
+}
+
+
+def _research_lifecycle_results(stage_results):
+    """Project the research lifecycle independently of the scheduled run."""
+    remaining = list(stage_results)
+    result = []
+    occupied_ids = {item["id"] for item in remaining}
+    for stage_id, kind in STAGE_KINDS.items():
+        scheduled = [item for item in remaining
+                     if STAGE_KINDS.get(item.get("kind"), item.get("kind")) == kind]
+        if scheduled:
+            result.extend({**item, "scheduled": True,
+                           "deliverable": STAGE_DELIVERABLES[stage_id]} for item in scheduled)
+            remaining = [item for item in remaining if item not in scheduled]
+        else:
+            result.append({
+                "id": stage_id if stage_id not in occupied_ids else f"lifecycle:{kind}",
+                "kind": kind, "label": STAGE_LABELS[stage_id], "scheduled": False,
+                "status": "not_scheduled", "deliverable": STAGE_DELIVERABLES[stage_id],
+                "source_root": None, "outputs": [], "review": {
+                    "status": "not_reviewed", "decision": None, "bound": False},
+                "open_obligations": [],
+            })
+    result.extend({**item, "scheduled": True} for item in remaining)
+    return result
+
+
 SKIP_DIRECTORIES = {
     ".git", ".venv", "__pycache__", "node_modules", "objects", ".staging",
 }
@@ -2310,14 +2347,6 @@ class DashboardSnapshot:
             return None
 
         stage_map = {item.get("id"): item for item in stages if isinstance(item, dict)}
-        deliverables = {
-            "topic": "Accepted research question and source challenge",
-            "survey": "Literature map, coverage, and gap assessment",
-            "experiment": "Pinned executable comparison and independent recalculation",
-            "interpretation": "Mechanism interpretation with alternatives",
-            "argument": "Claim-to-evidence argument package",
-            "paper": "Reviewed LaTeX source and rendered PDF",
-        }
         gates = {
             "topic": "question admitted",
             "survey": "literature coverage and gap assessment",
@@ -2339,7 +2368,7 @@ class DashboardSnapshot:
                 "current": stage.get("status") == "running",
                 "attempts": stage.get("attempts", 0),
                 "attempt_number": stage.get("attempt_number"),
-                "deliverable": deliverables.get(stage_id, "Stage result"),
+                "deliverable": STAGE_DELIVERABLES.get(stage_id, "Stage result"),
                 "gate": gates.get(stage_id, "stage acceptance gate"),
                 "last_result_status": result.get("status"),
                 "output_path": result.get("output_path"),
@@ -2692,7 +2721,8 @@ class DashboardSnapshot:
         recent_work = self._recent_work(db, organization_raw)
         organization = self._organization_view(organization_raw)
         literature, _ = self._literature_catalog()
-        stage_results = self._stage_results(stages, live_value, literature)
+        stage_results = _research_lifecycle_results(
+            self._stage_results(stages, live_value, literature))
         return {
             "schema_version": f"dashboard-snapshot-{APP_VERSION}",
             "generated_at": datetime.now(timezone.utc).isoformat(),
