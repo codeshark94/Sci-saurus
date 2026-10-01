@@ -586,11 +586,7 @@ class ExecutionRuntime:
         self._ensure_active()
         if not outcome["ok"]:
             if outcome.get("error_type") == "quota":
-                raise QuotaExceededError(
-                    outcome["error"], dimension="max_model_calls",
-                    limit=self.config.get("limits", {}).get("max_model_calls"),
-                    observed=self.model_calls_dispatched,
-                )
+                self._raise_dispatch_failures([outcome], kind)
             self._raise_model_failure(outcome)
         return outcome["result"], outcome["record_ref"]
 
@@ -621,6 +617,20 @@ class ExecutionRuntime:
                 retry_after_seconds=delay,
                 rate_limit={"provider": "model", "status_code": 429,
                             "retry_after_known": bool(provider_delays)})
+        quota_failures = [failure for failure in failures if failure.get("error_type") == "quota"]
+        if quota_failures:
+            usage = {}
+            for failure in quota_failures:
+                for key, value in failure.get("usage", {}).items():
+                    if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                        usage[key] = usage.get(key, 0) + value
+            error = QuotaExceededError(
+                context + ": " + "; ".join(failure["error"] for failure in quota_failures),
+                dimension="max_model_calls", limit=self.config.get("limits", {}).get("max_model_calls"),
+                observed=self.model_calls_dispatched, usage=usage, diagnostics=quota_failures,
+            )
+            error.dispatch_failures = deepcopy(quota_failures)
+            raise error
         model_failures = [failure for failure in failures
                           if failure.get("error_type") in {"ModelCallError", "ModelBudgetExceededError"}]
         if model_failures:

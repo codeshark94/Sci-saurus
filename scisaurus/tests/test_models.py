@@ -24,6 +24,34 @@ from scisaurus.runtime.models import (
 
 
 class TestModelClient(unittest.TestCase):
+    def test_remaining_call_capacity_is_read_only_and_matches_atomic_reservations(self):
+        from scisaurus.runtime.models import (
+            _reserve_model_call_budgets, model_call_budget_available, model_call_budget_remaining,
+        )
+        self.assertIsNone(model_call_budget_remaining({}))
+        self.assertTrue(model_call_budget_available({}))
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "budget.sqlite"
+            scope = {"model_call_budget_path": str(path), "model_call_budget_key": "stage",
+                     "model_call_budget_limit": 3}
+            self.assertEqual(model_call_budget_remaining(scope), 3)
+            self.assertFalse(path.exists())
+            _reserve_model_call_budgets([scope])
+            before = path.read_bytes()
+            self.assertEqual(model_call_budget_remaining(scope), 2)
+            self.assertTrue(model_call_budget_available(scope))
+            self.assertEqual(path.read_bytes(), before)
+            _reserve_model_call_budgets([scope])
+            _reserve_model_call_budgets([scope])
+            self.assertEqual(model_call_budget_remaining(scope), 0)
+            self.assertFalse(model_call_budget_available(scope))
+            with self.assertRaises(ValidationError):
+                model_call_budget_remaining({**scope, "model_call_budget_limit": 4})
+            with sqlite3.connect(path) as connection:
+                connection.execute("UPDATE model_call_budgets SET used_calls=4 WHERE budget_key='stage'")
+            with self.assertRaises(ValidationError):
+                model_call_budget_remaining(scope)
+
     def test_model_failure_round_trip_preserves_admission_and_provider_facts(self):
         from scisaurus.runtime.models import ModelBudgetExceededError
         from scisaurus.core.errors import QuotaExceededError

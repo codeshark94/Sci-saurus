@@ -40,6 +40,7 @@ from scisaurus.core.errors import ProviderRateLimitError, QuotaExceededError, St
 from scisaurus.core.events import ControlStore
 from scisaurus.core.schema import canonical_bytes, parse_ref, safe_artifact_component
 from scisaurus.core.store import ArtifactStore
+from scisaurus.core.tasks import TaskManager
 from scisaurus.tests.test_research_program import topic_package
 
 
@@ -415,6 +416,21 @@ class ComposerWorkflowTests(unittest.TestCase):
         self.assertEqual(classify_failure("experiment", caught.exception), "resource_fence")
         self.assertEqual(caught.exception.stage_result, result)
         self.assertEqual(caught.exception.usage, result["usage"])
+
+    def test_runner_quota_failure_preserves_owner_fields_and_known_usage(self):
+        raw = {"error_type": "quota", "error": "model_calls > max_model_calls", "usage": {"model_calls": 2}}
+        result = {"status": "blocked", "error": "request quota exhausted", "usage": {"model_calls": 2},
+                  "failure": {"kind": "quota_exceeded", "dimension": "max_model_calls", "limit": 2,
+                              "observed": 3, "diagnostics": [{"kind": "run_quota"}], "dispatch_failures": [raw]}}
+        with self.assertRaises(QuotaExceededError) as caught:
+            ComposerRunner._raise_stage_failure(result)
+        error = caught.exception
+        self.assertEqual((error.dimension, error.limit, error.observed), ("max_model_calls", 2, 3))
+        self.assertEqual(error.usage, result["usage"])
+        self.assertEqual(error.diagnostics, result["failure"]["diagnostics"])
+        self.assertEqual(error.dispatch_failures, [raw])
+        self.assertEqual(error.stage_result, result)
+        self.assertEqual(classify_failure("survey", error), "resource_fence")
 
     def test_non_admissible_stage_result_is_carried_with_the_failure(self):
         result = {"status": "blocked", "error": "independent review rejected the result",
@@ -18059,6 +18075,170 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.addCleanup(resumed.close)
             resumed._settle_stage_specialist_payment(stage, plan["plan_ref"], execution["artifact_ref"])
             self.assertEqual(resumed.usage["model_calls"], 467)
+
+    def test_same_cycle_review_recovery_retains_owned_mapping_and_pending_science(self):
+        with tempfile.TemporaryDirectory() as path:
+            workflow = self._workflow(Path(path))
+            workflow["stages"][0]["quota"] = {"max_model_calls": 96, "max_input_tokens": 1500000, "max_output_tokens": 400000, "max_openalex_requests": 200}
+            runner = ComposerRunner(workflow)
+            self.addCleanup(runner.close)
+            stage = runner.workflow["stages"][0]
+            project = Path(stage["project_dir"])
+            scopes = ["mapping", "focused_review", "integrated_review", "gap_assessment"]
+            request = {"id": "retained-review", "kind": "literature_expansion", "owner": "research.intelligence",
+                "objective": "Revalidate retained source claims", "why": "Current source contract",
+                "success_condition": "Complete all declared source reviews", "evidence_needed": "Captured spans",
+                "source_stage_id": "survey", "target_stage_id": "survey", "target_stage_kind": "survey",
+                "resume_scopes": scopes}
+            format_order = {"id": "format-experiment", "kind": "recovery", "owner": "methods.validation",
+                "objective": "Repair only response format", "why": "Failed JSON", "success_condition": "Valid JSON",
+                "evidence_needed": "Original response", "target_stage_id": "experiment", "target_stage_kind": "experiment"}
+            runner.continuation_cycles = 42
+            runner.active_research_requests = [request, format_order]
+            runner.reopened_stage_ids = runner.continuation_pending_stage_ids = {"survey", "experiment"}
+            runner._record_continuation(runner.active_research_requests, {"survey", "experiment"})
+            original = runner.store.head("command/composer/continuation/42")
+            runner.tasks.create("mapping-owner", "production", {}, "command.composer")
+            runner.tasks.transition("mapping-owner", "queued", "command.composer")
+            runner.tasks.start_attempt("mapping-owner", "mapping-owner-attempt", owner="command.composer", lease_ttl_seconds=60,
+                payload={"stage_id": "survey", "model_budget_cycle": 42, "project_dir": str(project)})
+            control = ControlStore(project); store = ArtifactStore(control)
+            store.init_project(principal_note="Retained survey")
+            def publish(logical, body, author="command.controller", kind="report", inputs=None):
+                return store.publish_artifact(logical_id=logical, artifact_type=kind, author=author,
+                    body=canonical_bytes(body), media_type="application/json", inputs=inputs or [])
+            config_body = {"survey": {"question": "Original question"}, "limits": {"wall_clock_seconds": 10}}
+            config = publish("inputs/run-config", config_body)
+            session = publish("command/resume-sessions/10", {"config_ref": config["artifact_ref"], "reopened_scopes": scopes})
+            entry = publish("kb/work-analyses/W1", {"work_id": "W1"}, "research.literature-mapper")
+            mapped = {"question": "Original question", "entry_refs": [entry["artifact_ref"]], "relationship_refs": []}
+            mapping = publish("kb/literature-map", mapped, "research.literature-mapper")
+            actual = {"model_calls": 47, "input_tokens": 587805, "output_tokens": 37303}
+            progress_record = publish("command/progress/mapping-run-74", {"cumulative_usage": {"actual": actual},
+                "next_action": {"decision": "calls_settled"}}, kind="progress_checkpoint")
+            progress = {"run_id": "mapping-run", "checkpoint": 74, "phase": "calls_settled", "cumulative_usage": actual}
+            runner.stage_records["survey"] = {"attempt_id": "mapping-owner-attempt", "child_progress": progress,
+                                              "project_dir": str(project)}
+            _, proof = runner._survey_revalidation_resume_plan(stage, scopes)
+            checkpoint = runner._publish("command/composer/checkpoints/owned-mapping", "report", {
+                "continuation_cycles": 42, "stages": {"survey": {"completed_mapping": proof}}}, "command.composer")
+            current_map = publish("kb/literature-map", mapped, "research.literature-mapper")
+            parent_path = str((runner.root/"state/stage-model-call-budget.sqlite").resolve())
+            limit = stage["quota"]["max_model_calls"]
+            context = publish("command/contexts/quota-denied", {"role": "methods.novelty-challenger", "client": {
+                "model_call_budget_scopes": [{"model_call_budget_path": parent_path,
+                    "model_call_budget_key": "stage:survey:cycle:42", "model_call_budget_limit": limit}]}})
+            denial = publish("command/failures/quota-denied", {"error_type": "ModelBudgetExceededError",
+                "error": "model call budget exhausted: stage:survey:cycle:42", "outcome_known": True,
+                "attempts": 0, "usage": {}, "budget_admission": {"path": parent_path,
+                "key": "stage:survey:cycle:42", "dimension": "model_calls", "limit": limit, "observed": limit,
+                "requested": 1, "reserved": 0}}, "methods.novelty-challenger",
+                inputs=[{"purpose": "subject", "ref": context["artifact_ref"]}])
+            control.close()
+            dossier = runner._publish("command/composer/failure-recovery/survey/attempt-22", "report", {
+                "schema_version": "composer-failure-recovery-1", "stage_id": "survey", "project_dir": str(project),
+                "input_sha256": "a"*64, "error": "ModelWorkBlocked: model call budget exhausted: stage:survey:cycle:42"}, "command.composer")
+            bad = {**request, "id": "quota-derived-repair", "failure_dossier_ref": dossier["artifact_ref"],
+                   "failure_input_sha256": "a"*64}
+            bad.pop("resume_scopes")
+            science = {**bad, "id": "valid-scientific-evidence", "objective": "Evaluate the unresolved comparison"}
+            science.pop("failure_dossier_ref"); science.pop("failure_input_sha256")
+            runner.continuation_cycles = 43
+            runner.active_research_requests = [bad, science]
+            runner._record_continuation(runner.active_research_requests, {"survey", "experiment"})
+            runner.stage_records["survey"] = {"status": "paused", "kind": "survey", "project_dir": str(project), "attempts": []}
+            runner.context["survey"] = {"kind": "survey", "project_dir": str(project), "research_requests": [bad, science],
+                                       "scientific_limitation": "The comparison remains unresolved"}
+            runner.status = "paused"
+            instruction = {"action": "resume_survey_reviews", "stage_id": "survey", "cycle": 43,
+                "original_continuation_ref": original["artifact_ref"], "request_id": request["id"],
+                "checkpoint_ref": checkpoint["artifact_ref"], "quota_failure_ref": denial["artifact_ref"],
+                "superseded_request_id": bad["id"]}
+            operator = runner._publish("command/operator/review-resume", "decision_note", instruction, "command.operator")
+            (project / "output").mkdir()
+            (project / "output/progress.json").write_bytes(canonical_bytes(progress))
+            runner.status = "running"
+            runner._checkpoint("survey:specialist_payment_settled", force=True)
+            from scisaurus.runtime.composer_supervisor import ComposerSupervisor
+            supervisor = object.__new__(ComposerSupervisor)
+            supervisor.workflow = runner.workflow
+            supervisor._mark_interrupted_checkpoint()
+            runner.close()
+            runner = ComposerRunner(workflow, resume=True)
+            self.addCleanup(runner.close)
+            stage = runner.workflow["stages"][0]
+            self.assertEqual(runner.status, "running")
+            self.assertEqual(runner._restored_execution_frontier["status"], "paused")
+            initial_usage, initial_deadline = deepcopy(runner.usage), runner.deadline_epoch
+            restored = deepcopy(runner._restored_execution_frontier)
+            self.assertIsNone(runner.control._conn.execute(
+                "SELECT 1 FROM artifacts WHERE body_hash=?", (restored["body_sha256"],)).fetchone())
+            for field, value in (("stop_reason", None), ("execution_sha256", "0"*64),
+                                 ("state_revision", restored["state_revision"]+1)):
+                runner._restored_execution_frontier[field] = value
+                with self.assertRaises(StateError):
+                    runner.admit_survey_review_recovery(operator_request_ref=operator["artifact_ref"])
+                runner._restored_execution_frontier = deepcopy(restored)
+            source_control = ControlStore(project)
+            source_tasks = TaskManager(source_control)
+            source_tasks.create("active-model", "production", {}, "methods.novelty-challenger")
+            source_tasks.transition("active-model", "queued", "methods.novelty-challenger")
+            source_tasks.start_attempt("active-model", "active-model-attempt", owner="methods.novelty-challenger", lease_ttl_seconds=60)
+            with self.assertRaisesRegex(StateError, "active producer"):
+                runner.admit_survey_review_recovery(operator_request_ref=operator["artifact_ref"])
+            self.assertEqual(runner.store.head("command/composer/continuation/43")["version"], 1)
+            source_tasks.finish_attempt("active-model-attempt", "failed", usage={})
+            source_tasks.transition("active-model", "blocked", "methods.novelty-challenger")
+            source_control.close()
+            for field, value in (("cycle", 42), ("cycle", True), ("request_id", "another-order"),
+                                 ("superseded_request_id", science["id"]), ("quota_failure_ref", mapping["artifact_ref"])):
+                invalid = {**instruction, field: value}
+                note = runner._publish("command/operator/invalid-review-resume", "decision_note", invalid, "command.operator")
+                with self.assertRaises((StateError, ValidationError)):
+                    runner.admit_survey_review_recovery(operator_request_ref=note["artifact_ref"])
+                self.assertEqual(runner.store.head("command/composer/continuation/43")["version"], 1)
+                self.assertEqual(runner.usage, initial_usage)
+            result = runner.admit_survey_review_recovery(operator_request_ref=operator["artifact_ref"])
+            self.assertEqual(result["completed_mapping"]["map_ref"], mapping["artifact_ref"])
+            self.assertEqual(result["current_map_ref"], current_map["artifact_ref"])
+            self.assertEqual(runner.usage, initial_usage)
+            self.assertEqual(runner.deadline_epoch, initial_deadline)
+            self.assertEqual(runner.continuation_cycles, 43)
+            self.assertEqual({x["id"] for x in runner.active_research_requests}, {request["id"], science["id"], format_order["id"]})
+            self.assertIn(science, runner.active_research_requests)
+            self.assertIn(format_order, runner.active_research_requests)
+            self.assertEqual(runner._survey_revalidation_scopes(stage), scopes)
+            self.assertEqual(runner._survey_revalidation_resume_plan(stage, scopes)[0], scopes[1:])
+            self.assertEqual(runner._survey_producer_work_orders(stage), [])
+            self.assertEqual(runner._active_stage_role_ids(stage, stage_context=runner.context["survey"]), [])
+            self.assertEqual(runner.context["survey"]["scientific_limitation"], "The comparison remains unresolved")
+            runner._mark_research_requests_attempted(stage)
+            self.assertNotIn(runner._research_request_signature(science), runner._attempted_request_signatures)
+            self.assertEqual(runner.admit_survey_review_recovery(operator_request_ref=operator["artifact_ref"]), result)
+            self.assertEqual(runner.store.head("command/composer/continuation/43")["version"], 2)
+            self.assertEqual(runner._gate_survey_work_orders(stage, {"status": "completed"})["status"], "research_expansion_required")
+            (project / "output/run.json").write_bytes(canonical_bytes({"run_id": "interrupted-review", "status": "blocked"}))
+            Path(stage["config_path"]).write_bytes(canonical_bytes(config_body))
+            boundary = {}
+            class SurveyBoundary:
+                def __init__(self, root, config, **options):
+                    boundary.update(root=root, config=config, scopes=options["resume_policy"]["source_changes"]["reopen_scopes"],
+                                    work_orders=options["work_orders"])
+                    raise KeyboardInterrupt("Survey constructor boundary")
+            with patch("scisaurus.runtime.survey.SurveyRunner", SurveyBoundary), \
+                 patch.object(runner, "_run_stage", side_effect=lambda current, **kwargs: runner._produce_stage(current, **kwargs)), \
+                 patch.object(runner, "_run_specialist_pool", return_value={"model_enabled": False, "reports": [], "by_role": {}, "usage": {}}), \
+                 patch.object(runner, "_start_live_progress", return_value=lambda: None), \
+                 patch.object(runner, "_stage_model_delegation", return_value=None):
+                stopped = runner.run()
+            self.assertEqual(stopped["status"], "paused", stopped.get("blockers"))
+            self.assertEqual(boundary["scopes"], scopes[1:])
+            self.assertEqual(boundary["config"], config_body)
+            self.assertEqual(boundary["work_orders"], [])
+            self.assertEqual(Path(boundary["root"]), project)
+            self.assertEqual(runner.continuation_cycles, 43)
+            self.assertIn(science, runner.active_research_requests)
+            self.assertIn(format_order, runner.active_research_requests)
 
     def test_revalidation_resume_uses_only_owned_completed_mapping_milestone(self):
         with tempfile.TemporaryDirectory() as path:

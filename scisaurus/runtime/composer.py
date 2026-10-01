@@ -1031,6 +1031,8 @@ class ComposerRunner:
         self.state_revision = 0
         self._restored_agenda_policy = None
         self._restored_topic_lineage_reconciliation = None
+        self._restored_execution_frontier = None
+        self._execution_started = False
         # A hold can echo the same work order in every returned stage packet.
         # Persist semantic identities so a resume cannot turn an unchanged
         # repair into another cycle of the same experiment.
@@ -7326,8 +7328,18 @@ class ComposerRunner:
         """
         from scisaurus.runtime.departments import REQUEST_STAGE_KINDS
 
+        deferred = set()
+        if stage.get("kind") == "survey":
+            record = self.stage_records.get(stage["id"], {})
+            project = record.get("project_dir") or self.context.get(stage["id"], {}).get("project_dir") or stage["project_dir"]
+            recovery = self._survey_revalidation_recovery({**stage, "project_dir": project})
+            if recovery is not None:
+                deferred = {self._research_request_signature(item)
+                            for item in recovery["deferred_research_requests"]}
         for request in self.active_research_requests:
             if not isinstance(request, dict):
+                continue
+            if self._research_request_signature(request) in deferred:
                 continue
             target_stage_id = request.get("target_stage_id")
             if isinstance(target_stage_id, str):
@@ -13745,6 +13757,298 @@ class ComposerRunner:
             raise ValidationError("survey revalidation requires an addressed literature order and unique analysis/review resume_scopes")
         return scopes
 
+    def _survey_revalidation_recovery(self, stage, decision=None):
+        """Read the immutable authorization for a same-owner review recovery."""
+        if decision is None:
+            head = self.store.head(f"command/composer/continuation/{self.continuation_cycles}")
+            if head is None:
+                return None
+            _, _, decision = self._read_verified_artifact_json(head["artifact_ref"])
+        ref = decision.get("revalidation_admission_ref")
+        if ref is None:
+            return None
+        manifest, _, body = self._read_verified_artifact_json(ref)
+        original, _, admission = self._read_verified_artifact_json(body["original_continuation_ref"])
+        prior, _, previous = self._read_verified_artifact_json(body["prior_continuation_ref"])
+        operator, _, instruction = self._read_verified_artifact_json(body["operator_request_ref"])
+        request = body.get("request") or {}
+        if (manifest.get("author") != "command.composer"
+                or manifest["body_hash"] != decision.get("revalidation_admission_sha256")
+                or body.get("schema_version") != "composer-survey-revalidation-admission-1"
+                or body.get("cycle") != decision.get("cycle")
+                or body.get("stage_id") != stage["id"]
+                or body.get("project_dir") != str(Path(stage["project_dir"]).resolve())
+                or original.get("author") != "command.composer"
+                or original["body_hash"] != body.get("original_continuation_sha256")
+                or prior.get("author") != "command.composer"
+                or prior["body_hash"] != body.get("prior_continuation_sha256")
+                or admission.get("action") != "continue_research"
+                or previous.get("action") != "continue_research"
+                or previous.get("cycle") != body["cycle"]
+                or type(admission.get("cycle")) is not int
+                or not admission["cycle"] < body["cycle"]
+                or stage["id"] not in admission.get("reopened_stage_ids", [])
+                or stage["id"] not in previous.get("reopened_stage_ids", [])
+                or operator.get("author") != "command.operator"
+                or operator["body_hash"] != body.get("operator_request_sha256")
+                or instruction.get("action") != "resume_survey_reviews"
+                or any(instruction.get(key) != body.get(key) for key in (
+                    "stage_id", "cycle", "original_continuation_ref", "request_id",
+                    "checkpoint_ref", "quota_failure_ref", "superseded_request_id"))
+                or request.get("id") != body.get("request_id")
+                or not any(canonical_bytes(item) == canonical_bytes(request)
+                           for item in admission.get("research_requests", []))
+                or not any(canonical_bytes(item) == canonical_bytes(request)
+                           for item in decision.get("research_requests", []))):
+            raise StateError("survey review recovery does not match its immutable operator admission")
+        self._validate_survey_revalidation_scopes(request)
+        return body
+
+    def _survey_review_recovery_evidence(self, current_stage, instruction, operator_request_ref):
+        """Validate the retained request, milestone and quota rejection without writes."""
+        stage = next(item for item in self.workflow["stages"] if item["id"] == current_stage["id"])
+        project = current_stage["project_dir"]
+        head = self.store.head(f"command/composer/continuation/{self.continuation_cycles}")
+        _, _, previous = self._read_verified_artifact_json(head["artifact_ref"])
+        operator, _, _ = self._read_verified_artifact_json(operator_request_ref)
+        original, _, admission = self._read_verified_artifact_json(instruction["original_continuation_ref"])
+        checkpoint, _, state = self._read_verified_artifact_json(instruction["checkpoint_ref"])
+        request = next((item for item in admission.get("research_requests", [])
+                        if item.get("id") == instruction.get("request_id")), None)
+        original_record = state.get("stages", state.get("stage_records", {})).get(stage["id"], {})
+        milestone = original_record.get("completed_mapping")
+        if (original.get("author") != "command.composer" or checkpoint.get("author") != "command.composer"
+                or admission.get("action") != "continue_research"
+                or type(admission.get("cycle")) is not int
+                or not admission["cycle"] < self.continuation_cycles
+                or state.get("continuation_cycles") != admission["cycle"]
+                or stage["id"] not in admission.get("reopened_stage_ids", [])
+                or previous.get("action") != "continue_research"
+                or previous.get("cycle") != self.continuation_cycles
+                or request is None or not isinstance(milestone, dict)
+                or request.get("target_stage_id") != stage["id"]
+                or self._scope_active_research_requests([request]) != [request]):
+            raise StateError("survey review recovery has no exact original admission and completed mapping")
+        declared = self._validate_survey_revalidation_scopes(request)
+        previous_record, previous_cycle = self.stage_records.get(stage["id"]), self.continuation_cycles
+        try:
+            self.stage_records[stage["id"]] = {"completed_mapping": deepcopy(milestone)}
+            self.continuation_cycles = admission["cycle"]
+            scopes, verified_mapping = self._survey_revalidation_resume_plan(current_stage, declared)
+        finally:
+            self.stage_records[stage["id"]] = previous_record
+            self.continuation_cycles = previous_cycle
+        if verified_mapping is None or scopes != [scope for scope in declared if scope != "mapping"]:
+            raise StateError("survey review recovery mapping milestone failed immutable owner replay")
+        superseded = next((item for item in previous.get("research_requests", [])
+                           if item.get("id") == instruction.get("superseded_request_id")), None)
+        if (superseded is None or superseded.get("target_stage_id") != stage["id"]
+                or superseded.get("kind") != "literature_expansion" or "resume_scopes" in superseded
+                or not isinstance(superseded.get("failure_dossier_ref"), str)
+                or not isinstance(superseded.get("failure_input_sha256"), str)):
+            raise StateError("survey review recovery does not own the superseded order")
+        dossier_manifest, _, dossier = self._read_verified_artifact_json(superseded["failure_dossier_ref"])
+        with closing(sqlite3.connect((Path(project)/"state/control.sqlite").resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            store = ArtifactStore(SimpleNamespace(dir=str(Path(project).resolve()), _conn=connection))
+            failure_record = store.get(instruction["quota_failure_ref"])
+            raw = store.read_body(failure_record["body_hash"])
+            failure = json.loads(raw)
+            quota = failure.get("budget_admission") or {}
+            ModelCallError.from_failure(failure.get("error") or "quota rejection", failure)
+            contexts = [item["ref"] for item in failure_record.get("inputs", []) if item.get("purpose") == "subject"]
+            if len(contexts) != 1:
+                raise StateError("quota rejection has no unique request context")
+            context_record = store.get(contexts[0]); context_raw = store.read_body(context_record["body_hash"])
+            context = json.loads(context_raw)
+            expected_scope = {"model_call_budget_path": str((self.root/"state/stage-model-call-budget.sqlite").resolve()),
+                              "model_call_budget_key": f"stage:{stage['id']}:cycle:{admission['cycle']}",
+                              "model_call_budget_limit": (stage.get("quota") or {}).get("max_model_calls")}
+            registered = (context.get("client") or {}).get("model_call_budget_scopes", [])
+            if (hashlib.sha256(raw).hexdigest() != failure_record["body_hash"]
+                    or hashlib.sha256(context_raw).hexdigest() != context_record["body_hash"]
+                    or failure.get("error_type") != "ModelBudgetExceededError"
+                    or failure.get("outcome_known") is not True
+                    or failure.get("attempts") != 0 or failure.get("usage") != {}
+                    or quota.get("requested") != 1 or quota.get("reserved") != 0
+                    or not isinstance(failure.get("error"), str) or not failure["error"]
+                    or context.get("role") != failure_record.get("author")
+                    or quota.get("dimension") != "model_calls"
+                    or quota.get("path") != expected_scope["model_call_budget_path"]
+                    or quota.get("key") != expected_scope["model_call_budget_key"]
+                    or quota.get("limit") != expected_scope["model_call_budget_limit"]
+                    or quota.get("observed") != quota.get("limit")
+                    or not any(all(item.get(key) == value for key, value in expected_scope.items()) for item in registered)
+                    or dossier_manifest.get("author") != "command.composer"
+                    or dossier.get("schema_version") != "composer-failure-recovery-1"
+                    or dossier.get("stage_id") != stage["id"]
+                    or dossier.get("project_dir") != str(Path(project).resolve())
+                    or dossier.get("input_sha256") != superseded.get("failure_input_sha256")
+                    or failure["error"] not in dossier.get("error", "")
+                    or not failure_record["created_at"] <= dossier_manifest["created_at"] < head["created_at"]):
+                raise StateError("superseded survey order is not proven to originate from this typed quota rejection")
+            current_map = store.head("kb/literature-map")
+            if current_map is None:
+                raise StateError("survey review recovery has no retained current map")
+            map_raw = store.read_body(current_map["body_hash"])
+            configured = json.loads(store.read_body(milestone["config_sha256"]))
+            if (hashlib.sha256(map_raw).hexdigest() != current_map["body_hash"]
+                    or json.loads(map_raw).get("question") != configured.get("survey", {}).get("question")):
+                raise StateError("survey review recovery current map does not match the declared question")
+        deferred = [deepcopy(item) for item in previous.get("research_requests", [])
+                    if item.get("id") != superseded["id"] and item.get("target_stage_id") == stage["id"]
+                    and "resume_scopes" not in item]
+        body = {"schema_version": "composer-survey-revalidation-admission-1", "stage_id": stage["id"],
+                "cycle": self.continuation_cycles, "project_dir": str(Path(project).resolve()),
+                "operator_request_ref": operator_request_ref, "operator_request_sha256": operator["body_hash"],
+                "original_continuation_ref": original["artifact_ref"], "original_continuation_sha256": original["body_hash"],
+                "prior_continuation_ref": head["artifact_ref"], "prior_continuation_sha256": head["body_hash"],
+                "checkpoint_ref": checkpoint["artifact_ref"], "checkpoint_sha256": checkpoint["body_hash"],
+                "request_id": request["id"], "request": deepcopy(request), "completed_mapping": verified_mapping,
+                "current_map_ref": current_map["artifact_ref"], "current_map_sha256": current_map["body_hash"],
+                "quota_failure_ref": failure_record["artifact_ref"], "quota_failure_sha256": failure_record["body_hash"],
+                "superseded_request_id": superseded["id"], "superseded_request": deepcopy(superseded),
+                "deferred_research_requests": deferred}
+        return body
+
+    def admit_survey_review_recovery(self, *, operator_request_ref):
+        """Restore a declared review under the already admitted stage allocation.
+
+        Only a source-owned, typed quota rejection can retire an order created
+        by a misclassified transport failure. Other scientific orders remain
+        pending while the explicitly requested review runs.
+        """
+        operator, _, instruction = self._read_verified_artifact_json(operator_request_ref)
+        stage = next((item for item in self.workflow["stages"]
+                      if item["id"] == instruction.get("stage_id")), None)
+        if (operator.get("author") != "command.operator"
+                or set(instruction) != {"action", "stage_id", "cycle", "original_continuation_ref", "request_id",
+                                        "checkpoint_ref", "quota_failure_ref", "superseded_request_id"}
+                or instruction.get("action") != "resume_survey_reviews"
+                or type(instruction.get("cycle")) is not int
+                or instruction.get("cycle") != self.continuation_cycles
+                or self._execution_started or self._remaining() <= 0
+                or stage is None or stage.get("kind") != "survey"
+                or stage["id"] not in self.continuation_pending_stage_ids
+                or stage["id"] not in self.reopened_stage_ids):
+            raise StateError("survey review recovery requires an explicit paused current-cycle operator request")
+        head = self.store.head(f"command/composer/continuation/{self.continuation_cycles}")
+        if head is None:
+            raise StateError("survey review recovery has no current continuation")
+        _, _, previous = self._read_verified_artifact_json(head["artifact_ref"])
+        record = self.stage_records.get(stage["id"], {})
+        project = record.get("project_dir") or self.context.get(stage["id"], {}).get("project_dir")
+        if not isinstance(project, str):
+            raise StateError("survey review recovery has no retained producer owner")
+        current_stage = {**stage, "project_dir": str(Path(project).resolve())}
+        self._survey_review_recovery_idle_frontier(current_stage)
+        existing = self._survey_revalidation_recovery(current_stage, previous)
+        if existing is not None:
+            if existing["operator_request_ref"] != operator_request_ref:
+                raise ConflictError("another operator review recovery already owns this cycle")
+            return deepcopy(existing)
+        body = self._survey_review_recovery_evidence(current_stage, instruction, operator_request_ref)
+        request = body["request"]
+        superseded = body["superseded_request"]
+        verified_mapping = body["completed_mapping"]
+        scopes = [scope for scope in request["resume_scopes"] if scope != "mapping"]
+        _, _, admission = self._read_verified_artifact_json(body["original_continuation_ref"])
+        receipt = self._publish(f"command/composer/revalidation-admissions/{stage['id']}/{self.continuation_cycles}",
+                                "decision_note", body, "command.composer")
+        replacement = deepcopy(previous)
+        replacement["research_requests"] = [deepcopy(item) for item in previous.get("research_requests", [])
+                                             if item.get("id") != superseded["id"] and item.get("id") != request["id"]] + [deepcopy(request)]
+        included = {item.get("id") for item in replacement["research_requests"]}
+        replacement["research_requests"].extend(deepcopy(item) for item in admission.get("research_requests", [])
+            if item.get("target_stage_id") != stage["id"] and item.get("id") not in included)
+        replacement.update(revalidation_admission_ref=receipt["artifact_ref"], revalidation_admission_sha256=receipt["body_hash"])
+        self._publish(f"command/composer/continuation/{self.continuation_cycles}", "decision_note", replacement, "command.composer")
+        self.feedback.append(deepcopy(replacement))
+        retained = [item for item in self.active_research_requests if item.get("id") not in {superseded["id"], request["id"]}]
+        retained_ids = {item.get("id") for item in retained}
+        retained.extend(deepcopy(item) for item in replacement["research_requests"] if item.get("id") not in retained_ids and item.get("id") != request["id"])
+        self.active_research_requests = [*retained, deepcopy(request)]
+        self.stage_records[stage["id"]]["completed_mapping"] = deepcopy(verified_mapping)
+        stage_context = self.context.setdefault(stage["id"], {})
+        for name in ("research_requests", "research_expansion_requests", "work_orders"):
+            values = stage_context.get(name)
+            if isinstance(values, list):
+                stage_context[name] = [item for item in values if item.get("id") != superseded["id"]]
+        stage_context.update(review_status="survey_revalidation", resume_scopes=scopes,
+                             revalidation_admission_ref=receipt["artifact_ref"])
+        self.status = "paused"
+        self.department_activity.append({"action": "admit_same_cycle_survey_revalidation", "stage_id": stage["id"],
+                                         "cycle": self.continuation_cycles, "admission_ref": receipt["artifact_ref"]})
+        self._checkpoint(f"{stage['id']}:review_recovery_admitted", force=True)
+        return deepcopy(body)
+
+    @staticmethod
+    def _interrupted_checkpoint_identity(body):
+        """Exclude supervisor observations while retaining admitted execution state."""
+        value = deepcopy(body)
+        for key in ("status", "phase", "stop_reason", "updated_at_epoch", "elapsed_seconds",
+                    "remaining_seconds", "observed_usage"):
+            value.pop(key, None)
+        blockers = value.get("blockers")
+        if isinstance(blockers, list):
+            value["blockers"] = [item for item in blockers if item != {
+                "stage_id": "workflow", "reason": "KeyboardInterrupt: termination requested",
+                "stop_reason": "process_interrupted"}]
+        for record in value.get("stages", {}).values():
+            if isinstance(record, dict):
+                record.pop("child_progress", None)
+                record.pop("specialist_live", None)
+        return hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+    def _survey_review_recovery_idle_frontier(self, stage):
+        """Require a durable stopped owner and an idle captured producer."""
+        restored = self._restored_execution_frontier
+        if (not isinstance(restored, dict) or restored.get("cycle") != self.continuation_cycles
+                or restored.get("status") not in {"paused", "blocked"}):
+            raise StateError("survey review recovery requires a restored stopped execution frontier")
+        row = self.control._conn.execute(
+            "SELECT artifact_ref FROM artifacts WHERE body_hash=? ORDER BY created_at DESC LIMIT 1",
+            (restored["body_sha256"],)).fetchone()
+        if row is None:
+            if (restored.get("status") != "paused" or restored.get("stop_reason") != "process_interrupted"
+                    or type(restored.get("state_revision")) is not int):
+                raise StateError("restored survey frontier has no immutable checkpoint")
+            candidates = self.control._conn.execute(
+                "SELECT artifact_ref FROM artifacts WHERE artifact_ref LIKE "
+                "'artifact:command/composer/checkpoints/%' ORDER BY created_at DESC LIMIT 16").fetchall()
+            matches = []
+            for candidate in candidates:
+                candidate_manifest, _, candidate_body = self._read_verified_artifact_json(candidate["artifact_ref"])
+                if (candidate_manifest.get("author") == "command.composer"
+                        and candidate_body.get("status") == "running"
+                        and candidate_body.get("state_revision") == restored["state_revision"]
+                        and self._interrupted_checkpoint_identity(candidate_body) == restored.get("execution_sha256")):
+                    matches.append((candidate_manifest, candidate_body))
+            if len(matches) != 1:
+                raise StateError("interrupted survey projection has no exact immutable execution owner")
+            manifest, body = matches[0]
+        else:
+            manifest, _, body = self._read_verified_artifact_json(row["artifact_ref"])
+        record = body.get("stages", {}).get(stage["id"], {})
+        if (manifest.get("author") != "command.composer"
+                or body.get("workflow_id") != self.workflow["id"]
+                or body.get("continuation_cycles") != self.continuation_cycles
+                or stage["id"] not in body.get("continuation_pending_stage_ids", [])
+                or stage["id"] not in body.get("reopened_stage_ids", [])
+                or record.get("project_dir") != str(Path(stage["project_dir"]).resolve())):
+            raise StateError("restored survey checkpoint does not own this pending producer")
+        observed = self._read_json_object(Path(stage["project_dir"]) / "output/progress.json") or {}
+        evidence = self._producer_checkpoint_evidence(stage["project_dir"], observed)
+        if evidence is None or observed.get("phase") != "calls_settled":
+            raise StateError("survey review recovery has no settled producer checkpoint")
+        with closing(sqlite3.connect((Path(stage["project_dir"])/"state/control.sqlite").resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+            active = connection.execute("SELECT 1 FROM tasks WHERE state IN ('running','awaiting_review') LIMIT 1").fetchone()
+            if active is not None:
+                raise StateError("survey review recovery cannot replace an active producer")
+        return {"checkpoint_ref": manifest["artifact_ref"], "checkpoint_sha256": manifest["body_hash"],
+                "producer_checkpoint": evidence}
+
     def _survey_revalidation_scopes(self, stage):
         requests = [request for request in self._requests_for_stage(stage)
                     if "resume_scopes" in request]
@@ -13765,6 +14069,9 @@ class ComposerRunner:
         scoped = self._scope_active_research_requests(requests)
         if len(scoped) != len(requests):
             raise StateError("survey revalidation request belongs to another topic")
+        record = self.stage_records.get(stage["id"], {})
+        retained_project = record.get("project_dir") or self.context.get(stage["id"], {}).get("project_dir") or stage["project_dir"]
+        self._survey_revalidation_recovery({**stage, "project_dir": retained_project}, decision)
         scopes = []
         for request in requests:
             declared = self._validate_survey_revalidation_scopes(request)
@@ -13777,6 +14084,21 @@ class ComposerRunner:
                 raise StateError("survey revalidation request does not match its immutable admission")
             scopes.extend(scope for scope in declared if scope not in scopes)
         return scopes
+
+    def _survey_mapping_owner_cycle(self, stage, milestone, decision=None):
+        recovery = self._survey_revalidation_recovery(stage, decision)
+        if recovery is None:
+            return self.continuation_cycles
+        if canonical_bytes(milestone) != canonical_bytes(recovery.get("completed_mapping")):
+            raise StateError("survey mapping differs from its explicitly retained admission")
+        _, _, original = self._read_verified_artifact_json(recovery["original_continuation_ref"])
+        return original["cycle"]
+
+    def _survey_producer_work_orders(self, stage):
+        requests = self._requests_for_stage(stage)
+        if self._survey_revalidation_recovery(stage) is not None:
+            return []
+        return self._follow_up_projection([item for item in requests if "resume_scopes" not in item])
 
     @staticmethod
     def _survey_resume_scope(prior, *, stage_context=None):
@@ -14815,6 +15137,14 @@ class ComposerRunner:
                 self.deadline = self.clock() + wall_remaining
         self._reconcile_repair_panel_invoices()
         self._settle_pending_stage_usage()
+        if isinstance(timing_state, dict):
+            self._restored_execution_frontier = {
+                "cycle": timing_state.get("continuation_cycles"), "status": timing_state.get("status"),
+                "body_sha256": hashlib.sha256(canonical_bytes(timing_state)).hexdigest(),
+                "execution_sha256": self._interrupted_checkpoint_identity(timing_state),
+                "state_revision": timing_state.get("state_revision"),
+                "stop_reason": timing_state.get("stop_reason"),
+            }
         if self.status in {"completed", "candidate_needs_review", "research_expansion_required", "review_rejected",
                            "blocked", "paused"}:
             # A resumed workflow must explicitly continue from a non-terminal
@@ -15445,7 +15775,8 @@ class ComposerRunner:
                         or retained_mapping.get("map_sha256") != mapping["body_hash"]
                         or retained_mapping.get("resume_sha256") != session["body_hash"]):
                     return declared_scopes, None
-                if (payload.get("stage_id") != stage["id"] or payload.get("model_budget_cycle") != self.continuation_cycles
+                owner_cycle = self._survey_mapping_owner_cycle(stage, retained_mapping) if isinstance(retained_mapping, dict) else self.continuation_cycles
+                if (payload.get("stage_id") != stage["id"] or payload.get("model_budget_cycle") != owner_cycle
                         or payload.get("project_dir") != str(Path(stage["project_dir"]).resolve())
                         or config is None or session is None or mapping is None
                         or not attempt["created_at"] <= session["created_at"] <= mapping["created_at"] <= evidence["created_at"]
@@ -16440,7 +16771,8 @@ class ComposerRunner:
                             or not owner["created_at"] <= original_session["created_at"] <= mapped_record["created_at"] <= checkpoint_record["created_at"]
                             or owner.get("payload", {}).get("project_dir") != body["project_dir"]
                             or owner.get("payload", {}).get("stage_id") != body["stage_id"]
-                            or owner.get("payload", {}).get("model_budget_cycle") != body["cycle"]):
+                            or owner.get("payload", {}).get("model_budget_cycle") != self._survey_mapping_owner_cycle(
+                                {"id": body["stage_id"], "project_dir": body["project_dir"]}, milestone, decision)):
                         return False
                 final_record = store.get(body["result_ref"])
                 resume_record = store.get(body["resume_ref"])
@@ -17927,6 +18259,10 @@ class ComposerRunner:
         if stage.get("kind") == "survey":
             context = stage_context if isinstance(stage_context, dict) else {}
             if (
+                context.get("review_status") == "survey_revalidation"
+                and isinstance(context.get("resume_scopes"), list)
+                and set(context["resume_scopes"]) <= {"focused_review", "integrated_review", "gap_assessment"}
+            ) or (
                 context.get("review_status") == "gap_assessment_resume"
                 and context.get("survey_current") is True
                 and context.get("assessment_current") is False
@@ -19942,6 +20278,16 @@ class ComposerRunner:
                 provider=failure.get("provider"), details=failure.get("details"),
             )
             error.stage_result = deepcopy(result)
+        elif failure.get("kind") == "quota_exceeded":
+            error = QuotaExceededError(
+                result.get("error") or "stage execution quota exhausted",
+                dimension=failure.get("dimension"), limit=failure.get("limit"),
+                observed=failure.get("observed"), usage=result.get("usage"),
+                diagnostics=failure.get("diagnostics"),
+            )
+            error.stage_result = deepcopy(result)
+            if isinstance(failure.get("dispatch_failures"), list):
+                error.dispatch_failures = deepcopy(failure["dispatch_failures"])
         elif failure.get("kind") == "model_call":
             error = ModelCallError.from_failure(
                 result.get("error") or "stage model request failed", failure)
@@ -22248,8 +22594,7 @@ class ComposerRunner:
                                   }, "command.composer")
                 delegation = self._stage_model_delegation(stage)
                 result = SurveyRunner(stage["project_dir"], config, on_progress=self._stage_progress(stage),
-                                      work_orders=self._follow_up_projection([item for item in self._requests_for_stage(stage)
-                                                                             if "resume_scopes" not in item]),
+                                      work_orders=self._survey_producer_work_orders(stage),
                                       resume_policy=resume_policy,
                                       provider_fallback=provider_fallback,
                                       model_call_budget_scopes=[delegation["scope"]] if delegation else [],
@@ -25521,6 +25866,8 @@ class ComposerRunner:
         return True
 
     def run(self):
+        self._execution_started = True
+        self.status = "running"
         try:
             self._reconcile_interrupted_stage_attempts()
             by_id = {stage["id"]: stage for stage in self.workflow["stages"]}

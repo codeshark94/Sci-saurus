@@ -26,6 +26,7 @@ WORK_CHECKS = ("inclusion", "reason", "problem", "approach", "finding", "limitat
 ABSTENTION_REASONS = {
     "source_unavailable": "The catalog record is relevant by metadata, but no abstract or verified full text was available, so substantive content could not be assessed.",
     "deep_analysis_budget": "This catalog record is deferred by the declared deep-analysis budget. No substantive claim is admitted; targeted follow-up may expand this scope.",
+    "model_call_budget": "Captured sources are retained, but extraction is deferred because the remaining model-call budget is reserved for required downstream verification. No substantive claim is admitted.",
     "contract_exhausted": "The bounded extraction did not produce a valid evidence contract; substantive claims remain unknown.",
     "unverified_map": "The captured source did not support a verifiable map claim, so this work remains uncertain.",
     "screening_unresolved": "The captured evidence does not resolve the screening rationale.",

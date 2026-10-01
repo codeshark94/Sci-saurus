@@ -2,6 +2,7 @@
 from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from scisaurus.core.errors import ModelContractError, ProviderRateLimitError, ValidationError
+from scisaurus.core.errors import ModelContractError, ProviderRateLimitError, QuotaExceededError, ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.store import ArtifactStore
@@ -264,7 +265,9 @@ def simulated_survey_worker(kind, params, channel):
                 value["entries"][0]["reason"] = "A changed screening rationale without new evidence."
     elif phase == "survey_review":
         value = {"checks": check_rows(SURVEY_CHECKS), "rationale": "The map preserves unknown facts and bounded coverage."}
-        if mode == "survey-fails":
+        if mode == "survey-review-malformed":
+            value = {"checks": [], "rationale": "Incomplete review envelope."}
+        elif mode == "survey-fails":
             value["checks"][1].update(outcome="failed", result="The independent fixture review rejects source fidelity.")
         elif (mode == "survey-coverage-insufficient"
               or mode.startswith("survey-coverage-insufficient-")):
@@ -310,6 +313,18 @@ def simulated_survey_worker(kind, params, channel):
             if contract != source_fidelity_review_contract():
                 next(check for check in value["checks"] if check["check_id"] == "finding").update(
                     outcome="insufficient_evidence", result="The supported finding does not answer the research question.")
+        if mode == "screening-relevance-adversary":
+            contract = assignment.get("review_contract", {})
+            if "Every included work must have a source-supported connection" in contract.get("screening_scope", ""):
+                if assignment["entry"]["reason"] == "The source's LED topic matches its own summary.":
+                    for check in value["checks"]:
+                        if check["check_id"] in {"inclusion", "reason"}:
+                            check.update(outcome="failed", result="The source does not establish a connection to the declared work/coherence question.")
+        if mode == "relationship-qualifier-adversary":
+            if "qualifiers in relationship claims" in assignment.get("review_contract", {}).get("failure_basis", ""):
+                for check in value["checks"]:
+                    if check["check_id"].startswith("relationship:"):
+                        check.update(outcome="failed", result="The cited source supports a topical connection but not the asserted fundamental qualifier.")
         if mode.startswith("semantic-") and "every task" in assignment["entry"]["reason"]:
             next(check for check in value["checks"] if check["check_id"] == "reason").update(
                 outcome="failed", result="The abstract does not establish generalization to every task; narrow the reason to recall timing.")
@@ -470,6 +485,192 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(raised.exception.usage, result["usage"])
         self.assertEqual(raised.exception.stage_result, result)
 
+    def test_actual_undispatched_quota_skips_scientific_cache_and_explicit_resume_uses_current_capacity(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._accept_survey()
+        runner._nominate()
+        runner.config["limits"]["max_model_calls"] = 126
+        runner.model_calls_dispatched = 126
+        with self.assertRaises(QuotaExceededError) as stopped:
+            runner._counter_plan()
+        self.assertEqual(stopped.exception.limit, 126)
+        self.assertEqual(stopped.exception.observed, 126)
+        self.assertEqual(runner.model_calls_dispatched, 126)
+        cache = ModelWorkCache(runner.store, runner._publish)
+        resources = [entry for entry in cache.entries() if entry.get("status") == "resource_blocked"]
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]["dispatch_failure"]["error_type"], "quota")
+        self.assertNotIn("repair_attempts", resources[0])
+        with self.assertRaises(QuotaExceededError):
+            runner._counter_plan()
+        self.assertEqual(runner.model_calls_dispatched, 126)
+        runner.resume_session = {"session": 1, "reopened_scopes": ["gap_assessment"]}
+        runner.config["limits"]["max_model_calls"] = 640
+        value, _ = runner._counter_plan()
+        self.assertEqual(value["queries"], ["prior solution"])
+        self.assertEqual(runner.model_calls_dispatched, 127)
+
+    def test_required_model_manifest_tracks_current_review_basis_and_actual_downstream_roles(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        manifest = runner._required_model_work()
+        self.assertIn("work-review-W101", [job["name"] for job in manifest])
+        self.assertEqual(next(job for job in manifest if job["name"] == "gap-assessment")["actor"],
+                         "methods.novelty-verifier")
+        runner._review_work_claims()
+        self.assertNotIn("work-review-W101", [job["name"] for job in runner._required_model_work()])
+        with patch.object(runner, "_review_protocol_matches", return_value=False):
+            self.assertIn("work-review-W101", [job["name"] for job in runner._required_model_work()])
+        old = runner.analysis_records["W101"]
+        changed = runner._body(old)
+        changed["reason"] = "The evidence is relevant to the measurement method."
+        runner.analysis_records["W101"] = runner._record("kb/work-analyses/W101", "note", changed,
+            "research.literature-mapper", subjects=runner.analyzed_basis["W101"])
+        self.assertIn("work-review-W101", [job["name"] for job in runner._required_model_work()])
+
+    def test_required_manifest_reserves_one_actual_disposition_per_uncompleted_work_order(self):
+        first = self.follow_up_order()
+        second = {**first, "id": "evidence-2", "objective": "Locate the measurement uncertainty."}
+        runner = self.runtime(work_orders=[first, second])
+        runner._initialize()
+        dispositions = [job for job in runner._required_model_work() if job["phase"] == "survey_follow_up"]
+        self.assertEqual([job["work_order_id"] for job in dispositions], [first["id"], second["id"]])
+        first_identity = hashlib.sha256(canonical_bytes(first)).hexdigest()
+        self.assertEqual(dispositions[0]["name"], f"follow-up-disposition-{first_identity}")
+        runner._follow_up_decisions.add(first_identity)
+        dispositions = [job for job in runner._required_model_work() if job["phase"] == "survey_follow_up"]
+        self.assertEqual([job["work_order_id"] for job in dispositions], [second["id"]])
+
+    def test_optional_mapping_reserves_materialized_downstream_decisions_and_retains_sources(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        source_bytes = deepcopy(runner.source_docs)
+        manifest = runner._required_model_work()
+        runner.config["limits"]["max_model_calls"] = runner.model_calls_dispatched + len(manifest)
+        job = runner._map_job("W101", runner._analysis_basis("W101"))
+        before = runner.model_calls_dispatched
+        self.assertEqual(runner._allocate_model_wave([job]), [])
+        self.assertEqual(runner.model_calls_dispatched, before)
+        self.assertEqual(runner.source_docs, source_bytes)
+        entry = runner._body(runner.analysis_records["W101"])
+        self.assertTrue(all(entry[field]["text"] is None for field in MAP_FIELDS))
+        self.assertEqual(runner._body(runner.store.head("command/survey-abstentions/W101"))["scope"], "model_call_budget")
+        self.assertTrue(runner._is_deferred_analysis("W101"))
+        debt = runner._body(runner.store.head(f"command/survey-resource-debts/{job['name']}"))
+        self.assertEqual(debt["required_calls"], len(manifest) + 1)
+        self.assertEqual(debt["induced_review_work_ids"], ["W101"])
+        self.assertTrue(all(item["input_tokens"] is None for item in debt["required_jobs"]))
+        runner.config["limits"]["max_model_calls"] = before + len(runner._required_model_work()) + 2
+        self.assertEqual(runner._allocate_model_wave([job]), [job])
+
+    def test_budget_reservation_never_erases_existing_claims_or_double_counts_required_retry(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        old = deepcopy(runner.analysis_records["W101"])
+        runner.config["limits"]["max_model_calls"] = runner.model_calls_dispatched
+        job = runner._map_job("W101", runner._analysis_basis("W101"))
+        with self.assertRaises(QuotaExceededError) as stopped:
+            runner._allocate_model_wave([job], repairing={job["name"]})
+        self.assertEqual(runner.analysis_records["W101"], old)
+        self.assertTrue(stopped.exception.diagnostics[0]["required_jobs"])
+        required = runner._required_model_work()
+        runner.config["limits"]["max_model_calls"] = runner.model_calls_dispatched + len(required)
+        review = {"name": "work-review-W101", "actor": "methods.work-reviewer", "assignment": {"phase": "work_review"}}
+        self.assertEqual(runner._allocate_model_wave([review], repairing={review["name"]}), [review])
+
+    def test_all_budget_deferred_claims_remain_resource_failure_without_masking_other_abstentions(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        sources = deepcopy(runner.source_docs)
+        runner.config["limits"]["max_model_calls"] = runner.model_calls_dispatched + len(runner._required_model_work())
+        before = runner.model_calls_dispatched
+        with self.assertRaises(QuotaExceededError) as stopped:
+            runner._accept_survey()
+        self.assertEqual(runner.model_calls_dispatched, before)
+        self.assertEqual(runner.source_docs, sources)
+        self.assertTrue(stopped.exception.diagnostics[0]["budget_abstentions"][0]["debt_refs"])
+        self.assertTrue(stopped.exception.diagnostics[0]["required_jobs"])
+        runner._materialize_source_less_map("W101", runner._analysis_basis("W101"), scope="source_unavailable")
+        with self.assertRaises(ModelWorkBlocked):
+            runner._accept_survey()
+        runner._materialize_source_less_map("W101", runner._analysis_basis("W101"), scope="review_exhausted")
+        with self.assertRaises(ModelWorkBlocked):
+            runner._accept_survey()
+        with patch.object(runner, "_setup", side_effect=stopped.exception):
+            result = runner.run()
+        self.assertEqual(result["failure"]["kind"], "quota_exceeded")
+        self.assertEqual(result["failure"]["diagnostics"], stopped.exception.diagnostics)
+        self.assertEqual(result["status"], "blocked")
+
+    def test_model_budget_admission_survives_checked_dispatch_and_run_result(self):
+        from scisaurus.runtime.models import ModelBudgetExceededError
+        runner = self.runtime()
+        admission = {"path": str(self.root / "owner.sqlite"), "key": "stage", "dimension": "input_tokens", "limit": 100, "observed": 90, "reserved": 0, "requested": 11}
+        failure = {"ok": False, "error": "owned token budget exhausted", "error_type": "ModelBudgetExceededError",
+                   "budget_admission": admission, "outcome_known": True, "attempts": 0, "usage": {"input_tokens": 7}}
+        def fail_setup():
+            with patch.object(runner, "_call_batch", side_effect=lambda specs, **kwargs: {spec["task_id"]: deepcopy(failure) for spec in specs}):
+                runner._model_checked("counter-plan", "methods.novelty-challenger", {"phase": "counter_plan"}, lambda value: None)
+        with patch.object(runner, "_setup", side_effect=fail_setup):
+            result = runner.run()
+        self.assertEqual(result["failure"]["budget_admission"], admission)
+        self.assertEqual(result["failure"]["kind"], "model_call")
+        control, store = self.open_store()
+        cache = ModelWorkCache(store, lambda *args, **kwargs: None)
+        resource = next(entry for entry in cache.entries() if entry.get("status") == "resource_blocked")
+        self.assertEqual(resource["dispatch_failure"], failure)
+        self.assertNotIn("repair_attempts", resource)
+
+    def test_owned_legacy_cache_recovers_exact_typed_failure_without_reusing_other_inputs(self):
+        from scisaurus.runtime.models import ModelBudgetExceededError
+        runner = self.runtime()
+        runner._initialize()
+        runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._accept_survey()
+        runner._nominate()
+        assignment = {"phase": "counter_plan", "nomination_ref": runner.nomination_record["artifact_ref"],
+                      "gap": runner.nomination}
+        role, name = "methods.novelty-challenger", "counter-plan"
+        cache = ModelWorkCache(runner.store, runner._publish)
+        key = cache.key(scope=f"survey:{name}", role=role, system=SYSTEM,
+                        prompt=assignment, model=runner.config["model"])
+        cache.put(key, {"status": "repairing", "repair_attempts": 1, "error": "invalid JSON"})
+        context = runner._record("command/contexts/survey-counter-plan-999", "note", {
+            "role": role, "client": runner.config["model"], "_routing_client": runner.config["model"],
+            "prompt": json.dumps({**assignment, "validation_feedback": {"error": "invalid JSON"}})}, role)
+        admission = {"path": str(self.root / "budget.sqlite"), "key": "stage", "dimension": "model_calls",
+                     "limit": 96, "observed": 96, "reserved": 0, "requested": 1}
+        failure = {"error": "model call budget exhausted: stage", "error_type": "ModelBudgetExceededError",
+                   "budget_admission": admission, "outcome_known": True, "attempts": 0, "usage": {}}
+        failure_record = runner._record("command/failures/survey-counter-plan-999", "report", failure, role,
+                                       subjects=[context["artifact_ref"]])
+        retained = cache.put(key, {"status": "blocked", "repair_attempts": 2,
+            "feedback": {"error": "invalid JSON"}, "error": f"{name}: {failure['error']}"})
+        recovered = runner._legacy_resource_dispatch_failure(retained, name)
+        self.assertEqual(recovered["budget_admission"], admission)
+        self.assertEqual(recovered["failure_ref"], failure_record["artifact_ref"])
+        with patch.object(runner, "_call_batch") as dispatch:
+            with self.assertRaises(ModelBudgetExceededError):
+                runner._model_checked(name, role, assignment, runner._plan_validator)
+            dispatch.assert_not_called()
+        self.assertIsNone(runner._legacy_resource_dispatch_failure({**retained, "error": "another failure"}, name))
+        mismatch_key = cache.key(scope=f"survey:{name}", role=role, system=SYSTEM,
+                                 prompt={**assignment, "question": "Other question"}, model=runner.config["model"])
+        mismatch = cache.put(mismatch_key, {"status": "blocked", "error": retained["error"]})
+        self.assertIsNone(runner._legacy_resource_dispatch_failure(mismatch, name))
+        runner.resume_session = {"session": 1, "reopened_scopes": ["gap_assessment"]}
+        result, _ = runner._model_checked(name, role, assignment, runner._plan_validator)
+        self.assertEqual(result["queries"], ["prior solution"])
+
     def test_unknown_field_cannot_be_reviewed_as_an_absence_claim(self):
         from scisaurus.runtime.survey_records import validate_work_review
         entry = {field: {"text": None, "evidence": []} for field in MAP_FIELDS}
@@ -521,7 +722,10 @@ class TestSurveyRunner(unittest.TestCase):
         runner.analyzed_basis["W102"].remove(removed)
         self.assertEqual(runner._work_review_failure_count("W102"), 0)
         runner.analyzed_basis["W102"].append(removed)
-        runner.relationships["scope-test"] = {"source": "W102", "target": "W101"}
+        relation = runner._record("kb/relationships/scope-test", "note", {"source": "W102", "target": "W101"},
+            "research.literature-mapper", subjects=[runner.analysis_records["W102"]["artifact_ref"],
+                                                  runner.work_records["W101"]["artifact_ref"]])
+        runner.relationships["scope-test"] = {"source": "W102", "target": "W101", "artifact_ref": relation["artifact_ref"]}
         runner._record("kb/work-reviews/W102", "note", adverse_review("W102", "changed"), "methods.work-reviewer")
         self.assertEqual(runner._work_review_failure_count("W102"), 1)
         target_identity = runner._record("kb/identities/W101", "reference_card", {"work_id": "W101"}, "research.cataloger")
@@ -1928,34 +2132,30 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertIn("Use insufficient_evidence for source-fidelity only",
                       review_prompt["instructions"])
 
-    def test_incomplete_coverage_does_not_discard_an_auditable_survey_map(self):
+    def test_incomplete_aggregate_evidence_is_not_replaced_by_focused_positive_verdicts(self):
         result = self.runtime(
             survey_config(self.endpoint, "survey-coverage-insufficient")).run()
-        self.assertEqual(result["status"], "completed", result.get("error"))
-        self.assertTrue(result["survey_current"])
-        self.assertEqual(result["gap_state"], "insufficient_evidence")
+        self.assertEqual(result["status"], "blocked", result.get("error"))
+        self.assertFalse(result["survey_current"])
         control, store = self.open_store()
         accepted = store.accepted("kb/surveys/current")
-        self.assertEqual(accepted["artifact_ref"], result["survey_ref"])
+        self.assertIsNone(accepted)
         review_rows = control._conn.execute(
             "SELECT artifact_ref FROM artifacts WHERE logical_id LIKE 'kb/survey-reviews/%' "
             "ORDER BY created_at DESC LIMIT 1").fetchone()
         review = json.loads(store.read_body(store.get(review_rows[0])["body_hash"]))
-        self.assertEqual(review["verification_kind"], "deterministic_aggregate")
-        self.assertEqual(
-            {item["check_id"]: item["outcome"] for item in review["checks"]},
-            {check_id: "passed" for check_id in SURVEY_CHECKS},
-        )
+        self.assertNotIn("verification_kind", review)
+        self.assertEqual(next(row["outcome"] for row in review["checks"] if row["check_id"] == "source-fidelity"), "insufficient_evidence")
         assessment_prompt_count = sum(
             prompt.get("phase") == "survey_review"
             for _, prompt in self.model_contexts(control, store))
         deterministic_count = control._conn.execute(
             "SELECT COUNT(*) FROM artifacts "
             "WHERE logical_id LIKE 'command/survey-review-deterministic/%'").fetchone()[0]
-        self.assertEqual(assessment_prompt_count, 2)
-        self.assertEqual(deterministic_count, assessment_prompt_count)
+        self.assertEqual(assessment_prompt_count, 1)
+        self.assertEqual(deterministic_count, 0)
 
-    def test_incomplete_coverage_fallback_still_requires_accounting_and_map_support(self):
+    def test_independent_aggregate_negative_verdicts_remain_blocking(self):
         for failed_check in ("coverage-accounting", "map-support"):
             with self.subTest(failed_check=failed_check):
                 run_root = self.root / failed_check
@@ -1975,22 +2175,81 @@ class TestSurveyRunner(unittest.TestCase):
                 control.close()
                 self.assertEqual(deterministic_count, 0)
 
-    def test_deterministic_aggregate_review_keeps_conflicted_included_source_blocking(self):
-        runner = self.runtime()
-        self.addCleanup(runner.control.close)
+    def test_aggregate_format_failure_cannot_create_semantic_acceptance(self):
+        runner = self.runtime(survey_config(self.endpoint, "survey-review-malformed"))
+        result = runner.run()
+        self.assertEqual(result["status"], "blocked", result.get("error"))
+        self.assertFalse(result["survey_current"])
+        control, store = self.open_store()
+        self.assertIsNone(store.accepted("kb/surveys/current"))
+        self.assertEqual(control._conn.execute("SELECT COUNT(*) FROM artifacts WHERE logical_id LIKE 'command/survey-review-deterministic/%'").fetchone()[0], 0)
+
+    def test_focused_relevance_contract_distinguishes_unrelated_summary_from_partial_support(self):
+        runner = self.runtime(survey_config(self.endpoint, "screening-relevance-adversary"))
         runner._initialize()
-        runner._setup()
-        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
-        runner._map()
-        runner.identity_records["W101"] = runner._record(
-            "kb/identity-fixture/W101", "note",
-            {"work_id": "W101", "status": "conflicted"},
-            "methods.identity-verifier")
-        packet = runner._survey_review_packet()
-        with self.assertRaisesRegex(ModelWorkBlocked, "conflicted bibliographic identity"):
-            runner._deterministic_survey_review(
-                packet, "artifact:kb/surveys/current@1",
-                ValidationError("incomplete aggregate source-fidelity review"))
+        question = "Does work extraction scale linearly with relational coherence?"
+        for index, (text, reason, expected) in enumerate((
+                ("This review summarizes LED device architectures.", "The source's LED topic matches its own summary.", "failed"),
+                ("Relational coherence contributes to thermodynamic work.", "The captured source connects coherence and thermodynamic work; linear scaling remains unestablished.", "passed"))):
+            entry = {"work_id": f"W{index}", "inclusion": "included", "reason": reason,
+                     **{field: {"text": None, "evidence": []} for field in MAP_FIELDS}}
+            value, _ = runner._model_checked(f"relevance-{index}", "methods.work-reviewer", {
+                "phase": "work_review", "question": question, "entry": entry,
+                "review_contract": source_fidelity_review_contract(), "required_checks": list(work_review_checks([])),
+                "sources": [{"source_ref": f"fixture-source-{index}", "work_id": entry["work_id"], "representation": "abstract", "text": text}]},
+                lambda value, entry=entry: validate_work_review(value, [], entry=entry), task_kind="verification")
+            outcomes = {row["check_id"]: row["outcome"] for row in value["checks"]}
+            self.assertEqual(outcomes["inclusion"], expected)
+            self.assertEqual(outcomes["reason"], expected)
+            self.assertEqual(outcomes["problem"], "passed")
+        self.assertEqual(source_fidelity_review_contract()["protocol"], "literature-source-fidelity-2")
+
+    def test_focused_relationship_qualifier_is_a_separate_entailed_clause(self):
+        runner = self.runtime(survey_config(self.endpoint, "relationship-qualifier-adversary"))
+        runner._initialize()
+        ref = "artifact:kb/relationships/fixture@1"
+        entry = {"work_id": "W1", "inclusion": "included", "reason": "The source connects coherence and work.",
+                 **{field: {"text": None, "evidence": []} for field in MAP_FIELDS}}
+        value, _ = runner._model_checked("qualifier-review", "methods.work-reviewer", {
+            "phase": "work_review", "question": "How does coherence contribute to work?", "entry": entry,
+            "review_contract": source_fidelity_review_contract(), "required_checks": list(work_review_checks([ref])),
+            "relationships": [{"kind": "related", "claim": {"text": "Both works investigate the fundamental problem of converting coherence to work."}}],
+            "sources": [{"source_ref": "fixture-source", "work_id": "W1", "representation": "abstract", "text": "We assess the problem of converting coherence to work."}]},
+            lambda value: validate_work_review(value, [ref], entry=entry), task_kind="verification")
+        self.assertEqual(next(row["outcome"] for row in value["checks"] if row["check_id"] == "relationship:" + ref), "failed")
+
+    def test_integrated_source_packet_preserves_exact_disjoint_paragraph_spans_and_hashes(self):
+        runner = self.runtime()
+        runner._initialize()
+        first, last = "First measurement: λ contributes to work.", "Last measurement: coupling changes the response."
+        text = first + "\n\n" + "Uncited background. " * 8000 + "\n\n" + last
+        source = {"work_id": "W1", "representation": "full_text", "text": text, "identity_verified": True,
+                  "identity_checks": {"title_match": True, "section_markers": ["Methods"]}}
+        record = runner._record("kb/full-text/W1", "source_capture", source, "methods.source-verifier")
+        ref = record["artifact_ref"]
+        runner.source_docs[ref] = source
+        proofs = [{"work_id": "W1", "source_ref": ref, "quote": quote,
+                   "start": text.index(quote), "end": text.index(quote) + len(quote),
+                   "quote_sha256": hashlib.sha256(quote.encode()).hexdigest()} for quote in (first, last)]
+        entry = {"work_id": "W1", "inclusion": "included", "reason": "Captured work measurements connect the declared mechanism.",
+                 **{field: {"text": None, "evidence": []} for field in MAP_FIELDS}}
+        entry["finding"] = {"text": "Both measurements are recorded.", "evidence": proofs}
+        windows = runner._survey_review_source_windows([entry], [])
+        self.assertEqual([window["text"] for window in windows], [first, last])
+        for window in windows:
+            start, end = window["window"]["start"], window["window"]["end"]
+            self.assertEqual(window["text"], text[start:end])
+            self.assertEqual(window["source_body_sha256"], record["body_hash"])
+            self.assertEqual(window["source_text_sha256"], hashlib.sha256(text.encode()).hexdigest())
+            self.assertEqual(window["window_sha256"], hashlib.sha256(window["text"].encode()).hexdigest())
+        self.assertLess(sum(len(window["text"]) for window in windows), 200)
+        forged = deepcopy(entry)
+        forged["finding"]["evidence"][0]["quote_sha256"] = "0" * 64
+        with self.assertRaises(ValidationError):
+            runner._survey_review_source_windows([forged], [])
+        source["text"] += "\n\nAn unrecorded addition."
+        with self.assertRaisesRegex(ValidationError, "immutable capture"):
+            runner._survey_review_source_windows([entry], [])
 
     def test_integrated_review_resume_reuses_map_without_retrieval(self):
         config = survey_config(self.endpoint, "survey-review-fails-second")

@@ -12,7 +12,8 @@ from scisaurus.core.events import ControlStore
 from scisaurus.core.schema import canonical_bytes, sha256_hex
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.surveys import (
-    ASSESSMENT_CHECKS, RELATIONSHIP_SEMANTICS, SURVEY_CHECKS, WORK_CHECKS, SurveyGate, work_review_checks,
+    ABSTENTION_REASONS, ASSESSMENT_CHECKS, RELATIONSHIP_SEMANTICS, SURVEY_CHECKS, WORK_CHECKS,
+    SurveyGate, is_explicit_abstention, work_review_checks,
 )
 from scisaurus.core.tasks import TaskManager
 
@@ -24,6 +25,16 @@ def checks(names, outcome="passed"):
 
 
 class TestSurveyGate(unittest.TestCase):
+    def test_call_budget_deferral_admits_no_scientific_assertion(self):
+        entry = {"work_id": "work-1", "inclusion": "uncertain", "reason": ABSTENTION_REASONS["model_call_budget"],
+                 **{field: {"text": None, "evidence": []} for field in WORK_CHECKS[2:]}}
+        record = {"scope": "model_call_budget", "work_id": "work-1",
+                  "entry_sha256": sha256_hex(canonical_bytes(entry))}
+        self.assertTrue(is_explicit_abstention(entry, record))
+        entry["finding"] = {"text": "The treatment works", "evidence": []}
+        record["entry_sha256"] = sha256_hex(canonical_bytes(entry))
+        self.assertFalse(is_explicit_abstention(entry, record))
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="scisaurus-survey-")
         self.control = ControlStore(self.directory.name)

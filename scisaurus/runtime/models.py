@@ -396,27 +396,28 @@ def _settle_model_token_budgets(reserved, usage):
             connection.execute("UPDATE model_token_reservations SET state=? WHERE reservation_id=?", (state,reservation_id))
 
 
-def model_call_budget_available(config):
-    """Check a durable model-call cap without reserving a call.
+def model_call_budget_remaining(config):
+    """Read remaining durable call capacity without reserving or registering it.
 
     A missing ledger means no call has been reserved yet.  The atomic reserve
     operation remains authoritative when concurrent workers race at the cap.
+    An uncapped configuration returns None.
     """
     budget = _budget_config(config)
     if budget is None:
-        return True
+        return None
     path = Path(budget["path"])
     if not path.exists():
-        return True
+        return budget["limit"]
     connection = None
     try:
-        connection = sqlite3.connect(str(path), timeout=5.0)
+        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)
         table = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
             ("model_call_budgets",),
         ).fetchone()
         if table is None:
-            return True
+            return budget["limit"]
         row = connection.execute(
             "SELECT max_calls, used_calls FROM model_call_budgets WHERE budget_key=?",
             (budget["key"],),
@@ -427,11 +428,19 @@ def model_call_budget_available(config):
         if connection is not None:
             connection.close()
     if row is None:
-        return True
+        return budget["limit"]
     if row[0] != budget["limit"]:
         raise ValidationError(
             f"{path} model-call budget limit conflicts with configured limit")
-    return row[1] < row[0]
+    if type(row[1]) is not int or not 0 <= row[1] <= row[0]:
+        raise ValidationError(f"{path} model-call budget usage is invalid")
+    return row[0] - row[1]
+
+
+def model_call_budget_available(config):
+    """Check whether the durable call cap admits one more reservation."""
+    remaining = model_call_budget_remaining(config)
+    return remaining is None or remaining > 0
 
 
 def _reserve_model_call_budgets(configs, *, token_reservation=None):

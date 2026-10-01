@@ -443,6 +443,27 @@ class TestExecutionRuntime(unittest.TestCase):
         self.assertEqual(single.exception.budget_admission, admission)
         self.assertEqual(single.exception.usage, usage)
 
+    def test_undispatched_call_quota_remains_typed_through_batch_and_single_dispatch(self):
+        from scisaurus.core.errors import QuotaExceededError
+        runtime = self.runtime()
+        runtime.config["limits"]["max_model_calls"] = 1
+        runtime.model_calls_dispatched = 1
+        outcome = runtime._call_batch([self.spec("quota-exhausted")])["quota-exhausted"]
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["error_type"], "quota")
+        self.assertEqual(outcome.get("usage", {}).get("model_calls", 0), 0)
+        with self.assertRaises(QuotaExceededError) as caught:
+            runtime._raise_dispatch_failures([outcome], "review")
+        self.assertEqual(caught.exception.dimension, "max_model_calls")
+        self.assertEqual(caught.exception.limit, 1)
+        self.assertEqual(caught.exception.observed, 1)
+        self.assertEqual(caught.exception.dispatch_failures, [outcome])
+        with self.assertRaises(QuotaExceededError) as single:
+            runtime._call("single-quota-exhausted", "model", self.spec("unused")["params"],
+                          actor="strategy.worker", task_kind="production")
+        self.assertEqual(single.exception.dimension, "max_model_calls")
+        self.assertEqual(runtime.model_calls_dispatched, 1)
+
     def test_failed_suffix_preserves_known_tokens_without_duplicate_calls(self):
         from scisaurus.runtime.execution import _complete_model_with_continuation
         from scisaurus.runtime.models import ModelResult
