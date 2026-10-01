@@ -2137,6 +2137,90 @@ class TestSurveyRunner(unittest.TestCase):
                 "source_pins": [{"ref": ref, "body_hash": runner.store.get(ref)["body_hash"]} for ref in sorted(source_refs)],
                 "hypothesis": "Independently determine whether every qualification in this screening rationale is supported by the pinned source text."}
 
+    def test_durable_independent_critique_reopens_only_the_pinned_review(self):
+        config = survey_config(self.endpoint, "review-obligation-adversary")
+        config["limits"]["max_rounds"] = 2
+        runner = self.runtime(config)
+        runner._initialize(); runner._setup()
+        for wid in ("W101", "W102"):
+            runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+        runner._accept_survey()
+        unaffected = runner.work_reviews["W102"]["artifact_ref"]
+        old_entry = runner.analysis_records["W101"]["artifact_ref"]
+        obligation = {k:v for k,v in self.review_obligation(runner, "W101").items()
+                      if k not in {"receipt_ref", "receipt_body_sha256"}}
+        receipt = runner._record("command/independent-literature-critiques/audit", "decision_note",
+            {"schema_version": "independent-literature-critique-1", "question": runner.score["question"],
+             "obligations": [obligation]}, "command.operator", subjects=[old_entry])
+        with self.assertRaisesRegex(ValidationError, "not adjudicated"):
+            runner.gate.require_current(runner.survey_ref)
+        requests = len(SurveyHTTPFixture.requests)
+        runner.control.close()
+        policy = {"additional_seconds": 20, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["gap_assessment"]}}
+        resumed = self.runtime(config, resume_policy=policy)
+        self.assertEqual(resumed.review_obligations[0]["receipt_ref"], receipt["artifact_ref"])
+        self.assertEqual(resumed.review_obligations[0]["receipt_body_sha256"], receipt["body_hash"])
+        self.assertNotIn("W101", resumed.reviewed_basis)
+        self.assertIsNone(resumed.survey_ref)
+        self.assertIsNone(resumed.assessment_ref)
+        resumed._initialize(); resumed._accept_survey()
+        self.assertEqual(len(SurveyHTTPFixture.requests), requests)
+        self.assertEqual(resumed.work_reviews["W102"]["artifact_ref"], unaffected)
+        self.assertNotEqual(resumed.analysis_records["W101"]["artifact_ref"], old_entry)
+        self.assertEqual(resumed._body(resumed.analysis_records["W101"])["reason"], "The captured study examines recall timing.")
+        focused = [p for _,p in self.model_contexts(resumed.control, resumed.store)
+                   if p.get("phase") == "work_review" and p.get("review_obligations")]
+        self.assertEqual(len(focused), 2)
+        self.assertTrue(all(p["entry"]["work_id"] == "W101" for p in focused))
+        self.assertTrue(resumed._review_protocol_matches(resumed._body(resumed.work_reviews["W101"])))
+
+        accepted = resumed.survey_ref
+        reviewed = resumed.work_reviews["W101"]["artifact_ref"]
+        before_calls = resumed.budget.get_window("run-window")["cumulative_usage"]["model_calls"]
+        resumed.control.close()
+        replay = self.runtime(config, resume_policy={**policy, "source_changes": {"mode": "reject", "reopen_scopes": []}})
+        self.assertEqual(replay.survey_ref, accepted)
+        self.assertEqual(replay.work_reviews["W101"]["artifact_ref"], reviewed)
+        self.assertEqual(replay.budget.get_window("run-window")["cumulative_usage"]["model_calls"], before_calls)
+
+    def test_exhausted_critiqued_abstention_blocks_without_recursive_redispatch(self):
+        config = survey_config(self.endpoint, "review-never-resolves")
+        config["limits"]["max_rounds"] = 2
+        runner = self.runtime(config)
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map(); runner._review_work_claims()
+        obligation = self.review_obligation(runner, "W101")
+        runner.review_obligations = runner._validate_review_obligations([obligation])
+        runner.reviewed_basis.pop("W101", None)
+        before = runner.model_calls_dispatched
+        with self.assertRaisesRegex(ModelWorkBlocked, "remains unresolved"):
+            runner._review_work_claims()
+        self.assertLess(runner.model_calls_dispatched - before, 10)
+        self.assertIsNone(runner.survey_ref)
+        self.assertTrue(all(runner._body(runner.analysis_records["W101"])[field]["text"] is None for field in MAP_FIELDS))
+
+    def test_durable_critique_rejects_changed_question_author_and_source(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._accept_survey()
+        obligation = {k:v for k,v in self.review_obligation(runner, "W101").items()
+                      if k not in {"receipt_ref", "receipt_body_sha256"}}
+        body = {"schema_version": "independent-literature-critique-1", "question": runner.score["question"],
+                "obligations": [obligation]}
+        logical = "command/independent-literature-critiques/audit"
+        for bad, author in (({**body, "question": "different question"}, "command.operator"),
+                            (body, "research.literature-mapper")):
+            runner._record(logical, "decision_note", bad, author)
+            with self.assertRaises(StateError):
+                runner.gate.independent_review_obligations(runner.score["question"])
+        bad = deepcopy(body); bad["obligations"][0]["source_pins"][0]["body_hash"] = "b"*64
+        runner._record(logical, "decision_note", bad, "command.operator")
+        with self.assertRaises(StateError):
+            runner._validate_review_obligations(runner.gate.independent_review_obligations(runner.score["question"]))
+
     def test_targeted_review_obligation_preserves_unaffected_reviews_and_adjudicates_hypothesis(self):
         config = survey_config(self.endpoint, "review-obligation-adversary")
         config["limits"]["max_rounds"] = 2

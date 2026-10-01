@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from copy import deepcopy
 import json
 import math
 import re
@@ -10,7 +11,7 @@ import unicodedata
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from scisaurus.core.errors import ConflictError, ValidationError
+from scisaurus.core.errors import ConflictError, StateError, ValidationError
 from scisaurus.core.schema import canonical_bytes, json_object, parse_ref, sha256_hex
 from scisaurus.core.source_spans import (bind as bind_source_spans, expand_evidence,
                                         validate as validate_source_span)
@@ -76,6 +77,29 @@ class SurveyGate:
         if store.control is not control:
             raise ValidationError("survey gate and artifact store must share the control connection")
         self.control, self.store = control, store
+
+    def independent_review_obligations(self, question):
+        """Consume controller-owned, source-pinned critiques as disputed claims."""
+        result = []
+        identities = self.control._conn.execute(
+            "SELECT DISTINCT logical_id FROM artifacts WHERE logical_id LIKE ? ORDER BY logical_id",
+            ("command/independent-literature-critiques/%",)).fetchall()
+        for (logical_id,) in identities:
+            head = self.store.head(logical_id)
+            manifest, raw = self._artifact(head["artifact_ref"], current=True)
+            body = self._json(raw, manifest["artifact_ref"])
+            if (manifest["author"] != "command.operator"
+                    or set(body) != {"schema_version", "question", "obligations"}
+                    or body["schema_version"] != "independent-literature-critique-1"
+                    or body["question"] != question
+                    or not isinstance(body["obligations"], list) or not body["obligations"]):
+                raise StateError("independent literature critique requires its exact question and operator receipt")
+            for obligation in body["obligations"]:
+                if not isinstance(obligation, dict) or {"receipt_ref", "receipt_body_sha256"} & set(obligation):
+                    raise StateError("independent literature critique cannot replace its receipt identity")
+                result.append({**deepcopy(obligation), "receipt_ref": manifest["artifact_ref"],
+                               "receipt_body_sha256": manifest["body_hash"]})
+        return result
 
     @staticmethod
     def _guard(guard):
@@ -214,6 +238,7 @@ class SurveyGate:
         _, mapped = self._note(survey["map_ref"])
         entry_refs = self._refs(mapped.get("entry_refs"), "map entry_refs")
         relationship_refs = self._refs(mapped.get("relationship_refs"), "map relationship_refs")
+        critiques = self.independent_review_obligations(mapped.get("question"))
         dependencies = set(survey["dependency_refs"])
         if not set([*entry_refs, *relationship_refs]).issubset(dependencies):
             raise ValidationError("survey dependencies must pin every map entry and relationship")
@@ -235,6 +260,8 @@ class SurveyGate:
             registered.add(work_id)
         if registered != work_ids:
             raise ValidationError("survey map must contain exactly one entry for every registered work")
+        if any(item.get("work_id") not in work_ids for item in critiques):
+            raise ValidationError("independent critique has no corresponding mapped work")
         outgoing = {work_id: set() for work_id in work_ids}
         relationship_bodies = {}
         for ref in relationship_refs:
@@ -263,7 +290,10 @@ class SurveyGate:
             checks = body.get("checks")
             self._passed_checks(checks, work_review_checks(relationships), "focused work review")
             self._text(body.get("rationale"), "work review rationale")
+            required_critiques = [item for item in critiques if item["work_id"] == work_id]
             if body.get("verification_kind") == "deterministic_abstention":
+                if required_critiques:
+                    raise ValidationError("independent critique requires substantive adjudication")
                 execution, abstention = self._note(body.get("execution_ref"))
                 if (relationships or execution["author"] != "command.controller"
                         or execution["artifact_id"] != f"command/survey-abstentions/{work_id}"
@@ -274,6 +304,12 @@ class SurveyGate:
                 evidence.extend((review, execution))
                 continue
             execution, context, prompt, reply = self._model_review_execution(body.get("execution_ref"), review["author"])
+            supplied_critiques = prompt.get("review_obligations", [])
+            if any(not any(canonical_bytes(item) == canonical_bytes(supplied) for supplied in supplied_critiques)
+                   for item in required_critiques):
+                raise ValidationError("focused review has not adjudicated the current independent critique")
+            if not {item["receipt_ref"] for item in required_critiques}.issubset(dependencies):
+                raise ValidationError("survey dependencies must pin its independent critique receipts")
             reply = normalize_check_envelope(reply, work_review_checks(relationships))
             if execution["artifact_ref"] not in dependencies:
                 raise ValidationError("survey dependencies must pin every focused review execution")

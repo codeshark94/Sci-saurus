@@ -518,7 +518,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         self.bounds = self.score["search"]
         self.operations = OperationsCell(self.control, self.store, project_id=self.config["project_id"])
         self.gate = SurveyGate(self.control, self.store)
-        self.review_obligations = self._validate_review_obligations(review_obligations)
+        self.review_obligations = self._validate_review_obligations([
+            *(review_obligations or []), *self.gate.independent_review_obligations(self.score["question"])])
         self.worker_slots = configured_worker_slots(self.config["limits"])
         self.bibliography_mode = "openalex"
         self.bibliography_fallback_policy = self.score.get(
@@ -1056,7 +1057,9 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         ).fetchall()]
         suffixes = [int(match.group(1)) for task_id in task_ids if (match := re.search(r"-([0-9]+)$", task_id))]
         self.serial = max(suffixes, default=0)
-        if "integrated_review" not in scopes and "mapping" not in scopes and "focused_review" not in scopes:
+        critiques_current = all(item["work_id"] in self.reviewed_basis for item in self.review_obligations)
+        if (critiques_current and "integrated_review" not in scopes
+                and "mapping" not in scopes and "focused_review" not in scopes):
             accepted = self.store.accepted("kb/surveys/current")
             if accepted:
                 try:
@@ -4180,7 +4183,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         if review.get("review_protocol") != contract["protocol"]:
             return False
         if review.get("verification_kind") == "deterministic_abstention":
-            return True
+            wid = self._body(self.store.get(review["entry_ref"]))["work_id"]
+            return not self._review_obligations_for(wid)
         try:
             wid = self._body(self.store.get(review["entry_ref"]))["work_id"]
             obligations = self._review_obligations_for(wid)
@@ -4283,7 +4287,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     continue
                 entry = json.loads(self.store.read_body(entry_record["body_hash"]))
                 abstention = self.store.head(f"command/survey-abstentions/{wid}")
-                if abstention and not refs and is_explicit_abstention(entry, self._body(abstention)):
+                if (abstention and not refs and not self._review_obligations_for(wid)
+                        and is_explicit_abstention(entry, self._body(abstention))):
                     checks = [{"check_id": check, "outcome": "passed", "method": "deterministic abstention integrity",
                                "result": "No substantive statement or relationship is admitted; the recorded limitation remains explicit."}
                               for check in work_review_checks([])]
@@ -4397,6 +4402,12 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                              or wid in self._contract_exhausted_work_reviews)]
             if exhausted:
                 for wid, feedback in exhausted:
+                    abstention = self.store.head(f"command/survey-abstentions/{wid}")
+                    if (self._review_obligations_for(wid) and abstention
+                            and is_explicit_abstention(self._body(self.analysis_records[wid]), self._body(abstention))):
+                        raise ModelWorkBlocked(
+                            f"independent critique for {wid} remains unresolved after substantive review",
+                            failure_class="model_contract" if wid in self._contract_exhausted_work_reviews else "scientific_review")
                     self._exclude_unresolved_work(wid, feedback)
                 self._map()
                 excluded_ids = {wid for wid, _ in exhausted}
@@ -4477,6 +4488,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "identity_refs": sorted(r["artifact_ref"] for r in self.identity_records.values()),
                 "dependency_refs": sorted(set(dependencies))}
         body["work_review_refs"] = sorted(r["artifact_ref"] for r in self.work_reviews.values())
+        local_critiques = self.gate.independent_review_obligations(self.score["question"])
+        body["dependency_refs"] = sorted(set(body["dependency_refs"]) | {item["receipt_ref"] for item in local_critiques})
         bundle = self._record("kb/surveys/current", "note", body, "research.literature-mapper", subjects=body["dependency_refs"])
         self.survey_revision += 1
         review_packet = self._survey_review_packet()
