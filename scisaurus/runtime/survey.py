@@ -293,7 +293,7 @@ def _normalize_scoped_entry_updates(wid, updates):
         raise ValidationError("scoped map repair changed an ungranted work")
     nested = updates[wid]
     if not isinstance(nested, dict):
-        return updates
+        raise ModelContractError("scoped map repair work updates must be an explicit object")
     return nested
 
 
@@ -326,8 +326,8 @@ def apply_scoped_map_repair(wid, previous, old_relationships, feedback, patch, *
     if not isinstance(relations, list):
         raise ValidationError("scoped map repair relationships must be a list")
     targets = set(feedback["relationship_targets"])
-    if not updates and not targets:
-        raise ValidationError("scoped map repair must change a granted entry field or relationship")
+    if not granted_fields and not targets:
+        raise ValidationError("scoped map repair requires a granted entry field or relationship")
     if any(not isinstance(relation, dict) or relation.get("source") != wid
            or relation.get("target") not in targets for relation in relations):
         raise ValidationError("scoped map repair changed an ungranted relationship")
@@ -476,12 +476,18 @@ def normalize_map_worker_response(value, *, work_id, all_work_ids, sources,
 
     value = normalize_map_relationships(value)
     if review_feedback is not None:
-        raw_updates = value.get("entry_updates") if isinstance(value, dict) else None
-        if isinstance(raw_updates, dict) and isinstance(raw_updates.get(work_id), dict):
+        exact(value, {"entry_updates", "relationships"}, "scoped map repair")
+        raw_updates = value["entry_updates"]
+        if isinstance(raw_updates, dict) and work_id in raw_updates:
+            if not isinstance(raw_updates[work_id], dict):
+                raise ModelContractError("scoped map repair work updates must be an explicit object")
+            for other_work in set(raw_updates) - {work_id}:
+                report_issue("ungranted_work_ignored", work_id=other_work)
             raw_updates = raw_updates[work_id]
         if not isinstance(raw_updates, dict):
-            report_issue("malformed_scoped_update_ignored")
-            raw_updates = {}
+            raise ModelContractError("scoped map repair entry updates must be an explicit object")
+        if not isinstance(value["relationships"], list):
+            raise ModelContractError("scoped map repair relationships must be an explicit list")
         granted = set(review_feedback.get("entry_fields", []))
         for field in set(raw_updates) - granted:
             report_issue("ungranted_entry_field_ignored", field=str(field))
@@ -490,6 +496,8 @@ def normalize_map_worker_response(value, *, work_id, all_work_ids, sources,
             "The captured source text did not support a verifiable screening rationale."
         )
         for field in review_feedback.get("entry_fields", []):
+            if field not in raw_updates:
+                continue
             raw = raw_updates.get(field)
             if field == "inclusion":
                 updates[field] = (raw if isinstance(raw, str)
@@ -3904,11 +3912,11 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "editable_relationship_targets": editable_targets,
                 "instructions":
                     "Return exactly {entry_updates:{assigned_work_id:{field:value}},relationships:[{source,target,kind,claim}]}. "
-                    "entry_updates must contain exactly one key, the assigned work ID, whose nested object contains a nonempty subset of editable_entry_fields; omit unchanged fields because the control plane retains and re-reviews them; do not return a complete entry. "
+                    "entry_updates must contain exactly one key, the assigned work ID, whose nested object contains a subset of editable_entry_fields; an empty object retains every entry field for independent re-review. Omit unchanged entry fields; do not return a complete entry. "
                     "For inclusion use included/excluded/uncertain; reason is a plain string; problem, approach, finding, and limitations use "
                     "Statement={text:string|null,evidence:[{work_id:string,source_ref:string,quote:string}]}. "
-                    "relationships contains only replacements for editable_relationship_targets; an omitted editable target deletes its old relationship. "
-                    "Never return unchanged fields or relationships because the control plane retains them from their accepted versions. "
+                    "relationships contains only replacements for editable_relationship_targets. Return the exact unchanged editable relationship to retain it; omit an editable relationship only to deliberately withdraw it. Protected relationships are retained by the control plane. "
+                    "The negative review is a disputed diagnosis, not proof. Retain source-supported assertions when the diagnosis is unsupported; every retention is independently re-reviewed and does not establish scientific acceptance. "
                     "Every substantive statement needs a short contiguous exact quote from the displayed source, with every clause supported. "
                     "Relationship source must be the assigned work, target must be editable, kind is extends/contradicts/compares/related, "
                     "and its claim needs evidence from both works. Use only displayed source_ref values. "

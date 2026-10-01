@@ -2398,6 +2398,59 @@ class TestSurveyRunner(unittest.TestCase):
                 {**feedback, "relationship_refs": ["artifact:kb/relationships/extends@999"]},
                 {"entry_updates": {}, "relationships": []}, reject_ungranted_changes=True)
 
+    def test_disputed_diagnosis_allows_exact_retention_without_expanding_grants(self):
+        previous = {"work_id": "W101", "reason": "A supported existing assertion."}
+        feedback = {"entry_fields": ["reason"], "relationship_targets": [], "relationship_refs": []}
+        normalized = normalize_map_worker_response(
+            {"entry_updates": {"W101": {}}, "relationships": []}, work_id="W101",
+            all_work_ids={"W101"}, sources=[], windows={}, previous=previous, review_feedback=feedback)
+        self.assertEqual(normalized["entry_updates"], {})
+        retained = apply_scoped_map_repair("W101", previous, [], feedback,
+            normalized, reject_ungranted_changes=True)
+        self.assertEqual(retained, {"entries": [previous], "relationships": []})
+        partial = normalize_map_worker_response(
+            {"entry_updates": {"W101": {"reason": "A narrower rationale."}}, "relationships": []},
+            work_id="W101", all_work_ids={"W101"}, sources=[], windows={}, previous=previous,
+            review_feedback={**feedback, "entry_fields": ["inclusion", "reason", "finding"]})
+        self.assertEqual(partial["entry_updates"], {"reason": "A narrower rationale."})
+        for malformed in ({}, {"entry_updates": None, "relationships": []},
+                          {"entry_updates": {"W101": None}, "relationships": []},
+                          {"entry_updates": {}, "relationships": None}):
+            with self.subTest(malformed=malformed), self.assertRaises(ValidationError):
+                normalize_map_worker_response(malformed, work_id="W101", all_work_ids={"W101"},
+                    sources=[], windows={}, previous=previous, review_feedback=feedback)
+        relation = {"source": "W101", "target": "W102", "kind": "related",
+                    "claim": {"text": "A supported common mechanism.", "evidence": []},
+                    "artifact_ref": "artifact:kb/relationships/one@1"}
+        feedback = {"entry_fields": [], "relationship_targets": ["W102"],
+                    "relationship_refs": [relation["artifact_ref"]]}
+        projection = {key: value for key, value in relation.items() if key != "artifact_ref"}
+        retained = apply_scoped_map_repair("W101", previous, [relation], feedback,
+            {"entry_updates": {}, "relationships": [projection]}, reject_ungranted_changes=True)
+        self.assertEqual(retained, {"entries": [previous], "relationships": [projection]})
+        with self.assertRaisesRegex(ValidationError, "granted"):
+            apply_scoped_map_repair("W101", previous, [],
+                {"entry_fields": [], "relationship_targets": []},
+                {"entry_updates": {}, "relationships": []}, reject_ungranted_changes=True)
+
+    def test_mapper_job_empty_repair_preserves_exact_current_entry(self):
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        before = deepcopy(runner._body(runner.analysis_records["W101"]))
+        feedback = {"review_ref": runner.analysis_records["W101"]["artifact_ref"],
+                    "entry_fields": ["inclusion", "reason", "problem", "finding"],
+                    "relationship_targets": [], "relationship_refs": [], "checks": []}
+        job = runner._map_job("W101", runner.analyzed_basis["W101"], review_feedback=feedback)
+        value = job["normalizer"]({"entry_updates": {"W101": {}}, "relationships": []})
+        self.assertEqual(value["entry_updates"], {})
+        job["validator"](value)
+        job["on_valid"](value, feedback["review_ref"])
+        self.assertEqual(runner._body(runner.analysis_records["W101"]), before)
+        self.assertIn("disputed diagnosis", job["assignment"]["instructions"])
+
     def test_aggregate_failure_routes_narrow_repair_and_preserves_siblings(self):
         runner = self.runtime(survey_config(self.endpoint, "aggregate-scoped-repair"))
         runner._initialize(); runner._setup()
