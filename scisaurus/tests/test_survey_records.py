@@ -370,6 +370,54 @@ class TestGapAssessment(unittest.TestCase):
 
 
 class TestSurveyChecks(unittest.TestCase):
+    def test_invalid_survey_findings_report_every_current_target_without_changing_verdicts(self):
+        row = entry()
+        ref = "artifact:kb/work-analyses/W1@2"
+        current = {"entries": [row], "entry_refs": {"W1": ref}, "relationships": []}
+        value = {"checks": required_checks(SURVEY_CHECKS), "rationale": "Inspect captured evidence.",
+                 "findings": []}
+        for check in value["checks"]:
+            if check["check_id"] != "coverage-accounting":
+                check["outcome"] = "failed"
+        for check_id, field, quote in (("source-fidelity", "finding", "A historical statement."),
+                                       ("map-support", "reason", "A historical rationale."),
+                                       ("map-support", "problem", "An absent assertion.")):
+            value["findings"].append({"check_id": check_id, "target_ref": ref, "field": field,
+                                      "quote": quote, "rationale": "Reassess source support."})
+        original = deepcopy(value)
+        with self.assertRaises(ModelContractError) as caught:
+            validate_survey_review(value, current_map=current)
+        message = str(caught.exception)
+        for index, field in enumerate(("finding", "reason", "problem")):
+            self.assertIn(f"findings[{index}].quote", message)
+            self.assertIn(f"target_ref={ref!r}, field={field!r}", message)
+            text = row[field]["text"] if isinstance(row[field], dict) else row[field]
+            self.assertIn(f"current_field={text!r}", message)
+        self.assertIn("map-support, source-fidelity", message)
+        self.assertIn("do not replace a historical quotation with unrelated current text", message)
+        self.assertEqual(value, original)
+
+    def test_survey_finding_diagnostics_preserve_valid_negative_findings(self):
+        row = entry()
+        ref = "artifact:kb/work-analyses/W1@2"
+        current = {"entries": [row], "entry_refs": {"W1": ref}, "relationships": []}
+        value = {"checks": required_checks(SURVEY_CHECKS), "rationale": "Inspect captured evidence.",
+                 "findings": []}
+        value["checks"][1]["outcome"] = "failed"
+        valid = {"check_id": "source-fidelity", "target_ref": ref, "field": "finding",
+                 "quote": row["finding"]["text"], "rationale": "This assertion requires a narrower scope."}
+        value["findings"] = [valid, {**valid, "target_ref": ref.replace("@2", "@1")},
+                             {**valid, "field": "claim"}]
+        with self.assertRaises(ModelContractError) as caught:
+            validate_survey_review(value, current_map=current)
+        message = str(caught.exception)
+        self.assertIn("findings[1].target_ref", message)
+        self.assertIn("findings[2].field", message)
+        self.assertNotIn("negative scientific survey checks require", message)
+        value["findings"] = [valid]
+        validate_survey_review(value, current_map=current)
+        self.assertEqual(value["checks"][1]["outcome"], "failed")
+
     def test_negative_survey_checks_bind_exact_current_assertions(self):
         row = entry()
         ref = "artifact:kb/work-analyses/W1@2"

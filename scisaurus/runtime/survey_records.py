@@ -650,19 +650,44 @@ def validate_survey_review(value, *, current_map=None):
     for relation in current_map["relationships"]:
         targets[relation["artifact_ref"]] = {"claim": relation["claim"]["text"]}
     grounded = set()
-    for finding in findings:
-        exact(finding, {"check_id", "target_ref", "field", "quote", "rationale"}, "survey finding")
+    errors = []
+    for index, finding in enumerate(findings):
+        path = f"findings[{index}]"
+        try:
+            exact(finding, {"check_id", "target_ref", "field", "quote", "rationale"}, "survey finding")
+        except ValidationError as exc:
+            errors.append(f"{path}: {exc}")
+            continue
         check_id, ref, field, quote = (finding[key] for key in ("check_id", "target_ref", "field", "quote"))
         if not all(isinstance(item, str) for item in (check_id, ref, field)) or check_id not in failed:
-            raise ModelContractError("survey finding must bind a non-passed required check")
-        _text(quote, "current assertion quote")
-        _text(finding["rationale"], "survey finding rationale")
-        text = targets.get(ref, {}).get(field)
+            errors.append(f"{path}: survey finding must bind a non-passed required check")
+            continue
+        try:
+            _text(quote, "current assertion quote")
+            _text(finding["rationale"], "survey finding rationale")
+        except ValidationError as exc:
+            errors.append(f"{path}: {exc}")
+            continue
+        if ref not in targets:
+            errors.append(f"{path}.target_ref {ref!r}: copy an exact current target reference from response_contract")
+            continue
+        if field not in targets[ref]:
+            errors.append(f"{path}.field {field!r}: target {ref!r} permits only {sorted(targets[ref])}")
+            continue
+        text = targets[ref][field]
         if not isinstance(text, str) or quote not in text:
-            raise ModelContractError("survey finding must quote an exact current target field")
+            errors.append(f"{path}.quote: survey finding must quote an exact current target field; "
+                          f"target_ref={ref!r}, field={field!r}, current_field={text!r}. "
+                          "Reassess the allegation against this current field and captured sources; "
+                          "do not replace a historical quotation with unrelated current text merely to satisfy the contract.")
+            continue
         grounded.add(check_id)
-    if not (failed & {"source-fidelity", "map-support"}) <= grounded:
-        raise ModelContractError("negative scientific survey checks require exact current assertion findings")
+    missing = (failed & {"source-fidelity", "map-support"}) - grounded
+    if missing:
+        errors.append("negative scientific survey checks require exact current assertion findings for "
+                      + ", ".join(sorted(missing)))
+    if errors:
+        raise ModelContractError("\n".join(errors))
 
 
 def validate_work_review(value, relationship_refs, *, entry=None, review_obligations=()):
