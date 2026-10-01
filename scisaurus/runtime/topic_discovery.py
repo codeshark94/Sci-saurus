@@ -38,7 +38,7 @@ from scisaurus.runtime.scientific_surface import find_control_leaks, project_int
 
 
 SCHEMA_VERSION = "topic-discovery-1"
-TOPIC_RESPONSE_CONTRACT_REVISION = "selected-feasibility-field-repair-1"
+TOPIC_RESPONSE_CONTRACT_REVISION = "declared-foundry-feasibility-field-repair-2"
 STAGE_CONFIG_SCHEMA_VERSION = "topic-discovery-config-1"
 TOPIC_HISTORY_SCHEMA_VERSION = "topic-history-1"
 RECENT_YEAR_WINDOW = 4

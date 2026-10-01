@@ -989,6 +989,41 @@ class ComposerWorkflowTests(unittest.TestCase):
             finally:
                 runner.close()
 
+    def test_survey_only_workflow_retains_its_declared_foundry_boundary(self):
+        with tempfile.TemporaryDirectory() as path:
+            workflow = self._workflow(Path(path))
+            workflow["stages"] = [stage for stage in workflow["stages"]
+                                  if stage["kind"] == "survey"]
+            workflow["completion"]["required_stage_ids"] = ["survey"]
+            model = Path(path) / "model.json"
+            model.write_text(json.dumps({"model": "fake", "protocol": "ollama",
+                                         "base_url": "http://example.invalid",
+                                         "timeout_seconds": 1, "max_output_tokens": 4096}))
+            requirements = Path(path) / "requirements.txt"
+            requirements.write_text("numpy==2.5.2\n")
+            foundry = Path(path) / "foundry.json"
+            foundry.write_text(json.dumps({
+                "schema_version": "capability-foundry-config-1",
+                "model_config_path": str(model), "runtime_python": str(Path(sys.executable).resolve()),
+                "workspace_root": str(Path(path) / "foundry-workspace"),
+                "registry_root": str(Path(path) / "registry"), "repo_root": path,
+                "requirements_file": str(requirements),
+                "max_attempts": 2, "timeout_seconds": 30,
+                "runtime_packages": [{"name": "numpy", "version": "2.5.2"}],
+            }))
+            workflow["capability_foundry_config_path"] = str(foundry)
+            runner = ComposerRunner(workflow)
+            try:
+                context = runner._runtime_context({})
+                self.assertTrue(context["capability_foundry"]["enabled"])
+                self.assertIsInstance(context["research_feasibility"], dict)
+                self.assertEqual(context["research_feasibility"]["execution_modes"], ["foundry"])
+                self.assertEqual(context["research_feasibility"]["max_experiment_seconds"], 30)
+                self.assertEqual(context["research_feasibility"]["allowed_input_kinds"],
+                                 ["analytical_parameters", "synthetic"])
+            finally:
+                runner.close()
+
     def test_topic_resume_reopens_only_after_response_policy_changes(self):
         with tempfile.TemporaryDirectory() as path:
             workflow = self._workflow(Path(path))

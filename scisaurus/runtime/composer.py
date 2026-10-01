@@ -6336,11 +6336,11 @@ class ComposerRunner:
             "topic_preferences": deepcopy(self.workflow.get("topic_preferences") or {}),
             "project_files": project_files,
             "project_scoped_execution": True,
-            # A survey-only/free-topic workflow has no experiment boundary to
-            # validate yet.  Leave its topic package on the legacy contract;
-            # experiment-backed missions receive the strict input/runtime
-            # feasibility gate above.
-            "research_feasibility": feasibility_boundary if experiment_stages else None,
+            # A declared foundry remains the execution boundary when the
+            # workflow stops at literature survey. Free-topic surveys without
+            # an execution configuration retain the legacy topic contract.
+            "research_feasibility": (
+                feasibility_boundary if experiment_stages or foundry_enabled else None),
         }
 
     def _topic_sampling_seed(self, *, attempt_number=0):
