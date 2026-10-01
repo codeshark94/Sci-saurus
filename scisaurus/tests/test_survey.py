@@ -2624,6 +2624,67 @@ class TestSurveyRunner(unittest.TestCase):
         search.assert_not_called(); explore.assert_called_once()
         counter.assert_called_once()
 
+    def test_gap_only_resume_with_work_orders_does_not_repeat_completed_acquisition(self):
+        config = survey_config(self.endpoint)
+        orders = [self.follow_up_order()]
+        with patch.object(SurveyRunner, "_assess", side_effect=KeyboardInterrupt("before gap assessment")):
+            first = self.runtime(config, work_orders=orders).run()
+        self.assertTrue(first["survey_current"], first.get("error"))
+        before_requests = len(SurveyHTTPFixture.requests)
+        policy = {"additional_seconds": 40, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["gap_assessment"]}}
+        resumed = self.runtime(config, work_orders=orders, resume_policy=policy)
+        self.assertTrue(resumed.counter_queries_complete)
+        with patch.object(resumed, "_prepare_follow_up", side_effect=AssertionError("acquisition repeated")), \
+             patch.object(resumed, "_accept_survey", side_effect=AssertionError("accepted survey repeated")), \
+             patch.object(resumed, "_countersearch", side_effect=AssertionError("countersearch repeated")), \
+             patch.object(resumed, "_setup", side_effect=AssertionError("operational probes repeated")):
+            result = resumed.run()
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        self.assertEqual(result["survey_ref"], first["survey_ref"])
+        self.assertTrue(result["assessment_current"])
+        self.assertEqual(len(SurveyHTTPFixture.requests), before_requests)
+
+    def test_follow_up_resume_after_counter_queries_sets_up_unfinished_acquisition(self):
+        config = survey_config(self.endpoint)
+        orders = [self.follow_up_order()]
+        original = SurveyRunner._full_texts
+        def interrupt_challenge(runner):
+            if runner._countersearch_active:
+                raise KeyboardInterrupt("after challenge query receipt")
+            return original(runner)
+        with patch.object(SurveyRunner, "_full_texts", interrupt_challenge):
+            first = self.runtime(config, work_orders=orders).run()
+        self.assertEqual(first["status"], "paused", first.get("error"))
+        policy = {"additional_seconds": 40, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["gap_assessment"]}}
+        resumed = self.runtime(config, work_orders=orders, resume_policy=policy)
+        self.assertTrue(resumed.counter_queries_complete)
+        self.assertFalse(resumed.countersearch_complete)
+        with patch.object(resumed, "_prepare_follow_up", side_effect=AssertionError("discovery repeated")), \
+             patch.object(resumed, "_setup", wraps=resumed._setup) as setup, \
+             patch.object(resumed, "_full_texts", wraps=resumed._full_texts) as capture:
+            result = resumed.run()
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        setup.assert_called_once(); capture.assert_called_once()
+        self.assertTrue(result["assessment_current"])
+        self.assertEqual(sum(request["query"].get("search") == ["prior solution"]
+                             for request in SurveyHTTPFixture.requests), 1)
+
+    def test_mapper_and_reviewer_share_the_evidence_and_screening_contract(self):
+        from scisaurus.runtime.survey import source_fidelity_review_contract
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map(); runner._review_work_claims()
+        prompts = [prompt for _, prompt in self.model_contexts(runner.control, runner.store)]
+        mapper = next(p for p in prompts if p["phase"] == "map")
+        reviewer = next(p for p in prompts if p["phase"] == "work_review")
+        self.assertEqual(mapper["source_fidelity_contract"], source_fidelity_review_contract())
+        for key, value in mapper["source_fidelity_contract"].items():
+            self.assertEqual(reviewer["review_contract"][key], value)
+
     def test_gap_only_resume_retains_accepted_survey_and_countersearch(self):
         config = survey_config(self.endpoint)
         with patch.object(SurveyRunner, "_assess", side_effect=KeyboardInterrupt("before gap assessment")):
@@ -4215,7 +4276,7 @@ class TestSurveyContracts(unittest.TestCase):
         stale = {"repairs": [{**raw["repairs"][0], "entry_ref": "artifact:kb/entry/W1@2"}]}
         self.assertIs(normalize_survey_repair_owners(stale, entries, {}), stale)
         duplicate = {"repairs": [raw["repairs"][0], {**raw["repairs"][0], "entry_ref": entries["W1"]}]}
-        self.assertIs(normalize_survey_repair_owners(duplicate, entries, {}), duplicate)
+        self.assertEqual(normalize_survey_repair_owners(duplicate, entries, {}), result)
     def test_relationship_repair_routes_by_source_without_moving_entry_fields(self):
         entries = {"W1": "artifact:kb/entry/W1@1", "W2": "artifact:kb/entry/W2@1"}
         ref = "artifact:kb/relationship/W1-W2@1"
@@ -4231,16 +4292,36 @@ class TestSurveyContracts(unittest.TestCase):
         self.assertEqual(normalize_survey_repair_owners(repaired, entries, relations), repaired)
         self.assertEqual(raw["repairs"][0]["entry_ref"], entries["W2"])
 
-    def test_relationship_owner_normalization_does_not_repair_stale_or_duplicate_grants(self):
+    def test_relationship_owner_normalization_does_not_repair_stale_or_unknown_grants(self):
         entries = {"W1": "artifact:kb/entry/W1@1", "W2": "artifact:kb/entry/W2@1"}
         ref = "artifact:kb/relationship/W1-W2@1"
         relations = {ref: {"source": "W1", "target": "W2"}}
         item = {"entry_ref": entries["W2"], "entry_fields": [], "relationship_refs": [ref], "rationale": "Inspect the relationship."}
         for raw in ({"repairs": [{**item, "relationship_refs": [ref.replace("@1", "@2")]}]},
                     {"repairs": [{**item, "entry_ref": entries["W2"].replace("@1", "@2")}]},
-                    {"repairs": [item, {**item, "entry_ref": entries["W1"]}]},
-                    {"repairs": [{**item, "entry_fields": ["finding", "finding"]}]}):
+                    {"repairs": [{**item, "entry_fields": ["unsupported"]}]}):
             self.assertIs(normalize_survey_repair_owners(raw, entries, relations), raw)
+
+    def test_repeated_exact_relationship_permissions_are_unioned_by_current_owner(self):
+        from copy import deepcopy
+        entries = {"W1": "artifact:kb/entry/W1@1", "W2": "artifact:kb/entry/W2@1"}
+        ref = "artifact:kb/relationship/W1-W2@1"
+        relations = {ref: {"source": "W1", "target": "W2"}}
+        raw = {"repairs": [
+            {"entry_ref": entries["W2"], "entry_fields": ["reason"], "relationship_refs": [ref], "rationale": "Target scope."},
+            {"entry_ref": entries["W1"], "entry_fields": ["finding"], "relationship_refs": [ref], "rationale": "Source scope."},
+        ]}
+        original = deepcopy(raw)
+        result = normalize_survey_repair_owners(raw, entries, relations)
+        grants = {row["entry_ref"]: row for row in result["repairs"]}
+        self.assertEqual(grants[entries["W1"]]["relationship_refs"], [ref])
+        self.assertEqual(grants[entries["W1"]]["entry_fields"], ["finding"])
+        self.assertEqual(grants[entries["W2"]]["relationship_refs"], [])
+        self.assertEqual(grants[entries["W2"]]["entry_fields"], ["reason"])
+        self.assertIn("Target scope.", grants[entries["W1"]]["rationale"])
+        self.assertIn("Source scope.", grants[entries["W1"]]["rationale"])
+        self.assertEqual(normalize_survey_repair_owners(result, entries, relations), result)
+        self.assertEqual(raw, original)
 
     def test_critique_checks_cannot_be_omitted_or_replace_narrow_failure_fields(self):
         obligations = [{"work_id": "W1", "hypothesis": "A current numerical claim may omit its conditions."}]

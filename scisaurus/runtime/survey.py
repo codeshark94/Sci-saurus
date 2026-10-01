@@ -231,25 +231,22 @@ def normalize_survey_repair_owners(value, entries, relationships):
     """Route exact relationship grants by their immutable source ownership."""
     if not isinstance(value, dict) or set(value) != {"repairs"} or not isinstance(value["repairs"], list):
         return value
-    seen_entries, seen_relationships = set(), set()
     for item in value["repairs"]:
         if (not isinstance(item, dict) or set(item) != {"entry_ref", "entry_fields", "relationship_refs", "rationale"}
                 or not isinstance(item["entry_ref"], str) or not isinstance(item["rationale"], str)
                 or not item["rationale"].strip()):
             return value
         entry_ref = entries.get(item["entry_ref"], item["entry_ref"])
-        if entry_ref not in entries.values() or entry_ref in seen_entries:
+        if entry_ref not in entries.values():
             return value
-        seen_entries.add(entry_ref)
         fields, refs = item["entry_fields"], item["relationship_refs"]
         if (not isinstance(fields, list) or not all(isinstance(field, str) for field in fields)
-                or len(set(fields)) != len(fields) or not set(fields) <= {"inclusion", "reason", *MAP_FIELDS}
+                or not set(fields) <= {"inclusion", "reason", *MAP_FIELDS}
                 or not isinstance(refs, list) or not all(isinstance(ref, str) for ref in refs)
-                or len(set(refs)) != len(refs) or not fields and not refs
-                or any(ref not in relationships or ref in seen_relationships
+                or not fields and not refs
+                or any(ref not in relationships
                        or relationships[ref]["source"] not in entries for ref in refs)):
             return value
-        seen_relationships.update(refs)
     grants = {}
     def grant(ref, rationale):
         item = grants.setdefault(ref, {"entry_ref": ref, "entry_fields": [], "relationship_refs": [], "rationales": []})
@@ -262,8 +259,8 @@ def normalize_survey_repair_owners(value, entries, relationships):
         for ref in item["relationship_refs"]:
             owner = entries[relationships[ref]["source"]]
             grant(owner, item["rationale"])["relationship_refs"].append(ref)
-    return {"repairs": [{"entry_ref": ref, "entry_fields": item["entry_fields"],
-                         "relationship_refs": item["relationship_refs"],
+    return {"repairs": [{"entry_ref": ref, "entry_fields": sorted(set(item["entry_fields"])),
+                         "relationship_refs": sorted(set(item["relationship_refs"])),
                          "rationale": "\n".join(item["rationales"])} for ref, item in sorted(grants.items())]}
 
 
@@ -1230,7 +1227,28 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         self.counter_plan_record = plan
         self.counter_query_refs = lineage["query_refs"]
         self.counter_queries_complete = lineage["queries_complete"]
-        self.countersearch_complete = lineage["complete"] and lineage["survey_current"]
+        self.countersearch_complete = (lineage["complete"] and lineage["survey_current"]
+                                       and self._counter_acquisition_complete())
+
+    def _counter_acquisition_id(self):
+        digest = hashlib.sha256(self.counter_plan_record["artifact_ref"].encode()).hexdigest()
+        return "command/counter-search-acquisitions/" + digest
+
+    def _counter_acquisition_complete(self):
+        if self.counter_plan_record is None:
+            return False
+        record = self.store.head(self._counter_acquisition_id())
+        if record is None:
+            return False
+        manifest, raw = self.gate._artifact(record["artifact_ref"], current=False)
+        body = self.gate._json(raw, record["artifact_ref"])
+        if (manifest["author"] != "command.controller"
+                or body.get("schema_version") != "counter-search-acquisition-1"):
+            raise StateError("counter-search acquisition receipt has an invalid owner or schema")
+        return (body.get("question") == self.score["question"]
+                and body.get("plan_ref") == self.counter_plan_record["artifact_ref"]
+                and body.get("nomination_ref") == self.nomination_record["artifact_ref"]
+                and body.get("query_refs") == self.counter_query_refs)
 
     def _record(self, logical, kind, body, author, *, subjects=()):
         head = self.store.head(logical)
@@ -3838,6 +3856,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "previous_affected_relationships": old_relationships,
             "semantic_feedback": review_feedback,
             "relationship_semantics": RELATIONSHIP_SEMANTICS,
+            "source_fidelity_contract": source_fidelity_review_contract(),
             "sources": sources,
             "instructions": "Return exactly {entries:[{work_id:string,inclusion:string,reason:string,problem:Statement,approach:Statement,finding:Statement,limitations:Statement}],"
                 "relationships:[{source:string,target:string,kind:string,claim:Statement}]}. entries must contain exactly the assigned work. "
@@ -3866,7 +3885,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         # intentionally placed after that stable prefix because they vary by
         # assignment or repair attempt.
         assignment = {key: assignment[key] for key in (
-            "assignment", "phase", "question", "works", "relationship_semantics", "instructions",
+            "assignment", "phase", "question", "works", "relationship_semantics", "source_fidelity_contract", "instructions",
             "requested_work_ids", "previous_entries", "entry_editable",
             "previous_affected_relationships", "semantic_feedback", "sources",
         )}
@@ -4896,6 +4915,14 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                      admission="challenge")
         self._complete_search_pages(admission="challenge")
         self._full_texts()
+        self._refresh_countersearch_state()
+        self._record(self._counter_acquisition_id(), "note", {
+            "schema_version": "counter-search-acquisition-1",
+            "question": self.score["question"], "plan_ref": record["artifact_ref"],
+            "nomination_ref": self.nomination_record["artifact_ref"],
+            "query_refs": self.counter_query_refs, "source_refs": sorted(self.source_docs),
+        }, "command.controller", subjects=[record["artifact_ref"], *self.counter_query_refs,
+                                             *sorted(self.source_docs)])
         self._accept_survey()
         self._refresh_countersearch_state()
         self._countersearch_active = False
@@ -5004,15 +5031,19 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 self._initialize()
             if not self.resume_session and not self.time_policy.snapshot()["initial_hard_limit_feasible"]:
                 raise ValidationError("configured survey stages do not fit the hard deadline; no external work dispatched")
-            follow_up_evidence_current = (bool(self.work_orders) and bool(self.assessment_ref)
-                                          and self.countersearch_complete
-                                          and self.resume_session is not None
-                                          and set(self.resume_session["reopened_scopes"]) <= {"follow_up"})
-            needs_operations = bool(self.work_orders) and not follow_up_evidence_current or not self.assessment_ref and (
-                not self.survey_ref or self.nomination is None or not self.countersearch_complete)
+            retained_follow_up_discovery = (
+                bool(self.work_orders) and self.resume_session is not None
+                and self.counter_queries_complete
+                and not {"retrieval", "production"}.intersection(self.resume_session["reopened_scopes"])
+            )
+            needs_operations = (bool(self.work_orders) and not retained_follow_up_discovery
+                                or not self.assessment_ref and (
+                                    not self.survey_ref or self.nomination is None or not self.countersearch_complete))
+            if self.resume_session and "operations" in self.resume_session["reopened_scopes"]:
+                needs_operations = True
             if needs_operations:
                 self._setup()
-            if self.work_orders and self.resume_session and not follow_up_evidence_current:
+            if self.work_orders and self.resume_session and not retained_follow_up_discovery:
                 self._prepare_follow_up()
             if self.assessment_ref:
                 decision = self._body(self.store.get(self.assessment_ref))["state"]
