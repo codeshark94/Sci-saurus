@@ -298,7 +298,7 @@ def simulated_survey_worker(kind, params, channel):
                 value["entries"][0]["reason"] = "The method generalizes to every task."
         if mode in {"review-obligation-adversary", "aggregate-scoped-repair"} and assignment.get("semantic_feedback") is not None:
             value = {"entry_updates": {"reason": "The captured study examines recall timing."}, "relationships": []}
-        if mode == "aggregate-inclusion-quote" and assignment.get("semantic_feedback") is not None:
+        if mode in {"aggregate-inclusion-quote", "aggregate-inclusion-selection"} and assignment.get("semantic_feedback") is not None:
             value = {"entry_updates": {"inclusion": "uncertain"}, "relationships": []}
         if mode.startswith("map-links") and assignment["requested_work_ids"] == ["W101"]:
             proofs = [source_quote(next(source for source in assignment["sources"] if source["work_id"] == wid))
@@ -313,7 +313,7 @@ def simulated_survey_worker(kind, params, channel):
             value["repairs"] = [{"entry_ref": assignment["entry_refs"]["W101"],
                 "entry_fields": ["reason"] if mode == "aggregate-scoped-repair" else ["invented_field"],
                 "relationship_refs": [], "rationale": "The retained screening qualifier is unsupported."}]
-        if mode == "aggregate-inclusion-quote":
+        if mode in {"aggregate-inclusion-quote", "aggregate-inclusion-selection"}:
             value["repairs"] = [{"entry_ref": assignment["entry_refs"]["W101"],
                 "entry_fields": ["inclusion"], "relationship_refs": [],
                 "rationale": "The inclusion decision needs a narrower screening state."}]
@@ -357,7 +357,7 @@ def simulated_survey_worker(kind, params, channel):
                 "rationale": row["result"]}
                 for row in value["checks"] if target is not None
                 and row["outcome"] != "passed" and row["check_id"] in {"source-fidelity", "map-support"}]
-        if mode == "aggregate-inclusion-quote":
+        if mode in {"aggregate-inclusion-quote", "aggregate-inclusion-selection"}:
             target = next(entry for entry in assignment["map"]["entries"] if entry["work_id"] == "W101")
             if target["inclusion"] == "included":
                 next(row for row in value["checks"] if row["check_id"] == "map-support").update(
@@ -365,6 +365,11 @@ def simulated_survey_worker(kind, params, channel):
                 value["findings"] = [{"check_id": "map-support",
                     "target_ref": assignment["map"]["entry_refs"]["W101"], "field": "inclusion",
                     "quote": target["reason"], "rationale": "The included screening state requires adjudication."}]
+                if mode == "aggregate-inclusion-selection":
+                    pin = next(row for row in assignment["response_contract"]["assertion_catalog"]
+                               if row["target_ref"] == assignment["map"]["entry_refs"]["W101"] and row["field"] == "inclusion")
+                    value["findings"] = [{"check_id": "map-support", "assertion_id": pin["assertion_id"],
+                                          "rationale": "The included screening state requires adjudication."}]
     elif phase == "work_review":
         if mode in {"review-malformed", "isolated-review-block"} and assignment["entry"]["work_id"] == "W101":
             value = {"checks": [{"check_id": "duplicate-check", "outcome": "passed",
@@ -2899,7 +2904,13 @@ class TestSurveyRunner(unittest.TestCase):
                             and record["rounds"] == 1 for record in ledgers))
 
     def test_aggregate_inclusion_quote_routes_only_decision_repair_and_replays_admission(self):
-        runner = self.runtime(survey_config(self.endpoint, "aggregate-inclusion-quote"))
+        self.check_aggregate_inclusion_binding("aggregate-inclusion-quote")
+
+    def test_aggregate_assertion_selection_routes_only_decision_repair_and_replays_admission(self):
+        self.check_aggregate_inclusion_binding("aggregate-inclusion-selection")
+
+    def check_aggregate_inclusion_binding(self, mode):
+        runner = self.runtime(survey_config(self.endpoint, mode))
         self.addCleanup(runner.control.close)
         runner._initialize(); runner._setup()
         for wid in ("W101", "W102"):
@@ -2930,6 +2941,9 @@ class TestSurveyRunner(unittest.TestCase):
                    if any(check["outcome"] != "passed" for check in runner._body(record)["checks"])]
         self.assertEqual(len(reviews), 1)
         rejected = runner._body(reviews[0])
+        if mode == "aggregate-inclusion-selection":
+            _, _, _, reply = runner.gate._model_review_execution(rejected["execution_ref"], "methods.survey-reviewer")
+            self.assertEqual(set(reply["findings"][0]), {"check_id", "assertion_id", "rationale"})
         self.assertEqual(rejected["findings"][0]["field"], "inclusion")
         self.assertEqual(rejected["findings"][0]["quote_field"], "reason")
         with self.assertRaises(ValidationError):
@@ -3424,7 +3438,9 @@ class TestSurveyRunner(unittest.TestCase):
         repaired = runner._repair_assignment({"assignment": prompt, "actor": "methods.survey-reviewer"},
                                             {"error": "unexpected findings inside a check", "finish_reason": "stop"})
         self.assertEqual(repaired["response_contract"], contract)
-        self.assertEqual(set(contract["findings"]["entry_targets"]), set(prompt["map"]["entry_refs"].values()))
+        self.assertEqual({row["target_ref"] for row in contract["assertion_catalog"]},
+                         set(prompt["map"]["entry_refs"].values()) | set(prompt["map"]["relationship_refs"]))
+        self.assertNotIn("Use quote_field=reason", prompt["instructions"])
         self.assertTrue(all(row["additional_fields"] is False for row in contract["checks"]))
 
     def test_aggregate_findings_use_refs_from_actual_relationship_projection(self):

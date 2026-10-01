@@ -1,5 +1,6 @@
 """Evidence-bound literature statements and scoped map updates."""
 from copy import deepcopy
+import hashlib
 import re
 import unicodedata
 
@@ -7,13 +8,14 @@ from scisaurus.core.errors import ModelContractError, ValidationError
 from scisaurus.runtime.config import _text
 from scisaurus.runtime.scores import exact
 from scisaurus.core.source_spans import validate as validate_source_span
+from scisaurus.core.schema import canonical_bytes
 
 
 MAP_FIELDS = ("problem", "approach", "finding", "limitations")
 SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
 GAP_CHECKS = ("closest-prior-work", "scope-comparability", "counterevidence", "full-text-support")
 REVIEW_CHECK_FIELDS = frozenset({"check_id", "outcome", "method", "result"})
-SURVEY_RESPONSE_CONTRACT_REVISION = "survey-retained-review-frontier-7"
+SURVEY_RESPONSE_CONTRACT_REVISION = "survey-retained-review-frontier-8"
 SURVEY_QUOTE_LOCATION_INSTRUCTION = (
     "Finding field identifies the affected decision or assertion and controls repair authority; "
     "quote_field separately identifies the field containing the exact quote on the same target_ref. "
@@ -53,12 +55,14 @@ def survey_review_response_contract(current_map, *, legacy=False):
         },
     }
     if not legacy:
-        contract["findings"].update(
-            optional_fields=["quote_field"],
-            field="The affected decision or assertion; this field alone controls repair authority.",
-            quote_field="The field containing the quote on the same exact target_ref; defaults to field.",
-            quote="An exact substring of quote_field on the current target, not a source quotation or a historical assertion.",
-        )
+        contract["assertion_catalog"] = survey_assertion_catalog(current_map)
+        contract["findings"] = {
+            "location": "top-level findings only; never inside a check row",
+            "required_fields": ["check_id", "assertion_id", "rationale"],
+            "additional_fields": False,
+            "assertion_id": "Copy the exact ID of the current assertion or screening decision being challenged from assertion_catalog. The controller attaches its immutable target, field, and exact current text. This locates the allegation; it does not establish its truth.",
+            "check_id": "A non-passed required check; omit findings for supported assertions.",
+        }
     return contract
 
 
@@ -95,8 +99,22 @@ def _survey_review_targets(current_map):
     return targets
 
 
+def survey_assertion_catalog(current_map):
+    """Pin selectable criticism destinations to exact current field contents."""
+    catalog = []
+    for ref, target in sorted(_survey_review_targets(current_map).items()):
+        for field in sorted(target):
+            quote_field = "reason" if field == "inclusion" else field
+            text = target[quote_field]
+            if not isinstance(text, str) or not text.strip():
+                continue
+            pin = {"target_ref": ref, "field": field, "quote_field": quote_field, "quote": text}
+            catalog.append({"assertion_id": "assertion-" + hashlib.sha256(canonical_bytes(pin)).hexdigest(), **pin})
+    return catalog
+
+
 def normalize_survey_review_envelope(value, *, current_map):
-    """Bind unchanged legacy quotes to unambiguous fields on their exact target."""
+    """Resolve exact assertion selections and unambiguous legacy quote locations."""
     value = deepcopy(normalize_check_envelope(value, SURVEY_CHECKS))
     if isinstance(value, dict) and isinstance(value.get("checks"), list):
         nested = []
@@ -120,7 +138,20 @@ def normalize_survey_review_envelope(value, *, current_map):
     if not isinstance(value, dict) or not isinstance(value.get("findings"), list):
         return value
     targets = _survey_review_targets(current_map)
-    for finding in value["findings"]:
+    catalog = {row["assertion_id"]: row for row in survey_assertion_catalog(current_map)}
+    for index, finding in enumerate(value["findings"]):
+        if isinstance(finding, dict) and "assertion_id" in finding:
+            try:
+                exact(finding, {"check_id", "assertion_id", "rationale"}, "survey assertion finding")
+            except ValidationError as exc:
+                raise ModelContractError(f"findings[{index}]: {exc}") from exc
+            assertion_id = finding["assertion_id"]
+            if not isinstance(assertion_id, str) or assertion_id not in catalog:
+                raise ModelContractError(f"findings[{index}].assertion_id must identify an exact current assertion_catalog item")
+            pin = catalog[assertion_id]
+            finding = {"check_id": finding["check_id"], "rationale": finding["rationale"],
+                       **{key: pin[key] for key in ("target_ref", "field", "quote_field", "quote")}}
+            value["findings"][index] = finding
         if not isinstance(finding, dict) or "quote_field" in finding:
             continue
         ref, field, quote = (finding.get(key) for key in ("target_ref", "field", "quote"))

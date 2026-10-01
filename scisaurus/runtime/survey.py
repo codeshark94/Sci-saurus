@@ -42,7 +42,7 @@ from scisaurus.runtime.survey_records import (
     BODY_SECTION_MARKERS, authoritative_source, has_section_heading as _has_section_heading,
     normalize_gap_assessment_envelope, validate_map,
     validate_survey_review, validate_assessment, validate_work_review, survey_review_response_contract,
-    normalize_survey_review_envelope, survey_review_assignment_identity, SURVEY_QUOTE_LOCATION_INSTRUCTION,
+    normalize_survey_review_envelope, survey_review_assignment_identity,
 )
 from scisaurus.runtime.time_policy import TimePolicy
 
@@ -5043,8 +5043,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "relationship_semantics": RELATIONSHIP_SEMANTICS,
             "required_checks": sorted(SURVEY_CHECKS),
             "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
-            "instructions": "Return exactly one JSON object {checks:[{check_id,outcome,method,result}],rationale,findings:[{check_id,target_ref,field,quote_field,quote,rationale}]}; no preamble, markdown, or analysis transcript. Execute exactly the required checks. "
-                "For each non-passed source-fidelity or map-support check supply at least one finding identifying an exact CURRENT entry_ref or relationship artifact_ref, its affected field, quote_field, and an exact substring quote from quote_field on that same target. Explain the concrete defect against the captured sources. Do not invent a current statement or screening status. Entry fields are inclusion, reason, problem, approach, finding, limitations; relationship field is claim. Passed checks have no findings. Coverage-accounting may be explained in its check result. "
+            "instructions": "Return exactly one JSON object {checks:[{check_id,outcome,method,result}],rationale,findings:[{check_id,assertion_id,rationale}]}; no preamble, markdown, or analysis transcript. Execute exactly the required checks. "
+                "For each non-passed source-fidelity or map-support check supply at least one finding selecting an exact assertion_id from response_contract.assertion_catalog. The catalog binds the current target, affected field, and exact assertion text; do not reconstruct quotations or source references. Explain the concrete defect against the captured sources. Selecting an item locates your allegation and grants only its named field; it does not prove the allegation. Reassess the whole current assertion and withdraw a diagnosis that its actual qualifiers contradict. Do not invent a current statement or screening status. Passed checks have no findings. Coverage-accounting may be explained in its check result. "
                 "Outcomes passed/failed/insufficient_evidence/check_failed. Passing approves a faithful bounded survey, not novelty or exhaustive coverage. "
                 "Check accurate coverage/accounting, faithful quotations and source scope, and support for every asserted map claim. "
                 "The question is a hypothesis for later investigation, not a claim that this survey must prove or disprove. "
@@ -5085,7 +5085,6 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "identity conflict in an included work, or accounting inconsistency if one exists; "
                 "otherwise pass the map and retain corpus limits as explicit coverage limitations."
             )
-        review_assignment["instructions"] += " " + SURVEY_QUOTE_LOCATION_INSTRUCTION
         limit = self._map_input_limit("methods.survey-reviewer")
         if limit is not None and estimate_input_tokens(SYSTEM, json.dumps(self._follow_up_assignment(review_assignment), ensure_ascii=False)) > limit:
             raise ValidationError("integrated survey review cannot fit all mandatory source evidence within its configured input budget")

@@ -372,6 +372,66 @@ class TestGapAssessment(unittest.TestCase):
 
 
 class TestSurveyChecks(unittest.TestCase):
+    def test_selection_and_legacy_response_schemas_have_distinct_fields(self):
+        current, _ = self.quote_location_fixture()
+        contract = survey_review_response_contract(current)
+        self.assertEqual(set(contract["findings"]["required_fields"]), {"check_id", "assertion_id", "rationale"})
+        self.assertFalse(contract["findings"]["additional_fields"])
+        self.assertNotIn("optional_fields", contract["findings"])
+        self.assertNotIn("quote_field", contract["findings"])
+        legacy = survey_review_response_contract(current, legacy=True)
+        self.assertNotIn("assertion_catalog", legacy)
+        self.assertIn("quote", legacy["findings"]["required_fields"])
+
+    def test_assertion_selection_preserves_verdict_rationale_and_edit_authority(self):
+        current, raw = self.quote_location_fixture()
+        selected = next(row for row in survey_review_response_contract(current)["assertion_catalog"]
+                        if row["field"] == "inclusion")
+        finding = raw["findings"][0]
+        raw["findings"] = [{"check_id": finding["check_id"], "assertion_id": selected["assertion_id"],
+                            "rationale": finding["rationale"]}]
+        before = deepcopy(raw)
+        bound = normalize_survey_review_envelope(raw, current_map=current)
+        validate_survey_review(bound, current_map=current)
+        self.assertEqual(bound["checks"], raw["checks"])
+        self.assertEqual(bound["rationale"], raw["rationale"])
+        self.assertEqual(bound["findings"][0], {**finding, "quote_field": "reason"})
+        self.assertEqual(raw, before)
+        self.assertEqual(normalize_survey_review_envelope(bound, current_map=current), bound)
+
+    def test_assertion_selection_rejects_stale_changed_unknown_and_conflicting_bindings(self):
+        current, raw = self.quote_location_fixture()
+        selected = next(row for row in survey_review_response_contract(current)["assertion_catalog"]
+                        if row["field"] == "inclusion")
+        raw["findings"] = [{"check_id": "map-support", "assertion_id": selected["assertion_id"],
+                            "rationale": "Check the screening scope."}]
+        for mutation in ("version", "text", "unknown", "conflict", "invalid_type"):
+            with self.subTest(mutation=mutation):
+                target, proposal = deepcopy(current), deepcopy(raw)
+                if mutation == "version": target["entry_refs"]["W1"] = "artifact:kb/work-analyses/W1@3"
+                elif mutation == "text": target["entries"][0]["reason"] += " A changed qualifier."
+                elif mutation == "unknown": proposal["findings"][0]["assertion_id"] = "assertion-missing"
+                elif mutation == "invalid_type": proposal["findings"][0]["assertion_id"] = []
+                else: proposal["findings"][0]["field"] = "finding"
+                with self.assertRaises(ValidationError):
+                    normalize_survey_review_envelope(proposal, current_map=target)
+
+    def test_assertion_catalog_excludes_absent_claims_and_binds_relationship_text(self):
+        current, _ = self.quote_location_fixture()
+        current["entries"][0]["finding"]["text"] = None
+        relation = {**relationship(), "artifact_ref": "artifact:kb/relationships/one@3"}
+        current["relationships"] = [relation]; current["relationship_refs"] = [relation["artifact_ref"]]
+        catalog = survey_review_response_contract(current)["assertion_catalog"]
+        self.assertFalse(any(row["field"] == "finding" for row in catalog))
+        selected = next(row for row in catalog if row["field"] == "claim")
+        raw = {"checks": required_checks(SURVEY_CHECKS), "rationale": "Inspect the relation.", "findings": [
+            {"check_id": "source-fidelity", "assertion_id": selected["assertion_id"], "rationale": "Adjudicate comparability."}]}
+        raw["checks"][1]["outcome"] = "failed"
+        bound = normalize_survey_review_envelope(raw, current_map=current)
+        validate_survey_review(bound, current_map=current)
+        self.assertEqual(bound["findings"][0]["quote"], relation["claim"]["text"])
+        self.assertEqual(bound["findings"][0]["target_ref"], relation["artifact_ref"])
+
     def quote_location_fixture(self):
         row = entry()
         ref = "artifact:kb/work-analyses/W1@2"
