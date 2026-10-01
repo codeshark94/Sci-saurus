@@ -233,6 +233,19 @@ def source_fidelity_review_contract():
     }
 
 
+def normalize_gap_nomination(value):
+    """Bind malformed transport identifiers to the unchanged hypothesis text."""
+    if (not isinstance(value, dict) or set(value) != {"id", "statement"}
+            or not isinstance(value.get("id"), str) or not value["id"].strip()
+            or not isinstance(value.get("statement"), str) or not value["statement"].strip()):
+        return value
+    try:
+        identifier(value["id"])
+    except ValidationError:
+        return {**value, "id": "gap-" + hashlib.sha256(canonical_bytes(value["statement"])).hexdigest()[:60]}
+    return value
+
+
 def normalize_survey_repair_owners(value, entries, relationships):
     """Route exact relationship grants by their immutable source ownership."""
     if not isinstance(value, dict) or set(value) != {"repairs"} or not isinstance(value["repairs"], list):
@@ -5018,7 +5031,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "question": self.score["question"], "map": self._map_body(), "coverage": self._coverage(),
                 "survey_ref": self.survey_ref, "prerequisite_survey_ref": self.survey_ref,
                 "instructions": "Return {id:lowercase_identifier,statement:string}. This is a hypothesis to challenge, not an established novelty claim."
-            }, validate, task_kind="selection")
+            }, validate, normalizer=normalize_gap_nomination, task_kind="selection")
         self.nomination_record = self._publish("kb/gap-nomination", "note", {
             "survey_ref": self.survey_ref, **self.nomination}, "research.gap-proposer", subjects=[self.survey_ref])
 

@@ -5905,8 +5905,10 @@ class ComposerRunner:
                 continue
             if (isinstance(topic_identity, dict)
                     and not self._survey_checkpoint_matches_topic(checkpoint, topic_identity)):
-                bound_partial = False
-                if (partial and self._survey_checkpoint_topic_id(checkpoint) is None
+                bound_checkpoint = False
+                if (self._survey_checkpoint_topic_id(checkpoint) is None
+                        and (type(checkpoint.get("topic_cycle")) is not int
+                             or checkpoint["topic_cycle"] == topic_identity["topic_cycle"])
                         and isinstance(owned_attempt, dict) and isinstance(owned_attempt.get("attempt_id"), str)
                         and candidate_topic_id == topic_identity["topic_id"]
                         and type(candidate_topic_cycle) is int and candidate_topic_cycle == topic_identity["topic_cycle"]):
@@ -5914,11 +5916,15 @@ class ComposerRunner:
                     payload = attempt.get("payload") or {}
                     topic = next((self.context.get(item["id"], {}).get("topic", {})
                                   for item in self.workflow["stages"] if item.get("kind") == "topic_discovery"), {})
-                    bound_partial = (payload.get("stage_id") == stage["id"]
+                    durable = self._durable_stage_config(resolved)
+                    question = durable.get("survey", {}).get("question") if isinstance(durable, dict) else None
+                    bound_checkpoint = (payload.get("stage_id") == stage["id"]
                         and payload.get("project_dir") == resolved
-                        and isinstance(checkpoint.get("question"), str)
-                        and checkpoint["question"] == topic.get("research_question"))
-                if bound_partial:
+                        and isinstance(question, str)
+                        and question == topic.get("research_question"))
+                if bound_checkpoint:
+                    if not partial:
+                        return Path(resolved)
                     coverage = checkpoint.get("coverage", {})
                     partials.append(((coverage.get("map_entry_count", 0), coverage.get("verified_full_texts", 0),
                                       coverage.get("unique_works", 0)), Path(resolved)))

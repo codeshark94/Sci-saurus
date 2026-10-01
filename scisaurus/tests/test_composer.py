@@ -10497,7 +10497,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                 self.assertEqual(runner._latest_resumable_survey_project(stage), Path(projects[0]).resolve())
             self.assertEqual(runner._survey_resume_scope({"coverage": {"map_entry_count": 12}}), "operations")
 
-    def test_partial_survey_without_nomination_requires_owned_attempt_and_exact_question(self):
+    def test_survey_without_nomination_requires_owned_attempt_and_exact_question(self):
         with tempfile.TemporaryDirectory() as path:
             runner = ComposerRunner(self._workflow(Path(path))); self.addCleanup(runner.close)
             stage = runner.workflow["stages"][0]
@@ -10517,9 +10517,24 @@ class ComposerWorkflowTests(unittest.TestCase):
             runner.stage_records[stage["id"]] = {"attempts": [{"attempt_id": "owned-attempt", "project_dir": str(project),
                 "topic_id": "active", "topic_cycle": 0}]}
             runner.context[stage["id"]] = {"project_dir": str(project)}
-            self.assertEqual(runner._latest_resumable_survey_project(stage), project)
-            runner.context["topic"]["topic"]["research_question"] = "Different question"
-            self.assertIsNone(runner._latest_resumable_survey_project(stage))
+            for accepted in (False, True):
+                checkpoint = {"status": "blocked", "coverage": {"map_entry_count": 13}}
+                if accepted:
+                    checkpoint.update({"survey_current": True, "survey_ref": "artifact:kb/surveys/current@1"})
+                (project/"output/run.json").write_text(json.dumps(checkpoint))
+                runner.context["topic"]["topic"]["research_question"] = "Exact question"
+                self.assertEqual(runner._latest_resumable_survey_project(stage), project)
+                self.assertEqual(runner._survey_resume_scope(checkpoint), "gap_assessment" if accepted else "operations")
+                runner.context["topic"]["topic"]["research_question"] = "Different question"
+                self.assertIsNone(runner._latest_resumable_survey_project(stage))
+                runner.context["topic"]["topic"]["research_question"] = "Exact question"
+                runner.stage_records[stage["id"]]["attempts"][0]["topic_cycle"] = 1
+                self.assertIsNone(runner._latest_resumable_survey_project(stage))
+                runner.stage_records[stage["id"]]["attempts"][0]["topic_cycle"] = 0
+                (project/"output/run.json").write_text(json.dumps({**checkpoint, "topic_cycle": 1}))
+                self.assertIsNone(runner._latest_resumable_survey_project(stage))
+                (project/"output/run.json").write_text(json.dumps({**checkpoint, "topic_id": "other"}))
+                self.assertIsNone(runner._latest_resumable_survey_project(stage))
 
     def test_budget_checkpoint_never_opens_a_scientific_continuation(self):
         with tempfile.TemporaryDirectory() as path:

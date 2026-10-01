@@ -29,6 +29,7 @@ from scisaurus.runtime.models import estimate_input_tokens
 from scisaurus.runtime.survey import (SurveyRunner, apply_scoped_map_repair,
                                       countersearch_lineage,
                                       normalize_survey_repair_owners,
+                                      normalize_gap_nomination,
                                       normalize_map_relationships,
                                       normalize_map_worker_response,
                                       overlay_post_checkpoint_relationships,
@@ -257,7 +258,7 @@ def simulated_survey_worker(kind, params, channel):
     elif phase == "counter_plan":
         value = {"queries": ["prior solution"], "rationale": "Search for an existing solution."}
     elif phase == "nomination":
-        value = {"id": "delayed-recall", "statement": GAP}
+        value = {"id": "Field_0to1T_" + "x" * 70 if mode == "nomination-id-drift" else "delayed-recall", "statement": GAP}
     elif phase == "map":
         if mode in {"map-repair", "map-reject"}:
             time.sleep(0.25)
@@ -2296,6 +2297,22 @@ class TestSurveyRunner(unittest.TestCase):
         nomination = next(prompt for _, prompt in self.model_contexts(control, store) if prompt["phase"] == "nomination")
         self.assertEqual(nomination["survey_ref"], nomination["prerequisite_survey_ref"])
         self.assertNotEqual(nomination["survey_ref"], result["survey_ref"])
+
+    def test_nomination_identifier_drift_reaches_countersearch_and_assessment(self):
+        config = survey_config(self.endpoint, "nomination-id-drift")
+        config["survey"]["proposed_gap"] = None
+        result = self.runtime(config).run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertTrue(result["survey_current"])
+        self.assertTrue(result["assessment_current"])
+        self.assertEqual(result["nomination"]["statement"], GAP)
+        self.assertEqual(result["nomination"]["id"], normalize_gap_nomination({"id": "INVALID", "statement": GAP})["id"])
+        control, store = self.open_store()
+        prompts = self.model_contexts(control, store)
+        self.assertEqual(sum(prompt["phase"] == "nomination" for _, prompt in prompts), 1)
+        for _, prompt in prompts:
+            if prompt["phase"] in {"counter_plan", "gap_assessment"}:
+                self.assertEqual(prompt["gap"], result["nomination"])
 
     def test_parallel_mapping_with_invalid_quote_does_not_retry_or_rewrite_siblings(self):
         config = survey_config(self.endpoint, "map-repair")
@@ -4982,6 +4999,23 @@ class TestSurveyRunner(unittest.TestCase):
 
 
 class TestSurveyContracts(unittest.TestCase):
+    def test_nomination_identifier_normalization_preserves_the_hypothesis(self):
+        statement = "A bounded model comparison remains unresolved."
+        for label in ("Gap With Spaces", "field_0to1T", "x" * 100, "123"):
+            raw = {"id": label, "statement": statement}
+            result = normalize_gap_nomination(raw)
+            from scisaurus.runtime.scores import identifier
+            identifier(result["id"])
+            self.assertEqual(result["statement"], statement)
+            self.assertEqual(raw["id"], label)
+            self.assertEqual(result, normalize_gap_nomination(raw))
+            self.assertNotEqual(result["id"], normalize_gap_nomination({**raw, "statement": statement + " Different."})["id"])
+        valid = {"id": "bounded-gap", "statement": statement}
+        self.assertIs(normalize_gap_nomination(valid), valid)
+        for invalid in ({"id": 3, "statement": statement}, {"id": "", "statement": statement},
+                        {"id": "INVALID", "statement": ""}, {**valid, "decision": "accepted"}):
+            self.assertIs(normalize_gap_nomination(invalid), invalid)
+
     def test_exact_relationship_target_grant_routes_to_owner_with_empty_entry_authority(self):
         entries = {"W1": "artifact:kb/entry/W1@1", "W2": "artifact:kb/entry/W2@1"}
         ref = "artifact:kb/relationship/W1-W2@1"
