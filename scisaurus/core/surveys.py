@@ -24,6 +24,7 @@ from scisaurus.runtime.survey_records import (
 SURVEY_CHECKS = frozenset({"coverage-accounting", "source-fidelity", "map-support"})
 WORK_CHECKS = ("inclusion", "reason", "problem", "approach", "finding", "limitations")
 ABSTENTION_REASONS = {
+    "reading_deferred": "This captured candidate has not been selected for substantive reading. Its catalog and available sources are retained; no scientific inclusion or content claim is admitted.",
     "source_unavailable": "The catalog record is relevant by metadata, but no abstract or verified full text was available, so substantive content could not be assessed.",
     "deep_analysis_budget": "This catalog record is deferred by the declared deep-analysis budget. No substantive claim is admitted; targeted follow-up may expand this scope.",
     "model_call_budget": "Captured sources are retained, but extraction is deferred because the remaining model-call budget is reserved for required downstream verification. No substantive claim is admitted.",

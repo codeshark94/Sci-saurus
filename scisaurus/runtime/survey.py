@@ -559,7 +559,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         self.api_calls, self.identity_calls, self.serial, self.survey_revision = 0, 0, 0, 0
         self.expanded, self.full_text_attempted = set(), set()
         self.exploration_tree = None
-        self._tree_admitted_reads = set()
+        self._tree_admitted_reads = None
+        self._tree_read_order = None
         self._active_tree_action = None
         self.survey_ref, self.assessment_ref, self.register_ref = None, None, None
         self.map_record = None
@@ -1536,13 +1537,13 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         required_names = {item["name"] for item in required}
         pending_reviews = {item.get("work_id") for item in required if item["phase"] == "work_review"}
         for job in wave:
-            optional = job["assignment"].get("phase") == "map" or job["name"] in repairing
+            optional = job["assignment"].get("phase") in {"map", "reading_selection", "exploration_plan"} or job["name"] in repairing
             if not optional:
                 admitted.append(job)
                 continue
             work_ids = job["assignment"].get("requested_work_ids", [])
             next_induced = induced | (set(work_ids) - pending_reviews)
-            current_optional = sum((item["assignment"].get("phase") == "map" or item["name"] in repairing)
+            current_optional = sum((item["assignment"].get("phase") in {"map", "reading_selection", "exploration_plan"} or item["name"] in repairing)
                                    and item["name"] not in required_names for item in admitted)
             required_calls = len(required) + len(next_induced)
             incremental_call = int(job["name"] not in required_names)
@@ -2465,9 +2466,11 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             route["fallback_urls"] = [fallback] if fallback and fallback != route["url"] else []
             routes.append((route, False))
         selected_ids = self._analysis_selection()
+        if self._tree_admitted_reads is not None:
+            selected_ids &= self._tree_admitted_reads
         analysis_limit = self.bounds.get("max_analyzed_works", self.bounds["max_works"])
-        auto_full_text_limit = min(
-            self.bounds["max_full_texts"], max(1, int(analysis_limit) // 2))
+        auto_full_text_limit = (len(selected_ids) if self.exploration_tree is not None else min(
+            self.bounds["max_full_texts"], max(1, int(analysis_limit) // 2)))
         # A free-topic run may discover Crossref records after its initial
         # route list was authored.  Use the verified catalog URLs as additional
         # candidates so a stale seed route cannot cap the entire full-text
@@ -2478,6 +2481,9 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             ranked = sorted(
                 (wid for wid in selected_ids if wid in self.works),
                 key=lambda wid: (self._work_relevance(wid), wid), reverse=True)
+            if self._tree_read_order is not None:
+                priority = {wid: index for index, wid in enumerate(self._tree_read_order)}
+                ranked.sort(key=lambda wid: priority.get(wid, len(priority)))
             for wid in ranked:
                 work = self.works[wid]
                 if not isinstance(wid, str) or wid in known:
@@ -2510,11 +2516,11 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             wid = self.aliases.get(route["work_id"], route["work_id"])
             # Automatic routes are only a second-pass deep-analysis surface;
             # never spend the full-text budget on the long-tailed catalog.
-            if auto_discovered and wid not in selected_ids:
+            if (auto_discovered or self.exploration_tree is not None) and wid not in selected_ids:
                 continue
             if wid not in self.works or wid in self.full_text_attempted:
                 continue
-            if len(self.full_text_attempted) >= self.bounds["max_full_texts"]:
+            if self.exploration_tree is None and len(self.full_text_attempted) >= self.bounds["max_full_texts"]:
                 self.gaps.append({"kind": "full_text_limit", "work_id": wid})
                 break
             self.full_text_attempted.add(wid)
@@ -2820,6 +2826,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         # Crossref for the entire catalog made the survey spend its first pass
         # on hundreds of metadata lookups before any scientific assessment.
         identity_scope = self._analysis_selection()
+        if self._tree_admitted_reads is not None:
+            identity_scope &= self._tree_admitted_reads
         for wid, work in list(self.works.items()):
             if wid not in identity_scope:
                 continue
@@ -2917,6 +2925,17 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         existing = {wid for wid, record in self.analysis_records.items()
                     if any(self._body(record).get(field, {}).get("text") is not None
                            for field in MAP_FIELDS)}
+        if self.exploration_tree is not None:
+            selected = {self.aliases.get(wid, wid) for action in self.exploration_tree["nodes"]
+                        if action["kind"] == "acquisition"
+                        for wid in action.get("selected_work_ids", [])}
+            if self._tree_admitted_reads is not None:
+                selected = set(self._tree_admitted_reads)
+            if self._countersearch_active:
+                selected.update(self.aliases.get(wid, wid) for row in self.search_log
+                                if row.get("role") == "methods.novelty-challenger"
+                                for wid in row.get("returned_work_ids", []))
+            return (existing | selected) & set(self.work_records)
         def priority(wid):
             work = self.works[wid]
             return (
@@ -3542,7 +3561,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "source_availability": [self._source_availability(wid) for wid in sorted({
                 gap["work_id"] for gap in self.gaps if gap.get("kind") == "full_text_failure"
                 and gap.get("work_id") in self.works})],
-            "deep_analysis_limit": self.bounds.get("max_analyzed_works", self.bounds["max_works"]),
+            "deep_analysis_limit": (None if self.exploration_tree is not None else
+                                    self.bounds.get("max_analyzed_works", self.bounds["max_works"])),
+            "reading_selection_policy": ("model_decisions_with_call_token_and_time_limits" if self.exploration_tree is not None else
+                                         "legacy_analysis_limit"),
             "abstentions": abstentions,
             "source_windows": [{"source_ref": item["source_ref"], "available_chars": item["available_chars"], "window": item["window"]}
                                for item in sorted(self._source_context(), key=lambda item: item["source_ref"])]}
@@ -3627,8 +3649,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             previous = self._body(self.analysis_records[wid]) if wid in self.analysis_records else None
             relationships = [relation for relation in self.relationships.values() if relation["source"] == wid]
             reopened = promotion_allowed and wid in selected and self._is_deferred_analysis(wid)
-            if self._tree_admitted_reads and wid not in self._tree_admitted_reads:
+            if self._tree_admitted_reads is not None and wid not in self._tree_admitted_reads:
                 reopened = False
+                if previous is None or wid not in selected:
+                    continue
             if (self.analyzed_basis.get(wid) != basis[wid] or previous is None or reopened
                     or contains_legacy(previous) or contains_legacy(relationships)):
                 requested.append(wid)
@@ -3641,8 +3665,9 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             model_requested = []
             for wid in requested:
                 if wid not in selected:
-                    self._materialize_source_less_map(wid, basis[wid], scope="deep_analysis_budget",
-                                                     reason=ABSTENTION_REASONS["deep_analysis_budget"])
+                    scope = "reading_deferred" if self.exploration_tree is not None else "deep_analysis_budget"
+                    self._materialize_source_less_map(wid, basis[wid], scope=scope,
+                                                     reason=ABSTENTION_REASONS[scope])
                     continue
                 if any(source["work_id"] == wid and authoritative_source(source)
                        for source in self.source_docs.values()):
@@ -3650,6 +3675,9 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 else:
                     self._materialize_source_less_map(wid, basis[wid])
             if model_requested:
+                if self._tree_read_order is not None:
+                    priority = {wid: index for index, wid in enumerate(self._tree_read_order)}
+                    model_requested.sort(key=lambda wid: priority.get(wid, len(priority)))
                 self._models_checked([self._map_job(wid, basis[wid]) for wid in model_requested])
         edges = []
         for wid, work in self.works.items():
@@ -3666,7 +3694,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
     def _is_deferred_analysis(self, wid):
         record = self.store.head(f"command/survey-abstentions/{wid}")
         current = self.analysis_records.get(wid)
-        return bool(record and current and self._body(record).get("scope") in {"deep_analysis_budget", "model_call_budget"}
+        return bool(record and current and self._body(record).get("scope") in {"deep_analysis_budget", "model_call_budget", "reading_deferred"}
                     and self._body(record).get("entry_sha256") == current["body_hash"])
 
     def _map_job(self, wid, basis, *, review_feedback=None):

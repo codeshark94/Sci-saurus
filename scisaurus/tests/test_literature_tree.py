@@ -5,7 +5,7 @@ import unittest
 
 from scisaurus.core.errors import ValidationError, StateError
 from scisaurus.core.source_spans import bind
-from scisaurus.runtime.literature_tree import validate_plan
+from scisaurus.runtime.literature_tree import validate_plan, validate_reading_selection
 from scisaurus.tests import test_survey as fixtures
 from scisaurus.tests.test_survey import simulated_survey_worker, source_quote, survey_config
 
@@ -14,11 +14,20 @@ def chain_worker(kind, params, channel):
     if kind != "model":
         return simulated_survey_worker(kind, params, channel)
     assignment = json.loads(params["prompt"])
+    if assignment.get("phase") == "reading_selection" and params["client"]["model"] == "select-independent":
+        value = {"rationale": "Compare alternatives before reading the independent study.",
+                 "candidates": [{"work_id": item["work_id"], "decision": "read" if item["work_id"] == "W201" else "defer",
+                                 "rationale": "Prioritize independent terminology for this inquiry."}
+                                for item in assignment["candidates"]]}
+        channel.put({"ok": True, "result": {"text": json.dumps(value), "model": params["client"]["model"],
+            "usage": {"model_calls": 1, "input_tokens": 1, "output_tokens": 1}, "elapsed_seconds": 0.01, "finish_reason": "stop"}})
+        return
     if assignment.get("phase") != "exploration_plan":
         return simulated_survey_worker(kind, params, channel)
     parent = assignment["parents"][0]
     branches = []
     if params["client"]["model"] == "local-stop" and parent["kind"] == "read":
+        parent = next((item for item in assignment["parents"] if item["work_id"] == "W201"), parent)
         if parent["work_id"] == "W201":
             source = next(s for s in assignment["sources"] if s["work_id"] == "W201")
             branches = [{"parent_id": parent["id"], "question": "Which studies cite this checked recall study?",
@@ -38,6 +47,8 @@ def chain_worker(kind, params, channel):
             branches.append({**branches[0], "query": "independent terminology"})
         if params["client"]["model"] == "direct-intake":
             branches[0].update(operation="work", query=None, work_id="W101")
+        if params["client"]["model"] == "select-independent":
+            branches[0]["query"] = "candidate comparison"
     elif parent["work_id"] in {"W101", "W102"}:
         # Citation metadata is supplied by the actual fixture work response.
         source = next(s for s in assignment["sources"] if s["work_id"] == parent["work_id"])
@@ -108,6 +119,24 @@ class TestExplorationContract(unittest.TestCase):
     def test_stop_cannot_contain_acquisition(self):
         self.plan["decision"] = "stop"
         with self.assertRaises(ValidationError): self.validate(self.plan)
+
+    def test_reading_selection_accounts_for_candidates_without_paper_quota(self):
+        value = {"rationale": "Investigate each unresolved mechanism.", "candidates": [
+            {"work_id": wid, "decision": "read", "rationale": "Resolve an independent evidence gap."}
+            for wid in ("W1", "W2", "W3", "W4", "W5")]}
+        validate_reading_selection(value, {"W1", "W2", "W3", "W4", "W5"})
+
+    def test_reading_selection_rejects_foreign_or_missing_candidates(self):
+        value = {"rationale": "Compare the candidates.", "candidates": [
+            {"work_id": "W3", "decision": "read", "rationale": "Read evidence."}]}
+        with self.assertRaises(ValidationError): validate_reading_selection(value, {"W1", "W2"})
+        value["candidates"][0]["work_id"] = "W1"
+        with self.assertRaises(ValidationError): validate_reading_selection(value, {"W1", "W2"})
+
+    def test_reading_selection_can_defer_every_candidate(self):
+        value = {"rationale": "These candidates do not address the inquiry.", "candidates": [
+            {"work_id": "W1", "decision": "defer", "rationale": "Different mechanism."}]}
+        validate_reading_selection(value, {"W1"})
 
 
 class TestExplorationExecution(unittest.TestCase):
@@ -450,3 +479,95 @@ class TestExplorationExecution(unittest.TestCase):
         root = next(n for n in nodes if n["kind"] == "root")
         self.assertTrue(any(n["kind"] == "acquisition" and n["parent_id"] == root["id"]
                             and n["request"]["operation"] == "work" for n in nodes))
+
+    def test_candidate_page_is_independent_of_reading_and_tree_count_limits(self):
+        from scisaurus.tests.test_survey import SurveyHTTPFixture
+        self.config["model"]["model"] = "select-independent"
+        self.config["survey"]["seed_work_ids"] = []
+        self.config["survey"]["search"].update(results_per_query=10, max_analyzed_works=2,
+                                              expansion_rounds=0, expansion_seed_count=1)
+        runner = self.runner()
+        result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        queries = [r for r in SurveyHTTPFixture.requests if r["query"].get("search") == ["candidate comparison"]]
+        self.assertEqual(len(queries), 1)
+        self.assertEqual(queries[0]["query"]["per_page"], ["10"])
+        control, store = self.fixture.open_store()
+        assignments = [prompt for _, prompt in self.fixture.model_contexts(control, store)]
+        selection = next(item for item in assignments if item["phase"] == "reading_selection")
+        self.assertEqual({item["work_id"] for item in selection["candidates"]}, {"W101", "W201", "W301"})
+        maps = [item["requested_work_ids"][0] for item in assignments if item["phase"] == "map"]
+        self.assertIn("W201", maps)
+        self.assertNotIn("W101", maps)
+        self.assertNotIn("W301", maps)
+        self.assertIsNone(result["coverage"]["deep_analysis_limit"])
+        action = next(node for node in result["coverage"]["exploration_tree"]["nodes"]
+                      if node["kind"] == "acquisition" and node["request"].get("query") == "candidate comparison")
+        self.assertEqual(action["selected_work_ids"], ["W201"])
+        self.assertTrue(action["selection_ref"])
+
+    def test_interrupted_selection_recovers_checked_choice_without_another_call(self):
+        from unittest.mock import patch
+        first = self.runner()
+        record = first._record
+        def interrupt(logical, *args, **kwargs):
+            result = record(logical, *args, **kwargs)
+            if logical.startswith("kb/reading-selections/"):
+                raise KeyboardInterrupt()
+            return result
+        with patch.object(first, "_record", side_effect=interrupt): paused = first.run()
+        self.assertEqual(paused["status"], "paused", paused["error"])
+        completed = self.runner(resume_policy=self.policy()).run()
+        self.assertEqual(completed["status"], "completed", completed["error"])
+        control, store = self.fixture.open_store()
+        selections = [prompt for _, prompt in self.fixture.model_contexts(control, store) if prompt["phase"] == "reading_selection"]
+        initial = [prompt for prompt in selections if {item["work_id"] for item in prompt["candidates"]} == {"W101"}]
+        self.assertEqual(len(initial), 1)
+
+    def test_checked_chain_ignores_legacy_depth_parent_and_paper_counts(self):
+        self.config["survey"]["search"].update(max_analyzed_works=2, expansion_rounds=0, expansion_seed_count=1)
+        result = self.runner().run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        reads = {node["work_id"]: node for node in result["coverage"]["exploration_tree"]["nodes"] if node["kind"] == "read"}
+        self.assertTrue({"W101", "W102", "W103"} <= set(reads))
+        self.assertGreater(reads["W103"]["depth"], 1)
+
+    def test_partially_deferred_page_is_reconsidered_with_fresh_inquiry(self):
+        from unittest.mock import patch
+        runner = self.runner(); runner._initialize(); runner._setup(); runner._tree_load()
+        root = runner.exploration_tree["nodes"][0]
+        def action(identity, ids):
+            receipts = [runner._bibliographic_call("work", role="research.search-planner", work_id=wid,
+                       result_limit=1, plan_ref=runner.protocol["artifact_ref"]) for wid in ids]
+            node = {"kind": "acquisition", "id": identity, "parent_id": root["id"], "depth": 1,
+                    "state": "captured", "request": {}, "question": "Investigate recall evidence.",
+                    "rationale": "Compare the scientific candidates.", "query_ref": runner.query_refs[-1],
+                    "plan_ref": runner.protocol["artifact_ref"], "follow_up_ref": None, "returned_work_ids": ids}
+            runner.exploration_tree["nodes"].append(node)
+            return node
+        first = action("first", ["W101", "W201"])
+        def choose(name, role, assignment, validator, **kwargs):
+            value = {"rationale": "Prioritize the inquiry evidence.", "candidates": [
+                {"work_id": item["work_id"], "decision": "defer" if item["work_id"] == "W201" else "read",
+                 "rationale": "Retain candidates for the next inquiry."} for item in assignment["candidates"]]}
+            validator(value)
+            return value, runner.protocol["artifact_ref"]
+        with patch.object(runner, "_model_checked", side_effect=choose): runner._tree_select_reads([first])
+        first["state"] = "read"
+        self.assertEqual(first["deferred_work_ids"], ["W201"])
+        second = action("second", ["W301"])
+        captured = []
+        def reconsider(name, role, assignment, validator, **kwargs):
+            captured.extend(item["work_id"] for item in assignment["candidates"])
+            value = {"rationale": "Reassess alternatives using the fresh inquiry.", "candidates": [
+                {"work_id": item["work_id"], "decision": "read", "rationale": "Advance the inquiry."}
+                for item in assignment["candidates"]]}
+            validator(value)
+            return value, runner.protocol["artifact_ref"]
+        with patch.object(runner, "_model_checked", side_effect=reconsider), \
+             patch.object(runner, "_full_texts"), patch.object(runner, "_reconcile_identities"), \
+             patch.object(runner, "_map"), patch.object(runner, "_review_work_claims"):
+            runner._tree_read([second])
+        self.assertIn("W201", captured)
+        self.assertIn("W201", first["selected_work_ids"])
+        runner.control.close()

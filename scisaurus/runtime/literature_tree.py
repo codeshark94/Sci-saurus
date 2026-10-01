@@ -27,11 +27,11 @@ def validate_plan(value, parents, sources, *, max_branches):
     if not isinstance(value["rationale"], str) or not value["rationale"].strip():
         raise ValidationError("exploration decision requires a rationale")
     branches = value["branches"]
-    if (not isinstance(branches, list) or len(branches) > max_branches
+    if (not isinstance(branches, list) or (max_branches is not None and len(branches) > max_branches)
             or bool(branches) != (value["decision"] == "expand")):
         raise ValidationError("exploration branches must match the decision and declared bound")
     seen = set()
-    for branch in branches:
+    for index, branch in enumerate(branches):
         if not isinstance(branch, dict) or set(branch) != {
                 "parent_id", "question", "rationale", "operation", "query", "work_id", "evidence"}:
             raise ValidationError("exploration branch has an invalid envelope")
@@ -65,7 +65,8 @@ def validate_plan(value, parents, sources, *, max_branches):
         allowed_refs = set(parent.get("source_refs", []))
         for proof in evidence:
             if not isinstance(proof, dict) or proof.get("source_ref") not in allowed_refs:
-                raise ValidationError("branch evidence is outside its reviewed parent's source scope")
+                raise ValidationError(f"branch {index} parent {branch['parent_id']} owns work {parent.get('work_id')} "
+                                      f"and allows sources {sorted(allowed_refs)}; branch evidence is outside its reviewed parent's source scope")
             source = sources.get(proof["source_ref"])
             if (source is None or proof.get("work_id") != parent["work_id"]
                     or not authoritative_source(source)):
@@ -77,13 +78,36 @@ def validate_plan(value, parents, sources, *, max_branches):
         seen.add(key)
 
 
+def validate_reading_selection(value, candidates):
+    if not isinstance(value, dict) or set(value) != {"rationale", "candidates"}:
+        raise ValidationError("reading selection requires rationale and candidates")
+    if not isinstance(value["rationale"], str) or not value["rationale"].strip():
+        raise ValidationError("reading selection requires a rationale")
+    if not isinstance(value["candidates"], list):
+        raise ValidationError("reading decisions must be a list")
+    seen = set()
+    for choice in value["candidates"]:
+        if not isinstance(choice, dict) or set(choice) != {"work_id", "decision", "rationale"}:
+            raise ValidationError("reading choice requires work_id, decision, and rationale")
+        wid = choice["work_id"]
+        if not isinstance(wid, str) or wid not in candidates or wid in seen:
+            raise ValidationError("reading choice must identify one captured candidate exactly once")
+        if choice["decision"] not in {"read", "defer"}:
+            raise ValidationError("reading decision must be read or defer")
+        if not isinstance(choice["rationale"], str) or not choice["rationale"].strip():
+            raise ValidationError("reading choice requires a rationale")
+        seen.add(wid)
+    if seen != set(candidates):
+        raise ValidationError("reading selection must account for every captured candidate")
+
+
 class LiteratureTree:
     """Survey orchestration mixin; scientific branch choices belong to model jobs."""
 
     def _tree_save(self):
         refs = {self.protocol["artifact_ref"]}
         for node in self.exploration_tree["nodes"]:
-            refs.update(node[field] for field in ("work_ref", "entry_ref", "review_ref", "plan_ref", "query_ref", "follow_up_ref")
+            refs.update(node[field] for field in ("work_ref", "entry_ref", "review_ref", "plan_ref", "query_ref", "selection_ref", "follow_up_ref")
                         if node.get(field))
             refs.update(node.get("source_refs", []))
         record = self._record("kb/exploration-tree", "note", self.exploration_tree,
@@ -130,16 +154,96 @@ class LiteratureTree:
                 "round": 0, "termination": None}
             self._tree_save()
 
+    def _tree_select_reads(self, actions, *, reconsider=False):
+        pending = [action for action in actions if not action.get("selection_ref")
+                   or (reconsider and action.get("deferred_work_ids"))]
+        if not pending:
+            return
+        candidate_ids = {self.aliases.get(wid, wid) for action in pending
+                         for wid in action.get("returned_work_ids", [])} & set(self.works)
+        existing = {wid for wid, record in self.analysis_records.items()
+                    if any(self._body(record)[field]["text"] is not None for field in MAP_FIELDS)}
+        candidates = candidate_ids - existing
+        remaining, scopes = self._remaining_model_capacity(["research.search-planner", "research.literature-mapper",
+                                                           "methods.work-reviewer"])
+        # Text windows share the declared context surface; catalog metadata is
+        # retained in full and never becomes evidence for substantive claims.
+        source_limit = max(1, self.bounds["context_chars"] // max(1, len(candidates)))
+        assignment = {"phase": "reading_selection", "question": self.score["question"],
+            "inquiries": [{key: action.get(key) for key in ("id", "parent_id", "question", "rationale", "evidence",
+                          "query_ref", "returned_work_ids")} for action in pending],
+            "candidates": [{"work_id": wid, "work_ref": self.work_records[wid]["artifact_ref"],
+                "work": {key: self.works[wid].get(key) for key in ("title", "year", "doi", "referenced_works")},
+                "sources": [{"source_ref": ref, "representation": source["representation"],
+                             "text": source["text"][:source_limit], "available_chars": len(source["text"])}
+                            for ref, source in self.source_docs.items()
+                            if source["work_id"] == wid and authoritative_source(source)]}
+                           for wid in sorted(candidates)],
+            "checked_entries": [self._body(self.analysis_records[wid]) for wid in sorted(existing)],
+            "resources": {"remaining_model_calls": remaining, "owned_scopes": scopes,
+                          "required_decisions": self._required_model_work()},
+            "instructions": "Compare the captured candidates against the incoming inquiries and existing checked findings. "
+                "Return exactly {rationale:string,candidates:[{work_id,decision:read|defer,rationale:string}]}. "
+                "Account for each candidate once. Put read decisions first, ordered by scientific priority. "
+                "Keep each rationale a concise selection reason; do not write a literature summary in this decision. "
+                "Choose how many and which works need substantive reading to advance the question. "
+                "There is no paper-count quota, fixed seed count, or per-depth allocation. Actual calls, tokens, and time are finite; "
+                "leave capacity for verification, further inquiry, and required downstream decisions. "
+                "A read decision requests source capture, analysis, and independent checking; it is not scientific inclusion or verification. "
+                "A defer decision retains the candidate for later consideration. Metadata and truncated abstracts do not establish "
+                "mechanisms, measurements, novelty, or absence. Explain priority and relevance without inventing substantive findings."}
+        identity = node_id({key: value for key, value in assignment.items() if key != "resources"})
+        retained_input = self.store.head("kb/reading-selection-inputs/" + identity)
+        if retained_input:
+            assignment = self._body(retained_input)
+        else:
+            self._record("kb/reading-selection-inputs/" + identity, "note", assignment, "research.search-planner",
+                         subjects=[action["query_ref"] for action in pending])
+        if candidates:
+            value, execution = self._model_checked("reading-selection-" + identity, "research.search-planner",
+                assignment, lambda value: validate_reading_selection(value, candidates), stage="supervision", task_kind="service")
+            subjects = [execution]
+        else:
+            value = {"rationale": "All returned candidates already have substantive entries or no admitted catalog record.",
+                     "candidates": []}
+            execution = None
+            subjects = []
+        record = self._record("kb/reading-selections/" + identity, "note",
+            {**value, "assignment_sha256": identity, "execution_ref": execution,
+             "candidate_work_refs": [self.work_records[wid]["artifact_ref"] for wid in sorted(candidate_ids)]},
+            "research.search-planner", subjects=[*subjects, *[action["query_ref"] for action in pending],
+                *[self.work_records[wid]["artifact_ref"] for wid in sorted(candidate_ids)]])
+        selected = [choice["work_id"] for choice in value["candidates"] if choice["decision"] == "read"]
+        selected.extend(sorted(existing))
+        for action in pending:
+            available = {self.aliases.get(wid, wid) for wid in action.get("returned_work_ids", [])}
+            action.update(selection_ref=record["artifact_ref"], selected_work_ids=[wid for wid in selected if wid in available],
+                          deferred_work_ids=sorted(available - set(selected)))
+        self._tree_save()
+        self._checkpoint("exploration_candidates_selected", force=True)
+
     def _tree_read(self, actions):
-        self._full_texts()
-        self._reconcile_identities()
+        actions = list(actions)
+        reconsider = any(not action.get("selection_ref") for action in actions)
+        if reconsider:
+            seen = {action["id"] for action in actions}
+            actions.extend(node for node in self.exploration_tree["nodes"] if node["kind"] == "acquisition"
+                           and node.get("deferred_work_ids") and node.get("follow_up_ref") == self.follow_up_ref
+                           and node["id"] not in seen)
+        self._tree_select_reads(actions, reconsider=reconsider)
         self._tree_admitted_reads = {self.aliases.get(wid, wid) for action in actions
-                                     for wid in action.get("returned_work_ids", [])}
+                                     for wid in action.get("selected_work_ids", [])}
+        decisions = [choice["work_id"] for ref in dict.fromkeys(action["selection_ref"] for action in actions)
+                     for choice in self._body(self.store.get(ref))["candidates"] if choice["decision"] == "read"]
+        self._tree_read_order = list(dict.fromkeys([*decisions, *[wid for action in actions for wid in action.get("selected_work_ids", [])]]))
         try:
+            self._full_texts()
+            self._reconcile_identities()
             self._map()
             self._review_work_claims()
         finally:
-            self._tree_admitted_reads = set()
+            self._tree_admitted_reads = None
+            self._tree_read_order = None
         for node in self.exploration_tree["nodes"]:
             if node["kind"] == "read" and (
                     self.work_records.get(node["work_id"], {}).get("artifact_ref") != node["work_ref"]
@@ -148,7 +252,7 @@ class LiteratureTree:
                 node["state"] = "superseded"
         existing = {node["id"] for node in self.exploration_tree["nodes"]}
         for action in actions:
-            for observed in action.get("returned_work_ids", []):
+            for observed in action.get("selected_work_ids", []):
                 wid = self.aliases.get(observed, observed)
                 entry = self.analysis_records.get(wid)
                 review = self.work_reviews.get(wid)
@@ -183,9 +287,19 @@ class LiteratureTree:
                         self.exploration_tree["nodes"][-1].update(
                             state="deferred_request", reason="a newer scoped evidence request is active")
                     existing.add(identity)
-            action["state"] = "read"
+            action["state"] = "read" if action.get("selected_work_ids") else "screened"
+        if not self._tree_admitted_read_success(actions):
+            for action in actions:
+                parent = next(node for node in self.exploration_tree["nodes"] if node["id"] == action["parent_id"])
+                if parent.get("decision") == "expand" and parent.get("follow_up_ref") == self.follow_up_ref:
+                    parent["state"] = "pending"
         self._tree_save()
         self._checkpoint("exploration_read_reviewed", force=True)
+
+    def _tree_admitted_read_success(self, actions):
+        identifiers = {action["id"] for action in actions}
+        return any(node["kind"] == "read" and node["parent_id"] in identifiers
+                   and node["state"] != "superseded" for node in self.exploration_tree["nodes"])
 
     def _tree_recover_action(self, action):
         from scisaurus.runtime.survey import acquisition_succeeded
@@ -238,23 +352,14 @@ class LiteratureTree:
         recovered = [action for action in actions if action["state"] == "captured"]
         if recovered:
             self._tree_finish_acquisitions(recovered)
-        depth = min((action["depth"] for action in pending), default=1)
-        rounds_left = max(1, 2 + self.bounds["expansion_rounds"] - depth)
-        remaining_slots = self._tree_remaining_slots()
-        batch = (remaining_slots + rounds_left - 1) // rounds_left
-        capacity, _ = self._remaining_model_capacity(["research.literature-mapper", "methods.work-reviewer"])
-        if capacity is not None:
-            batch = min(batch, max(0, (capacity - len(self._required_model_work())) // 2))
-        if batch <= 0 and pending:
-            self._tree_stop("acquisition capacity reserved or exhausted")
-            return
-        captured_before = len(self.works)
         for action in pending:
             if self._tree_recover_action(action):
                 continue
             request = action["request"]
-            if len(self.works) - captured_before >= batch:
-                break
+            if self._tree_catalog_capacity() <= 0:
+                action.update(state="deferred", reason="declared catalog storage allowance reached")
+                self._tree_save()
+                continue
             if self.api_calls >= self.bounds["max_api_calls"]:
                 action.update(state="deferred", reason="declared bibliography call budget reached")
                 self._tree_save()
@@ -311,16 +416,22 @@ class LiteratureTree:
         context = [source for source in self._source_context() if source["source_ref"] in sources]
         windows = {source["source_ref"]: source["window"] for source in context}
         assignments = [{**node, **({"work": self._body(self.store.get(node["work_ref"])), "entry": self._body(self.store.get(node["entry_ref"])),
-                                  "review": self._body(self.store.get(node["review_ref"]))}
+                                  "review": self._body(self.store.get(node["review_ref"])),
+                                  "allowed_evidence": {"work_id": node["work_id"], "source_refs": node["source_refs"]},
+                                  "sources": [source for source in context if source["source_ref"] in node["source_refs"]]}
                                  if node["kind"] == "read" else {})} for node in parents]
-        branch_limit = (self.bounds["queries_per_role"] if parents[0]["kind"] == "root" else
-                        self.bounds["queries_per_role"] + self.bounds["references_per_work"] + 1)
+        branch_limit = None
+        remaining, scopes = self._remaining_model_capacity(["research.search-planner", "research.literature-mapper", "methods.work-reviewer"])
         assignment = {"phase": "exploration_plan", "question": self.score["question"],
             "parents": assignments, "sources": context, "suggestions": suggestions,
             "max_branches": branch_limit, "search_syntax": self._tree_search_syntax(),
             "allowed_operations": {"root": ["search", "work"], "read": ["search", "work", "citing"]},
-            "remaining_analysis_slots": self._tree_remaining_slots(),
-            "acquisition_history": [{key: node.get(key) for key in ("request", "state", "question", "parent_id", "query_ref", "reason")}
+            "remaining_catalog_capacity": self._tree_catalog_capacity(),
+            "resources": {"remaining_model_calls": remaining, "owned_scopes": scopes,
+                          "remaining_bibliography_calls": max(0, self.bounds["max_api_calls"] - self.api_calls),
+                          "required_decisions": self._required_model_work()},
+            "acquisition_history": [{key: node.get(key) for key in ("request", "state", "question", "parent_id", "query_ref", "reason",
+                                                                 "selection_ref", "selected_work_ids")}
                                     for node in self.exploration_tree["nodes"] if node["kind"] == "acquisition"],
             "instructions": "Choose prioritized inquiries that advance the declared research question. "
                 "Return exactly {decision:expand|stop,rationale:string,branches:[{parent_id,question,rationale,"
@@ -328,13 +439,25 @@ class LiteratureTree:
                 "evidence:[{work_id,source_ref,quote}]}]}. Use assigned parent IDs. "
                 "For a root, choose initial searches or direct canonical OpenAlex work lookups from the scientific intake, with empty evidence. "
                 "For a read, explain what its checked findings suggest investigating next, with exact parent quotations. "
+                "Each branch parent_id must identify the work supplying its evidence: use that parent's allowed_evidence and sources. "
+                "Another parent's source cannot support a branch attached to this parent. Incoming inquiry_evidence explains its history, "
+                "not the allowed evidence for a new branch. Close irrelevant parents instead of using them to carry another work's findings. "
                 "An unresolved research question is not a source-stated limitation; abstract silence cannot prove absence. "
                 "For a read, work lookups follow actual parent references; citing uses the checked parent work ID. "
                 "Use diverse terminology or mechanism-specific searches when needed, not only citation neighbors. "
                 "Continue each parent incoming inquiry using its question, rationale and evidence. "
                 "Branches are ordered by scientific priority. Stop closes only the assigned parents. "
+                "Choose the number of inquiries by unresolved scientific needs, not a fixed seed count or breadth/depth quota. "
+                "max_branches is null: prioritize scientifically justified inquiries. "
+                "Remaining calls bound actual uncached dispatch, while captured receipts can be reused. "
                 "Stop with a reason when further acquisition would not improve their evidence. No novelty verdict."}
-        identity = node_id(assignment)
+        identity = node_id({key: value for key, value in assignment.items() if key != "resources"})
+        retained_input = self.store.head("kb/exploration-inputs/" + identity)
+        if retained_input:
+            assignment = self._body(retained_input)
+        else:
+            self._record("kb/exploration-inputs/" + identity, "note", assignment, "research.search-planner",
+                         subjects=[self.protocol["artifact_ref"], *[node["review_ref"] for node in parents if node.get("review_ref")]])
         normalizer = lambda value: bind(value, sources, windows=windows)
         validator = lambda value: validate_plan(value, parent_map, sources, max_branches=branch_limit)
         value, execution = self._model_checked("exploration-" + identity, "research.search-planner",
@@ -354,19 +477,16 @@ class LiteratureTree:
         from scisaurus.runtime.survey import SEARCH_SYNTAX
         return SEARCH_SYNTAX
 
-    def _tree_remaining_slots(self):
+    def _tree_catalog_capacity(self):
         reserve = self.bounds.get("challenge_reserve", 0)
-        analyzed = sum(any(self._body(record)[field]["text"] is not None for field in MAP_FIELDS)
-                       for record in self.analysis_records.values())
-        return max(0, min(self.bounds["max_works"] - reserve - len(self.works),
-                          self.bounds.get("max_analyzed_works", self.bounds["max_works"]) - reserve - analyzed))
+        return max(0, self.bounds["max_works"] - reserve - len(self.works))
 
     def _tree_stop(self, reason):
         for node in self.exploration_tree["nodes"]:
             if node["kind"] == "acquisition" and node["state"] == "pending":
                 node.update(state="deferred", reason=reason)
         self.exploration_tree["termination"] = {"reason": reason,
-            "remaining_analysis_slots": self._tree_remaining_slots(),
+            "remaining_catalog_capacity": self._tree_catalog_capacity(),
             "exhaustive_coverage": False}
         self._tree_save()
 
@@ -407,65 +527,38 @@ class LiteratureTree:
                         and node.get("follow_up_ref") == self.follow_up_ref]
             queued = any(node["kind"] == "acquisition" and node["state"] == "pending" for node in tree["nodes"])
             if not frontier and any(node["kind"] == "acquisition" and node["state"] == "pending" for node in tree["nodes"]):
-                if self._tree_remaining_slots() > 0 and self.api_calls < self.bounds["max_api_calls"]:
+                if self._tree_catalog_capacity() > 0 and self.api_calls < self.bounds["max_api_calls"]:
                     continue
             if not frontier:
                 self._tree_stop("no unexpanded reviewed reads remain")
                 return
-            if self._tree_remaining_slots() <= 0:
-                self._tree_stop("declared deep-analysis budget reached")
-                return
-            for node in frontier:
-                if node["kind"] == "read" and node["depth"] >= 1 + self.bounds["expansion_rounds"]:
-                    node.update(state="depth_limit", reason="declared expansion depth reached")
-            frontier = [node for node in frontier if node["state"] == "pending"]
-            if not frontier:
-                if queued:
-                    continue
-                self._tree_stop("declared expansion depth reached")
-                return
-            expanded_parents = sum(node["kind"] == "read" and node.get("decision") == "expand"
-                                   for node in tree["nodes"])
-            parent_slots = max(0, self.bounds["expansion_seed_count"] - expanded_parents)
-            if frontier[0]["kind"] != "root" and not parent_slots:
-                if queued:
-                    continue
-                self._tree_stop("declared expansion parent budget reached")
+            if self._tree_catalog_capacity() <= 0:
+                self._tree_stop("declared catalog storage allowance reached")
                 return
             remaining, _ = self._remaining_model_capacity(["research.search-planner", "research.literature-mapper",
                                                           "methods.work-reviewer"])
-            if remaining is not None and remaining < len(self._required_model_work()) + 3:
+            if remaining is not None and remaining < len(self._required_model_work()) + 4:
                 self._tree_stop("model capacity reserved for required downstream decisions")
                 return
             if self.api_calls >= self.bounds["max_api_calls"]:
                 self._tree_stop("declared bibliography call budget reached")
                 return
             parents = ([frontier[0]] if frontier[0]["kind"] == "root" else
-                       frontier[:parent_slots])
+                       frontier)
             suggestions = []
             if parents[0]["kind"] == "root":
                 planning_calls = sum(self.store.head("kb/search-plans/" + self._initial_plan_id(role)) is None
                                      for role in SEARCH_PLANNERS)
-                if remaining is not None and remaining < len(self._required_model_work()) + planning_calls + 3:
+                if remaining is not None and remaining < len(self._required_model_work()) + planning_calls + 4:
                     self._tree_stop("model capacity reserved for initial planning and checked reading")
                     return
                 plans = self._initial_plans()
-                suggestions = [*self.score["seed_queries"], *[q for _, queries, _ in plans for q in queries]]
+                suggestions = list(dict.fromkeys([*self.score["seed_queries"], *[q for _, queries, _ in plans for q in queries]]))
             value, ref = self._tree_plan(parents, suggestions=suggestions)
-            rounds_left = max(1, 1 + self.bounds["expansion_rounds"] - parents[0]["depth"])
-            batch = max(1, (self._tree_remaining_slots() + rounds_left - 1) // rounds_left)
-            remaining, _ = self._remaining_model_capacity(["research.literature-mapper", "methods.work-reviewer"])
-            if remaining is not None:
-                batch = min(batch, max(0, (remaining - len(self._required_model_work())) // 2))
-            batch = min(batch, max(0, self.bounds["max_api_calls"] - self.api_calls))
-            active_count = min(batch, len(value["branches"]))
-            per_action = divmod(batch, active_count) if active_count else (0, 0)
-            before = len(tree["nodes"])
-            for index, branch in enumerate(value["branches"]):
-                limit = min(self.bounds["results_per_query"], per_action[0] + (index < per_action[1]))
+            for branch in value["branches"]:
                 request = {"operation": branch["operation"], "query": branch["query"],
                            "work_id": branch["work_id"], "cursor": None,
-                           "limit": 1 if branch["operation"] == "work" else max(1, limit)}
+                           "limit": 1 if branch["operation"] == "work" else self.bounds["results_per_query"]}
                 pin = {"kind": "acquisition", "parent_id": branch["parent_id"], "request": request}
                 if not any(node["id"] == node_id(pin) for node in tree["nodes"]):
                     parent = next(node for node in parents if node["id"] == branch["parent_id"])
@@ -481,9 +574,4 @@ class LiteratureTree:
             self._tree_save()
             self._checkpoint("exploration_branches_planned", force=True)
             if value["decision"] == "stop":
-                continue
-            if not active_count:
-                self._tree_stop("acquisition capacity reserved or exhausted")
-                return
-            if len(tree["nodes"]) == before:
                 continue

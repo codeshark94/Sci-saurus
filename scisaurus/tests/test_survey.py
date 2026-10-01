@@ -174,6 +174,7 @@ class SurveyHTTPFixture(BaseHTTPRequestHandler):
         else:
             term = query.get("search", [""])[0]
             ids = ["W401"] if term == "prior solution" else (
+                ["W101", "W201", "W301"] if term == "candidate comparison" else
                 ["W201"] if term == "independent terminology" else ["W101"])
             if "filter" in query:
                 ids = ["W301"]
@@ -212,6 +213,11 @@ def simulated_survey_worker(kind, params, channel):
     started = time.monotonic()
     if phase == "blind_plan":
         value = {"queries": ["independent terminology"], "rationale": "Search neighboring terminology."}
+    elif phase == "reading_selection":
+        value = {"rationale": "Read the captured recall candidates relevant to the inquiry.",
+                 "candidates": [{"work_id": candidate["work_id"], "decision": "read",
+                                 "rationale": "Check the captured recall evidence."}
+                                for candidate in assignment["candidates"]]}
     elif phase == "exploration_plan":
         parent = assignment["parents"][0]
         branches = []
@@ -1716,6 +1722,7 @@ class TestSurveyRunner(unittest.TestCase):
 
     def test_revision_waves_reserve_review_for_previously_repaired_work(self):
         config = survey_config(self.endpoint, "semantic-many")
+        config["survey"]["seed_work_ids"] = ["W101", "W102", "W201", "W301"]
         config["limits"]["max_rounds"] = 2
         result = self.runtime(config).run()
         self.assertEqual(result["status"], "completed", result["error"])
@@ -1732,7 +1739,7 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertTrue(result["survey_current"])
         self.assertEqual(result["coverage"]["unique_works"], 5)
         self.assertEqual(result["coverage"]["verified_full_texts"], 0)
-        self.assertTrue(any(row["seed_work_ids"] == ["W101"] and row["new_unique_works"] == 3
+        self.assertTrue(any(row["seed_work_ids"] == ["W101"] and row["new_unique_works"] == 2
                             for row in result["coverage"]["expansion"]))
         searches = result["coverage"]["searches"]
         self.assertEqual(len(searches), 6)
@@ -1962,7 +1969,7 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertIsNone(result["assessment_ref"])
         self.assertIsNone(result["time_plan"]["first_verified_result"])
 
-    def test_deep_analysis_budget_reserves_countersearch_without_reviewing_deferrals(self):
+    def test_model_selected_reading_ignores_legacy_paper_quota_and_retains_countersearch(self):
         config = survey_config(self.endpoint)
         config["survey"]["seed_work_ids"] = ["W101", "W102", "W201", "W301"]
         config["survey"]["search"]["max_analyzed_works"] = 3
@@ -1980,14 +1987,12 @@ class TestSurveyRunner(unittest.TestCase):
         contexts = [prompt for _, prompt in self.model_contexts(control, store)]
         maps = [prompt for prompt in contexts if prompt["phase"] == "map"]
         reviews = [prompt for prompt in contexts if prompt["phase"] == "work_review"]
-        self.assertEqual(len(maps), 3)
-        self.assertEqual(len(reviews), 3)
+        self.assertEqual(len(maps), 5)
+        self.assertEqual(len(reviews), 5)
+        self.assertEqual({p["requested_work_ids"][0] for p in maps}, {"W101", "W102", "W201", "W301", "W401"})
         self.assertIn(["W401"], [p["requested_work_ids"] for p in maps])
-        self.assertEqual(result["coverage"]["deep_analysis_limit"], 3)
-        self.assertEqual(len(result["coverage"]["abstentions"]), 2)
-        for abstention in result["coverage"]["abstentions"]:
-            review = json.loads(store.read_body(store.head("kb/work-reviews/" + abstention["work_id"])["body_hash"]))
-            self.assertEqual(review["verification_kind"], "deterministic_abstention")
+        self.assertIsNone(result["coverage"]["deep_analysis_limit"])
+        self.assertEqual(result["coverage"]["abstentions"], [])
 
     def test_time_admission_counts_deep_analysis_not_catalog_size(self):
         config = survey_config(self.endpoint)
