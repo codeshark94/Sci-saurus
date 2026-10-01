@@ -18163,8 +18163,17 @@ class ComposerWorkflowTests(unittest.TestCase):
             supervisor = object.__new__(ComposerSupervisor)
             supervisor.workflow = runner.workflow
             supervisor._mark_interrupted_checkpoint()
+            captured = json.loads((runner.root / "output/progress.json").read_text())
+            captured_identity = runner._interrupted_checkpoint_identity(captured)
             runner.close()
-            runner = ComposerRunner(workflow, resume=True)
+            hydrate = ComposerRunner._hydrate_provisional_handoffs
+            def hydrate_retained_frontier(resumed):
+                hydrate(resumed)
+                resumed.context["survey"]["hydrated_status"] = "retained"
+            with patch.object(ComposerRunner, "_hydrate_provisional_handoffs", hydrate_retained_frontier):
+                runner = ComposerRunner(workflow, resume=True)
+            self.assertEqual(runner.context["survey"]["hydrated_status"], "retained")
+            self.assertEqual(runner._restored_execution_frontier["execution_sha256"], captured_identity)
             self.addCleanup(runner.close)
             stage = runner.workflow["stages"][0]
             self.assertEqual(runner.status, "running")

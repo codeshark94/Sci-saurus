@@ -15066,6 +15066,15 @@ class ComposerRunner:
                 live_checkpoint, reconciliation = self._restore_topic_lineage_checkpoint(
                     live_checkpoint, head_body, topic_stage["id"], lineage_error)
                 self._restored_topic_lineage_reconciliation = reconciliation
+        selected_state = live_checkpoint if isinstance(live_checkpoint, dict) else timing_state
+        if isinstance(selected_state, dict):
+            self._restored_execution_frontier = {
+                "cycle": selected_state.get("continuation_cycles"), "status": selected_state.get("status"),
+                "body_sha256": hashlib.sha256(canonical_bytes(selected_state)).hexdigest(),
+                "execution_sha256": self._interrupted_checkpoint_identity(selected_state),
+                "state_revision": selected_state.get("state_revision"),
+                "stop_reason": selected_state.get("stop_reason"),
+            }
         if isinstance(live_checkpoint, dict):
             timing_state = live_checkpoint
             self.stage_records = live_checkpoint.get("stages", self.stage_records)
@@ -15137,14 +15146,6 @@ class ComposerRunner:
                 self.deadline = self.clock() + wall_remaining
         self._reconcile_repair_panel_invoices()
         self._settle_pending_stage_usage()
-        if isinstance(timing_state, dict):
-            self._restored_execution_frontier = {
-                "cycle": timing_state.get("continuation_cycles"), "status": timing_state.get("status"),
-                "body_sha256": hashlib.sha256(canonical_bytes(timing_state)).hexdigest(),
-                "execution_sha256": self._interrupted_checkpoint_identity(timing_state),
-                "state_revision": timing_state.get("state_revision"),
-                "stop_reason": timing_state.get("stop_reason"),
-            }
         if self.status in {"completed", "candidate_needs_review", "research_expansion_required", "review_rejected",
                            "blocked", "paused"}:
             # A resumed workflow must explicitly continue from a non-terminal
