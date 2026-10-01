@@ -61,6 +61,7 @@ _GAP_ASSESSMENT_INSTRUCTIONS = (
     "Assess whether each coverage gap or omitted source window can change the nominated comparison. "
     "Use insufficient_evidence for decision-critical omissions; peripheral access failures or bounded source windows alone do not veto a supported comparison. "
     "Explain material coverage limits in the checks and rationale. Never infer support from undisplayed text. "
+    "When only an abstract is captured, distinguish a comparison not reported in that abstract from a comparison not performed by the full study. Abstract silence cannot establish the latter. "
     "When state is decisive, every comparison evidence item for that comparison must remain attached to an exact verified full_text quotation; prefer short contiguous prose spans over rendered equations. "
     "For refuted_by_prior_work or eligible_for_experiment, cite only the listed verified_full_text_refs for any decisive comparison; "
     "if no listed full-text quote directly supports the comparison, set the state to insufficient_evidence and use relationship=uncertain. "
@@ -4381,6 +4382,29 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 and (feedback is None or self._review_failure_keys(feedback) == self._review_failure_keys(review))
                 and (withdrawal["artifact_ref"] in inputs or review["entry_ref"] == entry["artifact_ref"]))
 
+    def _work_review_sources(self, wid):
+        owners = {wid, *[relation["target"] for relation in self.relationships.values()
+                        if relation["source"] == wid]}
+        pinned = {pin["ref"] for obligation in self._review_obligations_for(wid)
+                  for pin in obligation["source_pins"]}
+        return [source for source in self._assessment_source_context()
+                if source["work_id"] in owners or source["source_ref"] in pinned]
+
+    def _review_source_projection_matches(self, wid, sources):
+        full_texts = [source for source in self._work_review_sources(wid)
+                      if source["representation"] == "full_text"]
+        if not full_texts:
+            return True
+        if not isinstance(sources, list):
+            return False
+        for expected in full_texts:
+            presented = [source for source in sources if isinstance(source, dict)
+                         and source.get("source_ref") == expected["source_ref"]]
+            if (len(presented) != 1 or presented[0].get("text") != expected["text"]
+                    or presented[0].get("window") != expected["window"]):
+                return False
+        return True
+
     def _review_protocol_matches(self, review):
         contract = source_fidelity_review_contract()
         if review.get("review_protocol") != contract["protocol"]:
@@ -4399,6 +4423,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             reply = normalize_check_envelope(reply, work_review_checks(review["relationship_refs"], obligations))
             validate_work_review(reply, review["relationship_refs"], entry=prompt.get("entry"), review_obligations=obligations)
             return (prompt.get("phase") == "work_review" and prompt.get("review_contract") == contract
+                    and self._review_source_projection_matches(wid, prompt.get("sources"))
                     and prompt.get("entry_ref") == review.get("entry_ref")
                     and prompt.get("controller_abstention") == self._work_abstention_context(
                         self.store.get(review["entry_ref"]), review["relationship_refs"])
@@ -4425,6 +4450,11 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     *[ref for ref, source in self.source_docs.items() if source["work_id"] == target]])
                     for target in sorted(targets)}}
         obligations = self._review_obligations_for(wid)
+        full_text_windows = [{"source_ref": source["source_ref"], **source["window"]}
+                             for source in self._work_review_sources(wid)
+                             if source["representation"] == "full_text"]
+        if full_text_windows:
+            scope["full_text_windows"] = full_text_windows
         if obligations:
             scope["review_obligations_sha256"] = hashlib.sha256(canonical_bytes(obligations)).hexdigest()
             scope["critique_context_protocol"] = _CRITIQUE_CONTEXT_PROTOCOL
@@ -4522,11 +4552,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     raise StateError("focused review requires a completed current analysis for every mapped work")
                 relations = [relation for relation in self.relationships.values() if relation["source"] == wid]
                 refs = [relation["artifact_ref"] for relation in relations]
-                source_ids = {wid, *[relation["target"] for relation in relations]}
                 obligations = self._review_obligations_for(wid)
-                critique_sources = {pin["ref"] for item in obligations for pin in item["source_pins"]}
-                sources = [source for source in self._source_context()
-                           if source["work_id"] in source_ids or source["source_ref"] in critique_sources]
+                sources = self._work_review_sources(wid)
                 basis = self._work_review_basis(wid)
                 if self._work_review_current(wid):
                     continue
@@ -4875,6 +4902,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "Every included work requires a source-supported connection to the declared question mechanism, phenomenon, or method, even when it does not answer the question. "
                 "Null or withdrawn fields do not need content-level support for an absent assertion. "
                 "A partial withdrawal exempts only its absent fields; any surviving assertion still requires source support. "
+                "Included, excluded and uncertain are screening states, not assertion states: audit every non-null scientific field in all three states. "
                 "Unknown facts must stay unknown. Unverified provider metadata is not itself a false assertion if explicitly labeled; "
                 "fail unsupported chronology or superiority inferred from it. The map entries and sources are deliberate claim-bearing projections; use their projection counts and deterministic_integrity rather than recounting omitted rows. "
                 "Keep each method/result to one short sentence and rationale under 120 words; cite specific problems instead of enumerating the corpus."

@@ -485,6 +485,37 @@ def survey_config(endpoint, mode="pass"):
 
 
 class TestSurveyRunner(unittest.TestCase):
+    def test_focused_review_exposes_complete_capture_and_rejects_prefix_provenance(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner.bounds["context_chars"] = 80
+        text = "Recall timing is examined.\n\n" + "Detailed results. " * 50 + "\n\nThe uncertainty is standard error at 298 K."
+        source = {"work_id": "W101", "representation": "full_text", "identity_verified": True,
+                  "identity_checks": {"title_match": True, "section_markers": ["Results"]}, "text": text}
+        capture = runner._record("kb/full-text/W101", "source_capture", source, "methods.source-verifier")
+        runner.source_docs[capture["artifact_ref"]] = source
+        runner._map(); runner._review_work_claims()
+        review = runner._body(runner.work_reviews["W101"])
+        context, prompt = next((manifest, value) for manifest, value in self.model_contexts(runner.control, runner.store)
+                               if value.get("phase") == "work_review")
+        presented = next(item for item in prompt["sources"] if item["source_ref"] == capture["artifact_ref"])
+        self.assertEqual(presented["text"], text)
+        self.assertEqual(presented["window"], {"start": 0, "end": len(text)})
+        self.assertEqual(review["evidence_scope"]["full_text_windows"],
+                         [{"source_ref": capture["artifact_ref"], "start": 0, "end": len(text)}])
+        self.assertTrue(runner._work_review_current("W101"))
+        prefix_prompt = deepcopy(prompt)
+        prefix = next(item for item in prefix_prompt["sources"] if item["source_ref"] == capture["artifact_ref"])
+        prefix.update(text=text[:80], window={"start": 0, "end": 80})
+        _, _, _, reply = runner.gate._model_review_execution(review["execution_ref"], "methods.work-reviewer")
+        execution = runner.store.get(review["execution_ref"])
+        with patch.object(runner.gate, "_model_review_execution",
+                          return_value=(execution, context, prefix_prompt, reply)):
+            self.assertFalse(runner._review_protocol_matches(review))
+            self.assertFalse(runner._work_review_current("W101"))
+        self.assertEqual(runner.source_docs[capture["artifact_ref"]], source)
+
     def test_retained_critique_omission_uses_current_revalidation_diagnostic(self):
         runner = self.runtime(survey_config(self.endpoint, "missing-critique-section"))
         runner._initialize(); runner._setup()
