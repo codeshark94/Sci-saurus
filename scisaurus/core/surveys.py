@@ -19,6 +19,7 @@ from scisaurus.runtime.bibliographic_identity import normalize_doi, project_cros
 from scisaurus.runtime.operation_adapters import get_adapter
 from scisaurus.runtime.survey_records import (
     normalize_check_envelope, normalize_gap_assessment_envelope, authoritative_source, has_section_heading,
+    validate_work_review,
 )
 
 
@@ -60,9 +61,15 @@ ASSESSMENT_STATES = frozenset({
 })
 
 
-def work_review_checks(relationship_refs):
-    """Name every entry field and exact outgoing relationship requiring review."""
-    return (*WORK_CHECKS, *(f"relationship:{ref}" for ref in relationship_refs))
+def critique_check_id(obligation):
+    """Bind an adjudication to the complete immutable critique identity."""
+    return "critique:" + sha256_hex(canonical_bytes(obligation))
+
+
+def work_review_checks(relationship_refs, review_obligations=()):
+    """Name every claim and independently submitted critique requiring review."""
+    return (*WORK_CHECKS, *(f"relationship:{ref}" for ref in relationship_refs),
+            *sorted({critique_check_id(item) for item in review_obligations}))
 
 
 class SurveyGate:
@@ -288,12 +295,16 @@ class SurveyGate:
             if set(relationships) != outgoing[work_id]:
                 raise ValidationError("focused work review must cover every exact outgoing relationship")
             checks = body.get("checks")
-            self._passed_checks(checks, work_review_checks(relationships), "focused work review")
-            self._text(body.get("rationale"), "work review rationale")
             required_critiques = [item for item in critiques if item["work_id"] == work_id]
+            if (required_critiques and isinstance(checks, list)
+                    and not {critique_check_id(item) for item in required_critiques}.issubset(
+                        {check.get("check_id") for check in checks if isinstance(check, dict)})):
+                raise ValidationError("focused review has not adjudicated every current independent critique")
+            self._text(body.get("rationale"), "work review rationale")
             if body.get("verification_kind") == "deterministic_abstention":
                 if required_critiques:
                     raise ValidationError("independent critique requires substantive adjudication")
+                self._passed_checks(checks, work_review_checks(relationships), "focused work review")
                 execution, abstention = self._note(body.get("execution_ref"))
                 if (relationships or execution["author"] != "command.controller"
                         or execution["artifact_id"] != f"command/survey-abstentions/{work_id}"
@@ -305,12 +316,18 @@ class SurveyGate:
                 continue
             execution, context, prompt, reply = self._model_review_execution(body.get("execution_ref"), review["author"])
             supplied_critiques = prompt.get("review_obligations", [])
+            if (not isinstance(supplied_critiques, list)
+                    or any(not isinstance(item, dict) or item.get("work_id") != work_id
+                           for item in supplied_critiques)):
+                raise ValidationError("focused review critiques must belong to the assigned work")
             if any(not any(canonical_bytes(item) == canonical_bytes(supplied) for supplied in supplied_critiques)
                    for item in required_critiques):
                 raise ValidationError("focused review has not adjudicated the current independent critique")
             if not {item["receipt_ref"] for item in required_critiques}.issubset(dependencies):
                 raise ValidationError("survey dependencies must pin its independent critique receipts")
-            reply = normalize_check_envelope(reply, work_review_checks(relationships))
+            self._passed_checks(checks, work_review_checks(relationships, supplied_critiques), "focused work review")
+            reply = normalize_check_envelope(reply, work_review_checks(relationships, supplied_critiques))
+            validate_work_review(reply, relationships, entry=entry_body, review_obligations=supplied_critiques)
             if execution["artifact_ref"] not in dependencies:
                 raise ValidationError("survey dependencies must pin every focused review execution")
             if prompt.get("entry_ref") != entry_ref or prompt.get("relationship_refs") != relationships:

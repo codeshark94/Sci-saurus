@@ -197,7 +197,8 @@ class SurveyHTTPFixture(BaseHTTPRequestHandler):
 
 def check_rows(names, outcome="passed"):
     return [{"check_id": name, "outcome": outcome, "method": "Fixture checks captured source contracts.",
-             "result": "The explicit fixture contract is satisfied."} for name in names]
+             "result": "The explicit fixture contract is satisfied.",
+             **({"affected_check_ids": []} if name.startswith("critique:") else {})} for name in names]
 
 
 def source_quote(source, quote="Recall timing is examined."):
@@ -2252,6 +2253,8 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(context["current_entry"]["ref"], focused["entry_ref"])
         self.assertEqual(context["changed_entry_fields"], ["reason"])
         self.assertEqual(focused["review_obligations"], [obligation])
+        self.assertIn(context["check_id"], focused["required_checks"])
+        self.assertEqual(context["protocol"], "literature-critique-transition-2")
         aggregate = next(prompt for prompt in reversed(prompts) if prompt.get("phase") == "survey_review")
         self.assertEqual(aggregate["critique_contexts"], focused["critique_contexts"])
         self.assertTrue(runner._review_protocol_matches(runner._body(runner.work_reviews["W101"])))
@@ -2282,6 +2285,24 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(runner._review_failure_keys({"checks": [{"check_id": "relationship:"+relation["artifact_ref"], "outcome": "failed"}]}),
                          runner._review_failure_keys({"checks": [{"check_id": "relationship:"+revision["artifact_ref"], "outcome": "failed"}]}))
 
+    def test_aggregate_critique_keeps_excluded_claimless_target_and_source_visible(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        obligation = self.review_obligation(runner, "W101")
+        runner.review_obligations = runner._validate_review_obligations([obligation])
+        entry = deepcopy(runner._body(runner.analysis_records["W101"]))
+        entry.update(inclusion="excluded", reason="The connection to the declared question is disputed.")
+        entry.update({field: {"text": None, "evidence": []} for field in MAP_FIELDS})
+        runner.analysis_records["W101"] = runner._record("kb/work-analyses/W101", "note", entry,
+            "research.literature-mapper", subjects=runner.analyzed_basis["W101"])
+        packet = runner._survey_review_packet()
+        self.assertEqual(packet["map"]["entries"], [entry])
+        self.assertTrue({pin["ref"] for pin in obligation["source_pins"]}.issubset(
+            {source["source_ref"] for source in packet["sources"]}))
+
+
     def test_exact_relationship_grant_preserves_other_kinds_for_same_target(self):
         previous = {"work_id": "W101", "reason": "A retained reason."}
         relations = [{"source": "W101", "target": "W102", "kind": kind,
@@ -2304,6 +2325,14 @@ class TestSurveyRunner(unittest.TestCase):
         for wid in ("W101", "W102"):
             runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
         runner._map(); runner._review_work_claims()
+        old_scope = {"protocol": "literature-survey-repair-1", "question": runner.score["question"],
+                     "sources": sorted(runner.source_docs),
+                     "analysis_basis": {wid: sorted(runner._analysis_basis(wid)) for wid in sorted(runner.work_records)},
+                     "review_obligations": runner.review_obligations,
+                     "critique_context_protocol": "literature-critique-transition-1"}
+        old_digest = hashlib.sha256(canonical_bytes(old_scope)).hexdigest()
+        runner._record("command/survey-review-repairs/" + old_digest, "note",
+                       {"scope": old_scope, "rounds": runner.config["limits"]["max_rounds"]}, "command.controller")
         before = {wid: deepcopy(record) for wid, record in runner.analysis_records.items()}
         requests = len(SurveyHTTPFixture.requests)
         runner._accept_survey()
@@ -2320,6 +2349,9 @@ class TestSurveyRunner(unittest.TestCase):
         aggregate = [prompt for prompt in prompts if prompt.get("phase") == "survey_review"]
         self.assertEqual(len(aggregate), 2)
         self.assertIn("prior_review_response", aggregate[-1])
+        ledgers = [runner._body(record) for record in runner._heads("command/survey-review-repairs/")]
+        self.assertTrue(any(record["scope"]["critique_context_protocol"] == "literature-critique-transition-2"
+                            and record["rounds"] == 1 for record in ledgers))
 
     def test_aggregate_repair_rejects_ungranted_fields(self):
         runner = self.runtime(survey_config(self.endpoint, "aggregate-ungranted-repair"))
@@ -4127,6 +4159,40 @@ class TestSurveyRunner(unittest.TestCase):
 
 
 class TestSurveyContracts(unittest.TestCase):
+    def test_critique_checks_cannot_be_omitted_or_replace_narrow_failure_fields(self):
+        obligations = [{"work_id": "W1", "hypothesis": "A current numerical claim may omit its conditions."}]
+        required = work_review_checks([], obligations)
+        value = {"checks": check_rows(work_review_checks([])), "rationale": "All ordinary fields checked."}
+        with self.assertRaises(ValidationError):
+            validate_work_review(value, [], review_obligations=obligations)
+        value["checks"] = check_rows(required)
+        value["checks"][-1].update(outcome="failed", result="A current finding omits source conditions.",
+                                   affected_check_ids=["finding"])
+        with self.assertRaisesRegex(ModelContractError, "affected current entry field"):
+            validate_work_review(value, [], review_obligations=obligations)
+        next(row for row in value["checks"] if row["check_id"] == "finding")["outcome"] = "failed"
+        validate_work_review(value, [], review_obligations=obligations)
+
+    def test_each_failed_critique_requires_its_own_nonpassed_claim_check(self):
+        obligations = [{"work_id": "W1", "hypothesis": hypothesis} for hypothesis in ("Finding scope.", "Limitations scope.")]
+        required = work_review_checks([], obligations)
+        value = {"checks": check_rows(required), "rationale": "Two independent criticisms require separate corrections."}
+        critique_rows = [row for row in value["checks"] if row["check_id"].startswith("critique:")]
+        for row, field in zip(critique_rows, ("finding", "limitations")):
+            row.update(outcome="failed", affected_check_ids=[field])
+        next(row for row in value["checks"] if row["check_id"] == "finding")["outcome"] = "failed"
+        with self.assertRaisesRegex(ModelContractError, "Each unresolved critique"):
+            validate_work_review(value, [], review_obligations=obligations)
+        next(row for row in value["checks"] if row["check_id"] == "limitations")["outcome"] = "failed"
+        validate_work_review(value, [], review_obligations=obligations)
+
+    def test_open_question_does_not_require_a_negative_critique_outcome(self):
+        obligations = [{"work_id": "W1", "hypothesis": "The research question has not been answered."}]
+        value = {"checks": check_rows(work_review_checks([], obligations)),
+                 "rationale": "The current map makes no claim that the research question is answered."}
+        value["checks"][-1]["result"] = "The question remains open; no unsupported current answer is admitted."
+        validate_work_review(value, [], review_obligations=obligations)
+
     def test_follow_up_search_shares_only_exact_successful_current_discovery(self):
         runner = object.__new__(SurveyRunner)
         runner.bounds = {"results_per_query": 50}

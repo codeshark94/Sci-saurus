@@ -512,12 +512,15 @@ def validate_map(value, requested, all_work_ids, sources, *, require_spans=False
         raise ValidationError("\n".join(errors))
 
 
-def checks(value, names):
+def checks(value, names, *, critique_checks=()):
     if not isinstance(value, list):
         raise ValidationError("checks must be an explicit list")
     seen = set()
     for check in value:
-        exact(check, {"check_id", "outcome", "method", "result"}, "check")
+        fields = {"check_id", "outcome", "method", "result"}
+        if isinstance(check, dict) and check.get("check_id") in critique_checks:
+            fields.add("affected_check_ids")
+        exact(check, fields, "check")
         if check["check_id"] not in names or check["check_id"] in seen:
             raise ValidationError("unknown or duplicate required check")
         seen.add(check["check_id"])
@@ -537,11 +540,23 @@ def validate_survey_review(value):
     _text(value["rationale"], "survey review rationale")
 
 
-def validate_work_review(value, relationship_refs, *, entry=None):
-    from scisaurus.core.surveys import work_review_checks
+def validate_work_review(value, relationship_refs, *, entry=None, review_obligations=()):
+    from scisaurus.core.surveys import critique_check_id, work_review_checks
     exact(value, {"checks", "rationale"}, "work review")
-    checks(value["checks"], work_review_checks(relationship_refs))
+    critique_ids = {critique_check_id(item) for item in review_obligations}
+    checks(value["checks"], work_review_checks(relationship_refs, review_obligations), critique_checks=critique_ids)
     _text(value["rationale"], "work review rationale")
+    failed_claims = {check["check_id"] for check in value["checks"]
+                     if check["outcome"] != "passed" and check["check_id"] not in critique_ids}
+    for check in value["checks"]:
+        if check["check_id"] not in critique_ids:
+            continue
+        affected = check["affected_check_ids"]
+        if (not isinstance(affected, list) or any(not isinstance(item, str) for item in affected)
+                or len(set(affected)) != len(affected)
+                or (check["outcome"] == "passed" and affected)
+                or (check["outcome"] != "passed" and (not affected or not set(affected) <= failed_claims))):
+            raise ModelContractError("Each unresolved critique must identify its affected current entry field or relationship checks; passed critiques require an empty affected_check_ids list")
     if isinstance(entry, dict):
         for check in value["checks"]:
             field = check["check_id"]

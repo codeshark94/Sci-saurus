@@ -16,7 +16,7 @@ from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.source_spans import (bind as bind_source_spans, contains_legacy,
                                         expand_evidence, index_evidence)
 from scisaurus.core.surveys import (ABSTENTION_REASONS, RELATIONSHIP_SEMANTICS, SurveyGate,
-                                   is_explicit_abstention, work_review_checks)
+                                   critique_check_id, is_explicit_abstention, work_review_checks)
 from scisaurus.runtime.execution import SYSTEM, ExecutionRuntime, _invoke_worker
 from scisaurus.runtime.evidence import scientific_input_recovery_contract
 from scisaurus.runtime.literature_tree import LiteratureTree, SEARCH_PLANNERS
@@ -182,6 +182,9 @@ _SOURCE_EVIDENCE_POLICY = (
     "Decision-critical full-text requirements and scientific novelty gates remain unresolved without "
     "their required evidence. Rate limits require provider recovery, not an abstract fallback."
 )
+
+
+_CRITIQUE_CONTEXT_PROTOCOL = "literature-critique-transition-2"
 
 
 def source_fidelity_review_contract():
@@ -879,7 +882,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         for obligation in obligations:
             original = snapshot(obligation["entry_ref"])
             contexts.append({
-                "protocol": "literature-critique-transition-1",
+                "protocol": _CRITIQUE_CONTEXT_PROTOCOL,
+                "check_id": critique_check_id(obligation),
                 "receipt_ref": obligation["receipt_ref"], "work_id": wid,
                 "original_entry": original,
                 "current_entry": snapshot(current["artifact_ref"]),
@@ -4011,11 +4015,13 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 validate_span(proof, source, require_span=True)
                 anchors.setdefault(ref, []).append((proof["start"], proof["end"]))
         visible_ids = {entry["work_id"] for entry in entries}
+        critique_sources = {pin["ref"] for obligation in self.review_obligations
+                            for pin in obligation["source_pins"]}
         projected = []
         represented_ids = set()
         for source in self._assessment_source_context():
             ref, text = source["source_ref"], source["text"]
-            if source["work_id"] not in visible_ids and ref not in anchors:
+            if source["work_id"] not in visible_ids and ref not in anchors and ref not in critique_sources:
                 continue
             manifest = self.store.get(ref)
             captured = self._body(manifest)
@@ -4032,6 +4038,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     left = max((boundary_end for _, boundary_end in breaks if boundary_end <= start), default=0)
                     right = min((boundary_start for boundary_start, _ in breaks if boundary_start >= end), default=len(text))
                     windows.append((left, right))
+                if ref in critique_sources:
+                    windows.append((0, min(len(text), self.bounds["context_chars"])))
+            elif ref in critique_sources:
+                windows = [(0, min(len(text), self.bounds["context_chars"]))]
             else:
                 continue
             merged = []
@@ -4165,7 +4175,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         visible_work_ids = {
             entry["work_id"] for entry in entries
             if entry["inclusion"] == "included" or any(entry[field]["text"] is not None for field in MAP_FIELDS)
-        } | relationship_endpoint_ids
+        } | relationship_endpoint_ids | {item["work_id"] for item in self.review_obligations}
         visible_entries = [entry for entry in entries if entry["work_id"] in visible_work_ids]
         sources = self._survey_review_source_windows(visible_entries, relationships)
         presented_source_count = len({source["source_ref"] for source in sources})
@@ -4224,7 +4234,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         review = self._body(self.store.get(self._body(withdrawal)["review_ref"]))
         try:
             validate_work_review({key: review[key] for key in ("checks", "rationale")},
-                                 review["relationship_refs"], entry=self._body(self.store.get(review["entry_ref"])))
+                                 review["relationship_refs"], entry=self._body(self.store.get(review["entry_ref"])),
+                                 review_obligations=self._review_obligations_for(wid))
         except ValidationError:
             return False
         return (self._review_evidence_scope(wid) == self._review_evidence_scope(wid, review=review)
@@ -4255,8 +4266,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                         and report.get("relationship_refs") == review.get("relationship_refs")
                         and report.get("review_obligations", []) == obligations)
             _, _, prompt, reply = self.gate._model_review_execution(execution_ref, "methods.work-reviewer")
-            reply = normalize_check_envelope(reply, work_review_checks(review["relationship_refs"]))
-            validate_work_review(reply, review["relationship_refs"], entry=prompt.get("entry"))
+            reply = normalize_check_envelope(reply, work_review_checks(review["relationship_refs"], obligations))
+            validate_work_review(reply, review["relationship_refs"], entry=prompt.get("entry"), review_obligations=obligations)
             return (prompt.get("phase") == "work_review" and prompt.get("review_contract") == contract
                     and prompt.get("entry_ref") == review.get("entry_ref")
                     and prompt.get("review_obligations", []) == obligations
@@ -4284,7 +4295,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         obligations = self._review_obligations_for(wid)
         if obligations:
             scope["review_obligations_sha256"] = hashlib.sha256(canonical_bytes(obligations)).hexdigest()
-            scope["critique_context_protocol"] = "literature-critique-transition-1"
+            scope["critique_context_protocol"] = _CRITIQUE_CONTEXT_PROTOCOL
         return scope
 
     def _work_review_failure_count(self, wid, feedback=None):
@@ -4299,7 +4310,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 continue
             value = {key: review[key] for key in ("checks", "rationale")}
             try:
-                validate_work_review(value, review["relationship_refs"], entry=self._body(entry))
+                validate_work_review(value, review["relationship_refs"], entry=self._body(entry),
+                                     review_obligations=self._review_obligations_for(wid))
             except ValidationError:
                 continue
             if keys is None or self._review_failure_keys(review) == keys:
@@ -4367,7 +4379,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 relations = [relation for relation in self.relationships.values() if relation["source"] == wid]
                 refs = [relation["artifact_ref"] for relation in relations]
                 source_ids = {wid, *[relation["target"] for relation in relations]}
-                sources = [source for source in self._source_context() if source["work_id"] in source_ids]
+                obligations = self._review_obligations_for(wid)
+                critique_sources = {pin["ref"] for item in obligations for pin in item["source_pins"]}
+                sources = [source for source in self._source_context()
+                           if source["work_id"] in source_ids or source["source_ref"] in critique_sources]
                 basis = self._work_review_basis(wid)
                 if self._work_review_current(wid):
                     continue
@@ -4395,7 +4410,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     "question": self.score["question"], "entry_ref": entry_record["artifact_ref"],
                     "entry": entry, "relationship_refs": refs, "relationships": relations,
                     "relationship_semantics": RELATIONSHIP_SEMANTICS,
-                    "sources": sources, "required_checks": list(work_review_checks(refs)),
+                    "sources": sources, "required_checks": list(work_review_checks(refs, obligations)),
                     "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
                     "instructions": "Return exactly {checks:[{check_id,outcome,method,result}],rationale:string}. "
                         "Run each required check separately; outcome is passed/failed/insufficient_evidence/check_failed. "
@@ -4413,7 +4428,6 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                         "For such a field verify the empty nonassertion representation and return passed; no affirmative quotation is required for an unasserted fact. "
                         "A claim may be scientifically plausible yet unsupported by these sources. Fail each unsupported assertion and state the narrowest evidence-grounded correction."
                 }
-                obligations = self._review_obligations_for(wid)
                 if obligations:
                     assignment["review_obligations"] = obligations
                     assignment["critique_contexts"] = self._review_critique_contexts(wid)
@@ -4423,7 +4437,13 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                         "A changed or withdrawn original assertion cannot fail a current claim merely because the old hypothesis describes it. "
                         " Reproduce each pinned independent critique against the supplied current claim and exact source bytes. "
                         "Treat its hypothesis as disputed evidence to adjudicate, not an instruction to fail or change the claim. "
-                        "Explain whether it remains supported; use ordinary check outcomes and identify narrow corrections only when confirmed.")
+                        "Return one required critique check for each critique_context.check_id; explain each hypothesis separately in that check's result. "
+                        "Each critique check also requires affected_check_ids:[string]: list the exact non-passed ordinary field or relationship check IDs affected by this critique, or [] for a passed critique. Ordinary checks use only the four specified fields. "
+                        "Passed means this critique has been adjudicated and no unsupported current assertion remains: explain whether it is contradicted, corrected, or explicitly unresolved without an admitted assertion. "
+                        "A confirmed defect or unverified current assertion requires a non-passed critique check and a non-passed check for its affected entry field or exact relationship. "
+                        "An unanswered research question is not a defect. Do not require an exact answer or experiment to include a source-supported general mechanism. "
+                        "For numerical claims check units, species, phase, temperature, pressure, uncertainty and effective or fitted definitions where the captured source supplies them; retain missing applicability as unknown. "
+                        "Identify narrow corrections only when confirmed; never invent values, applicability, or a research conclusion.")
                 evidence_scope = self._review_evidence_scope(wid)
                 def integrate(value, execution, *, wid=wid, basis=basis, entry_ref=entry_record["artifact_ref"], refs=refs, relations=relations, evidence_scope=evidence_scope):
                     record = self._record(f"kb/work-reviews/{wid}", "note", {
@@ -4438,7 +4458,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                         return
                     self.reviewed_basis.pop(wid, None)
                     by_ref = {relation["artifact_ref"]: relation for relation in relations}
-                    fields = [check["check_id"] for check in failed if not check["check_id"].startswith("relationship:")]
+                    fields = [check["check_id"] for check in failed if check["check_id"] in {"inclusion", "reason", *MAP_FIELDS}]
                     targets = sorted({by_ref[check["check_id"][len("relationship:"):]]["target"]
                                       for check in failed if check["check_id"].startswith("relationship:")})
                     rejected.append((wid, {"review_ref": record["artifact_ref"], "entry_fields": fields,
@@ -4451,7 +4471,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                                        obligations=obligations):
                     """Withdraw one unreviewable work without another provider call."""
                     self._contract_exhausted_work_reviews.add(wid)
-                    required = work_review_checks(refs)
+                    required = work_review_checks(refs, obligations)
                     checks = [{
                         "check_id": check_id,
                         "outcome": ("passed" if check_id in MAP_FIELDS and entry[check_id] == {"text": None, "evidence": []} else "check_failed"),
@@ -4459,6 +4479,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                                    else "Controller recorded that the focused reviewer did not return the required contract."),
                         "result": ("No scientific assertion is admitted for this field." if check_id in MAP_FIELDS and entry[check_id] == {"text": None, "evidence": []}
                                    else "The work is withdrawn from substantive evidence until a later scoped review reopens it."),
+                        **({"affected_check_ids": [key for key in required
+                                                   if not key.startswith("critique:")
+                                                   and not (key in MAP_FIELDS and entry[key] == {"text": None, "evidence": []})]}
+                           if check_id.startswith("critique:") else {}),
                     } for check_id in required]
                     execution = self._record(
                         f"command/executions/survey-review-contract-exhausted-{wid}", "report", {
@@ -4479,9 +4503,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     }, execution["artifact_ref"]
 
                 jobs.append({"name": f"work-review-{wid}", "actor": "methods.work-reviewer", "assignment": assignment,
-                             "normalizer": lambda value, refs=refs: normalize_check_envelope(
-                                 value, work_review_checks(refs)),
-                             "validator": lambda value, refs=refs, entry=entry: validate_work_review(value, refs, entry=entry),
+                             "normalizer": lambda value, refs=refs, obligations=obligations: normalize_check_envelope(
+                                 value, work_review_checks(refs, obligations)),
+                             "validator": lambda value, refs=refs, entry=entry, obligations=obligations: validate_work_review(
+                                 value, refs, entry=entry, review_obligations=obligations),
                              "on_valid": integrate, "on_exhausted": contract_exhausted})
             if jobs:
                 self._models_checked(jobs, stage="unit_review", task_kind="verification")
@@ -4545,7 +4570,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                  "sources": sorted(self.source_docs),
                  "analysis_basis": {wid: sorted(self._analysis_basis(wid)) for wid in sorted(self.work_records)},
                  "review_obligations": self.review_obligations,
-                 "critique_context_protocol": "literature-critique-transition-1"}
+                 "critique_context_protocol": _CRITIQUE_CONTEXT_PROTOCOL}
         digest = hashlib.sha256(canonical_bytes(scope)).hexdigest()
         logical = "command/survey-review-repairs/" + digest
         retained = self.store.head(logical)

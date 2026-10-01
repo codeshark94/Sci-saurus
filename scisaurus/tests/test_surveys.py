@@ -20,7 +20,8 @@ from scisaurus.core.tasks import TaskManager
 
 def checks(names, outcome="passed"):
     return [{"check_id": name, "outcome": outcome,
-             "method": "Inspect the pinned source records", "result": "All scoped assertions are supported"}
+             "method": "Inspect the pinned source records", "result": "All scoped assertions are supported",
+             **({"affected_check_ids": []} if name.startswith("critique:") else {})}
             for name in sorted(names)]
 
 
@@ -608,6 +609,31 @@ class TestSurveyGate(unittest.TestCase):
                         self.accept()
                 else:
                     self.assertEqual(self.accept()["artifact_ref"], self.survey)
+
+    def test_critique_in_dispatch_requires_its_own_completed_reply_check(self):
+        receipt = self.publish("command/critique", {"hypothesis": "Test the applicability of the current claim."},
+                               author="command.operator")
+        obligations = [{"work_id": self.entry_body["work_id"], "receipt_ref": receipt,
+                        "hypothesis": "Determine whether the current claim is overstated."}]
+        with patch.object(self.gate, "independent_review_obligations", return_value=obligations):
+            review = self.work_review_for(self.entry, prompt_overrides={"review_obligations": obligations})
+            self.survey_with_work_reviews([review], extra_dependencies=[receipt])
+            with self.assertRaisesRegex(ValidationError, "not adjudicated"):
+                self.accept()
+            reply = {"checks": checks(work_review_checks([], obligations)),
+                     "rationale": "The critique is contradicted by the captured current claim and source."}
+            review = self.work_review_for(self.entry, reply=reply,
+                                         prompt_overrides={"review_obligations": obligations})
+            self.survey_with_work_reviews([review], extra_dependencies=[receipt])
+            self.assertEqual(self.accept()["artifact_ref"], self.survey)
+
+    def test_critique_check_identity_covers_every_immutable_obligation(self):
+        first = {"work_id": "W1", "hypothesis": "First allegation.", "entry_ref": "artifact:kb/entry@1"}
+        second = {**first, "hypothesis": "Second allegation."}
+        names = work_review_checks([], [first, second])
+        self.assertEqual(len(names), len(WORK_CHECKS) + 2)
+        self.assertEqual(names, work_review_checks([], [second, first]))
+        self.assertNotEqual(names, work_review_checks([], [first, {**second, "entry_ref": "artifact:kb/entry@2"}]))
 
     def test_focused_relationship_coverage_must_match_exact_outgoing_map_refs(self):
         mapped, relation, target_review, dependencies = self.map_with_relationship()
