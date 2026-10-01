@@ -25,6 +25,7 @@ import uuid
 
 from scisaurus.core.errors import QuotaExceededError, ValidationError
 from scisaurus.core.schema import canonical_bytes, json_object
+from scisaurus.runtime.execution_policy import MODEL_COST_LIMITS, enforce_model_cost_limits
 from scisaurus.runtime.models import (
     MAX_PROVIDER_SEED, ModelCallError, ModelClient, effective_model_timeout,
     estimate_input_tokens, is_local_qwen_route, model_call_budget_available,
@@ -1688,6 +1689,8 @@ class TopicBudget:
             usage=snapshot["usage"], diagnostics=snapshot["events"])
 
     def _check_available(self, key, dimension):
+        if key in MODEL_COST_LIMITS and not enforce_model_cost_limits():
+            return
         limit = self.limits.get(key)
         observed = self.usage.get(dimension, 0)
         if limit is not None and observed >= limit:
@@ -1703,7 +1706,7 @@ class TopicBudget:
             estimated_input_tokens = estimate_input_tokens(system, prompt)
             limit = self.limits.get("max_input_tokens")
             observed = self.usage.get("input_tokens", 0)
-            if limit is not None and observed + estimated_input_tokens > limit:
+            if enforce_model_cost_limits() and limit is not None and observed + estimated_input_tokens > limit:
                 self.events.append({
                     "sequence": len(self.events) + 1,
                     "kind": "quota",
@@ -1746,7 +1749,7 @@ class TopicBudget:
                 value = 0
             self.usage[key] = self.usage.get(key, 0) + value
             limit = self.limits.get(f"max_{key}")
-            if limit is not None and self.usage[key] > limit:
+            if enforce_model_cost_limits() and limit is not None and self.usage[key] > limit:
                 self._raise(key, limit, self.usage[key])
 
     def record_model_error(self, error):

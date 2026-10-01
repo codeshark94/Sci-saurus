@@ -225,6 +225,7 @@ def main(argv=None) -> int:
 
     p_composer = sub.add_parser(
         "run-composer", help="run a project-scoped end-to-end research workflow under Executive Command")
+    p_composer.add_argument("--development", action="store_true", help="disable cumulative model cost ceilings while retaining accounting and provider fences")
     p_composer.add_argument(
         "--workflow", required=True,
         help="composer workflow JSON; resume supports a bounded-to-deadline continuation update",
@@ -296,37 +297,39 @@ def main(argv=None) -> int:
             return 2
         return 0
     if args.cmd == "run-composer":
-        from scisaurus.core.errors import ValidationError
-        from scisaurus.runtime.composer import ComposerRunner, load_runtime_environment_files
-        try:
-            workflow = json.loads(Path(args.workflow).read_text())
-            load_runtime_environment_files(args.env_file)
-            on_progress = lambda state: print(_composer_progress_line(state), flush=True)
-            if args.watch:
-                from scisaurus.runtime.composer_supervisor import supervise_composer
-                result = supervise_composer(
-                    workflow, initial_resume=args.resume,
-                    initial_additional_seconds=args.extend_deadline_seconds,
-                    poll_seconds=args.watch_interval, on_progress=on_progress,
-                    stop_after_stage=args.stop_after_stage)
-            else:
-                result = ComposerRunner(workflow, resume=args.resume,
-                                        additional_seconds=args.extend_deadline_seconds,
-                                        on_progress=on_progress,
-                                        stop_after_stage=args.stop_after_stage).run()
-        except (OSError, ValueError, ValidationError) as exc:
-            print(f"composer workflow rejected: {exc}", file=sys.stderr)
-            return 2
-        print(json.dumps({"status": result["status"], "elapsed_seconds": result["elapsed_seconds"],
-                          "deadline_seconds": result.get("deadline_seconds"),
-                          "stages": result["stages"], "release_status": result["release_status"],
-                          "continuation_policy": result.get("continuation_policy"),
-                          "continuation_cycles": result.get("continuation_cycles", 0),
-                          "active_research_requests": result.get("active_research_requests", []),
-                          "organization": result.get("organization"),
-                          "report": str(Path(workflow["project_id"]).resolve() / "output" / "run.json"),
-                          "interim_report": result.get("interim_report_path")}, indent=2))
-        return 0 if result["status"] == "completed" else 3
+        from scisaurus.runtime.execution_policy import development_execution
+        with development_execution(args.development):
+            from scisaurus.core.errors import ValidationError
+            from scisaurus.runtime.composer import ComposerRunner, load_runtime_environment_files
+            try:
+                workflow = json.loads(Path(args.workflow).read_text())
+                load_runtime_environment_files(args.env_file)
+                on_progress = lambda state: print(_composer_progress_line(state), flush=True)
+                if args.watch:
+                    from scisaurus.runtime.composer_supervisor import supervise_composer
+                    result = supervise_composer(
+                        workflow, initial_resume=args.resume,
+                        initial_additional_seconds=args.extend_deadline_seconds,
+                        poll_seconds=args.watch_interval, on_progress=on_progress,
+                        stop_after_stage=args.stop_after_stage)
+                else:
+                    result = ComposerRunner(workflow, resume=args.resume,
+                                            additional_seconds=args.extend_deadline_seconds,
+                                            on_progress=on_progress,
+                                            stop_after_stage=args.stop_after_stage).run()
+            except (OSError, ValueError, ValidationError) as exc:
+                print(f"composer workflow rejected: {exc}", file=sys.stderr)
+                return 2
+            print(json.dumps({"status": result["status"], "elapsed_seconds": result["elapsed_seconds"],
+                              "deadline_seconds": result.get("deadline_seconds"),
+                              "stages": result["stages"], "release_status": result["release_status"],
+                              "continuation_policy": result.get("continuation_policy"),
+                              "continuation_cycles": result.get("continuation_cycles", 0),
+                              "active_research_requests": result.get("active_research_requests", []),
+                              "organization": result.get("organization"),
+                              "report": str(Path(workflow["project_id"]).resolve() / "output" / "run.json"),
+                              "interim_report": result.get("interim_report_path")}, indent=2))
+            return 0 if result["status"] == "completed" else 3
     if args.cmd == "composer-interim-report":
         from scisaurus.core.errors import ValidationError
         from scisaurus.runtime.composer import read_interim_report

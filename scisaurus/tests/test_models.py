@@ -24,6 +24,51 @@ from scisaurus.runtime.models import (
 
 
 class TestModelClient(unittest.TestCase):
+    def test_development_dispatch_preserves_costs_without_admission_ceiling(self):
+        from scisaurus.runtime.models import (_reserve_model_call_budgets, _settle_model_token_budgets,
+            model_call_budget_remaining, register_model_token_budget, model_token_budget_usage,
+            ModelBudgetExceededError)
+        with tempfile.TemporaryDirectory() as directory:
+            scope = {"model_call_budget_path": str(Path(directory)/"owner.sqlite"),
+                     "model_call_budget_key": "stage", "model_call_budget_limit": 1,
+                     "model_token_budget_limits": {"input_tokens": 1, "output_tokens": 1}}
+            register_model_token_budget(scope)
+            with self.assertRaises(ModelBudgetExceededError):
+                _reserve_model_call_budgets([scope], token_reservation={"input_tokens": 10, "output_tokens": 5})
+            with patch.dict("os.environ", {"SCISAURUS_EXECUTION_POLICY": "development"}):
+                self.assertIsNone(model_call_budget_remaining(scope))
+                for _ in range(3):
+                    reserved = _reserve_model_call_budgets([scope], token_reservation={"input_tokens": 10, "output_tokens": 5})
+                    _settle_model_token_budgets(reserved, {"input_tokens": 7, "output_tokens": 2})
+                self.assertIsNone(model_call_budget_remaining(scope))
+                self.assertEqual(model_token_budget_usage(scope), {"input_tokens": 21, "output_tokens": 6})
+            self.assertEqual(model_call_budget_remaining(scope), 0)
+            with self.assertRaises(ModelBudgetExceededError):
+                _reserve_model_call_budgets([scope], token_reservation={"input_tokens": 1, "output_tokens": 1})
+            with sqlite3.connect(scope["model_call_budget_path"]) as c:
+                self.assertEqual(c.execute("SELECT * FROM model_call_budgets").fetchone(), ("stage", 1, 3))
+                self.assertEqual(c.execute("SELECT COUNT(*) FROM model_development_admissions").fetchone()[0], 3)
+                self.assertEqual(c.execute("SELECT max_input,max_output FROM model_token_budgets").fetchone(), (1, 1))
+            with patch.dict("os.environ", {"SCISAURUS_EXECUTION_POLICY": "invalid"}):
+                with self.assertRaises(ValidationError):
+                    model_call_budget_remaining(scope)
+
+    def test_rejected_development_scope_rolls_back_accounting_and_receipt(self):
+        from scisaurus.runtime.models import _reserve_model_call_budgets, ModelCallError
+        with tempfile.TemporaryDirectory() as directory:
+            scope = {"model_call_budget_path": str(Path(directory)/"owner.sqlite"),
+                     "model_call_budget_key": "stage", "model_call_budget_limit": 1}
+            bad = {**scope, "model_call_budget_path": str(Path(directory)/"bad.sqlite")}
+            with sqlite3.connect(bad["model_call_budget_path"]) as c:
+                c.execute("CREATE TABLE model_call_budgets(budget_key TEXT PRIMARY KEY,max_calls INTEGER,used_calls INTEGER)")
+                c.execute("INSERT INTO model_call_budgets VALUES ('stage',2,0)")
+            with patch.dict("os.environ", {"SCISAURUS_EXECUTION_POLICY": "development"}):
+                with self.assertRaises(ModelCallError):
+                    _reserve_model_call_budgets([scope, bad])
+            with sqlite3.connect(scope["model_call_budget_path"]) as c:
+                self.assertEqual(c.execute("SELECT used_calls FROM model_call_budgets").fetchone()[0], 0)
+                self.assertEqual(c.execute("SELECT COUNT(*) FROM model_development_admissions").fetchone()[0], 0)
+
     def test_explicit_token_capacity_preserves_costs_and_base_allocation(self):
         from scisaurus.runtime.models import (grant_model_token_capacity, register_model_token_budget,
             model_token_budget_limits, model_token_budget_usage, _reserve_model_call_budgets,
@@ -80,6 +125,9 @@ class TestModelClient(unittest.TestCase):
                 model_call_budget_remaining({**scope, "model_call_budget_limit": 4})
             with sqlite3.connect(path) as connection:
                 connection.execute("UPDATE model_call_budgets SET used_calls=4 WHERE budget_key='stage'")
+            self.assertEqual(model_call_budget_remaining(scope), 0)
+            with sqlite3.connect(path) as connection:
+                connection.execute("UPDATE model_call_budgets SET used_calls=-1 WHERE budget_key='stage'")
             with self.assertRaises(ValidationError):
                 model_call_budget_remaining(scope)
 

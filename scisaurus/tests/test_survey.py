@@ -575,6 +575,18 @@ class TestSurveyRunner(unittest.TestCase):
         dispositions = [job for job in runner._required_model_work() if job["phase"] == "survey_follow_up"]
         self.assertEqual([job["work_order_id"] for job in dispositions], [second["id"]])
 
+    def test_development_mapping_does_not_create_budget_abstention(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner.config["limits"]["max_model_calls"] = 1
+        runner.model_calls_dispatched = 100
+        job = runner._map_job("W101", runner._analysis_basis("W101"))
+        with patch.dict("os.environ", {"SCISAURUS_EXECUTION_POLICY": "development"}):
+            self.assertEqual(runner._allocate_model_wave([job]), [job])
+        self.assertIsNone(runner.store.head("command/survey-abstentions/W101"))
+        self.assertIsNone(runner.store.head(f"command/survey-resource-debts/{job['name']}"))
+
     def test_optional_mapping_reserves_materialized_downstream_decisions_and_retains_sources(self):
         runner = self.runtime()
         runner._initialize(); runner._setup()

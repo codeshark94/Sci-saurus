@@ -22,6 +22,7 @@ from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.source_spans import SPAN_EVIDENCE_FIELDS
 from scisaurus.runtime.evidence import scientific_input_recovery_contract
+from scisaurus.runtime.execution_policy import enforce_model_cost_limits
 from scisaurus.runtime.models import (
     ModelCallError,
     ModelClient,
@@ -2157,6 +2158,7 @@ class SpecialistDispatcher:
         provider_retries = 0
         schema_repair_used = False
         accumulated_usage = {}
+        enforce_costs = enforce_model_cost_limits()
         output_budget_used = 0
         output_budget = quota.get("max_output_tokens")
         output_per_call = quota.get("max_output_tokens_per_call")
@@ -2183,7 +2185,7 @@ class SpecialistDispatcher:
             result = None
             request_input = None
             response_received = False
-            remaining_output_budget = output_budget - output_budget_used
+            remaining_output_budget = output_budget - output_budget_used if enforce_costs else output_per_call
             if remaining_output_budget <= 0:
                 report = {
                     **(last_model_failure or {}),
@@ -2432,7 +2434,8 @@ class SpecialistDispatcher:
                     min(
                         self._provider_retry_limit(
                             model_role, allow_same_pool=True),
-                        max(0, max_call_attempts - call_attempts),
+                        max(0, max_call_attempts - call_attempts) if enforce_costs else self._provider_retry_limit(
+                            model_role, allow_same_pool=True),
                     )
                     if route is not None and self._provider_route_failure(exc) else 0
                 )
@@ -2491,7 +2494,7 @@ class SpecialistDispatcher:
                         exc = ValidationError(continuation_error)
                 if request_input is not None and not response_received:
                     request_input.update(request_attempts=0, outcome_known=True)
-                retry_available = call_attempts < max_call_attempts
+                retry_available = not enforce_costs or call_attempts < max_call_attempts
                 can_repair_schema = not schema_repair_used
                 if (response_received and retry_available
                         and (continuing or can_repair_schema)):

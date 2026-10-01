@@ -3013,6 +3013,21 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(events[-1]["kind"], "validation")
         self.assertIn("source challenge", events[-1]["error"])
 
+    def test_development_topic_accounts_above_model_cost_limits(self):
+        budget = TopicBudget({"max_model_calls": 1, "max_input_tokens": 1, "max_output_tokens": 1,
+                              "max_openalex_requests": 1}, {})
+        with patch.dict("os.environ", {"SCISAURUS_EXECUTION_POLICY": "development"}):
+            for _ in range(3):
+                budget.before_model_call("topic_discovery", "fake", system="Return JSON.", prompt="Evidence request.")
+                budget.record_model_result(ModelResult(text="{}", model="fake",
+                    usage={"input_tokens": 7, "output_tokens": 3}, elapsed_seconds=0.01, finish_reason="stop"))
+            self.assertEqual(budget.usage["model_calls"], 3)
+            self.assertEqual(budget.usage["input_tokens"], 21)
+            self.assertEqual(budget.usage["output_tokens"], 9)
+            budget.before_openalex_request()
+            with self.assertRaises(QuotaExceededError):
+                budget.before_openalex_request()
+
     def test_topic_budget_preflights_input_before_provider_dispatch(self):
         budget = TopicBudget({"max_model_calls": 2, "max_input_tokens": 1}, {})
         with self.assertRaisesRegex(QuotaExceededError, "input_tokens"):

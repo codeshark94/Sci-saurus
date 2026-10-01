@@ -1645,6 +1645,39 @@ class SpecialistDispatcherTests(unittest.TestCase):
         self.assertTrue(all("continuation_text" not in item["input"]
                             for item in report["request_inputs"]))
 
+    def test_development_continues_past_cumulative_call_and_output_limits(self):
+        model = {
+            "protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+            "model": "fallback", "timeout_seconds": 5.0,
+            "max_output_tokens": 8192, "context_window_tokens": 262144,
+            "max_input_tokens": 245760,
+        }
+        assignment = {
+            "assigned_role": "methods.methodologist", "role_id": "methodologist",
+            "model_role": "methods.methodologist", "execution_kind": "model",
+            "stage_id": "repair", "stage_kind": "experiment",
+            "quota": {"max_calls": 1, "max_input_tokens": 245760,
+                      "max_output_tokens": 1000,
+                      "max_output_tokens_per_call": 8192, "max_seconds": 5},
+            "_prompt": json.dumps({"objective": "bounded repair"}),
+        }
+        results = [
+            ModelResult('{"decision":', "fake",
+                        {"model_calls": 1, "output_tokens": 700}, 0.01, "length", 1),
+            ModelResult('"repair"', "fake",
+                        {"model_calls": 1, "output_tokens": 300}, 0.01, "length", 1),
+            ModelResult(',"summary":"checked","findings":[],"evidence_gaps":[],"requested_actions":[]}',
+                        "fake", {"model_calls": 1, "output_tokens": 200}, 0.01, "stop", 1),
+        ]
+        with patch.dict("os.environ", {"SCISAURUS_EXECUTION_POLICY": "development"}), patch("scisaurus.runtime.specialists.ModelClient") as client:
+            client.return_value.complete.side_effect = results
+            report = SpecialistDispatcher(model, max_parallel=1, deadline=time.monotonic()+10).dispatch(
+                [assignment], {"objective": "bounded repair"})[0]
+        self.assertEqual(report["status"], "succeeded", report)
+        self.assertEqual(report["usage"]["model_calls"], 3)
+        self.assertEqual(report["usage"]["output_tokens"], 1200)
+        self.assertEqual([call.kwargs["max_output_tokens"] for call in client.call_args_list], [8192]*3)
+
     def test_specialist_continuation_never_exceeds_cumulative_output_budget(self):
         model = {
             "protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",

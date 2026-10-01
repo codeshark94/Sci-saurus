@@ -22,6 +22,7 @@ from scisaurus.runtime.evidence import scientific_input_recovery_contract
 from scisaurus.runtime.literature_tree import LiteratureTree, SEARCH_PLANNERS
 from scisaurus.runtime.config import configured_worker_slots
 from scisaurus.runtime.bibliographic_identity import normalize_doi, project_crossref_work, reconcile_result
+from scisaurus.runtime.execution_policy import enforce_model_cost_limits
 from scisaurus.runtime.models import (
     ModelCallError, ModelResult, estimate_input_tokens, is_local_qwen_route,
     model_call_budget_remaining, model_token_budget_usage, model_token_budget_limits, role_config_for, role_routes_for,
@@ -1503,7 +1504,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
     def _remaining_model_capacity(self, roles):
         limits, scopes = [], []
         local = self.config["limits"].get("max_model_calls")
-        if type(local) is int:
+        if type(local) is int and enforce_model_cost_limits():
             limits.append(max(0, local - self.model_calls_dispatched))
         candidates = [self.dispatch_budget or {}, *self.model_call_budget_scopes]
         for role in sorted(set(roles)):

@@ -67,6 +67,23 @@ class _ComposerTestSpecialistClient:
 
 
 class ComposerWorkflowTests(unittest.TestCase):
+    def test_development_stage_quota_retains_usage_and_provider_limits(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            stage = runner.workflow["stages"][1]
+            stage["quota"] = {"max_model_calls": 1, "max_input_tokens": 1,
+                              "max_output_tokens": 1, "max_openalex_requests": 2}
+            observed = {"model_calls": 100, "input_tokens": 10000, "output_tokens": 1000,
+                        "openalex_requests": 0}
+            with patch.object(runner, "_stage_usage", return_value=observed):
+                self.assertIsNotNone(runner._stage_quota_error(stage))
+                with patch.dict("os.environ", {"SCISAURUS_EXECUTION_POLICY": "development"}):
+                    self.assertIsNone(runner._stage_quota_error(stage))
+                    observed["openalex_requests"] = 2
+                    self.assertEqual(runner._stage_quota_error(stage).dimension, "max_openalex_requests")
+            self.assertEqual(observed["model_calls"], 100)
+
     def _owned_held_topic(self, root, *, include_experiment=True):
         workflow = self._workflow(root)
         workflow["time_policy"]["hard_seconds"] = 120

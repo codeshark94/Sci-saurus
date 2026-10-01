@@ -49,7 +49,7 @@ def planning_parent(node, alias, work=None, entry=None, review=None):
     if node["kind"] == "read":
         result.update(work={key: work.get(key) for key in ("title", "year", "doi")}, entry=entry,
             review={"entry_ref": node["entry_ref"], "checks": [
-                {key: check[key] for key in ("id", "outcome") if key in check} for check in review["checks"]]},
+                {key: check[key] for key in ("check_id", "outcome") if key in check} for check in review["checks"]]},
             allowed_evidence={"work_id": node["work_id"], "source_refs": node["source_refs"]})
     return result
 

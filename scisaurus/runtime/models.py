@@ -20,6 +20,7 @@ import time
 import urllib.parse
 import uuid
 
+from scisaurus.runtime.execution_policy import enforce_model_cost_limits
 from scisaurus.core.errors import QuotaExceededError, ValidationError
 from scisaurus.core.schema import json_object
 
@@ -464,7 +465,7 @@ def model_call_budget_remaining(config):
         return None
     path = Path(budget["path"])
     if not path.exists():
-        return budget["limit"]
+        return budget["limit"] if enforce_model_cost_limits() else None
     connection = None
     try:
         connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)
@@ -473,7 +474,7 @@ def model_call_budget_remaining(config):
             ("model_call_budgets",),
         ).fetchone()
         if table is None:
-            return budget["limit"]
+            return budget["limit"] if enforce_model_cost_limits() else None
         row = connection.execute(
             "SELECT max_calls, used_calls FROM model_call_budgets WHERE budget_key=?",
             (budget["key"],),
@@ -484,13 +485,13 @@ def model_call_budget_remaining(config):
         if connection is not None:
             connection.close()
     if row is None:
-        return budget["limit"]
+        return budget["limit"] if enforce_model_cost_limits() else None
     if row[0] != budget["limit"]:
         raise ValidationError(
             f"{path} model-call budget limit conflicts with configured limit")
-    if type(row[1]) is not int or not 0 <= row[1] <= row[0]:
+    if type(row[1]) is not int or row[1] < 0:
         raise ValidationError(f"{path} model-call budget usage is invalid")
-    return row[0] - row[1]
+    return max(0, row[0] - row[1]) if enforce_model_cost_limits() else None
 
 
 def model_call_budget_available(config):
@@ -522,13 +523,16 @@ def _reserve_model_call_budgets(configs, *, token_reservation=None):
         for config in owners.values():
             receipt = _reserve_model_call_budget(config, token_reservation=token_reservation)
             reserved.append(receipt)
-    except ModelCallError:
+    except (ModelCallError, ValidationError):
         for budget in reversed(reserved):
             try:
                 with closing(sqlite3.connect(budget["path"], timeout=30.0)) as connection:
                     with connection:
                         connection.execute("UPDATE model_call_budgets SET used_calls=used_calls-1 "
                             "WHERE budget_key=? AND used_calls>0", (budget["key"],))
+                        if budget.get("development_admission_id"):
+                            connection.execute("DELETE FROM model_development_admissions WHERE admission_id=?",
+                                               (budget["development_admission_id"],))
                         if budget.get("reservation_id"):
                             connection.execute("DELETE FROM model_token_reservations WHERE reservation_id=?",
                                                (budget["reservation_id"],))
@@ -577,10 +581,11 @@ def _reserve_model_call_budget(config, *, token_reservation=None):
                 "model call budget limit conflicts with the existing ledger",
                 outcome_known=True,
             )
+        enforce = enforce_model_cost_limits()
         updated = connection.execute(
             "UPDATE model_call_budgets SET used_calls=used_calls+1 "
-            "WHERE budget_key=? AND used_calls < max_calls",
-            (budget["key"],),
+            "WHERE budget_key=? AND (used_calls < max_calls OR ?)",
+            (budget["key"], not enforce),
         ) if not inserted else None
         if updated is not None and updated.rowcount != 1:
             connection.rollback()
@@ -608,7 +613,7 @@ def _reserve_model_call_budget(config, *, token_reservation=None):
             pending = connection.execute("SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0) "
                 "FROM model_token_reservations WHERE budget_key=? AND state!='settled'", (budget["key"],)).fetchone()
             for offset, dimension in enumerate(("input_tokens", "output_tokens")):
-                if tokens[offset+2] + pending[offset] + token_reservation[dimension] > effective[dimension]:
+                if enforce and tokens[offset+2] + pending[offset] + token_reservation[dimension] > effective[dimension]:
                     raise ModelBudgetExceededError(f"model token budget exhausted: {budget['key']} {dimension}",
                         outcome_known=True, budget_admission={"path": str(path.resolve()), "key": budget["key"],
                             "dimension": dimension, "limit": effective[dimension], "observed": tokens[offset+2],
@@ -617,6 +622,13 @@ def _reserve_model_call_budget(config, *, token_reservation=None):
             connection.execute("INSERT INTO model_token_reservations (reservation_id,budget_key,input_tokens,output_tokens,state) VALUES (?,?,?,?, 'reserved')",
                 (budget["reservation_id"], budget["key"], token_reservation["input_tokens"],
                  token_reservation["output_tokens"]))
+        if not enforce:
+            connection.execute("CREATE TABLE IF NOT EXISTS model_development_admissions ("
+                "admission_id TEXT PRIMARY KEY, budget_key TEXT NOT NULL, created_at REAL NOT NULL, "
+                "observed_calls INTEGER NOT NULL)")
+            budget["development_admission_id"] = uuid.uuid4().hex
+            connection.execute("INSERT INTO model_development_admissions VALUES (?,?,?,?)",
+                (budget["development_admission_id"], budget["key"], time.time(), row[1]+1))
         connection.commit()
         return budget
     except ModelCallError:

@@ -55,6 +55,7 @@ from scisaurus.runtime.specialists import (
     build_verifier_prompt, redact_sensitive_text, _preserve_response_value, _repair_candidate_program,
     _normalise_verdict,
 )
+from scisaurus.runtime.execution_policy import MODEL_COST_LIMITS, enforce_model_cost_limits, execution_policy
 from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
 from scisaurus.runtime.evidence import scientific_input_recovery_contract
 from scisaurus.runtime.experiment_config import (
@@ -2283,6 +2284,8 @@ class ComposerRunner:
         stage_quota = stage.get("quota") if isinstance(stage, dict) else None
         for budget_key, usage_key in usage_by_budget.items():
             if budget_key not in configured_budgets:
+                continue
+            if budget_key in MODEL_COST_LIMITS and not enforce_model_cost_limits():
                 continue
             limit = configured_budgets[budget_key]
             used = observed[usage_key]
@@ -16803,6 +16806,8 @@ class ComposerRunner:
             "max_openalex_requests": ("openalex_requests", quota["max_openalex_requests"]),
         }
         for dimension, (usage_key, limit) in dimensions.items():
+            if dimension in MODEL_COST_LIMITS and not enforce_model_cost_limits():
+                continue
             if usage[usage_key] > limit or (limit > 0 and usage[usage_key] == limit):
                 error = QuotaExceededError(
                     f"stage {stage['id']} quota exhausted: {usage_key}={usage[usage_key]} >= {limit}",
@@ -28284,7 +28289,7 @@ class ComposerRunner:
         active_blockers = self._active_blockers()
         result = {
             "schema_version": RUN_SCHEMA_VERSION, "run_id": self.run_id, "workflow_id": self.workflow["id"],
-            "status": self.status, "stages": deepcopy(self.stage_records), "context": deepcopy(self.context),
+            "status": self.status, "execution_policy": execution_policy(), "stages": deepcopy(self.stage_records), "context": deepcopy(self.context),
             "feedback": deepcopy(self.feedback), "blockers": deepcopy(self.blockers),
             "active_blockers": deepcopy(active_blockers),
             "blocker_counts": {

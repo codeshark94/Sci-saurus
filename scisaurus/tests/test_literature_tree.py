@@ -217,13 +217,13 @@ class TestPromptProjection(unittest.TestCase):
                 "entry_ref": "entry@1", "source_refs": ["source@1"], "referenced_works": ["W2"]}
         card = planning_parent(node, "parent-0", {"title": "Title", "year": 2020, "doi": "doi",
             "raw": "unused metadata"}, {"finding": "Checked finding"},
-            {"checks": [{"id": "source-fidelity", "outcome": "passed", "rationale": "Long rationale"}]})
+            {"checks": [{"check_id": "source-fidelity", "outcome": "passed", "rationale": "Long rationale"}]})
         self.assertNotIn("parent_id", card)
         self.assertNotIn("sources", card)
         self.assertNotIn("raw", card["work"])
         self.assertEqual(card["referenced_works"], ["W2"])
         self.assertEqual(card["allowed_evidence"], {"work_id": "W1", "source_refs": ["source@1"]})
-        self.assertEqual(card["review"]["checks"], [{"id": "source-fidelity", "outcome": "passed"}])
+        self.assertEqual(card["review"]["checks"], [{"check_id": "source-fidelity", "outcome": "passed"}])
 
 
 class TestExplorationExecution(unittest.TestCase):

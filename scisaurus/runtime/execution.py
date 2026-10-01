@@ -27,6 +27,7 @@ from scisaurus.core.schema import TASK_KINDS, canonical_bytes
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.tasks import TaskManager
 from scisaurus.review.issues import IssueManager
+from scisaurus.runtime.execution_policy import execution_policy, enforce_model_cost_limits
 from scisaurus.runtime.models import (
     DEFAULT_MODEL_RATE_LIMIT_COOLDOWN_SECONDS,
     ModelCallError, ModelBudgetExceededError, ModelClient, ModelResult, effective_model_timeout,
@@ -416,6 +417,9 @@ class ExecutionRuntime:
                                     capacity={"concurrent_calls": self.config["limits"]["concurrent_calls"]})
         elif self.budget.get_window("run-window")["state"] != "open":
             raise ValidationError("resume requires the original active accounting window")
+        self._publish(f"command/execution-policy/{self.run_id}", "note",
+                      {"execution_policy": execution_policy(), "model_cost_limits_enforced": enforce_model_cost_limits()},
+                      "command.controller")
         self.dispatch_budget = self._model_dispatch_budget()
         from scisaurus.runtime.literature import openalex_request_usage
         observed = openalex_request_usage(self.control._conn, self.store.read_body)
@@ -698,6 +702,7 @@ class ExecutionRuntime:
                         break
                     raw_spec = pending.pop(index)
                     if (raw_spec["kind"] == "model"
+                            and enforce_model_cost_limits()
                             and type(self.config.get("limits", {}).get("max_model_calls")) is int
                             and self.model_calls_dispatched >= self.config["limits"]["max_model_calls"]):
                         outcome = self._undispatched(
