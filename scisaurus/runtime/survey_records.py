@@ -12,6 +12,27 @@ from scisaurus.core.source_spans import validate as validate_source_span
 MAP_FIELDS = ("problem", "approach", "finding", "limitations")
 SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
 GAP_CHECKS = ("closest-prior-work", "scope-comparability", "counterevidence", "full-text-support")
+REVIEW_CHECK_FIELDS = frozenset({"check_id", "outcome", "method", "result"})
+
+
+def survey_review_response_contract(current_map):
+    """Expose the exact review envelope and immutable finding destinations."""
+    return {
+        "required_fields": ["checks", "rationale"],
+        "optional_fields": ["findings"],
+        "checks": [{"check_id": name, "required_fields": sorted(REVIEW_CHECK_FIELDS),
+                    "additional_fields": False} for name in SURVEY_CHECKS],
+        "findings": {
+            "location": "top-level findings only; never inside a check row",
+            "required_fields": ["check_id", "target_ref", "field", "quote", "rationale"],
+            "entry_targets": {ref: ["inclusion", "reason", *MAP_FIELDS]
+                              for ref in current_map["entry_refs"].values()},
+            "relationship_targets": {ref: ["claim"] for ref in current_map["relationship_refs"]},
+            "target_ref": "Copy an exact immutable artifact reference from the target catalog; a work ID is not a target reference.",
+            "quote": "An exact substring of the named current field, not a source quotation or a historical assertion.",
+            "check_id": "A non-passed required check; omit findings for supported assertions.",
+        },
+    }
 
 
 BODY_SECTION_MARKERS = ("Introduction", "Background", "Methods", "Materials and Methods",
@@ -536,10 +557,15 @@ def checks(value, names, *, critique_checks=()):
         raise ValidationError("checks must be an explicit list")
     seen = set()
     for check in value:
-        fields = {"check_id", "outcome", "method", "result"}
+        fields = set(REVIEW_CHECK_FIELDS)
         if isinstance(check, dict) and check.get("check_id") in critique_checks:
             fields.add("affected_check_ids")
-        exact(check, fields, "check")
+        if not isinstance(check, dict) or set(check) != fields:
+            missing = sorted(fields - set(check)) if isinstance(check, dict) else sorted(fields)
+            extra = sorted(set(check) - fields) if isinstance(check, dict) else []
+            raise ValidationError(f"check {check.get('check_id') if isinstance(check, dict) else None!r} "
+                                  f"has missing fields {missing} and unexpected fields {extra}; "
+                                  f"requires exactly {sorted(fields)}")
         if check["check_id"] not in names or check["check_id"] in seen:
             raise ValidationError("unknown or duplicate required check")
         seen.add(check["check_id"])

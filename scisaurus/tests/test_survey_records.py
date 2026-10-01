@@ -60,6 +60,12 @@ def assessment(state="refuted_by_prior_work"):
 
 
 class TestSurveyEvidence(unittest.TestCase):
+    def test_review_check_rejection_identifies_unexpected_nested_findings(self):
+        value = {"checks": required_checks(SURVEY_CHECKS), "rationale": "Inspect the exact claims."}
+        value["checks"][1]["findings"] = []
+        with self.assertRaisesRegex(ValidationError, "unexpected fields \\['findings'\\]"):
+            validate_survey_review(value)
+
     def test_follow_up_source_and_search_binding_errors_are_model_contract_failures(self):
         from scisaurus.core.source_spans import bind
         row = {"id": "one", "status": "limited", "rationale": "The capture remains bounded.",

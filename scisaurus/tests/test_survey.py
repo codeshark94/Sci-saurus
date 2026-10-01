@@ -2845,6 +2845,22 @@ class TestSurveyRunner(unittest.TestCase):
                             == config["model"]["max_output_tokens"]
                             for context in contexts))
 
+    def test_aggregate_review_initial_and_repair_share_exact_response_contract(self):
+        from scisaurus.runtime.survey_records import survey_review_response_contract
+        runner = self.runtime()
+        result = runner.run()
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        control, store = self.open_store()
+        prompt = next(prompt for _, prompt in self.model_contexts(control, store)
+                      if prompt.get("phase") == "survey_review")
+        contract = survey_review_response_contract(prompt["map"])
+        self.assertEqual(prompt["response_contract"], contract)
+        repaired = runner._repair_assignment({"assignment": prompt, "actor": "methods.survey-reviewer"},
+                                            {"error": "unexpected findings inside a check", "finish_reason": "stop"})
+        self.assertEqual(repaired["response_contract"], contract)
+        self.assertEqual(set(contract["findings"]["entry_targets"]), set(prompt["map"]["entry_refs"].values()))
+        self.assertTrue(all(row["additional_fields"] is False for row in contract["checks"]))
+
     def test_aggregate_findings_use_refs_from_actual_relationship_projection(self):
         from scisaurus.runtime.survey_records import validate_survey_review
         runner = self.runtime(survey_config(self.endpoint, "map-links"))
@@ -2855,6 +2871,9 @@ class TestSurveyRunner(unittest.TestCase):
         runner._map()
         packet = runner._survey_review_packet()
         self.assertTrue(packet["map"]["relationships"])
+        definitions = packet["coverage"]["count_definitions"]
+        self.assertIn("not a deduplicated study count", definitions["unique_works"])
+        self.assertIn("not a count of independent studies", definitions["entry_inclusion_counts"])
         relation = packet["map"]["relationships"][0]
         self.assertIn(relation["artifact_ref"], packet["map"]["relationship_refs"])
         value = {"checks": check_rows(SURVEY_CHECKS), "rationale": "Audit the current relationship."}

@@ -40,7 +40,7 @@ from scisaurus.runtime.survey_records import (
     MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, normalize_check_envelope,
     BODY_SECTION_MARKERS, authoritative_source, has_section_heading as _has_section_heading,
     normalize_gap_assessment_envelope, validate_map,
-    validate_survey_review, validate_assessment, validate_work_review,
+    validate_survey_review, validate_assessment, validate_work_review, survey_review_response_contract,
 )
 from scisaurus.runtime.time_policy import TimePolicy
 
@@ -4222,10 +4222,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "abstention_work_ids": sorted(row["work_id"] for row in coverage["abstentions"]),
             "count_definitions": {
                 "abstention_count": "Current hash-bound controller abstention records, including partial withdrawals; not all uncertain entries or all claimless entries.",
-                "entry_inclusion_counts": "Screening decisions for every current map entry; independent of controller abstention records.",
+                "entry_inclusion_counts": "Screening decisions for every current catalog record; independent of controller abstention records. Publication versions may describe the same study, so included records are not a count of independent studies.",
                 "claimless_entry_count": "Entries with no problem, approach, finding, or limitation assertion; these do not provide scientific support.",
                 "bibliographic_identities": "checked equals verified plus conflicted plus unresolved; by_status is the complete partition of checked records.",
-                "unique_works": "Distinct catalog work IDs captured by the finite search; this is the source inventory size.",
+                "unique_works": "Distinct catalog work IDs captured by the finite search; this is the source inventory size, not a deduplicated study count. Preprints and final publications may have different catalog IDs.",
                 "source_inventory_work_records": "The number of distinct catalog work IDs in the source inventory, equal to unique_works.",
                 "map_entry_count": "The number of current literature-map entries, including explicit uncertain or deferred entries.",
                 "abstract_work_count": "The number of catalog records with a non-null abstract; it is not the number of map entries or source records.",
@@ -4804,6 +4804,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "focused_review_summary": review_packet["focused_review_summary"],
             "deterministic_integrity": review_packet["deterministic_integrity"],
             "review_contract": review_packet["review_contract"],
+            "response_contract": survey_review_response_contract(review_packet["map"]),
             "relationship_semantics": RELATIONSHIP_SEMANTICS,
             "required_checks": sorted(SURVEY_CHECKS),
             "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
