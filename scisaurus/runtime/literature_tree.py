@@ -45,7 +45,7 @@ def selection_basis(assignment):
 
 def planning_parent(node, alias, work=None, entry=None, review=None):
     """Expose checked findings and evidence ownership without repeating captures."""
-    result = {key: value for key, value in node.items() if key not in {"id", "parent_id"}}
+    result = {key: value for key, value in node.items() if key not in {"id", "parent_id", "inquiry_evidence"}}
     result["id"] = alias
     if node["kind"] == "read":
         result.update(work={key: work.get(key) for key in ("title", "year", "doi")}, entry=entry,
@@ -182,7 +182,8 @@ def validate_plan(value, parents, sources, *, max_branches):
             else:
                 allowed = parent.get("referenced_works", []) if operation == "work" else [parent.get("work_id")]
                 if branch["work_id"] not in allowed:
-                    raise ModelContractError("citation branch must follow its parent's actual citation metadata")
+                    raise ModelContractError(f"branch {index} {operation} work_id {branch['work_id']!r} must follow "
+                                             f"its parent's actual citation metadata; allowed work_ids={allowed}")
         else:
             raise ModelContractError("unsupported exploration acquisition operation")
         evidence = branch["evidence"]
@@ -722,13 +723,13 @@ class LiteratureTree:
                 "Each branch parent_id must identify the work supplying its evidence: use that parent's allowed_evidence "
                 "and its source_refs in the shared sources table. Each captured source is supplied once. "
                 "Source windows retain every checked finding's cited span; copy new quotations only from these displayed windows. "
-                "Another parent's source cannot support a branch attached to this parent. Incoming inquiry_evidence explains its history, "
-                "not the allowed evidence for a new branch. Close irrelevant parents instead of using them to carry another work's findings. "
-                "Use each parent's entry for its checked findings; historical inquiry_evidence may belong to a different work. "
+                "Another parent's source cannot support a branch attached to this parent. Incoming question and inquiry_rationale "
+                "describe how the work was found; they do not grant evidence ownership. Close irrelevant parents instead of using "
+                "them to carry another work's findings. Use each parent's entry for its checked findings. "
                 "An unresolved research question is not a source-stated limitation; abstract silence cannot prove absence. "
                 "For a read, work lookups follow actual parent references; citing uses the checked parent work ID. "
                 "Use diverse terminology or mechanism-specific searches when needed, not only citation neighbors. "
-                "Continue each parent incoming inquiry using its question, rationale and evidence. "
+                "Continue or close each parent's incoming inquiry using its question, inquiry_rationale and its own checked findings. "
                 "Branches are ordered by scientific priority. Stop closes only the assigned parents. "
                 "Choose the number of inquiries by unresolved scientific needs, not a fixed seed count or breadth/depth quota. "
                 "max_branches is null: prioritize scientifically justified inquiries. "

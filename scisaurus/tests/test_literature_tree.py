@@ -445,11 +445,18 @@ class TestPromptProjection(unittest.TestCase):
 
     def test_planner_carries_checked_ownership_without_repeating_capture(self):
         node = {"id": "read-id", "parent_id": "acquisition-id", "kind": "read", "work_id": "W1",
-                "entry_ref": "entry@1", "source_refs": ["source@1"], "referenced_works": ["W2"]}
+                "entry_ref": "entry@1", "source_refs": ["source@1"], "referenced_works": ["W2"],
+                "inquiry_evidence": [{"work_id": "W9", "source_ref": "ancestor@1", "quote": "An ancestor's finding."}],
+                "question": "Which mechanism sets the boundary?", "inquiry_rationale": "Compare an independent mechanism."}
+        original = deepcopy(node)
         card = planning_parent(node, "parent-0", {"title": "Title", "year": 2020, "doi": "doi",
             "raw": "unused metadata"}, {"finding": "Checked finding"},
             {"checks": [{"check_id": "source-fidelity", "outcome": "passed", "rationale": "Long rationale"}]})
         self.assertNotIn("parent_id", card)
+        self.assertNotIn("inquiry_evidence", card)
+        self.assertEqual(node, original)
+        self.assertEqual(card["question"], node["question"])
+        self.assertEqual(card["inquiry_rationale"], node["inquiry_rationale"])
         self.assertNotIn("sources", card)
         self.assertNotIn("raw", card["work"])
         self.assertEqual(card["referenced_works"], ["W2"])
