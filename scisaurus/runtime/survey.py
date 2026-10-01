@@ -185,6 +185,7 @@ _SOURCE_EVIDENCE_POLICY = (
 
 
 _CRITIQUE_CONTEXT_PROTOCOL = "literature-critique-transition-2"
+_CURRENT_MAP_REVIEW_PROTOCOL = "literature-current-map-review-1"
 
 
 def source_fidelity_review_contract():
@@ -206,11 +207,13 @@ def normalize_survey_repair_owners(value, entries, relationships):
     seen_entries, seen_relationships = set(), set()
     for item in value["repairs"]:
         if (not isinstance(item, dict) or set(item) != {"entry_ref", "entry_fields", "relationship_refs", "rationale"}
-                or not isinstance(item["entry_ref"], str) or item["entry_ref"] not in entries.values()
-                or item["entry_ref"] in seen_entries or not isinstance(item["rationale"], str)
+                or not isinstance(item["entry_ref"], str) or not isinstance(item["rationale"], str)
                 or not item["rationale"].strip()):
             return value
-        seen_entries.add(item["entry_ref"])
+        entry_ref = entries.get(item["entry_ref"], item["entry_ref"])
+        if entry_ref not in entries.values() or entry_ref in seen_entries:
+            return value
+        seen_entries.add(entry_ref)
         fields, refs = item["entry_fields"], item["relationship_refs"]
         if (not isinstance(fields, list) or not all(isinstance(field, str) for field in fields)
                 or len(set(fields)) != len(fields) or not set(fields) <= {"inclusion", "reason", *MAP_FIELDS}
@@ -228,7 +231,7 @@ def normalize_survey_repair_owners(value, entries, relationships):
         return item
     for item in value["repairs"]:
         if item["entry_fields"]:
-            grant(item["entry_ref"], item["rationale"])["entry_fields"].extend(item["entry_fields"])
+            grant(entries.get(item["entry_ref"], item["entry_ref"]), item["rationale"])["entry_fields"].extend(item["entry_fields"])
         for ref in item["relationship_refs"]:
             owner = entries[relationships[ref]["source"]]
             grant(owner, item["rationale"])["relationship_refs"].append(ref)
@@ -4248,12 +4251,17 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         }
         return {
             "map": {"entries": visible_entries, "relationships": relationships,
+                    "entry_refs": {wid: self.analysis_records[wid]["artifact_ref"] for wid in sorted(visible_work_ids)},
+                    "relationship_refs": {value["artifact_ref"]: {"source": value["source"], "target": value["target"], "kind": value["kind"]}
+                                          for value in self.relationships.values()},
                     "projection": projection},
             "coverage": coverage_summary,
             "sources": sources,
             "focused_review_summary": focused_reviews,
             "review_contract": {
                 **source_fidelity_review_contract(),
+                "context_protocol": _CURRENT_MAP_REVIEW_PROTOCOL,
+                "history_scope": "Historical critique texts and superseded claims are adjudicated by focused work reviews. Assess only current map assertions and captured source windows; review references are provenance, not semantic support or a reason to pass.",
                 "decision": "Whether the retained evidence map faithfully represents the captured sources and its disclosed limitations.",
                 "upstream_checks": "Prior focused review references are provenance only, not semantic evidence or a reason to pass. Independently judge every retained claim, relationship clause, and included work's relevance using the supplied captured source windows and exact cited spans.",
                 "projection_scope": "The map and source lists are claim-bearing projections; omitted counts are explicit in map.projection and full inventory counts are in coverage and deterministic_integrity. Do not invent a missing map entry or relationship endpoint that contradicts deterministic_integrity.",
@@ -4608,7 +4616,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                  "sources": sorted(self.source_docs),
                  "analysis_basis": {wid: sorted(self._analysis_basis(wid)) for wid in sorted(self.work_records)},
                  "review_obligations": self.review_obligations,
-                 "critique_context_protocol": _CRITIQUE_CONTEXT_PROTOCOL}
+                 "critique_context_protocol": _CRITIQUE_CONTEXT_PROTOCOL,
+                 "review_context_protocol": _CURRENT_MAP_REVIEW_PROTOCOL}
         digest = hashlib.sha256(canonical_bytes(scope)).hexdigest()
         logical = "command/survey-review-repairs/" + digest
         retained = self.store.head(logical)
@@ -4620,15 +4629,17 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "phase": "survey_repair_plan",
             "assignment": "Locate the current claims implicated by the failed aggregate review and grant narrow repairs.",
             "question": self.score["question"], "review_ref": review_record["artifact_ref"], "review": review,
-            "map": self._map_body(), "entry_refs": entries,
+            "map": {**self._map_body(), "entries": [
+                {**self._body(record), "artifact_ref": record["artifact_ref"]}
+                for record in self.analysis_records.values()]}, "entry_refs": entries,
             "review_contract": source_fidelity_review_contract(),
-            "critique_contexts": [context for wid in sorted({item["work_id"] for item in self.review_obligations})
-                                  for context in self._review_critique_contexts(wid)],
+            "review_context_protocol": _CURRENT_MAP_REVIEW_PROTOCOL,
             "instructions": "Return exactly {repairs:[{entry_ref,entry_fields,relationship_refs,rationale}]}. "
                 "Each entry_ref must be a current supplied entry; entry_fields is a list drawn from inclusion, reason, problem, approach, finding, limitations. "
+                "Copy the artifact_ref value, not the work_id key, for entry_ref. A known work ID can be resolved only to its supplied current entry; an explicit stale artifact_ref is never advanced. "
                 "relationship_refs must be exact current outgoing relationship refs for that entry. "
                 "Grant only the fields and relationships implicated by a concrete failed check; preserve all other assertions. "
-                "The failed review is a disputed diagnosis, not proof. Compare original critiques with the current map; do not treat a withdrawn historical assertion as current. "
+                "The failed review is a disputed diagnosis, not proof. Compare its concrete allegations against the supplied current map; do not treat a withdrawn historical assertion as current. "
                 "If no current claim needs correction, return repairs:[] and let an independent aggregate reviewer reconsider the current packet. "
                 "A repair grant permits the mapper to narrow, substantiate, or withdraw the disputed assertion; it does not prescribe a scientific verdict."
         }
@@ -4762,21 +4773,18 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "Keep each method/result to one short sentence and rationale under 120 words; cite specific problems instead of enumerating the corpus."
         }
         if prior_review_response is not None:
-            review_assignment["prior_review_response"] = prior_review_response
+            review_assignment["prior_review_receipts"] = {key: prior_review_response[key] for key in ("review_ref", "plan_ref")}
             review_assignment["instructions"] += (
                 " A prior rejected review has been routed through a scoped correction plan. "
                 "Independently inspect the exact current map; do not repeat a historical defect that the current claims no longer assert. "
                 "The repair plan and prior reviewer are provenance, not proof of either support or failure.")
         if self.review_obligations:
-            review_assignment["review_obligations"] = deepcopy(self.review_obligations)
-            review_assignment["critique_contexts"] = [context
-                for wid in sorted({item["work_id"] for item in self.review_obligations})
-                for context in self._review_critique_contexts(wid)]
+            review_assignment["independent_critique_receipts"] = sorted({item["receipt_ref"] for item in self.review_obligations})
             review_assignment["instructions"] += (
-                " The critique_contexts show original allegations alongside exact current claims, including changed and withdrawn fields. "
-                "Only the current map supplies assertions to judge; original snapshots are historical and cannot supply missing current assertions. "
-                " Independently adjudicate the pinned review hypotheses against the current map and captured source bytes. "
-                "They are not established defects or a requirement to reject the survey; confirm or contradict them explicitly in the relevant checks.")
+                " Independent critique receipts have been adjudicated by separate, source-bound focused reviews. "
+                "Their targets and captured source windows remain visible in this packet. "
+                "Independently judge the exact current claims and source bytes; focused verdicts and receipt identities are not scientific support. "
+                "Report a current unsupported clause rather than inferring one from a historical allegation.")
         if (self.resume_session
                 and "integrated_review" in self.resume_session.get("reopened_scopes", [])):
             session = self.resume_session.get("session")

@@ -301,6 +301,9 @@ def simulated_survey_worker(kind, params, channel):
         value = {"checks": check_rows(SURVEY_CHECKS), "rationale": "The map preserves unknown facts and bounded coverage."}
         if mode == "survey-review-malformed":
             value = {"checks": [], "rationale": "Incomplete review envelope."}
+        elif mode == "aggregate-history-adversary" and any(
+                key in assignment for key in ("review_obligations", "critique_contexts", "prior_review_response")):
+            value["checks"][1].update(outcome="failed", result="A superseded allegation was mistaken for a current claim.")
         elif mode in {"aggregate-scoped-repair", "aggregate-ungranted-repair"}:
             if any(entry["work_id"] == "W101" and entry["reason"] == "Explicitly examines recall timing."
                    for entry in assignment["map"]["entries"]):
@@ -2235,7 +2238,7 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertIsNotNone(runner.survey_ref)
 
     def test_critique_context_preserves_original_and_exact_current_revision(self):
-        runner = self.runtime()
+        runner = self.runtime(survey_config(self.endpoint, "aggregate-history-adversary"))
         runner._initialize(); runner._setup()
         runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
         runner._map(); runner._review_work_claims()
@@ -2257,7 +2260,12 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertIn(context["check_id"], focused["required_checks"])
         self.assertEqual(context["protocol"], "literature-critique-transition-2")
         aggregate = next(prompt for prompt in reversed(prompts) if prompt.get("phase") == "survey_review")
-        self.assertEqual(aggregate["critique_contexts"], focused["critique_contexts"])
+        self.assertNotIn("critique_contexts", aggregate)
+        self.assertNotIn("review_obligations", aggregate)
+        self.assertEqual(aggregate["independent_critique_receipts"], [obligation["receipt_ref"]])
+        self.assertIn("W101", aggregate["map"]["entry_refs"])
+        self.assertEqual(aggregate["map"]["entry_refs"]["W101"], focused["entry_ref"])
+        self.assertTrue(any(source["source_ref"] == obligation["source_pins"][0]["ref"] for source in aggregate["sources"]))
         self.assertTrue(runner._review_protocol_matches(runner._body(runner.work_reviews["W101"])))
 
     def test_distinct_review_failures_preserve_each_durable_repair_allowance(self):
@@ -2349,7 +2357,9 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(repair["editable_entry_fields"], ["reason"])
         aggregate = [prompt for prompt in prompts if prompt.get("phase") == "survey_review"]
         self.assertEqual(len(aggregate), 2)
-        self.assertIn("prior_review_response", aggregate[-1])
+        self.assertIn("prior_review_receipts", aggregate[-1])
+        self.assertNotIn("prior_review_response", aggregate[-1])
+        self.assertEqual(set(aggregate[-1]["prior_review_receipts"]), {"review_ref", "plan_ref"})
         ledgers = [runner._body(record) for record in runner._heads("command/survey-review-repairs/")]
         self.assertTrue(any(record["scope"]["critique_context_protocol"] == "literature-critique-transition-2"
                             and record["rounds"] == 1 for record in ledgers))
@@ -2475,7 +2485,7 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(len(focused), 2)
         self.assertTrue(all(prompt["entry"]["work_id"] == "W101" and prompt["review_obligations"] == [obligation] for prompt in focused))
         self.assertTrue(all(any(source["source_ref"] == obligation["source_pins"][0]["ref"] for source in prompt["sources"]) for prompt in focused))
-        self.assertEqual([prompt for prompt in prompts if prompt.get("phase") == "survey_review"][-1]["review_obligations"], [obligation])
+        self.assertEqual([prompt for prompt in prompts if prompt.get("phase") == "survey_review"][-1]["independent_critique_receipts"], [obligation["receipt_ref"]])
         self.assertEqual(resumed._work_review_failure_count("W101"), 2)
         self.assertEqual(sum(any(check["outcome"] != "passed" for check in resumed._body(resumed.store.get(
             f"artifact:kb/work-reviews/W101@{version}"))["checks"])
@@ -4160,6 +4170,16 @@ class TestSurveyRunner(unittest.TestCase):
 
 
 class TestSurveyContracts(unittest.TestCase):
+    def test_repair_entry_work_id_resolves_only_to_supplied_current_version(self):
+        entries = {"W1": "artifact:kb/entry/W1@3"}
+        raw = {"repairs": [{"entry_ref": "W1", "entry_fields": ["reason"], "relationship_refs": [], "rationale": "Narrow the current reason."}]}
+        result = normalize_survey_repair_owners(raw, entries, {})
+        self.assertEqual(result["repairs"][0]["entry_ref"], entries["W1"])
+        self.assertEqual(result["repairs"][0]["entry_fields"], ["reason"])
+        stale = {"repairs": [{**raw["repairs"][0], "entry_ref": "artifact:kb/entry/W1@2"}]}
+        self.assertIs(normalize_survey_repair_owners(stale, entries, {}), stale)
+        duplicate = {"repairs": [raw["repairs"][0], {**raw["repairs"][0], "entry_ref": entries["W1"]}]}
+        self.assertIs(normalize_survey_repair_owners(duplicate, entries, {}), duplicate)
     def test_relationship_repair_routes_by_source_without_moving_entry_fields(self):
         entries = {"W1": "artifact:kb/entry/W1@1", "W2": "artifact:kb/entry/W2@1"}
         ref = "artifact:kb/relationship/W1-W2@1"
