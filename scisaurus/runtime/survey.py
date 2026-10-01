@@ -4745,6 +4745,22 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                                       for wid, feedback in revisions], stage="revision")
             self._map()
 
+    def _survey_repair_scope(self):
+        assertions = {
+            "entries": {wid: self._body(record) for wid, record in self.analysis_records.items()},
+            "relationships": sorted(
+                [{key: value for key, value in relation.items() if key != "artifact_ref"}
+                 for relation in self.relationships.values()], key=canonical_bytes),
+        }
+        return {"protocol": "literature-survey-repair-2", "question": self.score["question"],
+                "sources": sorted(self.source_docs),
+                "analysis_basis": {wid: sorted(self._analysis_basis(wid)) for wid in sorted(self.work_records)},
+                "assertions_sha256": hashlib.sha256(canonical_bytes(assertions)).hexdigest(),
+                "review_obligations": self.review_obligations,
+                "critique_context_protocol": _CRITIQUE_CONTEXT_PROTOCOL,
+                "review_context_protocol": _CURRENT_MAP_REVIEW_PROTOCOL,
+                "review_contract": source_fidelity_review_contract()}
+
     def _repair_survey_review(self, review_record):
         """Route aggregate criticisms through the same scoped mapper contract."""
         review = self._body(review_record)
@@ -4756,13 +4772,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 permitted_relations.add(finding["target_ref"])
             else:
                 permitted_fields.setdefault(finding["target_ref"], set()).add(finding["field"])
-        scope = {"protocol": "literature-survey-repair-1", "question": self.score["question"],
-                 "sources": sorted(self.source_docs),
-                 "analysis_basis": {wid: sorted(self._analysis_basis(wid)) for wid in sorted(self.work_records)},
-                 "review_obligations": self.review_obligations,
-                 "critique_context_protocol": _CRITIQUE_CONTEXT_PROTOCOL,
-                 "review_context_protocol": _CURRENT_MAP_REVIEW_PROTOCOL,
-                 "review_contract": source_fidelity_review_contract()}
+        scope = self._survey_repair_scope()
         digest = hashlib.sha256(canonical_bytes(scope)).hexdigest()
         logical = "command/survey-review-repairs/" + digest
         retained = self.store.head(logical)

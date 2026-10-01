@@ -2860,6 +2860,38 @@ class TestSurveyRunner(unittest.TestCase):
         repair = next(prompt for prompt in prompts if prompt.get("phase") == "map" and prompt.get("semantic_feedback"))
         self.assertEqual(repair["editable_entry_fields"], ["inclusion"])
 
+    def test_survey_repair_allowance_binds_assertions_and_retains_exhausted_unchanged_scopes(self):
+        runner = self.runtime(survey_config(self.endpoint, "aggregate-inclusion-quote"))
+        self.addCleanup(runner.control.close)
+        runner._initialize(); runner._setup()
+        for wid in ("W101", "W102"):
+            runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+        runner._map(); runner._review_work_claims()
+        rejected = runner._accept_survey_once()
+        scope = runner._survey_repair_scope()
+        logical = "command/survey-review-repairs/" + hashlib.sha256(canonical_bytes(scope)).hexdigest()
+        runner._record(logical, "note", {"scope": scope, "rounds": runner.config["limits"]["max_rounds"]}, "command.controller")
+        with self.assertRaisesRegex(ModelWorkBlocked, "after scoped repairs"):
+            runner._repair_survey_review(rejected)
+        before = runner.analysis_records["W101"]
+        body = runner._body(before)
+        updated = {**body, "inclusion": "uncertain"}
+        runner.analysis_records["W101"] = runner._publish(before["artifact_id"], "note", updated, "research.literature-mapper")
+        changed_scope = runner._survey_repair_scope()
+        self.assertNotEqual(changed_scope["assertions_sha256"], scope["assertions_sha256"])
+        self.assertEqual(changed_scope["sources"], scope["sources"])
+        self.assertEqual(changed_scope["analysis_basis"], scope["analysis_basis"])
+        changed_logical = "command/survey-review-repairs/" + hashlib.sha256(canonical_bytes(changed_scope)).hexdigest()
+        self.assertIsNone(runner.store.head(changed_logical))
+        runner.analysis_records = dict(reversed(list(runner.analysis_records.items())))
+        self.assertEqual(runner._survey_repair_scope(), changed_scope)
+        runner.analysis_records["W101"] = runner._publish(before["artifact_id"], "note", updated, "research.literature-mapper")
+        self.assertEqual(runner._survey_repair_scope(), changed_scope)
+        runner.analysis_records["W101"] = before
+        self.assertEqual(runner._survey_repair_scope(), scope)
+        with self.assertRaisesRegex(ModelWorkBlocked, "after scoped repairs"):
+            runner._repair_survey_review(rejected)
+
     def test_aggregate_repair_rejects_ungranted_fields(self):
         runner = self.runtime(survey_config(self.endpoint, "aggregate-ungranted-repair"))
         result = runner.run()
