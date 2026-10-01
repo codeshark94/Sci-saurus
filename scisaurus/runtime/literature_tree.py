@@ -8,7 +8,8 @@ import tempfile
 
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.errors import ModelContractError, ProviderRateLimitError, StateError, ValidationError
-from scisaurus.core.source_spans import bind, validate as validate_span
+from scisaurus.core.source_spans import (LEGACY_EVIDENCE_FIELDS, SPAN_EVIDENCE_FIELDS,
+                                         bind, validate as validate_span)
 from scisaurus.runtime.survey_config import search_query, work_id
 from scisaurus.runtime.survey_records import MAP_FIELDS, authoritative_source
 
@@ -55,7 +56,7 @@ def planning_parent(node, alias, work=None, entry=None, review=None):
 
 
 def bind_plan_parents(value, parent_aliases):
-    """Resolve exact handles while retaining already-bound canonical parents."""
+    """Bind assigned parents and canonicalize inactive acquisition parameters."""
     value = deepcopy(value)
     if not isinstance(value, dict) or not isinstance(value.get("branches"), list):
         raise ModelContractError("exploration plan must provide a branches list")
@@ -65,65 +66,113 @@ def bind_plan_parents(value, parent_aliases):
             raise ModelContractError(f"branch {index} parent_id {alias!r} is unassigned; "
                                      f"use one of {list(parent_aliases)}")
         branch["parent_id"] = parent_aliases.get(alias, alias)
+        operation = branch.get("operation")
+        if operation == "search":
+            branch.setdefault("work_id", None)
+        elif operation in ("work", "citing"):
+            branch.setdefault("query", None)
     return value
 
 
-def validate_plan(value, parents, sources, *, max_branches):
+def _plan_branches(value, *, max_branches=None):
     if not isinstance(value, dict) or set(value) != {"decision", "rationale", "branches"}:
-        raise ValidationError("exploration plan requires decision, rationale, and branches")
-    if value["decision"] not in {"expand", "stop"}:
-        raise ValidationError("exploration decision must be expand or stop")
+        raise ModelContractError("exploration plan requires decision, rationale, and branches")
+    if value["decision"] not in ("expand", "stop"):
+        raise ModelContractError("exploration decision must be expand or stop")
     if not isinstance(value["rationale"], str) or not value["rationale"].strip():
-        raise ValidationError("exploration decision requires a rationale")
+        raise ModelContractError("exploration decision requires a rationale")
     branches = value["branches"]
     if (not isinstance(branches, list) or (max_branches is not None and len(branches) > max_branches)
             or bool(branches) != (value["decision"] == "expand")):
-        raise ValidationError("exploration branches must match the decision and declared bound")
+        raise ModelContractError("exploration branches must match the decision and declared bound")
+    for index, branch in enumerate(branches):
+        fields = {"parent_id", "question", "rationale", "operation", "query", "work_id", "evidence"}
+        if not isinstance(branch, dict):
+            raise ModelContractError(f"branch {index} must be an object")
+        if set(branch) != fields:
+            raise ModelContractError(f"branch {index} has invalid fields: "
+                                     f"missing {sorted(fields - set(branch))}, "
+                                     f"extra {sorted(set(branch) - fields)}")
+        if not isinstance(branch["parent_id"], str):
+            raise ModelContractError(f"branch {index} parent_id must be an assigned string handle")
+    return branches
+
+
+def normalize_plan(value, parent_aliases, sources, *, windows=None):
+    """Bind only exact assigned identifiers and captured evidence spans."""
+    try:
+        value = bind_plan_parents(value, parent_aliases)
+        for index, branch in enumerate(_plan_branches(value)):
+            evidence = branch.get("evidence")
+            if not isinstance(evidence, list):
+                raise ModelContractError(f"branch {index} evidence must be a list")
+            for proof in evidence:
+                if not isinstance(proof, dict) or not isinstance(proof.get("source_ref"), str):
+                    raise ModelContractError(f"branch {index} evidence requires a string source_ref")
+                if set(proof) not in (LEGACY_EVIDENCE_FIELDS, SPAN_EVIDENCE_FIELDS):
+                    raise ModelContractError(f"branch {index} evidence fields must match the quote contract")
+                if any(not isinstance(proof.get(field), str) for field in ("work_id", "quote")):
+                    raise ModelContractError(f"branch {index} evidence requires string work_id and quote")
+            branch["evidence"] = [bind(proof, sources, windows=windows) for proof in evidence]
+        return value
+    except ValidationError as exc:
+        raise ModelContractError(str(exc)) from exc
+
+
+def validate_plan(value, parents, sources, *, max_branches):
+    branches = _plan_branches(value, max_branches=max_branches)
     seen = set()
     for index, branch in enumerate(branches):
-        if not isinstance(branch, dict) or set(branch) != {
-                "parent_id", "question", "rationale", "operation", "query", "work_id", "evidence"}:
-            raise ValidationError("exploration branch has an invalid envelope")
         parent = parents.get(branch["parent_id"])
         if parent is None:
-            raise ValidationError("exploration branch identifies an unassigned parent")
+            raise ModelContractError("exploration branch identifies an unassigned parent")
         for field in ("question", "rationale"):
             if not isinstance(branch[field], str) or not branch[field].strip():
-                raise ValidationError("exploration branch requires a question and rationale")
+                raise ModelContractError("exploration branch requires a question and rationale")
         operation = branch["operation"]
         if operation == "search":
-            search_query(branch["query"])
+            try:
+                search_query(branch["query"])
+            except ValidationError as exc:
+                raise ModelContractError(f"branch {index} query: {exc}") from exc
             if branch["work_id"] is not None:
-                raise ValidationError("search branch cannot identify a work lookup")
-        elif operation in {"work", "citing"}:
-            work_id(branch["work_id"])
+                raise ModelContractError("search branch cannot identify a work lookup")
+        elif operation in ("work", "citing"):
+            try:
+                work_id(branch["work_id"])
+            except ValidationError as exc:
+                raise ModelContractError(f"branch {index} work_id: {exc}") from exc
             if branch["query"] is not None:
-                raise ValidationError("work and citing branches cannot supply a search query")
+                raise ModelContractError("work and citing branches cannot supply a search query")
             if parent["kind"] == "root":
                 if operation != "work":
-                    raise ValidationError("citing branches require a concrete reviewed parent work")
+                    raise ModelContractError("citing branches require a concrete reviewed parent work")
             else:
                 allowed = parent.get("referenced_works", []) if operation == "work" else [parent.get("work_id")]
                 if branch["work_id"] not in allowed:
-                    raise ValidationError("citation branch must follow its parent's actual citation metadata")
+                    raise ModelContractError("citation branch must follow its parent's actual citation metadata")
         else:
-            raise ValidationError("unsupported exploration acquisition operation")
+            raise ModelContractError("unsupported exploration acquisition operation")
         evidence = branch["evidence"]
         if not isinstance(evidence, list) or bool(evidence) != (parent["kind"] == "read"):
-            raise ValidationError("a read-driven branch requires captured parent evidence")
+            raise ModelContractError("a read-driven branch requires captured parent evidence")
         allowed_refs = set(parent.get("source_refs", []))
         for proof in evidence:
-            if not isinstance(proof, dict) or proof.get("source_ref") not in allowed_refs:
-                raise ValidationError(f"branch {index} parent {branch['parent_id']} owns work {parent.get('work_id')} "
+            if (not isinstance(proof, dict) or not isinstance(proof.get("source_ref"), str)
+                    or proof["source_ref"] not in allowed_refs):
+                raise ModelContractError(f"branch {index} parent {branch['parent_id']} owns work {parent.get('work_id')} "
                                       f"and allows sources {sorted(allowed_refs)}; branch evidence is outside its reviewed parent's source scope")
             source = sources.get(proof["source_ref"])
             if (source is None or proof.get("work_id") != parent["work_id"]
                     or not authoritative_source(source)):
-                raise ValidationError("branch evidence does not identify an authoritative parent source")
-            validate_span(proof, source, require_span=True)
+                raise ModelContractError("branch evidence does not identify an authoritative parent source")
+            try:
+                validate_span(proof, source, require_span=True)
+            except ValidationError as exc:
+                raise ModelContractError(f"branch {index} evidence: {exc}") from exc
         key = (branch["parent_id"], operation, branch["query"], branch["work_id"])
         if key in seen:
-            raise ValidationError("exploration plan repeats the same parent acquisition")
+            raise ModelContractError("exploration plan repeats the same parent acquisition")
         seen.add(key)
 
 
@@ -639,7 +688,7 @@ class LiteratureTree:
         else:
             self._record("kb/exploration-inputs/" + identity, "note", assignment, "research.search-planner",
                          subjects=[self.protocol["artifact_ref"], *[node["review_ref"] for node in parents if node.get("review_ref")]])
-        normalizer = lambda value: bind(bind_plan_parents(value, parent_aliases), sources, windows=windows)
+        normalizer = lambda value: normalize_plan(value, parent_aliases, sources, windows=windows)
         validator = lambda value: validate_plan(value, parent_map, sources, max_branches=branch_limit)
         value, execution = self._model_checked("exploration-" + identity, "research.search-planner",
             assignment, validator, normalizer=normalizer, stage="supervision", task_kind="service")

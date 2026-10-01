@@ -3,10 +3,10 @@ from copy import deepcopy
 import json
 import unittest
 
-from scisaurus.core.errors import ValidationError, StateError
+from scisaurus.core.errors import ModelContractError, ValidationError, StateError
 from scisaurus.core.source_spans import bind
 from scisaurus.runtime.literature_tree import (validate_plan, validate_reading_selection,
-                                             reading_selection_parts, bind_plan_parents, bind_reading_candidates,
+                                             reading_selection_parts, bind_plan_parents, normalize_plan, bind_reading_candidates,
                                              planning_parent, selection_basis)
 from scisaurus.tests import test_survey as fixtures
 from scisaurus.tests.test_survey import simulated_survey_worker, source_quote, survey_config
@@ -95,6 +95,84 @@ class TestExplorationContract(unittest.TestCase):
         self.assertEqual(bind_plan_parents(bound, aliases), bound)
         self.assertEqual(proposal["branches"][0]["parent_id"], "parent-0")
         self.validate(bound)
+
+    def test_inactive_acquisition_parameters_are_canonical_and_idempotent(self):
+        for operation in ("search", "work", "citing"):
+            with self.subTest(operation=operation):
+                proposal = deepcopy(self.plan)
+                branch = proposal["branches"][0]
+                branch.update(operation=operation, query="humidity kinetics" if operation == "search" else None,
+                              work_id=None if operation == "search" else ("W1" if operation == "citing" else "W2"))
+                inactive = "work_id" if operation == "search" else "query"
+                branch.pop(inactive)
+                bound = bind_plan_parents(proposal, {"parent-0": "parent"})
+                self.assertIsNone(bound["branches"][0][inactive])
+                self.assertNotIn(inactive, branch)
+                self.assertEqual(bind_plan_parents(bound, {"parent-0": "parent"}), bound)
+                self.validate(bound)
+
+    def test_binding_never_invents_required_acquisition_inputs(self):
+        for field in ("work_id", "evidence", "question", "rationale"):
+            with self.subTest(field=field):
+                proposal = deepcopy(self.plan)
+                proposal["branches"][0].pop(field)
+                bound = bind_plan_parents(proposal, {"parent-0": "parent"})
+                with self.assertRaisesRegex(ModelContractError, "branch 0.*missing.*" + field):
+                    self.validate(bound)
+
+    def test_binding_never_discards_conflicting_or_unknown_fields(self):
+        for change in ({"query": "conflicting query"}, {"extra": "unassigned field"}):
+            with self.subTest(change=change):
+                proposal = deepcopy(self.plan)
+                proposal["branches"][0].update(change)
+                bound = bind_plan_parents(proposal, {"parent-0": "parent"})
+                with self.assertRaises(ModelContractError):
+                    self.validate(bound)
+                self.assertEqual(bound["branches"][0], proposal["branches"][0])
+
+    def test_invalid_response_types_are_typed_model_contract_failures(self):
+        for field, value in (("parent_id", []), ("operation", {}), ("work_id", [])):
+            with self.subTest(field=field):
+                proposal = deepcopy(self.plan)
+                proposal["branches"][0][field] = value
+                with self.assertRaises(ModelContractError):
+                    self.validate(proposal)
+        proposal = deepcopy(self.plan)
+        proposal["branches"][0]["evidence"][0]["quote"] = "An invented result."
+        with self.assertRaises(ModelContractError):
+            normalize_plan(proposal, {"parent-0": "parent"}, self.sources)
+
+    def test_invalid_source_handle_types_fail_before_span_binding(self):
+        for handle in ([], {}, None, 7):
+            with self.subTest(handle=handle):
+                proposal = deepcopy(self.plan)
+                proposal["branches"][0]["evidence"][0]["source_ref"] = handle
+                with self.assertRaisesRegex(ModelContractError, "string source_ref"):
+                    normalize_plan(proposal, {"parent-0": "parent"}, self.sources)
+
+    def test_unknown_fields_are_rejected_before_recursive_span_binding(self):
+        proposal = deepcopy(self.plan)
+        proposal["branches"][0]["extra"] = {"work_id": "W1", "source_ref": [], "quote": "invalid"}
+        with self.assertRaisesRegex(ModelContractError, "branch 0.*extra.*extra"):
+            normalize_plan(proposal, {"parent-0": "parent"}, self.sources)
+        proposal = deepcopy(self.plan)
+        proposal["extra"] = {"work_id": "W1", "source_ref": [], "quote": "invalid"}
+        with self.assertRaisesRegex(ModelContractError, "requires decision"):
+            normalize_plan(proposal, {"parent-0": "parent"}, self.sources)
+
+    def test_arbitrary_model_values_are_not_traversed_as_evidence(self):
+        nested = {"work_id": "W1", "source_ref": [], "quote": "invalid"}
+        for field in ("question", "rationale", "operation", "query", "work_id"):
+            with self.subTest(field=field):
+                proposal = deepcopy(self.plan)
+                proposal["branches"][0][field] = nested
+                normalized = normalize_plan(proposal, {"parent-0": "parent"}, self.sources)
+                with self.assertRaises(ModelContractError):
+                    validate_plan(normalized, self.parents, self.sources, max_branches=None)
+        proposal = deepcopy(self.plan)
+        proposal["branches"][0]["evidence"][0]["extra"] = nested
+        with self.assertRaisesRegex(ModelContractError, "evidence fields"):
+            normalize_plan(proposal, {"parent-0": "parent"}, self.sources)
 
     def test_incoming_acquisition_id_is_not_a_parent_handle(self):
         self.plan["branches"][0]["parent_id"] = "incoming-acquisition"

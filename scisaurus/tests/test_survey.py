@@ -1634,6 +1634,48 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(len(runner.tasks.attempts_for_task(task_id)), 1)
         runner.control.close()
 
+    def test_resume_revalidates_grounded_plan_without_inactive_parameter_or_call(self):
+        from scisaurus.runtime.literature_tree import normalize_plan, validate_plan
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        assignment = {"phase": "exploration_plan", "question": "Which mechanism explains recall timing?"}
+        assignment = runner._follow_up_assignment(assignment)
+        source = {"work_id": "W101", "text": "Recall changes with timing.", "representation": "abstract"}
+        parents = {"read-node": {"kind": "read", "work_id": "W101", "source_refs": ["source"]}}
+        sources = {"source": source}
+        prior = {"decision": "expand", "rationale": "Resolve timing dependence.", "branches": [
+            {"parent_id": "parent-0", "question": "Which mechanism explains timing dependence?",
+             "rationale": "Follow measured timing dependence.", "operation": "search", "query": "recall timing",
+             "evidence": [{"work_id": "W101", "source_ref": "source", "quote": source["text"]}]}]}
+        task_id = "survey-exploration-retained"
+        runner.tasks.create(task_id, "service", {"operation": "model"}, "command.controller")
+        runner.tasks.admit(task_id, "command.controller")
+        runner.tasks.start_attempt(task_id, "attempt-plan-retained", owner="research.search-planner",
+                                   lease_ttl_seconds=30)
+        context = runner._publish("command/contexts/" + task_id, "note", {
+            "client": {"model": "fixture"}, "prompt": json.dumps(assignment)}, "research.search-planner")
+        execution = runner._publish("command/executions/" + task_id, "report", {"text": json.dumps(prior)},
+            "research.search-planner", subjects=[context["artifact_ref"]])
+        runner.tasks.finish_attempt("attempt-plan-retained", "succeeded", usage={"model_calls": 1})
+        runner.tasks.transition(task_id, "blocked", "command.controller", reason="output requires revalidation")
+        proposal = runner._publish("kb/model-proposals/" + task_id, "note", prior,
+            "research.search-planner", subjects=[execution["artifact_ref"]])
+        runner._publish("command/validation/" + task_id, "note", {
+            "error": "exploration branch has an invalid envelope"}, "command.controller",
+            subjects=[proposal["artifact_ref"]])
+        runner.resume_session = {"session": 2}
+        job = {"name": "exploration", "actor": "research.search-planner", "assignment": assignment,
+            "normalizer": lambda value: normalize_plan(value, {"parent-0": "read-node"}, sources),
+            "validator": lambda value: validate_plan(value, parents, sources, max_branches=None)}
+        with patch.object(runner, "_call_batch", side_effect=AssertionError("retained answer should avoid provider call")):
+            result = runner._models_checked([job])["exploration"]
+        self.assertEqual(result[1], execution["artifact_ref"])
+        self.assertEqual(result[0]["branches"][0]["query"], "recall timing")
+        self.assertIsNone(result[0]["branches"][0]["work_id"])
+        self.assertEqual(runner.tasks.get(task_id)["state"], "completed")
+        self.assertEqual(len(runner.tasks.attempts_for_task(task_id)), 1)
+        self.assertNotIn("work_id", prior["branches"][0])
+
     def test_focused_semantic_repair_changes_only_failed_field_and_work(self):
         config = survey_config(self.endpoint)
         config["model"]["model"] = "semantic-repair"
