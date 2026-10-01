@@ -4357,6 +4357,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             self._ensure_active()
             jobs, rejected = [], []
             for wid, entry_record in self.analysis_records.items():
+                if self.analyzed_basis.get(wid) != self._analysis_basis(wid):
+                    if self._tree_admitted_reads is not None:
+                        continue
+                    raise StateError("focused review requires a completed current analysis for every mapped work")
                 relations = [relation for relation in self.relationships.values() if relation["source"] == wid]
                 refs = [relation["artifact_ref"] for relation in relations]
                 source_ids = {wid, *[relation["target"] for relation in relations]}

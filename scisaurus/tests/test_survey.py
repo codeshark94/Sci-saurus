@@ -2189,6 +2189,26 @@ class TestSurveyRunner(unittest.TestCase):
                 "source_pins": [{"ref": ref, "body_hash": runner.store.get(ref)["body_hash"]} for ref in sorted(source_refs)],
                 "hypothesis": "Independently determine whether every qualification in this screening rationale is supported by the pinned source text."}
 
+    def test_scoped_read_reviews_only_completed_analysis_then_finalizes_remaining_map(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        for wid in ("W101", "W102"):
+            runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+        runner._map()
+        old = runner.analysis_records["W102"]["artifact_ref"]
+        runner.analyzed_basis.pop("W102")
+        runner._tree_admitted_reads = {"W101"}
+        runner._review_work_claims()
+        self.assertIn("W101", runner.reviewed_basis)
+        self.assertNotIn("W102", runner.work_reviews)
+        self.assertEqual(runner.analysis_records["W102"]["artifact_ref"], old)
+        runner._tree_admitted_reads = None
+        with self.assertRaisesRegex(StateError, "completed current analysis"):
+            runner._review_work_claims()
+        runner._map(); runner._review_work_claims(); runner._accept_survey()
+        self.assertIn("W102", runner.reviewed_basis)
+        self.assertIsNotNone(runner.survey_ref)
+
     def test_critique_context_preserves_original_and_exact_current_revision(self):
         runner = self.runtime()
         runner._initialize(); runner._setup()
@@ -2603,13 +2623,17 @@ class TestSurveyRunner(unittest.TestCase):
         review = json.loads(store.read_body(store.get(review_rows[0])["body_hash"]))
         self.assertNotIn("verification_kind", review)
         self.assertEqual(next(row["outcome"] for row in review["checks"] if row["check_id"] == "source-fidelity"), "insufficient_evidence")
-        assessment_prompt_count = sum(
+        review_prompt_count = sum(
             prompt.get("phase") == "survey_review"
             for _, prompt in self.model_contexts(control, store))
         deterministic_count = control._conn.execute(
             "SELECT COUNT(*) FROM artifacts "
             "WHERE logical_id LIKE 'command/survey-review-deterministic/%'").fetchone()[0]
-        self.assertEqual(assessment_prompt_count, 1)
+        self.assertEqual(review_prompt_count, 2)
+        self.assertEqual(sum(prompt.get("phase") == "survey_repair_plan"
+                             for _, prompt in self.model_contexts(control, store)), 1)
+        self.assertEqual(sum(prompt.get("phase") == "gap_assessment"
+                             for _, prompt in self.model_contexts(control, store)), 0)
         self.assertEqual(deterministic_count, 0)
 
     def test_independent_aggregate_negative_verdicts_remain_blocking(self):
