@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from scisaurus.core.errors import ModelContractError, ProviderRateLimitError, QuotaExceededError, ValidationError
+from scisaurus.core.errors import ModelContractError, ProviderRateLimitError, QuotaExceededError, StateError, ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.store import ArtifactStore
@@ -27,6 +27,7 @@ from scisaurus.runtime.model_work import ModelWorkCache
 from scisaurus.runtime.model_work import ModelWorkBlocked
 from scisaurus.runtime.models import estimate_input_tokens
 from scisaurus.runtime.survey import (SurveyRunner, apply_scoped_map_repair,
+                                      countersearch_lineage,
                                       normalize_map_relationships,
                                       normalize_map_worker_response,
                                       overlay_post_checkpoint_relationships,
@@ -256,6 +257,8 @@ def simulated_survey_worker(kind, params, channel):
                     value["entry_updates"]["finding"] = deepcopy(entries[0]["problem"])
             else:
                 value["entries"][0]["reason"] = "The method generalizes to every task."
+        if mode == "review-obligation-adversary" and assignment.get("semantic_feedback") is not None:
+            value = {"entry_updates": {"reason": "The captured study examines recall timing."}, "relationships": []}
         if mode.startswith("map-links") and assignment["requested_work_ids"] == ["W101"]:
             proofs = [source_quote(next(source for source in assignment["sources"] if source["work_id"] == wid))
                       for wid in ("W101", "W102")]
@@ -301,6 +304,10 @@ def simulated_survey_worker(kind, params, channel):
         if mode == "review-forced-reason-failure":
             next(check for check in value["checks"] if check["check_id"] == "reason").update(
                 outcome="failed", result="The screening rationale exceeds the captured evidence.")
+        if (mode == "review-obligation-adversary" and assignment.get("review_obligations")
+                and assignment["entry"]["reason"] == "Explicitly examines recall timing."):
+            next(check for check in value["checks"] if check["check_id"] == "reason").update(
+                outcome="failed", result="The independent critique identifies a qualification requiring a narrower rationale.")
         if mode in {"review-current-diagnostic", "review-current-diagnostic-failure"}:
             if mode.endswith("-failure"):
                 next(check for check in value["checks"] if check["check_id"] == "reason").update(
@@ -1241,9 +1248,10 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(contexts, [])
         runner.control.close()
 
-    def runtime(self, config=None, *, on_progress=None, resume_policy=None, work_orders=None):
+    def runtime(self, config=None, *, on_progress=None, resume_policy=None, work_orders=None, review_obligations=None):
         runner = SurveyRunner(self.root / "run", config or survey_config(self.endpoint),
-                              on_progress=on_progress, resume_policy=resume_policy, work_orders=work_orders)
+                              on_progress=on_progress, resume_policy=resume_policy, work_orders=work_orders,
+                              review_obligations=review_obligations)
         self.addCleanup(runner.control.close)
         runner.worker_target = simulated_survey_worker
         return runner
@@ -1976,6 +1984,169 @@ class TestSurveyRunner(unittest.TestCase):
         with patch.object(runner, "_call_batch") as dispatch:
             runner._map()
         dispatch.assert_not_called()
+
+    def test_review_only_scope_retains_deferred_entries_and_allows_changed_source_basis(self):
+        config = survey_config(self.endpoint)
+        config["survey"]["search"]["max_analyzed_works"] = 2
+        runner = self.runtime(config)
+        runner._initialize(); runner._setup()
+        for wid in ("W101", "W102", "W201"):
+            runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+        runner._map()
+        wid = next(wid for wid in runner.works if runner._is_deferred_analysis(wid))
+        original = deepcopy(runner.analysis_records[wid])
+        runner.resume_session = {"session": 2, "reopened_scopes": ["focused_review", "integrated_review", "gap_assessment"]}
+        with patch.object(runner, "_analysis_selection", return_value={wid}), patch.object(runner, "_models_checked") as dispatch:
+            runner._map()
+            dispatch.assert_not_called()
+        self.assertEqual(runner.analysis_records[wid], original)
+        old_ref, old_source = next((ref, source) for ref, source in runner.source_docs.items() if source["work_id"] == wid)
+        text = old_source["text"] + " A second captured observation is available."
+        added = runner._record(f"kb/abstracts/{wid}", "source_capture", {"work_id": wid, "abstract": text},
+                               "research.cataloger", subjects=[old_source["execution_ref"]])
+        runner.source_docs[added["artifact_ref"]] = {**old_source, "text": text}
+        with patch.object(runner, "_analysis_selection", return_value={wid}):
+            runner._map()
+        self.assertNotEqual(runner.analysis_records[wid]["artifact_ref"], original["artifact_ref"])
+        self.assertIn(added["artifact_ref"], runner.analyzed_basis[wid])
+
+    def test_countersearch_retains_hypothesis_across_accepted_planning_snapshots(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._accept_survey(); runner._nominate()
+        nominee, hypothesis = deepcopy(runner.nomination_record), deepcopy(runner.nomination)
+        origin = runner.survey_ref
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W102")
+        runner._accept_survey()
+        planning = runner.survey_ref
+        self.assertNotEqual(origin, planning)
+        runner._countersearch()
+        self.assertEqual(runner.nomination_record, nominee)
+        self.assertEqual(runner.nomination, hypothesis)
+        self.assertTrue(runner.countersearch_complete)
+        lineage = countersearch_lineage(runner.control, runner.store, score_ref=runner.score_ref,
+            question=runner.score["question"], nomination_ref=nominee["artifact_ref"],
+            plan_ref=runner.counter_plan_record["artifact_ref"], survey_ref=runner.survey_ref)
+        self.assertEqual(lineage["origin_survey_ref"], origin)
+        self.assertEqual(lineage["planning_survey_ref"], planning)
+        self.assertTrue(lineage["complete"])
+        self.assertTrue(lineage["survey_current"])
+        with patch.object(runner, "_refresh_countersearch_state", side_effect=lambda: setattr(runner, "countersearch_complete", False)):
+            with self.assertRaises(StateError):
+                runner._countersearch()
+        with patch.object(runner, "_countersearch", side_effect=StateError("Invalid owned completion dependency")):
+            result = runner.run()
+        self.assertEqual(result["failure"], {"kind": "operational_state"})
+
+    def test_countersearch_lineage_rejects_wrong_question_owner_and_nomination(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._accept_survey(); runner._nominate(); runner._countersearch()
+        arguments = {"score_ref": runner.score_ref, "question": runner.score["question"],
+            "nomination_ref": runner.nomination_record["artifact_ref"], "plan_ref": runner.counter_plan_record["artifact_ref"],
+            "survey_ref": runner.survey_ref}
+        with self.assertRaises(StateError):
+            countersearch_lineage(runner.control, runner.store, **{**arguments, "question": "A different question"})
+        query = runner.store.get(runner.counter_query_refs[0])
+        query_body = runner._body(query)
+        wrong_query = runner._publish("kb/queries/wrong-owner", "query_record", query_body,
+            "research.seed-reader", subjects=[item["ref"] for item in query["inputs"]])
+        with self.assertRaises(StateError):
+            countersearch_lineage(runner.control, runner.store, **arguments, query_refs=[wrong_query["artifact_ref"]])
+        mismatched_query = runner._publish("kb/queries/wrong-request", "query_record",
+            {**query_body, "request": {**query_body["request"], "query": "A search that was never executed"}},
+            "methods.novelty-challenger", subjects=[item["ref"] for item in query["inputs"]])
+        with self.assertRaises(StateError):
+            countersearch_lineage(runner.control, runner.store, **arguments, query_refs=[mismatched_query["artifact_ref"]])
+        body = runner._body(runner.counter_plan_record)
+        wrong = runner._publish("kb/counter-search-plan", "note", body, "research.literature-mapper",
+                                subjects=[item["ref"] for item in runner.counter_plan_record["inputs"]])
+        with self.assertRaises(StateError):
+            countersearch_lineage(runner.control, runner.store, **{**arguments, "plan_ref": wrong["artifact_ref"]})
+        changed = runner._publish("kb/gap-nomination", "note", {**runner._body(runner.nomination_record),
+            "statement": "A changed hypothesis"}, "research.gap-proposer", subjects=[runner.survey_ref])
+        with self.assertRaises(StateError):
+            countersearch_lineage(runner.control, runner.store, **{**arguments, "nomination_ref": changed["artifact_ref"]})
+
+    def review_obligation(self, runner, wid):
+        entry = runner.analysis_records[wid]
+        relations = [value for value in runner.relationships.values() if value["source"] == wid]
+        source_refs = {proof["source_ref"] for field in MAP_FIELDS
+                       for proof in runner._body(entry)[field]["evidence"]}
+        source_refs.update(proof["source_ref"] for value in relations for proof in value["claim"]["evidence"])
+        return {"receipt_ref": "artifact:command/operator-review/critique@1", "receipt_body_sha256": "a" * 64,
+                "work_id": wid, "entry_ref": entry["artifact_ref"], "entry_body_sha256": entry["body_hash"],
+                "relationship_pins": [{"ref": value["artifact_ref"], "body_hash": runner.store.get(value["artifact_ref"])["body_hash"]}
+                                      for value in relations],
+                "source_pins": [{"ref": ref, "body_hash": runner.store.get(ref)["body_hash"]} for ref in sorted(source_refs)],
+                "hypothesis": "Independently determine whether every qualification in this screening rationale is supported by the pinned source text."}
+
+    def test_targeted_review_obligation_preserves_unaffected_reviews_and_adjudicates_hypothesis(self):
+        config = survey_config(self.endpoint, "review-obligation-adversary")
+        config["limits"]["max_rounds"] = 2
+        runner = self.runtime(config)
+        runner._initialize(); runner._setup()
+        for wid in ("W101", "W102"):
+            runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+        runner._accept_survey()
+        entry = runner.analysis_records["W101"]
+        unaffected = runner.work_reviews["W102"]["artifact_ref"]
+        obligation = self.review_obligation(runner, "W101")
+        request_count = len(SurveyHTTPFixture.requests)
+        runner.control.close()
+        policy = {"additional_seconds": 20, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["focused_review", "integrated_review", "gap_assessment"]}}
+        resumed = self.runtime(config, resume_policy=policy, review_obligations=[obligation])
+        self.assertEqual(resumed.work_reviews["W102"]["artifact_ref"], unaffected)
+        self.assertNotIn("W101", resumed.reviewed_basis)
+        self.assertEqual(resumed._work_review_failure_count("W101"), 0)
+        resumed._initialize(); resumed._accept_survey()
+        self.assertEqual(len(SurveyHTTPFixture.requests), request_count)
+        self.assertEqual(resumed.work_reviews["W102"]["artifact_ref"], unaffected)
+        self.assertNotEqual(resumed.analysis_records["W101"]["artifact_ref"], entry["artifact_ref"])
+        self.assertEqual(resumed._body(resumed.analysis_records["W101"])["problem"], runner._body(entry)["problem"])
+        self.assertEqual(resumed._body(resumed.analysis_records["W101"])["reason"], "The captured study examines recall timing.")
+        prompts = [prompt for _, prompt in self.model_contexts(resumed.control, resumed.store)]
+        focused = [prompt for prompt in prompts if prompt.get("phase") == "work_review" and prompt.get("review_obligations")]
+        self.assertEqual(len(focused), 2)
+        self.assertTrue(all(prompt["entry"]["work_id"] == "W101" and prompt["review_obligations"] == [obligation] for prompt in focused))
+        self.assertTrue(all(any(source["source_ref"] == obligation["source_pins"][0]["ref"] for source in prompt["sources"]) for prompt in focused))
+        self.assertEqual([prompt for prompt in prompts if prompt.get("phase") == "survey_review"][-1]["review_obligations"], [obligation])
+        self.assertEqual(resumed._work_review_failure_count("W101"), 2)
+        self.assertEqual(sum(any(check["outcome"] != "passed" for check in resumed._body(resumed.store.get(
+            f"artifact:kb/work-reviews/W101@{version}"))["checks"])
+            for version in resumed.store.versions("kb/work-reviews/W101")), 1)
+        self.assertTrue(resumed._review_protocol_matches(resumed._body(resumed.work_reviews["W101"])))
+
+    def test_review_obligation_is_not_a_forced_verdict_and_rejects_changed_source_pins(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._accept_survey()
+        retained = runner.analysis_records["W101"]["artifact_ref"]
+        obligation = self.review_obligation(runner, "W101")
+        runner.review_obligations = runner._validate_review_obligations([obligation])
+        runner._accept_survey()
+        self.assertEqual(runner.analysis_records["W101"]["artifact_ref"], retained)
+        self.assertTrue(all(check["outcome"] == "passed" for check in runner._body(runner.work_reviews["W101"])["checks"]))
+        bad = deepcopy(obligation); bad["source_pins"][0]["body_hash"] = "b" * 64
+        with self.assertRaises(StateError):
+            runner._validate_review_obligations([bad])
+        with self.assertRaises(StateError):
+            runner._validate_review_obligations([{**obligation, "source_pins": []}])
+        with self.assertRaises(StateError):
+            runner._validate_review_obligations([{**obligation, "entry_body_sha256": "c" * 64}])
+        original_question = runner.score["question"]
+        runner.score["question"] = "A different declared question"
+        with self.assertRaises(StateError):
+            runner._validate_review_obligations([obligation])
+        runner.score["question"] = original_question
+        source_ref = obligation["source_pins"][0]["ref"]
+        runner.source_docs.pop(source_ref)
+        with self.assertRaises(StateError):
+            runner._review_obligations_for("W101")
 
     def test_abstention_integrity_cannot_accept_scientific_prose(self):
         from scisaurus.core.schema import canonical_bytes, sha256_hex

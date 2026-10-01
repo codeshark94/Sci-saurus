@@ -521,11 +521,11 @@ def build_repair_commands(stage_kind, failure_class, *, stage_result=None,
         }]
     if failure_class == "operational_recovery":
         return [{
-            "id": "repair-attempt-namespace",
-            "operation": "reopen",
-            "target": "the failed stage project namespace",
-            "instruction": "Create a fresh attempt namespace, retain the old checkpoint read-only, and bind the same immutable input without overwriting it.",
-            "acceptance_check": "The runner starts in a unique attempt directory and the old run remains inspectable.",
+            "id": "reconcile-execution-state",
+            "operation": "reconcile",
+            "target": "the failed stage's durable checkpoint and dependency ownership",
+            "instruction": "Reproduce the recorded state failure and repair its dependency or namespace ownership. Retain committed source captures, reviews, query receipts, and paid usage. Admit a fresh namespace only when a reproduced namespace collision requires it.",
+            "acceptance_check": "The supported resume consumes the retained immutable inputs and completed outputs exactly once, with unchanged deadline and allocation limits, before dispatching unfinished work.",
         }]
     if failure_class == "harness_bug":
         return [{

@@ -59,6 +59,107 @@ def acquisition_succeeded(record):
             and record.get("provider_http_status") == 404))
 
 
+def countersearch_lineage(control, store, *, score_ref, question, nomination_ref,
+                          plan_ref, survey_ref=None, query_refs=None):
+    """Replay hypothesis, planning snapshot, and acquired-query ownership without dispatch."""
+    gate = SurveyGate(control, store)
+    def artifact(ref):
+        manifest, raw = gate._artifact(ref, current=False)
+        return manifest, gate._json(raw, ref)
+    def accepted_snapshot(ref):
+        manifest, body = artifact(ref)
+        if (body.get("schema_version") not in {"literature-survey-2", "literature-survey-3"}
+                or body.get("score_ref") != score_ref):
+            raise StateError("counter-search snapshot belongs to another survey score")
+        acceptance = gate._accepted_event("survey.accepted", "survey_ref", ref)
+        if {"ref": ref, "body_hash": manifest["body_hash"]} not in acceptance.get("evidence_pins", []):
+            raise StateError("counter-search snapshot has no matching historical acceptance")
+        _, mapped = artifact(body["map_ref"])
+        _, score = artifact(score_ref)
+        if mapped.get("question") != question or score.get("survey", {}).get("question") != question:
+            raise StateError("counter-search snapshot changed the declared question")
+        return body
+    try:
+        nominee = gate.require_current_nomination(nomination_ref)
+        nominee_manifest, _ = artifact(nomination_ref)
+        if nominee_manifest.get("score_ref") != score_ref or nominee_manifest["author"] != "research.gap-proposer":
+            raise StateError("counter-search nomination has a different owner or score")
+        accepted_snapshot(nominee["survey_ref"])
+        plan, body = artifact(plan_ref)
+        if (store.head(plan["artifact_id"])["artifact_ref"] != plan_ref
+                or plan["author"] != "methods.novelty-challenger" or plan.get("score_ref") != score_ref
+                or body.get("nomination_ref") != nomination_ref):
+            raise StateError("counter-search plan has a different owner, score, or nomination")
+        accepted_snapshot(body["survey_ref"])
+        proposal = {key: body.get(key) for key in ("queries", "rationale")}
+        exact(proposal, {"queries", "rationale"}, "counter-search plan")
+        if (not isinstance(proposal["queries"], list) or not proposal["queries"]
+                or any(not isinstance(query, str) or not query.strip() for query in proposal["queries"])
+                or not isinstance(proposal["rationale"], str) or not proposal["rationale"].strip()):
+            raise StateError("counter-search plan has no valid search proposal")
+        subjects = {item["ref"] for item in plan["inputs"] if item.get("purpose") == "subject"}
+        executions = [ref for ref in subjects if ref.startswith("artifact:command/executions/")]
+        if not {nomination_ref, body["survey_ref"]}.issubset(subjects) or len(executions) != 1:
+            raise StateError("counter-search plan omitted its owned execution or prerequisites")
+        execution, result = artifact(executions[0])
+        if execution["author"] != plan["author"] or execution.get("score_ref") != score_ref or len(execution["inputs"]) != 1:
+            raise StateError("counter-search plan execution has a different owner or score")
+        context, params = artifact(execution["inputs"][0]["ref"])
+        assignment = json.loads(params["prompt"])
+        if (context["author"] != plan["author"] or context.get("score_ref") != score_ref
+                or params.get("role") != plan["author"] or assignment.get("phase") != "counter_plan"
+                or assignment.get("question") != question or assignment.get("nomination_ref") != nomination_ref
+                or assignment.get("survey_ref") != body["survey_ref"]
+                or assignment.get("prerequisite_survey_ref") != body["survey_ref"]
+                or assignment.get("gap") != {key: nominee[key] for key in ("id", "statement")}
+                or ModelResult(**result).json_object(allow_missing_closers=True) != proposal):
+            raise StateError("counter-search plan changed its admitted hypothesis or planning input")
+        current_body = accepted_snapshot(survey_ref) if survey_ref else None
+        survey_current = False
+        if survey_ref:
+            try:
+                gate.require_current(survey_ref)
+            except ContractError:
+                pass
+            else:
+                survey_current = True
+        refs = query_refs if query_refs is not None else (current_body or {}).get("query_refs", [])
+        successful = {}
+        for ref in refs:
+            receipt, row = artifact(ref)
+            request = row.get("request", {})
+            query = request.get("query")
+            if row.get("plan_ref") != plan_ref or request.get("operation") != "search" or not query or not acquisition_succeeded(row):
+                continue
+            inputs = {item["ref"] for item in receipt["inputs"] if item.get("purpose") == "subject"}
+            if (receipt["artifact_type"] != "query_record" or receipt["author"] != plan["author"]
+                    or receipt.get("score_ref") != score_ref or row.get("role") != plan["author"]
+                    or not {plan_ref, row.get("execution_ref")}.issubset(inputs)):
+                raise StateError("counter-search query receipt has a different execution owner")
+            produced, _ = artifact(row["execution_ref"])
+            if produced["author"] != plan["author"] or produced.get("score_ref") != score_ref:
+                raise StateError("counter-search query execution has a different owner or score")
+            adapter = "crossref" if row.get("provider") == "crossref" else "openalex"
+            _, _, captured, params = gate._recorded_execution(
+                row["execution_ref"], plan["author"], operation=adapter, task_kinds={"retrieval"})
+            expected = row.get("provider_request") if adapter == "crossref" else request
+            if ({key: value for key, value in params.items() if key != "client"} != expected
+                    or captured.get("outcome") != row.get("outcome")
+                    or adapter == "crossref" and (params.get("query") != query
+                        or params.get("cursor") != request.get("cursor"))):
+                raise StateError("counter-search query differs from its exact owned retrieval execution")
+            successful[query_identity(query)] = ref
+        required = [query_identity(query) for query in proposal["queries"]]
+        complete_queries = all(query in successful for query in required)
+        acquired = [successful[query] for query in required] if complete_queries else []
+        return {"nomination_ref": nomination_ref, "origin_survey_ref": nominee["survey_ref"],
+                "planning_survey_ref": body["survey_ref"], "survey_ref": survey_ref, "query_refs": acquired,
+                "queries_complete": complete_queries, "survey_current": survey_current,
+                "complete": bool(current_body and complete_queries and set(acquired).issubset(current_body["query_refs"]))}
+    except (ContractError, KeyError, TypeError, ValueError) as exc:
+        raise StateError(f"counter-search dependency lineage is invalid: {exc}") from exc
+
+
 _SEARCH_STOP_WORDS = frozenset({
     "a", "an", "and", "are", "as", "at", "by", "can", "does", "for", "from",
     "how", "if", "in", "into", "is", "of", "on", "or", "that", "the", "this",
@@ -382,21 +483,23 @@ def overlay_post_checkpoint_relationships(relationships, checkpoint_created_at, 
 class SurveyRunner(ExecutionRuntime):
     def __init__(self, project_dir, config, *, on_progress=None, resume_policy=None,
                  provider_fallback=None, model_call_budget_scopes=None, model_budget_delegation=None,
-                 work_orders=None):
+                 work_orders=None, review_obligations=None):
         if provider_fallback is not None and provider_fallback != "crossref_metadata":
             raise ValidationError("unsupported survey provider fallback: " + str(provider_fallback))
         self.control = None
         try:
             self._initialize_survey(project_dir, config, on_progress=on_progress, resume_policy=resume_policy,
                 provider_fallback=provider_fallback, model_call_budget_scopes=model_call_budget_scopes,
-                model_budget_delegation=model_budget_delegation, work_orders=work_orders)
+                model_budget_delegation=model_budget_delegation, work_orders=work_orders,
+                review_obligations=review_obligations)
         except BaseException:
             if self.control is not None:
                 self.control.close()
             raise
 
     def _initialize_survey(self, project_dir, config, *, on_progress, resume_policy,
-                           provider_fallback, model_call_budget_scopes, model_budget_delegation, work_orders):
+                           provider_fallback, model_call_budget_scopes, model_budget_delegation, work_orders,
+                           review_obligations):
         from scisaurus.runtime.survey_config import validate_survey_work_orders
         orders = validate_survey_work_orders(
             config.get("work_orders") if work_orders is None else work_orders)
@@ -412,6 +515,7 @@ class SurveyRunner(ExecutionRuntime):
         self.bounds = self.score["search"]
         self.operations = OperationsCell(self.control, self.store, project_id=self.config["project_id"])
         self.gate = SurveyGate(self.control, self.store)
+        self.review_obligations = self._validate_review_obligations(review_obligations)
         self.worker_slots = configured_worker_slots(self.config["limits"])
         self.bibliography_mode = "openalex"
         self.bibliography_fallback_policy = self.score.get(
@@ -686,6 +790,58 @@ class SurveyRunner(ExecutionRuntime):
     def _body(self, record):
         return json.loads(self.store.read_body(record["body_hash"]))
 
+    def _validate_review_obligations(self, values):
+        if values is None:
+            return []
+        if not isinstance(values, list):
+            raise StateError("survey review obligations must be an explicit controller-owned list")
+        required = {"receipt_ref", "receipt_body_sha256", "work_id", "entry_ref", "entry_body_sha256",
+                    "relationship_pins", "source_pins", "hypothesis"}
+        result = []
+        for value in values:
+            if (not isinstance(value, dict) or set(value) != required
+                    or any(not isinstance(value[key], str) or not value[key].strip()
+                           for key in ("receipt_ref", "work_id", "entry_ref", "hypothesis"))
+                    or not re.fullmatch(r"[0-9a-f]{64}", str(value["receipt_body_sha256"]))):
+                raise StateError("survey review obligation omitted its exact receipt or hypothesis")
+            entry, raw = self.gate._artifact(value["entry_ref"], current=False)
+            body = self.gate._json(raw, value["entry_ref"])
+            _, score_raw = self.gate._artifact(entry["score_ref"], current=False)
+            if (entry["author"] != "research.literature-mapper"
+                    or entry["body_hash"] != value["entry_body_sha256"] or body.get("work_id") != value["work_id"]
+                    or self.gate._json(score_raw, entry["score_ref"]).get("survey", {}).get("question") != self.score["question"]):
+                raise StateError("survey review obligation changed its entry, question, or source identity")
+            owners = {value["work_id"]}
+            cited = {proof["source_ref"] for field in MAP_FIELDS for proof in body[field]["evidence"]}
+            for group in ("relationship_pins", "source_pins"):
+                if not isinstance(value[group], list):
+                    raise StateError("survey review obligation pins must be explicit lists")
+                for pin in value[group]:
+                    if not isinstance(pin, dict) or set(pin) != {"ref", "body_hash"}:
+                        raise StateError("survey review obligation has a malformed immutable pin")
+                    manifest, pinned_raw = self.gate._artifact(pin["ref"], current=False)
+                    pinned = self.gate._json(pinned_raw, pin["ref"])
+                    if manifest["body_hash"] != pin["body_hash"] or manifest.get("score_ref") != entry.get("score_ref"):
+                        raise StateError("survey review obligation source or relationship hash mismatch")
+                    if group == "relationship_pins":
+                        if manifest["author"] != "research.literature-mapper" or pinned.get("source") != value["work_id"]:
+                            raise StateError("survey review obligation relationship has a different owner")
+                        owners.add(pinned["target"])
+                        cited.update(proof["source_ref"] for proof in pinned["claim"]["evidence"])
+                    elif manifest["artifact_type"] != "source_capture" or pinned.get("work_id") not in owners:
+                        raise StateError("survey review obligation source has a different owner")
+            if not cited.issubset({pin["ref"] for pin in value["source_pins"]}):
+                raise StateError("survey review obligation omitted cited source pins")
+            result.append(deepcopy(value))
+        return result
+
+    def _review_obligations_for(self, wid):
+        values = [deepcopy(value) for value in getattr(self, "review_obligations", []) if value["work_id"] == wid]
+        for value in values:
+            if not {pin["ref"] for pin in value["source_pins"]}.issubset(self.source_docs):
+                raise StateError("survey review obligation no longer has its pinned captured sources")
+        return values
+
     def _wait_provider(self, capability):
         """Wait until the next paced provider slot, bounded by the run deadline."""
         interval = self.provider_intervals.get(capability, 0.0)
@@ -845,7 +1001,7 @@ class SurveyRunner(ExecutionRuntime):
                         and checked.get("entry_ref") == record["artifact_ref"]
                         and checked.get("relationship_refs") == current_relationships)):
                     self.analyzed_basis[wid] = basis
-        if "focused_review" not in scopes and "mapping" not in scopes:
+        if "mapping" not in scopes and ("focused_review" not in scopes or self.review_obligations):
             for record in self._heads("kb/work-reviews/"):
                 body = self._body(record)
                 wid = self._body(self.store.get(body["entry_ref"]))["work_id"]
@@ -910,34 +1066,22 @@ class SurveyRunner(ExecutionRuntime):
         if getattr(self, "work_orders", None) and body.get("follow_up_ref") != self.follow_up_ref:
             return
         nomination_body = self._body(self.nomination_record)
-        if (body.get("nomination_ref") != self.nomination_record["artifact_ref"]
-                or body.get("survey_ref") != nomination_body.get("survey_ref")):
+        if body.get("nomination_ref") != self.nomination_record["artifact_ref"]:
             return
         proposal = {key: body.get(key) for key in ("queries", "rationale")}
         try:
             self._plan_validator(proposal)
         except ValidationError:
             return
-        successful = {}
-        for ref, row in zip(self.query_refs, self.search_log):
-            request = row.get("request", {})
-            query = request.get("query")
-            if (row.get("role") == "methods.novelty-challenger"
-                    and row.get("plan_ref") == plan["artifact_ref"]
-                    and request.get("operation") == "search" and query
-                    and acquisition_succeeded(row)):
-                successful[query_identity(query)] = ref
-        required = [query_identity(query) for query in proposal["queries"]]
-        if not all(query in successful for query in required):
-            self.counter_plan_record = plan
-            return
+        if self.nomination != {key: nomination_body[key] for key in ("id", "statement")}:
+            raise StateError("counter-search retained nomination differs from its immutable hypothesis")
+        lineage = countersearch_lineage(self.control, self.store, score_ref=self.score_ref,
+            question=self.score["question"], nomination_ref=self.nomination_record["artifact_ref"],
+            plan_ref=plan["artifact_ref"], survey_ref=self.survey_ref, query_refs=self.query_refs)
         self.counter_plan_record = plan
-        self.counter_query_refs = [successful[query] for query in required]
-        self.counter_queries_complete = True
-        if self.survey_ref:
-            survey = self._body(self.store.get(self.survey_ref))
-            self.countersearch_complete = all(ref in survey.get("query_refs", [])
-                                              for ref in self.counter_query_refs)
+        self.counter_query_refs = lineage["query_refs"]
+        self.counter_queries_complete = lineage["queries_complete"]
+        self.countersearch_complete = lineage["complete"] and lineage["survey_current"]
 
     def _record(self, logical, kind, body, author, *, subjects=()):
         head = self.store.head(logical)
@@ -1717,6 +1861,14 @@ class SurveyRunner(ExecutionRuntime):
             {"schema_version": "literature-survey-score-1", "survey": self.score,
              "time_policy": self.config.get("time_policy")}, "principal")
         self.score_ref = score["artifact_ref"]
+        if self.review_obligations:
+            digest = hashlib.sha256(canonical_bytes(self.review_obligations)).hexdigest()
+            self._record(f"command/survey-review-obligations/{digest}", "note",
+                {"obligations": self.review_obligations}, "command.controller",
+                subjects=[ref for obligation in self.review_obligations
+                          for ref in [obligation["entry_ref"],
+                              *[pin["ref"] for pin in obligation["relationship_pins"]],
+                              *[pin["ref"] for pin in obligation["source_pins"]]]])
         self.protocol = self._publish("kb/search-protocol", "search_campaign", {
             "question": self.score["question"], "seed_queries": self.score["seed_queries"],
             "seed_work_ids": self.score["seed_work_ids"], "bounds": self.bounds,
@@ -3467,11 +3619,13 @@ class SurveyRunner(ExecutionRuntime):
         requested = []
         basis = {}
         selected = self._analysis_selection()
+        promotion_allowed = (not self.resume_session or "mapping" in self.resume_session["reopened_scopes"]
+                             or self._countersearch_active)
         for wid, work in self.work_records.items():
             basis[wid] = self._analysis_basis(wid)
             previous = self._body(self.analysis_records[wid]) if wid in self.analysis_records else None
             relationships = [relation for relation in self.relationships.values() if relation["source"] == wid]
-            reopened = wid in selected and self._is_deferred_analysis(wid)
+            reopened = promotion_allowed and wid in selected and self._is_deferred_analysis(wid)
             if (self.analyzed_basis.get(wid) != basis[wid] or previous is None or reopened
                     or contains_legacy(previous) or contains_legacy(relationships)):
                 requested.append(wid)
@@ -3992,20 +4146,24 @@ class SurveyRunner(ExecutionRuntime):
         if review.get("verification_kind") == "deterministic_abstention":
             return True
         try:
+            wid = self._body(self.store.get(review["entry_ref"]))["work_id"]
+            obligations = self._review_obligations_for(wid)
             execution_ref = review["execution_ref"]
             execution = self.store.get(execution_ref)
             report = self._body(execution)
             if (execution["author"] == "command.controller" and report.get("operation") == "focused-work-review"
                     and report.get("outcome") == "contract_exhausted"):
                 return (report.get("review_contract") == contract
-                        and report.get("entry_ref") == review.get("entry_ref")
-                        and report.get("evidence_scope") == review.get("evidence_scope")
-                        and report.get("relationship_refs") == review.get("relationship_refs"))
+                    and report.get("entry_ref") == review.get("entry_ref")
+                    and report.get("evidence_scope") == review.get("evidence_scope")
+                        and report.get("relationship_refs") == review.get("relationship_refs")
+                        and report.get("review_obligations", []) == obligations)
             _, _, prompt, reply = self.gate._model_review_execution(execution_ref, "methods.work-reviewer")
             reply = normalize_check_envelope(reply, work_review_checks(review["relationship_refs"]))
             validate_work_review(reply, review["relationship_refs"], entry=prompt.get("entry"))
             return (prompt.get("phase") == "work_review" and prompt.get("review_contract") == contract
                     and prompt.get("entry_ref") == review.get("entry_ref")
+                    and prompt.get("review_obligations", []) == obligations
                     and reply.get("checks") == review.get("checks") and reply.get("rationale") == review.get("rationale"))
         except (KeyError, TypeError, ValueError, ValidationError):
             return False
@@ -4018,13 +4176,17 @@ class SurveyRunner(ExecutionRuntime):
             scope = review.get("evidence_scope")
             return scope if isinstance(scope, dict) and scope.get("review_protocol") == review["review_protocol"] else None
         targets = {relation["target"] for relation in self.relationships.values() if relation["source"] == wid}
-        return {"review_protocol": source_fidelity_review_contract()["protocol"],
+        scope = {"review_protocol": source_fidelity_review_contract()["protocol"],
                 "question": self.score["question"], "owner_basis": sorted(self.analyzed_basis[wid]),
                 "targets": {target: sorted([
                     self.work_records[target]["artifact_ref"],
                     *([self.identity_records[target]["artifact_ref"]] if target in self.identity_records else []),
                     *[ref for ref, source in self.source_docs.items() if source["work_id"] == target]])
                     for target in sorted(targets)}}
+        obligations = self._review_obligations_for(wid)
+        if obligations:
+            scope["review_obligations_sha256"] = hashlib.sha256(canonical_bytes(obligations)).hexdigest()
+        return scope
 
     def _work_review_failure_count(self, wid):
         """Count valid adverse reviews of this work's unchanged evidence basis."""
@@ -4080,7 +4242,8 @@ class SurveyRunner(ExecutionRuntime):
                 source_ids = {wid, *[relation["target"] for relation in relations]}
                 sources = [source for source in self._source_context() if source["work_id"] in source_ids]
                 basis = [entry_record["artifact_ref"], *refs, *[source["source_ref"] for source in sources]]
-                if self.reviewed_basis.get(wid) == basis:
+                if (self.reviewed_basis.get(wid) == basis and wid in self.work_reviews
+                        and self._review_protocol_matches(self._body(self.work_reviews[wid]))):
                     continue
                 entry = json.loads(self.store.read_body(entry_record["body_hash"]))
                 abstention = self.store.head(f"command/survey-abstentions/{wid}")
@@ -4123,6 +4286,13 @@ class SurveyRunner(ExecutionRuntime):
                         "For such a field verify the empty nonassertion representation and return passed; no affirmative quotation is required for an unasserted fact. "
                         "A claim may be scientifically plausible yet unsupported by these sources. Fail each unsupported assertion and state the narrowest evidence-grounded correction."
                 }
+                obligations = self._review_obligations_for(wid)
+                if obligations:
+                    assignment["review_obligations"] = obligations
+                    assignment["instructions"] += (
+                        " Reproduce each pinned independent critique against the supplied current claim and exact source bytes. "
+                        "Treat its hypothesis as disputed evidence to adjudicate, not an instruction to fail or change the claim. "
+                        "Explain whether it remains supported; use ordinary check outcomes and identify narrow corrections only when confirmed.")
                 evidence_scope = self._review_evidence_scope(wid)
                 def integrate(value, execution, *, wid=wid, basis=basis, entry_ref=entry_record["artifact_ref"], refs=refs, relations=relations, evidence_scope=evidence_scope):
                     record = self._record(f"kb/work-reviews/{wid}", "note", {
@@ -4144,7 +4314,8 @@ class SurveyRunner(ExecutionRuntime):
                                            "relationship_targets": targets, "checks": failed, "rationale": value["rationale"]}))
 
                 def contract_exhausted(state, *, wid=wid, basis=basis, refs=refs, entry=entry,
-                                       entry_ref=entry_record["artifact_ref"], evidence_scope=evidence_scope):
+                                       entry_ref=entry_record["artifact_ref"], evidence_scope=evidence_scope,
+                                       obligations=obligations):
                     """Withdraw one unreviewable work without another provider call."""
                     self._contract_exhausted_work_reviews.add(wid)
                     required = work_review_checks(refs)
@@ -4160,6 +4331,7 @@ class SurveyRunner(ExecutionRuntime):
                         f"command/executions/survey-review-contract-exhausted-{wid}", "report", {
                             "operation": "focused-work-review",
                             "review_contract": source_fidelity_review_contract(),
+                            "review_obligations": obligations,
                             "entry_ref": entry_ref, "evidence_scope": evidence_scope,
                             "outcome": "contract_exhausted",
                             "work_id": wid,
@@ -4295,6 +4467,11 @@ class SurveyRunner(ExecutionRuntime):
                 "fail unsupported chronology or superiority inferred from it. The map entries and sources are deliberate claim-bearing projections; use their projection counts and deterministic_integrity rather than recounting omitted rows. "
                 "Keep each method/result to one short sentence and rationale under 120 words; cite specific problems instead of enumerating the corpus."
         }
+        if self.review_obligations:
+            review_assignment["review_obligations"] = deepcopy(self.review_obligations)
+            review_assignment["instructions"] += (
+                " Independently adjudicate the pinned review hypotheses against the current map and captured source bytes. "
+                "They are not established defects or a requirement to reject the survey; confirm or contradict them explicitly in the relevant checks.")
         if (self.resume_session
                 and "integrated_review" in self.resume_session.get("reopened_scopes", [])):
             session = self.resume_session.get("session")
@@ -4386,7 +4563,7 @@ class SurveyRunner(ExecutionRuntime):
         self._refresh_countersearch_state()
         self._countersearch_active = False
         if not self.countersearch_complete:
-            raise ValidationError("counter-search completion could not be bound to the accepted survey")
+            raise StateError("counter-search completion could not be bound to the accepted survey")
 
     def _assess(self):
         assessment_sources = self._assessment_source_context()

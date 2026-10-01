@@ -10214,6 +10214,43 @@ class ComposerWorkflowTests(unittest.TestCase):
                     self.assertFalse(attempt["repair_order_issued"])
                     self.assertEqual(runner.format_recovery_ledger, {})
 
+    def test_operational_stage_failure_requires_owned_recovery_without_retry_or_science(self):
+        with tempfile.TemporaryDirectory() as path:
+            workflow = self._workflow(Path(path))
+            workflow["retry_policy"] = {"mode": "until_deadline", "backoff_seconds": 0}
+            runner = ComposerRunner(workflow)
+            self.addCleanup(runner.close)
+            calls = []
+            envelope = {"status": "blocked", "error": "accepted dependency binding failed",
+                        "failure": {"kind": "operational_state"},
+                        "usage": {"model_calls": 1, "input_tokens": 12, "output_tokens": 3}}
+            with self.assertRaises(StateError) as raised:
+                runner._raise_stage_failure(envelope)
+            error = raised.exception
+            self.assertEqual(error.stage_result, envelope)
+            self.assertEqual(runner._forward_failure_class(error), "operational_recovery")
+            self.assertFalse(runner._should_run_failure_specialist_review(error))
+            def reject(stage, **kwargs):
+                calls.append(stage["id"])
+                return deepcopy(envelope)
+            runner._execute_stage = reject
+            stage = runner.workflow["stages"][0]
+            for attempt in (1, 2):
+                with self.assertRaises(StateError):
+                    runner._run_stage(stage, attempt_number=attempt)
+            self.assertEqual(calls, ["survey", "survey"])
+            calls.clear()
+            result = runner.run()
+            self.assertEqual(calls, ["survey"])
+            self.assertEqual(result["status"], "paused")
+            self.assertEqual(result["continuation_cycles"], 0)
+            self.assertEqual(result["usage"]["model_calls"], 1)
+            self.assertEqual(result["stages"]["survey"]["status"], "paused")
+            self.assertEqual(result["blockers"][0]["stop_reason"], "operational_state")
+            self.assertFalse(runner._continuation_requests())
+            self.assertFalse(result["retry_schedule"])
+            self.assertFalse(result["stages"]["survey"]["attempts"][0]["repair_order_issued"])
+
     def test_provider_429_bypasses_scientific_stage_failure_cache(self):
         with tempfile.TemporaryDirectory() as path:
             runner = ComposerRunner(self._workflow(Path(path)))
@@ -16934,11 +16971,14 @@ class ComposerWorkflowTests(unittest.TestCase):
             runner.workflow["experiment_catalog"] = [{"id": "capability"}]
             runner.context["topic"] = {
                 "kind": "topic_discovery",
-                "topic": {"research_question": "Does mechanism change the measured outcome?",
+                "topic": {"id": "direction-1", "research_question": "Does mechanism change the measured outcome?",
+                          "why_promising": "A promising boundary of a resource.",
                           "search_queries": ["mechanism comparison", "controlled experiment", "public data"],
                           "recent_papers": [{"work_id": "W123456789"}]},
             }
-            config = {"survey": {"question": "placeholder", "seed_queries": ["old query"],
+            config = {"survey": {"question": "placeholder", "proposed_gap": {
+                                      "id": "old-gap", "statement": "A hypothesis for the old question."},
+                                  "seed_queries": ["old query"],
                                   "seed_work_ids": ["W999"]}}
             projected = runner._apply_topic_to_survey_config(workflow["stages"][1], config)
             self.assertEqual(projected["survey"]["question"], "Does mechanism change the measured outcome?")
@@ -16946,6 +16986,41 @@ class ComposerWorkflowTests(unittest.TestCase):
                              ["mechanism comparison", "controlled experiment", "public data"])
             self.assertEqual(projected["survey"]["seed_work_ids"], [])
             self.assertEqual(projected["survey"]["bibliography_fallback"], "disabled")
+            self.assertIsNone(projected["survey"]["proposed_gap"])
+            from unittest.mock import Mock
+            from scisaurus.runtime.survey import SurveyRunner
+            survey_runner = object.__new__(SurveyRunner)
+            survey_runner.score = projected["survey"]
+            survey_runner.survey_ref = "artifact:kb/surveys/current@1"
+            survey_runner.gate = Mock()
+            accepted_map = {"question": projected["survey"]["question"], "entry_refs": ["artifact:kb/work-analyses/W1@1"]}
+            survey_runner._map_body = Mock(return_value=accepted_map)
+            survey_runner._coverage = Mock(return_value={"analyzed": 1})
+            nomination = {"id": "map-bound-gap", "statement": "A bounded hypothesis nominated from the accepted map."}
+            def nominate(key, role, prompt, validator, **options):
+                self.assertEqual((key, role), ("nominate", "research.gap-proposer"))
+                self.assertEqual(prompt["question"], projected["survey"]["question"])
+                self.assertEqual(prompt["map"], accepted_map)
+                self.assertEqual(options["task_kind"], "selection")
+                self.assertNotIn("why_promising", prompt)
+                validator(nomination)
+                return nomination, "artifact:command/model-executions/nominate@1"
+            survey_runner._model_checked = Mock(side_effect=nominate)
+            survey_runner._publish = Mock(return_value={"artifact_ref": "artifact:kb/gap-nomination@1"})
+            survey_runner._nominate()
+            survey_runner._model_checked.assert_called_once()
+            self.assertEqual(survey_runner.nomination, nomination)
+            survey_runner.gate.require_current.assert_called_once_with(survey_runner.survey_ref)
+            explicit_gap = {"id": "declared-gap", "statement": "A deliberately configured hypothesis for this question."}
+            same_question = {"survey": {"question": projected["survey"]["question"],
+                "proposed_gap": deepcopy(explicit_gap), "seed_queries": [], "seed_work_ids": []}}
+            same_question = runner._apply_topic_to_survey_config(workflow["stages"][1], same_question)
+            self.assertEqual(same_question["survey"]["proposed_gap"], explicit_gap)
+            survey_runner.score = same_question["survey"]
+            survey_runner._model_checked.reset_mock()
+            survey_runner._nominate()
+            self.assertEqual(survey_runner.nomination, explicit_gap)
+            survey_runner._model_checked.assert_not_called()
             runner.close()
 
     def test_free_topic_enables_auto_pdf_routes_without_overriding_exact_routes(self):
@@ -18104,13 +18179,16 @@ class ComposerWorkflowTests(unittest.TestCase):
                 payload={"stage_id": "survey", "model_budget_cycle": 42, "project_dir": str(project)})
             control = ControlStore(project); store = ArtifactStore(control)
             store.init_project(principal_note="Retained survey")
-            def publish(logical, body, author="command.controller", kind="report", inputs=None):
+            def publish(logical, body, author="command.controller", kind="report", inputs=None, score_ref=None):
                 return store.publish_artifact(logical_id=logical, artifact_type=kind, author=author,
-                    body=canonical_bytes(body), media_type="application/json", inputs=inputs or [])
+                    body=canonical_bytes(body), media_type="application/json", inputs=inputs or [], score_ref=score_ref)
             config_body = {"survey": {"question": "Original question"}, "limits": {"wall_clock_seconds": 10}}
             config = publish("inputs/run-config", config_body)
             session = publish("command/resume-sessions/10", {"config_ref": config["artifact_ref"], "reopened_scopes": scopes})
-            entry = publish("kb/work-analyses/W1", {"work_id": "W1"}, "research.literature-mapper")
+            from scisaurus.runtime.survey_records import MAP_FIELDS
+            score = publish("command/scores/literature", {"survey": {"question": "Original question"}}, "principal")
+            entry = publish("kb/work-analyses/W1", {"work_id": "W1", **{field: {"text": "Unreviewed", "evidence": []} for field in MAP_FIELDS}},
+                "research.literature-mapper", score_ref=score["artifact_ref"])
             mapped = {"question": "Original question", "entry_refs": [entry["artifact_ref"]], "relationship_refs": []}
             mapping = publish("kb/literature-map", mapped, "research.literature-mapper")
             actual = {"model_calls": 47, "input_tokens": 587805, "output_tokens": 37303}
@@ -18232,7 +18310,7 @@ class ComposerWorkflowTests(unittest.TestCase):
             class SurveyBoundary:
                 def __init__(self, root, config, **options):
                     boundary.update(root=root, config=config, scopes=options["resume_policy"]["source_changes"]["reopen_scopes"],
-                                    work_orders=options["work_orders"])
+                                    work_orders=options["work_orders"], review_obligations=options.get("review_obligations", []))
                     raise KeyboardInterrupt("Survey constructor boundary")
             with patch("scisaurus.runtime.survey.SurveyRunner", SurveyBoundary), \
                  patch.object(runner, "_run_stage", side_effect=lambda current, **kwargs: runner._produce_stage(current, **kwargs)), \
@@ -18248,6 +18326,105 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(runner.continuation_cycles, 43)
             self.assertIn(science, runner.active_research_requests)
             self.assertIn(format_order, runner.active_research_requests)
+
+            runner = ComposerRunner(workflow, resume=True); self.addCleanup(runner.close)
+            dependency_usage = deepcopy(runner.usage)
+            source_control = ControlStore(project); store = ArtifactStore(source_control)
+            runner.tasks.create("dependency-owner", "production", {}, "command.composer")
+            runner.tasks.transition("dependency-owner", "queued", "command.composer")
+            runner.tasks.start_attempt("dependency-owner", "dependency-attempt", owner="command.composer", lease_ttl_seconds=60,
+                payload={"stage_id": "survey", "model_budget_cycle": 43, "project_dir": str(project), "attempt_number": 24})
+            failure_result = {"status": "blocked", "error": "ValidationError: counter-search completion could not be bound to the accepted survey", "failure": None,
+                              "run_id": "counter-run", "survey_ref": "artifact:kb/surveys/current@6",
+                              "nomination_ref": "artifact:kb/gap-nomination@3", "assessment_ref": None,
+                              "project_id": str(project), "score_ref": "artifact:command/scores/literature@1"}
+            retained_result = publish("command/results/final", failure_result)
+            unrelated_failure = {**failure_result, "error": "ValidationError: independent scientific evidence is insufficient"}
+            unrelated_result = publish("command/results/unrelated-failure", unrelated_failure)
+            publish("command/progress/interrupted-dependency-9", {"cumulative_usage": {"actual": actual},
+                "next_action": {"decision": "paused"}}, kind="progress_checkpoint")
+            (project / "output/progress.json").write_bytes(canonical_bytes({"run_id": "interrupted-dependency",
+                "checkpoint": 9, "phase": "paused", "cumulative_usage": actual,
+                "active_tasks": [], "active_operations": []}))
+            source_control.close()
+            dossier = runner._publish("command/composer/failure-recovery/survey/attempt-24", "report", {
+                "schema_version": "composer-failure-recovery-1", "stage_id": "survey", "project_dir": str(project),
+                "input_sha256": "b"*64, "attempt_number": 24, "observed_result": failure_result}, "command.composer")
+            technical = {**bad, "id": "dependency-repair", "failure_dossier_ref": dossier["artifact_ref"], "failure_input_sha256": "b"*64}
+            unrelated_dossier = runner._publish("command/composer/failure-recovery/survey/unrelated", "report", {
+                "schema_version": "composer-failure-recovery-1", "stage_id": "survey", "project_dir": str(project),
+                "input_sha256": "c"*64, "attempt_number": 24, "observed_result": unrelated_failure}, "command.composer")
+            unrelated_order = {**technical, "id": "unrelated-scientific-repair", "failure_dossier_ref": unrelated_dossier["artifact_ref"],
+                               "failure_input_sha256": "c"*64}
+            runner.stage_records["survey"].setdefault("attempts", []).append({"attempt_id": "dependency-attempt",
+                "failure_dossier_ref": dossier["artifact_ref"], "attempt_number": 24, "cycle": 43})
+            runner.stage_records["survey"]["attempts"].append({"attempt_id": "dependency-attempt",
+                "failure_dossier_ref": unrelated_dossier["artifact_ref"], "attempt_number": 24, "cycle": 43})
+            runner.context["survey"]["research_requests"] = [technical, unrelated_order]
+            runner.continuation_cycles = 44
+            runner._record_continuation([request, science, format_order], {"survey", "experiment"})
+            obligation = {"work_id": "W1", "entry_ref": entry["artifact_ref"], "entry_body_sha256": entry["body_hash"],
+                          "relationship_pins": [], "source_pins": [], "hypothesis": "Check whether the retained wording is supported."}
+            dependency_instruction = {key: value for key, value in instruction.items() if key != "quota_failure_ref"}
+            dependency_instruction.update(cycle=44, dependency_failure_ref=retained_result["artifact_ref"],
+                superseded_request_id=technical["id"], plan_ref="artifact:kb/counter-search-plan@3",
+                resume_scopes=scopes[1:], review_obligations=[obligation])
+            note = runner._publish("command/operator/dependency-resume", "decision_note", dependency_instruction, "command.operator")
+            unrelated_note = runner._publish("command/operator/unrelated-resume", "decision_note", {
+                **dependency_instruction, "dependency_failure_ref": unrelated_result["artifact_ref"],
+                "superseded_request_id": unrelated_order["id"]}, "command.operator")
+            runner.status = "running"; runner._checkpoint("survey:specialist_payment_settled", force=True)
+            supervisor.workflow = runner.workflow; supervisor._mark_interrupted_checkpoint()
+            runner.close(); runner = ComposerRunner(workflow, resume=True); self.addCleanup(runner.close)
+            lineage = {"complete": True, "survey_current": False, "query_refs": ["artifact:kb/queries/108@1"],
+                       "origin_survey_ref": "artifact:kb/surveys/current@4", "planning_survey_ref": "artifact:kb/surveys/current@5"}
+            with patch("scisaurus.runtime.survey.countersearch_lineage", return_value={"complete": False}):
+                with self.assertRaisesRegex(StateError, "completed owned counter-search"):
+                    runner.admit_survey_review_recovery(operator_request_ref=note["artifact_ref"])
+            with patch("scisaurus.runtime.survey.countersearch_lineage", return_value={**lineage,
+                       "origin_survey_ref": lineage["planning_survey_ref"]}):
+                with self.assertRaisesRegex(StateError, "no reproduced nomination/planning mismatch"):
+                    runner.admit_survey_review_recovery(operator_request_ref=note["artifact_ref"])
+            with patch("scisaurus.runtime.survey.countersearch_lineage", return_value=lineage):
+                with self.assertRaisesRegex(StateError, "mismatch and binding failure"):
+                    runner.admit_survey_review_recovery(operator_request_ref=unrelated_note["artifact_ref"])
+            self.assertIn(unrelated_order, runner.context["survey"]["research_requests"])
+            invalid_obligation = {**obligation, "entry_body_sha256": "0"*64}
+            bad_note = runner._publish("command/operator/invalid-dependency-pin", "decision_note",
+                {**dependency_instruction, "review_obligations": [invalid_obligation]}, "command.operator")
+            with patch("scisaurus.runtime.survey.countersearch_lineage", return_value=lineage):
+                with self.assertRaisesRegex(StateError, "entry, question, or source identity"):
+                    runner.admit_survey_review_recovery(operator_request_ref=bad_note["artifact_ref"])
+            self.assertIsNone(runner.store.head("command/composer/revalidation-admissions/survey/44"))
+            self.assertEqual(runner.store.head("command/composer/continuation/44")["version"], 1)
+            with patch("scisaurus.runtime.survey.countersearch_lineage", return_value=lineage) as replay:
+                repaired = runner.admit_survey_review_recovery(operator_request_ref=note["artifact_ref"])
+            self.assertEqual(replay.call_args.kwargs["survey_ref"], failure_result["survey_ref"])
+            self.assertEqual(repaired["dependency_replay"]["lineage"], lineage)
+            self.assertEqual(repaired["dependency_replay"]["resume_scopes"], scopes[1:])
+            self.assertEqual(runner._survey_revalidation_resume_plan(stage, scopes)[0], scopes[1:])
+            owned = runner._survey_review_obligations(stage)
+            self.assertEqual({key: value for key, value in owned[0].items() if key not in {"receipt_ref", "receipt_body_sha256"}}, obligation)
+            self.assertEqual(owned[0]["receipt_ref"], note["artifact_ref"])
+            self.assertEqual(runner.continuation_cycles, 44)
+            self.assertIn(science, runner.active_research_requests); self.assertIn(format_order, runner.active_research_requests)
+            self.assertEqual(runner.usage, dependency_usage); self.assertEqual(runner.deadline_epoch, initial_deadline)
+            self.assertEqual(runner._survey_producer_work_orders(stage), [])
+            self.assertFalse(any(item.get("id") == technical["id"] for item in runner.context["survey"]["research_requests"]))
+            self.assertEqual(runner.admit_survey_review_recovery(operator_request_ref=note["artifact_ref"]), repaired)
+            with patch("scisaurus.runtime.survey.SurveyRunner", SurveyBoundary), \
+                 patch.object(runner, "_run_stage", side_effect=lambda current, **kwargs: runner._produce_stage(current, **kwargs)), \
+                 patch.object(runner, "_run_specialist_pool", return_value={"model_enabled": False, "reports": [], "by_role": {}, "usage": {}}), \
+                 patch.object(runner, "_start_live_progress", return_value=lambda: None), \
+                 patch.object(runner, "_stage_model_delegation", return_value=None):
+                interrupted = runner.run()
+            self.assertEqual(interrupted["status"], "paused")
+            self.assertEqual(boundary["scopes"], scopes[1:])
+            self.assertEqual(boundary["review_obligations"], owned)
+            self.assertEqual(boundary["config"], config_body)
+            self.assertEqual(boundary["work_orders"], [])
+            self.assertEqual(runner.continuation_cycles, 44)
+            self.assertIn(science, runner.active_research_requests); self.assertIn(format_order, runner.active_research_requests)
 
     def test_revalidation_resume_uses_only_owned_completed_mapping_milestone(self):
         with tempfile.TemporaryDirectory() as path:

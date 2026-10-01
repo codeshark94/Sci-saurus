@@ -5701,7 +5701,6 @@ class TopicDiscoveryRunner:
                 "topic": selected,
                 "question": selected["research_question"],
                 "search_queries": selected["search_queries"],
-                "proposed_gap": selected["why_promising"],
                 "feasibility_check": feasibility,
                 "recent_papers": recent_papers,
                 "frontier_seed_plan": frontier_seed_plan,
@@ -5720,7 +5719,7 @@ class TopicDiscoveryRunner:
             if same_question_feasibility_repair:
                 for key, value in retained_admission.items():
                     if key not in {
-                            "source_challenge", "candidate_prior_work",
+                            "source_challenge", "candidate_prior_work", "proposed_gap",
                             "candidate_sampling_trace"}:
                         output[key] = deepcopy(value)
             if review is not None:

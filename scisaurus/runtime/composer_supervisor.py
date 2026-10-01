@@ -38,7 +38,7 @@ TERMINAL_STATUSES = frozenset({"completed", "candidate_needs_review"})
 STOP_REASONS = frozenset({
     "hard_deadline", "required_stage_window_does_not_fit_remaining_deadline",
     "provider_configuration", "provider_rate_limit", "missing_stage_input", "stage_quota_exhausted",
-    "workflow_validation",
+    "workflow_validation", "operational_state",
 })
 SUPERVISOR_SCHEMA_VERSION = "composer-supervisor-3"
 DEFAULT_WATCHDOG_SECONDS = 300.0
@@ -749,7 +749,8 @@ class ComposerSupervisor:
             active_blockers = result.get("blockers", [])
         if isinstance(active_blockers, list) and any(
                 isinstance(blocker, dict)
-                and blocker.get("failure_class") == "harness_bug"
+                and (blocker.get("failure_class") == "harness_bug"
+                     or blocker.get("stop_reason") == "operational_state")
                 for blocker in active_blockers):
             # Retrying a runtime defect without a source fix consumes provider
             # calls while preserving the same failed execution path.

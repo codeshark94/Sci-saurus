@@ -2512,8 +2512,17 @@ class ComposerRunner:
         }
 
     @staticmethod
+    def _is_operational_stage_failure(error):
+        result = getattr(error, "stage_result", None)
+        return (isinstance(error, StateError) and isinstance(result, dict)
+                and isinstance(result.get("failure"), dict)
+                and result["failure"].get("kind") == "operational_state")
+
+    @staticmethod
     def _forward_failure_class(error):
         """Classify a failed attempt without turning every defect into a stop."""
+        if ComposerRunner._is_operational_stage_failure(error):
+            return "operational_recovery"
         if getattr(error, "failure_class", None) == "context_budget":
             return "resource_fence"
         if isinstance(error, (*PROVIDER_OPERATOR_STOP_ERRORS, ProviderCooldownError, QuotaExceededError,
@@ -4005,7 +4014,7 @@ class ComposerRunner:
                 stage, self.context.get(stage.get("id")), error):
             return False
         failure_class = self._forward_failure_class(error)
-        return failure_class not in {"resource_fence", "unknown_external_outcome",
+        return failure_class not in {"resource_fence", "operational_recovery", "unknown_external_outcome",
                                      "process_interruption"}
 
     def _authorize_forward_context(self, stage, context, *, reason):
@@ -4183,7 +4192,7 @@ class ComposerRunner:
             # executable direction instead of parking behind a release gate.
             return None
         failure_class = self._forward_failure_class(error)
-        if failure_class in {"resource_fence", "unknown_external_outcome",
+        if failure_class in {"resource_fence", "operational_recovery", "unknown_external_outcome",
                              "process_interruption"} and not force_advance:
             return None
         stage_id = stage["id"]
@@ -8318,12 +8327,12 @@ class ComposerRunner:
                     capability = survey.get(capability_key)
                     if isinstance(capability, dict) and isinstance(capability.get("id"), str):
                         capability["id"] = f"topic-{topic_key}-{capability_key}"[:64]
+        # A configured hypothesis belongs to its declared question. Topic
+        # motivation is not a nomination; new questions are nominated from
+        # the accepted literature map by the gap-proposer.
+        if survey.get("question") != topic["research_question"]:
+            survey["proposed_gap"] = None
         survey["question"] = topic["research_question"]
-        if isinstance(topic.get("id"), str):
-            survey["proposed_gap"] = {
-                "id": f"topic-{topic['id']}"[:64],
-                "statement": topic.get("why_promising") or topic["research_question"],
-            }
         # The discovery sampler is intentionally broad: it gives the topic
         # selector a current landscape, but those records are not evidence
         # for the selected question.  Carrying their IDs into the survey
@@ -13802,10 +13811,20 @@ class ComposerRunner:
                            for item in decision.get("research_requests", []))):
             raise StateError("survey review recovery does not match its immutable operator admission")
         self._validate_survey_revalidation_scopes(request)
+        dependency = body.get("dependency_replay")
+        if dependency is not None and (
+                not isinstance(dependency, dict)
+                or instruction.get("dependency_failure_ref") != dependency.get("failure_ref")
+                or instruction.get("resume_scopes") != dependency.get("resume_scopes")
+                or instruction.get("plan_ref") != dependency.get("plan_ref")
+                or canonical_bytes(instruction.get("review_obligations")) != canonical_bytes([
+                    {key: value for key, value in item.items() if key not in {"receipt_ref", "receipt_body_sha256"}}
+                    for item in dependency.get("review_obligations", [])])):
+            raise StateError("survey dependency replay differs from its immutable operator admission")
         return body
 
     def _survey_review_recovery_evidence(self, current_stage, instruction, operator_request_ref):
-        """Validate the retained request, milestone and quota rejection without writes."""
+        """Validate the retained request, milestone and technical failure without writes."""
         stage = next(item for item in self.workflow["stages"] if item["id"] == current_stage["id"])
         project = current_stage["project_dir"]
         head = self.store.head(f"command/composer/continuation/{self.continuation_cycles}")
@@ -13840,7 +13859,9 @@ class ComposerRunner:
             self.continuation_cycles = previous_cycle
         if verified_mapping is None or scopes != [scope for scope in declared if scope != "mapping"]:
             raise StateError("survey review recovery mapping milestone failed immutable owner replay")
-        superseded = next((item for item in previous.get("research_requests", [])
+        owned_orders = [*previous.get("research_requests", []),
+                        *self.context.get(stage["id"], {}).get("research_requests", [])]
+        superseded = next((item for item in owned_orders
                            if item.get("id") == instruction.get("superseded_request_id")), None)
         if (superseded is None or superseded.get("target_stage_id") != stage["id"]
                 or superseded.get("kind") != "literature_expansion" or "resume_scopes" in superseded
@@ -13852,42 +13873,103 @@ class ComposerRunner:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA query_only=ON")
             store = ArtifactStore(SimpleNamespace(dir=str(Path(project).resolve()), _conn=connection))
-            failure_record = store.get(instruction["quota_failure_ref"])
-            raw = store.read_body(failure_record["body_hash"])
-            failure = json.loads(raw)
-            quota = failure.get("budget_admission") or {}
-            ModelCallError.from_failure(failure.get("error") or "quota rejection", failure)
-            contexts = [item["ref"] for item in failure_record.get("inputs", []) if item.get("purpose") == "subject"]
-            if len(contexts) != 1:
-                raise StateError("quota rejection has no unique request context")
-            context_record = store.get(contexts[0]); context_raw = store.read_body(context_record["body_hash"])
-            context = json.loads(context_raw)
-            expected_scope = {"model_call_budget_path": str((self.root/"state/stage-model-call-budget.sqlite").resolve()),
-                              "model_call_budget_key": f"stage:{stage['id']}:cycle:{admission['cycle']}",
-                              "model_call_budget_limit": (stage.get("quota") or {}).get("max_model_calls")}
-            registered = (context.get("client") or {}).get("model_call_budget_scopes", [])
-            if (hashlib.sha256(raw).hexdigest() != failure_record["body_hash"]
-                    or hashlib.sha256(context_raw).hexdigest() != context_record["body_hash"]
-                    or failure.get("error_type") != "ModelBudgetExceededError"
-                    or failure.get("outcome_known") is not True
-                    or failure.get("attempts") != 0 or failure.get("usage") != {}
-                    or quota.get("requested") != 1 or quota.get("reserved") != 0
-                    or not isinstance(failure.get("error"), str) or not failure["error"]
-                    or context.get("role") != failure_record.get("author")
-                    or quota.get("dimension") != "model_calls"
-                    or quota.get("path") != expected_scope["model_call_budget_path"]
-                    or quota.get("key") != expected_scope["model_call_budget_key"]
-                    or quota.get("limit") != expected_scope["model_call_budget_limit"]
-                    or quota.get("observed") != quota.get("limit")
-                    or not any(all(item.get(key) == value for key, value in expected_scope.items()) for item in registered)
-                    or dossier_manifest.get("author") != "command.composer"
-                    or dossier.get("schema_version") != "composer-failure-recovery-1"
-                    or dossier.get("stage_id") != stage["id"]
-                    or dossier.get("project_dir") != str(Path(project).resolve())
-                    or dossier.get("input_sha256") != superseded.get("failure_input_sha256")
-                    or failure["error"] not in dossier.get("error", "")
-                    or not failure_record["created_at"] <= dossier_manifest["created_at"] < head["created_at"]):
-                raise StateError("superseded survey order is not proven to originate from this typed quota rejection")
+            dependency = None
+            if "dependency_failure_ref" in instruction:
+                from scisaurus.runtime.survey import countersearch_lineage
+                failure_record = store.get(instruction["dependency_failure_ref"])
+                raw = store.read_body(failure_record["body_hash"])
+                failure = json.loads(raw)
+                observed = dossier.get("observed_result") or {}
+                history = self.stage_records.get(stage["id"], {}).get("attempts", [])
+                attempts = [item for item in history if item.get("failure_dossier_ref") == dossier_manifest["artifact_ref"]]
+                if len(attempts) != 1:
+                    raise StateError("dependency recovery has no unique owned failed attempt")
+                attempt = self.tasks.get_attempt(attempts[0]["attempt_id"])
+                payload = attempt.get("payload") or {}
+                if (failure_record.get("author") != "command.controller"
+                        or hashlib.sha256(raw).hexdigest() != failure_record["body_hash"]
+                        or failure.get("project_id") != str(Path(project).resolve())
+                        or failure.get("status") != "blocked" or failure.get("assessment_ref") is not None
+                        or (failure.get("failure") or {}).get("kind") not in {None, "operational_state"}
+                        or any(observed.get(key) != failure.get(key) for key in (
+                            "status", "run_id", "survey_ref", "nomination_ref", "error", "assessment_ref"))
+                        or dossier_manifest.get("author") != "command.composer"
+                        or dossier.get("schema_version") != "composer-failure-recovery-1"
+                        or dossier.get("stage_id") != stage["id"]
+                        or dossier.get("project_dir") != str(Path(project).resolve())
+                        or dossier.get("input_sha256") != superseded.get("failure_input_sha256")
+                        or dossier.get("attempt_number") != payload.get("attempt_number")
+                        or payload.get("stage_id") != stage["id"]
+                        or payload.get("project_dir") != str(Path(project).resolve())
+                        or type(payload.get("model_budget_cycle")) is not int
+                        or not payload["model_budget_cycle"] < self.continuation_cycles
+                        or not attempt["created_at"] <= failure_record["created_at"] <= dossier_manifest["created_at"] < head["created_at"]
+                        or instruction.get("resume_scopes") != ["focused_review", "integrated_review", "gap_assessment"]):
+                    raise StateError("dependency recovery does not own its failed producer and replay scope")
+                configured = json.loads(store.read_body(milestone["config_sha256"]))
+                lineage = countersearch_lineage(store.control, store, score_ref=failure["score_ref"],
+                    question=configured["survey"]["question"], nomination_ref=failure["nomination_ref"],
+                    plan_ref=instruction["plan_ref"], survey_ref=failure["survey_ref"])
+                if lineage.get("complete") is not True:
+                    raise StateError("dependency recovery lacks completed owned counter-search evidence")
+                if ((failure.get("failure") or {}).get("kind") is None
+                        and (failure.get("error") != "ValidationError: counter-search completion could not be bound to the accepted survey"
+                             or not isinstance(lineage.get("origin_survey_ref"), str)
+                             or not isinstance(lineage.get("planning_survey_ref"), str)
+                             or lineage["origin_survey_ref"] == lineage["planning_survey_ref"])):
+                    raise StateError("legacy dependency recovery has no reproduced nomination/planning mismatch and binding failure")
+                from scisaurus.core.surveys import SurveyGate
+                from scisaurus.runtime.survey import SurveyRunner
+                obligations = instruction.get("review_obligations")
+                if not isinstance(obligations, list) or any(not isinstance(item, dict) for item in obligations):
+                    raise StateError("dependency recovery requires an explicit bounded review obligation list")
+                review_validator = object.__new__(SurveyRunner)
+                review_validator.gate = SurveyGate(store.control, store)
+                review_validator.score = configured["survey"]
+                checked_obligations = review_validator._validate_review_obligations([
+                    {**deepcopy(item), "receipt_ref": operator_request_ref, "receipt_body_sha256": operator["body_hash"]}
+                    for item in obligations])
+                dependency = {"failure_ref": failure_record["artifact_ref"], "failure_sha256": failure_record["body_hash"],
+                              "dossier_ref": dossier_manifest["artifact_ref"], "dossier_sha256": dossier_manifest["body_hash"],
+                              "plan_ref": instruction["plan_ref"], "lineage": lineage, "resume_scopes": instruction["resume_scopes"],
+                              "review_obligations": checked_obligations}
+            else:
+                failure_record = store.get(instruction["quota_failure_ref"])
+                raw = store.read_body(failure_record["body_hash"])
+                failure = json.loads(raw)
+                quota = failure.get("budget_admission") or {}
+                ModelCallError.from_failure(failure.get("error") or "quota rejection", failure)
+                contexts = [item["ref"] for item in failure_record.get("inputs", []) if item.get("purpose") == "subject"]
+                if len(contexts) != 1:
+                    raise StateError("quota rejection has no unique request context")
+                context_record = store.get(contexts[0]); context_raw = store.read_body(context_record["body_hash"])
+                context = json.loads(context_raw)
+                expected_scope = {"model_call_budget_path": str((self.root/"state/stage-model-call-budget.sqlite").resolve()),
+                                  "model_call_budget_key": f"stage:{stage['id']}:cycle:{admission['cycle']}",
+                                  "model_call_budget_limit": (stage.get("quota") or {}).get("max_model_calls")}
+                registered = (context.get("client") or {}).get("model_call_budget_scopes", [])
+                if (hashlib.sha256(raw).hexdigest() != failure_record["body_hash"]
+                        or hashlib.sha256(context_raw).hexdigest() != context_record["body_hash"]
+                        or failure.get("error_type") != "ModelBudgetExceededError"
+                        or failure.get("outcome_known") is not True
+                        or failure.get("attempts") != 0 or failure.get("usage") != {}
+                        or quota.get("requested") != 1 or quota.get("reserved") != 0
+                        or not isinstance(failure.get("error"), str) or not failure["error"]
+                        or context.get("role") != failure_record.get("author")
+                        or quota.get("dimension") != "model_calls"
+                        or quota.get("path") != expected_scope["model_call_budget_path"]
+                        or quota.get("key") != expected_scope["model_call_budget_key"]
+                        or quota.get("limit") != expected_scope["model_call_budget_limit"]
+                        or quota.get("observed") != quota.get("limit")
+                        or not any(all(item.get(key) == value for key, value in expected_scope.items()) for item in registered)
+                        or dossier_manifest.get("author") != "command.composer"
+                        or dossier.get("schema_version") != "composer-failure-recovery-1"
+                        or dossier.get("stage_id") != stage["id"]
+                        or dossier.get("project_dir") != str(Path(project).resolve())
+                        or dossier.get("input_sha256") != superseded.get("failure_input_sha256")
+                        or failure["error"] not in dossier.get("error", "")
+                        or not failure_record["created_at"] <= dossier_manifest["created_at"] < head["created_at"]):
+                    raise StateError("superseded survey order is not proven to originate from this typed quota rejection")
             current_map = store.head("kb/literature-map")
             if current_map is None:
                 raise StateError("survey review recovery has no retained current map")
@@ -13910,21 +13992,28 @@ class ComposerRunner:
                 "quota_failure_ref": failure_record["artifact_ref"], "quota_failure_sha256": failure_record["body_hash"],
                 "superseded_request_id": superseded["id"], "superseded_request": deepcopy(superseded),
                 "deferred_research_requests": deferred}
+        if dependency is not None:
+            body.pop("quota_failure_ref", None)
+            body.pop("quota_failure_sha256", None)
+            body["dependency_replay"] = dependency
         return body
 
     def admit_survey_review_recovery(self, *, operator_request_ref):
         """Restore a declared review under the already admitted stage allocation.
 
-        Only a source-owned, typed quota rejection can retire an order created
-        by a misclassified transport failure. Other scientific orders remain
-        pending while the explicitly requested review runs.
+        Only replayed immutable failure provenance can retire a technically
+        misclassified order. Other scientific orders remain pending while
+        the explicitly requested review runs.
         """
         operator, _, instruction = self._read_verified_artifact_json(operator_request_ref)
         stage = next((item for item in self.workflow["stages"]
                       if item["id"] == instruction.get("stage_id")), None)
+        common_fields = {"action", "stage_id", "cycle", "original_continuation_ref", "request_id",
+                         "checkpoint_ref", "superseded_request_id"}
+        quota_fields = common_fields | {"quota_failure_ref"}
+        dependency_fields = common_fields | {"dependency_failure_ref", "plan_ref", "resume_scopes", "review_obligations"}
         if (operator.get("author") != "command.operator"
-                or set(instruction) != {"action", "stage_id", "cycle", "original_continuation_ref", "request_id",
-                                        "checkpoint_ref", "quota_failure_ref", "superseded_request_id"}
+                or set(instruction) not in (quota_fields, dependency_fields)
                 or instruction.get("action") != "resume_survey_reviews"
                 or type(instruction.get("cycle")) is not int
                 or instruction.get("cycle") != self.continuation_cycles
@@ -13952,7 +14041,8 @@ class ComposerRunner:
         request = body["request"]
         superseded = body["superseded_request"]
         verified_mapping = body["completed_mapping"]
-        scopes = [scope for scope in request["resume_scopes"] if scope != "mapping"]
+        scopes = (body["dependency_replay"]["resume_scopes"] if "dependency_replay" in body
+                  else [scope for scope in request["resume_scopes"] if scope != "mapping"])
         _, _, admission = self._read_verified_artifact_json(body["original_continuation_ref"])
         receipt = self._publish(f"command/composer/revalidation-admissions/{stage['id']}/{self.continuation_cycles}",
                                 "decision_note", body, "command.composer")
@@ -14040,8 +14130,9 @@ class ComposerRunner:
             raise StateError("restored survey checkpoint does not own this pending producer")
         observed = self._read_json_object(Path(stage["project_dir"]) / "output/progress.json") or {}
         evidence = self._producer_checkpoint_evidence(stage["project_dir"], observed)
-        if evidence is None or observed.get("phase") != "calls_settled":
-            raise StateError("survey review recovery has no settled producer checkpoint")
+        if (evidence is None or observed.get("phase") not in {"calls_settled", "paused"}
+                or observed.get("active_tasks") or observed.get("active_operations")):
+            raise StateError("survey review recovery has no idle captured producer checkpoint")
         with closing(sqlite3.connect((Path(stage["project_dir"])/"state/control.sqlite").resolve().as_uri() + "?mode=ro", uri=True)) as connection:
             active = connection.execute("SELECT 1 FROM tasks WHERE state IN ('running','awaiting_review') LIMIT 1").fetchone()
             if active is not None:
@@ -14093,6 +14184,10 @@ class ComposerRunner:
             raise StateError("survey mapping differs from its explicitly retained admission")
         _, _, original = self._read_verified_artifact_json(recovery["original_continuation_ref"])
         return original["cycle"]
+
+    def _survey_review_obligations(self, stage):
+        recovery = self._survey_revalidation_recovery(stage)
+        return deepcopy((recovery or {}).get("dependency_replay", {}).get("review_obligations", []))
 
     def _survey_producer_work_orders(self, stage):
         requests = self._requests_for_stage(stage)
@@ -15800,7 +15895,11 @@ class ComposerRunner:
                          "resume_ref": session["artifact_ref"], "resume_sha256": session["body_hash"],
                          "config_ref": config["artifact_ref"], "config_sha256": config["body_hash"],
                          "producer_checkpoint": evidence, "aggregate_attempt_id": attempt_id}
-                return [scope for scope in declared_scopes if scope != "mapping"], proof
+                remaining = [scope for scope in declared_scopes if scope != "mapping"]
+                recovery = self._survey_revalidation_recovery(stage)
+                if recovery is not None and "dependency_replay" in recovery:
+                    remaining = recovery["dependency_replay"]["resume_scopes"]
+                return remaining, proof
         except (sqlite3.Error, NotFoundError, KeyError, TypeError, ValueError, OSError):
             return declared_scopes, proof
 
@@ -17841,7 +17940,7 @@ class ComposerRunner:
         debt = record.get("failure_debt")
         if isinstance(debt, dict):
             failure_class = debt.get("failure_class")
-        if failure_class in {"resource_fence", "unknown_external_outcome",
+        if failure_class in {"resource_fence", "operational_recovery", "unknown_external_outcome",
                              "process_interruption"}:
             return False
         text = " ".join(str(record.get(key) or "") for key in ("error", "reason"))
@@ -19632,6 +19731,8 @@ class ComposerRunner:
 
     def _should_run_failure_specialist_review(self, error, stage=None):
         """Review scientific evidence, not transport or missing-input failures."""
+        if self._is_operational_stage_failure(error):
+            return False
         if (getattr(error, "capability_repair_panel_completed", False)
                 or getattr(error, "capability_repair_panel_attempted", False)
                 or getattr(error, "capability_repair_routed", False)):
@@ -20101,6 +20202,14 @@ class ComposerRunner:
             "progression_policy": self.workflow.get("progression_policy", "evidence_first"),
             "runtime_revision": self._stage_runtime_revision(),
         }
+        if stage["kind"] == "survey" and self.context.get(stage["id"], {}).get("revalidation_admission_ref"):
+            context = self.context[stage["id"]]
+            retained_project = self.stage_records.get(stage["id"], {}).get("project_dir") or context.get("project_dir") or stage["project_dir"]
+            recovery = self._survey_revalidation_recovery({**stage, "project_dir": retained_project})
+            receipt = self.store.get(context["revalidation_admission_ref"])
+            if recovery is None or receipt.get("author") != "command.composer":
+                raise StateError("survey stage cache has no owned revalidation admission")
+            packet["revalidation_admission"] = {"ref": receipt["artifact_ref"], "body_sha256": receipt["body_hash"]}
         if stage["kind"] == "topic_discovery":
             packet["topic_history"] = self._topic_history_context()
             # Topic intake is a sampling boundary, not a deterministic
@@ -20186,6 +20295,8 @@ class ComposerRunner:
             # A provider reset is a time boundary, not a failed scientific
             # revision. Scoped research holds likewise return work orders.
             from scisaurus.runtime.capability_foundry import CapabilityDeadlineError
+            if self._is_operational_stage_failure(exc):
+                raise
             if isinstance(exc, (ModelCallError, QuotaExceededError, *PROVIDER_OPERATOR_STOP_ERRORS, ProviderCooldownError, CapabilityDeadlineError,
                                 ComposerHardDeadlineExceeded, ComposerStageDeadlineExceeded)) or (
                     isinstance(exc, ModelCallError) and exc.status_code == 429):
@@ -22596,6 +22707,7 @@ class ComposerRunner:
                 delegation = self._stage_model_delegation(stage)
                 result = SurveyRunner(stage["project_dir"], config, on_progress=self._stage_progress(stage),
                                       work_orders=self._survey_producer_work_orders(stage),
+                                      review_obligations=self._survey_review_obligations(stage),
                                       resume_policy=resume_policy,
                                       provider_fallback=provider_fallback,
                                       model_call_budget_scopes=[delegation["scope"]] if delegation else [],
@@ -26926,6 +27038,7 @@ class ComposerRunner:
                             self._clear_child_progress(stage_id)
                             provider_paused = isinstance(exc, ProviderCooldownError)
                             provider_operator_stop = isinstance(exc, PROVIDER_OPERATOR_STOP_ERRORS)
+                            operational_stop = self._is_operational_stage_failure(exc)
                             provider_rate_limited = isinstance(exc, ProviderRateLimitError)
                             rate_limit = getattr(exc, "rate_limit", None)
                             model_rate_limited = (
@@ -26949,7 +27062,7 @@ class ComposerRunner:
                                     getattr(exc, "stage_result", None)) == "harness_bug"
                             )
                             resource_or_control_failure = (
-                                provider_paused or provider_operator_stop
+                                provider_paused or provider_operator_stop or operational_stop
                                 or isinstance(exc, QuotaExceededError)
                                 or isinstance(exc, (ComposerLateStageResult,
                                                     ComposerHardDeadlineExceeded,
@@ -27125,7 +27238,7 @@ class ComposerRunner:
                                     attempt_id, "failed", usage=failure_usage)
                                 self.tasks.transition(
                                     task_id,
-                                    "paused" if (provider_paused or provider_operator_stop) else "blocked",
+                                    "paused" if (provider_paused or provider_operator_stop or operational_stop) else "blocked",
                                     "command.composer",
                                     reason=str(exc),
                                 )
@@ -27186,7 +27299,7 @@ class ComposerRunner:
                             # an escalating cooldown and retry under the same
                             # mission deadline without replaying the blocked call.
                             retry_open = (
-                                not provider_operator_stop
+                                not provider_operator_stop and not operational_stop
                                 and not quota_exhausted
                                 and not model_rate_limited
                                 # Topic intake already has an explicit
@@ -27237,7 +27350,7 @@ class ComposerRunner:
                             self.stage_records[stage_id] = {
                                 "kind": stage["kind"],
                                 "status": ("retrying" if adaptive_retry_scheduled
-                                           else "paused" if (provider_paused or provider_operator_stop)
+                                           else "paused" if (provider_paused or provider_operator_stop or operational_stop)
                                            else "retrying" if retry_open else "blocked"),
                                 "task_id": task_id, "attempt_id": attempt_id, "attempt_number": attempt_number,
                                 "attempt_count": attempt_number, "attempts": deepcopy(attempt_history),
@@ -27311,6 +27424,16 @@ class ComposerRunner:
                                 self.retry_schedule.pop(stage_id, None)
                                 self.stage_records.setdefault(stage_id, {})["status"] = "retrying"
                                 adaptive_retry_scheduled = True
+                            if operational_stop:
+                                self.blockers.append({
+                                    "stage_id": stage_id, "reason": str(exc),
+                                    "stop_reason": "operational_state",
+                                    "failure": deepcopy(exc.stage_result["failure"]),
+                                    "model_calls_dispatched": failure_usage.get("model_calls", 0),
+                                })
+                                self.status = "paused"
+                                self._checkpoint(f"{stage_id}:operational_state", force=True)
+                                return self._finish()
                             if provider_operator_stop:
                                 stop_reason = ("provider_rate_limit" if provider_rate_limited
                                                else "provider_configuration")

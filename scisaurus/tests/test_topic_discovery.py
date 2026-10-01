@@ -2549,6 +2549,9 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["candidate_attempt_trace"][0]["status"], "admitted")
         self.assertEqual(len(result["candidate_attempt_trace"][0]["candidate_signatures"]), 3)
         self.assertEqual(result["candidate_attempt_trace"][0]["portfolio_profile"]["distinct"]["research_form"], 3)
+        self.assertEqual(result["question"], result["topic"]["research_question"])
+        self.assertNotEqual(result["question"], result["topic"]["why_promising"])
+        self.assertNotIn("proposed_gap", result)
 
     def test_runner_ignores_malformed_unselected_plans_and_repairs_selection(self):
         class InconsistentFeasibilityPortfolioModel(FakeModel):
@@ -2770,6 +2773,8 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["admission_state"], "provisional_for_survey")
         self.assertEqual(result["next_evidence_action"], "literature_survey")
+        self.assertEqual(result["question"], result["topic"]["research_question"])
+        self.assertNotIn("proposed_gap", result)
         self.assertEqual(len(result["maturity_open_requirements"]), 2)
         self.assertEqual(
             result["candidate_attempt_trace"][-1]["status"],

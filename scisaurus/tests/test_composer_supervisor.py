@@ -439,6 +439,17 @@ class ComposerSupervisorTests(unittest.TestCase):
                     self.assertTrue(supervisor._should_resume({**base, "active_blockers": [], "blockers": [blocker]}))
             self.assertFalse(supervisor._should_resume({**base, "stop_reason": "provider_rate_limit", "active_blockers": []}))
 
+    def test_operational_state_stops_supervisor_before_pending_requests(self):
+        with tempfile.TemporaryDirectory() as path:
+            supervisor = ComposerSupervisor({"id": "state-stop-test", "project_id": str(Path(path) / "project")})
+            base = {"status": "paused", "remaining_seconds": 3600,
+                    "active_research_requests": [{"objective": "Review retained literature"}]}
+            blocker = {"stage_id": "survey", "reason": "Dependency ownership mismatch",
+                       "stop_reason": "operational_state"}
+            self.assertFalse(supervisor._should_resume({**base, "active_blockers": [blocker]}))
+            self.assertFalse(supervisor._should_resume({**base, "stop_reason": "operational_state"}))
+            self.assertTrue(supervisor._should_resume({**base, "active_blockers": [], "blockers": [blocker]}))
+
     def test_model_429_stops_supervisor_without_replaying_the_mission(self):
         with tempfile.TemporaryDirectory() as path:
             supervisor = ComposerSupervisor({

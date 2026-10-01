@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from scisaurus.runtime.failure_recovery import (
-    build_failure_dossier, build_repair_request, classify_failure,
+    build_failure_dossier, build_repair_request, build_repair_commands, classify_failure,
 )
 from scisaurus.runtime.capability_foundry import SourceDataUnavailable
 from scisaurus.core.errors import ModelContractError, ProviderRateLimitError, QuotaExceededError, ValidationError
@@ -132,6 +132,17 @@ class FailureRecoveryTests(unittest.TestCase):
             classify_failure("survey", ValidationError("run requires a new project directory")),
             "operational_recovery",
         )
+
+    def test_operational_dependency_failure_preserves_completed_work(self):
+        result = {"status": "blocked", "failure": {"kind": "operational_state"}}
+        self.assertEqual(classify_failure("survey", ValidationError("Dependency ownership mismatch"), result),
+                         "operational_recovery")
+        commands = build_repair_commands("survey", "operational_recovery", stage_result=result)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["operation"], "reconcile")
+        self.assertIn("query receipts", commands[0]["instruction"])
+        self.assertIn("reproduced namespace collision", commands[0]["instruction"])
+        self.assertIn("unchanged deadline and allocation limits", commands[0]["acceptance_check"])
 
     def test_provider_rate_limit_remains_a_resource_fence_across_serialization(self):
         details = {"outcome": "rate_limited", "metadata": {"http_status": 429}}
