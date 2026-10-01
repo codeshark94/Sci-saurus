@@ -327,7 +327,6 @@ class SurveyGate:
                 raise ValidationError("survey dependencies must pin its independent critique receipts")
             self._passed_checks(checks, work_review_checks(relationships, supplied_critiques), "focused work review")
             reply = normalize_check_envelope(reply, work_review_checks(relationships, supplied_critiques))
-            validate_work_review(reply, relationships, entry=entry_body, review_obligations=supplied_critiques)
             if execution["artifact_ref"] not in dependencies:
                 raise ValidationError("survey dependencies must pin every focused review execution")
             if prompt.get("entry_ref") != entry_ref or prompt.get("relationship_refs") != relationships:
@@ -343,6 +342,7 @@ class SurveyGate:
                 [{**relationship_bodies[ref], "artifact_ref": ref} for ref in relationships])
             if reply.get("checks") != checks or reply.get("rationale") != body["rationale"]:
                 raise ValidationError("focused work review does not match the completed model reply")
+            validate_work_review(reply, relationships, entry=entry_body, review_obligations=supplied_critiques)
             reviewed.add(entry_ref)
             evidence.extend((review, execution, context))
         if reviewed != set(entry_refs):

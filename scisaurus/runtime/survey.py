@@ -199,6 +199,44 @@ def source_fidelity_review_contract():
     }
 
 
+def normalize_survey_repair_owners(value, entries, relationships):
+    """Route exact relationship grants by their immutable source ownership."""
+    if not isinstance(value, dict) or set(value) != {"repairs"} or not isinstance(value["repairs"], list):
+        return value
+    seen_entries, seen_relationships = set(), set()
+    for item in value["repairs"]:
+        if (not isinstance(item, dict) or set(item) != {"entry_ref", "entry_fields", "relationship_refs", "rationale"}
+                or not isinstance(item["entry_ref"], str) or item["entry_ref"] not in entries.values()
+                or item["entry_ref"] in seen_entries or not isinstance(item["rationale"], str)
+                or not item["rationale"].strip()):
+            return value
+        seen_entries.add(item["entry_ref"])
+        fields, refs = item["entry_fields"], item["relationship_refs"]
+        if (not isinstance(fields, list) or not all(isinstance(field, str) for field in fields)
+                or len(set(fields)) != len(fields) or not set(fields) <= {"inclusion", "reason", *MAP_FIELDS}
+                or not isinstance(refs, list) or not all(isinstance(ref, str) for ref in refs)
+                or len(set(refs)) != len(refs) or not fields and not refs
+                or any(ref not in relationships or ref in seen_relationships
+                       or relationships[ref]["source"] not in entries for ref in refs)):
+            return value
+        seen_relationships.update(refs)
+    grants = {}
+    def grant(ref, rationale):
+        item = grants.setdefault(ref, {"entry_ref": ref, "entry_fields": [], "relationship_refs": [], "rationales": []})
+        if rationale not in item["rationales"]:
+            item["rationales"].append(rationale)
+        return item
+    for item in value["repairs"]:
+        if item["entry_fields"]:
+            grant(item["entry_ref"], item["rationale"])["entry_fields"].extend(item["entry_fields"])
+        for ref in item["relationship_refs"]:
+            owner = entries[relationships[ref]["source"]]
+            grant(owner, item["rationale"])["relationship_refs"].append(ref)
+    return {"repairs": [{"entry_ref": ref, "entry_fields": item["entry_fields"],
+                         "relationship_refs": item["relationship_refs"],
+                         "rationale": "\n".join(item["rationales"])} for ref, item in sorted(grants.items())]}
+
+
 _HTTP_STATUS_FIELDS = frozenset({"status", "status_code", "http_status", "provider_http_status"})
 
 
@@ -4617,7 +4655,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 if not isinstance(item["rationale"], str) or not item["rationale"].strip():
                     raise ModelContractError("aggregate repair needs a concrete diagnosis")
         value, execution = self._model_checked("survey-repair-plan", "research.literature-mapper",
-                                              assignment, validate, stage="revision", task_kind="selection")
+                                              assignment, validate, stage="revision", task_kind="selection",
+                                              normalizer=lambda value: normalize_survey_repair_owners(value, entries, relations))
         plan = self._record("kb/survey-review-repair-plan", "decision_note", {
             "review_ref": review_record["artifact_ref"], "execution_ref": execution, **value,
         }, "research.literature-mapper", subjects=[review_record["artifact_ref"], execution, *entries.values(), *relations])

@@ -28,6 +28,7 @@ from scisaurus.runtime.model_work import ModelWorkBlocked
 from scisaurus.runtime.models import estimate_input_tokens
 from scisaurus.runtime.survey import (SurveyRunner, apply_scoped_map_repair,
                                       countersearch_lineage,
+                                      normalize_survey_repair_owners,
                                       normalize_map_relationships,
                                       normalize_map_worker_response,
                                       overlay_post_checkpoint_relationships,
@@ -4159,6 +4160,32 @@ class TestSurveyRunner(unittest.TestCase):
 
 
 class TestSurveyContracts(unittest.TestCase):
+    def test_relationship_repair_routes_by_source_without_moving_entry_fields(self):
+        entries = {"W1": "artifact:kb/entry/W1@1", "W2": "artifact:kb/entry/W2@1"}
+        ref = "artifact:kb/relationship/W1-W2@1"
+        relations = {ref: {"source": "W1", "target": "W2"}}
+        raw = {"repairs": [{"entry_ref": entries["W2"], "entry_fields": ["finding"],
+                            "relationship_refs": [ref], "rationale": "Narrow the supported scopes."}]}
+        repaired = normalize_survey_repair_owners(raw, entries, relations)
+        grants = {item["entry_ref"]: item for item in repaired["repairs"]}
+        self.assertEqual(grants[entries["W1"]]["relationship_refs"], [ref])
+        self.assertEqual(grants[entries["W1"]]["entry_fields"], [])
+        self.assertEqual(grants[entries["W2"]]["entry_fields"], ["finding"])
+        self.assertEqual(grants[entries["W2"]]["relationship_refs"], [])
+        self.assertEqual(normalize_survey_repair_owners(repaired, entries, relations), repaired)
+        self.assertEqual(raw["repairs"][0]["entry_ref"], entries["W2"])
+
+    def test_relationship_owner_normalization_does_not_repair_stale_or_duplicate_grants(self):
+        entries = {"W1": "artifact:kb/entry/W1@1", "W2": "artifact:kb/entry/W2@1"}
+        ref = "artifact:kb/relationship/W1-W2@1"
+        relations = {ref: {"source": "W1", "target": "W2"}}
+        item = {"entry_ref": entries["W2"], "entry_fields": [], "relationship_refs": [ref], "rationale": "Inspect the relationship."}
+        for raw in ({"repairs": [{**item, "relationship_refs": [ref.replace("@1", "@2")]}]},
+                    {"repairs": [{**item, "entry_ref": entries["W2"].replace("@1", "@2")}]},
+                    {"repairs": [item, {**item, "entry_ref": entries["W1"]}]},
+                    {"repairs": [{**item, "entry_fields": ["finding", "finding"]}]}):
+            self.assertIs(normalize_survey_repair_owners(raw, entries, relations), raw)
+
     def test_critique_checks_cannot_be_omitted_or_replace_narrow_failure_fields(self):
         obligations = [{"work_id": "W1", "hypothesis": "A current numerical claim may omit its conditions."}]
         required = work_review_checks([], obligations)
