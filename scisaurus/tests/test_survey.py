@@ -4544,6 +4544,29 @@ class TestSurveyContracts(unittest.TestCase):
         missing = {"checks": before["checks"][1:], "rationale": before["rationale"]}
         self.assertIs(normalize_check_envelope(missing, required), missing)
 
+    def test_unresolved_critique_links_project_only_explicit_nonpassed_targets(self):
+        from scisaurus.runtime.survey_records import normalize_check_envelope
+        obligations = [{"work_id": "W1", "hypothesis": "Assess the current screening decision."}]
+        required = work_review_checks([], obligations)
+        value = {"checks": check_rows(required), "rationale": "The screening decision is unsupported."}
+        value["checks"][0]["outcome"] = "failed"
+        value["checks"][-1].update(outcome="failed", affected_check_ids=["inclusion", "reason"])
+        before = deepcopy(value)
+        normalized = normalize_check_envelope(value, required)
+        self.assertEqual(normalized["checks"][-1]["affected_check_ids"], ["inclusion"])
+        self.assertEqual([(row["check_id"], row["outcome"]) for row in normalized["checks"]],
+                         [(row["check_id"], row["outcome"]) for row in before["checks"]])
+        self.assertEqual(value, before)
+        validate_work_review(normalized, [], review_obligations=obligations)
+        for links in ([], ["reason"], ["unknown", "inclusion"], ["inclusion", "inclusion"],
+                      ["inclusion", "reason", "reason"], None, "inclusion"):
+            bad = deepcopy(value); bad["checks"][-1]["affected_check_ids"] = links
+            with self.subTest(links=links), self.assertRaises(ValidationError):
+                validate_work_review(normalize_check_envelope(bad, required), [], review_obligations=obligations)
+        bad = deepcopy(value); bad["checks"][-1].pop("affected_check_ids")
+        with self.assertRaises(ValidationError):
+            validate_work_review(normalize_check_envelope(bad, required), [], review_obligations=obligations)
+
     def test_each_failed_critique_requires_its_own_nonpassed_claim_check(self):
         obligations = [{"work_id": "W1", "hypothesis": hypothesis} for hypothesis in ("Finding scope.", "Limitations scope.")]
         required = work_review_checks([], obligations)

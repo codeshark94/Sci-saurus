@@ -59,7 +59,9 @@ def normalize_check_envelope(value, required):
     allowed only when every required ID occurs exactly once; missing required
     checks still fail normally. A passed critique has no affected failed check;
     its omitted empty list is structurally determined by that explicit verdict.
-    Unresolved critique links are never inferred.
+    Unresolved critique links are never inferred. Explicit links to passed
+    ordinary checks can be removed only when a known non-passed link remains;
+    check outcomes and scientific assertions are never changed.
     """
     if not isinstance(value, dict) or not isinstance(value.get("checks"), list):
         return value
@@ -88,6 +90,16 @@ def normalize_check_envelope(value, required):
         if row["check_id"].startswith("critique:") and row.get("outcome") == "passed"
         and "affected_check_ids" not in row else row
         for row in projected["checks"]]
+    ordinary = {row["check_id"]: row.get("outcome") for row in projected["checks"]
+                if not row["check_id"].startswith("critique:")}
+    unresolved = {key for key, outcome in ordinary.items() if outcome != "passed"}
+    for index, row in enumerate(projected["checks"]):
+        links = row.get("affected_check_ids")
+        if (row["check_id"].startswith("critique:") and row.get("outcome") != "passed"
+                and isinstance(links, list) and all(isinstance(key, str) and key in ordinary for key in links)
+                and len(set(links)) == len(links)
+                and any(key in unresolved for key in links)):
+            projected["checks"][index] = {**row, "affected_check_ids": [key for key in links if key in unresolved]}
     return projected
 
 
