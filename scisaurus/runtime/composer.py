@@ -21623,6 +21623,9 @@ class ComposerRunner:
 
     @staticmethod
     def _format_recovery_policy_revision(stage):
+        if isinstance(stage, dict) and stage.get("kind") == "survey":
+            from scisaurus.runtime.survey_records import SURVEY_RESPONSE_CONTRACT_REVISION
+            return SURVEY_RESPONSE_CONTRACT_REVISION
         if isinstance(stage, dict) and stage.get("kind") == "topic_discovery":
             return TOPIC_RESPONSE_CONTRACT_REVISION
         if isinstance(stage, dict) and stage.get("kind") == "argument":

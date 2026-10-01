@@ -14717,6 +14717,40 @@ class ComposerWorkflowTests(unittest.TestCase):
                 runner.active_research_requests[0]["objective"])
             runner.close()
 
+    def test_survey_contract_revision_admits_one_native_same_stage_recovery(self):
+        from scisaurus.runtime.survey_records import SURVEY_RESPONSE_CONTRACT_REVISION
+        with tempfile.TemporaryDirectory() as path:
+            workflow = self._workflow(Path(path))
+            stage = next(item for item in workflow["stages"] if item["kind"] == "survey")
+            workflow["stages"] = [stage]
+            workflow["completion"]["required_stage_ids"] = [stage["id"]]
+            workflow["continuation_policy"] = {"mode": "bounded", "max_cycles": 1}
+            runner = ComposerRunner(workflow)
+            self.addCleanup(runner.close)
+            runner.continuation_cycles = 1
+            runner._continuation_budget_baseline = 0
+            self.assertEqual(runner._continuation_budget_used(), workflow["continuation_policy"]["max_cycles"])
+            error = ModelWorkBlocked("survey-review did not satisfy its evidence contract: finding quote location is invalid")
+            error.failure_class = "model_contract"
+            with patch.object(ComposerRunner, "_format_recovery_policy_revision", return_value=None):
+                old_signature = runner._format_recovery_signature(stage, error)
+            runner.format_recovery_ledger[old_signature] = {"stage_id": stage["id"], "status": "exhausted"}
+            runner.context[stage["id"]] = {"kind": "survey", "status": "blocked", "error": str(error),
+                "project_dir": stage["project_dir"], "format_recovery": True,
+                "format_recovery_dispatched": True, "format_recovery_policy_revision": None,
+                "review_status": "format_recovery_exhausted", "failure_class": "model_contract",
+                "failure_recovery": {"failure_class": "model_contract", "recovery_mode": "format_repair_then_rerun"}}
+            deadline = runner.deadline_epoch
+            self.assertTrue(runner._admit_scientific_blocker_recovery(stage, error, set(), {stage["id"]: stage}))
+            self.assertEqual(runner.continuation_cycles, 2)
+            context = runner.context[stage["id"]]
+            self.assertEqual(context["project_dir"], stage["project_dir"])
+            self.assertEqual(context["format_recovery_policy_revision"], SURVEY_RESPONSE_CONTRACT_REVISION)
+            signature = context["format_recovery_signature"]
+            self.assertEqual(runner.format_recovery_ledger[signature]["status"], "dispatched")
+            self.assertFalse(runner._admit_scientific_blocker_recovery(stage, error, set(), {stage["id"]: stage}))
+            self.assertEqual(runner.deadline_epoch, deadline)
+
     def test_topic_contract_failure_runs_before_pending_scientific_refinement(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)

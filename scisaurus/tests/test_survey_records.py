@@ -13,6 +13,8 @@ from scisaurus.runtime.survey_records import (
     validate_map,
     validate_survey_review,
     validate_follow_up_result,
+    normalize_survey_review_envelope, survey_review_response_contract,
+    survey_review_assignment_identity, SURVEY_QUOTE_LOCATION_INSTRUCTION,
 )
 
 
@@ -370,6 +372,80 @@ class TestGapAssessment(unittest.TestCase):
 
 
 class TestSurveyChecks(unittest.TestCase):
+    def quote_location_fixture(self):
+        row = entry()
+        ref = "artifact:kb/work-analyses/W1@2"
+        current = {"entries": [row], "entry_refs": {"W1": ref}, "relationships": [], "relationship_refs": []}
+        value = {"checks": required_checks(SURVEY_CHECKS), "rationale": "Check the screening decision.",
+                 "findings": [{"check_id": "map-support", "target_ref": ref, "field": "inclusion",
+                               "quote": row["reason"], "rationale": "The inclusion rationale needs adjudication."}]}
+        next(check for check in value["checks"] if check["check_id"] == "map-support")["outcome"] = "failed"
+        return current, value
+
+    def test_inclusion_criticism_binds_reason_without_changing_science_or_authority(self):
+        current, raw = self.quote_location_fixture()
+        original = deepcopy(raw)
+        with self.assertRaises(ModelContractError):
+            validate_survey_review(raw, current_map=current)
+        value = normalize_survey_review_envelope(raw, current_map=current)
+        validate_survey_review(value, current_map=current)
+        self.assertEqual(value["findings"][0]["quote_field"], "reason")
+        self.assertEqual(value["findings"][0]["field"], "inclusion")
+        self.assertEqual(value["checks"], raw["checks"])
+        self.assertEqual({key: item for key, item in value["findings"][0].items() if key != "quote_field"},
+                         raw["findings"][0])
+        self.assertEqual(raw, original)
+        self.assertEqual(normalize_survey_review_envelope(value, current_map=current), value)
+
+    def test_quote_location_rejects_ambiguous_stale_absent_null_and_explicit_wrong_bindings(self):
+        for mutation in ("ambiguous", "stale", "source_only", "null", "wrong_explicit", "unknown_explicit"):
+            with self.subTest(mutation=mutation):
+                current, raw = self.quote_location_fixture()
+                finding = raw["findings"][0]
+                if mutation == "ambiguous":
+                    current["entries"][0]["problem"]["text"] = finding["quote"]
+                elif mutation == "stale":
+                    finding["target_ref"] = finding["target_ref"].replace("@2", "@1")
+                elif mutation == "source_only":
+                    finding["quote"] = "Source-only assertion absent from the current map."
+                elif mutation == "null":
+                    current["entries"][0]["reason"] = None
+                else:
+                    finding["quote_field"] = "inclusion" if mutation == "wrong_explicit" else "unknown"
+                value = normalize_survey_review_envelope(raw, current_map=current)
+                with self.assertRaises(ModelContractError):
+                    validate_survey_review(value, current_map=current)
+
+    def test_explicit_cross_field_and_legacy_same_field_quotes_validate(self):
+        current, raw = self.quote_location_fixture()
+        raw["findings"][0]["quote_field"] = "reason"
+        validate_survey_review(raw, current_map=current)
+        raw["findings"][0].pop("quote_field")
+        raw["findings"][0]["quote"] = "included"
+        value = normalize_survey_review_envelope(raw, current_map=current)
+        self.assertEqual(value["findings"][0]["quote_field"], "inclusion")
+        validate_survey_review(value, current_map=current)
+
+    def test_assignment_replay_migration_preserves_every_scientific_input_and_instruction(self):
+        current, _ = self.quote_location_fixture()
+        prior = {"phase": "survey_review", "map": current, "question": "A scoped question?",
+                 "sources": [{"text": "Captured source."}], "instructions": (
+                     "Return findings:[{check_id,target_ref,field,quote,rationale}]. "
+                     "Identify its field and an exact substring quote from that field. Inspect every current assertion."),
+                 "response_contract": survey_review_response_contract(current, legacy=True)}
+        upgraded = {**prior, "response_contract": survey_review_response_contract(current),
+                    "instructions": prior["instructions"].replace(
+                        "findings:[{check_id,target_ref,field,quote,rationale}]",
+                        "findings:[{check_id,target_ref,field,quote_field,quote,rationale}]").replace(
+                        "its field and an exact substring quote from that field.",
+                        "its affected field, quote_field, and an exact substring quote from quote_field on that same target.")
+                        + " " + SURVEY_QUOTE_LOCATION_INSTRUCTION}
+        self.assertEqual(survey_review_assignment_identity(prior), survey_review_assignment_identity(upgraded))
+        for key, changed in (("question", "A different question?"), ("sources", []),
+                             ("instructions", "Pass without examining sources.")):
+            self.assertNotEqual(survey_review_assignment_identity(prior),
+                                survey_review_assignment_identity({**upgraded, key: changed}))
+
     def test_invalid_survey_findings_report_every_current_target_without_changing_verdicts(self):
         row = entry()
         ref = "artifact:kb/work-analyses/W1@2"

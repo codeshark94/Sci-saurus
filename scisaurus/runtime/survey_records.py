@@ -13,6 +13,19 @@ MAP_FIELDS = ("problem", "approach", "finding", "limitations")
 SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
 GAP_CHECKS = ("closest-prior-work", "scope-comparability", "counterevidence", "full-text-support")
 REVIEW_CHECK_FIELDS = frozenset({"check_id", "outcome", "method", "result"})
+SURVEY_RESPONSE_CONTRACT_REVISION = "survey-finding-quote-location-1"
+SURVEY_QUOTE_LOCATION_INSTRUCTION = (
+    "Finding field identifies the affected decision or assertion and controls repair authority; "
+    "quote_field separately identifies the field containing the exact quote on the same target_ref. "
+    "Use quote_field=reason when challenging inclusion with its screening rationale. "
+    "Never change field merely to match the quote, and never quote a source or historical target."
+)
+_SURVEY_QUOTE_SCHEMA_MIGRATION = (
+    ("findings:[{check_id,target_ref,field,quote,rationale}]",
+     "findings:[{check_id,target_ref,field,quote_field,quote,rationale}]"),
+    ("its field and an exact substring quote from that field.",
+     "its affected field, quote_field, and an exact substring quote from quote_field on that same target."),
+)
 CRITIQUE_DISPOSITIONS = {
     "current_defect": "The critique identifies an unsupported or unverified current assertion.",
     "corrected": "The original defect was corrected in the current entry or relationships.",
@@ -21,9 +34,9 @@ CRITIQUE_DISPOSITIONS = {
 }
 
 
-def survey_review_response_contract(current_map):
+def survey_review_response_contract(current_map, *, legacy=False):
     """Expose the exact review envelope and immutable finding destinations."""
-    return {
+    contract = {
         "required_fields": ["checks", "rationale"],
         "optional_fields": ["findings"],
         "checks": [{"check_id": name, "required_fields": sorted(REVIEW_CHECK_FIELDS),
@@ -39,6 +52,72 @@ def survey_review_response_contract(current_map):
             "check_id": "A non-passed required check; omit findings for supported assertions.",
         },
     }
+    if not legacy:
+        contract["findings"].update(
+            optional_fields=["quote_field"],
+            field="The affected decision or assertion; this field alone controls repair authority.",
+            quote_field="The field containing the quote on the same exact target_ref; defaults to field.",
+            quote="An exact substring of quote_field on the current target, not a source quotation or a historical assertion.",
+        )
+    return contract
+
+
+def survey_review_assignment_identity(assignment):
+    """Canonicalize only the known quote-location schema migration for replay."""
+    value = deepcopy(assignment)
+    current_map = value.get("map")
+    if value.get("phase") != "survey_review" or not isinstance(current_map, dict):
+        return value
+    contract = value.get("response_contract")
+    if contract not in (survey_review_response_contract(current_map),
+                        survey_review_response_contract(current_map, legacy=True)):
+        return value
+    value["response_contract"] = survey_review_response_contract(current_map)
+    instructions = value.get("instructions")
+    suffix = " " + SURVEY_QUOTE_LOCATION_INSTRUCTION
+    if isinstance(instructions, str) and instructions.endswith(suffix):
+        instructions = instructions[:-len(suffix)]
+    if isinstance(instructions, str):
+        for prior, current in _SURVEY_QUOTE_SCHEMA_MIGRATION:
+            instructions = instructions.replace(current, prior)
+        value["instructions"] = instructions
+    return value
+
+
+def _survey_review_targets(current_map):
+    targets = {}
+    for entry in current_map["entries"]:
+        ref = current_map["entry_refs"][entry["work_id"]]
+        targets[ref] = {field: entry[field] if field in {"inclusion", "reason"} else entry[field]["text"]
+                        for field in ("inclusion", "reason", *MAP_FIELDS)}
+    for relation in current_map["relationships"]:
+        targets[relation["artifact_ref"]] = {"claim": relation["claim"]["text"]}
+    return targets
+
+
+def normalize_survey_review_envelope(value, *, current_map):
+    """Bind unchanged legacy quotes to unambiguous fields on their exact target."""
+    value = deepcopy(normalize_check_envelope(value, SURVEY_CHECKS))
+    if not isinstance(value, dict) or not isinstance(value.get("findings"), list):
+        return value
+    targets = _survey_review_targets(current_map)
+    for finding in value["findings"]:
+        if not isinstance(finding, dict) or "quote_field" in finding:
+            continue
+        ref, field, quote = (finding.get(key) for key in ("target_ref", "field", "quote"))
+        if not all(isinstance(item, str) for item in (ref, field, quote)) or not quote.strip():
+            continue
+        target = targets.get(ref, {})
+        if field not in target:
+            continue
+        text = target[field]
+        if isinstance(text, str) and quote in text:
+            finding["quote_field"] = field
+            continue
+        matches = [key for key, text in target.items() if isinstance(text, str) and quote in text]
+        if len(matches) == 1:
+            finding["quote_field"] = matches[0]
+    return value
 
 
 BODY_SECTION_MARKERS = ("Introduction", "Background", "Methods", "Materials and Methods",
@@ -642,19 +721,14 @@ def validate_survey_review(value, *, current_map=None):
     findings = value.get("findings", [])
     if not isinstance(findings, list):
         raise ModelContractError("survey findings must be a list")
-    targets = {}
-    for entry in current_map["entries"]:
-        ref = current_map["entry_refs"][entry["work_id"]]
-        targets[ref] = {field: entry[field] if field in {"inclusion", "reason"} else entry[field]["text"]
-                        for field in ("inclusion", "reason", *MAP_FIELDS)}
-    for relation in current_map["relationships"]:
-        targets[relation["artifact_ref"]] = {"claim": relation["claim"]["text"]}
+    targets = _survey_review_targets(current_map)
     grounded = set()
     errors = []
     for index, finding in enumerate(findings):
         path = f"findings[{index}]"
         try:
-            exact(finding, {"check_id", "target_ref", "field", "quote", "rationale"}, "survey finding")
+            exact(finding, {"check_id", "target_ref", "field", "quote", "rationale",
+                            *({"quote_field"} if "quote_field" in finding else set())}, "survey finding")
         except ValidationError as exc:
             errors.append(f"{path}: {exc}")
             continue
@@ -674,10 +748,14 @@ def validate_survey_review(value, *, current_map=None):
         if field not in targets[ref]:
             errors.append(f"{path}.field {field!r}: target {ref!r} permits only {sorted(targets[ref])}")
             continue
-        text = targets[ref][field]
+        quote_field = finding.get("quote_field", field)
+        if not isinstance(quote_field, str) or quote_field not in targets[ref]:
+            errors.append(f"{path}.quote_field {quote_field!r}: target {ref!r} permits only {sorted(targets[ref])}")
+            continue
+        text = targets[ref][quote_field]
         if not isinstance(text, str) or quote not in text:
             errors.append(f"{path}.quote: survey finding must quote an exact current target field; "
-                          f"target_ref={ref!r}, field={field!r}, current_field={text!r}. "
+                          f"target_ref={ref!r}, field={field!r}, current_field={text!r}, quote_field={quote_field!r}. "
                           "Reassess the allegation against this current field and captured sources; "
                           "do not replace a historical quotation with unrelated current text merely to satisfy the contract.")
             continue

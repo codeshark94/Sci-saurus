@@ -41,6 +41,7 @@ from scisaurus.runtime.survey_records import (
     BODY_SECTION_MARKERS, authoritative_source, has_section_heading as _has_section_heading,
     normalize_gap_assessment_envelope, validate_map,
     validate_survey_review, validate_assessment, validate_work_review, survey_review_response_contract,
+    normalize_survey_review_envelope, survey_review_assignment_identity, SURVEY_QUOTE_LOCATION_INSTRUCTION,
 )
 from scisaurus.runtime.time_policy import TimePolicy
 
@@ -1393,7 +1394,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             for candidate in (prior_assignment, current_assignment):
                 candidate.pop("resume_boundary", None)
                 candidate.pop("_contract_repair_boundary", None)
-            if canonical_bytes(prior_assignment) == canonical_bytes(current_assignment):
+            if canonical_bytes(survey_review_assignment_identity(prior_assignment)) == canonical_bytes(
+                    survey_review_assignment_identity(current_assignment)):
                 return {"error": error, "previous_response": previous_response,
                     "finish_reason": validation_body.get("finish_reason", "stop"),
                     "execution_ref": execution["artifact_ref"],
@@ -4895,8 +4897,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "relationship_semantics": RELATIONSHIP_SEMANTICS,
             "required_checks": sorted(SURVEY_CHECKS),
             "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
-            "instructions": "Return exactly one JSON object {checks:[{check_id,outcome,method,result}],rationale,findings:[{check_id,target_ref,field,quote,rationale}]}; no preamble, markdown, or analysis transcript. Execute exactly the required checks. "
-                "For each non-passed source-fidelity or map-support check supply at least one finding identifying an exact CURRENT entry_ref or relationship artifact_ref, its field and an exact substring quote from that field. Explain the concrete defect against the captured sources. Do not invent a current statement or screening status. Entry fields are inclusion, reason, problem, approach, finding, limitations; relationship field is claim. Passed checks have no findings. Coverage-accounting may be explained in its check result. "
+            "instructions": "Return exactly one JSON object {checks:[{check_id,outcome,method,result}],rationale,findings:[{check_id,target_ref,field,quote_field,quote,rationale}]}; no preamble, markdown, or analysis transcript. Execute exactly the required checks. "
+                "For each non-passed source-fidelity or map-support check supply at least one finding identifying an exact CURRENT entry_ref or relationship artifact_ref, its affected field, quote_field, and an exact substring quote from quote_field on that same target. Explain the concrete defect against the captured sources. Do not invent a current statement or screening status. Entry fields are inclusion, reason, problem, approach, finding, limitations; relationship field is claim. Passed checks have no findings. Coverage-accounting may be explained in its check result. "
                 "Outcomes passed/failed/insufficient_evidence/check_failed. Passing approves a faithful bounded survey, not novelty or exhaustive coverage. "
                 "Check accurate coverage/accounting, faithful quotations and source scope, and support for every asserted map claim. "
                 "The question is a hypothesis for later investigation, not a claim that this survey must prove or disprove. "
@@ -4937,13 +4939,14 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "identity conflict in an included work, or accounting inconsistency if one exists; "
                 "otherwise pass the map and retain corpus limits as explicit coverage limitations."
             )
+        review_assignment["instructions"] += " " + SURVEY_QUOTE_LOCATION_INSTRUCTION
         limit = self._map_input_limit("methods.survey-reviewer")
         if limit is not None and estimate_input_tokens(SYSTEM, json.dumps(self._follow_up_assignment(review_assignment), ensure_ascii=False)) > limit:
             raise ValidationError("integrated survey review cannot fit all mandatory source evidence within its configured input budget")
         value, execution = self._model_checked(
             "survey-review", "methods.survey-reviewer", review_assignment,
             lambda value: validate_survey_review(value, current_map=review_packet["map"]),
-            normalizer=lambda value: normalize_check_envelope(value, SURVEY_CHECKS),
+            normalizer=lambda value: normalize_survey_review_envelope(value, current_map=review_packet["map"]),
             model_overrides={"temperature": 0.1},
             stage="unit_review", task_kind="verification")
         review_body = {"survey_ref": bundle["artifact_ref"], "execution_ref": execution, **value}

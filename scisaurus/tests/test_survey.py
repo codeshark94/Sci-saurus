@@ -289,6 +289,8 @@ def simulated_survey_worker(kind, params, channel):
                 value["entries"][0]["reason"] = "The method generalizes to every task."
         if mode in {"review-obligation-adversary", "aggregate-scoped-repair"} and assignment.get("semantic_feedback") is not None:
             value = {"entry_updates": {"reason": "The captured study examines recall timing."}, "relationships": []}
+        if mode == "aggregate-inclusion-quote" and assignment.get("semantic_feedback") is not None:
+            value = {"entry_updates": {"inclusion": "uncertain"}, "relationships": []}
         if mode.startswith("map-links") and assignment["requested_work_ids"] == ["W101"]:
             proofs = [source_quote(next(source for source in assignment["sources"] if source["work_id"] == wid))
                       for wid in ("W101", "W102")]
@@ -302,6 +304,10 @@ def simulated_survey_worker(kind, params, channel):
             value["repairs"] = [{"entry_ref": assignment["entry_refs"]["W101"],
                 "entry_fields": ["reason"] if mode == "aggregate-scoped-repair" else ["invented_field"],
                 "relationship_refs": [], "rationale": "The retained screening qualifier is unsupported."}]
+        if mode == "aggregate-inclusion-quote":
+            value["repairs"] = [{"entry_ref": assignment["entry_refs"]["W101"],
+                "entry_fields": ["inclusion"], "relationship_refs": [],
+                "rationale": "The inclusion decision needs a narrower screening state."}]
     elif phase == "survey_review":
         value = {"checks": check_rows(SURVEY_CHECKS), "rationale": "The map preserves unknown facts and bounded coverage."}
         if mode == "survey-review-malformed":
@@ -342,6 +348,14 @@ def simulated_survey_worker(kind, params, channel):
                 "rationale": row["result"]}
                 for row in value["checks"] if target is not None
                 and row["outcome"] != "passed" and row["check_id"] in {"source-fidelity", "map-support"}]
+        if mode == "aggregate-inclusion-quote":
+            target = next(entry for entry in assignment["map"]["entries"] if entry["work_id"] == "W101")
+            if target["inclusion"] == "included":
+                next(row for row in value["checks"] if row["check_id"] == "map-support").update(
+                    outcome="failed", result="Adjudicate the inclusion decision from its rationale.")
+                value["findings"] = [{"check_id": "map-support",
+                    "target_ref": assignment["map"]["entry_refs"]["W101"], "field": "inclusion",
+                    "quote": target["reason"], "rationale": "The included screening state requires adjudication."}]
     elif phase == "work_review":
         if mode in {"review-malformed", "isolated-review-block"} and assignment["entry"]["work_id"] == "W101":
             value = {"checks": [{"check_id": "duplicate-check", "outcome": "passed",
@@ -1878,6 +1892,53 @@ class TestSurveyRunner(unittest.TestCase):
             "gap-assessment", {**assignment, "survey_ref": "artifact:kb/surveys/current@2"}))
         runner.control.close()
 
+    def test_resume_reuses_negative_aggregate_reply_after_quote_location_schema_migration(self):
+        from scisaurus.runtime.survey_records import (
+            normalize_survey_review_envelope, survey_review_response_contract,
+            validate_survey_review, SURVEY_QUOTE_LOCATION_INSTRUCTION)
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        ref = "artifact:kb/work-analyses/W101@1"
+        row = {"work_id": "W101", "inclusion": "included", "reason": "The study examines recall timing.",
+               **{field: {"text": None, "evidence": []} for field in MAP_FIELDS}}
+        current_map = {"entries": [row], "entry_refs": {"W101": ref}, "relationships": [], "relationship_refs": []}
+        base = runner._follow_up_assignment({"phase": "survey_review", "map": current_map,
+            "question": "Which mechanism explains recall timing?", "survey_ref": "artifact:kb/surveys/current@1",
+            "instructions": "Inspect the current map.",
+            "response_contract": survey_review_response_contract(current_map, legacy=True)})
+        upgraded = {**base, "response_contract": survey_review_response_contract(current_map),
+                    "instructions": base["instructions"] + " " + SURVEY_QUOTE_LOCATION_INSTRUCTION}
+        raw = {"checks": check_rows(SURVEY_CHECKS), "rationale": "The inclusion decision needs adjudication.",
+               "findings": [{"check_id": "map-support", "target_ref": ref, "field": "inclusion",
+                             "quote": row["reason"], "rationale": "The rationale does not justify inclusion."}]}
+        next(check for check in raw["checks"] if check["check_id"] == "map-support")["outcome"] = "failed"
+        task_id = "survey-survey-review-retained"
+        runner.tasks.create(task_id, "verification", {"operation": "model"}, "command.controller")
+        runner.tasks.admit(task_id, "command.controller")
+        runner.tasks.start_attempt(task_id, "attempt-review-retained", owner="methods.survey-reviewer", lease_ttl_seconds=30)
+        context = runner._publish("command/contexts/" + task_id, "note", {
+            "client": {"model": "fixture"}, "prompt": json.dumps(base)}, "methods.survey-reviewer")
+        execution = runner._publish("command/executions/" + task_id, "report", {"text": json.dumps(raw)},
+            "methods.survey-reviewer", subjects=[context["artifact_ref"]])
+        runner.tasks.finish_attempt("attempt-review-retained", "succeeded", usage={"model_calls": 1})
+        runner.tasks.transition(task_id, "blocked", "command.controller", reason="quote location requires validation")
+        proposal = runner._publish("kb/model-proposals/" + task_id, "note", raw,
+            "methods.survey-reviewer", subjects=[execution["artifact_ref"]])
+        runner._publish("command/validation/" + task_id, "note", {"error": "quote differs from inclusion enum"},
+            "command.controller", subjects=[proposal["artifact_ref"]])
+        runner.resume_session = {"session": 2}
+        job = {"name": "survey-review", "actor": "methods.survey-reviewer", "assignment": upgraded,
+               "validator": lambda value: validate_survey_review(value, current_map=current_map),
+               "normalizer": lambda value: normalize_survey_review_envelope(value, current_map=current_map)}
+        with patch.object(runner, "_call_batch", side_effect=AssertionError("paid review was dispatched again")):
+            value, execution_ref = runner._models_checked([job])["survey-review"]
+        self.assertEqual(execution_ref, execution["artifact_ref"])
+        self.assertEqual(value["checks"], raw["checks"])
+        self.assertEqual(value["findings"][0]["quote_field"], "reason")
+        self.assertEqual(runner._body(proposal), raw)
+        self.assertEqual(len(runner.tasks.attempts_for_task(task_id)), 1)
+        self.assertIsNone(runner._retained_validation_feedback("survey-review", {**upgraded, "question": "Changed question?"}))
+
     def test_resume_revalidates_parsed_gap_answer_across_transport_boundary_without_call(self):
         runner = self.runtime()
         base = {"phase": "gap_assessment", "survey_ref": "artifact:kb/surveys/current@1",
@@ -2756,6 +2817,35 @@ class TestSurveyRunner(unittest.TestCase):
         ledgers = [runner._body(record) for record in runner._heads("command/survey-review-repairs/")]
         self.assertTrue(any(record["scope"]["critique_context_protocol"] == "literature-critique-transition-3"
                             and record["rounds"] == 1 for record in ledgers))
+
+    def test_aggregate_inclusion_quote_routes_only_decision_repair_and_replays_admission(self):
+        runner = self.runtime(survey_config(self.endpoint, "aggregate-inclusion-quote"))
+        self.addCleanup(runner.control.close)
+        runner._initialize(); runner._setup()
+        for wid in ("W101", "W102"):
+            runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+        runner._map(); runner._review_work_claims()
+        before = {wid: deepcopy(record) for wid, record in runner.analysis_records.items()}
+        runner._accept_survey()
+        self.assertIsNotNone(runner.survey_ref)
+        self.assertEqual(runner.analysis_records["W102"]["artifact_ref"], before["W102"]["artifact_ref"])
+        old, current = runner._body(before["W101"]), runner._body(runner.analysis_records["W101"])
+        self.assertEqual({key: val for key, val in old.items() if key != "inclusion"},
+                         {key: val for key, val in current.items() if key != "inclusion"})
+        self.assertEqual(current["inclusion"], "uncertain")
+        reviews = [record for record in runner._heads("kb/survey-reviews/")
+                   if any(check["outcome"] != "passed" for check in runner._body(record)["checks"])]
+        self.assertEqual(len(reviews), 1)
+        rejected = runner._body(reviews[0])
+        self.assertEqual(rejected["findings"][0]["field"], "inclusion")
+        self.assertEqual(rejected["findings"][0]["quote_field"], "reason")
+        with self.assertRaises(ValidationError):
+            runner.gate._review(runner.store.get(rejected["survey_ref"]), reviews[0]["artifact_ref"])
+        with patch.object(runner.gate, "_passed_checks"):
+            runner.gate._review(runner.store.get(rejected["survey_ref"]), reviews[0]["artifact_ref"])
+        prompts = [prompt for _, prompt in self.model_contexts(runner.control, runner.store)]
+        repair = next(prompt for prompt in prompts if prompt.get("phase") == "map" and prompt.get("semantic_feedback"))
+        self.assertEqual(repair["editable_entry_fields"], ["inclusion"])
 
     def test_aggregate_repair_rejects_ungranted_fields(self):
         runner = self.runtime(survey_config(self.endpoint, "aggregate-ungranted-repair"))
