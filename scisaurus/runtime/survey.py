@@ -1187,6 +1187,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         if nomination:
             self.nomination_record, self.nomination = nomination, {
                 key: self._body(nomination)[key] for key in ("id", "statement")}
+        if self.store.head("kb/exploration-tree") is not None:
+            self._tree_load()
         self._refresh_countersearch_state()
         if self.survey_ref and "gap_assessment" not in scopes:
             accepted = self.store.accepted("kb/gap-assessments/current")
@@ -3073,6 +3075,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 selected.update(self.aliases.get(wid, wid) for row in self.search_log
                                 if row.get("role") == "methods.novelty-challenger"
                                 for wid in row.get("returned_work_ids", []))
+            selected.update(item["work_id"] for item in self.review_obligations)
             return (existing | selected) & set(self.work_records)
         def priority(wid):
             work = self.works[wid]

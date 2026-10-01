@@ -2624,6 +2624,29 @@ class TestSurveyRunner(unittest.TestCase):
         search.assert_not_called(); explore.assert_called_once()
         counter.assert_called_once()
 
+    def test_scoped_resume_restores_tree_selection_without_reopening_catalog(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        for wid in ("W101", "W102"):
+            runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+        runner._tree_load()
+        runner.exploration_tree["nodes"].append({"id": "selection-fixture", "kind": "acquisition",
+            "state": "read", "selected_work_ids": ["W101"], "follow_up_ref": runner.follow_up_ref})
+        runner._tree_save(); runner._map()
+        selection = runner._analysis_selection()
+        self.assertEqual(selection, {"W101"})
+        requests = len(SurveyHTTPFixture.requests)
+        runner.control.close()
+        policy = {"additional_seconds": 40, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["gap_assessment"]}}
+        resumed = self.runtime(resume_policy=policy)
+        self.addCleanup(resumed.control.close)
+        self.assertIsNotNone(resumed.exploration_tree)
+        self.assertEqual(resumed._analysis_selection(), selection)
+        self.assertEqual(len(SurveyHTTPFixture.requests), requests)
+        resumed.review_obligations = [{"work_id": "W102"}]
+        self.assertEqual(resumed._analysis_selection(), {"W101", "W102"})
+
     def test_gap_only_resume_with_work_orders_does_not_repeat_completed_acquisition(self):
         config = survey_config(self.endpoint)
         orders = [self.follow_up_order()]
