@@ -547,7 +547,10 @@ class SurveyGate:
             raise ValidationError("review model reply did not finish normally")
         return execution, context, prompt, reply
 
-    def _recorded_execution(self, execution_ref, author, *, operation, task_kinds):
+    def _recorded_execution(self, execution_ref, author, *, operation, task_kinds,
+                            allow_blocked_retrieval=False):
+        if allow_blocked_retrieval and operation == "model":
+            raise ValidationError("blocked model output cannot establish review authority")
         execution, raw = self._artifact(execution_ref)
         prefix = "command/executions/"
         if (execution["artifact_type"] != "report" or not execution["artifact_id"].startswith(prefix)
@@ -559,7 +562,8 @@ class SurveyGate:
             "SELECT * FROM attempts WHERE task_id=? ORDER BY lease_fence DESC LIMIT 1", (task_id,),
         ).fetchone()
         if (task is None or task["kind"] not in task_kinds
-                or task["state"] not in {"awaiting_review", "completed"}
+                or task["state"] not in ({"awaiting_review", "completed", "blocked"}
+                                         if allow_blocked_retrieval else {"awaiting_review", "completed"})
                 or self._json(task["payload_json"], "review task").get("operation") != operation
                 or attempt is None or attempt["state"] != "succeeded"
                 or attempt["lease_owner"] != author):

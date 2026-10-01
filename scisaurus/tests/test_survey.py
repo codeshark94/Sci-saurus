@@ -62,6 +62,7 @@ def survey_work(wid):
 
 
 class SurveyHTTPFixture(BaseHTTPRequestHandler):
+    identity_rate_limit_once = None
     requests = []
     refresh_target = False
     rate_limit_once = None
@@ -158,6 +159,13 @@ class SurveyHTTPFixture(BaseHTTPRequestHandler):
                 or query.get("filter", [""])[0].lower().startswith("doi:")):
             doi = query.get("query.bibliographic", query.get("filter"))[0].lower()
             doi = doi.removeprefix("doi:")
+            if doi == type(self).identity_rate_limit_once:
+                type(self).identity_rate_limit_once = None
+                self.send_response(429)
+                self.send_header("Retry-After", "1")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             wid = doi.rsplit("/", 1)[-1].upper()
             item = {"DOI": doi, "title": ["Recall study " + wid], "publisher": "Fixture Publisher",
                     "published": {"date-parts": [[2020 + int(wid[-1])]]}, "author": []}
@@ -1213,6 +1221,7 @@ class TestSurveyRunner(unittest.TestCase):
         SurveyHTTPFixture.requests.clear()
         SurveyHTTPFixture.refresh_target = False
         SurveyHTTPFixture.rate_limit_once = None
+        SurveyHTTPFixture.identity_rate_limit_once = None
         SurveyHTTPFixture.locations_by_work = {}
         SurveyHTTPFixture.robots_disallow = None
 
@@ -4416,6 +4425,92 @@ class TestSurveyRunner(unittest.TestCase):
                 self.assertEqual(stopped.exception.details["error"], "HTTP429")
                 self.assertIn("identity", runner.bindings)
                 self.assertEqual(runner.identity_records, {})
+
+    def test_identity_rate_limit_resume_settles_recorded_failure_without_losing_usage(self):
+        for missing_receipt in (False, True):
+            with self.subTest(missing_receipt=missing_receipt):
+                project = self.root / f"identity-resume-{missing_receipt}"
+                config = survey_config(self.endpoint)
+                config["survey"]["identity"] = {
+                    "id": "identity", "adapter": "crossref",
+                    "client": {"endpoint": self.endpoint, "timeout": 4, "max_bytes": 1000000,
+                               "mailto": "catalog@example.org"},
+                    "representative": {"query": "10.1234/W101", "limit": 1}, "environment_files": []}
+                first = SurveyRunner(project, config)
+                self.addCleanup(first.control.close)
+                first._initialize(); first._setup()
+                first._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+                SurveyHTTPFixture.identity_rate_limit_once = "10.1234/w101"
+                original = first._record
+                def record(logical, *args, **kwargs):
+                    if missing_receipt and logical.startswith("command/identity-rate-limits/"):
+                        return None
+                    return original(logical, *args, **kwargs)
+                with patch.object(first, "_analysis_selection", return_value={"W101"}), \
+                     patch.object(first, "_record", side_effect=record):
+                    with self.assertRaises(ProviderRateLimitError) as stopped:
+                        first._reconcile_identities()
+                charged = first.api_calls
+                execution = stopped.exception.details["execution_ref"]
+                with self.assertRaises(ValidationError):
+                    first.gate._recorded_execution(execution, "research.identity-checker",
+                        operation="crossref", task_kinds={"retrieval"})
+                first.gate._recorded_execution(execution, "research.identity-checker",
+                    operation="crossref", task_kinds={"retrieval"}, allow_blocked_retrieval=True)
+                if missing_receipt:
+                    first._reconcile_identity_rate_limits({"query": "10.1234/other", "limit": 3})
+                    with patch.dict(first.score["identity"]["client"], {"endpoint": "http://wrong-provider"}):
+                        first._reconcile_identity_rate_limits({"query": "10.1234/w101", "limit": 3})
+                    self.assertIsNone(first.store.head(f"command/identity-rate-limits/{charged}"))
+                first.control.close()
+                policy = {"additional_seconds": 30,
+                    "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+                    "source_changes": {"mode": "reopen", "reopen_scopes": ["operations"]}}
+                resumed = SurveyRunner(project, config, resume_policy=policy)
+                self.addCleanup(resumed.control.close)
+                self.assertEqual(resumed.api_calls, charged)
+                resumed._setup()
+                before = resumed.api_calls
+                with patch.object(resumed, "_analysis_selection", return_value={"W101"}):
+                    resumed._reconcile_identities()
+                self.assertEqual(resumed.api_calls, before + 1)
+                self.assertIn("W101", resumed.identity_records)
+                receipt = resumed._body(resumed.store.head(f"command/identity-rate-limits/{charged}"))
+                self.assertEqual(receipt["execution_ref"], execution)
+                arguments = {"query": "10.1234/w101", "limit": 3}
+                resumed._reserve_api_call("identity", arguments, "research.identity-checker")
+                later = resumed.api_calls
+                with self.assertRaises(ProviderRateLimitError):
+                    resumed._stop_identity_rate_limit(stopped.exception.details, arguments)
+                self.assertIsNone(resumed.store.head(f"command/identity-rate-limits/{later}"))
+                with self.assertRaises(ValidationError):
+                    resumed.gate._recorded_execution(execution, "research.identity-checker",
+                        operation="model", task_kinds={"verification"}, allow_blocked_retrieval=True)
+
+    def test_identity_unknown_reservation_still_prohibits_redispatch(self):
+        config = survey_config(self.endpoint)
+        config["survey"]["identity"] = {
+            "id": "identity", "adapter": "crossref",
+            "client": {"endpoint": self.endpoint, "timeout": 4, "max_bytes": 1000000,
+                       "mailto": "catalog@example.org"},
+            "representative": {"query": "10.1234/W101", "limit": 1}, "environment_files": []}
+        first = self.runtime(config)
+        first._initialize(); first._setup()
+        first._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        first._reserve_api_call("identity", {"query": "10.1234/w101", "limit": 3}, "research.identity-checker")
+        first.control.close()
+        policy = {"additional_seconds": 30,
+            "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+            "source_changes": {"mode": "reopen", "reopen_scopes": ["operations"]}}
+        resumed = self.runtime(config, resume_policy=policy)
+        resumed._setup()
+        before = resumed.api_calls
+        with patch.object(resumed, "_analysis_selection", return_value={"W101"}), \
+             patch.object(resumed.operations, "run") as dispatch:
+            with self.assertRaisesRegex(StateError, "unresolved charged reservation"):
+                resumed._reconcile_identities()
+        dispatch.assert_not_called()
+        self.assertEqual(resumed.api_calls, before)
 
     def test_owned_top_level_http429_survives_failure_projection_and_readiness(self):
         for field in ("status", "status_code", "http_status", "provider_http_status"):

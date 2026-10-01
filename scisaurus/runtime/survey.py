@@ -3087,6 +3087,51 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 continue
         return None
 
+    def _reconcile_identity_rate_limits(self, arguments):
+        capability = self.score.get("identity")
+        if not capability:
+            return
+        reservations = sorted((record for record in self._heads("command/api-calls/")
+            if self._body(record).get("capability") == "identity"
+            and self._body(record).get("request") == arguments), key=lambda record: record["created_at"])
+        if not reservations:
+            return
+        executions = []
+        for record in self._heads("command/executions/ops-work-" + capability["id"] + "-"):
+            try:
+                _, context, result, params = self.gate._recorded_execution(
+                    record["artifact_ref"], "research.identity-checker", operation="crossref",
+                    task_kinds={"retrieval"}, allow_blocked_retrieval=True)
+                if ({key: value for key, value in params.items() if key != "client"} == arguments
+                        and params.get("client") == capability["client"]
+                        and (result.get("outcome") in {"rate_limited", 429} or _has_http_429(result))):
+                    executions.append((record, context, result))
+            except (KeyError, TypeError, ValueError, ValidationError, StateError):
+                continue
+        for index, reservation in enumerate(reservations):
+            number = self._body(reservation)["number"]
+            if self.store.head(f"command/identity-rate-limits/{number}"):
+                continue
+            end = reservations[index + 1]["created_at"] if index + 1 < len(reservations) else None
+            matching = [(execution, result) for execution, context, result in executions
+                if reservation.get("author") == "research.identity-checker"
+                and reservation.get("score_ref") == context.get("score_ref") == execution.get("score_ref")
+                and reservation["created_at"] <= context["created_at"] <= execution["created_at"]
+                and (end is None or execution["created_at"] < end)]
+            if len(matching) > 1:
+                raise ValidationError("identity reservation has ambiguous terminal executions")
+            if matching:
+                execution, result = matching[0]
+                self._record(f"command/identity-rate-limits/{number}", "note", {
+                    "number": number, "request": arguments, "execution_ref": execution["artifact_ref"],
+                    "outcome": "rate_limited"}, "research.identity-checker",
+                    subjects=[reservation["artifact_ref"], execution["artifact_ref"]])
+
+    def _stop_identity_rate_limit(self, failure, arguments):
+        if failure.get("outcome") in {"rate_limited", 429} or _has_http_429(failure):
+            self._reconcile_identity_rate_limits(arguments)
+        self._stop_provider_rate_limit(failure, provider="crossref")
+
     def _reconcile_identities(self):
         if "identity" not in self.bindings:
             retained = True
@@ -3141,6 +3186,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             if recovered is not None:
                 result, execution = recovered
             else:
+                self._reconcile_identity_rate_limits(arguments)
                 failed = {self._body(record)["number"] for record in self._heads("command/identity-rate-limits/")}
                 uncertain = [self._body(record) for record in self._heads("command/api-calls/")
                              if self._body(record).get("capability") == "identity"
@@ -3157,23 +3203,21 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     result, execution = self.operations.run(
                         self.bindings["identity"], arguments, self._call,
                         operator="research.identity-checker")
-                except ProviderRateLimitError:
-                    self._record(f"command/identity-rate-limits/{self.api_calls}", "note",
-                                 {"number": self.api_calls, "request": arguments, "work_id": wid},
-                                 "research.identity-checker")
+                except ProviderRateLimitError as exc:
+                    self._stop_identity_rate_limit(exc.details, arguments)
                     raise
                 except Exception as exc:
                     self._ensure_active()
-                    self._stop_provider_rate_limit(
+                    self._stop_identity_rate_limit(
                         {"kind": "identity_lookup_failure", "work_id": wid, "reason": str(exc),
-                         **self._failure_detail(self.score["identity"]["id"])}, provider="crossref")
+                         **self._failure_detail(self.score["identity"]["id"])}, arguments)
                     self.gaps.append({"kind": "identity_lookup_failure", "work_id": wid, "reason": str(exc)})
                     self.bindings.pop("identity", None)
                     break
             if isinstance(result, dict):
-                self._stop_provider_rate_limit(
+                self._stop_identity_rate_limit(
                     {**result, "kind": "identity_lookup_failure", "work_id": wid,
-                     "execution_ref": execution}, provider="crossref")
+                     "execution_ref": execution}, arguments)
             identity = reconcile_result(work, self.work_records[wid]["artifact_ref"], result, execution)
             record = self._record(f"kb/identities/{wid}", "reference_card", identity,
                                   "research.identity-checker",
