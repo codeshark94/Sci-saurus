@@ -3998,6 +3998,42 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertIn("same work_id", projected["instructions"])
         from scisaurus.runtime.evidence import scientific_input_recovery_contract
         self.assertEqual(projected["scientific_input_recovery"], scientific_input_recovery_contract())
+        self.assertEqual(projected["claim_index"]["entries"][0]["statements"], {"problem": "A claim"})
+        from scisaurus.runtime.survey import _GAP_ASSESSMENT_INSTRUCTIONS
+        self.assertTrue(projected["instructions"].startswith(_GAP_ASSESSMENT_INSTRUCTIONS))
+        for token in ("state:string", "rationale:string", "comparisons:", "checks:",
+                      "evidence:", "refuted_by_prior_work", "eligible_for_experiment",
+                      "solves/partial/different/uncertain"):
+            self.assertIn(token, projected["instructions"])
+
+    def test_gap_compaction_preserves_contract_and_current_claims_on_repeated_repairs(self):
+        from copy import deepcopy
+        from scisaurus.runtime.survey import _GAP_ASSESSMENT_INSTRUCTIONS
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        assignment = {
+            "phase": "gap_assessment", "instructions": _GAP_ASSESSMENT_INSTRUCTIONS + " Scoped requirement.",
+            "map": {"entries": [{"work_id": "W1", "inclusion": "included", "reason": "Bounded",
+                                  "finding": {"text": "An explicitly bounded current finding", "evidence": []}}],
+                    "relationships": [{"source": "W1", "target": "W2", "kind": "extends",
+                                       "claim": {"text": "A current relationship", "evidence": []}}]},
+            "evidence_catalog": [], "sources": [], "coverage": {},
+            "required_checks": list(GAP_CHECKS), "allowed_check_outcomes": ["passed", "insufficient_evidence"],
+            "resume_boundary": "gap-assessment-resume-8",
+        }
+        original = deepcopy(assignment)
+        projected = runner._compact_gap_repair_assignment(assignment)
+        repaired = runner._repair_assignment(
+            {"name": "gap-assessment", "actor": "methods.novelty-verifier", "assignment": projected},
+            {"error": "invalid JSON", "finish_reason": "length", "previous_response": {"raw_text": "unfinished"}})
+        self.assertEqual(assignment, original)
+        self.assertTrue(repaired["instructions"].startswith(original["instructions"]))
+        self.assertEqual(repaired["required_checks"], original["required_checks"])
+        self.assertEqual(repaired["allowed_check_outcomes"], original["allowed_check_outcomes"])
+        self.assertEqual(repaired["resume_boundary"], original["resume_boundary"])
+        self.assertEqual(repaired["claim_index"], projected["claim_index"])
+        self.assertEqual(repaired["claim_index"]["relationships"][0]["claim"], "A current relationship")
+        self.assertNotIn("previous_response", repaired["validation_feedback"])
 
     def test_retained_contract_blocker_gets_one_fresh_resume_cache_identity(self):
         from scisaurus.runtime.model_work import ModelWorkCache

@@ -45,6 +45,33 @@ from scisaurus.runtime.survey_records import (
 from scisaurus.runtime.time_policy import TimePolicy
 
 
+_GAP_ASSESSMENT_INSTRUCTIONS = (
+    "Return only the final JSON object, with no analysis transcript or preamble: {state:string,rationale:string,comparisons:[{work_id:string,relationship:string,statement:string,evidence:[{evidence_id:string}]}],checks:[{check_id:string,outcome:string,method:string,result:string}],evidence:[{evidence_id:string}]}. "
+    "Select evidence_id values from evidence_catalog; their exact source quotations and offsets are attached deterministically. Never rewrite those quotations or reproduce the catalog in the response. "
+    "If an additional passage is essential, an evidence item may instead contain {work_id,source_ref,quote}, quoting exact visible source text. "
+    "Compare only decision-relevant closest prior works, not the entire work inventory. Keep findings concise and do not repeat the same evidence in explanatory prose. "
+    "Each additional quote must be unique in its displayed source window. relationship is solves/partial/different/uncertain. "
+    "state is refuted_by_prior_work, insufficient_evidence, or eligible_for_experiment. Run exactly all required checks. "
+    "For every check, copy outcome from allowed_check_outcomes exactly; words such as pass, incomplete, inconclusive, or partial are invalid. "
+    "A prior solution supported by decisive full-text quotes refutes the gap even if global search is incomplete. "
+    "For decisive states all checks must pass and evidence must include verified full_text sources. Abstracts alone cannot authorize a decisive state. "
+    "Use insufficient_evidence if access, source windows, missing closest work, or incomparable conditions prevent the judgment. "
+    "A decisive state is valid only when every required check has outcome=passed. If any check is insufficient_evidence, failed, or check_failed, state must be insufficient_evidence. "
+    "For insufficient_evidence, keep comparisons different or uncertain as warranted by the captured text; do not relabel an abstract sentence as full_text. "
+    "Assess whether each coverage gap or omitted source window can change the nominated comparison. "
+    "Use insufficient_evidence for decision-critical omissions; peripheral access failures or bounded source windows alone do not veto a supported comparison. "
+    "Explain material coverage limits in the checks and rationale. Never infer support from undisplayed text. "
+    "When state is decisive, every comparison evidence item for that comparison must remain attached to an exact verified full_text quotation; prefer short contiguous prose spans over rendered equations. "
+    "For refuted_by_prior_work or eligible_for_experiment, cite only the listed verified_full_text_refs for any decisive comparison; "
+    "if no listed full-text quote directly supports the comparison, set the state to insufficient_evidence and use relationship=uncertain. "
+    "Eligibility requires meaningful, testable distinction, no prior solution or unresolved comparison, and adequate search coverage. "
+    "It authorizes an experiment under the stated scope, never publication-ready novelty. Do not force a positive finding to finish the task. "
+    "Every comparison evidence item must have the same work_id as that comparison. "
+    "If no same-work evidence is available, omit it or use relationship=uncertain with evidence=[]."
+)
+
+
+
 def normalized(text):
     return " ".join(re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold()))
 
@@ -1404,6 +1431,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "inclusion": entry.get("inclusion"),
                 "reason": str(entry.get("reason") or "")[:320],
                 "evidence_by_field": {},
+                "statements": {},
             }
             for field in MAP_FIELDS:
                 statement = entry.get(field)
@@ -1411,6 +1439,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     continue
                 ids = self._assessment_evidence_ids(statement.get("evidence"), catalog)
                 projected["evidence_by_field"][field] = ids
+                projected["statements"][field] = statement["text"]
             entries.append(projected)
         relationships = []
         for relation in map_body.get("relationships", []):
@@ -1419,7 +1448,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             claim = relation.get("claim") if isinstance(relation.get("claim"), dict) else {}
             relationships.append({
                 "source": relation.get("source"), "target": relation.get("target"),
-                "kind": relation.get("kind"),
+                "kind": relation.get("kind"), "claim": claim.get("text"),
                 "evidence_ids": self._assessment_evidence_ids(claim.get("evidence"), catalog),
             })
         coverage = self._compact_assessment_coverage(assignment.get("coverage", {}))
@@ -1461,23 +1490,16 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "nomination_ref": assignment.get("nomination_ref"),
             "survey_ref": assignment.get("survey_ref"),
             "prerequisite_survey_ref": assignment.get("prerequisite_survey_ref"),
-            "claim_index": {"entries": entries, "relationships": relationships},
+            "claim_index": (deepcopy(assignment["claim_index"])
+                            if isinstance(assignment.get("claim_index"), dict) and "map" not in assignment
+                            else {"entries": entries, "relationships": relationships}),
             "coverage": coverage,
             "sources": sources,
             "verified_full_text_refs": deepcopy(assignment.get("verified_full_text_refs", [])),
             "evidence_catalog": catalog,
             "required_checks": deepcopy(assignment.get("required_checks", [])),
             "allowed_check_outcomes": deepcopy(assignment.get("allowed_check_outcomes", [])),
-            "instructions": (
-                "Return exactly one compact JSON object and nothing else; do not emit analysis, "
-                "a preamble, markdown, or a transcript. Use only evidence_id values from "
-                "evidence_catalog. Every comparison's evidence_id must have the same work_id "
-                "as that comparison; if no same-work evidence is available, omit it or use "
-                "relationship=uncertain with evidence=[]. Run each required check exactly once. "
-                "Use insufficient_evidence whenever a decision-critical comparison lacks its required "
-                "evidence. Decisive gap states require verified full text; abstract-supported bounded "
-                "survey claims remain usable within their quoted scope. Keep rationale and check results concise."
-            ),
+            "instructions": assignment.get("instructions", _GAP_ASSESSMENT_INSTRUCTIONS),
             "source_evidence_policy": _SOURCE_EVIDENCE_POLICY,
             **({"validation_feedback": feedback} if feedback else {}),
             "scientific_input_recovery": scientific_input_recovery_contract(),
@@ -4898,26 +4920,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                                         and source.get("identity_verified") is True],
             "required_checks": sorted(GAP_CHECKS),
             "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
-            "instructions": "Return only the final JSON object, with no analysis transcript or preamble: {state:string,rationale:string,comparisons:[{work_id:string,relationship:string,statement:string,evidence:[{evidence_id:string}]}],checks:[{check_id:string,outcome:string,method:string,result:string}],evidence:[{evidence_id:string}]}. "
-                "Select evidence_id values from evidence_catalog; their exact source quotations and offsets are attached deterministically. Never rewrite those quotations or reproduce the catalog in the response. "
-                "If an additional passage is essential, an evidence item may instead contain {work_id,source_ref,quote}, quoting exact visible source text. "
-                "Compare only decision-relevant closest prior works, not the entire work inventory. Keep findings concise and do not repeat the same evidence in explanatory prose. "
-                "Each additional quote must be unique in its displayed source window. relationship is solves/partial/different/uncertain. "
-                "state is refuted_by_prior_work, insufficient_evidence, or eligible_for_experiment. Run exactly all required checks. "
-                "For every check, copy outcome from allowed_check_outcomes exactly; words such as pass, incomplete, inconclusive, or partial are invalid. "
-                "A prior solution supported by decisive full-text quotes refutes the gap even if global search is incomplete. "
-                "For decisive states all checks must pass and evidence must include verified full_text sources. Abstracts alone cannot authorize a decisive state. "
-                "Use insufficient_evidence if access, source windows, missing closest work, or incomparable conditions prevent the judgment. "
-                "A decisive state is valid only when every required check has outcome=passed. If any check is insufficient_evidence, failed, or check_failed, state must be insufficient_evidence. "
-                "For insufficient_evidence, keep comparisons different or uncertain as warranted by the captured text; do not relabel an abstract sentence as full_text. "
-                "Assess whether each coverage gap or omitted source window can change the nominated comparison. "
-                "Use insufficient_evidence for decision-critical omissions; peripheral access failures or bounded source windows alone do not veto a supported comparison. "
-                "Explain material coverage limits in the checks and rationale. Never infer support from undisplayed text. "
-                "When state is decisive, every comparison evidence item for that comparison must remain attached to an exact verified full_text quotation; prefer short contiguous prose spans over rendered equations. "
-                "For refuted_by_prior_work or eligible_for_experiment, cite only the listed verified_full_text_refs for any decisive comparison; "
-                "if no listed full-text quote directly supports the comparison, set the state to insufficient_evidence and use relationship=uncertain. "
-                "Eligibility requires meaningful, testable distinction, no prior solution or unresolved comparison, and adequate search coverage. "
-                "It authorizes an experiment under the stated scope, never publication-ready novelty. Do not force a positive finding to finish the task."
+            "instructions": _GAP_ASSESSMENT_INSTRUCTIONS,
         }
         if resume_gap_assessment:
             # A Composer continuation is an explicit new assessment attempt.
