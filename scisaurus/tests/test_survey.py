@@ -1766,8 +1766,7 @@ class TestSurveyRunner(unittest.TestCase):
         runner._map()
         obligation = self.review_obligation(runner, "W101")
         runner.review_obligations = runner._validate_review_obligations([obligation])
-        runner._materialize_source_less_map("W101", runner.analyzed_basis["W101"], scope="review_exhausted",
-                                           reason=ABSTENTION_REASONS["review_exhausted"])
+        runner._materialize_source_less_map("W101", runner.analyzed_basis["W101"], scope="review_exhausted")
         runner._review_work_claims()
         prompt = [value for _, value in self.model_contexts(runner.control, runner.store)
                   if value.get("phase") == "work_review" and value["entry"]["work_id"] == "W101"][-1]
@@ -1807,8 +1806,7 @@ class TestSurveyRunner(unittest.TestCase):
         runner._initialize(); runner._setup()
         runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
         runner._map()
-        runner._materialize_source_less_map("W101", runner.analyzed_basis["W101"], scope="review_exhausted",
-                                           reason=ABSTENTION_REASONS["review_exhausted"])
+        runner._materialize_source_less_map("W101", runner.analyzed_basis["W101"], scope="review_exhausted")
         entry = runner.analysis_records["W101"]
         self.assertIsNotNone(runner._work_abstention_context(entry, []))
         self.assertIsNone(runner._work_abstention_context(entry, ["artifact:kb/relationships/retained@1"]))
@@ -2264,6 +2262,7 @@ class TestSurveyRunner(unittest.TestCase):
             runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
         runner._map()
         runner._materialize_source_less_map("W102", runner.analyzed_basis["W102"], scope="reading_deferred")
+        self.assertEqual(runner._body(runner.analysis_records["W102"])["reason"], ABSTENTION_REASONS["reading_deferred"])
         runner._review_work_claims()
         old_review = runner.work_reviews["W102"]["artifact_ref"]
         abstention = runner.store.head("command/survey-abstentions/W102")
@@ -2985,7 +2984,7 @@ class TestSurveyRunner(unittest.TestCase):
             runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
         runner._map()
         runner._materialize_source_less_map("W102", runner.analyzed_basis["W102"],
-            scope="review_exhausted", reason=ABSTENTION_REASONS["review_exhausted"])
+            scope="review_exhausted")
         runner._record("command/survey-abstentions/W101", "note", {
             "work_id": "W101", "scope": "contract_exhausted", "withdrawn_fields": ["finding"],
             "entry_sha256": runner.analysis_records["W101"]["body_hash"],

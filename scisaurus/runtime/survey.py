@@ -1703,8 +1703,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     dimension="max_model_calls", limit=self.config["limits"].get("max_model_calls"),
                     observed=self.model_calls_dispatched, diagnostics=[{**plan, "debt_ref": debt["artifact_ref"]}])
             wid = work_ids[0]
-            self._materialize_source_less_map(wid, self._analysis_basis(wid), scope="model_call_budget",
-                                             reason=ABSTENTION_REASONS["model_call_budget"])
+            self._materialize_source_less_map(wid, self._analysis_basis(wid), scope="model_call_budget")
             self.gaps.append({"kind": "model_call_budget", "work_id": wid, "debt_ref": debt["artifact_ref"],
                               "remaining_calls": remaining, "required_calls": required_calls})
         self._record(f"command/survey-resource-plans/{self.serial}", "note", {
@@ -3712,17 +3711,9 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
     def _source_less_reason():
         return ABSTENTION_REASONS["source_unavailable"]
 
-    def _materialize_source_less_map(self, wid, basis, *, reason=None, scope="source_unavailable"):
-        """Commit a deterministic abstention without spending a model call.
-
-        A catalog-only work has no textual claim for a model to assess.  The
-        normalizer in ``_map_job`` already reduced this case to the same
-        uncertainty record after a model response, which made large sparse
-        corpora pay for a call whose answer could not legitimately contain
-        substantive content.  Preserve the same evidence contract and an
-        auditable execution report locally instead.
-        """
-        reason = reason or self._source_less_reason()
+    def _materialize_source_less_map(self, wid, basis, *, scope="source_unavailable"):
+        """Commit hash-bound non-admission for the declared procedural scope."""
+        reason = ABSTENTION_REASONS[scope]
         null_statement = {"text": None, "evidence": []}
         value = {
             "entries": [{
@@ -3805,8 +3796,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             for wid in requested:
                 if wid not in selected:
                     scope = "reading_deferred" if self.exploration_tree is not None else "deep_analysis_budget"
-                    self._materialize_source_less_map(wid, basis[wid], scope=scope,
-                                                     reason=ABSTENTION_REASONS[scope])
+                    self._materialize_source_less_map(wid, basis[wid], scope=scope)
                     continue
                 if any(source["work_id"] == wid and authoritative_source(source)
                        for source in self.source_docs.values()):
@@ -4419,8 +4409,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
 
     def _exclude_unresolved_work(self, wid, feedback):
         previous = self.analysis_records[wid]
-        self._materialize_source_less_map(wid, self.analyzed_basis[wid], scope="review_exhausted",
-                                         reason=ABSTENTION_REASONS["review_exhausted"])
+        self._materialize_source_less_map(wid, self.analyzed_basis[wid], scope="review_exhausted")
         self._record(f"kb/work-exclusions/{wid}", "note", {
             "work_id": wid, "retained_analysis_ref": previous["artifact_ref"],
             "review_ref": feedback["review_ref"], "failed_checks": feedback["checks"],
@@ -4515,7 +4504,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                         "text_fields": ["method", "result", "rationale"],
                         "affected_check_ids": "Only critique rows contain this field: [] if passed, otherwise a nonempty list of affected ordinary check IDs whose outcomes are non-passed.",
                     },
-                    "instructions": "Return only the final JSON object matching response_contract, without preamble. "
+                    "instructions": "Return exactly {checks:[{check_id:string,outcome:string,method:string,result:string}],rationale:string}. "
+                        "The checks value must be an array, never an object keyed by check ID. The top-level rationale string is required. "
+                        "Each critique row additionally requires affected_check_ids as specified in response_contract; ordinary rows must omit it. "
+                        "Return only this final JSON object, without preamble or extra fields. "
                         "Run each required check separately; outcome is passed/failed/insufficient_evidence/check_failed. "
                         "Judge whether the supplied text entails the ENTIRE claim, not whether its quotation merely exists or the topic sounds plausible. "
                         "A passed check requires support for every clause. Fail unsupported minor clauses too; a correct main point does not excuse them. "

@@ -227,6 +227,7 @@ class TestExplorationContract(unittest.TestCase):
     def test_parent_checks_current_owner_and_relationship_source_dependencies(self):
         from scisaurus.runtime.survey import SurveyRunner
         runner = object.__new__(SurveyRunner)
+        runner._work_abstention_context = lambda entry, refs: None
         runner.work_records = {"W1": {"artifact_ref": "work-1"}}
         runner.analysis_records = {"W1": {"artifact_ref": "entry-1"}}
         runner.work_reviews = {"W1": {"artifact_ref": "review-1"}}
@@ -250,6 +251,7 @@ class TestExplorationContract(unittest.TestCase):
     def test_parent_requires_current_target_identity_and_work_scope(self):
         from scisaurus.runtime.survey import SurveyRunner
         runner = object.__new__(SurveyRunner)
+        runner._work_abstention_context = lambda entry, refs: None
         runner.work_records = {"W1": {"artifact_ref": "work-1"}, "W2": {"artifact_ref": "work-2"}}
         runner.analysis_records = {"W1": {"artifact_ref": "entry-1"}}
         runner.work_reviews = {"W1": {"artifact_ref": "review-1"}}
@@ -305,6 +307,7 @@ class TestExplorationContract(unittest.TestCase):
         from unittest.mock import Mock
         from scisaurus.runtime.survey import SurveyRunner
         runner = object.__new__(SurveyRunner)
+        runner._work_abstention_context = lambda entry, refs: None
         runner.follow_up_ref = None
         runner.work_records = {wid: {"artifact_ref": "work-" + wid} for wid in ("W1", "W2")}
         runner.works = {wid: {"referenced_works": []} for wid in ("W1", "W2")}
