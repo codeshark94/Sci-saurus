@@ -10415,7 +10415,8 @@ class ComposerWorkflowTests(unittest.TestCase):
                     (stale, "artifact:kb/surveys/current@1", False),
                     (current, "artifact:kb/surveys/current@2", True)):
                 (project / "state").mkdir(parents=True)
-                (project / "state" / "control.sqlite").write_bytes(b"checkpoint")
+                control = ControlStore(project)
+                control.close()
                 (project / "output").mkdir()
                 (project / "output" / "run.json").write_text(json.dumps({
                     "status": "blocked", "survey_ref": survey_ref,
@@ -10543,14 +10544,16 @@ class ComposerWorkflowTests(unittest.TestCase):
             runner.stage_records[stage["id"]] = {"attempts": [{"attempt_id": "owned-attempt", "project_dir": str(project),
                 "topic_id": "active", "topic_cycle": 0}]}
             runner.context[stage["id"]] = {"project_dir": str(project)}
-            for accepted in (False, True):
+            for frontier in ("partial", "accepted", "stale"):
+                accepted = frontier == "accepted"
                 checkpoint = {"status": "blocked", "coverage": {"map_entry_count": 13}}
-                if accepted:
-                    checkpoint.update({"survey_current": True, "survey_ref": "artifact:kb/surveys/current@1"})
+                if frontier != "partial":
+                    checkpoint.update({"survey_current": accepted, "survey_ref": "artifact:kb/surveys/current@1"})
                 (project/"output/run.json").write_text(json.dumps(checkpoint))
                 runner.context["topic"]["topic"]["research_question"] = "Exact question"
                 self.assertEqual(runner._latest_resumable_survey_project(stage), project)
-                self.assertEqual(runner._survey_resume_scope(checkpoint), "gap_assessment" if accepted else "operations")
+                self.assertEqual(runner._survey_resume_scope(checkpoint),
+                    {"partial": "operations", "accepted": "gap_assessment", "stale": "integrated_review"}[frontier])
                 runner.context["topic"]["topic"]["research_question"] = "Different question"
                 self.assertIsNone(runner._latest_resumable_survey_project(stage))
                 runner.context["topic"]["topic"]["research_question"] = "Exact question"

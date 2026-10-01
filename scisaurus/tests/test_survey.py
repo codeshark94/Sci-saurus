@@ -2324,6 +2324,33 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertFalse(changed.counter_queries_complete)
         changed.control.close()
 
+    def test_stale_accepted_map_retains_discovery_and_reopens_review_with_tree(self):
+        config = survey_config(self.endpoint)
+        config["survey"]["proposed_gap"] = None
+        orders = [self.follow_up_order()]
+        first = self.runtime(config, work_orders=orders)
+        with patch.object(first, "_nominate", side_effect=ModelContractError("nomination response malformed")):
+            failed = first.run()
+        self.assertTrue(failed["survey_current"])
+        policy = {"additional_seconds": config["limits"]["wall_clock_seconds"],
+                  "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["integrated_review"]}}
+        editor = self.runtime(config, resume_policy=policy, work_orders=orders)
+        entry = editor.analysis_records["W101"]
+        editor._publish(entry["artifact_id"], "note", editor._body(entry), "research.literature-mapper")
+        editor._tree_load(); editor._tree_save()
+        editor.control.close()
+        second = self.runtime(config, resume_policy=policy, work_orders=orders)
+        self.assertIsNone(second.survey_ref)
+        self.assertIsNotNone(second.exploration_tree)
+        self.assertTrue(second.follow_up_discovery_current)
+        with patch.object(second, "_prepare_follow_up", side_effect=AssertionError("accepted acquisition repeated")), \
+             patch.object(second, "_explore", side_effect=AssertionError("review scope cannot reopen discovery")):
+            completed = second.run()
+        self.assertEqual(completed["status"], "completed", completed["error"])
+        self.assertTrue(completed["survey_current"])
+        self.assertTrue(completed["assessment_current"])
+
 
     def test_nomination_identifier_drift_reaches_countersearch_and_assessment(self):
         config = survey_config(self.endpoint, "nomination-id-drift")

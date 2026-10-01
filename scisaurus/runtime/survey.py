@@ -1260,11 +1260,6 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     if prompt.get("review_contract") != self._survey_review_packet()["review_contract"]:
                         raise ValidationError("accepted survey requires the current review contract")
                     self.survey_ref = self.incumbent = accepted["artifact_ref"]
-                    self.follow_up_discovery_current = (
-                        self.follow_up_ref is not None
-                        and prompt.get("follow_up_ref") == self.follow_up_ref
-                        and prompt.get("work_orders") == self.work_orders
-                    )
                     self.time_policy.mark_retained_result(self.survey_ref)
                 except Exception:
                     pass
@@ -1274,6 +1269,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 key: self._body(nomination)[key] for key in ("id", "statement")}
         if self.store.head("kb/exploration-tree") is not None:
             self._tree_load()
+        self.follow_up_discovery_current = self._retained_follow_up_discovery()
         self._refresh_countersearch_state()
         if self.survey_ref and "gap_assessment" not in scopes:
             accepted = self.store.accepted("kb/gap-assessments/current")
@@ -1283,6 +1279,25 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     self.assessment_ref = accepted["artifact_ref"]
                 except Exception:
                     pass
+
+    def _retained_follow_up_discovery(self):
+        if self.follow_up_ref is None:
+            return False
+        accepted = self.store.accepted("kb/surveys/current")
+        if accepted is None:
+            return False
+        try:
+            receipt = self.gate._accepted_event("survey.accepted", "survey_ref", accepted["artifact_ref"])
+            if {"ref": accepted["artifact_ref"], "body_hash": accepted["body_hash"]} not in receipt.get("evidence_pins", []):
+                return False
+            review = self._body(self.store.get(receipt["review_ref"]))
+            if review.get("survey_ref") != accepted["artifact_ref"]:
+                return False
+            _, _, prompt, _ = self.gate._model_review_execution(review["execution_ref"], "methods.survey-reviewer")
+            return (prompt.get("follow_up_ref") == self.follow_up_ref
+                    and prompt.get("work_orders") == self.work_orders)
+        except (KeyError, TypeError, ValueError, ValidationError, StateError):
+            return False
 
     def _refresh_countersearch_state(self):
         """Reconstruct challenge completion from exact durable dependencies."""
@@ -5207,7 +5222,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 if not self.survey_ref:
                     review_checkpoint = (self.resume_session and self.map_record is not None
                                          and "retrieval" not in self.resume_session["reopened_scopes"]
-                                         and self.store.head("kb/exploration-tree") is None)
+                                         and ("integrated_review" in self.resume_session["reopened_scopes"]
+                                              or self.store.head("kb/exploration-tree") is None))
                     if self.nomination is not None or review_checkpoint:
                         self._accept_survey()
                         self._refresh_countersearch_state()

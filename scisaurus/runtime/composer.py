@@ -5972,7 +5972,7 @@ class ComposerRunner:
             return None
         if (not isinstance(payload, dict)
                 or payload.get("status") not in {"blocked", "paused", "running"}
-                or payload.get("survey_ref")):
+                or payload.get("survey_current") is True):
             return None
         config = cls._durable_stage_config(root)
         if not isinstance(config, dict):
@@ -14595,6 +14595,8 @@ class ComposerRunner:
             return "follow_up"
         if prior.get("survey_current") is True and prior.get("survey_ref"):
             return "gap_assessment"
+        if prior.get("survey_ref") and isinstance(prior.get("coverage"), dict) and prior["coverage"].get("map_entry_count", 0) > 0:
+            return "integrated_review"
         if isinstance(prior.get("coverage"), dict) and prior["coverage"].get("map_entry_count", 0) > 0:
             return "operations"
         return "focused_review"
