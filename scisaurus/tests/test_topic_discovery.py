@@ -3220,6 +3220,120 @@ class TopicDiscoveryTests(unittest.TestCase):
             for item in repairs
         ))
 
+    def test_invalid_selected_plan_is_repaired_without_changing_scientific_fields(self):
+        value = package("Choose a feasible research direction")
+        selected = value["candidates"][1]
+        selected["feasibility_plan"] = foundry_feasibility_plan(
+            estimated_compute_seconds="120")
+        value["candidates"][0]["feasibility_plan"] = {"invalid_alternative": True}
+        original = deepcopy(value)
+        repaired_plan = foundry_feasibility_plan()
+        runner = TopicDiscoveryRunner({"model": "fake", "protocol": "ollama"})
+        with patch.object(runner, "_client") as client:
+            client.return_value.complete.return_value = ModelResult(
+                text=json.dumps({"candidate_patches": [{
+                    "id": selected["id"], "fields": {"feasibility_plan": repaired_plan},
+                }]}), model="fake", usage={"model_calls": 1},
+                elapsed_seconds=0.01, finish_reason="stop")
+            runner._repair_missing_topic_fields(
+                value, deadline=None, budget=TopicBudget(None, {}),
+                require_feasibility_plan=True,
+                runtime_context={"capability_foundry": {"enabled": True}})
+            self.assertEqual(client.return_value.complete.call_count, 1)
+            prompt = json.loads(client.return_value.complete.call_args.kwargs["prompt"])
+        expected = deepcopy(original)
+        expected["candidates"][1]["feasibility_plan"] = repaired_plan
+        self.assertEqual(value, expected)
+        self.assertIn("estimated_compute_seconds", str(
+            prompt["candidate_context"][0]["validation_errors"]))
+        self.assertEqual(set(prompt["feasibility_plan_contract"]), set(repaired_plan))
+
+    def test_normalizable_selected_plan_needs_no_model_repair(self):
+        value = package("Choose a feasible research direction")
+        value["candidates"][1]["feasibility_plan"] = foundry_feasibility_plan(
+            experiment_input="project_artifact", data_access="project_local")
+        runner = TopicDiscoveryRunner({"model": "fake", "protocol": "ollama"})
+        with patch.object(runner, "_client") as client:
+            runner._repair_missing_topic_fields(
+                value, deadline=None, budget=TopicBudget(None, {}),
+                require_feasibility_plan=True,
+                runtime_context={"capability_foundry": {"enabled": True}})
+            client.assert_not_called()
+        validate_feasibility_plan(value["candidates"][1]["feasibility_plan"])
+
+    def test_runner_repairs_invalid_selected_plan_in_the_same_intake(self):
+        class InvalidPlanModel(FakeModel):
+            assignments = []
+
+            def complete(self, *, system, prompt, images=None):
+                payload = json.loads(prompt)
+                type(self).assignments.append(payload["assignment"])
+                if payload["assignment"] == "repair_missing_topic_fields":
+                    value = {"candidate_patches": [{
+                        "id": item["id"],
+                        "fields": {"feasibility_plan": foundry_feasibility_plan()},
+                    } for item in payload["candidate_context"]]}
+                    return ModelResult(text=json.dumps(value), model="fake",
+                                       usage={"model_calls": 1}, elapsed_seconds=0.01,
+                                       finish_reason="stop")
+                result = super().complete(system=system, prompt=prompt, images=images)
+                if payload["assignment"] == "free_topic_discovery":
+                    value = json.loads(result.text)
+                    value["selected_id"] = "direction_0"
+                    for candidate in value["candidates"]:
+                        candidate["feasibility_plan"] = foundry_feasibility_plan(
+                            estimated_compute_seconds="120")
+                    result = ModelResult(
+                        text=json.dumps(value), model=result.model, usage=result.usage,
+                        elapsed_seconds=result.elapsed_seconds, finish_reason=result.finish_reason)
+                return result
+
+        runtime_context = {
+            "capability_foundry": {"enabled": True, "allowed_evidence_modes": ["synthetic_simulation"]},
+            "research_feasibility": {
+                "execution_modes": ["foundry"],
+                "allowed_input_kinds": ["synthetic", "analytical_parameters"],
+                "allowed_data_access": ["closed_world"], "network_access": False,
+                "undeclared_data": False, "max_external_requests": 0,
+                "max_model_calls": 0, "max_experiment_seconds": 900,
+                "available_executables": ["python3"], "available_packages": ["numpy"],
+            },
+            "executables": {"python3": True}, "python_packages": {"numpy": True},
+            "configured_stage_kinds": ["experiment"],
+        }
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", InvalidPlanModel):
+            result = TopicDiscoveryRunner({
+                "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+            }).run("Choose a feasible research direction", candidate_count=3,
+                   bibliography=False, max_attempts=1, runtime_context=runtime_context)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["selected_id"], "direction_0")
+        self.assertEqual(len(result["candidate_attempt_trace"]), 1)
+        self.assertEqual(InvalidPlanModel.assignments,
+                         ["free_topic_discovery", "repair_missing_topic_fields"])
+
+    def test_invalid_plan_repair_cannot_replace_declared_evidence(self):
+        value = package("Choose a feasible research direction")
+        selected = value["candidates"][1]
+        selected["feasibility_plan"] = foundry_feasibility_plan(
+            experiment_input="project_artifact", evidence_inputs=[{
+                "kind": "public_dataset", "status": "unavailable", "source": "unavailable measurements",
+            }])
+        original = deepcopy(value)
+        runner = TopicDiscoveryRunner({"model": "fake", "protocol": "ollama"})
+        with patch.object(runner, "_client") as client:
+            client.return_value.complete.return_value = ModelResult(
+                text=json.dumps({"candidate_patches": [{
+                    "id": selected["id"], "fields": {"feasibility_plan": foundry_feasibility_plan()},
+                }]}), model="fake", usage={"model_calls": 1},
+                elapsed_seconds=0.01, finish_reason="stop")
+            with self.assertRaisesRegex(ValidationError, "declared evidence"):
+                runner._repair_missing_topic_fields(
+                    value, deadline=None, budget=TopicBudget(None, {}),
+                    require_feasibility_plan=True,
+                    runtime_context={"capability_foundry": {"enabled": True}})
+        self.assertEqual(value, original)
+
     def test_empty_resource_plan_is_derived_from_declared_feasibility_without_model_call(self):
         value = package("Choose a feasible research direction")
         candidate = value["candidates"][1]

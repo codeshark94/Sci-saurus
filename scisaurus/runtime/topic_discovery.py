@@ -38,6 +38,7 @@ from scisaurus.runtime.scientific_surface import find_control_leaks, project_int
 
 
 SCHEMA_VERSION = "topic-discovery-1"
+TOPIC_RESPONSE_CONTRACT_REVISION = "selected-feasibility-field-repair-1"
 STAGE_CONFIG_SCHEMA_VERSION = "topic-discovery-config-1"
 TOPIC_HISTORY_SCHEMA_VERSION = "topic-history-1"
 RECENT_YEAR_WINDOW = 4
@@ -1607,12 +1608,32 @@ def _resource_plan_from_feasibility(candidate):
     return " ".join(clauses)[:680].rstrip()
 
 
-def _topic_missing_field_repair_prompt(package, targets):
+FEASIBILITY_PLAN_PROMPT_CONTRACT = {
+    "execution_mode": "foundry, configured_program, or project_runner",
+    "experiment_input": "self_contained, project_artifact, or survey_artifact",
+    "evidence_inputs": (
+        "one to eight {kind,status,source} objects; kind must be exactly "
+        "synthetic, analytical_parameters, project_artifact, survey_metadata, "
+        "survey_full_text, public_dataset, new_measurement, or external_service; "
+        "status must be exactly available, acquirable_before_experiment, or "
+        "unavailable; declare every input used"
+    ),
+    "data_access": "closed_world, project_local, survey_artifact, or external_provider",
+    "required_packages": "exact package names required by the study",
+    "required_executables": "exact executable names required by the study",
+    "estimated_compute_seconds": "integer estimate inside the declared experiment deadline",
+    "estimated_api_requests": "integer count of external requests needed by the study",
+    "estimated_model_calls": "integer count of model calls needed by the study",
+    "network_access": "boolean; false for the deterministic foundry",
+}
+
+
+def _topic_missing_field_repair_prompt(package, targets, runtime_context=None):
     """Build a field-only repair request for an otherwise intact package.
 
     The model has already supplied the scientific direction.  A repair turn
     therefore receives only the affected candidate fields and may fill only
-    the explicitly missing or empty required text fields. This prevents a formatting
+    the explicitly missing or invalid contract fields. This prevents a formatting
     omission such as a missing title from causing a new portfolio, source
     selection, or research-shape decision.
     """
@@ -1622,6 +1643,7 @@ def _topic_missing_field_repair_prompt(package, targets):
             "candidate_index": candidate["candidate_index"],
             "id": candidate["id"],
             "missing_fields": candidate["missing_fields"],
+            "validation_errors": candidate.get("validation_errors", {}),
             "candidate_fields": {
                 key: candidate["candidate"].get(key)
                 for key in _TOPIC_REPAIR_CONTEXT_FIELDS
@@ -1630,6 +1652,12 @@ def _topic_missing_field_repair_prompt(package, targets):
         })
     return json.dumps({
         "assignment": "repair_missing_topic_fields",
+        "feasibility_plan_contract": deepcopy(FEASIBILITY_PLAN_PROMPT_CONTRACT),
+        "runtime_boundary": {
+            key: deepcopy((runtime_context or {}).get(key))
+            for key in ("research_feasibility", "capability_foundry")
+            if key in (runtime_context or {})
+        },
         "candidate_context": context,
         "output_contract": {
             "candidate_patches": [{
@@ -1641,6 +1669,7 @@ def _topic_missing_field_repair_prompt(package, targets):
             "return exactly one patch for every candidate_context item and no other candidate",
             "copy each id exactly; do not rename, reorder, or omit a candidate",
             "fields must contain exactly the missing_fields listed for that candidate; do not return any valid existing field",
+            "preserve all existing declared evidence_inputs; do not replace unavailable or external evidence with synthetic inputs",
             "derive every repaired value only from the supplied candidate_fields; do not introduce a new domain, mechanism, dataset, result, citation, or claim of novelty",
             "keep repaired prose concise and consistent with the candidate's research form, evidence mode, comparison type, and source grounding",
             "return only the JSON object; do not echo candidate_context or add metadata",
@@ -3726,7 +3755,7 @@ SYSTEM = (
 
 
 TOPIC_FIELD_REPAIR_SYSTEM = (
-    "You repair one missing structured field in a scientific topic portfolio. "
+    "You repair only the listed missing or invalid fields in a scientific topic portfolio. "
     "Use only the supplied candidate fields, preserve the candidate identity and research shape, "
     "and do not invent evidence, citations, results, or novelty. Return JSON only."
 )
@@ -4169,24 +4198,7 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "disconfirmation_test": "what result or prior work would make this direction unhelpful",
         "disconfirmation_test_note": "optional detail about how the disconfirmation test separates explanations",
         "feasibility": "why the declared runtime can execute the study within the mission budget",
-        "feasibility_plan": {
-            "execution_mode": "foundry, configured_program, or project_runner",
-            "experiment_input": "self_contained, project_artifact, or survey_artifact",
-            "evidence_inputs": (
-                "one to eight {kind,status,source} objects; kind must be exactly "
-                "synthetic, analytical_parameters, project_artifact, survey_metadata, "
-                "survey_full_text, public_dataset, new_measurement, or external_service; "
-                "status must be exactly available, acquirable_before_experiment, or "
-                "unavailable; declare every input used"
-            ),
-            "data_access": "closed_world, project_local, survey_artifact, or external_provider",
-            "required_packages": "exact package names required by the study",
-            "required_executables": "exact executable names required by the study",
-            "estimated_compute_seconds": "integer estimate inside the declared experiment deadline",
-            "estimated_api_requests": "integer count of external requests needed by the study",
-            "estimated_model_calls": "integer count of model calls needed by the study",
-            "network_access": "boolean; false for the deterministic foundry",
-        },
+        "feasibility_plan": deepcopy(FEASIBILITY_PLAN_PROMPT_CONTRACT),
         "resource_plan": "data, programs, tools, and compute the study would use",
     }
     constraints = [
@@ -4729,18 +4741,7 @@ def _topic_candidate_refinement_prompt(objective, parent_candidate, *,
         "disconfirmation_test": "result or prior evidence that would disconfirm the direction",
         "disconfirmation_test_note": "optional operational detail for the disconfirmation test",
         "feasibility": "why the declared runtime can execute this bounded study",
-        "feasibility_plan": {
-            "execution_mode": "copy the runtime-compatible execution mode",
-            "experiment_input": "declare self_contained, project_artifact, or survey_artifact",
-            "evidence_inputs": "one to eight {kind,status,source} objects; declare every experiment input",
-            "data_access": "declare the actual access boundary",
-            "required_packages": "exact package names required by the study",
-            "required_executables": "exact executable names required by the study",
-            "estimated_compute_seconds": "integer estimate inside the declared experiment deadline",
-            "estimated_api_requests": "integer count of external requests needed by the study",
-            "estimated_model_calls": "integer count of model calls needed by the study",
-            "network_access": "boolean; false for the deterministic foundry",
-        },
+        "feasibility_plan": deepcopy(FEASIBILITY_PLAN_PROMPT_CONTRACT),
         "resource_plan": "data, programs, tools, and compute used",
         "frontier_seed_id": "copy target_frontier_seed_id exactly",
         "prior_work_ids": "one to three work_id values from target_seed_records only",
@@ -5099,13 +5100,15 @@ class TopicDiscoveryRunner:
 
     def _repair_missing_topic_fields(self, package, *, deadline, budget,
                                      require_feasibility_plan=False,
-                                     runtime_context=None):
-        """Fill omitted contract fields while keeping all other fields immutable.
+                                     runtime_context=None,
+                                     repair_invalid_feasibility=True):
+        """Repair selected execution contracts and omitted prose without changing science.
 
         A portfolio alternative is not an executable commitment.  Its
         operational plan is only needed if that alternative is selected, so
         the targeted repair lane must not spend a model call repairing plans
-        for every unselected candidate.
+        for every unselected candidate. Malformed existing plans can be
+        deferred until deterministic selection has considered usable peers.
         """
         if not isinstance(package, dict) or not isinstance(package.get("candidates"), list):
             return []
@@ -5130,16 +5133,30 @@ class TopicDiscoveryRunner:
                 if (not isinstance(candidate.get(field), str)
                     or not candidate[field].strip())
             ]
-            if (require_feasibility_plan
-                    and candidate.get("id") == selected_id
-                    and not isinstance(candidate.get("feasibility_plan"), dict)):
-                repairable_fields.extend(_TOPIC_REPAIRABLE_STRUCTURED_FIELDS)
+            validation_errors = {}
+            if require_feasibility_plan and candidate.get("id") == selected_id:
+                selected_package = {"candidates": [candidate]}
+                for normalize in (
+                        _repair_feasibility_input_kinds,
+                        _repair_feasibility_input_statuses,
+                        _repair_feasibility_input_duplicates):
+                    repairs.extend(normalize(selected_package))
+                repairs.extend(_repair_feasibility_input_contract(
+                    selected_package, runtime_context or {}))
+                try:
+                    validate_feasibility_plan(candidate.get("feasibility_plan"))
+                except ValidationError as exc:
+                    if (repair_invalid_feasibility
+                            or not isinstance(candidate.get("feasibility_plan"), dict)):
+                        repairable_fields.extend(_TOPIC_REPAIRABLE_STRUCTURED_FIELDS)
+                        validation_errors["feasibility_plan"] = str(exc)
             if repairable_fields:
                 targets.append({
                     "candidate_index": index,
                     "id": candidate.get("id"),
                     "candidate": candidate,
                     "missing_fields": repairable_fields,
+                    "validation_errors": validation_errors,
                 })
         if not targets:
             return repairs
@@ -5149,7 +5166,7 @@ class TopicDiscoveryRunner:
             sampling_overrides={"temperature": 0.2, "top_p": 0.85, "presence_penalty": 0.0},
             max_output_tokens=2400,
         )
-        prompt = _topic_missing_field_repair_prompt(package, targets)
+        prompt = _topic_missing_field_repair_prompt(package, targets, runtime_context)
         budget.before_model_call(
             "topic_discovery", getattr(client, "model", None),
             system=TOPIC_FIELD_REPAIR_SYSTEM, prompt=prompt)
@@ -5217,6 +5234,13 @@ class TopicDiscoveryRunner:
                             repair_package, runtime_context or {}))
                         value = repair_package["candidates"][0]["feasibility_plan"]
                         validate_feasibility_plan(value)
+                        original_plan = target["candidate"].get("feasibility_plan")
+                        declared_inputs = (original_plan.get("evidence_inputs")
+                                           if isinstance(original_plan, dict) else None)
+                        if (isinstance(declared_inputs, list) and declared_inputs
+                                and value["evidence_inputs"] != declared_inputs):
+                            raise ValidationError(
+                                "topic field repair must preserve declared evidence inputs")
                         for repair in contract_repairs:
                             field_repairs.append({
                                 **repair,
@@ -6298,7 +6322,8 @@ class TopicDiscoveryRunner:
                     package, deadline=deadline, budget=budget,
                     require_feasibility_plan=isinstance(
                         (runtime_context or {}).get("research_feasibility"), dict),
-                    runtime_context=runtime_context)
+                    runtime_context=runtime_context,
+                    repair_invalid_feasibility=False)
                 objective_normalized = (
                     isinstance(package, dict)
                     and isinstance(package.get("objective"), str)
@@ -6436,6 +6461,14 @@ class TopicDiscoveryRunner:
                 if post_repair_novelty_selection_repair is not None:
                     attempt_record["post_repair_novelty_selection_repair"] = (
                         post_repair_novelty_selection_repair)
+                selected_plan_repairs = self._repair_missing_topic_fields(
+                    package, deadline=deadline, budget=budget,
+                    require_feasibility_plan=isinstance(
+                        (runtime_context or {}).get("research_feasibility"), dict),
+                    runtime_context=runtime_context)
+                if selected_plan_repairs:
+                    attempt_record.setdefault("derived_field_repairs", []).extend(
+                        selected_plan_repairs)
                 _record_attempt_selection(attempt_record, package)
                 if (selection_repair is not None
                         or refinement_selection_repair is not None

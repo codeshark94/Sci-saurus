@@ -74,6 +74,7 @@ from scisaurus.runtime.failure_recovery import (
     classify_failure, failure_evidence_lineage_conflicts,
 )
 from scisaurus.runtime.topic_discovery import (
+    TOPIC_RESPONSE_CONTRACT_REVISION,
     DEFAULT_TOPIC_BUDGETS,
     DEFAULT_TOPIC_CONTINUATION_BUDGETS,
     EVIDENCE_MODE_VALUES,
@@ -21560,7 +21561,15 @@ class ComposerRunner:
         "complete JSON object locally. "
         "Preserve the scientific assignment and do not invent or release a result."
     )
-        if stage.get("kind") == "argument":
+        if stage.get("kind") == "topic_discovery":
+            objective = (
+                "Repair the topic response under the current field contract. Preserve the proposed "
+                "scientific questions and declared evidence; normalize redundant execution labels, "
+                "then repair only missing fields or the selected malformed execution plan. "
+                "Validate the complete portfolio and retain the ordinary feasibility, source, and "
+                "maturity gates before admitting the topic to literature survey."
+            )
+        elif stage.get("kind") == "argument":
             objective = (
                 "Re-run the scientific argument under the revised prose policy: preserve complete, "
                 "evidence-grounded claims; enforce the JSON schema, item counts, evidence IDs, and "
@@ -21586,8 +21595,8 @@ class ComposerRunner:
             "owner": owner,
             "objective": objective,
             "why": (
-                "The previous provider response was unusable as JSON before the experiment produced "
-                "an observation; forwarding it would create a false downstream input."
+                "The previous provider response did not satisfy its stage contract; "
+                "forwarding it would create an invalid downstream input."
             ),
             "success_condition": (
                 "The same stage returns a complete schema-valid object, or the Composer records an "
@@ -21614,6 +21623,8 @@ class ComposerRunner:
 
     @staticmethod
     def _format_recovery_policy_revision(stage):
+        if isinstance(stage, dict) and stage.get("kind") == "topic_discovery":
+            return TOPIC_RESPONSE_CONTRACT_REVISION
         if isinstance(stage, dict) and stage.get("kind") == "argument":
             return ARGUMENT_RESPONSE_CONTRACT_REVISION
         if isinstance(stage, dict) and stage.get("kind") == "experiment":
@@ -22338,6 +22349,9 @@ class ComposerRunner:
     def _format_recovery_signature(stage, error):
         """Identify the same response-contract failure across attempts and resumes."""
         text = str(error).casefold()
+        # Stage records serialize the exception class alongside its message;
+        # the initial recovery ledger receives the exception itself.
+        text = re.sub(r"^(?:[a-z_][a-z0-9_]*(?:error|blocked)):\s*", "", text)
         text = re.sub(
             r"\b(attempt|cycle)[\s:#_-]*\d+\b", r"\1 <n>", text,
             flags=re.IGNORECASE)
@@ -25922,8 +25936,12 @@ class ComposerRunner:
             if ((failure_recovery.get("recovery_mode") == "format_repair_then_rerun"
                  or legacy_topic_contract_failure)
                     and not exact_format_recovery_spent):
+                policy_revision = self._format_recovery_policy_revision(stage)
                 requests = [item for item in prior_context.get("research_requests", [])
-                            if isinstance(item, dict)]
+                            if isinstance(item, dict)
+                            and item.get("recovery_mode") == "format_repair_then_rerun"
+                            and item.get("target_stage_id") == stage["id"]
+                            and item.get("repair_policy_revision") == policy_revision]
                 if not requests:
                     request = self._format_contract_recovery_request(stage, prior_context)
                     if isinstance(request, dict):
@@ -25938,9 +25956,18 @@ class ComposerRunner:
                         "release_blocking": True,
                         "format_recovery": True,
                         "format_recovery_attempts": prior_format_attempts + 1,
+                        "format_recovery_dispatched": False,
+                        "format_recovery_signature": format_signature,
+                        "format_recovery_policy_revision": policy_revision,
                         "research_requests": deepcopy(requests),
                         "preserve_work_orders": True,
                     })
+                    self.format_recovery_ledger[format_signature] = {
+                        **(format_ledger_entry or {}),
+                        "stage_id": stage["id"], "status": "pending",
+                        "request_ids": [item.get("id") for item in requests],
+                        "response_contract_revision": policy_revision,
+                    }
                     self.context[stage["id"]] = prior_context
                     if self._begin_continuation(completed, by_id):
                         self.department_activity.append({

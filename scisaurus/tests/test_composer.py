@@ -989,6 +989,60 @@ class ComposerWorkflowTests(unittest.TestCase):
             finally:
                 runner.close()
 
+    def test_topic_resume_reopens_only_after_response_policy_changes(self):
+        with tempfile.TemporaryDirectory() as path:
+            workflow = self._workflow(Path(path))
+            stage = next(item for item in workflow["stages"] if item["kind"] == "experiment")
+            stage["kind"] = "topic_discovery"
+            workflow["continuation_policy"] = {"mode": "bounded", "max_cycles": 1}
+            runner = ComposerRunner(workflow)
+            try:
+                error_text = (
+                    "topic discovery bounded intake exhausted: "
+                    "feasibility_plan.project_artifact must declare a project_artifact input")
+                error = QuotaExceededError(error_text, dimension="topic_attempts", limit=0,
+                                           observed=0, usage={}, diagnostics=[])
+                with patch.object(ComposerRunner, "_format_recovery_policy_revision", return_value=None):
+                    old_signature = runner._format_recovery_signature(stage, error)
+                runner.format_recovery_ledger[old_signature] = {
+                    "stage_id": stage["id"], "status": "exhausted"}
+                runner.context[stage["id"]] = {
+                    "error": error_text, "format_recovery_dispatched": True,
+                    "format_recovery_signature": old_signature,
+                    "failure_class": "model_contract",
+                    "failure_recovery": {"failure_class": "model_contract",
+                                         "recovery_mode": "format_repair_then_rerun"},
+                    "research_requests": [],
+                }
+                runner.stage_records[stage["id"]] = {
+                    "status": "blocked", "error": "QuotaExceededError: " + error_text,
+                    "attempts": [{"retry_reason": "intake_contract_failure"}],
+                }
+                runner.continuation_cycles = 1
+                by_id = {item["id"]: item for item in workflow["stages"]}
+                with patch.object(ComposerRunner, "_format_recovery_policy_revision", return_value=None):
+                    self.assertFalse(runner._reopen_blocked_checkpoint(set(), by_id))
+                self.assertTrue(runner._reopen_blocked_checkpoint(set(), by_id))
+                self.assertEqual(runner.continuation_cycles, 2)
+                request = runner.context[stage["id"]]["research_requests"][0]
+                self.assertEqual(request["repair_policy_revision"],
+                                 runner._format_recovery_policy_revision(stage))
+                self.assertFalse(any(item.get("action") == "pivot_topic_after_scientific_blocker"
+                                     for item in runner.department_activity))
+                current_signature = runner._format_recovery_signature(stage, error)
+                self.assertEqual(runner.context[stage["id"]]["format_recovery_signature"],
+                                 current_signature)
+                self.assertEqual(runner.format_recovery_ledger[current_signature]["status"],
+                                 "dispatched")
+                runner.format_recovery_ledger[current_signature] = {
+                    "stage_id": stage["id"], "status": "exhausted"}
+                runner.stage_records[stage["id"]]["status"] = "blocked"
+                with patch.object(runner, "_begin_continuation", return_value=True) as begin:
+                    self.assertFalse(runner._reopen_blocked_checkpoint(set(), by_id))
+                    begin.assert_not_called()
+            finally:
+                runner.close()
+
     def test_exhausted_format_failure_does_not_pivot_the_research_topic(self):
         with tempfile.TemporaryDirectory() as path:
             workflow = self._workflow(Path(path))
