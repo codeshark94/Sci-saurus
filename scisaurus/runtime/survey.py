@@ -832,6 +832,16 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         return {"survey_ref": self.survey_ref, "map_ref": survey["map_ref"],
                 "coverage_ref": survey["coverage_ref"], "works": works}
 
+    @staticmethod
+    def _project_follow_up_inventory(inventory, order):
+        """Keep exact named records visible without repeating the whole catalog."""
+        order_text = json.dumps(order, ensure_ascii=False)
+        named = [row for row in inventory["works"]
+                 if re.search(r"(?<!\w)" + re.escape(row["work_id"]) + r"(?!\w)", order_text)]
+        return {**inventory, "catalog_work_count": len(inventory["works"]),
+                "projection_scope": "named_records" if named else "catalog",
+                "works": named or inventory["works"]}
+
     def _resolve_follow_up(self):
         if not self.work_orders:
             return
@@ -864,6 +874,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         orders, executions = [], []
         for order in self.work_orders:
             scoped = self._follow_up_assignment({**assignment, "work_orders": [order]})
+            scoped["survey_inventory"] = self._project_follow_up_inventory(
+                assignment["survey_inventory"], order)
             for chars in (12000, 6000, 3000, 1000, 300):
                 scoped["sources"] = self._project_assessment_sources(
                     sources, full_text_chars=chars, abstract_chars=min(chars, 2000), unverified_chars=0)

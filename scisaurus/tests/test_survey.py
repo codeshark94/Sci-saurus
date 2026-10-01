@@ -1830,6 +1830,23 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(captured[0]["work_orders"], [self.follow_up_order()])
         self.assertEqual(runner.source_docs, original)
 
+    def test_follow_up_inventory_projection_keeps_exact_named_ids_and_discloses_scope(self):
+        inventory = {"survey_ref": "artifact:kb/surveys/current@1", "works": [
+            {"work_id": "W1", "screening": "uncertain", "sources": [{"representation": "abstract"}]},
+            {"work_id": "W10", "screening": "included"},
+            {"work_id": "doi:10.123/example", "screening": "uncertain"}]}
+        original = deepcopy(inventory)
+        projected = SurveyRunner._project_follow_up_inventory(inventory, {"objective": "Check W1 membership."})
+        self.assertEqual(projected["works"], [inventory["works"][0]])
+        self.assertEqual(projected["catalog_work_count"], 3)
+        self.assertEqual(projected["projection_scope"], "named_records")
+        doi = SurveyRunner._project_follow_up_inventory(inventory, {"objective": "Check doi:10.123/example."})
+        self.assertEqual(doi["works"], [inventory["works"][2]])
+        all_records = SurveyRunner._project_follow_up_inventory(inventory, {"objective": "Check captured records."})
+        self.assertEqual(all_records["works"], inventory["works"])
+        self.assertEqual(all_records["projection_scope"], "catalog")
+        self.assertEqual(inventory, original)
+
     def test_follow_up_inventory_is_pinned_to_accepted_membership_and_reading_status(self):
         runner = self.runtime(work_orders=[self.follow_up_order()])
         result = runner.run()
