@@ -86,6 +86,33 @@ class TestExplorationContract(unittest.TestCase):
     def test_grounded_reference_branch(self):
         self.validate(self.plan)
 
+    def test_normalizer_reports_all_foreign_sources_with_owned_destinations(self):
+        proposal = deepcopy(self.plan)
+        second = deepcopy(proposal["branches"][0])
+        proposal["branches"].append(second)
+        first_proof = proposal["branches"][0]["evidence"][0]
+        first_proof.update(work_id="W3", source_ref="historical@1")
+        second["evidence"][0]["work_id"] = "W4"
+        original = deepcopy(proposal)
+        with self.assertRaises(ModelContractError) as caught:
+            normalize_plan(proposal, {"parent-0": "parent"}, self.sources, parents=self.parents)
+        message = str(caught.exception)
+        for required in ("branches[0].evidence[0]", "historical@1", "allows sources ['source']",
+                         "branches[1].evidence[0]", "supplied work 'W4'", "work W1"):
+            self.assertIn(required, message)
+        self.assertEqual(proposal, original)
+        corrected = deepcopy(self.plan)
+        corrected["branches"][0]["parent_id"] = "parent-0"
+        bound = normalize_plan(corrected, {"parent-0": "parent"}, self.sources, parents=self.parents)
+        validate_plan(bound, self.parents, self.sources, max_branches=None)
+        self.assertEqual(bound["branches"][0]["evidence"][0]["quote"], self.source["text"])
+
+    def test_normalizer_quote_errors_identify_the_exact_branch_and_proof(self):
+        proposal = deepcopy(self.plan)
+        proposal["branches"][0]["evidence"].append({"work_id": "W1", "source_ref": "source", "quote": "Invented result."})
+        with self.assertRaisesRegex(ModelContractError, r"branches\[0\].evidence\[1\]"):
+            normalize_plan(proposal, {"parent-0": "parent"}, self.sources, parents=self.parents)
+
     def test_local_parent_handle_is_bound_idempotently(self):
         proposal = deepcopy(self.plan)
         proposal["branches"][0]["parent_id"] = "parent-0"
