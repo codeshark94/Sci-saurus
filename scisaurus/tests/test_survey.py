@@ -2913,6 +2913,79 @@ class TestSurveyRunner(unittest.TestCase):
         with self.assertRaises(StateError):
             runner._review_obligations_for("W101")
 
+    def test_pinned_comparison_reaches_review_repair_and_invalidates_stale_peer_context(self):
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        runner._initialize(); runner._setup()
+        for wid in ("W101", "W102"):
+            runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+        runner._map()
+        obligation = self.review_obligation(runner, "W101")
+        peer = runner.analysis_records["W102"]
+        obligation["comparison_pins"] = [{"ref": peer["artifact_ref"], "body_hash": peer["body_hash"]}]
+        peer_sources = {proof["source_ref"] for field in MAP_FIELDS
+                        for proof in runner._body(peer)[field]["evidence"]}
+        pinned = {pin["ref"] for pin in obligation["source_pins"]}
+        obligation["source_pins"].extend({"ref": ref, "body_hash": runner.store.get(ref)["body_hash"]}
+                                         for ref in sorted(peer_sources - pinned))
+        runner.review_obligations = runner._validate_review_obligations([obligation])
+        runner._review_work_claims()
+        self.assertTrue(runner._work_review_current("W101"))
+        prompt = next(prompt for _, prompt in reversed(self.model_contexts(runner.control, runner.store))
+                      if prompt.get("phase") == "work_review" and prompt["entry"]["work_id"] == "W101")
+        comparison = prompt["critique_contexts"][0]["comparison_entries"][0]
+        self.assertEqual(comparison["original_entry"]["ref"], peer["artifact_ref"])
+        self.assertEqual(comparison["current_entry"]["body"], runner._body(peer))
+        self.assertTrue(peer_sources <= {source["source_ref"] for source in prompt["sources"]})
+        self.assertIn(peer["artifact_ref"], runner._work_review_basis("W101"))
+        entries = {row["artifact_ref"]: (row, runner._body(row)) for row in runner.analysis_records.values()}
+        visible = {source["source_ref"]: source for source in prompt["sources"]}
+        runner.gate._work_review_comparisons(prompt, [obligation], entries, visible, require_spans=True)
+        bad = deepcopy(prompt)
+        bad["critique_contexts"][0]["comparison_entries"][0]["current_entry"]["body"]["reason"] = "Altered criterion."
+        with self.assertRaisesRegex(ValidationError, "exact current peer"):
+            runner.gate._work_review_comparisons(bad, [obligation], entries, visible, require_spans=True)
+        with self.assertRaises(ValidationError):
+            runner.gate._work_review_comparisons(prompt, [obligation], entries, {}, require_spans=True)
+        feedback = {"entry_fields": ["inclusion", "reason"], "relationship_targets": [],
+                    "relationship_refs": [], "checks": [], "rationale": "Reconcile the screening criterion."}
+        repair = runner._map_job("W101", runner.analyzed_basis["W101"], review_feedback=feedback)
+        self.assertEqual(repair["assignment"]["critique_contexts"], prompt["critique_contexts"])
+        self.assertTrue(peer_sources <= {source["source_ref"] for source in repair["assignment"]["sources"]})
+        changed = runner._body(peer); changed["reason"] = "The same bounded method with a revised criterion."
+        runner.analysis_records["W102"] = runner._record("kb/work-analyses/W102", "note", changed,
+                                                        "research.literature-mapper")
+        self.assertFalse(runner._work_review_current("W101"))
+        with self.assertRaisesRegex(ValidationError, "exact current peer"):
+            entries = {row["artifact_ref"]: (row, runner._body(row)) for row in runner.analysis_records.values()}
+            runner.gate._work_review_comparisons(prompt, [obligation], entries, visible, require_spans=True)
+
+    def test_comparison_pins_preserve_owner_question_and_source_integrity(self):
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        runner._initialize(); runner._setup()
+        for wid in ("W101", "W102"):
+            runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+        runner._map()
+        obligation = self.review_obligation(runner, "W101")
+        peer = runner.analysis_records["W102"]
+        pin = {"ref": peer["artifact_ref"], "body_hash": peer["body_hash"]}
+        with self.assertRaisesRegex(StateError, "omitted cited source"):
+            runner._validate_review_obligations([{**obligation, "comparison_pins": [pin]}])
+        for pins in ([{**pin, "body_hash": "0" * 64}],
+                     [{"ref": obligation["entry_ref"], "body_hash": obligation["entry_body_sha256"]}],
+                     [pin, pin], "invalid"):
+            with self.subTest(pins=pins), self.assertRaises(StateError):
+                runner._validate_review_obligations([{**obligation, "comparison_pins": pins}])
+        read_artifact = runner.gate._artifact
+        def different_question(ref, **kwargs):
+            manifest, raw = read_artifact(ref, **kwargs)
+            if ref == peer["artifact_ref"]:
+                manifest = {**manifest, "score_ref": "artifact:command/scores/different@1"}
+            return manifest, raw
+        with patch.object(runner.gate, "_artifact", side_effect=different_question), self.assertRaises(StateError):
+            runner._validate_review_obligations([{**obligation, "comparison_pins": [pin]}])
+
     def test_abstention_integrity_cannot_accept_scientific_prose(self):
         from scisaurus.core.schema import canonical_bytes, sha256_hex
         from scisaurus.core.surveys import ABSTENTION_REASONS, is_explicit_abstention

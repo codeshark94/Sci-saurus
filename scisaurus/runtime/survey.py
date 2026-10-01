@@ -896,7 +896,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     "relationship_pins", "source_pins", "hypothesis"}
         result = []
         for value in values:
-            if (not isinstance(value, dict) or set(value) != required
+            if (not isinstance(value, dict) or not required <= set(value)
+                    or set(value) - required - {"comparison_pins"}
                     or any(not isinstance(value[key], str) or not value[key].strip()
                            for key in ("receipt_ref", "work_id", "entry_ref", "hypothesis"))
                     or not re.fullmatch(r"[0-9a-f]{64}", str(value["receipt_body_sha256"]))):
@@ -910,6 +911,23 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 raise StateError("survey review obligation changed its entry, question, or source identity")
             owners = {value["work_id"]}
             cited = {proof["source_ref"] for field in MAP_FIELDS for proof in body[field]["evidence"]}
+            comparisons = value.get("comparison_pins", [])
+            if not isinstance(comparisons, list):
+                raise StateError("survey review comparison pins must be an explicit list")
+            for pin in comparisons:
+                if not isinstance(pin, dict) or set(pin) != {"ref", "body_hash"}:
+                    raise StateError("survey review obligation has a malformed comparison pin")
+                manifest, peer_raw = self.gate._artifact(pin["ref"], current=False)
+                peer = self.gate._json(peer_raw, pin["ref"])
+                peer_id = peer.get("work_id")
+                if (manifest["author"] != "research.literature-mapper"
+                        or not manifest["artifact_id"].startswith("kb/work-analyses/")
+                        or manifest["body_hash"] != pin["body_hash"]
+                        or manifest.get("score_ref") != entry.get("score_ref")
+                        or not isinstance(peer_id, str) or peer_id in owners):
+                    raise StateError("survey review comparison changed its identity, hash, question, or owner")
+                owners.add(peer_id)
+                cited.update(proof["source_ref"] for field in MAP_FIELDS for proof in peer[field]["evidence"])
             for group in ("relationship_pins", "source_pins"):
                 if not isinstance(value[group], list):
                     raise StateError("survey review obligation pins must be explicit lists")
@@ -939,6 +957,11 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 raise StateError("survey review obligation no longer has its pinned captured sources")
         return values
 
+    def _review_comparison_ids(self, wid):
+        return {self._body(self.store.get(pin["ref"]))["work_id"]
+                for value in self._review_obligations_for(wid)
+                for pin in value.get("comparison_pins", [])}
+
     def _review_critique_contexts(self, wid, *, entry_ref=None, relationship_refs=None):
         """Expose both immutable critique targets and the claims being judged."""
         obligations = self._review_obligations_for(wid)
@@ -954,7 +977,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         contexts = []
         for obligation in obligations:
             original = snapshot(obligation["entry_ref"])
-            contexts.append({
+            context = {
                 "protocol": _CRITIQUE_CONTEXT_PROTOCOL,
                 "check_id": critique_check_id(obligation),
                 "receipt_ref": obligation["receipt_ref"], "work_id": wid,
@@ -964,7 +987,19 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                                                if current_body[key] != original["body"].get(key)),
                 "original_relationships": [snapshot(pin["ref"]) for pin in obligation["relationship_pins"]],
                 "current_relationships": [snapshot(ref) for ref in refs],
-            })
+            }
+            if obligation.get("comparison_pins"):
+                context["comparison_entries"] = []
+                for pin in obligation["comparison_pins"]:
+                    peer = snapshot(pin["ref"])
+                    peer_id = peer["body"]["work_id"]
+                    if peer_id not in self.analysis_records:
+                        raise StateError("survey review comparison has no current mapped entry")
+                    context["comparison_entries"].append({
+                        "original_entry": peer,
+                        "current_entry": snapshot(self.analysis_records[peer_id]["artifact_ref"]),
+                    })
+            contexts.append(context)
         return contexts
 
     def _review_failure_keys(self, review):
@@ -2092,6 +2127,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 subjects=[ref for obligation in self.review_obligations
                           for ref in [obligation["entry_ref"],
                               *[pin["ref"] for pin in obligation["relationship_pins"]],
+                              *[pin["ref"] for pin in obligation.get("comparison_pins", [])],
                               *[pin["ref"] for pin in obligation["source_pins"]]]])
         self.protocol = self._publish("kb/search-protocol", "search_campaign", {
             "question": self.score["question"], "seed_queries": self.score["seed_queries"],
@@ -3368,7 +3404,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             target for target in assignment.get("editable_relationship_targets", [])
             if isinstance(target, str)
         )
-        required_ids = {owner_id, *target_ids}
+        required_ids = {owner_id, *target_ids, *self._review_comparison_ids(owner_id)}
         optional_sources = [source for source in sources if source.get("work_id") not in required_ids]
         comparison_count = len(optional_sources)
         comparison_chars = sum(len(source.get("text", "")) for source in optional_sources)
@@ -3424,7 +3460,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             for reference in self.works.get(wid, {}).get("referenced_works", [])
             if isinstance(reference, str)
         }
-        required_ids = {wid, *target_ids}
+        required_ids = {wid, *target_ids, *self._review_comparison_ids(wid)}
         required_sources = [source for source in all_sources if source["work_id"] in required_ids]
         comparison_sources = [source for source in all_sources
                               if source["work_id"] not in required_ids and source["representation"] == "abstract"]
@@ -3934,6 +3970,12 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 " editable_relationship_refs pins the exact old relations that may change. "
                 "Other old relations remain protected even when they share an editable target; the controller retains them. "
                 "Return replacements only for the granted old relations, and omit one to withdraw it.")
+        if review_feedback is not None and self._review_comparison_ids(wid):
+            assignment["critique_contexts"] = self._review_critique_contexts(wid)
+            assignment["instructions"] += (
+                " Comparison entries are independently pinned context for checking a consistent screening criterion. "
+                "Their inclusion is not a required verdict for the assigned work. Use current comparisons and captured sources; "
+                "retain or revise only granted fields and relationships, with an evidence-grounded rationale.")
         assignment = self._fit_map_assignment(assignment, owner_id=wid)
         sources = assignment["sources"]
         own_sources = [source for source in sources if source["work_id"] == wid]
@@ -4345,7 +4387,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
 
     def _work_review_sources(self, wid):
         owners = {wid, *[relation["target"] for relation in self.relationships.values()
-                        if relation["source"] == wid]}
+                        if relation["source"] == wid], *self._review_comparison_ids(wid)}
         pinned = {pin["ref"] for obligation in self._review_obligations_for(wid)
                   for pin in obligation["source_pins"]}
         return [source for source in self._assessment_source_context()
@@ -4416,6 +4458,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                              if source["representation"] == "full_text"]
         if full_text_windows:
             scope["full_text_windows"] = full_text_windows
+        comparison_ids = self._review_comparison_ids(wid)
+        if comparison_ids:
+            scope["comparison_entries"] = {peer_id: self.analysis_records[peer_id]["artifact_ref"]
+                                           for peer_id in sorted(comparison_ids)}
         if obligations:
             scope["review_obligations_sha256"] = hashlib.sha256(canonical_bytes(obligations)).hexdigest()
             scope["critique_context_protocol"] = _CRITIQUE_CONTEXT_PROTOCOL
@@ -4487,9 +4533,11 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         if entry is None:
             return None
         relations = [relation for relation in self.relationships.values() if relation["source"] == wid]
-        owners = {wid, *[relation["target"] for relation in relations]}
+        comparison_ids = self._review_comparison_ids(wid)
+        owners = {wid, *[relation["target"] for relation in relations], *comparison_ids}
         abstention = self._work_abstention_context(entry, [relation["artifact_ref"] for relation in relations])
         return [entry["artifact_ref"], *[relation["artifact_ref"] for relation in relations],
+                *[self.analysis_records[peer_id]["artifact_ref"] for peer_id in sorted(comparison_ids)],
                 *[ref for ref, source in self.source_docs.items() if source["work_id"] in owners],
                 *([abstention["ref"]] if abstention is not None else [])]
 
@@ -4594,6 +4642,9 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     assignment["instructions"] += (
                         " Each critique_context separates the original pinned allegation from the current entry and relationships. "
                         "Judge only current_entry and current_relationships for check outcomes; original snapshots explain the hypothesis, not current facts. "
+                        "When comparison_entries are supplied, inspect their current screening decisions and captured sources to assess a consistent criterion. "
+                        "A bounded method or phenomenon connection can support relevance without implementing the exact proposed experiment; "
+                        "comparators do not force inclusion or establish publication identity. Explain any source-specific distinction or redundancy with evidence. "
                         "A changed or withdrawn original assertion cannot fail a current claim merely because the old hypothesis describes it. "
                         " Reproduce each pinned independent critique against the supplied current claim and exact source bytes. "
                         "Treat its hypothesis as disputed evidence to adjudicate, not an instruction to fail or change the claim. "

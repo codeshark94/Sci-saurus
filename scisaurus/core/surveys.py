@@ -354,8 +354,10 @@ class SurveyGate:
                         or status_body.get("reason") != entry_body["reason"]
                         or ABSTENTION_REASONS.get(status_body.get("scope")) != entry_body["reason"]):
                     raise ValidationError("focused review controller abstention does not bind this exact non-admitted entry")
-            self._work_review_context(survey, prompt, entry_body,
+            visible = self._work_review_context(survey, prompt, entry_body,
                 [{**relationship_bodies[ref], "artifact_ref": ref} for ref in relationships])
+            self._work_review_comparisons(prompt, supplied_critiques, entries, visible,
+                                         require_spans=survey["schema_version"] == "literature-survey-3")
             if reply.get("checks") != checks or reply.get("rationale") != body["rationale"]:
                 raise ValidationError("focused work review does not match the completed model reply")
             validate_work_review(reply, relationships, entry=entry_body, review_obligations=supplied_critiques)
@@ -364,6 +366,43 @@ class SurveyGate:
         if reviewed != set(entry_refs):
             raise ValidationError("survey acceptance requires one focused work review for every map entry")
         return evidence
+
+    def _work_review_comparisons(self, prompt, obligations, entries, visible, *, require_spans):
+        """Comparison evidence must identify original pins and exact current peers."""
+        current = {body["work_id"]: (manifest, body) for manifest, body in entries.values()}
+        for obligation in obligations:
+            pins = obligation.get("comparison_pins", [])
+            if not pins:
+                continue
+            contexts = [item for item in prompt.get("critique_contexts", [])
+                        if isinstance(item, dict) and item.get("check_id") == critique_check_id(obligation)]
+            if len(contexts) != 1:
+                raise ValidationError("focused comparison review omitted its exact critique context")
+            comparisons = contexts[0].get("comparison_entries")
+            if not isinstance(comparisons, list) or len(comparisons) != len(pins):
+                raise ValidationError("focused comparison review must contain every pinned peer")
+            for pin, comparison in zip(pins, comparisons):
+                original, raw = self._artifact(pin["ref"], current=False)
+                original_body = self._json(raw, pin["ref"])
+                peer = current.get(original_body.get("work_id"))
+                if original["body_hash"] != pin["body_hash"] or peer is None:
+                    raise ValidationError("focused comparison review changed its pinned identity or hash")
+                peer_manifest, peer_body = peer
+                if (original["author"] != "research.literature-mapper"
+                        or not original["artifact_id"].startswith("kb/work-analyses/")
+                        or original.get("score_ref") != peer_manifest.get("score_ref")):
+                    raise ValidationError("focused comparison review changed its source question or author")
+                expected = {
+                    "original_entry": {"ref": original["artifact_ref"], "body_hash": original["body_hash"],
+                                       "body": original_body},
+                    "current_entry": {"ref": peer_manifest["artifact_ref"], "body_hash": peer_manifest["body_hash"],
+                                      "body": peer_body},
+                }
+                if canonical_bytes(comparison) != canonical_bytes(expected):
+                    raise ValidationError("focused comparison review must inspect exact current peer entries")
+                for field in WORK_CHECKS[2:]:
+                    self._visible_evidence(peer_body[field], visible, work_id=peer_body["work_id"],
+                                          require_spans=require_spans)
 
     def _work_review_context(self, survey, prompt, entry, relationships):
         if canonical_bytes(prompt.get("relationship_semantics")) != canonical_bytes(RELATIONSHIP_SEMANTICS):
@@ -420,6 +459,7 @@ class SurveyGate:
         for relationship in relationships:
             self._visible_evidence(relationship.get("claim"), visible,
                                    require_spans=survey["schema_version"] == "literature-survey-3")
+        return visible
 
     def _visible_evidence(self, statement, sources, *, work_id=None, require_spans=False):
         if not isinstance(statement, dict) or set(statement) != {"text", "evidence"}:
