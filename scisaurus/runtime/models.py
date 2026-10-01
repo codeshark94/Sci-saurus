@@ -320,6 +320,62 @@ def _token_budget_tables(connection):
         "observed_input INTEGER, observed_output INTEGER)")
 
 
+def _effective_token_limits(connection, key, limits):
+    if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='model_token_capacity_grants'").fetchone():
+        return dict(limits)
+    rows = connection.execute("SELECT base_input,base_output,added_input,added_output "
+        "FROM model_token_capacity_grants WHERE budget_key=?", (key,)).fetchall()
+    expected = (limits["input_tokens"], limits["output_tokens"])
+    if any(row[:2] != expected for row in rows):
+        raise ValidationError("token capacity grant conflicts with the configured base allocation")
+    return {dimension: limits[dimension] + sum(row[index+2] for row in rows)
+            for index, dimension in enumerate(("input_tokens", "output_tokens"))}
+
+
+def model_token_budget_limits(config):
+    """Read the base allocation plus explicitly registered capacity grants."""
+    budget = _budget_config(config)
+    if not budget or "token_limits" not in budget:
+        return {}
+    path = Path(budget["path"])
+    if not path.is_file():
+        return dict(budget["token_limits"])
+    with closing(sqlite3.connect(path.resolve().as_uri()+"?mode=ro", uri=True)) as connection:
+        return _effective_token_limits(connection, budget["key"], budget["token_limits"])
+
+
+def grant_model_token_capacity(path, key, *, grant_id, input_tokens=0, output_tokens=0, reason):
+    """Append an explicit operator grant without altering allocations or costs."""
+    if (not isinstance(path, str) or not Path(path).is_absolute() or not Path(path).is_file()
+            or any(not isinstance(value, str) or not value.strip() for value in (key, grant_id, reason))
+            or any(type(value) is not int or value < 0 for value in (input_tokens, output_tokens))
+            or input_tokens + output_tokens == 0):
+        raise ValidationError("capacity grant requires an existing absolute ledger, identity, reason and positive capacity")
+    with closing(sqlite3.connect(path, timeout=30.0)) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='model_token_budgets'").fetchone():
+            raise ValidationError("capacity grant requires a registered token allocation")
+        row = connection.execute("SELECT max_input,max_output,used_input,used_output "
+                                 "FROM model_token_budgets WHERE budget_key=?", (key,)).fetchone()
+        if row is None:
+            raise ValidationError("capacity grant requires a registered budget owner")
+        connection.execute("CREATE TABLE IF NOT EXISTS model_token_capacity_grants ("
+            "grant_id TEXT PRIMARY KEY, budget_key TEXT NOT NULL, base_input INTEGER NOT NULL, "
+            "base_output INTEGER NOT NULL, added_input INTEGER NOT NULL, added_output INTEGER NOT NULL, "
+            "reason TEXT NOT NULL, created_at REAL NOT NULL, used_input INTEGER NOT NULL, used_output INTEGER NOT NULL)")
+        expected = (key, row[0], row[1], input_tokens, output_tokens, reason)
+        previous = connection.execute("SELECT budget_key,base_input,base_output,added_input,added_output,reason "
+            "FROM model_token_capacity_grants WHERE grant_id=?", (grant_id,)).fetchone()
+        if previous is not None and previous != expected:
+            raise ValidationError("capacity grant identity was already used for a different request")
+        if previous is None:
+            connection.execute("INSERT INTO model_token_capacity_grants VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (grant_id, *expected, time.time(), row[2], row[3]))
+        receipt = connection.execute("SELECT * FROM model_token_capacity_grants WHERE grant_id=?", (grant_id,)).fetchone()
+    return dict(zip(("grant_id", "budget_key", "base_input", "base_output", "added_input", "added_output",
+                     "reason", "created_at", "used_input", "used_output"), receipt))
+
+
 def register_model_token_budget(config, usage_floor=None):
     """Register immutable token ceilings and monotonically restore observed costs."""
     budget = _budget_config(config)
@@ -548,13 +604,14 @@ def _reserve_model_call_budget(config, *, token_reservation=None):
                 "FROM model_token_budgets WHERE budget_key=?", (budget["key"],)).fetchone()
             if tokens[:2] != (limits["input_tokens"], limits["output_tokens"]):
                 raise ModelCallError("model token-budget limit conflicts with existing ledger", outcome_known=True)
+            effective = _effective_token_limits(connection, budget["key"], limits)
             pending = connection.execute("SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0) "
                 "FROM model_token_reservations WHERE budget_key=? AND state!='settled'", (budget["key"],)).fetchone()
             for offset, dimension in enumerate(("input_tokens", "output_tokens")):
-                if tokens[offset+2] + pending[offset] + token_reservation[dimension] > tokens[offset]:
+                if tokens[offset+2] + pending[offset] + token_reservation[dimension] > effective[dimension]:
                     raise ModelBudgetExceededError(f"model token budget exhausted: {budget['key']} {dimension}",
                         outcome_known=True, budget_admission={"path": str(path.resolve()), "key": budget["key"],
-                            "dimension": dimension, "limit": tokens[offset], "observed": tokens[offset+2],
+                            "dimension": dimension, "limit": effective[dimension], "observed": tokens[offset+2],
                             "reserved": pending[offset], "requested": token_reservation[dimension]})
             budget["reservation_id"] = uuid.uuid4().hex
             connection.execute("INSERT INTO model_token_reservations (reservation_id,budget_key,input_tokens,output_tokens,state) VALUES (?,?,?,?, 'reserved')",

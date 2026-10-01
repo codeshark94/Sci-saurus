@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sqlite3
 import sys
 
 from scisaurus.core.events import ControlStore
@@ -83,6 +84,14 @@ def main(argv=None) -> int:
 
     p_init = sub.add_parser("init", help="initialize a project control store")
     p_init.add_argument("project_dir")
+
+    p_grant = sub.add_parser("grant-token-capacity", help="record explicit additional capacity for an existing model budget")
+    p_grant.add_argument("ledger")
+    p_grant.add_argument("budget_key")
+    p_grant.add_argument("--grant-id", required=True)
+    p_grant.add_argument("--input-tokens", type=int, default=0)
+    p_grant.add_argument("--output-tokens", type=int, default=0)
+    p_grant.add_argument("--reason", required=True)
 
     p_pub = sub.add_parser("publish", help="publish an artifact from a file")
     p_pub.add_argument("project_dir")
@@ -250,6 +259,17 @@ def main(argv=None) -> int:
     p_interim.add_argument("project_dir")
 
     args = parser.parse_args(argv)
+    if args.cmd == "grant-token-capacity":
+        from scisaurus.core.errors import ValidationError
+        from scisaurus.runtime.models import grant_model_token_capacity
+        try:
+            result = grant_model_token_capacity(args.ledger, args.budget_key, grant_id=args.grant_id,
+                input_tokens=args.input_tokens, output_tokens=args.output_tokens, reason=args.reason)
+        except (OSError, ValueError, sqlite3.Error, ValidationError) as exc:
+            print(f"capacity grant rejected: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
     if args.cmd in {"run-review-article", "prepare-review-article"}:
         from scisaurus.core.errors import ValidationError
         from scisaurus.runtime.composer import load_runtime_environment_files

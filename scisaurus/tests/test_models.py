@@ -24,6 +24,37 @@ from scisaurus.runtime.models import (
 
 
 class TestModelClient(unittest.TestCase):
+    def test_explicit_token_capacity_preserves_costs_and_base_allocation(self):
+        from scisaurus.runtime.models import (grant_model_token_capacity, register_model_token_budget,
+            model_token_budget_limits, model_token_budget_usage, _reserve_model_call_budgets,
+            _settle_model_token_budgets, ModelBudgetExceededError)
+        with tempfile.TemporaryDirectory() as directory:
+            scope = {"model_call_budget_path": str(Path(directory)/"owner.sqlite"),
+                "model_call_budget_key": "stage", "model_call_budget_limit": 5,
+                "model_token_budget_limits": {"input_tokens": 20, "output_tokens": 30}}
+            register_model_token_budget(scope, {"input_tokens": 19, "output_tokens": 3})
+            with self.assertRaises(ModelBudgetExceededError):
+                _reserve_model_call_budgets([scope], token_reservation={"input_tokens": 10, "output_tokens": 2})
+            receipt = grant_model_token_capacity(scope["model_call_budget_path"], "stage",
+                grant_id="repair", input_tokens=20, reason="Verified runtime repair")
+            self.assertEqual(grant_model_token_capacity(scope["model_call_budget_path"], "stage",
+                grant_id="repair", input_tokens=20, reason="Verified runtime repair"), receipt)
+            self.assertEqual(model_token_budget_limits(scope), {"input_tokens": 40, "output_tokens": 30})
+            self.assertEqual(model_token_budget_usage(scope), {"input_tokens": 19, "output_tokens": 3})
+            reservations = _reserve_model_call_budgets([scope], token_reservation={"input_tokens": 10, "output_tokens": 2})
+            _settle_model_token_budgets(reservations, {"input_tokens": 7, "output_tokens": 1})
+            register_model_token_budget(scope)
+            self.assertEqual(model_token_budget_usage(scope), {"input_tokens": 26, "output_tokens": 4})
+            with self.assertRaises(ValidationError):
+                grant_model_token_capacity(scope["model_call_budget_path"], "stage",
+                    grant_id="repair", input_tokens=21, reason="Verified runtime repair")
+            changed = {**scope, "model_token_budget_limits": {"input_tokens": 40, "output_tokens": 30}}
+            with self.assertRaises(ValidationError):
+                register_model_token_budget(changed)
+            with sqlite3.connect(scope["model_call_budget_path"]) as connection:
+                self.assertEqual(connection.execute("SELECT * FROM model_token_budgets").fetchone(), ("stage", 20, 30, 26, 4))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM model_token_capacity_grants").fetchone()[0], 1)
+
     def test_remaining_call_capacity_is_read_only_and_matches_atomic_reservations(self):
         from scisaurus.runtime.models import (
             _reserve_model_call_budgets, model_call_budget_available, model_call_budget_remaining,

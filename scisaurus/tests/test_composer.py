@@ -2743,6 +2743,23 @@ class ComposerWorkflowTests(unittest.TestCase):
             from scisaurus.runtime.models import _reserve_model_call_budgets
             with self.assertRaisesRegex(ModelCallError, "token budget exhausted"):
                 _reserve_model_call_budgets([scope], token_reservation={"input_tokens": 1, "output_tokens": 1})
+            from scisaurus.runtime.models import grant_model_token_capacity
+            before = runner._stage_usage(stage["id"])
+            grant_model_token_capacity(scope["model_call_budget_path"], scope["model_call_budget_key"],
+                grant_id="verified-repair", input_tokens=1500000, reason="Verified runtime repair")
+            self.assertIsNone(runner._stage_quota_error(stage))
+            self.assertEqual(runner._stage_usage(stage["id"]), before)
+            self.assertEqual(runner._stage_model_config(stage, {})["model_call_budget_scopes"][0], scope)
+            from scisaurus.runtime.models import ModelBudgetExceededError
+            granted_error = ModelBudgetExceededError("effective capacity exhausted", outcome_known=True,
+                budget_admission={"path": scope["model_call_budget_path"], "key": scope["model_call_budget_key"],
+                    "dimension": "input_tokens", "limit": 3000000, "observed": 2999999,
+                    "reserved": 0, "requested": 2})
+            with patch.object(runner, "_remaining", return_value=36000), \
+                 patch.object(runner, "_deadline_dispatch_floor", return_value=0), \
+                 patch.object(runner, "_begin_continuation", return_value=True):
+                self.assertTrue(runner._admit_stage_quota_recovery(stage, granted_error, set(), {}))
+            self.assertEqual(runner.context[stage["id"]]["quota_recovery"]["limit"], 3000000)
             runner.continuation_cycles = 11
             self.assertEqual(runner._stage_usage(stage["id"])["input_tokens"], 0)
 

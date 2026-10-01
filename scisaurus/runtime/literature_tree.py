@@ -20,6 +20,40 @@ def node_id(value):
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
+def bind_reading_candidates(value, aliases):
+    """Bind exact candidate handles without inferring a paper identity."""
+    validate_reading_proposal(value, require_priority=isinstance(value, dict) and "read_priority" in value)
+    value = deepcopy(value)
+    for row in value.get("candidates", []):
+        if isinstance(row, dict) and isinstance(row.get("work_id"), str):
+            row["work_id"] = aliases.get(row["work_id"], row["work_id"])
+    if isinstance(value.get("read_priority"), list):
+        value["read_priority"] = [aliases.get(wid, wid) if isinstance(wid, str) else wid
+                                  for wid in value["read_priority"]]
+    return value
+
+
+def selection_basis(assignment):
+    """Identify scientific inputs independently of their model presentation."""
+    return {"question": assignment["question"], "inquiries": assignment["inquiries"],
+            "candidates": [{"work_id": item["work_id"], "work_ref": item["work_ref"],
+                            "source_refs": sorted(source["source_ref"] for source in item["sources"])}
+                           for item in assignment["candidates"]],
+            "checked_entries": assignment["checked_entries"]}
+
+
+def planning_parent(node, alias, work=None, entry=None, review=None):
+    """Expose checked findings and evidence ownership without repeating captures."""
+    result = {key: value for key, value in node.items() if key not in {"id", "parent_id"}}
+    result["id"] = alias
+    if node["kind"] == "read":
+        result.update(work={key: work.get(key) for key in ("title", "year", "doi")}, entry=entry,
+            review={"entry_ref": node["entry_ref"], "checks": [
+                {key: check[key] for key in ("id", "outcome") if key in check} for check in review["checks"]]},
+            allowed_evidence={"work_id": node["work_id"], "source_refs": node["source_refs"]})
+    return result
+
+
 def bind_plan_parents(value, parent_aliases):
     """Resolve exact handles while retaining already-bound canonical parents."""
     value = deepcopy(value)
@@ -211,16 +245,13 @@ class LiteratureTree:
         candidates = candidate_ids - existing
         remaining, scopes = self._remaining_model_capacity(["research.search-planner", "research.literature-mapper",
                                                            "methods.work-reviewer"])
-        # Text windows share the declared context surface; catalog metadata is
-        # retained in full and never becomes evidence for substantive claims.
-        source_limit = max(1, self.bounds["context_chars"] // max(1, len(candidates)))
         assignment = {"phase": "reading_selection", "question": self.score["question"],
             "inquiries": [{key: action.get(key) for key in ("id", "parent_id", "question", "rationale", "evidence",
                           "query_ref", "returned_work_ids")} for action in pending],
             "candidates": [{"work_id": wid, "work_ref": self.work_records[wid]["artifact_ref"],
-                "work": {key: self.works[wid].get(key) for key in ("title", "year", "doi", "referenced_works")},
+                "work": {key: self.works[wid].get(key) for key in ("title", "year", "doi")},
                 "sources": [{"source_ref": ref, "representation": source["representation"],
-                             "text": source["text"][:source_limit], "available_chars": len(source["text"])}
+                             "text": source["text"], "available_chars": len(source["text"])}
                             for ref, source in self.source_docs.items()
                             if source["work_id"] == wid and authoritative_source(source)]}
                            for wid in sorted(candidates)],
@@ -235,15 +266,33 @@ class LiteratureTree:
                 "There is no paper-count quota, fixed seed count, or per-depth allocation. Actual calls, tokens, and time are finite; "
                 "leave capacity for verification, further inquiry, and required downstream decisions. "
                 "A read decision requests source capture, analysis, and independent checking; it is not scientific inclusion or verification. "
-                "A defer decision retains the candidate for later consideration. Metadata and truncated abstracts do not establish "
+                "A defer decision retains the candidate for later consideration. Metadata does not establish "
                 "mechanisms, measurements, novelty, or absence. Explain priority and relevance without inventing substantive findings."}
-        identity = node_id({key: value for key, value in assignment.items() if key != "resources"})
+        basis = selection_basis(assignment)
+        identity = node_id(basis)
         retained_input = self.store.head("kb/reading-selection-inputs/" + identity)
-        if retained_input:
-            assignment = self._body(retained_input)
-        else:
+        if retained_input is None:
+            for record in self._heads("kb/reading-selection-inputs/"):
+                previous = self._body(record)
+                if selection_basis(previous) == basis and self.store.head(
+                        "kb/reading-selection-progress/" + record["artifact_id"].split("/")[-1]):
+                    retained_input = record
+                    identity = record["artifact_id"].split("/")[-1]
+                    break
+        if retained_input is None:
             self._record("kb/reading-selection-inputs/" + identity, "note", assignment, "research.search-planner",
                          subjects=[action["query_ref"] for action in pending])
+        assignment["checked_entries"] = [{"work_id": wid,
+            "entry_ref": self.analysis_records[wid]["artifact_ref"],
+            "inclusion": entry["inclusion"], "reason": entry["reason"],
+            "findings": {field: entry[field]["text"] for field in MAP_FIELDS}}
+            for wid in sorted(existing) for entry in [self._body(self.analysis_records[wid])]]
+        assignment["inquiries"] = [{key: value for key, value in inquiry.items() if key != "returned_work_ids"}
+                                    for inquiry in assignment["inquiries"]]
+        for item in assignment["candidates"]:
+            abstracts = [source for source in item["sources"] if source["representation"] == "abstract"]
+            if abstracts:
+                item["sources"] = abstracts
         progress_id = "kb/reading-selection-progress/" + identity
         retained = self.store.head(progress_id)
         progress = self._body(retained) if retained else {
@@ -259,7 +308,10 @@ class LiteratureTree:
             repairing = bool(progress["execution_refs"])
             if repairing:
                 scoped["candidates"] = [item for item in assignment["candidates"] if item["work_id"] in pending_ids]
-                scoped["retained_decisions"] = deepcopy(progress["candidates"])
+                scoped["retained_decisions"] = [deepcopy(choice) for choice in progress["candidates"]
+                                                if choice["decision"] == "read"]
+                scoped["retained_deferred_count"] = sum(choice["decision"] == "defer"
+                                                        for choice in progress["candidates"])
                 scoped["validation_feedback"] = {"issues": progress["issues"],
                     "previous_execution_ref": progress["execution_refs"][-1],
                     "scope": "Decide only the candidates supplied in this assignment. Unique valid earlier decisions are retained. "
@@ -270,11 +322,35 @@ class LiteratureTree:
                     "read_priority must order every retained or newly selected READ work exactly once, by scientific importance. "
                     "Do not put deferred IDs in read_priority. Resolve placement of repaired reads explicitly. "
                     "If no unresolved candidate remains, return candidates:[] and repair only read_priority.")
-            repair_identity = identity if not progress["execution_refs"] else identity + "-repair-" + node_id(scoped)
+            candidate_aliases = {f"candidate-{index}": item["work_id"]
+                                 for index, item in enumerate(scoped["candidates"])}
+            for alias, item in zip(candidate_aliases, scoped["candidates"]):
+                item["canonical_work_id"] = item["work_id"]
+                item["work_id"] = alias
+            reverse = {wid: alias for alias, wid in candidate_aliases.items()}
+            if repairing:
+                scoped["validation_feedback"]["issues"] = {"unresolved": [
+                    {"work_id": reverse.get(row["work_id"], row["work_id"]), "reason": row["reason"]}
+                    for row in progress["issues"]["unresolved"]]}
+            scoped["instructions"] += (
+                " Candidate work_id values are assignment-local handles. Copy them exactly in candidates; "
+                "checked_entries are prior context, not candidates to decide. For read_priority, retained READ IDs "
+                "remain canonical and new READ IDs use their supplied handles. Never copy citation metadata into a decision.")
+            repair_identity = identity if not progress["execution_refs"] else identity + "-repair-" + node_id(
+                {key: value for key, value in scoped.items() if key != "resources"})
+            model_input_id = "kb/reading-selection-model-inputs/" + repair_identity
+            model_input = self.store.head(model_input_id)
+            if model_input is not None:
+                scoped = self._body(model_input)
+            else:
+                self._record(model_input_id, "note", scoped, "research.search-planner",
+                    subjects=[*progress["execution_refs"], *[action["query_ref"] for action in pending]])
             proposal, execution = self._model_checked("reading-selection-" + repair_identity,
                 "research.search-planner", scoped,
                 lambda value: validate_reading_proposal(value, require_priority=repairing),
+                normalizer=lambda value: bind_reading_candidates(value, candidate_aliases),
                 stage="supervision", task_kind="service")
+            proposal = bind_reading_candidates(proposal, candidate_aliases)
             valid, issues = reading_selection_parts(proposal, pending_ids)
             progress["rationale"] = progress["rationale"] or proposal["rationale"]
             progress["candidates"].extend(valid)
@@ -518,12 +594,10 @@ class LiteratureTree:
         context = [source for source in self._source_context() if source["source_ref"] in sources]
         windows = {source["source_ref"]: source["window"] for source in context}
         parent_aliases = {f"parent-{index}": node["id"] for index, node in enumerate(parents)}
-        assignments = [{**{key: value for key, value in node.items() if key not in {"id", "parent_id"}},
-                                  "id": alias, **({"work": self._body(self.store.get(node["work_ref"])), "entry": self._body(self.store.get(node["entry_ref"])),
-                                  "review": self._body(self.store.get(node["review_ref"])),
-                                  "allowed_evidence": {"work_id": node["work_id"], "source_refs": node["source_refs"]},
-                                  "sources": [source for source in context if source["source_ref"] in node["source_refs"]]}
-                                 if node["kind"] == "read" else {})} for alias, node in zip(parent_aliases, parents)]
+        assignments = [planning_parent(node, alias, **{
+            field: self._body(self.store.get(node[ref])) for field, ref in (
+                ("work", "work_ref"), ("entry", "entry_ref"), ("review", "review_ref"))}
+            if node["kind"] == "read" else {}) for alias, node in zip(parent_aliases, parents)]
         branch_limit = None
         remaining, scopes = self._remaining_model_capacity(["research.search-planner", "research.literature-mapper", "methods.work-reviewer"])
         assignment = {"phase": "exploration_plan", "question": self.score["question"],
@@ -544,7 +618,8 @@ class LiteratureTree:
                 "These handles are local to this assignment; work IDs and acquisition history IDs are not parent handles. "
                 "For a root, choose initial searches or direct canonical OpenAlex work lookups from the scientific intake, with empty evidence. "
                 "For a read, explain what its checked findings suggest investigating next, with exact parent quotations. "
-                "Each branch parent_id must identify the work supplying its evidence: use that parent's allowed_evidence and sources. "
+                "Each branch parent_id must identify the work supplying its evidence: use that parent's allowed_evidence "
+                "and its source_refs in the shared sources table. Each captured source is supplied once. "
                 "Another parent's source cannot support a branch attached to this parent. Incoming inquiry_evidence explains its history, "
                 "not the allowed evidence for a new branch. Close irrelevant parents instead of using them to carry another work's findings. "
                 "An unresolved research question is not a source-stated limitation; abstract silence cannot prove absence. "

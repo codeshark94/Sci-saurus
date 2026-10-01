@@ -6,7 +6,8 @@ import unittest
 from scisaurus.core.errors import ValidationError, StateError
 from scisaurus.core.source_spans import bind
 from scisaurus.runtime.literature_tree import (validate_plan, validate_reading_selection,
-                                             reading_selection_parts, bind_plan_parents)
+                                             reading_selection_parts, bind_plan_parents, bind_reading_candidates,
+                                             planning_parent, selection_basis)
 from scisaurus.tests import test_survey as fixtures
 from scisaurus.tests.test_survey import simulated_survey_worker, source_quote, survey_config
 
@@ -17,7 +18,7 @@ def chain_worker(kind, params, channel):
     assignment = json.loads(params["prompt"])
     if assignment.get("phase") == "reading_selection" and params["client"]["model"] == "select-independent":
         value = {"rationale": "Compare alternatives before reading the independent study.",
-                 "candidates": [{"work_id": item["work_id"], "decision": "read" if item["work_id"] == "W201" else "defer",
+                 "candidates": [{"work_id": item["work_id"], "decision": "read" if item["canonical_work_id"] == "W201" else "defer",
                                  "rationale": "Prioritize independent terminology for this inquiry."}
                                 for item in assignment["candidates"]]}
         channel.put({"ok": True, "result": {"text": json.dumps(value), "model": params["client"]["model"],
@@ -187,7 +188,92 @@ class TestExplorationContract(unittest.TestCase):
         validate_reading_selection(value, {"W1"})
 
 
+class TestPromptProjection(unittest.TestCase):
+    def test_candidate_handles_preserve_unknown_rows_and_bind_idempotently(self):
+        value = {"rationale": "Evidence priority.", "candidates": [
+            {"work_id": "candidate-0", "decision": "read", "rationale": "Relevant."},
+            {"work_id": "misspelled-id", "decision": "read", "rationale": "Unassigned."}],
+            "read_priority": ["candidate-0", "W2"]}
+        bound = bind_reading_candidates(value, {"candidate-0": "W1"})
+        self.assertEqual(bound["read_priority"], ["W1", "W2"])
+        self.assertEqual(bound["candidates"][1]["work_id"], "misspelled-id")
+        self.assertEqual(bind_reading_candidates(bound, {"candidate-0": "W1"}), bound)
+        self.assertEqual(value["candidates"][0]["work_id"], "candidate-0")
+        for bad in ([], None, {"rationale": "x", "candidates": None}):
+            with self.assertRaises(ValidationError):
+                bind_reading_candidates(bad, {})
+
+    def test_selection_identity_pins_refs_independently_of_text_projection(self):
+        value = {"question": "Question", "inquiries": [], "checked_entries": [], "candidates": [
+            {"work_id": "W1", "work_ref": "work@1", "sources": [{"source_ref": "source@1", "text": "old"}]}]}
+        projected = deepcopy(value)
+        projected["candidates"][0]["sources"][0]["text"] = "Complete captured abstract"
+        self.assertEqual(selection_basis(projected), selection_basis(value))
+        projected["candidates"][0]["sources"][0]["source_ref"] = "source@2"
+        self.assertNotEqual(selection_basis(projected), selection_basis(value))
+
+    def test_planner_carries_checked_ownership_without_repeating_capture(self):
+        node = {"id": "read-id", "parent_id": "acquisition-id", "kind": "read", "work_id": "W1",
+                "entry_ref": "entry@1", "source_refs": ["source@1"], "referenced_works": ["W2"]}
+        card = planning_parent(node, "parent-0", {"title": "Title", "year": 2020, "doi": "doi",
+            "raw": "unused metadata"}, {"finding": "Checked finding"},
+            {"checks": [{"id": "source-fidelity", "outcome": "passed", "rationale": "Long rationale"}]})
+        self.assertNotIn("parent_id", card)
+        self.assertNotIn("sources", card)
+        self.assertNotIn("raw", card["work"])
+        self.assertEqual(card["referenced_works"], ["W2"])
+        self.assertEqual(card["allowed_evidence"], {"work_id": "W1", "source_refs": ["source@1"]})
+        self.assertEqual(card["review"]["checks"], [{"id": "source-fidelity", "outcome": "passed"}])
+
+
 class TestExplorationExecution(unittest.TestCase):
+    def test_selection_model_input_survives_capacity_drift(self):
+        from unittest.mock import patch
+        runner = self.runner(); runner._initialize(); runner._setup(); runner._tree_load()
+        runner._bibliographic_call("work", role="research.search-planner", work_id="W101",
+            result_limit=1, plan_ref=runner.protocol["artifact_ref"])
+        action = {"id": "capture", "parent_id": runner.exploration_tree["nodes"][0]["id"],
+            "question": "Investigate recall.", "rationale": "Check the source.",
+            "query_ref": runner.query_refs[-1], "returned_work_ids": ["W101"]}
+        captured = []
+        def interrupted(name, role, assignment, *args, **kwargs):
+            captured.append((name, deepcopy(assignment)))
+            raise KeyboardInterrupt()
+        with patch.object(runner, "_remaining_model_capacity", return_value=(10, [])), \
+             patch.object(runner, "_model_checked", side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt): runner._tree_select_reads([action])
+        with patch.object(runner, "_remaining_model_capacity", return_value=(9, [])), \
+             patch.object(runner, "_model_checked", side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt): runner._tree_select_reads([action])
+        self.assertEqual(captured[0], captured[1])
+        runner.control.close()
+
+    def test_selection_preserves_complete_abstract_without_citation_adjacency(self):
+        from unittest.mock import patch
+        runner = self.runner(); runner._initialize(); runner._setup(); runner._tree_load()
+        runner._bibliographic_call("work", role="research.search-planner", work_id="W101",
+            result_limit=1, plan_ref=runner.protocol["artifact_ref"])
+        captured = []
+        def choose(name, role, assignment, validator, **kwargs):
+            captured.append(assignment)
+            value = {"rationale": "Check evidence.", "candidates": [{"work_id": "candidate-0",
+                "decision": "read", "rationale": "Relevant evidence."}]}
+            return value, runner.protocol["artifact_ref"]
+        action = {"id": "capture", "parent_id": runner.exploration_tree["nodes"][0]["id"],
+            "question": "Investigate recall.", "rationale": "Check the source.",
+            "query_ref": runner.query_refs[-1], "returned_work_ids": ["W101"]}
+        runner.works["W101"]["referenced_works"] = ["W999"] * 1000
+        with patch.object(runner, "_model_checked", side_effect=choose):
+            runner._tree_select_reads([action])
+        card = captured[0]["candidates"][0]
+        self.assertNotIn("referenced_works", card["work"])
+        self.assertEqual(card["canonical_work_id"], "W101")
+        for source in card["sources"]:
+            self.assertEqual(source["text"], runner.source_docs[source["source_ref"]]["text"])
+        self.assertNotIn("returned_work_ids", captured[0]["inquiries"][0])
+        self.assertEqual(action["selected_work_ids"], ["W101"])
+        runner.control.close()
+
     @classmethod
     def setUpClass(cls):
         fixtures.TestSurveyRunner.setUpClass()
@@ -543,7 +629,7 @@ class TestExplorationExecution(unittest.TestCase):
         control, store = self.fixture.open_store()
         assignments = [prompt for _, prompt in self.fixture.model_contexts(control, store)]
         selection = next(item for item in assignments if item["phase"] == "reading_selection")
-        self.assertEqual({item["work_id"] for item in selection["candidates"]}, {"W101", "W201", "W301"})
+        self.assertEqual({item["canonical_work_id"] for item in selection["candidates"]}, {"W101", "W201", "W301"})
         maps = [item["requested_work_ids"][0] for item in assignments if item["phase"] == "map"]
         self.assertIn("W201", maps)
         self.assertNotIn("W101", maps)
@@ -582,7 +668,7 @@ class TestExplorationExecution(unittest.TestCase):
         with patch.object(runner, "_model_checked", side_effect=choose):
             runner._tree_select_reads([action])
         self.assertEqual(len(assignments), 2)
-        self.assertEqual([row["work_id"] for row in assignments[1]["candidates"]], ["W201"])
+        self.assertEqual([row["canonical_work_id"] for row in assignments[1]["candidates"]], ["W201"])
         self.assertEqual({row["work_id"] for row in assignments[1]["retained_decisions"]}, {"W101", "W301"})
         self.assertEqual(action["selected_work_ids"], ["W201", "W101", "W301"])
         action.pop("selection_ref")
@@ -605,7 +691,7 @@ class TestExplorationExecution(unittest.TestCase):
         self.assertEqual(completed["status"], "completed", completed["error"])
         control, store = self.fixture.open_store()
         selections = [prompt for _, prompt in self.fixture.model_contexts(control, store) if prompt["phase"] == "reading_selection"]
-        initial = [prompt for prompt in selections if {item["work_id"] for item in prompt["candidates"]} == {"W101"}]
+        initial = [prompt for prompt in selections if {item["canonical_work_id"] for item in prompt["candidates"]} == {"W101"}]
         self.assertEqual(len(initial), 1)
 
     def test_checked_chain_ignores_legacy_depth_parent_and_paper_counts(self):
@@ -632,7 +718,7 @@ class TestExplorationExecution(unittest.TestCase):
         first = action("first", ["W101", "W201"])
         def choose(name, role, assignment, validator, **kwargs):
             value = {"rationale": "Prioritize the inquiry evidence.", "candidates": [
-                {"work_id": item["work_id"], "decision": "defer" if item["work_id"] == "W201" else "read",
+                {"work_id": item["work_id"], "decision": "defer" if item["canonical_work_id"] == "W201" else "read",
                  "rationale": "Retain candidates for the next inquiry."} for item in assignment["candidates"]]}
             validator(value)
             return value, runner.protocol["artifact_ref"]
@@ -642,7 +728,7 @@ class TestExplorationExecution(unittest.TestCase):
         second = action("second", ["W301"])
         captured = []
         def reconsider(name, role, assignment, validator, **kwargs):
-            captured.extend(item["work_id"] for item in assignment["candidates"])
+            captured.extend(item["canonical_work_id"] for item in assignment["candidates"])
             value = {"rationale": "Reassess alternatives using the fresh inquiry.", "candidates": [
                 {"work_id": item["work_id"], "decision": "read", "rationale": "Advance the inquiry."}
                 for item in assignment["candidates"]]}

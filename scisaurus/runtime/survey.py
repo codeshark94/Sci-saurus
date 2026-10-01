@@ -24,7 +24,7 @@ from scisaurus.runtime.config import configured_worker_slots
 from scisaurus.runtime.bibliographic_identity import normalize_doi, project_crossref_work, reconcile_result
 from scisaurus.runtime.models import (
     ModelCallError, ModelResult, estimate_input_tokens, is_local_qwen_route,
-    model_call_budget_remaining, model_token_budget_usage, role_config_for, role_routes_for,
+    model_call_budget_remaining, model_token_budget_usage, model_token_budget_limits, role_config_for, role_routes_for,
 )
 from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
 from scisaurus.runtime.literature import (
@@ -1525,7 +1525,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             limits.append(remaining)
             scopes.append({"path": identity[0], "key": identity[1], "remaining_calls": remaining,
                            "charged_tokens": model_token_budget_usage(config),
-                           "token_limits": deepcopy(config.get("model_token_budget_limits"))})
+                           "token_limits": model_token_budget_limits(config)})
         return (min(limits) if limits else None), scopes
 
     def _allocate_model_wave(self, wave, *, repairing=()):

@@ -65,7 +65,7 @@ from scisaurus.runtime.models import (
     MAX_MODEL_RATE_LIMIT_COOLDOWN_SECONDS,
     ModelCallError, ModelContextBudgetError, effective_model_timeout,
     with_runtime_cooldown_fallback,
-    register_model_token_budget, model_token_budget_usage,
+    register_model_token_budget, model_token_budget_usage, model_token_budget_limits,
     validate_model_budget_scope,
 )
 from scisaurus.runtime.failure_recovery import (
@@ -16751,16 +16751,27 @@ class ComposerRunner:
                 totals["openalex_requests"] = provider_total
         return totals
 
+    def _stage_token_limits(self, stage):
+        quota = stage["quota"]
+        cycle = self.continuation_cycles if stage["id"] in self.reopened_stage_ids else 0
+        return model_token_budget_limits({
+            "model_call_budget_path": str((self.root / "state/stage-model-call-budget.sqlite").resolve()),
+            "model_call_budget_key": f"stage:{stage['id']}:cycle:{cycle}",
+            "model_call_budget_limit": quota["max_model_calls"],
+            "model_token_budget_limits": {"input_tokens": quota["max_input_tokens"],
+                                           "output_tokens": quota["max_output_tokens"]}})
+
     def _stage_quota_error(self, stage):
         """Check an aggregate stage quota before admitting another attempt."""
         quota = stage.get("quota") if isinstance(stage, dict) else None
         if not isinstance(quota, dict):
             return None
         usage = self._stage_usage(stage["id"])
+        tokens = self._stage_token_limits(stage)
         dimensions = {
             "max_model_calls": ("model_calls", quota["max_model_calls"]),
-            "max_input_tokens": ("input_tokens", quota["max_input_tokens"]),
-            "max_output_tokens": ("output_tokens", quota["max_output_tokens"]),
+            "max_input_tokens": ("input_tokens", tokens["input_tokens"]),
+            "max_output_tokens": ("output_tokens", tokens["output_tokens"]),
             "max_openalex_requests": ("openalex_requests", quota["max_openalex_requests"]),
         }
         for dimension, (usage_key, limit) in dimensions.items():
@@ -16795,9 +16806,13 @@ class ComposerRunner:
         if admission is not None:
             cycle = self.continuation_cycles if stage["id"] in self.reopened_stage_ids else 0
             quota = stage.get("quota") or {}
+            limit = quota.get(quota_error.dimension)
+            if quota_error.dimension in {"max_input_tokens", "max_output_tokens"}:
+                token_limits = self._stage_token_limits(stage)
+                limit = token_limits[quota_error.dimension.removeprefix("max_")]
             if (admission.get("path") != str((self.root/"state/stage-model-call-budget.sqlite").resolve())
                     or admission.get("key") != f"stage:{stage['id']}:cycle:{cycle}"
-                    or quota.get(quota_error.dimension) != admission.get("limit")):
+                    or limit != admission.get("limit")):
                 return False
         if stage.get("kind") == "topic_discovery":
             # A combined topic stage can include specialist and verifier calls
