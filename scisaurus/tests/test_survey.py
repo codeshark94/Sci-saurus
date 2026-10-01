@@ -1636,6 +1636,20 @@ class TestSurveyRunner(unittest.TestCase):
                 self.assertEqual(prompt["follow_up_ref"], result["follow_up_ref"])
                 from scisaurus.runtime.evidence import scientific_input_recovery_contract
                 self.assertEqual(prompt["scientific_input_recovery"], scientific_input_recovery_contract())
+                if prompt["phase"] == "survey_follow_up":
+                    survey = json.loads(store.read_body(store.get(result["survey_ref"])["body_hash"]))
+                    inventory = prompt["survey_inventory"]
+                    self.assertEqual(inventory["survey_ref"], result["survey_ref"])
+                    self.assertEqual(inventory["map_ref"], survey["map_ref"])
+                    self.assertEqual(inventory["coverage_ref"], survey["coverage_ref"])
+                    self.assertEqual({work["work_ref"] for work in inventory["works"]},
+                                     set(survey["work_refs"]))
+                    for work in inventory["works"]:
+                        entry = json.loads(store.read_body(store.get(work["map_entry_ref"])["body_hash"]))
+                        self.assertEqual(work["work_id"], entry["work_id"])
+                        self.assertEqual(work["screening"], entry["inclusion"])
+                        for source in work["sources"]:
+                            self.assertIn(source["source_ref"], survey["source_refs"])
         self.assertEqual(phases, {"blind_plan", "map", "gap_assessment", "survey_follow_up"})
         report = json.loads(store.read_body(store.get(result["follow_up_result"]["ref"])["body_hash"]))
         self.assertEqual(report["survey_ref"], result["survey_ref"])
@@ -1746,7 +1760,13 @@ class TestSurveyRunner(unittest.TestCase):
         self.addCleanup(runner.control.close)
         runner.config["model"].update({"context_window_tokens": 65536, "max_input_tokens": 56000,
                                        "max_output_tokens": 8192})
-        runner.survey_ref = "artifact:kb/surveys/current@1"
+        map_ref = runner._record("kb/map/context-fixture", "note",
+            {"entries": [], "entry_refs": []}, "research.cataloger")["artifact_ref"]
+        coverage_ref = runner._record("kb/coverage/context-fixture", "note",
+            {"abstentions": []}, "research.cataloger")["artifact_ref"]
+        runner.survey_ref = runner._record("kb/surveys/current", "note",
+            {"map_ref": map_ref, "coverage_ref": coverage_ref, "work_refs": [], "source_refs": []},
+            "research.cataloger")["artifact_ref"]
         runner.assessment_ref = runner._record("kb/assessment/context-fixture", "note",
             {"state": "insufficient_evidence", "rationale": "Measurements absent.", "checks": []},
             "methods.novelty-verifier")["artifact_ref"]
@@ -1763,6 +1783,52 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertLessEqual(estimate_input_tokens(SYSTEM, json.dumps(captured[0], ensure_ascii=False)), 56000)
         self.assertEqual(captured[0]["work_orders"], [self.follow_up_order()])
         self.assertEqual(runner.source_docs, original)
+
+    def test_follow_up_inventory_is_pinned_to_accepted_membership_and_reading_status(self):
+        runner = self.runtime(work_orders=[self.follow_up_order()])
+        result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        control, store = self.open_store()
+        runner.store = store
+        before = runner._follow_up_inventory()
+        survey = json.loads(store.read_body(store.get(result["survey_ref"])["body_hash"]))
+        map_record = store.get(survey["map_ref"])
+        newer = json.loads(store.read_body(map_record["body_hash"]))
+        newer["entry_refs"] = []
+        store.publish_artifact(logical_id=map_record["artifact_id"], artifact_type="note",
+            author="research.cataloger", body=canonical_bytes(newer))
+        self.assertEqual(runner._follow_up_inventory(), before)
+        self.assertTrue(before["works"])
+        for row in before["works"]:
+            self.assertIsNotNone(row["map_entry_ref"])
+            self.assertTrue(row["sources"])
+            if row["abstention"] is not None:
+                self.assertEqual(row["abstention"]["work_id"], row["work_id"])
+        deferred = before["works"][0]
+        entry_record = store.get(deferred["map_entry_ref"])
+        entry = json.loads(store.read_body(entry_record["body_hash"]))
+        entry.update(inclusion="uncertain", reason="Captured source retained; substantive reading deferred.")
+        for field in MAP_FIELDS:
+            entry[field] = {"text": None, "evidence": []}
+        updated_entry = store.publish_artifact(logical_id=entry_record["artifact_id"], artifact_type="note",
+            author="research.cataloger", body=canonical_bytes(entry))
+        retained_map = json.loads(store.read_body(map_record["body_hash"]))
+        retained_map["entry_refs"] = [updated_entry["artifact_ref"] if ref == deferred["map_entry_ref"] else ref
+                                      for ref in retained_map["entry_refs"]]
+        updated_map = store.publish_artifact(logical_id=map_record["artifact_id"], artifact_type="note",
+            author="research.cataloger", body=canonical_bytes(retained_map))
+        coverage = {"abstentions": [{"work_id": deferred["work_id"], "scope": "reading_deferred"}]}
+        updated_coverage = store.publish_artifact(logical_id="kb/coverage", artifact_type="note",
+            author="research.cataloger", body=canonical_bytes(coverage))
+        runner.survey_ref = store.publish_artifact(logical_id="kb/surveys/current", artifact_type="note",
+            author="research.cataloger", body=canonical_bytes({**survey,
+                "map_ref": updated_map["artifact_ref"], "coverage_ref": updated_coverage["artifact_ref"]}))["artifact_ref"]
+        inventory = runner._follow_up_inventory()
+        retained = next(row for row in inventory["works"] if row["work_id"] == deferred["work_id"])
+        self.assertEqual(retained["screening"], "uncertain")
+        self.assertEqual(retained["abstention"]["scope"], "reading_deferred")
+        self.assertEqual(retained["sources"], deferred["sources"])
+        self.assertEqual(retained["map_entry_ref"], updated_entry["artifact_ref"])
 
     def test_follow_up_contract_resume_keeps_accepted_frontier_and_checked_orders(self):
         from scisaurus.runtime.composer import ComposerRunner

@@ -802,6 +802,36 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 refs.append(ref)
         return refs
 
+    def _follow_up_inventory(self):
+        """Expose catalog and map membership from the accepted survey version."""
+        survey = self._body(self.store.get(self.survey_ref))
+        map_body = self._body(self.store.get(survey["map_ref"]))
+        coverage = self._body(self.store.get(survey["coverage_ref"]))
+        entries, entry_refs = {}, {}
+        for ref in map_body["entry_refs"]:
+            entry = self._body(self.store.get(ref))
+            entries[entry["work_id"]] = entry
+            entry_refs[entry["work_id"]] = ref
+        abstentions = {row["work_id"]: row for row in coverage.get("abstentions", [])}
+        sources = {}
+        for ref in survey["source_refs"]:
+            source = self._body(self.store.get(ref))
+            sources.setdefault(source["work_id"], []).append({
+                "source_ref": ref, "representation": source["representation"],
+                "identity_verified": source.get("identity_verified") is True})
+        works = []
+        for ref in survey["work_refs"]:
+            work = self._body(self.store.get(ref))
+            wid = work["work_id"]
+            entry = entries.get(wid)
+            works.append({
+                "work_id": wid, "work_ref": ref, "title": work["title"],
+                "map_entry_ref": entry_refs.get(wid),
+                "screening": entry["inclusion"] if entry is not None else None,
+                "abstention": abstentions.get(wid), "sources": sources.get(wid, [])})
+        return {"survey_ref": self.survey_ref, "map_ref": survey["map_ref"],
+                "coverage_ref": survey["coverage_ref"], "works": works}
+
     def _resolve_follow_up(self):
         if not self.work_orders:
             return
@@ -811,6 +841,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "survey_ref": self.survey_ref, "assessment_ref": self.assessment_ref,
             "assessment": {key: self._body(self.store.get(self.assessment_ref)).get(key)
                            for key in ("state", "rationale", "checks")},
+            "survey_inventory": self._follow_up_inventory(),
             "sources": sources, "query_refs": self._follow_up_query_refs(),
             "searches": [{"query_ref": ref, "request": row["request"], "outcome": row["outcome"],
                           "returned_work_ids": row.get("returned_work_ids", []), "has_more": row.get("has_more")}
@@ -822,6 +853,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "resolved requires captured quotations supporting fulfillment; limited requires a bounded recorded "
                 "search, an explicit remaining evidence limitation, and a justified next scientific action. "
                 "Use unresolved when neither condition holds. Quote only exact displayed source passages. "
+                "Use survey_inventory to check current catalog, map membership, retained source availability, "
+                "and explicit reading abstentions. A retained unread entry is distinct from an unavailable "
+                "record or an absent map entry. These records establish current survey membership, not "
+                "what an earlier topic projection contained or a scientific claim from an unread source. "
                 "An insufficient gap assessment never establishes novelty or fulfills a measurement request by itself. "
                 "Return all seven fields for the single assigned order, including empty evidence/query_refs lists "
                 "and an empty limitation string when appropriate. Keep rationale and next_action concise.")}
