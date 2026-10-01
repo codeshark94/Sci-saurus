@@ -431,6 +431,54 @@ class TestPromptProjection(unittest.TestCase):
 
 
 class TestExplorationExecution(unittest.TestCase):
+    def test_planner_source_projection_retains_checked_quotes_beyond_prefix(self):
+        from unittest.mock import patch
+        runner = self.runner(); runner._initialize(); runner._setup(); runner._tree_load()
+        text = "Unique opening context. " + "Background. " * 3000 + "A late checked mechanism remains unresolved." + " Further context." * 100
+        source = {"work_id": "W101", "representation": "full_text", "identity_verified": True,
+                  "identity_checks": {"title_match": True, "section_markers": ["Results"]},
+                  "text": text, "url": "https://example.org/paper"}
+        ref = "source@1"
+        quote = "A late checked mechanism remains unresolved."
+        proof = bind({"work_id": "W101", "source_ref": ref, "quote": quote}, {ref: source})
+        entry = {"work_id": "W101", **{field: {"text": "Checked mechanism.", "evidence": [proof]}
+                                    for field in ("problem", "approach", "finding", "limitations")}}
+        records = {key: runner._record("kb/test/" + key, "note", body, "research.search-planner")
+                   for key, body in {"work": {"title": "Mechanism study"}, "entry": entry,
+                                     "review": {"checks": [{"check_id": "source-fidelity", "outcome": "passed"}]}}.items()}
+        parent = {"kind": "read", "id": "read-parent", "work_id": "W101", "source_refs": [ref],
+                  "referenced_works": [], **{key + "_ref": record["artifact_ref"] for key, record in records.items()}}
+        runner.source_docs[ref] = source
+        context = [{**source, "source_ref": ref, "available_chars": len(text),
+                    "window": {"start": 0, "end": len(text)}}]
+        proposal = {"decision": "expand", "rationale": "Investigate the checked mechanism.", "branches": [
+            {"parent_id": "parent-0", "question": "What sets this mechanism?", "rationale": "Resolve its boundary.",
+             "operation": "search", "query": "mechanism boundary", "work_id": None,
+             "evidence": [{"work_id": "W101", "source_ref": ref, "quote": quote}]}]}
+        old_windows = {ref: {"start": 0, "end": runner.bounds["context_chars"]}}
+        with self.assertRaises(ModelContractError):
+            normalize_plan(proposal, {"parent-0": parent["id"]}, {ref: source}, windows=old_windows)
+        captured = []
+        def check(name, role, assignment, validator, *, normalizer, **kwargs):
+            captured.append((name, deepcopy(assignment)))
+            displayed = assignment["sources"][0]
+            self.assertIn(quote, displayed["text"])
+            start, end = displayed["window"]["start"], displayed["window"]["end"]
+            self.assertEqual(displayed["text"], text[start:end])
+            bound = normalizer(proposal); validator(bound)
+            self.assertEqual(bound["branches"][0]["evidence"][0], proof)
+            for bad_quote in ("Invented result.", "Unique opening context."):
+                bad = deepcopy(proposal); bad["branches"][0]["evidence"][0]["quote"] = bad_quote
+                with self.assertRaises(ModelContractError): normalizer(bad)
+            raise KeyboardInterrupt()
+        with patch.object(runner, "_tree_parent_current", return_value=True), \
+             patch.object(runner, "_assessment_source_context", return_value=context), \
+             patch.object(runner, "_model_checked", side_effect=check):
+            for _ in range(2):
+                with self.assertRaises(KeyboardInterrupt): runner._tree_plan([parent], suggestions=[])
+        self.assertEqual(captured[0], captured[1])
+        self.assertEqual(runner.source_docs[ref], source)
+
     def test_selection_model_input_survives_capacity_drift(self):
         from unittest.mock import patch
         runner = self.runner(); runner._initialize(); runner._setup(); runner._tree_load()

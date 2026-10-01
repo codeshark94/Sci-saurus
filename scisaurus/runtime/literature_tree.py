@@ -658,13 +658,23 @@ class LiteratureTree:
         parent_map = {node["id"]: deepcopy(node) for node in parents}
         sources = {ref: source for ref, source in self.source_docs.items()
                    if any(ref in node.get("source_refs", []) for node in parents)}
-        context = [source for source in self._source_context() if source["source_ref"] in sources]
-        windows = {source["source_ref"]: source["window"] for source in context}
         parent_aliases = {f"parent-{index}": node["id"] for index, node in enumerate(parents)}
         assignments = [planning_parent(node, alias, **{
             field: self._body(self.store.get(node[ref])) for field, ref in (
                 ("work", "work_ref"), ("entry", "entry_ref"), ("review", "review_ref"))}
             if node["kind"] == "read" else {}) for alias, node in zip(parent_aliases, parents)]
+        evidence = [proof for parent in assignments if parent["kind"] == "read"
+                    for field in MAP_FIELDS for proof in parent["entry"][field]["evidence"]]
+        for proof in evidence:
+            source = sources.get(proof["source_ref"])
+            if source is None:
+                raise ValidationError("checked exploration finding has no assigned captured source")
+            validate_span(proof, source, require_span=True)
+        context = self._project_assessment_sources(
+            [source for source in self._assessment_source_context() if source["source_ref"] in sources],
+            full_text_chars=self.bounds["context_chars"], abstract_chars=self.bounds["context_chars"],
+            unverified_chars=self.bounds["context_chars"], evidence=evidence)
+        windows = {source["source_ref"]: source["window"] for source in context}
         branch_limit = None
         remaining, scopes = self._remaining_model_capacity(["research.search-planner", "research.literature-mapper", "methods.work-reviewer"])
         assignment = {"phase": "exploration_plan", "question": self.score["question"],
@@ -687,6 +697,7 @@ class LiteratureTree:
                 "For a read, explain what its checked findings suggest investigating next, with exact parent quotations. "
                 "Each branch parent_id must identify the work supplying its evidence: use that parent's allowed_evidence "
                 "and its source_refs in the shared sources table. Each captured source is supplied once. "
+                "Source windows retain every checked finding's cited span; copy new quotations only from these displayed windows. "
                 "Another parent's source cannot support a branch attached to this parent. Incoming inquiry_evidence explains its history, "
                 "not the allowed evidence for a new branch. Close irrelevant parents instead of using them to carry another work's findings. "
                 "An unresolved research question is not a source-stated limitation; abstract silence cannot prove absence. "
