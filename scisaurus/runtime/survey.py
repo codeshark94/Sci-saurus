@@ -1817,7 +1817,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 recovered = normalize_response(job, recovered, execution_ref=execution_ref)
                 job["validator"](recovered)
             except (ValidationError, TypeError, ValueError, KeyError) as exc:
-                retained_feedback["failure_class"] = getattr(exc, "failure_class", None)
+                retained_feedback["error"] = str(exc)
+                retained_feedback["failure_class"] = getattr(exc, "failure_class", None) or "model_contract"
                 return None
             execution = self.store.get(execution_ref)
             task_id = execution["artifact_id"].removeprefix("command/executions/")
@@ -2002,6 +2003,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                         value = normalize_response(job, value, assignment=json.loads(spec["params"]["prompt"]))
                         job["validator"](value)
                     except (ValidationError, TypeError, ValueError, KeyError) as exc:
+                        failure_class = getattr(exc, "failure_class", None) or "model_contract"
                         feedback[job["name"]] = {"error": str(exc), "previous_response": value,
                             "finish_reason": result.finish_reason,
                             "scope": "Repair only this assignment's contract violations; preserve every valid field. "
@@ -2009,7 +2011,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                         self.tasks.transition(task_id, "blocked", "command.controller", reason=str(exc))
                         self._publish(f"command/validation/{task_id}", "note",
                                       {"error": str(exc), "finish_reason": result.finish_reason,
-                                       "failure_class": getattr(exc, "failure_class", None)},
+                                       "failure_class": failure_class},
                                       "command.controller", subjects=[proposal["artifact_ref"]])
                         attempts = states[job["name"]].get("repair_attempts", 0) + 1
                         exhausted = attempts >= self.config["limits"]["max_rounds"]
@@ -2017,7 +2019,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                             "status": "blocked" if exhausted else "repairing",
                             "failure_origin": "response_validation",
                             "repair_attempts": attempts, "feedback": feedback[job["name"]],
-                            "failure_class": getattr(exc, "failure_class", None),
+                            "failure_class": failure_class,
                             "error": f"{job['name']} did not satisfy its evidence contract: {exc}",
                         }, subjects=[proposal["artifact_ref"]])
                         rejected.append(job)

@@ -352,13 +352,15 @@ def simulated_survey_worker(kind, params, channel):
         if mode == "isolated-review-block" and assignment["entry"]["work_id"] == "W102" and assignment["entry"]["reason"] == "The method generalizes to every task.":
             next(row for row in value["checks"] if row["check_id"] == "reason").update(
                 outcome="failed", result="The screening rationale asserts unsupported generalization.")
-        if mode == "typed-critique-review" and assignment.get("review_obligations"):
+        if mode in {"typed-critique-review", "missing-critique-section"} and assignment.get("review_obligations"):
             critique_rows = [row for row in value["checks"] if row["check_id"].startswith("critique:")]
             value["checks"] = [row for row in value["checks"] if not row["check_id"].startswith("critique:")]
             value["critique_adjudications"] = [{"check_id": row["check_id"], "disposition": "rejected",
                 "method": "Compare the current entry with its captured source.",
                 "result": "The current claim is supported; the disputed allegation is rejected.",
                 "affected_check_ids": []} for row in critique_rows]
+            if mode == "missing-critique-section" and not assignment.get("validation_feedback"):
+                value.pop("critique_adjudications")
         if mode == "review-never-resolves" and assignment["entry"]["work_id"] == "W101":
             next(check for check in value["checks"] if check["check_id"] == "reason").update(
                 outcome="insufficient_evidence", result="The screening rationale remains unresolved.")
@@ -483,6 +485,57 @@ def survey_config(endpoint, mode="pass"):
 
 
 class TestSurveyRunner(unittest.TestCase):
+    def test_retained_critique_omission_uses_current_revalidation_diagnostic(self):
+        from scisaurus.runtime.models import ModelResult
+        runner = self.runtime(survey_config(self.endpoint, "missing-critique-section"))
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        obligation = self.review_obligation(runner, "W101")
+        runner.review_obligations = runner._validate_review_obligations([obligation])
+        with self.assertRaises(ModelWorkBlocked):
+            runner._review_work_claims()
+        contexts = self.model_contexts(runner.control, runner.store)
+        manifest, _ = next((manifest, prompt) for manifest, prompt in reversed(contexts)
+                           if prompt.get("phase") == "work_review")
+        execution_ref = manifest["artifact_ref"].replace("command/contexts/", "command/executions/")
+        raw = ModelResult(**runner._body(runner.store.get(execution_ref))).json_object(allow_missing_closers=True)
+        retained = {"error": "required checks were omitted", "previous_response": raw,
+                    "execution_ref": execution_ref, "finish_reason": "stop"}
+        runner.resume_session = {"session": 9}
+        with patch.object(runner, "_retained_validation_feedback", return_value=retained):
+            runner._review_work_claims()
+        self.assertIn("critique_adjudications", retained["error"])
+        prompt = [value for _, value in self.model_contexts(runner.control, runner.store)
+                  if value.get("phase") == "work_review"][-1]
+        self.assertEqual(prompt["validation_feedback"]["error"], retained["error"])
+        self.assertEqual(prompt["_contract_repair_boundary"], "model-contract-repair-9")
+        self.assertTrue(runner._work_review_current("W101"))
+
+    def test_missing_critique_section_repairs_with_exact_schema_feedback(self):
+        config = survey_config(self.endpoint, "missing-critique-section")
+        config["limits"]["max_rounds"] = 2
+        runner = self.runtime(config)
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        entry_ref = runner.analysis_records["W101"]["artifact_ref"]
+        obligation = self.review_obligation(runner, "W101")
+        runner.review_obligations = runner._validate_review_obligations([obligation])
+        runner._review_work_claims()
+        prompts = [value for _, value in self.model_contexts(runner.control, runner.store)
+                   if value.get("phase") == "work_review"]
+        self.assertEqual(len(prompts), 2)
+        error = prompts[-1]["validation_feedback"]["error"]
+        self.assertIn("critique_adjudications", error)
+        self.assertIn(prompts[-1]["critique_contexts"][0]["check_id"], error)
+        self.assertIn("Preserve the valid ordinary checks", error)
+        self.assertEqual(prompts[0]["response_contract"], prompts[-1]["response_contract"])
+        self.assertEqual(runner.analysis_records["W101"]["artifact_ref"], entry_ref)
+        self.assertTrue(runner._work_review_current("W101"))
+        runner._accept_survey()
+        runner.gate.require_current(runner.survey_ref)
+
     def test_typed_critique_rejection_replays_through_independent_survey_gate(self):
         from scisaurus.runtime.models import ModelResult
         runner = self.runtime(survey_config(self.endpoint, "typed-critique-review"))
@@ -4657,6 +4710,22 @@ class TestSurveyContracts(unittest.TestCase):
             else: row["disposition"] = "rejected"
             with self.subTest(mutation=mutation), self.assertRaises(ValidationError):
                 validate_work_review(normalize_check_envelope(value, required), [], review_obligations=obligations)
+
+    def test_incomplete_critique_adjudications_name_exact_missing_ids(self):
+        obligations = [{"work_id": "W1", "hypothesis": hypothesis}
+                       for hypothesis in ("The result may omit temperature.", "The uncertainty meaning may be omitted.")]
+        required = work_review_checks([], obligations)
+        raw = {"checks": check_rows(work_review_checks([])), "rationale": "Check both allegations.",
+               "critique_adjudications": [{"check_id": required[-2], "disposition": "rejected",
+                   "method": "Inspect the source and current entry.", "result": "No current defect confirmed.",
+                   "affected_check_ids": []}]}
+        original = deepcopy(raw)
+        with self.assertRaises(ModelContractError) as rejected:
+            normalize_check_envelope(raw, required)
+        self.assertIn("critique_adjudications", str(rejected.exception))
+        self.assertIn(required[-1], str(rejected.exception))
+        self.assertIn("affected_check_ids", str(rejected.exception))
+        self.assertEqual(raw, original)
 
     def test_repair_entry_work_id_resolves_only_to_supplied_current_version(self):
         entries = {"W1": "artifact:kb/entry/W1@3"}

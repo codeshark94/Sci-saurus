@@ -99,20 +99,35 @@ def normalize_check_envelope(value, required):
     required_ids = frozenset(required)
     if "critique_adjudications" in value:
         if set(value) != {"checks", "rationale", "critique_adjudications"}:
-            return value
+            expected = {"checks", "rationale", "critique_adjudications"}
+            raise ModelContractError(f"typed review has missing fields {sorted(expected - set(value))} "
+                                     f"and unexpected fields {sorted(set(value) - expected)}")
         adjudications = value["critique_adjudications"]
         critique_ids = {key for key in required_ids if key.startswith("critique:")}
         fields = {"check_id", "disposition", "method", "result", "affected_check_ids"}
-        if (not critique_ids or not isinstance(adjudications, list)
-                or any(not isinstance(row, dict) or set(row) != fields
-                       or not isinstance(row["check_id"], str) or row["check_id"] not in critique_ids
-                       or not isinstance(row["disposition"], str) or row["disposition"] not in CRITIQUE_DISPOSITIONS
-                       for row in adjudications)
-                or len(adjudications) != len(critique_ids)
-                or {row["check_id"] for row in adjudications} != critique_ids
-                or any(isinstance(row, dict) and isinstance(row.get("check_id"), str)
-                       and row["check_id"] in critique_ids for row in value["checks"])):
-            return value
+        if not critique_ids or not isinstance(adjudications, list):
+            raise ModelContractError("critique_adjudications must be an explicit list for the required critique IDs: "
+                                     f"{sorted(critique_ids)}")
+        seen = set()
+        for index, row in enumerate(adjudications):
+            if not isinstance(row, dict) or set(row) != fields:
+                missing = sorted(fields - set(row)) if isinstance(row, dict) else sorted(fields)
+                extra = sorted(set(row) - fields) if isinstance(row, dict) else []
+                raise ModelContractError(f"critique_adjudications[{index}] has missing fields {missing} "
+                                         f"and unexpected fields {extra}; requires exactly {sorted(fields)}")
+            if not isinstance(row["check_id"], str) or row["check_id"] not in critique_ids or row["check_id"] in seen:
+                raise ModelContractError(f"critique_adjudications[{index}].check_id {row['check_id']!r} "
+                                         f"must identify one unused required critique ID: {sorted(critique_ids - seen)}")
+            seen.add(row["check_id"])
+            if not isinstance(row["disposition"], str) or row["disposition"] not in CRITIQUE_DISPOSITIONS:
+                raise ModelContractError(f"critique_adjudications[{index}].disposition {row['disposition']!r} "
+                                         f"must be one of {sorted(CRITIQUE_DISPOSITIONS)}")
+        if seen != critique_ids:
+            raise ModelContractError(f"critique_adjudications omitted required critique IDs: {sorted(critique_ids - seen)}; "
+                                     f"each row requires exactly {sorted(fields)}. Preserve the valid ordinary checks.")
+        if any(isinstance(row, dict) and isinstance(row.get("check_id"), str)
+               and row["check_id"] in critique_ids for row in value["checks"]):
+            raise ModelContractError("Return critique IDs only in critique_adjudications; checks contains ordinary checks only")
         value = {"rationale": value["rationale"], "checks": [*value["checks"], *[
             {"check_id": row["check_id"],
              "outcome": "failed" if row["disposition"] == "current_defect" else "passed",
@@ -607,7 +622,14 @@ def checks(value, names, *, critique_checks=()):
         _text(check["method"], "check method")
         _text(check["result"], "check result")
     if seen != set(names):
-        raise ValidationError("required checks were omitted")
+        missing = sorted(set(names) - seen)
+        message = f"required checks were omitted: {missing}"
+        if set(missing).intersection(critique_checks):
+            message += (". Return every missing critique ID in the adjudication structure specified by response_contract; "
+                        "for typed reviews this is critique_adjudications with check_id, disposition, method, result, "
+                        "affected_check_ids. Discussing a critique only in rationale does not provide its adjudication. "
+                        "Preserve the valid ordinary checks.")
+        raise ModelContractError(message)
 
 
 def validate_survey_review(value, *, current_map=None):
