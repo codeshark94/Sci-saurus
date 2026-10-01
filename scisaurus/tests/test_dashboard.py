@@ -4,6 +4,8 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from copy import deepcopy
+from unittest.mock import patch
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -16,6 +18,114 @@ from scisaurus.tests.test_research_program import topic_package
 
 
 class DashboardTests(unittest.TestCase):
+    def test_resumed_owner_does_not_revive_closed_specialist_calls(self):
+        temporary, root = self.make_project()
+        self.addCleanup(temporary.cleanup)
+        snapshot = DashboardSnapshot(root)
+        path = root / "output/progress.json"
+        progress = json.loads(path.read_text())
+        progress["stages"]["survey"]["specialist_live"] = {
+            "research.search-strategist": {
+                "event": "dispatched", "status": "running", "task_id": "task-survey-1",
+                "role": "research.search-strategist", "model": "fixture"},
+            "research.reviewer": {
+                "event": "dispatched", "status": "running", "task_id": "current-call",
+                "role": "research.reviewer", "model": "fixture"}}
+        path.write_text(json.dumps(progress))
+        original = path.read_bytes()
+        db = snapshot._db_records()
+        db["tasks"] = [{"task_id": "task-survey-1", "root_key": "project",
+                        "state": "blocked", "payload": {"assignment_id": "assignment-1",
+                        "assigned_role": "research.search-strategist", "stage_id": "survey"}},
+                       {"task_id": "current-call", "root_key": "project",
+                        "state": "running", "payload": {"assignment_id": "assignment-2"}}]
+        recorded_db = deepcopy(db)
+        with patch.object(snapshot, "_db_records", return_value=db), \
+                patch.object(snapshot, "_processes", return_value=[{"pid": 123, "owns_execution": True}]):
+            payload = snapshot.payload()
+        self.assertTrue(payload["runtime"]["execution_observed"])
+        self.assertEqual(payload["model_calls"]["active"], 1)
+        self.assertEqual(payload["model_calls"]["live_items"][0]["task_id"], "current-call")
+        historical = next(item for item in payload["model_calls"]["recent_items"]
+                          if item["task_id"] == "task-survey-1")
+        self.assertEqual(historical["state"], "blocked")
+        self.assertIsNone(historical["finished_at"])
+        self.assertEqual(payload["specialists_active"], 0)
+        self.assertEqual(payload["organization"]["active_assignments"], [])
+        historical_work = next(item for item in payload["recent_work"]
+                               if item["task_id"] == "task-survey-1")
+        self.assertFalse(historical_work["current"])
+        self.assertEqual(payload["pipeline"]["stages"][1]["active_agents"], [])
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(db, recorded_db)
+
+    def test_inactive_owner_projects_all_activity_without_changing_recorded_evidence(self):
+        temporary, root = self.make_project()
+        self.addCleanup(temporary.cleanup)
+        snapshot = DashboardSnapshot(root)
+        path = root / "output/progress.json"
+        original = json.loads(path.read_text())
+        original["usage"] = {"model_calls": 7}
+        original["stages"]["survey"]["specialist_live"] = {
+            "reviewer": {"event": "dispatched", "status": "running", "task_id": "checkpoint-call",
+                         "role": "research.reviewer", "model": "fixture", "execution_mode": "model"}}
+        db = snapshot._db_records()
+        db["tasks"] = [
+            {"task_id": "model", "root_key": "project", "state": "running", "payload": {"operation": "model"}},
+            {"task_id": "search", "root_key": "project", "state": "running", "payload": {"operation": "crossref"}},
+            {"task_id": "task-survey-1", "root_key": "project", "state": "running", "payload": {
+                "assignment_id": "assignment-1", "assigned_role": "research.search-strategist",
+                "stage_id": "survey", "assignment_phase": "specialist"}},
+        ]
+        db["counts"]["active_tasks"] = 3
+        recorded_db = deepcopy(db)
+        for status, processes in (("paused", []), ("paused", [{"pid": 123}]),
+                                  ("completed", [{"pid": 123}]), ("blocked", []), ("running", [])):
+            with self.subTest(status=status, process_observed=bool(processes)):
+                progress = {**original, "status": status}
+                path.write_text(json.dumps(progress))
+                recorded = path.read_bytes()
+                with patch.object(snapshot, "_db_records", return_value=db), \
+                        patch.object(snapshot, "_processes", return_value=processes):
+                    payload = snapshot.payload()
+                self.assertFalse(payload["runtime"]["execution_observed"])
+                self.assertEqual(payload["model_calls"]["active"], 0)
+                self.assertEqual(payload["model_calls"]["history_total"], 2)
+                self.assertTrue(all(item["finished_at"] is None for item in payload["model_calls"]["recent_items"]))
+                self.assertEqual(payload["provider_work"]["active"], 0)
+                self.assertEqual(payload["specialists_active"], 0)
+                self.assertEqual(payload["counts"]["active_tasks"], 0)
+                self.assertEqual(payload["counts"]["unfinished_tasks"], 3)
+                self.assertEqual(payload["execution"]["role_assignments"]["active"], 0)
+                self.assertEqual(payload["execution"]["provider"]["running_tasks"], 0)
+                self.assertIsNone(payload["live"]["current_activity"])
+                self.assertTrue(all(not row["current"] for row in payload["recent_work"]))
+                self.assertEqual(payload["pipeline"]["stages"][0]["status"], "completed")
+                self.assertEqual(payload["pipeline"]["stages"][1]["active_agents"], [])
+                self.assertEqual(payload["live"]["usage"], {"model_calls": 7})
+                self.assertEqual(path.read_bytes(), recorded)
+                self.assertEqual(db, recorded_db)
+
+    def test_owner_process_requires_runner_entrypoint_and_exact_project_binding(self):
+        temporary, root = self.make_project()
+        self.addCleanup(temporary.cleanup)
+        snapshot = DashboardSnapshot(root)
+        workflow = root / "workflow.json"
+        for command in (
+            f"/usr/bin/python3 -u -m scisaurus.cli run-composer --workflow {workflow} --resume --watch",
+            f"/usr/bin/python3 -m scisaurus run-composer --workflow={workflow}",
+            f"/usr/local/bin/scisaurus run-composer --workflow '{workflow}' --watch",
+        ):
+            self.assertTrue(snapshot._command_owns_execution(command), command)
+        for command in (
+            f"/usr/bin/python3 -c 'import time; time.sleep(5)' {root}",
+            f"/usr/bin/python3 -c 'print(\"run-composer --workflow {workflow}\")'",
+            f"/usr/bin/python3 -m scisaurus.cli dashboard {root}",
+            f"/usr/bin/python3 -m scisaurus.cli run-composer --workflow {workflow}.other",
+            f"/usr/bin/python3 -m scisaurus.cli run-composer --workflow {root / 'other.json'} {workflow}",
+        ):
+            self.assertFalse(snapshot._command_owns_execution(command), command)
+
     def make_project(self):
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
@@ -63,11 +173,35 @@ class DashboardTests(unittest.TestCase):
         }), encoding="utf-8")
         return temporary, root
 
+    def test_live_usage_prefers_observed_costs_and_parent_stage_authority(self):
+        temporary, root = self.make_project()
+        self.addCleanup(temporary.cleanup)
+        progress_path = root / "output" / "progress.json"
+        progress = json.loads(progress_path.read_text())
+        progress["usage"] = {"model_calls": 141}
+        progress["observed_usage"] = {"model_calls": 193}
+        progress_path.write_text(json.dumps(progress))
+        snapshot = DashboardSnapshot(root)
+        payload = snapshot.payload()
+        self.assertEqual(payload["live"]["usage"]["model_calls"], 193)
+        from unittest.mock import patch
+        live = {"value": progress, "modified": 1, "root_key": "project"}
+        snapshot.roots["stage:survey"] = root / "survey"
+        newer_child = {"root_key": "stage:survey", "modified": 2,
+                       "value": {"phase": "work-review", "active_tasks": ["work-review"]}}
+        with patch.object(snapshot, "_checkpoint_files", return_value=[newer_child]):
+            stage = snapshot._stage_summary({"id": "survey", "kind": "survey"}, live)
+        self.assertEqual(stage["status"], "running")
+        self.assertEqual(stage["active_agents"], ["research.search-strategist"])
+        from scisaurus.cli import _composer_progress_line
+        self.assertEqual(json.loads(_composer_progress_line(progress))["usage"]["model_calls"], 193)
+
     def test_snapshot_is_read_only_and_tracks_live_checkpoint(self):
         temporary, root = self.make_project()
         self.addCleanup(temporary.cleanup)
 
-        snapshot = DashboardSnapshot(root).payload()
+        with patch.object(DashboardSnapshot, "_processes", return_value=[{"pid": 123, "command": "fixture owner", "owns_execution": True}]):
+            snapshot = DashboardSnapshot(root).payload()
 
         self.assertEqual(snapshot["live"]["status"], "running")
         self.assertEqual(snapshot["live"]["current_stage"], "survey")

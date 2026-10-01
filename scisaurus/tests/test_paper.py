@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from scisaurus.core.documents import Documents
 from scisaurus.core.errors import ValidationError
@@ -102,6 +103,15 @@ class PaperReleaseTests(unittest.TestCase):
         self.assertTrue(_finding_supported(finding, "The maximum absolute error was 1.110 × 10⁻¹⁶."))
         threshold = {"statement": "The rule first crossed 1e-06 at n=14."}
         self.assertTrue(_finding_supported(threshold, "The rule first crossed 10⁻⁶ at n = 14."))
+
+    def test_accepted_survey_and_assessment_must_be_one_exact_pair(self):
+        from scisaurus.runtime.paper import load_paper_survey
+        config = self.config()
+        self.assertEqual(load_paper_survey(config)["assessment"]["survey_ref"], config["survey_ref"])
+        config["survey_ref"] = "artifact:kb/surveys/other-current@1"
+        with patch("scisaurus.runtime.paper.SurveyGate.require_current"), \
+                self.assertRaisesRegex(ValidationError, "does not reference"):
+            load_paper_survey(config)
 
     def test_latex_projection_preserves_common_scientific_glyphs(self):
         rendered = _latex("f(x)=exp(−100(x−c)^2), 1.110 × 10⁻¹⁶, a≤b, 1/√a—b")

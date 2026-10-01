@@ -20,6 +20,17 @@ from scisaurus.tests.test_manuscript_review import review_for
 
 
 class ModelWorkTests(unittest.TestCase):
+    def test_budget_ownership_is_not_model_work_identity(self):
+        from scisaurus.runtime.model_work import ModelWorkCache
+        request = dict(scope="map", role="research.mapper", system="contract", prompt={"source": "exact"})
+        model = {"model": "fixture", "base_url": "http://localhost", "temperature": 0.2}
+        key = ModelWorkCache.key(**request, model=model)
+        owned = {**model, "model_call_budget_scopes": [{"model_call_budget_key": "cycle-2"}],
+                 "model_call_budget_path": "/budget", "model_call_budget_key": "run", "model_call_budget_limit": 4}
+        self.assertEqual(key, ModelWorkCache.key(**request, model=owned))
+        self.assertNotEqual(key, ModelWorkCache.key(**request, model={**owned, "temperature": 0.5}))
+        self.assertNotEqual(key, ModelWorkCache.key(**request, model={**owned, "model": "other"}))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -108,8 +119,12 @@ class ModelWorkTests(unittest.TestCase):
 
     def test_resumed_runner_usage_is_charged_incrementally(self):
         self.assertEqual(self.runner._incremental_stage_usage(self.stage, {"cumulative_usage": {"model_calls": 3}}), {"model_calls": 3})
+        self.runner._checkpoint("survey:producer_returned", force=True)
         self.reopen()
+        self.assertEqual(self.runner.usage["model_calls"], 3)
         self.assertEqual(self.runner._incremental_stage_usage(self.stage, {"cumulative_usage": {"model_calls": 5}}), {"model_calls": 2})
+        self.runner._settle_pending_stage_usage(self.stage["id"])
+        self.assertEqual(self.runner.usage["model_calls"], 5)
         self.assertEqual(self.runner._incremental_stage_usage(self.stage, {"cumulative_usage": {"model_calls": 5}}), {"model_calls": 0})
 
     def test_image_and_bound_dependency_contents_invalidate_stage_reuse(self):
@@ -258,7 +273,10 @@ class ModelWorkTests(unittest.TestCase):
             output.write_text(json.dumps(result))
             return {**result, "output_path": str(output)}
         runner._execute_stage = execute
-        result = runner.run()
+        with patch.object(runner, "_survey_work_order_was_fulfilled", return_value=True) as fulfillment:
+            result = runner.run()
+        self.assertTrue(fulfillment.called)
+        self.assertTrue(all(call.args[2]["id"] == "counter-search" for call in fulfillment.call_args_list))
         self.assertEqual(result["status"], "completed", result.get("blockers"))
         self.assertEqual(calls[:6], [name for name, _ in names])
         self.assertEqual(calls[6:], ["survey", "experiment", "interpretation", "argument", "paper"])

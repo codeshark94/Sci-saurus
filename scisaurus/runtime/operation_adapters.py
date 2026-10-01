@@ -8,7 +8,7 @@ import math
 import os
 from pathlib import Path
 import re
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes, sha256_hex
@@ -152,7 +152,13 @@ def _retrieval_arguments(arguments, required, size_name, maximum):
 
 
 def _crossref_arguments(arguments):
-    arguments = _retrieval_arguments(arguments, {"query", "limit"}, "limit", 1000)
+    if not isinstance(arguments, dict):
+        raise ValidationError("Crossref arguments must be an object")
+    fields = {"query", "limit"} | ({"cursor"} if "cursor" in arguments else set())
+    arguments = _retrieval_arguments(arguments, fields, "limit", 1000)
+    cursor = arguments.get("cursor")
+    if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > 8192):
+        raise ValidationError("Crossref cursor must be a bounded nonempty string")
     if len(_text(arguments["query"], "query")) > 2048:
         raise ValidationError("query exceeds the length limit")
     return arguments
@@ -287,16 +293,38 @@ def _inspect_retrieval(profile, result, params, *, representative=True):
         try:
             payload = json.loads(raw)
             items = payload["message"]["items"]
+            expected_request = retrieval.CrossrefClient.request_parameters(
+                params["query"], limit=params["limit"], cursor=params.get("cursor"))
+            expected_url = retrieval.CrossrefClient(**profile.get("client", {})).request_url(
+                params["query"], limit=params["limit"], cursor=params.get("cursor"))
             valid = (payload == result["raw_response"] and payload["status"] == "ok"
+                     and result["source_url"] == expected_url
+                     and metadata.get("final_url") == result["source_url"]
                      and isinstance(items, list) and (items == [] if empty_search else bool(items))
                      and metadata["http_status"] == 200 and metadata["query"] == params["query"]
                      and metadata["rows"] == params["limit"] and isinstance(schema_identity["schema_version"], str)
                      and bool(schema_identity["schema_version"])
                      and schema_identity["schema_version"] == payload.get("message-version"))
-            doi_set = {item["DOI"] for item in items}
-            valid = valid and len(sources) == len(items) and all(
-                source["doi"] in doi_set and source["source_url"] == "https://doi.org/" + source["doi"]
-                and source["representation"] == "metadata" for source in sources)
+            valid = valid and (
+                ("cursor" not in metadata or metadata["cursor"] == expected_request["cursor"])
+                and metadata.get("next_cursor") == payload["message"].get("next-cursor")
+                and metadata.get("total_results") == payload["message"].get("total-results")
+                and metadata.get("result_set_complete") is (len(items) < params["limit"]))
+            expected_sources = []
+            for item in items:
+                titles = item.get("title", [])
+                if (not isinstance(item.get("DOI"), str) or not isinstance(titles, list)
+                        or any(not isinstance(title, str) for title in titles)):
+                    raise ValueError("invalid Crossref item identity")
+                expected_sources.append({
+                    "doi": item["DOI"], "title": "; ".join(titles),
+                    "source_url": "https://doi.org/" + item["DOI"], "representation": "metadata",
+                    "publisher": item.get("publisher"), "published": item.get("published"),
+                    "authors": item.get("author", []), "abstract": item.get("abstract"),
+                })
+            valid = valid and canonical_bytes(sources) == canonical_bytes(expected_sources)
+            valid = valid and result.get("text") == "\n".join(
+                source["title"] + " — " + source["source_url"] for source in expected_sources)
         except (KeyError, TypeError, ValueError):
             valid = False
         check("crossref-response", valid, "Captured Crossref envelope and source identities match the requested query")
@@ -675,8 +703,11 @@ def _inspect_openalex(profile, result, params, *, representative=True):
         )
     elif provider_http_failure:
         try:
-            payload = (json.loads(raw, object_pairs_hook=object_pairs, parse_constant=reject_constant,
-                                  parse_float=finite_float) if raw else None)
+            try:
+                payload = (json.loads(raw, object_pairs_hook=object_pairs, parse_constant=reject_constant,
+                                      parse_float=finite_float) if raw else None)
+            except (ValueError, TypeError, RecursionError):
+                payload = None
             expected_outcome = (
                 "not_found" if missing_work else
                 "rate_limited" if metadata.get("http_status") == 429
@@ -692,7 +723,6 @@ def _inspect_openalex(profile, result, params, *, representative=True):
             response_valid = (
                 request_valid and integrity and metadata.get("capture_incomplete") is False
                 and metadata.get("capture_truncated") is False
-                and (payload is None or isinstance(payload, dict))
                 and canonical_bytes(result.get("raw_response")) == canonical_bytes(payload)
                 and result.get("outcome") == expected_outcome
                 and result.get("error") == expected_error

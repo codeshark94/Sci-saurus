@@ -331,7 +331,13 @@ class ReviewArticleTests(unittest.TestCase):
         self.assertEqual([s["kind"] for s in workflow["stages"]], ["paper"])
         composer = ComposerRunner(workflow)
         self.addCleanup(composer.close)
-        with patch.object(ReviewArticleRunner, "run", return_value={"status": "review_rejected", "output_path": str(self.root / "output/run.json")}) as run:
+        def finish(runner):
+            try:
+                return {"status": "review_rejected", "output_path": str(self.root / "output/run.json")}
+            finally:
+                runner.control.close()
+
+        with patch.object(ReviewArticleRunner, "run", autospec=True, side_effect=finish) as run:
             composer._execute_stage(workflow["stages"][0])
         run.assert_called_once()
 

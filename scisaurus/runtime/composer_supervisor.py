@@ -10,13 +10,19 @@ immutable mission deadline.
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import closing
+from datetime import datetime
 import hashlib
 import json
 import math
 import multiprocessing
+import os
 from pathlib import Path
 import re
+import signal
+import threading
 import sqlite3
+import subprocess
 import time
 
 try:
@@ -31,32 +37,42 @@ from scisaurus.runtime.composer import ComposerRunner
 TERMINAL_STATUSES = frozenset({"completed", "candidate_needs_review"})
 STOP_REASONS = frozenset({
     "hard_deadline", "required_stage_window_does_not_fit_remaining_deadline",
-    "provider_configuration", "missing_stage_input", "stage_quota_exhausted",
+    "provider_configuration", "provider_rate_limit", "missing_stage_input", "stage_quota_exhausted",
     "workflow_validation",
 })
 SUPERVISOR_SCHEMA_VERSION = "composer-supervisor-3"
 DEFAULT_WATCHDOG_SECONDS = 300.0
 
 
-def _composer_child_entry(workflow, resume, on_progress, result_pipe,
-                          additional_seconds=None):
+def _composer_child_entry(workflow, resume, result_pipe,
+                          additional_seconds=None, runner_type=ComposerRunner):
     """Run one Composer attempt in a killable process.
 
     The parent owns supervision.  A provider or a library call that ignores
     its Python timeout must not be able to keep the only control loop alive
-    forever.  ``fork`` keeps the caller's progress callback and test doubles
-    available on the supported macOS/Linux runtime; the parent never shares a
-    SQLite connection with this child.
+    forever. A fresh interpreter owns all model locks and database connections.
+    Progress callbacks run in the parent; ticker and main-thread publications
+    share a lock so their IPC frames cannot interleave.
     """
+    send_lock = threading.Lock()
+
+    def publish(message):
+        with send_lock:
+            result_pipe.send(message)
+
     try:
-        runner_options = {"resume": resume, "on_progress": on_progress}
+        runner_options = {"resume": resume, "on_progress": lambda state: publish({"kind": "progress", "state": state})}
         if additional_seconds is not None:
             runner_options["additional_seconds"] = additional_seconds
-        runner = ComposerRunner(workflow, **runner_options)
-        result_pipe.send({"kind": "result", "result": runner.run()})
+        runner = runner_type(workflow, **runner_options)
+        try:
+            result = runner.run()
+        finally:
+            runner.close()
+        publish({"kind": "result", "result": result})
     except BaseException as exc:  # the parent turns this into a typed retry
         try:
-            result_pipe.send({
+            publish({
                 "kind": "exception",
                 "type": type(exc).__name__,
                 "error": str(exc)[:4096],
@@ -178,8 +194,8 @@ def _stop_reason(result):
     return result.get("stop_reason")
 
 
-def _has_active_model_rate_limit(result):
-    """Keep a model 429 paused until an explicit operator resume."""
+def _has_active_provider_rate_limit(result):
+    """Keep an active provider 429 paused until an explicit operator resume."""
     if not isinstance(result, dict):
         return False
     blockers = (result.get("active_blockers") if "active_blockers" in result
@@ -187,12 +203,12 @@ def _has_active_model_rate_limit(result):
     if not isinstance(blockers, list):
         return False
     for blocker in blockers:
-        if (not isinstance(blocker, dict)
-                or not isinstance(blocker.get("rate_limit"), dict)
-                or blocker["rate_limit"].get("provider") != "model"
-                or blocker["rate_limit"].get("status_code") != 429):
+        if not isinstance(blocker, dict):
             continue
-        return True
+        if blocker.get("stop_reason") == "provider_rate_limit" or blocker.get("reason") == "provider_rate_limit":
+            return True
+        if isinstance(blocker.get("rate_limit"), dict) and blocker["rate_limit"].get("status_code") == 429:
+            return True
     return False
 
 
@@ -382,18 +398,17 @@ class ComposerSupervisor:
         event_seq = None
         active_tasks = ()
         try:
-            connection = sqlite3.connect(database, timeout=0.2)
-            event_row = connection.execute(
-                "SELECT COALESCE(MAX(seq), 0) FROM events"
-            ).fetchone()
-            event_seq = event_row[0] if event_row else 0
-            task_rows = connection.execute(
-                "SELECT task_id, state FROM tasks "
-                "WHERE state IN ('queued', 'running', 'awaiting_review') "
-                "ORDER BY updated_at DESC LIMIT 16"
-            ).fetchall()
-            active_tasks = tuple((row[0], row[1]) for row in task_rows)
-            connection.close()
+            with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.2)) as connection:
+                event_row = connection.execute(
+                    "SELECT COALESCE(MAX(seq), 0) FROM events"
+                ).fetchone()
+                event_seq = event_row[0] if event_row else 0
+                task_rows = connection.execute(
+                    "SELECT task_id, state FROM tasks "
+                    "WHERE state IN ('queued', 'running', 'awaiting_review') "
+                    "ORDER BY updated_at DESC LIMIT 16"
+                ).fetchall()
+                active_tasks = tuple((row[0], row[1]) for row in task_rows)
         except (OSError, sqlite3.Error):
             pass
         if progress == {} and event_seq is None:
@@ -430,21 +445,34 @@ class ComposerSupervisor:
         active_attempts = []
         try:
             database_stat = database.stat()
-            connection = sqlite3.connect(database, timeout=0.2)
-            event_row = connection.execute(
-                "SELECT COALESCE(MAX(seq), 0) FROM events"
-            ).fetchone()
-            event_seq = event_row[0] if event_row else 0
-            rows = connection.execute(
-                "SELECT a.task_id, a.state, a.created_at "
-                "FROM attempts a WHERE a.state IN ('started', 'running') "
-                "ORDER BY a.created_at DESC LIMIT 16"
-            ).fetchall()
-            connection.close()
-            active_attempts = [
-                {"task_id": row[0], "state": row[1], "created_at": row[2]}
-                for row in rows
-            ]
+            with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.2)) as connection:
+                event_row = connection.execute(
+                    "SELECT COALESCE(MAX(seq), 0) FROM events"
+                ).fetchone()
+                event_seq = event_row[0] if event_row else 0
+                rows = connection.execute(
+                    "SELECT a.task_id, a.state, a.created_at, a.lease_expiry, a.payload_json "
+                    "FROM attempts a WHERE a.state IN ('started', 'running') "
+                    "ORDER BY a.created_at DESC LIMIT 16"
+                ).fetchall()
+            stage_durations = {stage["id"]: stage.get("deadline_seconds")
+                               for stage in self.workflow.get("stages", [])}
+            for task_id, state, created_at, lease_expiry, payload_json in rows:
+                deadline = None
+                try:
+                    payload = json.loads(payload_json)
+                    deadline = _finite_number(payload.get("attempt_deadline_at_epoch"))
+                    duration = _finite_number(stage_durations.get(payload.get("stage_id")))
+                    if deadline is None and duration is not None:
+                        # Legacy aggregate leases used the whole mission wall.
+                        deadline = datetime.fromisoformat(created_at).timestamp() + duration
+                except (TypeError, ValueError, AttributeError):
+                    pass
+                lease = _finite_number(lease_expiry)
+                if lease is not None and deadline is not None:
+                    lease = min(lease, deadline)
+                active_attempts.append({"task_id": task_id, "state": state,
+                    "created_at": created_at, "lease_expiry": lease})
         except (OSError, sqlite3.Error):
             active_attempts = []
         stage_signals = []
@@ -483,6 +511,11 @@ class ComposerSupervisor:
         return {
             "progress": progress,
             "active_attempts": active_attempts,
+            "leased_attempts": [
+                item for item in active_attempts
+                if (_finite_number(item.get("lease_expiry")) is not None
+                    and item["lease_expiry"] > time.time())
+            ],
             "stage_signals": stage_signals,
             "heartbeat_mtime_ns": progress_stat.st_mtime_ns if progress_stat else None,
             "database_mtime_ns": database_stat.st_mtime_ns if database_stat else None,
@@ -490,16 +523,33 @@ class ComposerSupervisor:
             "signature": signature,
         }
 
-    def _watchdog_remaining(self, snapshot):
+    def _watchdog_remaining(self, snapshot, *, authorized_deadline=None):
+        if authorized_deadline is not None:
+            return max(0.0, authorized_deadline - time.time())
         progress = snapshot.get("progress", {}) if isinstance(snapshot, dict) else {}
         value = progress.get("remaining_seconds") if isinstance(progress, dict) else None
         value = _finite_number(value)
+        deadline = _finite_number(progress.get("deadline_at_epoch"))
+        if deadline is not None:
+            remaining = deadline - time.time()
+            value = min(value, remaining) if value is not None else remaining
         if value is not None:
             return max(0.0, value)
         hard_seconds = _finite_number(self.workflow.get("time_policy", {}).get("hard_seconds", 0))
         return max(0.0, hard_seconds if hard_seconds is not None else 0.0)
 
-    def _watchdog_result(self, snapshot, stale_seconds):
+    @staticmethod
+    def _deadline_expired(snapshot, *, authorized_deadline=None):
+        if authorized_deadline is not None:
+            return authorized_deadline <= time.time()
+        progress = snapshot.get("progress", {})
+        deadline = _finite_number(progress.get("deadline_at_epoch"))
+        if deadline is not None:
+            return deadline <= time.time()
+        remaining = _finite_number(progress.get("remaining_seconds"))
+        return remaining is not None and remaining <= 0
+
+    def _watchdog_result(self, snapshot, stale_seconds, *, authorized_deadline=None):
         progress = snapshot.get("progress", {}) if isinstance(snapshot, dict) else {}
         if not isinstance(progress, dict):
             progress = {}
@@ -508,7 +558,7 @@ class ComposerSupervisor:
         return {
             "status": "blocked",
             "phase": phase,
-            "remaining_seconds": self._watchdog_remaining(snapshot),
+            "remaining_seconds": self._watchdog_remaining(snapshot, authorized_deadline=authorized_deadline),
             "stages": deepcopy(progress.get("stages", {})),
             "active_research_requests": deepcopy(
                 progress.get("active_research_requests", [])),
@@ -516,8 +566,9 @@ class ComposerSupervisor:
             "blockers": [{
                 "stage_id": phase.split(":", 1)[0],
                 "reason": (
+                    "hard_deadline" if self._deadline_expired(snapshot, authorized_deadline=authorized_deadline) else
                     "Composer watchdog terminated an in-flight process after "
-                    f"{stale_seconds:.1f}s without a durable heartbeat"
+                    f"{stale_seconds:.1f}s without durable progress or a valid lease"
                 ),
                 "watchdog": True,
                 "active_attempts": [item.get("task_id") for item in active],
@@ -691,7 +742,7 @@ class ComposerSupervisor:
     def _should_resume(self, result):
         if not isinstance(result, dict):
             return True
-        if _has_active_model_rate_limit(result):
+        if _has_active_provider_rate_limit(result):
             return False
         active_blockers = result.get("active_blockers")
         if not isinstance(active_blockers, list):
@@ -700,9 +751,8 @@ class ComposerSupervisor:
                 isinstance(blocker, dict)
                 and blocker.get("failure_class") == "harness_bug"
                 for blocker in active_blockers):
-            # Runtime defects require a source fix and a fresh process import.
-            # Re-forking the same loaded supervisor would repeat the defect
-            # and could burn more provider calls without changing evidence.
+            # Retrying a runtime defect without a source fix consumes provider
+            # calls while preserving the same failed execution path.
             return False
         status = result.get("status")
         if _remaining(result) <= 0:
@@ -884,6 +934,7 @@ class ComposerSupervisor:
                 # it appear to describe the newest run.
                 continue
             value["status"] = "paused"
+            value["stop_reason"] = "process_interrupted"
             if name == "progress.json":
                 value["phase"] = "paused"
             blockers = value.setdefault("blockers", [])
@@ -910,24 +961,85 @@ class ComposerSupervisor:
                 except OSError:
                     pass
 
+    @staticmethod
+    def _process_tree():
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid=,lstart="],
+            capture_output=True, text=True, timeout=2, check=True)
+        return {int(fields[0]): {"parent": int(fields[1]), "group": int(fields[2]),
+                                "started": fields[3]}
+                for line in result.stdout.splitlines()
+                if len(fields := line.split(None, 3)) == 4}
+
+    @classmethod
+    def _stop_child(cls, child):
+        owned = {}
+
+        def capture_descendants():
+            tree = cls._process_tree()
+            parents = {child.pid}
+            while descendants := {pid for pid, record in tree.items()
+                                  if record["parent"] in parents and pid not in parents}:
+                parents.update(descendants)
+            owned.update({pid: tree[pid] for pid in parents if pid != child.pid and pid in tree})
+
+        inventory_error = None
+        try:
+            capture_descendants()
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            inventory_error = exc
+        try:
+            child.terminate()
+            child.join(timeout=5.0)
+            if child.is_alive():
+                capture_descendants()
+            # Workers create private sessions. Killing only the Composer cannot
+            # reap those workers when its graceful cleanup is unresponsive.
+            current = cls._process_tree()
+            for pid, record in owned.items():
+                observed = current.get(pid)
+                if (observed is None or observed["started"] != record["started"]
+                        or observed["group"] != record["group"]):
+                    continue
+                try:
+                    if record["group"] == pid:
+                        os.killpg(pid, signal.SIGKILL)
+                    else:
+                        os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            inventory_error = exc
+        finally:
+            if child.is_alive():
+                child.kill()
+            child.join(timeout=5.0)
+        if inventory_error is not None:
+            raise ValidationError(
+                f"Composer child stopped but descendant cleanup could not be verified: {inventory_error}") from inventory_error
+
     def _run_one_process(self, resume, *, additional_seconds=None):
         """Run one Composer attempt while the parent remains killable."""
-        try:
-            context = multiprocessing.get_context("fork")
-        except ValueError:
-            # The project is developed on macOS/Linux.  Keep a portable
-            # fallback for runtimes without fork rather than silently losing
-            # the original retry semantics.
-            return self._run_one_in_process(
-                resume, additional_seconds=additional_seconds)
+        context = multiprocessing.get_context("spawn")
         parent_pipe, child_pipe = context.Pipe(duplex=False)
+        authorized_deadline = None
+        if additional_seconds is not None:
+            prior_deadline = _finite_number(
+                self._live_snapshot().get("progress", {}).get("deadline_at_epoch"))
+            if prior_deadline is not None:
+                authorized_deadline = prior_deadline + additional_seconds
         child = context.Process(
             target=_composer_child_entry,
-            args=(self.workflow, resume, self.on_progress, child_pipe,
-                  additional_seconds),
+            args=(self.workflow, resume, child_pipe, additional_seconds, ComposerRunner),
             name=f"scisaurus-composer-{self.workflow.get('id', 'run')}",
         )
-        child.start()
+        try:
+            child.start()
+        except BaseException:
+            parent_pipe.close()
+            child_pipe.close()
+            child.close()
+            raise
         child_pipe.close()
         message = None
         last_signature = None
@@ -937,10 +1049,18 @@ class ComposerSupervisor:
             while child.is_alive():
                 while parent_pipe.poll():
                     try:
-                        message = parent_pipe.recv()
+                        received = parent_pipe.recv()
+                        if received.get("kind") == "progress":
+                            self.on_progress(received["state"])
+                        else:
+                            message = received
                     except EOFError:
                         break
                 snapshot = self._live_snapshot()
+                observed_deadline = _finite_number(snapshot.get("progress", {}).get("deadline_at_epoch"))
+                if (authorized_deadline is not None and observed_deadline is not None
+                        and observed_deadline >= authorized_deadline):
+                    authorized_deadline = None
                 signature = snapshot.get("signature")
                 if signature != last_signature:
                     last_signature = signature
@@ -969,16 +1089,18 @@ class ComposerSupervisor:
                 # checkpoint for several minutes while its durable attempt is
                 # still leased.  The stage/deadline and provider timeout own
                 # that call; killing the child here would turn a slow valid
-                # response into a result-unknown retry.  Only the no-attempt
-                # case is a supervisor-level stall.
-                active_attempts = snapshot.get("active_attempts", [])
-                if (stale >= self.watchdog_seconds
+                # response into a result-unknown retry. An expired lease no
+                # longer protects the child, and the mission deadline bounds
+                # both active calls and intentional retry waits.
+                leased_attempts = snapshot.get("leased_attempts", [])
+                if (self._deadline_expired(snapshot, authorized_deadline=authorized_deadline) or (
+                        stale >= self.watchdog_seconds
                         and not scheduled_wait
-                        and not active_attempts):
-                    result = self._watchdog_result(snapshot, stale)
+                        and not leased_attempts)):
+                    result = self._watchdog_result(snapshot, stale, authorized_deadline=authorized_deadline)
                     self._write_state(
                         child_status="watchdog_terminated",
-                        action="retry_after_watchdog", result=result,
+                        action="stop" if self._deadline_expired(snapshot, authorized_deadline=authorized_deadline) else "retry_after_watchdog", result=result,
                         watchdog={
                             "process_pid": child.pid,
                             "stale_seconds": round(stale, 3),
@@ -988,28 +1110,35 @@ class ComposerSupervisor:
                             "stage_signal_count": len(snapshot.get("stage_signals", [])),
                         },
                     )
-                    child.terminate()
-                    child.join(timeout=5.0)
-                    if child.is_alive():
-                        child.kill()
-                        child.join(timeout=5.0)
+                    self._stop_child(child)
                     return result
                 time.sleep(monitor_interval)
             child.join(timeout=5.0)
             while parent_pipe.poll():
                 try:
-                    message = parent_pipe.recv()
+                    received = parent_pipe.recv()
+                    if received.get("kind") == "progress":
+                        self.on_progress(received["state"])
+                    else:
+                        message = received
                 except EOFError:
                     break
         except KeyboardInterrupt:
             if child.is_alive():
-                child.terminate()
-                child.join(timeout=5.0)
+                self._stop_child(child)
             self._mark_interrupted_checkpoint()
             self._write_state(child_status="interrupted", action="stop")
             raise
         finally:
-            parent_pipe.close()
+            try:
+                if child.is_alive():
+                    self._stop_child(child)
+                child_exitcode = child.exitcode
+            finally:
+                try:
+                    parent_pipe.close()
+                finally:
+                    child.close()
         if isinstance(message, dict) and message.get("kind") == "result":
             return message.get("result")
         if isinstance(message, dict) and message.get("kind") == "exception":
@@ -1020,7 +1149,7 @@ class ComposerSupervisor:
             # dispatches a second Composer against the same checkpoint.
             return self._child_exception_result(message)
         else:
-            error = f"Composer child exited without a result (exitcode={child.exitcode})"
+            error = f"Composer child exited without a result (exitcode={child_exitcode})"
         return {
             "status": "blocked",
             "remaining_seconds": self._watchdog_remaining(self._live_snapshot()),
@@ -1033,7 +1162,10 @@ class ComposerSupervisor:
             if additional_seconds is not None:
                 runner_options["additional_seconds"] = additional_seconds
             runner = ComposerRunner(self.workflow, **runner_options)
-            return runner.run()
+            try:
+                return runner.run()
+            finally:
+                runner.close()
         except KeyboardInterrupt:
             self._write_state(child_status="interrupted", action="stop")
             raise
@@ -1056,6 +1188,12 @@ class ComposerSupervisor:
 
     def run(self):
         self._acquire_project_lock()
+        previous_termination = None
+        if threading.current_thread() is threading.main_thread():
+            previous_termination = signal.getsignal(signal.SIGTERM)
+            def terminate(signum, frame):
+                raise KeyboardInterrupt("termination requested")
+            signal.signal(signal.SIGTERM, terminate)
         try:
             if not self.process_watchdog:
                 return self._run_in_process()
@@ -1081,6 +1219,8 @@ class ComposerSupervisor:
                     return result
                 resume = True
         finally:
+            if previous_termination is not None:
+                signal.signal(signal.SIGTERM, previous_termination)
             self._release_project_lock()
 
 

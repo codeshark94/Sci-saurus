@@ -67,6 +67,20 @@ class ResumeTests(unittest.TestCase):
             self.controller.prepare(self.config, policy)
         self.assertEqual(self.budget.get_window("run-window")["reserved"], {"concurrent_calls": 1})
 
+    def test_conservative_reconciliation_preserves_observed_usage_floor(self):
+        self.tasks.create("remote", "service", {"operation": "model"}, "worker")
+        self.tasks.admit("remote", "scheduler")
+        self.budget.reserve(window_id="run-window", reservation_id="remote", task_id="remote",
+                            amount={"concurrent_calls": 1})
+        self.tasks.start_attempt("remote", "remote-attempt", owner="worker", lease_ttl_seconds=1)
+        self.tasks.reconcile_unknown("remote-attempt", "command.controller",
+                                     observed_usage={"model_calls": 4, "input_tokens": 3000})
+        policy = self.policy()
+        policy["unknown_outcomes"]["usage_per_attempt"] = {"model_calls": 1, "output_tokens": 1000}
+        self.controller.prepare(self.config, policy)
+        self.assertEqual(self.budget.get_window("run-window")["cumulative_usage"],
+                         {"model_calls": 4, "input_tokens": 3000, "output_tokens": 1000})
+
     def test_source_change_requires_named_reopened_scope(self):
         (self.root / "scisaurus" / "worker.py").write_text("VERSION = 2\n")
         with self.assertRaisesRegex(ValidationError, "source changed"):

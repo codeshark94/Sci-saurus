@@ -745,6 +745,23 @@ class DepartmentRuntimeTests(unittest.TestCase):
         self.assertEqual(body["target_stage_kind"], "argument")
         self.assertEqual(body["repair_priority"], "immediate")
         self.assertEqual(self.tasks.get(active["task_id"])["state"], "running")
+        for label in ("research_requests", "research_expansion_requests", "event"):
+            feedback = {"to": {"dept": "strategy"}, "stage_id": "survey"}
+            feedback[label] = {"expansion_requests": [request]} if label == "event" else [request]
+            received = self.runtime.receive_message(f"routing-{label}", feedback, None)
+            self.assertEqual(received["rejected"], [])
+            self.assertEqual(received["proposals"][0]["task_id"], active["task_id"])
+            self.assertEqual(self.tasks.get(active["task_id"])["state"], "running")
+            resumed = self.runtime.activate_work_orders([request])[0]
+            self.assertEqual(resumed["task_id"], active["task_id"])
+            self.assertEqual(resumed["task_state"], "running")
+        self.assertEqual(self.runtime.resolve_work_orders(
+            [request], stage_kind="interpretation", stage_id="interpretation", outcome="accepted"), [])
+        self.assertEqual(self.runtime.resolve_work_orders(
+            [request], stage_kind="argument", stage_id="other-argument", outcome="accepted"), [])
+        resolved = self.runtime.resolve_work_orders(
+            [request], stage_kind="argument", stage_id="argument", outcome="accepted")
+        self.assertEqual(resolved[0]["state"], "completed")
 
     def test_retire_superseded_work_orders_removes_old_generation_from_live_backlog(self):
         first = self.runtime.activate_work_orders([{

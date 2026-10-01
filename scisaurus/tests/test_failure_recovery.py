@@ -7,7 +7,7 @@ from scisaurus.runtime.failure_recovery import (
     build_failure_dossier, build_repair_request, classify_failure,
 )
 from scisaurus.runtime.capability_foundry import SourceDataUnavailable
-from scisaurus.core.errors import ModelContractError, QuotaExceededError, ValidationError
+from scisaurus.core.errors import ModelContractError, ProviderRateLimitError, QuotaExceededError, ValidationError
 from scisaurus.runtime.experiment import ExperimentProgramOutputContractError
 from scisaurus.runtime.model_work import ModelWorkBlocked
 from scisaurus.runtime.models import ModelCallError
@@ -132,6 +132,25 @@ class FailureRecoveryTests(unittest.TestCase):
             classify_failure("survey", ValidationError("run requires a new project directory")),
             "operational_recovery",
         )
+
+    def test_provider_rate_limit_remains_a_resource_fence_across_serialization(self):
+        details = {"outcome": "rate_limited", "metadata": {"http_status": 429}}
+        error = ProviderRateLimitError("source result package unavailable", provider="publisher", details=details)
+        details["metadata"]["http_status"] = 403
+        self.assertEqual(error.details["metadata"]["http_status"], 429)
+        for value, result in (
+            (error, None),
+            (ValidationError("source result package unavailable"), {"failure": {"kind": "provider_rate_limit"}}),
+        ):
+            with self.subTest(error_type=type(value).__name__):
+                self.assertEqual(classify_failure("experiment", value, result), "resource_fence")
+                dossier = build_failure_dossier(
+                    stage={"id": "survey", "kind": "survey"},
+                    attempt_stage={"attempt_number": 3, "project_dir": None},
+                    error=value, stage_result=result,
+                )
+                self.assertFalse(dossier["recoverable"])
+                self.assertEqual([item["operation"] for item in dossier["repair_commands"]], ["reconcile"])
 
     def test_python_runtime_exception_is_a_nonrecoverable_harness_bug(self):
         error = AttributeError("'NoneType' object has no attribute 'get'")

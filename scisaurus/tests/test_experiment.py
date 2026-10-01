@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -144,6 +145,29 @@ def disputed_claim_fixture_worker(kind, params, channel):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_runner_budget_failure_preserves_typed_fence_into_composer(self):
+        from scisaurus.runtime.models import ModelBudgetExceededError
+        from scisaurus.runtime.composer import ComposerRunner
+        from scisaurus.core.errors import QuotaExceededError
+        runner = ExperimentRunner(self.root / "budget-failure", self.config())
+        admission = {"path": str(self.root / "owner.sqlite"), "key": "stage",
+                     "dimension": "input_tokens", "limit": 100,
+                     "observed": 70, "reserved": 20, "requested": 11}
+        error = ModelBudgetExceededError("admission rejected", budget_admission=admission,
+                                        outcome_known=True, attempts=0)
+        error.usage = {"input_tokens": 7}
+        with patch.object(runner, "_setup", side_effect=error):
+            result = runner.run()
+        self.assertEqual(result["status"], "blocked", result)
+        self.assertEqual(result["failure"], error.failure_details())
+        with self.assertRaises(ModelBudgetExceededError) as raised:
+            ComposerRunner._raise_stage_failure(result)
+        self.assertIsInstance(raised.exception, QuotaExceededError)
+        self.assertEqual(raised.exception.budget_admission, admission)
+        self.assertEqual(raised.exception.attempts, 0)
+        self.assertEqual(raised.exception.usage, result["usage"])
+        self.assertEqual(raised.exception.stage_result, result)
+
     def test_integrated_model_reviews_use_json_mode_and_configured_output_budget(self):
         config = self.config()
         config["model"]["max_output_tokens"] = 8192
@@ -676,8 +700,14 @@ class ExperimentTests(unittest.TestCase):
         })
         self.assertEqual(validate_program_output(censored_with_bound, experiment)["study_id"],
                          "fixture_study")
-        with self.assertRaisesRegex(ValidationError, "all declared primary outcomes are null"):
+        with self.assertRaisesRegex(ValidationError, "all declared primary outcomes are null") as failure:
             validate_program_output(output(None), experiment)
+        self.assertIn("Diagnose the undefinedness", str(failure.exception))
+        self.assertIn("Preserve the admitted research question and primary outcome definitions",
+                      str(failure.exception))
+        self.assertIn("do not replace an outcome or change a parameter range merely",
+                      str(failure.exception))
+        self.assertNotIn("add a scientifically meaningful", str(failure.exception))
         with self.assertRaisesRegex(ValidationError, "non-finite numeric marker"):
             validate_program_output(output(0.75, "The onset shifted by nan atm."), experiment)
         with self.assertRaisesRegex(ValidationError, "non-finite numeric marker"):
@@ -946,6 +976,24 @@ class ExperimentTests(unittest.TestCase):
         self.assertNotEqual(package["provenance"]["replay_sha256"], "0" * 64)
         self.assertTrue((package_path.parent / "figure.png").is_file())
         self.assertTrue(result["event_chain"][0])
+
+    def test_review_transport_failure_retains_executed_results_and_typed_failure(self):
+        runner = ExperimentRunner(self.root / "review-failure", self.config())
+        runner.worker_target = fixture_worker
+        with patch.object(runner, "_model_reviews", side_effect=ModelCallError(
+                "model call budget exhausted", outcome_known=True, attempts=2)):
+            result = runner.run()
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["failure"]["kind"], "model_call")
+        self.assertEqual(result["failure"]["attempts"], 2)
+        raw = json.loads(Path(result["raw_results"]).read_text())
+        self.assertEqual(result["raw_results_sha256"],
+                         hashlib.sha256(Path(result["raw_results"]).read_bytes()).hexdigest())
+        self.assertEqual(raw["study_id"], "fixture_study")
+        self.assertEqual(raw["observations"], [{"run": 1, "accuracy": .75}])
+        self.assertEqual(len(result["execution_refs"]), 2)
+        self.assertIsNotNone(result["deterministic_validation_ref"])
+        self.assertIsNone(result["results_package"])
 
     def test_end_to_end_work_order_is_executed_reviewed_and_preserved_in_package(self):
         config = self.config()

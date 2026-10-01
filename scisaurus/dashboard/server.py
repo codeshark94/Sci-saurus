@@ -10,6 +10,7 @@ and research records.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from copy import deepcopy
 import json
 import mimetypes
 import os
@@ -196,6 +197,35 @@ def _display_status(value):
     value = str(value or "unknown").lower()
     aliases = {"accepted": "completed", "success": "completed", "succeeded": "completed"}
     return aliases.get(value, value)
+
+
+def _runner_command(command):
+    """Recognize a CLI dispatch at argv start, excluding diagnostic strings."""
+    return re.match(
+        r"^(?:\S*(?:Python|python(?:\d+(?:\.\d+)?)?)\s+(?:(?:-u|-B|-I|-s|-E)\s+)*-m\s+scisaurus(?:\.cli)?"
+        r"|(?:\S*/)?scisaurus)\s+(?P<verb>run-composer|run-survey|resume-survey|run-experiment|"
+        r"run-project|run-paragraph|run-visual-review)(?=\s|$)", command)
+
+
+def _command_binds_path(command, prefix, path):
+    binding = re.search(prefix + r'(?:"(?P<double>[^\"]+)"|\x27(?P<single>[^\x27]+)\x27|(?P<plain>\S+))', command)
+    if binding:
+        candidate = binding["double"] or binding["single"] or binding["plain"]
+        if Path(candidate).resolve() == Path(path).resolve():
+            return True
+    variants = {str(Path(path).resolve())}
+    try:
+        variants.add(Path(path).resolve().relative_to(Path.cwd().resolve()).as_posix())
+    except ValueError:
+        pass
+    return any(re.search(prefix + r'["\x27]?' + re.escape(value) + r'["\x27]?(?=\s|$)', command)
+               for value in variants)
+
+
+def _composer_owns_workflow(command, workflow_path):
+    runner = _runner_command(command)
+    return bool(runner and runner["verb"] == "run-composer"
+                and _command_binds_path(command[runner.end():], r"(?:^|\s)--workflow(?:=|\s+)", workflow_path))
 
 
 def _file_kind(path: Path):
@@ -442,7 +472,10 @@ class DashboardSnapshot:
                 stage_record = self._stage_record(value, stage_id) or value
                 if isinstance(stage_record, dict):
                     candidates.append((record["modified"], stage_record, record["root_key"]))
-        if candidates:
+        parent = self._stage_record(live["value"], stage_id) if live is not None else None
+        if isinstance(parent, dict):
+            raw, source_root = parent, live["root_key"]
+        elif candidates:
             _, raw, source_root = max(candidates, key=lambda item: item[0])
         else:
             raw, source_root = {}, f"stage:{stage_id}"
@@ -771,14 +804,25 @@ class DashboardSnapshot:
                 pass
         processes = []
         for line in result.stdout.splitlines():
-            if not any(marker in line for marker in markers) or "dashboard" in line.lower():
-                continue
             match = re.match(r"\s*(\d+)\s+(\S+)\s+(.*)", line)
             if not match:
                 continue
+            command = match.group(3)
+            owns_execution = self._command_owns_execution(command)
+            if not owns_execution and (not any(marker in command for marker in markers)
+                                       or "dashboard" in command.lower()):
+                continue
             processes.append({"pid": int(match.group(1)), "elapsed": match.group(2),
-                              "command": _short(match.group(3), 240)})
+                              "command": _short(command, 240), "owns_execution": owns_execution})
+        processes.sort(key=lambda item: not item["owns_execution"])
         return processes[:12]
+
+    def _command_owns_execution(self, command):
+        if self.workflow_path is not None:
+            return _composer_owns_workflow(command, self.workflow_path)
+        runner = _runner_command(command)
+        return bool(runner and runner["verb"] != "run-composer"
+                    and _command_binds_path(command[runner.end():], r"^\s+", self.root))
 
     @staticmethod
     def _activity_from_department(items):
@@ -1363,6 +1407,9 @@ class DashboardSnapshot:
                 "queued": "queued",
                 "running": "awaiting response",
                 "awaiting_review": "response recorded · awaiting review",
+                "review_pending": "response recorded · awaiting review",
+                "interrupted": "execution interrupted · outcome unreconciled",
+                "unobserved": "execution not observed · outcome unreconciled",
             }.get(state)
             if response_status is None:
                 response_status = "response recorded" if execution_artifact else (
@@ -1389,6 +1436,7 @@ class DashboardSnapshot:
                 "task_id": task_id,
                 "attempt_id": attempt.get("attempt_id"),
                 "state": state,
+                "recorded_state": task.get("recorded_state"),
                 "role": role if isinstance(role, str) else None,
                 "stage_id": stage_id,
                 "model": model or "model not recorded",
@@ -1450,6 +1498,10 @@ class DashboardSnapshot:
                 else:
                     state = _display_status(report_status or "queued")
                     response_status = "awaiting response" if state in MODEL_LIVE_STATES else "not recorded"
+                    if event_name == "execution_unobserved":
+                        response_status = "execution not observed · outcome unreconciled"
+                    elif event_name == "task_reconciled":
+                        response_status = "task closed · provider outcome not recorded"
                 usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
                 input_tokens = usage.get("input_tokens")
                 cache_read_tokens = usage.get("cache_read_tokens")
@@ -1482,6 +1534,7 @@ class DashboardSnapshot:
                     "task_id": task_id,
                     "attempt_id": None,
                     "state": state,
+                    "recorded_state": event.get("recorded_status"),
                     "role": event.get("role") if isinstance(event.get("role"), str) else role,
                     "stage_id": event.get("stage_id") if isinstance(event.get("stage_id"), str) else stage_id,
                     "model": event.get("model") if isinstance(event.get("model"), str) else "model not recorded",
@@ -1500,7 +1553,8 @@ class DashboardSnapshot:
                     "response_ref": event.get("response_ref") if isinstance(event.get("response_ref"), str) else None,
                     "artifact_ref": event.get("artifact_ref") if isinstance(event.get("artifact_ref"), str) else None,
                     "started_at": started_at,
-                    "finished_at": updated_at if state not in MODEL_LIVE_STATES else None,
+                    "finished_at": _iso_timestamp(event.get("finished_at")) or (
+                        updated_at if event_name == "completed" else None),
                     "updated_at": updated_at,
                     "elapsed_seconds": _safe_float(event.get("elapsed_seconds")),
                     "usage": {key: value for key, value in usage.items()
@@ -1519,9 +1573,9 @@ class DashboardSnapshot:
                 return 0.0
 
         live_calls = [item for item in calls if item.get("state") in MODEL_LIVE_STATES]
-        review_calls = [item for item in calls if item.get("state") == "awaiting_review"]
+        review_calls = [item for item in calls if item.get("state") in {"awaiting_review", "review_pending"}]
         recent_calls = [item for item in calls if item.get("state") not in MODEL_LIVE_STATES
-                        and item.get("state") != "awaiting_review"]
+                        and item.get("state") not in {"awaiting_review", "review_pending"}]
         live_calls.sort(key=lambda item: (
             state_priority.get(item.get("state"), 3),
             -timestamp(item.get("updated_at") or item.get("started_at")),
@@ -1723,7 +1777,7 @@ class DashboardSnapshot:
         }
         gates = {
             "topic": "question admitted",
-            "survey": "evidence suffices for experiment",
+            "survey": "literature coverage and gap assessment",
             "experiment": "results pass recalculation",
             "interpretation": "mechanism survives challenge",
             "argument": "every claim has support",
@@ -1901,6 +1955,9 @@ class DashboardSnapshot:
             "failed": "failed · repair signal",
             "blocked": "blocked · repair signal",
             "paused": "paused",
+            "interrupted": "interrupted · awaiting reconciliation",
+            "unobserved": "execution not observed",
+            "review_pending": "awaiting independent review",
             "cancelled": "cancelled",
             "stale": "stale",
         }
@@ -1980,6 +2037,12 @@ class DashboardSnapshot:
         active_blockers, blocker_counts = _blocker_projection(live_value)
         db = self._db_records()
         stages = [self._stage_summary(spec, live) for spec in self._stage_specs()]
+        live_value, stages = self._reconciled_execution_projection(live_value, stages, db)
+        processes = self._processes()
+        execution_observed = any(item.get("owns_execution") is True for item in processes) and (
+            _display_status(live_value.get("status")) in {"running", "retrying"})
+        if not execution_observed:
+            live_value, stages, db = self._inactive_execution_projection(live_value, stages, db)
         current_stage = None
         phase = live_value.get("phase") if isinstance(live_value, dict) else None
         if isinstance(phase, str) and phase:
@@ -2008,7 +2071,8 @@ class DashboardSnapshot:
             })
         checkpoint_items.extend(item for item in db["artifacts"] if item["kind"] == "checkpoint")
         checkpoint_items.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "", reverse=True)
-        usage = live_value.get("usage") if isinstance(live_value.get("usage"), dict) else {}
+        usage = live_value.get("observed_usage") if isinstance(live_value.get("observed_usage"), dict) else (
+            live_value.get("usage") if isinstance(live_value.get("usage"), dict) else {})
         deadline_at = live_value.get("deadline_at_epoch")
         workflow_policy = self.workflow.get("time_policy") if isinstance(self.workflow.get("time_policy"), dict) else {}
         deadline_seconds = live_value.get("deadline_seconds") or workflow_policy.get("hard_seconds")
@@ -2139,9 +2203,117 @@ class DashboardSnapshot:
             "resources": {"usage": usage, "pools": db["pools"], "windows": db["windows"]},
             "integrity": {"databases": db["integrity"], "read_only": True},
             "runtime": {"host": platform.node(), "platform": platform.platform(),
-                         "python": sys.version.split()[0], "processes": self._processes()},
+                         "python": sys.version.split()[0], "processes": processes,
+                         "execution_observed": execution_observed},
             "organization": organization,
         }
+
+    @staticmethod
+    def _reconciled_execution_projection(live_value, stages, db):
+        """Use durable task outcomes to retire stale checkpoint activity."""
+        live_value, stages = deepcopy((live_value, stages))
+        tasks = {}
+        for task in db.get("tasks") or []:
+            tasks.setdefault(task.get("task_id"), task)
+
+        def reconcile(record):
+            if not isinstance(record, dict):
+                return
+            task = tasks.get(record.get("task_id"))
+            state = task.get("state") if isinstance(task, dict) else None
+            if not isinstance(state, str) or state not in TERMINAL_STATES | {"blocked", "result_unknown"}:
+                return
+            for key in ("state", "status", "task_state"):
+                previous = record.get(key)
+                if isinstance(previous, str) and previous in ACTIVE_STATES:
+                    record["recorded_" + key] = previous
+                    record[key] = state
+            if record.get("event") == "dispatched":
+                record["recorded_event"] = "dispatched"
+                record["event"] = "task_reconciled"
+                record["status"] = state
+
+        records = (live_value.get("stages") or {}).values()
+        for stage in [*records, *stages]:
+            if not isinstance(stage, dict):
+                continue
+            events = stage.get("specialist_live")
+            if not isinstance(events, dict):
+                continue
+            for event in events.values():
+                reconcile(event)
+            stage["active_agents"] = [
+                role for role in stage.get("active_agents") or []
+                if not (isinstance(events.get(role), dict)
+                        and events[role].get("event") == "task_reconciled")]
+        organization = live_value.get("organization")
+        if isinstance(organization, dict):
+            for key in ("active_assignments", "agent_activity"):
+                for assignment in organization.get(key) or []:
+                    reconcile(assignment)
+            assignments = organization.get("active_assignments") or []
+            retired = [item for item in assignments if isinstance(item, dict)
+                       and item.get("recorded_task_state") in ACTIVE_STATES
+                       and item.get("task_state") not in ACTIVE_STATES]
+            organization["active_assignments"] = [item for item in assignments if item not in retired]
+            history = organization.get("agent_activity") or []
+            organization["agent_activity"] = history
+            recorded_ids = {item.get("task_id") for item in history if isinstance(item, dict)}
+            history.extend(item for item in retired if item.get("task_id") not in recorded_ids)
+        return live_value, stages
+
+    @staticmethod
+    def _inactive_execution_projection(live_value, stages, db):
+        """Retain unfinished records without presenting them as observed work."""
+        live_value, stages, db = deepcopy((live_value, stages, db))
+        owner_stopped = _display_status(live_value.get("status")) in {
+            "paused", "blocked", "completed", "candidate_needs_review", "failed", "cancelled"}
+
+        def project(record):
+            if not isinstance(record, dict):
+                return
+            for key in ("state", "status", "task_state", "attempt_state"):
+                state = record.get(key)
+                if not isinstance(state, str) or state not in ACTIVE_STATES:
+                    continue
+                record["recorded_" + key] = state
+                record[key] = ("review_pending" if state == "awaiting_review" else
+                               "paused" if owner_stopped and state in {"proposed", "queued"} else
+                               "interrupted" if owner_stopped else "unobserved")
+            record["execution_observed"] = False
+            if record.get("active_agents"):
+                record["recorded_active_agents"] = record["active_agents"]
+                record["active_agents"] = []
+            events = record.get("specialist_live")
+            if isinstance(events, dict):
+                for event in events.values():
+                    project(event)
+                    if isinstance(event, dict) and event.get("event") == "dispatched":
+                        event["recorded_event"] = event["event"]
+                        event["event"] = "execution_unobserved"
+                        event["status"] = "interrupted" if owner_stopped else "unobserved"
+
+        for record in stages:
+            project(record)
+        for record in (live_value.get("stages") or {}).values():
+            project(record)
+        for key in ("tasks", "attempts"):
+            for record in db.get(key) or []:
+                project(record)
+        counts = db.get("counts")
+        if isinstance(counts, dict):
+            counts["unfinished_tasks"] = counts.get("active_tasks", 0)
+            counts["active_tasks"] = 0
+        organization = live_value.get("organization")
+        if isinstance(organization, dict):
+            assignments = organization.get("active_assignments") or []
+            organization["recorded_active_assignments"] = deepcopy(assignments)
+            organization["active_assignments"] = []
+            activity = organization.get("agent_activity") or []
+            organization["agent_activity"] = activity + assignments
+            for record in organization["agent_activity"]:
+                project(record)
+        return live_value, stages, db
 
     def resolve_file(self, file_ref):
         if not isinstance(file_ref, str) or "::" not in file_ref:
@@ -2415,11 +2587,6 @@ class DashboardService:
 
     @staticmethod
     def _composer_processes(workflow_path):
-        markers = {str(workflow_path)}
-        try:
-            markers.add(workflow_path.relative_to(Path.cwd().resolve()).as_posix())
-        except ValueError:
-            pass
         try:
             result = subprocess.run(
                 ["ps", "-axo", "pid=,command="], check=False,
@@ -2433,7 +2600,7 @@ class DashboardService:
             if not match:
                 continue
             command = match.group(2)
-            if "run-composer" not in command or not any(marker in command for marker in markers):
+            if not _composer_owns_workflow(command, workflow_path):
                 continue
             processes.append({"pid": int(match.group(1)), "command": _short(command, 240)})
         return processes

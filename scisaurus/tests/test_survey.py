@@ -13,11 +13,12 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import ModelContractError, ProviderRateLimitError, ValidationError
 from scisaurus.core.events import ControlStore
+from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.source_spans import bind, expand_evidence
-from scisaurus.core.surveys import ABSTENTION_REASONS, SurveyGate
+from scisaurus.core.surveys import ABSTENTION_REASONS, SurveyGate, work_review_checks
 from scisaurus.runtime.execution import SYSTEM, _invoke_worker
 from scisaurus.runtime.bibliographic_identity import reconcile_result
 from scisaurus.runtime.literature import ProviderCooldownError
@@ -27,12 +28,13 @@ from scisaurus.runtime.models import estimate_input_tokens
 from scisaurus.runtime.survey import (SurveyRunner, apply_scoped_map_repair,
                                       normalize_map_relationships,
                                       normalize_map_worker_response,
-                                      overlay_post_checkpoint_relationships)
+                                      overlay_post_checkpoint_relationships,
+                                      source_fidelity_review_contract)
 from scisaurus.runtime.survey_config import validate_survey_config
 from scisaurus.runtime.survey_records import (GAP_CHECKS, MAP_FIELDS, SURVEY_CHECKS,
                                                normalize_check_envelope,
                                                normalize_gap_assessment_envelope,
-                                               validate_assessment, validate_map)
+                                               validate_assessment, validate_map, validate_work_review)
 from scisaurus.runtime.time_policy import STAGES
 from scisaurus.tests.test_retrieval import minimal_pdf
 
@@ -208,6 +210,23 @@ def simulated_survey_worker(kind, params, channel):
     started = time.monotonic()
     if phase == "blind_plan":
         value = {"queries": ["independent terminology"], "rationale": "Search neighboring terminology."}
+    elif phase == "survey_follow_up":
+        value = {"orders": [{
+            "id": order["id"], "status": "limited", "rationale": "The bounded evidence does not resolve this measurement.",
+            "evidence": [], "query_refs": assignment["query_refs"],
+            "limitation": "The configured sources lack the requested measurement.",
+            "next_action": "Keep the measurement claim provisional and narrow the study.",
+        } for order in assignment["work_orders"]]}
+        if mode == "follow-up-source-binding":
+            for row in value["orders"]:
+                if row["id"] != "evidence-2":
+                    continue
+                if "_contract_repair_boundary" in assignment:
+                    row["evidence"] = [{"evidence_id": assignment["evidence_catalog"][0]["evidence_id"]}]
+                else:
+                    source = assignment["sources"][0]
+                    row["evidence"] = [{"work_id": source["work_id"], "source_ref": source["source_ref"],
+                                        "quote": "This quotation belongs to another captured document."}]
     elif phase == "counter_plan":
         value = {"queries": ["prior solution"], "rationale": "Search for an existing solution."}
     elif phase == "nomination":
@@ -276,6 +295,21 @@ def simulated_survey_worker(kind, params, channel):
         if mode == "review-never-resolves" and assignment["entry"]["work_id"] == "W101":
             next(check for check in value["checks"] if check["check_id"] == "reason").update(
                 outcome="insufficient_evidence", result="The screening rationale remains unresolved.")
+        if mode == "review-forced-reason-failure":
+            next(check for check in value["checks"] if check["check_id"] == "reason").update(
+                outcome="failed", result="The screening rationale exceeds the captured evidence.")
+        if mode in {"review-current-diagnostic", "review-current-diagnostic-failure"}:
+            if mode.endswith("-failure"):
+                next(check for check in value["checks"] if check["check_id"] == "reason").update(
+                    outcome="failed", result="The screening rationale exceeds the captured evidence.")
+            value["checks"].append({"check_id": "question-answer-coverage", "outcome": "insufficient_evidence",
+                                    "method": "Separate question coverage diagnostic.",
+                                    "result": "The research question remains for downstream gap assessment."})
+        if mode == "review-question-adversary":
+            contract = assignment.get("review_contract", {})
+            if contract != source_fidelity_review_contract():
+                next(check for check in value["checks"] if check["check_id"] == "finding").update(
+                    outcome="insufficient_evidence", result="The supported finding does not answer the research question.")
         if mode.startswith("semantic-") and "every task" in assignment["entry"]["reason"]:
             next(check for check in value["checks"] if check["check_id"] == "reason").update(
                 outcome="failed", result="The abstract does not establish generalization to every task; narrow the reason to recall timing.")
@@ -304,7 +338,9 @@ def simulated_survey_worker(kind, params, channel):
     timing = {"fixture": "explicitly-simulated-survey-worker", "started": started, "finished": time.monotonic(), "pid": os.getpid()}
     channel.put({"ok": True, "result": {"text": json.dumps(value), "model": json.dumps(timing),
         "usage": {"model_calls": 1, "input_tokens": 100, "output_tokens": 50},
-        "elapsed_seconds": time.monotonic() - started, "finish_reason": "stop"}})
+        "elapsed_seconds": time.monotonic() - started,
+        "finish_reason": ("content_filter" if mode == "follow-up-filtered" and phase == "survey_follow_up"
+                          and "_contract_repair_boundary" not in assignment else "stop")}})
 
 
 MCP_SURVEY_FIXTURE = r'''
@@ -364,6 +400,249 @@ def survey_config(endpoint, mode="pass"):
 
 
 class TestSurveyRunner(unittest.TestCase):
+    def test_follow_up_source_binding_repair_preserves_checked_sibling_and_frontier(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        from scisaurus.runtime.model_work import ModelWorkCache
+        config = survey_config(self.endpoint, "follow-up-source-binding")
+        config["limits"]["max_rounds"] = 2
+        orders = [self.follow_up_order(), {**self.follow_up_order(), "id": "evidence-2"}]
+        first = self.runtime(config, work_orders=orders)
+        failed = first.run()
+        self.assertEqual(failed["failure"]["failure_class"], "model_contract")
+        typed = ModelWorkBlocked(failed["error"], failure_class="model_contract")
+        self.assertFalse(ComposerRunner._is_survey_evidence_contract_blocker({"kind": "survey"}, typed))
+        self.assertTrue(ComposerRunner._is_survey_evidence_contract_blocker({"kind": "survey"}, failed["error"]))
+        control, store = self.open_store()
+        def publish(logical_id, artifact_type, body, author, *, subjects=()):
+            return store.publish_artifact(logical_id=logical_id, artifact_type=artifact_type,
+                                          body=canonical_bytes(body), author=author)
+        cache = ModelWorkCache(store, publish)
+        siblings = [row for row in cache.entries() if row.get("status") == "succeeded"
+                    and isinstance(row.get("value"), dict) and "orders" in row["value"]]
+        self.assertEqual(len(siblings), 1)
+        sibling_execution = siblings[0]["execution_ref"]
+        for state in cache.entries():
+            if state.get("status") == "blocked" and "follow-up-disposition" in state.get("error", ""):
+                key = state.pop("cache_ref").split("/")[-1].split("@")[0]
+                state["failure_class"] = None
+                cache.put(key, state)
+        policy = {"additional_seconds": config["limits"]["wall_clock_seconds"],
+                  "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["follow_up"]}}
+        second = self.runtime(config, resume_policy=policy, work_orders=orders)
+        with patch.object(second, "_prepare_follow_up", side_effect=AssertionError("accepted frontier must remain")), \
+             patch.object(second, "_setup", side_effect=AssertionError("no acquisition needed")):
+            completed = second.run()
+        self.assertEqual(completed["status"], "completed", completed["error"])
+        self.assertEqual(completed["survey_ref"], failed["survey_ref"])
+        self.assertEqual(completed["assessment_ref"], failed["assessment_ref"])
+        report = json.loads(store.read_body(store.get(completed["follow_up_result"]["ref"])["body_hash"]))
+        self.assertEqual(report["execution_refs"][0], sibling_execution)
+        repair_execution = store.get(report["execution_refs"][1])
+        context = json.loads(store.read_body(store.get(repair_execution["inputs"][0]["ref"])["body_hash"]))
+        assignment = json.loads(context["prompt"])
+        self.assertTrue(assignment["evidence_catalog"])
+        self.assertTrue(all("text" not in source for source in assignment["sources"]))
+        self.assertNotIn("previous_response", assignment["validation_feedback"])
+        for order in orders:
+            self.assertTrue(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", completed, order))
+
+    def test_runner_budget_failure_preserves_typed_fence_into_composer(self):
+        from scisaurus.runtime.models import ModelBudgetExceededError
+        from scisaurus.runtime.composer import ComposerRunner
+        from scisaurus.core.errors import QuotaExceededError
+        runner = self.runtime()
+        admission = {"path": str(self.root / "owner.sqlite"), "key": "stage",
+                     "dimension": "input_tokens", "limit": 100,
+                     "observed": 70, "reserved": 20, "requested": 11}
+        error = ModelBudgetExceededError("admission rejected", budget_admission=admission,
+                                        outcome_known=True, attempts=0)
+        error.usage = {"input_tokens": 7}
+        with patch.object(runner, "_setup", side_effect=error):
+            result = runner.run()
+        self.assertEqual(result["status"], "blocked", result)
+        self.assertEqual(result["failure"], error.failure_details())
+        with self.assertRaises(ModelBudgetExceededError) as raised:
+            ComposerRunner._raise_stage_failure(result)
+        self.assertIsInstance(raised.exception, QuotaExceededError)
+        self.assertEqual(raised.exception.budget_admission, admission)
+        self.assertEqual(raised.exception.attempts, 0)
+        self.assertEqual(raised.exception.usage, result["usage"])
+        self.assertEqual(raised.exception.stage_result, result)
+
+    def test_unknown_field_cannot_be_reviewed_as_an_absence_claim(self):
+        from scisaurus.runtime.survey_records import validate_work_review
+        entry = {field: {"text": None, "evidence": []} for field in MAP_FIELDS}
+        value = {"checks": check_rows(["inclusion", "reason", *MAP_FIELDS]), "rationale": "Only asserted facts are audited."}
+        validate_work_review(value, [], entry=entry)
+        next(check for check in value["checks"] if check["check_id"] == "limitations")["outcome"] = "insufficient_evidence"
+        with self.assertRaises(ModelContractError):
+            validate_work_review(value, [], entry=entry)
+
+    def test_scientific_review_allowance_belongs_to_each_unchanged_work(self):
+        runner = self.runtime()
+        runner._initialize()
+        runner._setup()
+        for wid in ("W101", "W102"):
+            runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+        runner._map()
+        runner.config["model"]["model"] = "review-forced-reason-failure"
+        def adverse_review(wid, number):
+            entry_ref = runner.analysis_records[wid]["artifact_ref"]
+            assignment = {"phase": "work_review", "entry_ref": entry_ref,
+                          "entry": runner._body(runner.analysis_records[wid]),
+                          "required_checks": list(work_review_checks([])),
+                          "review_contract": source_fidelity_review_contract()}
+            value, execution = runner._model_checked(f"scope-test-review-{wid}-{number}",
+                "methods.work-reviewer", assignment, lambda value: validate_work_review(value, []),
+                stage="unit_review", task_kind="verification")
+            return {"entry_ref": entry_ref, "relationship_refs": [],
+                    "review_protocol": source_fidelity_review_contract()["protocol"],
+                    "evidence_scope": runner._review_evidence_scope(wid),
+                    "execution_ref": execution, **value}
+        for wid, count in (("W101", 3), ("W102", 1)):
+            for number in range(count):
+                runner._record(f"kb/work-reviews/{wid}", "note", adverse_review(wid, number), "methods.work-reviewer")
+        self.assertEqual(runner._work_review_failure_count("W101"), 3)
+        self.assertEqual(runner._work_review_failure_count("W102"), 1)
+        old = runner.analysis_records["W102"]
+        candidate = runner._body(old)
+        candidate["reason"] = "A revised screening rationale."
+        runner.analysis_records["W102"] = runner._record("kb/work-analyses/W102", "note", candidate,
+            "research.literature-mapper", subjects=runner.analyzed_basis["W102"])
+        self.assertEqual(runner._work_review_failure_count("W102"), 1)
+        source = runner._record("kb/abstract/W102", "source_capture", {"work_id": "W102", "abstract": "New evidence."},
+                                "research.cataloger")
+        runner.analyzed_basis["W102"].append(source["artifact_ref"])
+        self.assertEqual(runner._work_review_failure_count("W102"), 0)
+        runner.analyzed_basis["W102"].pop()
+        removed = next(ref for ref in runner.analyzed_basis["W102"]
+                       if runner.store.get(ref)["artifact_type"] == "source_capture")
+        runner.analyzed_basis["W102"].remove(removed)
+        self.assertEqual(runner._work_review_failure_count("W102"), 0)
+        runner.analyzed_basis["W102"].append(removed)
+        runner.relationships["scope-test"] = {"source": "W102", "target": "W101"}
+        runner._record("kb/work-reviews/W102", "note", adverse_review("W102", "changed"), "methods.work-reviewer")
+        self.assertEqual(runner._work_review_failure_count("W102"), 1)
+        target_identity = runner._record("kb/identities/W101", "reference_card", {"work_id": "W101"}, "research.cataloger")
+        runner.identity_records["W101"] = target_identity
+        self.assertEqual(runner._work_review_failure_count("W102"), 0)
+
+    def test_focused_review_audits_supported_claim_without_requiring_question_answer(self):
+        runner = self.runtime(survey_config(self.endpoint, "review-question-adversary"))
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        entry = runner.analysis_records["W101"]
+        retained = runner._body(entry)
+        runner._review_work_claims()
+        self.assertEqual(runner.analysis_records["W101"]["artifact_ref"], entry["artifact_ref"])
+        self.assertEqual(runner._body(entry), retained)
+        review = runner._body(runner.work_reviews["W101"])
+        self.assertTrue(all(check["outcome"] == "passed" for check in review["checks"]))
+        self.assertEqual(review["review_protocol"], source_fidelity_review_contract()["protocol"])
+        self.assertTrue(runner._review_protocol_matches(review))
+        self.assertEqual(runner._work_review_failure_count("W101"), 0)
+        prompt = next(prompt for _, prompt in self.model_contexts(runner.control, runner.store)
+                      if prompt.get("phase") == "work_review")
+        self.assertEqual(prompt["review_contract"], source_fidelity_review_contract())
+        self.assertIn("partial or general claim", prompt["review_contract"]["screening_scope"])
+        self.assertIn("Fail unsupported minor clauses", prompt["review_contract"]["failure_basis"])
+        self.assertEqual(prompt["question"], runner.score["question"])
+        self.assertIsNone(runner.store.head("kb/gap-assessments/current"))
+
+    def test_old_focused_review_protocol_cannot_gain_failure_credit_by_outer_retagging(self):
+        runner = self.runtime(survey_config(self.endpoint, "review-forced-reason-failure"))
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        entry_ref = runner.analysis_records["W101"]["artifact_ref"]
+        assignment = {"phase": "work_review", "entry_ref": entry_ref,
+                      "entry": runner._body(runner.analysis_records["W101"]),
+                      "required_checks": list(work_review_checks([]))}
+        value, execution = runner._model_checked("legacy-review-protocol", "methods.work-reviewer", assignment,
+            lambda value: validate_work_review(value, []), stage="unit_review", task_kind="verification")
+        legacy_scope = runner._review_evidence_scope("W101")
+        legacy_scope.pop("review_protocol")
+        legacy = {"entry_ref": entry_ref, "relationship_refs": [], "execution_ref": execution,
+                  "evidence_scope": legacy_scope, **value}
+        runner._record("kb/work-reviews/W101", "note", legacy, "methods.work-reviewer")
+        self.assertFalse(runner._review_protocol_matches(legacy))
+        self.assertEqual(runner._work_review_failure_count("W101"), 0)
+        forged = {**legacy, "review_protocol": source_fidelity_review_contract()["protocol"],
+                  "evidence_scope": runner._review_evidence_scope("W101")}
+        runner._record("kb/work-reviews/W101", "note", forged, "methods.work-reviewer")
+        self.assertFalse(runner._review_protocol_matches(forged))
+        self.assertEqual(runner._work_review_failure_count("W101"), 0)
+        assignment["review_contract"] = source_fidelity_review_contract()
+        value, execution = runner._model_checked("current-review-protocol", "methods.work-reviewer", assignment,
+            lambda value: validate_work_review(value, []), stage="unit_review", task_kind="verification")
+        current = {**forged, "execution_ref": execution, **value}
+        runner._record("kb/work-reviews/W101", "note", current, "methods.work-reviewer")
+        self.assertTrue(runner._review_protocol_matches(current))
+        self.assertEqual(runner._work_review_failure_count("W101"), 1)
+        runner.config["model"]["model"] = "pass"
+        assignment.pop("review_contract")
+        passed, old_execution = runner._model_checked("legacy-passed-review-protocol", "methods.work-reviewer", assignment,
+            lambda value: validate_work_review(value, []), stage="unit_review", task_kind="verification")
+        old_pass = {**legacy, "execution_ref": old_execution, **passed}
+        self.assertTrue(all(check["outcome"] == "passed" for check in old_pass["checks"]))
+        runner._record("kb/work-reviews/W101", "note", old_pass, "methods.work-reviewer",
+                       subjects=[entry_ref, *runner.analyzed_basis["W101"]])
+        retained_analysis = runner.analysis_records["W101"]["artifact_ref"]
+        retained_sources = deepcopy(runner.source_docs)
+        runner.resume_session = {"reopened_scopes": []}
+        runner._restore()
+        self.assertNotIn("W101", runner.reviewed_basis)
+        self.assertEqual(runner.analysis_records["W101"]["artifact_ref"], retained_analysis)
+        self.assertEqual(runner.source_docs, retained_sources)
+
+    def test_current_review_protocol_credit_replays_normalized_extra_diagnostics(self):
+        runner = self.runtime(survey_config(self.endpoint, "review-current-diagnostic"))
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        entry_ref = runner.analysis_records["W101"]["artifact_ref"]
+        assignment = {"phase": "work_review", "entry_ref": entry_ref,
+                      "entry": runner._body(runner.analysis_records["W101"]),
+                      "required_checks": list(work_review_checks([])),
+                      "review_contract": source_fidelity_review_contract()}
+        for failed in (False, True):
+            runner.config["model"]["model"] = "review-current-diagnostic-failure" if failed else "review-current-diagnostic"
+            value, execution = runner._model_checked(f"diagnostic-review-{failed}", "methods.work-reviewer", assignment,
+                lambda value: validate_work_review(value, []),
+                normalizer=lambda value: normalize_check_envelope(value, work_review_checks([])),
+                stage="unit_review", task_kind="verification")
+            _, _, _, raw = runner.gate._model_review_execution(execution, "methods.work-reviewer")
+            self.assertEqual(len(raw["checks"]), len(value["checks"]) + 1)
+            body = {"entry_ref": entry_ref, "relationship_refs": [], "execution_ref": execution,
+                    "review_protocol": source_fidelity_review_contract()["protocol"],
+                    "evidence_scope": runner._review_evidence_scope("W101"), **value}
+            runner._record("kb/work-reviews/W101", "note", body, "methods.work-reviewer",
+                           subjects=[entry_ref, *runner.source_docs])
+            self.assertTrue(runner._review_protocol_matches(body))
+            self.assertEqual(runner._work_review_failure_count("W101"), int(failed))
+            evidence = runner.gate._model_review_execution(execution, "methods.work-reviewer")
+            for malformed in (raw["checks"][1:], [*raw["checks"], raw["checks"][0]]):
+                invalid = {**raw, "checks": malformed}
+                with patch.object(runner.gate, "_model_review_execution", return_value=(*evidence[:-1], invalid)):
+                    self.assertFalse(runner._review_protocol_matches({**body, "checks": malformed}))
+            if not failed:
+                runner.resume_session = {"reopened_scopes": []}
+                runner._restore()
+                self.assertIn("W101", runner.reviewed_basis)
+                self.assertEqual(runner.work_reviews["W101"]["artifact_ref"], runner.store.head("kb/work-reviews/W101")["artifact_ref"])
+
+    def test_independent_model_and_admission_ignore_unrelated_retrieval_bindings(self):
+        runner = SurveyRunner.__new__(SurveyRunner)
+        runner.bindings = {"bibliography": "stale", "full_text": "degraded"}
+        runner.operations = unittest.mock.Mock()
+        runner._ensure_active = unittest.mock.Mock()
+        runner._before_dispatch({"kind": "model", "params": {"prompt": '{"phase":"map"}'}})
+        runner._admission_guard()
+        runner.operations.authorize.assert_not_called()
+        self.assertEqual(runner._ensure_active.call_count, 3)
+
     @classmethod
     def setUpClass(cls):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), SurveyHTTPFixture)
@@ -524,7 +803,8 @@ class TestSurveyRunner(unittest.TestCase):
             }
             if index == 0:
                 runner.source_docs[f"source-{wid}-full"] = {
-                    "work_id": wid, "representation": "full_text",
+                    "work_id": wid, "representation": "full_text", "identity_verified": True,
+                    "identity_checks": {"title_match": True, "section_markers": ["Results"]},
                     "text": "Owner evidence. " * 2200,
                 }
             else:
@@ -532,13 +812,16 @@ class TestSurveyRunner(unittest.TestCase):
                     "work_id": wid, "representation": "abstract",
                     "text": f"Comparison evidence for {wid}. " * 300,
                 }
-        assignment = runner._map_job("W000", ["artifact:work-W000@1"])["assignment"]
+        runner.works["W000"]["referenced_works"] = ["W070"]
+        with patch.object(runner, "_analysis_selection", return_value={f"W{index:03d}" for index in range(5)}):
+            assignment = runner._map_job("W000", ["artifact:work-W000@1"])["assignment"]
         estimate = estimate_input_tokens(SYSTEM, json.dumps(assignment, ensure_ascii=False))
         self.assertLessEqual(estimate, 56000)
         owner = next(source for source in assignment["sources"] if source["work_id"] == "W000")
         comparisons = [source for source in assignment["sources"] if source["work_id"] != "W000"]
         self.assertEqual(len(owner["text"]), 30000)
-        self.assertEqual(len(comparisons), 79)
+        self.assertEqual({source["work_id"] for source in comparisons}, {"W001", "W002", "W003", "W004", "W070"})
+        self.assertEqual({work["id"] for work in assignment["works"]}, {"W000", "W001", "W002", "W003", "W004", "W070"})
         self.assertLessEqual(sum(len(source["text"]) for source in comparisons), 60000)
         runner.control.close()
 
@@ -567,7 +850,8 @@ class TestSurveyRunner(unittest.TestCase):
             }
             if index == 0:
                 runner.source_docs[f"source-{wid}-full"] = {
-                    "work_id": wid, "representation": "full_text",
+                    "work_id": wid, "representation": "full_text", "identity_verified": True,
+                    "identity_checks": {"title_match": True, "section_markers": ["Results"]},
                     "text": "Owner evidence. " * 2200,
                 }
             else:
@@ -753,11 +1037,237 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(contexts, [])
         runner.control.close()
 
-    def runtime(self, config=None, *, on_progress=None, resume_policy=None):
+    def runtime(self, config=None, *, on_progress=None, resume_policy=None, work_orders=None):
         runner = SurveyRunner(self.root / "run", config or survey_config(self.endpoint),
-                              on_progress=on_progress, resume_policy=resume_policy)
+                              on_progress=on_progress, resume_policy=resume_policy, work_orders=work_orders)
+        self.addCleanup(runner.control.close)
         runner.worker_target = simulated_survey_worker
         return runner
+
+    @staticmethod
+    def follow_up_order(objective="Locate the instrument calibration measurement."):
+        return {"id": "evidence-1", "kind": "literature_expansion", "owner": "research.intelligence",
+                "objective": objective, "why": "The evidence needed by the experiment is absent.",
+                "success_condition": "Attach primary measurements or document the bounded negative search.",
+                "evidence_needed": "Captured measurements, units, uncertainty and search records."}
+
+    def test_follow_up_reaches_search_analysis_assessment_and_pinned_disposition(self):
+        order = self.follow_up_order()
+        runner = self.runtime(work_orders=[order])
+        result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertEqual(result["follow_up_result"]["orders"][0]["status"], "limited")
+        control = ControlStore(self.root / "run")
+        self.addCleanup(control.close)
+        store = ArtifactStore(control)
+        phases = set()
+        for row in control._conn.execute("SELECT artifact_ref FROM artifacts WHERE logical_id LIKE 'command/contexts/%'"):
+            body = json.loads(store.read_body(store.get(row[0])["body_hash"]))
+            prompt = json.loads(body["prompt"]) if isinstance(body.get("prompt"), str) else {}
+            if prompt.get("phase") in {"blind_plan", "map", "gap_assessment", "survey_follow_up"}:
+                phases.add(prompt["phase"])
+                self.assertEqual(prompt["work_orders"], [order])
+                self.assertEqual(prompt["follow_up_ref"], result["follow_up_ref"])
+        self.assertEqual(phases, {"blind_plan", "map", "gap_assessment", "survey_follow_up"})
+        report = json.loads(store.read_body(store.get(result["follow_up_result"]["ref"])["body_hash"]))
+        self.assertEqual(report["survey_ref"], result["survey_ref"])
+        self.assertEqual(report["assessment_ref"], result["assessment_ref"])
+        from scisaurus.runtime.composer import ComposerRunner
+        self.assertTrue(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, order))
+        changed = {**order, "objective": "Locate the down-sweep measurement."}
+        self.assertFalse(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, changed))
+        changed = {**order, "acceptance_checks": ["Independent calibrated replication."]}
+        self.assertFalse(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, changed))
+        forged_body = deepcopy(report)
+        forged_body["orders"][0]["status"] = "resolved"
+        forged = store.publish_artifact(logical_id="command/survey-follow-up-results/forged",
+            artifact_type="report", author="methods.evidence-verifier", body=canonical_bytes(forged_body),
+            inputs=store.get(result["follow_up_result"]["ref"])["inputs"])
+        forged_run = {**result, "follow_up_result": {"ref": forged["artifact_ref"], "orders": forged_body["orders"]}}
+        self.assertFalse(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", forged_run, order))
+        query_ref = report["orders"][0]["query_refs"][0]
+        query = json.loads(store.read_body(store.get(query_ref)["body_hash"]))
+        fake_query = store.publish_artifact(logical_id="kb/forged-follow-up-query", artifact_type="query_record",
+            author=query["role"], body=canonical_bytes({"request": query["request"], "outcome": "empty",
+                "role": query["role"], "plan_ref": query["plan_ref"], "returned_work_ids": []}))
+        with self.assertRaises(ValidationError):
+            SurveyGate(control, store).require_successful_follow_up_search(
+                fake_query["artifact_ref"], {"query_refs": [fake_query["artifact_ref"]]}, result["follow_up_ref"])
+        for field, replacement in (("returned_work_ids", ["W999"]), ("count", query["count"] + 99),
+                                   ("next_cursor", "invented"), ("has_more", not query["has_more"])):
+            forged_summary = store.publish_artifact(logical_id=f"kb/forged-follow-up-summary/{field}",
+                artifact_type="query_record", author=query["role"], body=canonical_bytes({**query, field: replacement}),
+                inputs=store.get(query_ref)["inputs"])
+            with self.subTest(field=field), self.assertRaises(ValidationError):
+                SurveyGate(control, store).require_successful_follow_up_search(
+                    forged_summary["artifact_ref"], {"query_refs": [forged_summary["artifact_ref"]]},
+                    result["follow_up_ref"])
+
+    def test_follow_up_resume_keeps_completed_analysis_with_unchanged_claims(self):
+        config = survey_config(self.endpoint)
+        order = self.follow_up_order()
+        first = self.runtime(config, work_orders=[order])
+        initial = first.run()
+        self.assertEqual(initial["status"], "completed", initial.get("error"))
+        hashes = {wid: record["body_hash"] for wid, record in first.analysis_records.items()}
+        changed = self.follow_up_order("Locate the independent instrument calibration measurement.")
+        policy = {"additional_seconds": config["limits"]["wall_clock_seconds"],
+                  "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["gap_assessment"]}}
+        second = self.runtime(config, resume_policy=policy, work_orders=[changed])
+        refreshed = second.run()
+        self.assertEqual(refreshed["status"], "completed", refreshed.get("error"))
+        self.assertEqual({wid: record["body_hash"] for wid, record in second.analysis_records.items()}, hashes)
+        control, store = self.open_store()
+        completion = store.head("command/survey-analysis-completions/W101")
+        checked = json.loads(store.read_body(completion["body_hash"]))
+        self.assertNotIn(second.follow_up_ref, checked["basis"])
+        self.assertEqual(checked["question"], second.score["question"])
+        self.assertEqual(checked["entry_ref"], second.analysis_records["W101"]["artifact_ref"])
+        third = self.runtime(config, resume_policy=policy, work_orders=[changed])
+        self.assertEqual(third.analyzed_basis["W101"], third._analysis_basis("W101"))
+        with patch.object(third, "_map_job", side_effect=AssertionError("unchanged analysis must be retained")):
+            final = third.run()
+        self.assertEqual(final["status"], "completed", final.get("error"))
+
+    def test_follow_up_overlay_preserves_durable_config_and_changes_assignment_identity(self):
+        config = survey_config(self.endpoint)
+        first = self.runtime(config)
+        original = first.store.head("inputs/run-config")
+        first.run()
+        policy = {"additional_seconds": config["limits"]["wall_clock_seconds"], "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["gap_assessment"]}}
+        resumed = self.runtime(config, resume_policy=policy, work_orders=[self.follow_up_order()])
+        self.addCleanup(resumed.control.close)
+        self.assertEqual(resumed.store.head("inputs/run-config")["body_hash"], original["body_hash"])
+        self.assertNotIn("work_orders", resumed.config)
+        projection = resumed._follow_up_assignment({"phase": "blind_plan"})
+        self.assertEqual(projection["work_orders"][0]["objective"], self.follow_up_order()["objective"])
+        self.assertIsNotNone(projection["follow_up_ref"])
+        result = resumed.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertNotEqual(result["survey_ref"], first.survey_ref)
+        from scisaurus.runtime.composer import ComposerRunner
+        self.assertTrue(ComposerRunner._survey_work_order_was_fulfilled(
+            self.root / "run", result, self.follow_up_order()))
+
+    def test_follow_up_rejects_forged_passages_unrecorded_searches_and_missing_orders(self):
+        runner = self.runtime(work_orders=[self.follow_up_order()])
+        self.addCleanup(runner.control.close)
+        runner.source_docs = {"source-1": {"work_id": "W101", "text": "Recorded exact text."}}
+        runner.query_refs = ["query-1"]
+        row = {"id": "evidence-1", "status": "resolved", "rationale": "Captured measurement.",
+               "evidence": [{"work_id": "W101", "source_ref": "source-1", "quote": "Fabricated text."}],
+               "query_refs": ["query-1"], "limitation": "", "next_action": "Use the measurement."}
+        with self.assertRaises(ValidationError):
+            runner._validate_follow_up_result({"orders": [row]})
+        with self.assertRaises(ValidationError):
+            runner._validate_follow_up_result({"orders": [{**row, "status": "limited", "evidence": [],
+                "limitation": "Source unavailable.", "query_refs": ["unrecorded-query"]}]})
+        with self.assertRaises(ValidationError):
+            runner._validate_follow_up_result({"orders": []})
+        for proof in ({"work_id": "W101", "source_ref": "source-1"},
+                      {"work_id": "W101", "source_ref": "source-1", "quote": "Recorded exact text.", "extra": True},
+                      {"work_id": "W101", "source_ref": "source-1", "quote": "Recorded exact text.",
+                       "start": -1, "end": -1, "quote_sha256": "forged"}):
+            with self.subTest(proof=proof), self.assertRaises(ValidationError):
+                runner._validate_follow_up_result({"orders": [{**row, "query_refs": [], "evidence": [proof]}]})
+
+    def test_follow_up_disposition_fits_context_without_changing_captures(self):
+        runner = self.runtime(work_orders=[self.follow_up_order()])
+        self.addCleanup(runner.control.close)
+        runner.config["model"].update({"context_window_tokens": 65536, "max_input_tokens": 56000,
+                                       "max_output_tokens": 8192})
+        runner.survey_ref = "artifact:kb/surveys/current@1"
+        runner.assessment_ref = runner._record("kb/assessment/context-fixture", "note",
+            {"state": "insufficient_evidence", "rationale": "Measurements absent.", "checks": []},
+            "methods.novelty-verifier")["artifact_ref"]
+        runner.source_docs = {f"source-{i}": {"work_id": f"W{i}", "representation": "full_text",
+            "identity_verified": True, "identity_checks": {"title_match": True, "section_markers": ["Results"]},
+            "text": "Measured outcome. " * 22000} for i in range(10)}
+        original = deepcopy(runner.source_docs)
+        captured = []
+        def capture(name, actor, assignment, *args, **kwargs):
+            captured.append(assignment)
+            raise RuntimeError("captured bounded assignment")
+        with patch.object(runner, "_model_checked", side_effect=capture), self.assertRaises(RuntimeError):
+            runner._resolve_follow_up()
+        self.assertLessEqual(estimate_input_tokens(SYSTEM, json.dumps(captured[0], ensure_ascii=False)), 56000)
+        self.assertEqual(captured[0]["work_orders"], [self.follow_up_order()])
+        self.assertEqual(runner.source_docs, original)
+
+    def test_follow_up_contract_resume_keeps_accepted_frontier_and_checked_orders(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        config = survey_config(self.endpoint)
+        orders = [self.follow_up_order(), {**self.follow_up_order(), "id": "evidence-2"}]
+        first = self.runtime(config, work_orders=orders)
+        validate = first._validate_follow_up_result
+        def reject_second(value, **kwargs):
+            if kwargs.get("work_orders", [{}])[0].get("id") == "evidence-2":
+                raise ModelContractError("survey follow-up disposition requires all assigned fields")
+            return validate(value, **kwargs)
+        with patch.object(first, "_validate_follow_up_result", side_effect=reject_second):
+            failed = first.run()
+        self.assertEqual(failed["failure"], {"kind": "unchanged_assignment_exhausted",
+                                            "failure_class": "model_contract"})
+        self.assertTrue(failed["survey_current"])
+        self.assertTrue(failed["assessment_current"])
+        self.assertEqual(ComposerRunner._survey_resume_scope(failed), "follow_up")
+        self.assertIsNotNone(ComposerRunner._survey_checkpoint(self.root / "run"))
+        with self.assertRaises(ModelWorkBlocked) as error:
+            ComposerRunner._raise_stage_failure(failed)
+        self.assertEqual(error.exception.failure_class, "model_contract")
+        from scisaurus.runtime.failure_recovery import classify_failure
+        self.assertEqual(classify_failure("survey", error.exception, failed), "model_contract")
+        policy = {"additional_seconds": config["limits"]["wall_clock_seconds"],
+                  "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["follow_up"]}}
+        second = self.runtime(config, resume_policy=policy, work_orders=orders)
+        with patch.object(second, "_prepare_follow_up", side_effect=AssertionError("accepted evidence must remain")), \
+             patch.object(second, "_setup", side_effect=AssertionError("no retrieval setup needed")):
+            completed = second.run()
+        self.assertEqual(completed["status"], "completed", completed["error"])
+        self.assertEqual(completed["survey_ref"], failed["survey_ref"])
+        self.assertEqual(completed["assessment_ref"], failed["assessment_ref"])
+        for order in orders:
+            self.assertTrue(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", completed, order))
+        control, store = self.open_store()
+        report = json.loads(store.read_body(store.get(completed["follow_up_result"]["ref"])["body_hash"]))
+        self.assertEqual(len(report["execution_refs"]), 2)
+        records = []
+        for ref in report["execution_refs"]:
+            execution = store.get(ref)
+            context = json.loads(store.read_body(store.get(execution["inputs"][0]["ref"])["body_hash"]))
+            records.append(json.loads(context["prompt"])["work_orders"])
+        self.assertEqual(records, [[orders[0]], [orders[1]]])
+        forged = {**report, "execution_refs": [report["execution_refs"][0]]}
+        record = store.publish_artifact(logical_id="command/survey-follow-up-results/missing-execution",
+            artifact_type="report", author="methods.evidence-verifier", body=canonical_bytes(forged),
+            inputs=store.get(completed["follow_up_result"]["ref"])["inputs"])
+        bad_run = {**completed, "follow_up_result": {"ref": record["artifact_ref"], "orders": report["orders"]}}
+        self.assertFalse(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", bad_run, orders[0]))
+
+    def test_follow_up_filtered_response_is_repaired_without_adopting_old_execution(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        config = survey_config(self.endpoint, "follow-up-filtered")
+        order = self.follow_up_order()
+        first = self.runtime(config, work_orders=[order])
+        failed = first.run()
+        self.assertEqual(failed["failure"]["failure_class"], "model_contract")
+        control, store = self.open_store()
+        old_tasks = [row[0] for row in control._conn.execute(
+            "SELECT task_id FROM tasks WHERE task_id LIKE 'survey-follow-up-disposition-%'")]
+        policy = {"additional_seconds": config["limits"]["wall_clock_seconds"],
+                  "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["follow_up"]}}
+        second = self.runtime(config, resume_policy=policy, work_orders=[order])
+        completed = second.run()
+        self.assertEqual(completed["status"], "completed", completed["error"])
+        self.assertEqual(completed["survey_ref"], failed["survey_ref"])
+        self.assertEqual(completed["assessment_ref"], failed["assessment_ref"])
+        self.assertTrue(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", completed, order))
+        for task_id in old_tasks:
+            self.assertEqual(control._conn.execute("SELECT state FROM tasks WHERE task_id=?", (task_id,)).fetchone()[0], "blocked")
 
     def test_process_stop_is_not_a_survey_failure_retry(self):
         runner = self.runtime()
@@ -836,6 +1346,11 @@ class TestSurveyRunner(unittest.TestCase):
         prior_assignment = {**base, "resume_boundary": "gap-assessment-resume-1"}
         current_assignment = {**base, "resume_boundary": "gap-assessment-resume-2"}
         prior_response = {"state": "insufficient_evidence", "evidence": []}
+        task_id = "survey-gap-assessment-retained"
+        runner.tasks.create(task_id, "verification", {"operation": "model"}, "command.controller")
+        runner.tasks.admit(task_id, "command.controller")
+        runner.tasks.start_attempt(task_id, "attempt-gap-retained", owner="methods.novelty-verifier",
+                                   lease_ttl_seconds=30)
         context = runner._publish("command/contexts/survey-gap-assessment-retained", "note", {
             "client": {"model": "fixture"},
             "prompt": json.dumps(prior_assignment),
@@ -843,6 +1358,8 @@ class TestSurveyRunner(unittest.TestCase):
         execution = runner._publish("command/executions/survey-gap-assessment-retained", "report", {
             "text": json.dumps(prior_response),
         }, "methods.novelty-verifier", subjects=[context["artifact_ref"]])
+        runner.tasks.finish_attempt("attempt-gap-retained", "succeeded", usage={"model_calls": 1})
+        runner.tasks.transition(task_id, "blocked", "command.controller", reason="output requires revalidation")
         proposal = runner._publish("kb/model-proposals/survey-gap-assessment-retained", "note",
             prior_response, "methods.novelty-verifier", subjects=[execution["artifact_ref"]])
         runner._publish("command/validation/survey-gap-assessment-retained", "note", {
@@ -862,6 +1379,8 @@ class TestSurveyRunner(unittest.TestCase):
 
         self.assertEqual(result[0], prior_response)
         self.assertEqual(result[1], execution["artifact_ref"])
+        self.assertEqual(runner.tasks.get(task_id)["state"], "completed")
+        self.assertEqual(len(runner.tasks.attempts_for_task(task_id)), 1)
         runner.control.close()
 
     def test_focused_semantic_repair_changes_only_failed_field_and_work(self):
@@ -983,9 +1502,9 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(result["coverage"]["verified_full_texts"], 0)
         self.assertEqual(result["coverage"]["expansion"][0]["new_unique_works"], 2)
         searches = result["coverage"]["searches"]
-        self.assertEqual(len(searches), 7)
-        self.assertEqual(len(SurveyHTTPFixture.requests), 8)
-        self.assertEqual(result["usage"]["cumulative_usage"]["retrieval_calls"], 8)
+        self.assertEqual(len(searches), 6)
+        self.assertEqual(len(SurveyHTTPFixture.requests), 7)
+        self.assertEqual(result["usage"]["cumulative_usage"]["retrieval_calls"], 7)
         self.assertEqual(sum(query["new_unique_works"] for query in searches), 5)
         self.assertTrue(any(request["path"] == "/works/W102" for request in SurveyHTTPFixture.requests))
         self.assertTrue(any(request["query"].get("filter") == ["cites:W101"] for request in SurveyHTTPFixture.requests))
@@ -1285,6 +1804,62 @@ class TestSurveyRunner(unittest.TestCase):
         self.addCleanup(resumed.control.close)
         self.assertEqual(resumed.analysis_records["W101"]["artifact_ref"], latest["artifact_ref"])
 
+    def test_resume_does_not_credit_old_analysis_and_review_for_new_source(self):
+        runner = self.runtime()
+        runner._initialize()
+        runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        runner._review_work_claims()
+        self.assertIn("W101", runner.analyzed_basis)
+        self.assertIn("W101", runner.reviewed_basis)
+        source = {"work_id": "W101", "text": "Newly captured full text changes the result boundary.",
+                  "representation": "full_text"}
+        record = runner._record("kb/full-text/W101", "source_capture", source, "methods.source-verifier")
+        runner.source_docs[record["artifact_ref"]] = source
+        runner._update_register()
+        runner.control.close()
+        policy = {"additional_seconds": 20, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["operations"]}}
+        resumed = self.runtime(resume_policy=policy)
+        self.addCleanup(resumed.control.close)
+        self.assertIn("W101", resumed.analysis_records)
+        self.assertNotIn("W101", resumed.analyzed_basis)
+        self.assertNotIn("W101", resumed.reviewed_basis)
+
+    def test_resume_invalidates_claims_even_with_unchanged_unverified_source_refs(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        abstract = next(body for body in runner.source_docs.values() if body["work_id"] == "W101")
+        unverified = {**abstract, "representation": "unverified_text", "identity_verified": False,
+                      "identity_checks": {"title_match": False, "section_markers": []}}
+        capture = runner._record("kb/full-text/W101", "source_capture", unverified, "methods.source-verifier")
+        runner.source_docs[capture["artifact_ref"]] = unverified
+        runner._update_register()
+        basis = [runner.work_records["W101"]["artifact_ref"], *runner.source_docs]
+        body = runner._body(runner.analysis_records["W101"])
+        for field in MAP_FIELDS:
+            for proof in body[field]["evidence"]:
+                proof["source_ref"] = capture["artifact_ref"]
+        record = runner._record("kb/work-analyses/W101", "note", body, "research.literature-mapper", subjects=basis)
+        runner.analysis_records["W101"] = record
+        runner.analyzed_basis["W101"] = basis
+        runner.map_record = runner._record("kb/literature-map", "note", {
+            "entry_refs": [record["artifact_ref"]], "relationship_refs": []}, "research.literature-mapper")
+        runner._review_work_claims()
+        runner.control.close()
+        policy = {"additional_seconds": 20, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["operations"]}}
+        resumed = self.runtime(resume_policy=policy)
+        self.addCleanup(resumed.control.close)
+        self.assertIn(capture["artifact_ref"], resumed.source_docs)
+        self.assertEqual(resumed.analysis_records["W101"]["artifact_ref"], record["artifact_ref"])
+        self.assertNotIn("W101", resumed.analyzed_basis)
+        self.assertNotIn("W101", resumed.reviewed_basis)
+        self.assertNotIn("W101", resumed.work_reviews)
+
     def test_review_only_resume_does_not_repeat_initial_acquisition(self):
         config = survey_config(self.endpoint)
         with patch.object(SurveyRunner, "_review_work_claims", side_effect=KeyboardInterrupt("checkpoint before review")):
@@ -1508,7 +2083,7 @@ class TestSurveyRunner(unittest.TestCase):
         resumed = self.runtime(resume_policy=policy)
         self.addCleanup(resumed.control.close)
         self.assertEqual(resumed.full_text_attempted, {"W101", "W102"})
-        self.assertEqual(resumed.expanded, {"W101"})
+        self.assertEqual(resumed.expanded, set())
 
     def test_cached_unsupported_map_is_abstained_without_repeated_calls(self):
         runner = self.runtime(survey_config(self.endpoint, "map-reject"))
@@ -1699,6 +2274,81 @@ class TestSurveyRunner(unittest.TestCase):
             "url": source_url, "section_markers": ["Methods", "Results"]}]
         return config
 
+    def test_automatic_capture_uses_actual_body_headings_without_introduction(self):
+        config = self.full_text_config("fulltext-refutes")
+        config["survey"]["full_text_sources"] = []
+        SurveyHTTPFixture.locations_by_work = {"W401": [{"is_oa": True,
+            "landing_page_url": "https://example.org/W401", "pdf_url": None}]}
+        runner = self.runtime(config)
+        self.addCleanup(runner.control.close)
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W401")
+        runner._full_texts()
+        capture = runner._body(runner.source_records["full_text/W401"])
+        self.assertEqual(capture["representation"], "full_text")
+        self.assertEqual(capture["identity_checks"]["section_markers"], ["Methods", "Results"])
+
+    def test_explicit_missing_introduction_remains_unverified(self):
+        config = self.full_text_config("fulltext-refutes")
+        config["survey"]["full_text_sources"][0]["section_markers"] = ["Introduction"]
+        runner = self.runtime(config)
+        self.addCleanup(runner.control.close)
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W401")
+        runner._full_texts()
+        capture = runner._body(runner.source_records["full_text/W401"])
+        self.assertEqual(capture["representation"], "unverified_text")
+        runner._revalidate_retained_full_texts()
+        self.assertEqual(runner._body(runner.source_records["full_text/W401"]), capture)
+
+    def test_unverified_text_does_not_crowd_out_usable_abstract(self):
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        runner.source_docs = {
+            "bad": {"work_id": "W1", "representation": "unverified_text", "identity_verified": False,
+                    "identity_checks": {"title_match": False, "section_markers": []}, "text": "unverified " * 5000},
+            "abstract": {"work_id": "W1", "representation": "abstract", "text": "Reliable abstract."}}
+        sources = runner._map_sources("W1")
+        self.assertEqual([source["source_ref"] for source in sources], ["abstract"])
+        self.assertEqual([source["source_ref"] for source in runner._assessment_source_context()], ["abstract"])
+        diagnostic = runner._source_context()[0]
+        self.assertIs(diagnostic["identity_verified"], False)
+        self.assertFalse(diagnostic["identity_checks"]["title_match"])
+
+    def test_retained_auto_capture_revalidation_pins_original_bytes_and_invalidates_credit(self):
+        config = self.full_text_config("fulltext-refutes")
+        config["survey"]["full_text_sources"] = []
+        SurveyHTTPFixture.locations_by_work = {"W401": [{"is_oa": True,
+            "landing_page_url": "https://example.org/W401", "pdf_url": None}]}
+        runner = self.runtime(config)
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W401")
+        runner._full_texts()
+        valid = runner._body(runner.source_records["full_text/W401"])
+        historical = {**valid, "representation": "unverified_text", "identity_verified": False,
+                      "identity_checks": {"title_match": True, "section_markers": []}}
+        old = runner._record("kb/full-text/W401", "source_capture", historical, "methods.source-verifier",
+                             subjects=[valid["execution_ref"], runner.work_records["W401"]["artifact_ref"]])
+        runner.source_docs = {ref: body for ref, body in runner.source_docs.items() if body["representation"] == "abstract"}
+        runner.source_docs[old["artifact_ref"]] = historical
+        runner.source_records["full_text/W401"] = old
+        runner._update_register(); runner._map(); runner._review_work_claims()
+        runner.control.close()
+        policy = {"additional_seconds": 20, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["operations"]}}
+        before = len(SurveyHTTPFixture.requests)
+        resumed = self.runtime(config, resume_policy=policy)
+        self.addCleanup(resumed.control.close)
+        record = resumed.source_records["full_text/W401"]
+        self.assertNotEqual(record["artifact_ref"], old["artifact_ref"])
+        self.assertEqual(resumed._body(record), valid)
+        self.assertEqual(len(SurveyHTTPFixture.requests), before)
+        self.assertNotIn(old["artifact_ref"], resumed.source_docs)
+        self.assertTrue({old["artifact_ref"], valid["execution_ref"], resumed.work_records["W401"]["artifact_ref"]}.issubset(
+            {item["ref"] for item in record["inputs"]}))
+        self.assertNotIn("W401", resumed.analyzed_basis)
+        self.assertNotIn("W401", resumed.reviewed_basis)
+
     def test_real_stdio_full_text_can_refute_prior_gap(self):
         result = self.runtime(self.full_text_config("fulltext-refutes")).run()
         self.assertEqual(result["status"], "completed", result["error"])
@@ -1706,7 +2356,7 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(result["coverage"]["verified_full_texts"], 1)
         self.assertTrue(result["survey_current"])
         self.assertIsNotNone(result["assessment_ref"])
-        self.assertEqual(result["usage"]["cumulative_usage"]["retrieval_calls"], 10)
+        self.assertEqual(result["usage"]["cumulative_usage"]["retrieval_calls"], 9)
         _, store = self.open_store()
         capture = json.loads(store.read_body(store.head("kb/full-text/W401")["body_hash"]))
         execution = json.loads(store.read_body(store.get(capture["execution_ref"])["body_hash"]))
@@ -1882,6 +2532,346 @@ class TestSurveyRunner(unittest.TestCase):
                        if item.get("kind") == "full_text_failure")
         self.assertEqual(failure["outcome"], "access_denied")
 
+    def test_access_denial_uses_abstract_scoped_evidence_through_review_and_resume(self):
+        denied_url = f"http://127.0.0.1:{self.server.server_port}/denied.pdf"
+        config = self.full_text_config("pass", source_url=denied_url)
+        order = self.follow_up_order()
+        result = self.runtime(config, work_orders=[order]).run()
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        self.assertEqual(result["gap_state"], "insufficient_evidence")
+        self.assertEqual(result["coverage"]["verified_full_texts"], 0)
+        availability = next(row for row in result["coverage"]["source_availability"]
+                            if row["work_id"] == "W401")
+        self.assertEqual(availability["evidence_scope"], "abstract")
+        self.assertEqual(availability["full_text_access"], "unavailable")
+        self.assertTrue(availability["abstract_refs"])
+        self.assertEqual(availability["verified_full_text_refs"], [])
+        self.assertEqual(availability["full_text_failures"][0]["outcome"], "access_denied")
+        self.assertTrue(availability["full_text_failures"][0]["execution_ref"])
+        control, store = self.open_store()
+        phases = set()
+        for _, assignment in self.model_contexts(control, store):
+            if assignment.get("phase") in {"map", "work_review", "survey_review", "gap_assessment", "survey_follow_up"}:
+                phases.add(assignment["phase"])
+                self.assertEqual(assignment["source_evidence_policy"], result["coverage"]["source_evidence_policy"])
+                for source in assignment.get("sources", []):
+                    if source.get("work_id") == "W401":
+                        self.assertEqual(source["source_availability"], availability)
+                        self.assertEqual(source["representation"], "abstract")
+        self.assertEqual(phases, {"map", "work_review", "survey_review", "gap_assessment", "survey_follow_up"})
+        policy = {"additional_seconds": 40,
+                  "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["follow_up"]}}
+        resumed = self.runtime(config, resume_policy=policy, work_orders=[order])
+        self.assertEqual(resumed._source_availability("W401"), availability)
+        with patch.object(resumed.operations, "run", side_effect=AssertionError("inaccessible source must not be retried")):
+            resumed._full_texts()
+        self.assertTrue(all(source["representation"] == "abstract"
+                            for source in resumed._assessment_source_context()))
+        followup = resumed._follow_up_assignment({"sources": resumed._assessment_source_context()})
+        self.assertEqual(followup["source_evidence_policy"], result["coverage"]["source_evidence_policy"])
+        policy["source_changes"]["reopen_scopes"] = ["retrieval"]
+        reopened = self.runtime(config, resume_policy=policy, work_orders=[order])
+        with patch.object(reopened.operations, "run", side_effect=AssertionError("retrieval reopen must preserve terminal access unavailability")):
+            reopened._full_texts()
+        self.assertEqual(reopened._source_availability("W401"), availability)
+
+    def test_full_text_robots_http429_stops_instead_of_using_abstract_fallback(self):
+        runner = self.runtime(self.full_text_config("pass"))
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W401")
+        execution = runner._record("command/rate-limit-fixture", "note", {}, "command.controller")["artifact_ref"]
+        response = {"outcome": "robots_denied", "error": "Robots policy HTTP429",
+                    "metadata": {"robots_policy": {"status": 429}}}
+        with patch.object(runner.operations, "run", return_value=(response, execution)) as dispatch:
+            with self.assertRaisesRegex(ProviderRateLimitError, "rate limit requires provider recovery") as stopped:
+                runner._full_texts()
+            self.assertEqual(dispatch.call_count, 1)
+        self.assertEqual(stopped.exception.provider, "full_text")
+        self.assertEqual(stopped.exception.details["execution_ref"], execution)
+        self.assertEqual(stopped.exception.details["metadata"], response["metadata"])
+        availability = runner._source_availability("W401")
+        self.assertEqual(availability["full_text_access"], "rate_limited")
+        self.assertEqual(availability["full_text_failures"][0]["outcome"], "rate_limited")
+        receipt = runner._body(runner.store.head("command/source-attempts/full-text/W401-1"))
+        self.assertEqual(receipt["status"], "rate_limited")
+        with patch.object(runner.operations, "run", side_effect=AssertionError("rate limit must stop later dispatch")):
+            with self.assertRaisesRegex(ValidationError, "provider recovery"):
+                runner._full_texts()
+
+    def test_full_text_readiness_http429_is_typed_and_preserves_immutable_probe(self):
+        runner = self.runtime(self.full_text_config("pass"))
+        runner._initialize()
+        metadata = {"robots_policy": {"status": 429}, "rate_limit": {"retry_after_seconds": 60}}
+        execution = runner._record("command/executions/readiness-rate", "report", {
+            "outcome": "robots_denied", "error": "Robots policy HTTP429", "metadata": metadata,
+        }, "operations.operator")
+        probe = runner._record("command/readiness-rate", "note", {
+            "execution_ref": execution["artifact_ref"]}, "operations.verifier")
+        full_text_id = runner.score["full_text"]["id"]
+        def readiness(capability_id, *args, **kwargs):
+            return ({"state": "degraded", "reason": "Robots policy HTTP429"} if capability_id == full_text_id
+                    else {"state": "ready", "binding": "fixture-ready-binding"})
+        with patch.object(runner.operations, "ensure_ready", side_effect=readiness) as dispatch, \
+             patch.object(runner.operations, "idle"), \
+             patch.object(runner.operations, "status", return_value={"probe_ref": probe["artifact_ref"]}):
+            with self.assertRaises(ProviderRateLimitError) as stopped:
+                runner._setup()
+        self.assertEqual(dispatch.call_count, 2)
+        self.assertEqual(stopped.exception.provider, "full_text")
+        self.assertEqual(stopped.exception.details["execution_ref"], execution["artifact_ref"])
+        self.assertEqual(stopped.exception.details["metadata"], metadata)
+        self.assertEqual(stopped.exception.details["kind"], "full_text_readiness_failure")
+        self.assertNotIn("full_text", runner.bindings)
+        self.assertFalse(any(gap.get("kind") == "full_text_unavailable" for gap in runner.gaps))
+
+    def test_full_text_owned_http429_stops_before_recovery_and_source_admission(self):
+        for path in ("exception", "recovery", "result"):
+            config = self.full_text_config("pass")
+            runner = SurveyRunner(self.root / f"full-text-{path}", config)
+            self.addCleanup(runner.control.close)
+            runner._initialize()
+            runner.works = {"W401": {"id": "W401", "title": config["survey"]["full_text_sources"][0]["title"]}}
+            runner.work_records["W401"] = runner._record("kb/works/W401", "reference_card", runner.works["W401"], "research.cataloger")
+            runner.bindings["full_text"] = "fixture-text-binding"
+            metadata = {"rate_limit": {"status_code": 429}}
+            response = {"outcome": "ok" if path == "result" else "provider_error", "metadata": metadata, "error": "HTTP429"}
+            if path == "result":
+                metadata.clear()
+                response.update(status_code=429, rate_limit={"retry_after_seconds": 60})
+            execution = runner._record("command/executions/text-rate", "report", response, "operations.operator")
+            failure = runner._record("command/text-rate", "note", {"execution_ref": execution["artifact_ref"]}, "operations.verifier")
+            states = ([{} , {"failure_ref": failure["artifact_ref"]}] if path == "recovery"
+                      else [{"failure_ref": failure["artifact_ref"]}])
+            dispatch_args = ({"return_value": (response, execution["artifact_ref"])} if path == "result"
+                             else {"side_effect": ValidationError("owned text operation failed")})
+            with patch.object(runner.operations, "run", **dispatch_args) as dispatch, \
+                 patch.object(runner.operations, "status", side_effect=states), \
+                 patch.object(runner.operations, "ensure_ready", return_value={"state": "degraded", "reason": "HTTP429"}) as recovery:
+                with self.assertRaises(ProviderRateLimitError) as stopped:
+                    runner._full_texts()
+            self.assertEqual(dispatch.call_count, 1)
+            self.assertEqual(recovery.call_count, int(path == "recovery"))
+            self.assertEqual(stopped.exception.details["metadata"], metadata)
+            self.assertEqual(stopped.exception.details["execution_ref"], execution["artifact_ref"])
+            if path == "result":
+                self.assertEqual(stopped.exception.details["rate_limit"], response["rate_limit"])
+            self.assertEqual(runner.source_docs, {})
+
+    def test_full_text_rate_limit_stays_paused_at_run_boundary_with_or_without_retry_after(self):
+        for index, rate_limit in enumerate((None, {"retry_after_seconds": 60})):
+            runner = SurveyRunner(self.root / f"rate-boundary-{index}", survey_config(self.endpoint))
+            self.addCleanup(runner.control.close)
+            details = {"kind": "full_text_failure", "outcome": "rate_limited",
+                       "execution_ref": "artifact:command/executions/retained-rate@1",
+                       "metadata": {"http_status": 429, "rate_limit": rate_limit}}
+            error = ProviderRateLimitError("Full-text provider requires recovery", provider="full_text", details=details)
+            with patch.object(runner, "_setup", side_effect=error), \
+                 patch.object(runner, "_call", side_effect=AssertionError("rate limit must stop later dispatch")):
+                result = runner.run()
+            self.assertEqual(result["status"], "paused", result.get("error"))
+            self.assertEqual(result["failure"], {"kind": "provider_rate_limit", "provider": "full_text", "details": details})
+
+    def test_all_provider_readiness_http429_stops_before_fallback_or_later_probes(self):
+        for key in ("bibliography", "identity", "full_text"):
+            for index, retry_after in enumerate((None, 60)):
+                config = self.full_text_config("pass")
+                config["survey"]["identity"] = {
+                    "id": "identity", "adapter": "crossref", "client": {"endpoint": self.endpoint, "timeout": 4, "max_bytes": 1000000, "mailto": "catalog@example.org"},
+                    "representative": {"query": "readiness", "limit": 1}, "environment_files": []}
+                runner = SurveyRunner(self.root / f"ready-{key}-{index}", config)
+                self.addCleanup(runner.control.close)
+                runner._initialize()
+                metadata = {"rate_limit": {"status_code": 429, "retry_after_seconds": retry_after}}
+                execution = runner._record("command/executions/readiness-rate", "report", {
+                    "outcome": "provider_error", "metadata": metadata}, "operations.operator")
+                probe = runner._record("command/readiness-rate", "note", {
+                    "execution_ref": execution["artifact_ref"]}, "operations.verifier")
+                target = runner.score[key]["id"]
+                def readiness(capability_id, *args, **kwargs):
+                    return ({"state": "degraded", "reason": "HTTP429"} if capability_id == target
+                            else {"state": "ready", "binding": "fixture-ready"})
+                with patch.object(runner.operations, "ensure_ready", side_effect=readiness) as dispatch, \
+                     patch.object(runner.operations, "idle"), \
+                     patch.object(runner.operations, "status", return_value={"probe_ref": probe["artifact_ref"]}):
+                    with self.assertRaises(ProviderRateLimitError) as stopped:
+                        runner._setup()
+                self.assertEqual(dispatch.call_count, ("bibliography", "identity", "full_text").index(key) + 1)
+                self.assertEqual(stopped.exception.provider, {"bibliography": "openalex", "identity": "crossref", "full_text": "full_text"}[key])
+                self.assertEqual(stopped.exception.details["metadata"], metadata)
+                self.assertEqual(stopped.exception.details["execution_ref"], execution["artifact_ref"])
+                self.assertEqual(runner.bibliography_mode, "openalex")
+                self.assertIn(stopped.exception.details, runner.gaps)
+
+    def test_bibliographic_http429_stops_result_and_owned_exception_before_ingest(self):
+        for provider in ("openalex", "crossref"):
+            for path in ("result", "exception"):
+                for index, retry_after in enumerate((None, 60)):
+                    config = survey_config(self.endpoint)
+                    config["survey"]["identity"] = {
+                        "id": "identity", "adapter": "crossref", "client": {"endpoint": self.endpoint, "timeout": 4, "max_bytes": 1000000, "mailto": "catalog@example.org"},
+                        "representative": {"query": "readiness", "limit": 1}, "environment_files": []}
+                    runner = SurveyRunner(self.root / f"search-{provider}-{path}-{index}", config)
+                    self.addCleanup(runner.control.close)
+                    runner._initialize()
+                    runner.bindings = {"bibliography": "fixture-openalex", "identity": "fixture-crossref"}
+                    runner.bibliography_mode = provider
+                    metadata = {"rate_limit": {"status_code": 429, "retry_after_seconds": retry_after}}
+                    response = {"outcome": "provider_error", "error": "HTTP429", "works": [], "sources": [], "metadata": metadata}
+                    if path == "exception":
+                        metadata["rate_limit"].pop("status_code")
+                        response["status_code"] = 429
+                    execution = runner._record("command/executions/search-rate", "report", response, "operations.operator")
+                    failure = runner._record("command/search-rate", "note", {"execution_ref": execution["artifact_ref"]}, "operations.verifier")
+                    dispatch_args = ({"return_value": (response, execution["artifact_ref"])} if path == "result"
+                                     else {"side_effect": ValidationError("owned provider execution failed")})
+                    with patch.object(runner.operations, "run", **dispatch_args) as dispatch, \
+                         patch.object(runner.operations, "status", return_value={"failure_ref": failure["artifact_ref"]}), \
+                         patch.object(runner, "_activate_crossref_fallback", side_effect=AssertionError("no rate-limit fallback")), \
+                         patch.object(runner, "_ingest", side_effect=AssertionError("no rate-limit ingestion")):
+                        with self.assertRaises(ProviderRateLimitError) as stopped:
+                            runner._bibliographic_call("search", role="research.searcher", query="bounded query")
+                    self.assertEqual(dispatch.call_count, 1)
+                    self.assertEqual(stopped.exception.provider, provider)
+                    self.assertEqual(stopped.exception.details["metadata"], metadata)
+                    self.assertEqual(stopped.exception.details["execution_ref"], execution["artifact_ref"])
+                    self.assertIn(stopped.exception.details, runner.gaps)
+                    self.assertEqual(runner.query_refs, [])
+        runner = self.runtime()
+        runner._initialize()
+        runner._stop_provider_rate_limit({"outcome": "robots_denied", "metadata": {"status": 403}}, provider="full_text")
+        runner._stop_provider_rate_limit({"outcome": "robots_unavailable", "metadata": {"status_code": 406}}, provider="full_text")
+        with self.assertRaises(ProviderRateLimitError):
+            runner._stop_provider_rate_limit({"outcome": "rate_limited"}, provider="openalex")
+
+    def test_identity_workload_http429_does_not_become_an_optional_lookup_gap(self):
+        for path in ("result", "exception"):
+            for index, retry_after in enumerate((None, 60)):
+                runner = SurveyRunner(self.root / f"identity-{path}-{index}", survey_config(self.endpoint))
+                self.addCleanup(runner.control.close)
+                runner._initialize()
+                runner.score["identity"] = {"id": "fixture-identity"}
+                runner.bindings["identity"] = "fixture-identity-binding"
+                runner.works = {"W1": {"id": "W1", "doi": "10.1234/example"},
+                                "W2": {"id": "W2", "doi": "10.1234/second"}}
+                metadata = {"rate_limit": {"status_code": 429, "retry_after_seconds": retry_after}}
+                response = {"outcome": "provider_error", "error": "HTTP429", "metadata": metadata}
+                if path == "exception":
+                    metadata["rate_limit"].pop("status_code")
+                    response["status_code"] = 429
+                execution = runner._record("command/executions/identity-rate", "report", response, "operations.operator")
+                failure = runner._record("command/identity-rate", "note", {"execution_ref": execution["artifact_ref"]}, "operations.verifier")
+                dispatch_args = ({"return_value": (response, execution["artifact_ref"])} if path == "result"
+                                 else {"side_effect": ValidationError("owned identity execution failed")})
+                with patch.object(runner, "_analysis_selection", return_value={"W1", "W2"}), \
+                     patch.object(runner.operations, "run", **dispatch_args) as dispatch, \
+                     patch.object(runner.operations, "status", return_value={"failure_ref": failure["artifact_ref"]}):
+                    with self.assertRaises(ProviderRateLimitError) as stopped:
+                        runner._reconcile_identities()
+                self.assertEqual(dispatch.call_count, 1)
+                self.assertEqual(stopped.exception.provider, "crossref")
+                self.assertEqual(stopped.exception.details["metadata"], metadata)
+                self.assertEqual(stopped.exception.details["execution_ref"], execution["artifact_ref"])
+                self.assertEqual(stopped.exception.details["error"], "HTTP429")
+                self.assertIn("identity", runner.bindings)
+                self.assertEqual(runner.identity_records, {})
+
+    def test_owned_top_level_http429_survives_failure_projection_and_readiness(self):
+        for field in ("status", "status_code", "http_status", "provider_http_status"):
+            for index, retry_after in enumerate((None, 60)):
+                runner = SurveyRunner(self.root / f"top-status-{field}-{index}", survey_config(self.endpoint))
+                self.addCleanup(runner.control.close)
+                runner._initialize()
+                response = {"outcome": "provider_error", field: 429, "metadata": {},
+                            "rate_limit": {"retry_after_seconds": retry_after}}
+                execution = runner._record("command/executions/top-rate", "report", response, "operations.operator")
+                failure = runner._record("command/top-rate", "note", {"execution_ref": execution["artifact_ref"]}, "operations.verifier")
+                with patch.object(runner.operations, "ensure_ready", return_value={"state": "degraded", "reason": "provider failure"}) as dispatch, \
+                     patch.object(runner.operations, "status", return_value={"failure_ref": failure["artifact_ref"]}):
+                    with self.assertRaises(ProviderRateLimitError) as stopped:
+                        runner._setup()
+                self.assertEqual(dispatch.call_count, 1)
+                self.assertEqual(stopped.exception.details[field], 429)
+                self.assertEqual(stopped.exception.details["rate_limit"], response["rate_limit"])
+                self.assertEqual(stopped.exception.details["execution_ref"], execution["artifact_ref"])
+                self.assertEqual(runner.bibliography_mode, "openalex")
+
+    def test_legacy_owned_top_level_http429_is_recovered_as_terminal_rate_limit(self):
+        runner = self.runtime(self.full_text_config("pass"))
+        runner._initialize()
+        wid, url = "W401", "https://example.org/W401"
+        runner.works[wid] = {"id": wid}
+        work = runner._record(f"kb/works/{wid}", "reference_card", {"work_id": wid}, "research.cataloger")
+        runner.work_records[wid] = work
+        runner._record(f"command/source-attempts/full-text/{wid}-1", "note", {
+            "work_id": wid, "url": url, "source_kind": "auto", "status": "reserved"},
+            "command.controller", subjects=[work["artifact_ref"]])
+        capability = runner.score["full_text"]["id"]
+        context = runner._record(f"command/contexts/ops-work-{capability}-rate", "note", {
+            "url": url, "source_kind": "auto"}, "research.full-text-reader")
+        execution = runner._record(f"command/executions/ops-work-{capability}-rate", "report", {
+            "outcome": "provider_error", "status_code": 429, "metadata": {}, "source_url": url},
+            "research.full-text-reader", subjects=[context["artifact_ref"]])
+        runner._restore_source_access_failures()
+        self.assertEqual(len(runner.gaps), 1)
+        failure = runner.gaps[0]
+        self.assertEqual(failure["outcome"], "rate_limited")
+        self.assertEqual(failure["status_code"], 429)
+        self.assertEqual(failure["execution_ref"], execution["artifact_ref"])
+        with patch.object(runner.operations, "run", side_effect=AssertionError("no source retry")):
+            with self.assertRaises(ProviderRateLimitError):
+                runner._full_texts()
+
+    def test_legacy_reserved_access_failure_recovers_exact_owned_execution(self):
+        config = self.full_text_config("pass", source_url=f"http://127.0.0.1:{self.server.server_port}/denied.pdf")
+        runner = self.runtime(config)
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W401")
+        original = runner._record
+        def omit_terminal(logical_id, artifact_type, body, author, **kwargs):
+            if body.get("status") == "access_unavailable":
+                return runner.store.head(logical_id)
+            return original(logical_id, artifact_type, body, author, **kwargs)
+        with patch.object(runner, "_record", side_effect=omit_terminal):
+            runner._full_texts()
+        self.assertEqual(runner._body(runner.store.head("command/source-attempts/full-text/W401-1"))["status"], "reserved")
+        failure = deepcopy(runner.gaps[-1])
+        runner.gaps = []
+        runner._restore_source_access_failures()
+        self.assertEqual(runner.gaps, [failure])
+        runner._restore_source_access_failures()
+        self.assertEqual(runner.gaps, [failure])
+        self.assertEqual(runner._source_availability("W401")["evidence_scope"], "abstract")
+        runner.full_text_attempted.clear()
+        with patch.object(runner.operations, "run", side_effect=AssertionError("retained source attempt must not repeat")):
+            runner._full_texts()
+        execution = runner.store.get(failure["execution_ref"])
+        report = runner._body(execution)
+        capability_id = config["survey"]["full_text"]["id"]
+        original(f"command/executions/ops-work-{capability_id}-duplicate", "report", report,
+                 "research.full-text-reader", subjects=[execution["inputs"][0]["ref"]])
+        with self.assertRaisesRegex(ValidationError, "ambiguous terminal executions"):
+            runner._restore_source_access_failures()
+
+    def test_access_unavailability_never_fabricates_abstract_or_demotes_verified_full_text(self):
+        runner = self.runtime()
+        for outcome in ("access_denied", "auth_required", "robots_denied", "robots_unavailable"):
+            runner.gaps = [{"kind": "full_text_failure", "work_id": "W1", "outcome": outcome,
+                            "source_url": "https://example.org/paper", "execution_ref": "execution"}]
+            runner.source_docs = {"bad": {"work_id": "W1", "representation": "unverified_text", "text": "Body"}}
+            self.assertEqual(runner._source_availability("W1")["evidence_scope"], "unavailable")
+            self.assertEqual(runner._assessment_source_context(), [])
+            runner.source_docs["abstract"] = {"work_id": "W1", "representation": "abstract", "text": "Captured abstract."}
+            self.assertEqual(runner._source_availability("W1")["evidence_scope"], "abstract")
+            runner.source_docs["full"] = {"work_id": "W1", "representation": "full_text", "text": "Methods\nBody",
+                                          "identity_verified": True,
+                                          "identity_checks": {"title_match": True, "section_markers": ["Methods"]}}
+            availability = runner._source_availability("W1")
+            self.assertEqual(availability["evidence_scope"], "full_text")
+            self.assertEqual(availability["full_text_access"], "available")
+            self.assertEqual(availability["verified_full_text_refs"], ["full"])
+            self.assertEqual(availability["full_text_failures"][0]["outcome"], outcome)
+
     def test_robots_denial_does_not_fall_through_to_openalex_pdf(self):
         primary_url = f"http://127.0.0.1:{self.server.server_port}/paper.pdf"
         fallback_url = f"http://127.0.0.1:{self.server.server_port}/fallback.pdf"
@@ -1913,7 +2903,7 @@ class TestSurveyRunner(unittest.TestCase):
         failures = [gap for gap in result["coverage"]["access_and_limit_gaps"] if gap["kind"] == "full_text_failure"]
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0]["work_id"], "W401")
-        self.assertEqual(result["usage"]["cumulative_usage"]["retrieval_calls"], 10)
+        self.assertEqual(result["usage"]["cumulative_usage"]["retrieval_calls"], 9)
         capability = result["capabilities"]["full-text"]
         self.assertEqual(capability["state"], "idle")
         control, store = self.open_store()
@@ -1930,7 +2920,8 @@ class TestSurveyRunner(unittest.TestCase):
         config["survey"]["search"]["max_api_calls"] = 30
         config["survey"]["identity"] = {
             "id": "identity", "adapter": "crossref",
-            "client": {"endpoint": self.endpoint, "timeout": 4, "max_bytes": 1000000},
+            "client": {"endpoint": self.endpoint, "timeout": 4, "max_bytes": 1000000,
+                       "mailto": "catalog@example.org"},
             "representative": {"query": "10.1234/W101", "limit": 1},
             "environment_files": []}
         result = self.runtime(config).run()
@@ -1939,6 +2930,7 @@ class TestSurveyRunner(unittest.TestCase):
         survey = json.loads(store.read_body(store.get(result["survey_ref"])["body_hash"]))
         self.assertEqual(survey["schema_version"], "literature-survey-3")
         self.assertTrue(survey["identity_refs"])
+        SurveyGate(control, store)._bibliographic_identities(survey)
         for ref in survey["identity_refs"]:
             identity = json.loads(store.read_body(store.get(ref)["body_hash"]))
             self.assertEqual(identity["status"], "verified")
@@ -1996,11 +2988,14 @@ class TestSurveyRunner(unittest.TestCase):
             "kind": "bibliographic_identity_conflicted", "work_id": "W1",
             "identity_ref": old_record["artifact_ref"],
         }]
-        params = {"query": "10.1234/example", "limit": 3}
+        params = {"query": "10.1234/example", "limit": 3,
+                  "client": {"endpoint": self.endpoint, "mailto": "catalog@example.org"}}
 
         class ValidCrossrefAdapter:
             @staticmethod
-            def inspect_result(_profile, _result, _params, representative=False):
+            def inspect_result(profile, _result, _params, representative=False):
+                if profile.get("client") != params["client"]:
+                    raise AssertionError("Identity replay lost its pinned client configuration")
                 return ([{"outcome": "passed"}], {})
 
         with patch.object(runner, "_analysis_selection", return_value={"W1"}), \
@@ -2208,6 +3203,7 @@ class TestSurveyRunner(unittest.TestCase):
                               "coverage": {}, "sources": [], "required_checks": [],
                               "allowed_check_outcomes": []},
                "validator": lambda value: None}
+        job["assignment"] = runner._follow_up_assignment(job["assignment"])
         model = {**runner.config["model"]}
         cache = ModelWorkCache(runner.store, runner._publish)
         key = cache.key(scope="survey:gap-assessment", role=job["actor"], system=SYSTEM,
@@ -2233,22 +3229,51 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(result["gap-assessment"][0]["ok"], True)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["_contract_repair_boundary"], "model-contract-repair-7")
+        self.assertEqual(calls[0]["source_evidence_policy"], job["assignment"]["source_evidence_policy"])
 
-    def test_rate_limit_pauses_partial_survey_and_resume_continues_after_cooldown(self):
+    def test_legacy_assignment_without_source_policy_does_not_alias_current_review_cache(self):
+        runner = self.runtime()
+        runner._initialize()
+        runner._complete = lambda task_id: None
+        runner.resume_session = {"session": 7}
+        job = {"name": "gap-assessment", "actor": "methods.novelty-verifier",
+               "assignment": {"phase": "gap_assessment", "sources": []},
+               "validator": lambda value: None}
+        cache = ModelWorkCache(runner.store, runner._publish)
+        legacy_key = cache.key(scope="survey:gap-assessment", role=job["actor"], system=SYSTEM,
+                               prompt=job["assignment"], model=runner.config["model"])
+        cache.put(legacy_key, {"status": "blocked", "failure_class": "model_contract",
+                              "error": "Old source-policy assignment failed its contract."})
+        calls = []
+        def fake_call(specs, **kwargs):
+            calls.append(json.loads(specs[0]["params"]["prompt"]))
+            execution = runner._publish("command/executions/current-source-policy", "report", {}, job["actor"])
+            return {specs[0]["task_id"]: {"ok": True, "record_ref": execution["artifact_ref"],
+                    "result": {"text": '{"ok": true}', "model": "fixture", "usage": {"model_calls": 1},
+                               "elapsed_seconds": 0.01, "finish_reason": "stop"}}}
+        with patch.object(runner, "_call_batch", side_effect=fake_call):
+            runner._models_checked([job])
+            runner._models_checked([job])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("source_evidence_policy", calls[0])
+        self.assertNotIn("_contract_repair_boundary", calls[0])
+        self.assertEqual(cache.get(legacy_key)["status"], "blocked")
+
+    def test_rate_limit_pauses_partial_survey_and_explicit_resume_retains_prior_search(self):
         config = survey_config(self.endpoint)
         config["survey"]["seed_queries"] = ["recall timing", "rate limited topic"]
         config["survey"]["search"]["expansion_rounds"] = 0
-        # A provider-declared cooldown is a pause, not a malformed workload
-        # result. Resume only after the stated interval and retain the first
-        # successful query rather than replaying it.
+        # Explicit recovery preserves the successful query and the failed
+        # physical request; neither is an empty search or a repair attempt.
         config["survey"]["bibliography"]["client"]["max_retries"] = 0
         SurveyHTTPFixture.rate_limit_once = "rate limited topic"
         first = self.runtime(config).run()
         self.assertEqual(first["status"], "paused")
-        self.assertEqual(first["failure"]["kind"], "provider_cooldown")
+        self.assertEqual(first["failure"]["kind"], "provider_rate_limit")
         self.assertEqual(first["coverage"]["unique_works"], 1)
-        self.assertIn("OpenAlex survey retrieval is paused", first["error"])
-        self.assertTrue(first["failure"]["retry_after_seconds"] > 0)
+        self.assertIn("provider recovery", first["error"])
+        self.assertEqual(first["failure"]["provider"], "openalex")
+        self.assertEqual(first["failure"]["details"]["metadata"]["http_status"], 429)
         first_searches = [request["query"].get("search", [None])[0]
                           for request in SurveyHTTPFixture.requests
                           if request["path"] == "/works"]
@@ -2260,7 +3285,6 @@ class TestSurveyRunner(unittest.TestCase):
             "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
             "source_changes": {"mode": "reject", "reopen_scopes": []},
         }
-        time.sleep(first["failure"]["retry_after_seconds"] + 0.05)
         completed = self.runtime(config, resume_policy=policy).run()
         self.assertEqual(completed["status"], "completed", completed)
         successful = [row["request"]["query"] for row in completed["coverage"]["searches"]
@@ -2335,6 +3359,72 @@ class TestSurveyRunner(unittest.TestCase):
 
 
 class TestSurveyContracts(unittest.TestCase):
+    def test_follow_up_search_shares_only_exact_successful_current_discovery(self):
+        runner = object.__new__(SurveyRunner)
+        runner.bounds = {"results_per_query": 50}
+        runner.bibliography_mode = "openalex"
+        runner.work_orders = [{"id": "current"}]
+        runner.follow_up_ref = "follow-up-current"
+        plans = {"first": {"follow_up_ref": "follow-up-current"},
+                 "second": {"follow_up_ref": "follow-up-current"},
+                 "superseded": {"follow_up_ref": "follow-up-current"},
+                 "old": {"follow_up_ref": "follow-up-old"}}
+        runner.store = type("Store", (), {
+            "get": lambda _self, ref: {**plans[ref], "artifact_id": ref},
+            "head": lambda _self, logical: {"artifact_ref": "replacement" if logical == "superseded" else logical},
+        })()
+        runner._body = lambda value: value
+        request = {"operation": "search", "query": "exact query", "cursor": None, "limit": 50}
+        row = {"request": request, "plan_ref": "first", "role": "research.search-planner",
+               "provider": "openalex", "outcome": "ok"}
+        runner.search_log = [row]
+        with patch.object(runner, "_bibliographic_call") as call:
+            runner._search(["exact query"], "methods.blind-search-planner", "second")
+        call.assert_not_called()
+        self.assertEqual(runner.search_log, [row])
+        for replacement, kwargs in (
+                ({"plan_ref": "old"}, {}), ({"plan_ref": "superseded"}, {}), ({"outcome": "timeout"}, {}),
+                ({"provider": "crossref"}, {}), ({"request": {**request, "cursor": "next"}}, {}),
+                ({"request": {**request, "limit": 20}}, {}), ({}, {"admission": "challenge"})):
+            with self.subTest(replacement=replacement, kwargs=kwargs):
+                runner.search_log = [{**row, **replacement}]
+                with patch.object(runner, "_bibliographic_call") as call:
+                    runner._search(["exact query"], "methods.blind-search-planner", "second", **kwargs)
+                self.assertEqual(call.call_count, 1)
+
+    def test_query_identity_preserves_provider_syntax_and_deduplicates_current_run(self):
+        from scisaurus.runtime.survey import query_identity
+        self.assertNotEqual(query_identity('"long range order"'), query_identity('long range order'))
+        self.assertNotEqual(query_identity('C++ simulation'), query_identity('C simulation'))
+        runner = object.__new__(SurveyRunner)
+        runner.search_log = []
+        runner.resume_session = None
+        runner.work_orders = []
+        runner.bounds = {"results_per_query": 50}
+        runner.bibliography_mode = "openalex"
+        def record(operation, *, role, query, **kwargs):
+            runner.search_log.append({"request": {"operation": operation, "query": query, "limit": 50},
+                                      "outcome": "ok"})
+        with patch.object(runner, "_bibliographic_call", side_effect=record) as call:
+            runner._search(['"long range order"', 'long range order'], 'planner-a')
+            runner._search(['"long range order"'], 'planner-b')
+        self.assertEqual(call.call_count, 2)
+
+    def test_cursor_coverage_tracks_unconsumed_successful_pages(self):
+        from scisaurus.runtime.survey import acquisition_succeeded
+        runner = object.__new__(SurveyRunner)
+        first = {"request": {"operation": "search", "query": "critical phenomena", "cursor": None},
+                 "outcome": "ok", "has_more": True, "next_cursor": "page-2"}
+        runner.search_log = [first]
+        self.assertEqual(len(runner._pending_bibliographic_pages()), 1)
+        runner.search_log.append({"request": {**first["request"], "cursor": "page-2"},
+                                  "outcome": "timeout", "has_more": False, "next_cursor": None})
+        self.assertEqual(len(runner._pending_bibliographic_pages()), 1)
+        self.assertFalse(acquisition_succeeded(runner.search_log[-1]))
+        runner.search_log.append({"request": {**first["request"], "cursor": "page-2"},
+                                  "outcome": "ok", "has_more": False, "next_cursor": None})
+        self.assertEqual(runner._pending_bibliographic_pages(), [])
+
     def test_resume_overlays_only_validated_relationship_versions_after_map_checkpoint(self):
         old = {"source": "W101", "target": "W102", "kind": "related",
                "claim": {"text": "old", "evidence": []}, "artifact_ref": "artifact:kb/r@1"}
@@ -2434,8 +3524,8 @@ class TestSurveyContracts(unittest.TestCase):
     def test_conceptual_connection_requires_both_works(self):
         entry = {"work_id": "W101", "inclusion": "included", "reason": "The source examines recall timing.",
                  **{field: {"text": None, "evidence": []} for field in MAP_FIELDS}}
-        sources = {"source-one": {"work_id": "W101", "text": "Recall timing is examined."},
-                   "source-two": {"work_id": "W102", "text": "Recall timing is examined."}}
+        sources = {"source-one": {"work_id": "W101", "representation": "abstract", "text": "Recall timing is examined."},
+                   "source-two": {"work_id": "W102", "representation": "abstract", "text": "Recall timing is examined."}}
         claim = {"text": "Both works examine recall timing.", "evidence": [
             {"work_id": "W101", "source_ref": "source-one", "quote": "Recall timing is examined."}]}
         value = {"entries": [entry], "relationships": [{"source": "W101", "target": "W102", "kind": "compares", "claim": claim}]}
@@ -2448,9 +3538,9 @@ class TestSurveyContracts(unittest.TestCase):
         source_one = "The measured period increased by ten percent."
         source_two = "The basal control differed across the sample."
         displayed = [
-            {"source_ref": "source-one", "work_id": "W101", "text": source_one,
+            {"source_ref": "source-one", "work_id": "W101", "representation": "abstract", "text": source_one,
              "window": {"start": 0, "end": len(source_one)}},
-            {"source_ref": "source-two", "work_id": "W102", "text": source_two,
+            {"source_ref": "source-two", "work_id": "W102", "representation": "abstract", "text": source_two,
              "window": {"start": 0, "end": len(source_two)}},
         ]
         value = {
@@ -2503,9 +3593,9 @@ class TestSurveyContracts(unittest.TestCase):
         source_one = "The measured period increased by ten percent."
         source_two = "The basal control differed across the sample."
         displayed = [
-            {"source_ref": "source-one", "work_id": "W101", "text": source_one,
+            {"source_ref": "source-one", "work_id": "W101", "representation": "abstract", "text": source_one,
              "window": {"start": 0, "end": len(source_one)}},
-            {"source_ref": "source-two", "work_id": "W102", "text": source_two,
+            {"source_ref": "source-two", "work_id": "W102", "representation": "abstract", "text": source_two,
              "window": {"start": 0, "end": len(source_two)}},
         ]
         previous = {"work_id": "W101", "inclusion": "included", "reason": "Prior screening.",
@@ -2554,8 +3644,8 @@ class TestSurveyContracts(unittest.TestCase):
     def test_flat_relationship_statement_is_canonicalized_without_dropping_evidence(self):
         entry = {"work_id": "W101", "inclusion": "included", "reason": "The source examines recall timing.",
                  **{field: {"text": None, "evidence": []} for field in MAP_FIELDS}}
-        sources = {"source-one": {"work_id": "W101", "text": "Recall timing is examined."},
-                   "source-two": {"work_id": "W102", "text": "Recall timing is examined."}}
+        sources = {"source-one": {"work_id": "W101", "representation": "abstract", "text": "Recall timing is examined."},
+                   "source-two": {"work_id": "W102", "representation": "abstract", "text": "Recall timing is examined."}}
         evidence = [
             {"work_id": "W101", "source_ref": "source-one", "quote": "Recall timing is examined."},
             {"work_id": "W102", "source_ref": "source-two", "quote": "Recall timing is examined."},

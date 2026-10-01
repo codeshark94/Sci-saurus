@@ -22,6 +22,7 @@ from scisaurus.runtime.models import (
     ModelClient, complete_with_role_fallbacks, normalize_generated_string_list,
 )
 from scisaurus.runtime.scientific_surface import find_control_leaks
+from scisaurus.runtime.evidence import evidence_ids_from_packet
 
 
 SCHEMA_VERSION = "research-argument-1"
@@ -285,39 +286,6 @@ def validate_argument_review(value, *, argument=None):
     return value
 
 
-def evidence_ids_from_packet(packet):
-    """Return stable evidence IDs without inventing a claim source."""
-    if not isinstance(packet, dict):
-        raise ValidationError("argument evidence packet must be an object")
-    ids = set(packet.get("evidence_ids", [])) if isinstance(packet.get("evidence_ids", []), list) else set()
-    results = packet.get("results_package") or packet.get("results") or {}
-    if isinstance(results, dict):
-        for key in ("procedures", "metrics", "findings"):
-            for item in results.get(key, []):
-                if isinstance(item, dict) and isinstance(item.get("id"), str):
-                    ids.add(item["id"])
-        for index, _ in enumerate(results.get("limitations", [])):
-            ids.add(f"limitation-{index}")
-    interpretation = _interpretation_record(packet.get("scientific_interpretation"))
-    if interpretation:
-        for pattern in interpretation.get("result_patterns", []):
-            for key in ("supporting_evidence", "contradicting_evidence"):
-                ids.update(item for item in pattern.get(key, []) if isinstance(item, str))
-        for explanation in interpretation.get("competing_explanations", []):
-            for key in ("supporting_evidence", "counterevidence"):
-                ids.update(item for item in explanation.get(key, []) if isinstance(item, str))
-    for key in ("literature_evidence", "evidence", "reference_cards"):
-        values = packet.get(key, [])
-        if isinstance(values, dict):
-            values = list(values.values())
-        for item in values:
-            if isinstance(item, dict):
-                for candidate in (item.get("id"), item.get("evidence_id"), item.get("work_id")):
-                    if isinstance(candidate, str) and candidate:
-                        ids.add(candidate)
-    return sorted(ids)
-
-
 def _interpretation_record(value):
     """Unwrap the stage-output envelope used by persisted interpretation artifacts."""
     if not isinstance(value, dict):
@@ -339,6 +307,8 @@ def argument_evidence_packet(packet):
             packet.get("scientific_interpretation")),
         "literature_evidence": packet.get("literature_evidence", []),
         "reference_cards": packet.get("reference_cards", []),
+        "survey_assessment": packet.get("survey_assessment", {}),
+        "survey_lineage": packet.get("survey_lineage", {}),
         "evidence_ids": evidence_ids_from_packet(packet),
         "asset_ids": [asset.get("id") for asset in result.get("assets", [])
                       if isinstance(asset, dict) and isinstance(asset.get("id"), str)],

@@ -1,4 +1,5 @@
 import json
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 import time
@@ -135,6 +136,178 @@ class _ProviderFallbackHandler(BaseHTTPRequestHandler):
 
 
 class SpecialistDispatcherTests(unittest.TestCase):
+    def test_repair_evidence_preserves_complete_scope_and_rejects_unbound_sources(self):
+        from scisaurus.runtime.specialists import REPAIR_EVIDENCE_SYSTEM, build_repair_evidence_prompt
+        source = "def execute():\n    return 1\n" * 300
+        packet = {"topic": {"id": "topic", "research_question": "Does C change eta?"},
+                  "prior_foundry_work": {"last_attempt": {"experiment_intent": {"primary_outcomes": ["eta"]}}},
+                  "exact_candidate_sources": {"executor": {"available": True, "source_chunks": [source],
+                      "prompt_source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                      "prompt_source_characters": len(source)}}}
+        request = {"requested_actions": ["Derive and delimit the source-bound claim. " * 100],
+                   "source_ref_catalog": ["candidate_program.executor"]}
+        assignment = {"assigned_role": "methods.methodologist", "model_role": "methods.methodologist",
+                      "role_id": "methodologist", "task_id": "evidence-task", "stage_id": "evidence",
+                      "_response_contract": "repair_evidence", "execution_kind": "review",
+                      "quota": {"max_input_tokens": 24000, "max_output_tokens": 2000,
+                                "max_calls": 1, "max_seconds": 10}}
+        prompt = build_repair_evidence_prompt(assignment, packet, request)
+        payload = json.loads(prompt)
+        self.assertEqual(payload["repair_evidence_request"], request)
+        self.assertEqual("".join(payload["candidate_program"]["exact_execution_sources"]["executor"]["source_chunks"]), source)
+        with self.assertRaisesRegex(ValidationError, "cannot preserve"):
+            build_repair_evidence_prompt({**assignment, "quota": {"max_input_tokens": 1000}}, packet, request)
+        model = {"protocol": "openai_compatible", "base_url": "http://fake/v1", "model": "fake",
+                 "max_input_tokens": 24000, "max_output_tokens": 512, "timeout_seconds": 5}
+        for bad_source in (False, True):
+            note = {"title": "Analytic note", "content": "Exact complete derivation. " * 100,
+                    "source_refs": ["forged-source" if bad_source else "candidate_program.executor"], "limitations": [],
+                    "action_disposition": "fulfilled"}
+            response = {"decision": "pass", "summary": "Produced.", "findings": [], "evidence_gaps": [],
+                        "requested_actions": [], "evidence_note": note}
+            with patch("scisaurus.runtime.specialists.ModelClient") as client:
+                client.return_value.complete.return_value = ModelResult(json.dumps(response), "fake",
+                    {"model_calls": 1}, 0, "stop")
+                report = SpecialistDispatcher(model, max_parallel=1).dispatch([{**assignment, "_prompt": prompt}], {})[0]
+                self.assertEqual(client.return_value.complete.call_args.kwargs["system"], REPAIR_EVIDENCE_SYSTEM)
+            self.assertEqual(report["status"], "failed" if bad_source else "succeeded")
+            self.assertEqual(report["usage"]["model_calls"], 1)
+            if not bad_source:
+                self.assertEqual(report["response"]["evidence_note"], note)
+
+    def test_all_progress_events_preserve_admitted_assignment_identity(self):
+        model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+                 "model": "fixture", "timeout_seconds": 5.0, "max_output_tokens": 512}
+        assignment = {"assigned_role": "methods.analysis-reviewer", "role_id": "analysis-reviewer",
+                      "model_role": "methods.analysis-reviewer", "execution_kind": "review",
+                      "task_id": "scoped-review", "stage_id": "repair", "attempt_number": 7,
+                      "quota": {"max_calls": 2, "max_input_tokens": 10000,
+                                "max_output_tokens": 1024, "max_seconds": 5}, "_prompt": "{}"}
+        events = []
+        with patch("scisaurus.runtime.specialists.ModelClient") as client:
+            client.return_value.complete.side_effect = [
+                ModelResult("Narration.", "fixture", {"model_calls": 1}, .01, "length"),
+                ModelResult('{"decision":"repair","summary":"source defect"}', "fixture",
+                            {"model_calls": 1}, .01, "stop"),
+            ]
+            report = SpecialistDispatcher(model, max_parallel=1,
+                deadline=time.monotonic() + 10, on_progress=events.append).dispatch([assignment], {})[0]
+        self.assertEqual(report["status"], "succeeded")
+        self.assertEqual([item["event"] for item in events],
+                         ["dispatched", "retrying", "dispatched", "completed"])
+        for event in events:
+            self.assertEqual(event["task_id"], assignment["task_id"])
+            self.assertEqual(event["stage_id"], assignment["stage_id"])
+            self.assertEqual(event["role"], assignment["assigned_role"])
+            self.assertEqual(event["assignment_attempt_number"], 7)
+
+    def test_json_continuation_classifies_incomplete_tokens_and_invalid_prefixes(self):
+        from scisaurus.runtime.models import json_object_continuation_error
+        for prefix in ('{"a":', '{"a":tr', '{"a":-', '{"a":1.', '{"a":1e',
+                       '{"a":1.2e+', '{"a":"unterminated', '{"a":"\\u12'):
+            with self.subTest(prefix=prefix):
+                self.assertIsNone(json_object_continuation_error(prefix))
+        for prefix in ('{not JSON', '{"a":truX', '{"a":1,]', '{"a":1.e',
+                       '{"a":"\\uZZ', '{"a":false nope', '{"a":t\n', '{"a":1e ',
+                       '{"a":"x\n', '{"a":"x\t', '```json\n{"a":t\n',
+                       '```json\n{"a":"x\n', '{"a":NaN', '{"a":Infinity',
+                       '{"a":-Infinity', '{"a":1e999'):
+            with self.subTest(prefix=prefix):
+                self.assertIn("invalid JSON object prefix", json_object_continuation_error(prefix))
+
+    def test_verifier_records_each_actual_repair_input(self):
+        from copy import deepcopy
+        import hashlib
+        captured = []
+        replies = ['{"decision":"hold"', json.dumps({"decision": "accept", "rationale": "Checked.",
+                   "critical_findings": [], "repair_scope": []})]
+        def complete(_client, **kwargs):
+            captured.append(deepcopy(kwargs))
+            return ModelResult(text=replies[len(captured)-1], model="fake", usage={"model_calls": 1,
+                               "input_tokens": 10, "output_tokens": 20}, elapsed_seconds=0, finish_reason="stop")
+        dispatcher = SpecialistDispatcher({"protocol": "ollama", "base_url": "http://127.0.0.1:11434",
+                                           "model": "fake", "timeout_seconds": 1, "max_output_tokens": 512})
+        assignment = {"assigned_role": "review.arbiter", "role_id": "adversary", "model_role": "review.arbiter",
+                      "execution_kind": "model", "_prompt": '{"stage":"survey"}',
+                      "quota": {"max_calls": 2, "max_input_tokens": 10000, "max_output_tokens": 1024}}
+        with patch("scisaurus.runtime.specialists.ModelClient.complete", complete):
+            result = dispatcher.dispatch([assignment], {}, verifier=True)[0]
+        self.assertEqual(result["status"], "succeeded", result)
+        self.assertEqual([item["input"] for item in result["request_inputs"]], captured)
+        self.assertNotEqual(captured[0]["prompt"], captured[1]["prompt"])
+        for item in result["request_inputs"]:
+            encoded = json.dumps(item["input"], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+            self.assertEqual(item["input_sha256"], hashlib.sha256(encoded).hexdigest())
+            self.assertEqual(item["request_attempts"], 1)
+
+    def test_verifier_preflight_error_preserves_original_context_failure_without_dispatch(self):
+        dispatcher = SpecialistDispatcher({"protocol": "ollama", "base_url": "http://127.0.0.1:11434",
+                                           "model": "fake", "timeout_seconds": 1, "max_output_tokens": 512})
+        assignment = {"assigned_role": "review.arbiter", "role_id": "adversary", "model_role": "review.arbiter",
+                      "execution_kind": "model", "_prompt": '{}',
+                      "quota": {"max_calls": 2, "max_input_tokens": 100, "max_output_tokens": 1024}}
+        with patch("scisaurus.runtime.specialists.ModelClient.complete") as complete:
+            result = dispatcher.dispatch([assignment], {}, verifier=True)[0]
+        complete.assert_not_called()
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("context budget", result["error"])
+        self.assertNotIn("UnboundLocalError", result["error"])
+        self.assertEqual(result["usage"], {})
+        self.assertEqual(result["request_inputs"], [])
+
+    def test_survey_verifier_keeps_current_searches_counts_and_exact_disposition_spans(self):
+        from scisaurus.core.source_spans import bind
+        source = {"work_id": "W1", "text": "Captured primary evidence. " * 90}
+        proof = bind({"work_id": "W1", "source_ref": "artifact:source@1", "quote": source["text"]},
+                     {"artifact:source@1": source})
+        searches = [{"role": "research.novelty-challenger", "execution_ref": f"artifact:search-{i}@1",
+                     "request": {"operation": "search", "query": f"counterquery {i}"}, "outcome": "ok"}
+                    for i in range(12)]
+        availability = {"work_id": "W1", "evidence_scope": "abstract",
+                        "full_text_access": "unavailable", "abstract_refs": ["artifact:source@1"],
+                        "verified_full_text_refs": [], "full_text_failures": [{
+                            "outcome": "access_denied", "source_url": "https://example.org/paper.pdf",
+                            "execution_ref": "artifact:fetch@1"}]}
+        coverage = {**{f"counter_{i}": i for i in range(15)}, "unique_works": 170,
+                    "verified_full_texts": 4, "searches": searches,
+                    "source_evidence_policy": "Use captured abstracts within their quoted scope.",
+                    "source_availability": [availability],
+                    "source_windows": [{"source_ref": "artifact:source@1", "work_id": "W1",
+                                        "source_availability": availability,
+                                        "window": {"start": 0, "end": len(source["text"])}}]}
+        chief = {"status": "completed", "survey_ref": "artifact:survey@3", "assessment_ref": "artifact:assessment@1",
+                 "gap_state": "insufficient_evidence", "coverage": coverage,
+                 "revalidation": {"ref": "artifact:revalidation@1", "body_sha256": "a" * 64},
+                 "follow_up_result": {"ref": "artifact:disposition@1", "orders": [{"id": "one", "status": "limited",
+                    "rationale": "Coverage remains bounded.", "evidence": [proof], "query_refs": ["artifact:query@1"],
+                    "limitation": "No independent measurement.", "next_action": "Test an exploratory model."}]}}
+        from scisaurus.runtime.specialists import _verifier_chief_result
+        for detail in ("full", "compact", "minimal", "focused"):
+            with self.subTest(detail=detail):
+                projected = _verifier_chief_result(chief, detail=detail)
+                self.assertEqual(projected["coverage"]["unique_works"], 170)
+                self.assertEqual(projected["coverage"]["verified_full_texts"], 4)
+                self.assertEqual(projected["survey_evidence"]["searches"], searches)
+                self.assertEqual(projected["survey_evidence"]["follow_up_result"], chief["follow_up_result"])
+                self.assertEqual(projected["survey_evidence"]["revalidation"], chief["revalidation"])
+                self.assertEqual(projected["survey_evidence"]["source_evidence_policy"],
+                                 coverage["source_evidence_policy"])
+                self.assertEqual(projected["survey_evidence"]["source_availability"], [availability])
+                self.assertEqual(projected["survey_evidence"]["source_windows"][0]["source_availability"],
+                                 availability)
+        with self.assertRaisesRegex(ValidationError, "input quota"):
+            build_verifier_prompt({"id": "survey", "kind": "survey"}, {}, [], chief, max_input_tokens=100)
+
+    def test_verifier_report_exposes_declared_input_scope_without_replacing_current_counts(self):
+        report = {"role_id": "search-strategist", "assigned_role": "research.search-strategist", "status": "succeeded",
+                  "input_scope": {"declared_fields": ["objective", "topic", "known_gaps", "source_classes"],
+                                  "assignment_phase": "specialist"},
+                  "response": {"decision": "hold", "summary": "Historical inventory has 6 full texts and 120 works."}}
+        chief = {"survey_ref": "artifact:survey@3", "coverage": {"unique_works": 170, "verified_full_texts": 4}}
+        value = json.loads(build_verifier_prompt({"id": "survey", "kind": "survey"}, {}, [report], chief))
+        self.assertEqual(value["specialist_reports"][0]["input_scope"], report["input_scope"])
+        self.assertEqual(value["chief_result"]["coverage"], chief["coverage"])
+
     def setUp(self):
         clear_model_provider_cooldown({
             "protocol": "openai_compatible",
@@ -428,7 +601,7 @@ class SpecialistDispatcherTests(unittest.TestCase):
                 "target": "estimand", "instruction": "Use a signed slope difference.",
                 "scientific_basis": "The null must be reachable.", "source_refs": [],
             }],
-            "acceptance_checks": ["Equal slopes produce an interval containing zero."],
+            "acceptance_checks": [{"phase": "execution", "check": "Equal slopes produce an interval containing zero."}],
         }
         result = ModelResult(
             json.dumps({
@@ -839,14 +1012,15 @@ class SpecialistDispatcherTests(unittest.TestCase):
 
     def test_pre_execution_repair_verifier_reviews_the_plan_not_missing_results(self):
         plan = {
-            "schema_version": "experiment-repair-adjudication-1",
+            "schema_version": "experiment-repair-adjudication-2",
             "topic_id": "direction_3",
             "failure_lineage": {"stage_id": "experiment", "attempt_number": 4},
             "disposition": "repair",
             "root_cause": {"statement": "The intervention cancels.",
                             "evidence": ["The output is constant."]},
             "required_changes": [{"target": "executor", "instruction": "Change the state update."}],
-            "acceptance_checks": ["Recalculate independently."],
+            "acceptance_checks": [{"phase": "plan", "check": "Identify the declared primary estimand."},
+                                  {"phase": "execution", "check": "Recalculate independently."}],
         }
         prompt = build_verifier_prompt(
             {"id": "experiment-repair-panel", "kind": "experiment"},
@@ -865,6 +1039,98 @@ class SpecialistDispatcherTests(unittest.TestCase):
         self.assertEqual(payload["verifier_contract"]["acceptance_target"],
                          "the scoped methods repair plan before source authoring or execution")
         self.assertIn("Do not hold solely", payload["verifier_contract"]["repair_panel_rule"])
+        from scisaurus.runtime.specialists import SCIENTIFIC_REPAIR_ACCEPTANCE_RULE, REPAIR_CHECK_PHASE_RULE
+        self.assertEqual(payload["chief_result"]["repair_adjudication"], plan)
+        self.assertIn(REPAIR_CHECK_PHASE_RULE, payload["verifier_contract"]["repair_panel_rule"])
+        self.assertNotIn("must be checked before execution", payload["verifier_contract"]["repair_panel_rule"])
+        self.assertIn("during or after execution", payload["verifier_contract"]["repair_panel_rule"])
+        self.assertIn("estimand ambiguous", payload["verifier_contract"]["repair_panel_rule"])
+        self.assertIn(SCIENTIFIC_REPAIR_ACCEPTANCE_RULE,
+                      payload["verifier_contract"]["repair_panel_rule"])
+        self.assertIn(SCIENTIFIC_REPAIR_ACCEPTANCE_RULE, REPAIR_ADJUDICATION_SYSTEM)
+
+    def test_repair_verifier_retains_the_leads_source_evidence_at_every_detail(self):
+        from scisaurus.runtime.specialists import (
+            _verifier_repair_packet, build_repair_adjudication_prompt,
+        )
+        sources = {
+            "executor": "def measure(state):\n    denominator = state['normalizer']\n    return None if denominator == 0 else state['work'] / denominator\n",
+            "validator": "def recalculate(rows):\n    return [row['work'] / row['normalizer'] if row['normalizer'] != 0 else None for row in rows]\n",
+        }
+        packet = {"program_snapshot": [], "exact_candidate_sources": {},
+                  "failure_lineage": {"stage_id": "experiment", "attempt_number": 18},
+                  "repair_subject_lineage": {"stage_id": "experiment", "attempt_number": 14},
+                  "plan_review_failure": {"error": "plan rejected"},
+                  "prior_foundry_work": {"validation_context": {
+                      "observation_count": 70, "numeric_observation_fields": {
+                          "W": {"finite_count": 70, "max": 0.0}}},
+                      "last_attempt": {"experiment_intent": {
+                      "question": "Does the intervention change extraction efficiency?",
+                      "primary_outcomes": ["correlation"]}}}}
+        for name, source in sources.items():
+            packet["exact_candidate_sources"][name] = {
+                "available": True, "source_chunks": [source[:35], source[35:]],
+                "prompt_source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                "prompt_source_characters": len(source),
+                "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                "source_characters": len(source), "redaction_applied": False,
+            }
+        lead = json.loads(build_repair_adjudication_prompt(
+            {"quota": {"max_input_tokens": 24000}}, packet, []))
+        self.assertNotIn("topic_id", lead["decision_contract"]["output_schema"]["repair_plan"])
+        expected = lead["repair_adjudication_packet"]["candidate_program"]
+        self.assertEqual(lead["repair_adjudication_packet"]["validation_context"]["observation_count"], 70)
+        self.assertEqual(lead["repair_adjudication_packet"]["validation_context"]["numeric_observation_fields"]["W"]["max"], 0.0)
+        for detail in ("full", "compact", "minimal", "focused"):
+            projected = _verifier_repair_packet(packet, detail=detail)
+            self.assertEqual(projected["candidate_program"], expected)
+            self.assertEqual(expected["repair_subject_lineage"]["attempt_number"], 14)
+            self.assertEqual(projected["failure_lineage"]["attempt_number"], 18)
+            self.assertEqual(projected["plan_review_failure"]["error"], "plan rejected")
+            self.assertEqual(projected["prior_foundry_work"]["validation_context"]["observation_count"], 70)
+            for name, source in sources.items():
+                evidence = projected["candidate_program"]["exact_execution_sources"][name]
+                self.assertTrue(evidence["complete"])
+                self.assertEqual("".join(evidence["source_chunks"]), source)
+        packet["exact_candidate_sources"]["executor"]["source_chunks"][0] += "modified"
+        evidence = _verifier_repair_packet(packet)["candidate_program"]["exact_execution_sources"]["executor"]
+        self.assertFalse(evidence["complete"])
+        self.assertEqual(evidence["source_chunks"], [])
+
+    def test_repair_verifier_preserves_the_entire_selected_plan_at_every_detail(self):
+        from scisaurus.runtime.specialists import _verifier_chief_result
+        from scisaurus.core.schema import canonical_bytes
+        plan = {"topic_id": "topic", "disposition": "repair", "root_cause": {
+            "statement": "Source diagnostics. " * 120, "evidence": ["Exact measurement. " * 100]},
+            "required_changes": [{"target": "operator", "instruction": "Physical basis. " * 180 + "K = X + g*(X@Z+Z@X); g=0.5.",
+                "scientific_basis": "The intervention must be independently identifiable. " * 50,
+                "source_refs": ["executor"]}] * 6,
+            "acceptance_checks": [{"phase": "plan" if index == 0 else "execution",
+                                   "check": f"check-{index}: " + "independent calculation. " * 70}
+                                  for index in range(16)],
+            "residual_uncertainties": ["uncertainty. " * 100] * 8}
+        chief = {"decision": "repair", "repair_adjudication": plan}
+        expected = hashlib.sha256(canonical_bytes(plan)).hexdigest()
+        for detail in ("full", "compact", "minimal", "focused"):
+            projected = _verifier_chief_result(chief, detail=detail)
+            self.assertEqual(projected["repair_adjudication"], plan)
+            self.assertEqual(projected["repair_adjudication_sha256"], expected)
+        with self.assertRaisesRegex(ValidationError, "input quota"):
+            build_verifier_prompt({"id": "repair", "kind": "experiment"},
+                {"repair_panel": True, "repair_verification_scope": "pre_execution_plan", "capability_repair_packet": {}},
+                [], chief, max_input_tokens=1200)
+
+    def test_repair_verifier_rejects_quota_overflow_without_discarding_exact_source(self):
+        source = "def observe(rows):\n    return [row['raw_measurement'] for row in rows]\n" * 1000
+        packet = {"program_snapshot": [], "exact_candidate_sources": {
+            "executor": {"available": True, "source_chunks": [source],
+                         "prompt_source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                         "prompt_source_characters": len(source)}}}
+        with self.assertRaisesRegex(ValidationError, "projection exceeds its input quota"):
+            build_verifier_prompt(
+                {"id": "repair", "kind": "experiment"},
+                {"repair_panel": True, "capability_repair_packet": packet},
+                [], {}, max_input_tokens=2000)
 
     def test_topic_verifier_judges_provisional_result_against_survey_admission(self):
         chief_result = {
@@ -1049,6 +1315,83 @@ class SpecialistDispatcherTests(unittest.TestCase):
                          ["length_continuation"])
         self.assertEqual(sum(event.get("event") == "continuing" for event in events), 1)
 
+    def test_non_json_and_closed_specialist_outputs_regenerate_without_suffix(self):
+        model = {
+            "protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+            "model": "fixture", "timeout_seconds": 5.0,
+            "max_output_tokens": 8192, "context_window_tokens": 262144,
+            "max_input_tokens": 245760,
+        }
+        assignment = {
+            "assigned_role": "methods.analysis-reviewer", "role_id": "analysis-reviewer",
+            "model_role": "methods.analysis-reviewer", "execution_kind": "review",
+            "stage_id": "repair", "stage_kind": "experiment",
+            "quota": {"max_calls": 4, "max_input_tokens": 245760,
+                      "max_output_tokens": 24576,
+                      "max_output_tokens_per_call": 8192, "max_seconds": 5},
+            "_prompt": json.dumps({"objective": "bounded repair"}),
+        }
+        for verifier in (False, True):
+            for prefix in (
+                    "Let me carefully analyze this packet.", "<think>Still reasoning",
+                    '```json\n', '{not JSON', '{"decision":truX', '{"decision":1,]',
+                    '{"decision":"repair"}',
+                    '```json\n{"decision":"repair"}\n```\ntrailing text'):
+                with self.subTest(verifier=verifier, prefix=prefix):
+                    response = ({"decision": "accept", "rationale": "evidence checked"}
+                                if verifier else {"decision": "repair", "summary": "source defect"})
+                    results = [
+                        ModelResult(prefix, "fixture", {"model_calls": 1,
+                                    "input_tokens": 23, "output_tokens": 7000}, .01, "length"),
+                        ModelResult(json.dumps(response), "fixture", {"model_calls": 1,
+                                    "input_tokens": 31, "output_tokens": 100}, .01, "stop"),
+                    ]
+                    with patch("scisaurus.runtime.specialists.ModelClient") as client:
+                        client.return_value.complete.side_effect = results
+                        report = SpecialistDispatcher(model, max_parallel=1,
+                            deadline=time.monotonic() + 10).dispatch(
+                                [assignment], {}, verifier=verifier)[0]
+                    self.assertEqual(report["status"], "succeeded")
+                    self.assertEqual(report["usage"], {"model_calls": 2,
+                                      "input_tokens": 54, "output_tokens": 7100})
+                    self.assertEqual(report["request_attempts"], 2)
+                    self.assertEqual([item["kind"] for item in report["retry_history"]],
+                                     ["validation"])
+                    self.assertEqual(len(report["request_inputs"]), 2)
+                    for call in client.return_value.complete.call_args_list:
+                        self.assertNotIn("continuation_text", call.kwargs)
+                    self.assertIn("repair_instruction", json.loads(
+                        client.return_value.complete.call_args_list[1].kwargs["prompt"]))
+
+    def test_repeated_prose_truncation_stops_after_one_schema_repair(self):
+        model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+                 "model": "fixture", "timeout_seconds": 5.0, "max_output_tokens": 8192,
+                 "context_window_tokens": 262144, "max_input_tokens": 245760}
+        assignment = {
+            "assigned_role": "methods.analysis-reviewer", "role_id": "analysis-reviewer",
+            "model_role": "methods.analysis-reviewer", "execution_kind": "review",
+            "stage_id": "repair", "stage_kind": "experiment",
+            "quota": {"max_calls": 4, "max_input_tokens": 245760,
+                      "max_output_tokens": 24576, "max_output_tokens_per_call": 8192,
+                      "max_seconds": 5}, "_prompt": "{}",
+        }
+        with patch("scisaurus.runtime.specialists.ModelClient") as client:
+            client.return_value.complete.side_effect = [
+                ModelResult(text, "fixture", {"model_calls": 1, "output_tokens": 7000},
+                            .01, "length")
+                for text in ("Let me analyze the packet.", "I will continue reasoning.")
+            ]
+            report = SpecialistDispatcher(model, max_parallel=1,
+                deadline=time.monotonic() + 10).dispatch([assignment], {})[0]
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("no JSON object prefix", report["error"])
+        self.assertEqual(report["usage"], {"model_calls": 2, "output_tokens": 14000})
+        self.assertEqual(client.return_value.complete.call_count, 2)
+        self.assertEqual(report["validation_retries"], 1)
+        self.assertEqual(report["partial_response"], "I will continue reasoning.")
+        self.assertTrue(all("continuation_text" not in item["input"]
+                            for item in report["request_inputs"]))
+
     def test_specialist_continuation_never_exceeds_cumulative_output_budget(self):
         model = {
             "protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
@@ -1147,6 +1490,92 @@ class SpecialistDispatcherTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_failed_response_output_exhaustion_preserves_operational_fence(self):
+        model = {"protocol": "openai_compatible", "base_url": "http://fake/v1",
+                 "model": "output-failure-fallback", "timeout_seconds": 5,
+                 "max_output_tokens": 100, "role_routes": {"review.arbiter": [
+                     {"id": "first", "pool": "isolated", "model": "output-failed"},
+                     {"id": "second", "pool": "isolated", "model": "output-healthy"}]}}
+        assignment = {"assigned_role": "research.adversarial-reviewer", "role_id": "adversarial-reviewer",
+                      "model_role": "review.arbiter", "execution_kind": "review",
+                      "stage_id": "experiment", "stage_kind": "experiment",
+                      "quota": {"max_calls": 2, "max_input_tokens": 1000,
+                                "max_output_tokens": 100, "max_output_tokens_per_call": 100,
+                                "max_seconds": 5}, "_prompt": "{}"}
+        error = ModelCallError("transient failed response", outcome_known=True, attempts=1, status_code=500)
+        error.usage = {"model_calls": 1, "input_tokens": 23, "output_tokens": 100}
+        calls = []
+        class FailedResponseClient:
+            def __init__(self, **config):
+                pass
+            def complete(self, **request):
+                calls.append(request)
+                raise error
+        try:
+            with patch("scisaurus.runtime.specialists.ModelClient", FailedResponseClient):
+                report = SpecialistDispatcher(model).dispatch([assignment], {}, verifier=True)[0]
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(report["usage"], error.usage)
+            self.assertEqual(report["failure"]["status_code"], 500)
+            self.assertEqual(report["error_type"], "ModelCallError")
+            self.assertIn("cumulative output-token budget", report["error"])
+        finally:
+            for name in ("output-failure-fallback", "output-failed", "output-healthy"):
+                clear_model_provider_cooldown({**model, "model": name})
+
+    def test_specialist_invoices_known_failed_response_usage_once(self):
+        for status_code in (400, 429):
+            with self.subTest(status_code=status_code):
+                error = ModelCallError("failed response", outcome_known=True,
+                                       attempts=1, status_code=status_code)
+                error.usage = {"model_calls": 1, "input_tokens": 23, "output_tokens": 7}
+                class FailedResponseClient:
+                    def __init__(self, **config):
+                        pass
+                    def complete(self, **request):
+                        raise error
+                assignment = {"assigned_role": "methods.methodologist", "role_id": "methodologist",
+                              "model_role": "methods.methodologist", "execution_kind": "model",
+                              "stage_id": "repair-panel", "stage_kind": "experiment",
+                              "quota": {"max_calls": 1, "max_input_tokens": 1000,
+                                        "max_output_tokens": 100, "max_seconds": 5}, "_prompt": "{}"}
+                model = {"protocol": "openai_compatible", "base_url": "http://fake/v1",
+                         "model": f"known-failed-usage-{status_code}", "timeout_seconds": 5,
+                         "max_output_tokens": 100}
+                try:
+                    with patch("scisaurus.runtime.specialists.ModelClient", FailedResponseClient):
+                        report = SpecialistDispatcher(model).dispatch([assignment], {})[0]
+                    self.assertEqual(report["usage"], error.usage)
+                    self.assertEqual(report["failure"]["usage"], error.usage)
+                    self.assertEqual(report["status_code"], status_code)
+                finally:
+                    clear_model_provider_cooldown(model)
+
+    def test_specialist_preserves_typed_budget_admission_without_provider_usage(self):
+        from scisaurus.runtime.models import ModelBudgetExceededError
+        admission = {"path": "/tmp/budget.sqlite", "key": "stage:experiment:cycle:30",
+                     "dimension": "model_calls", "limit": 24, "observed": 24,
+                     "reserved": 0, "requested": 1}
+        class BudgetClient:
+            def __init__(self, **config):
+                pass
+            def complete(self, **request):
+                raise ModelBudgetExceededError("owner model call budget exhausted",
+                                               budget_admission=admission, outcome_known=True)
+        assignment = {"assigned_role": "methods.methodologist", "role_id": "methodologist",
+                      "model_role": "methods.methodologist", "execution_kind": "model",
+                      "stage_id": "repair-panel", "stage_kind": "experiment",
+                      "quota": {"max_calls": 1, "max_input_tokens": 1000,
+                                "max_output_tokens": 100, "max_seconds": 5}, "_prompt": "{}"}
+        model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:11434/v1",
+                 "model": "test-budget", "timeout_seconds": 5, "max_output_tokens": 100}
+        with patch("scisaurus.runtime.specialists.ModelClient", BudgetClient):
+            report = SpecialistDispatcher(model).dispatch([assignment], {})[0]
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["error_type"], "ModelBudgetExceededError")
+        self.assertEqual(report["budget_admission"], admission)
+        self.assertEqual(report["usage"], {})
 
     def test_provider_429_stops_specialist_assignments_still_queued(self):
         quota_scope = "specialist-queued-429-test"

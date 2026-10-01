@@ -36,6 +36,29 @@ class TestTaskLifecycle(unittest.TestCase):
         self.assertEqual([attempt["attempt_id"] for attempt in attempts], ["a-1"])
         self.assertEqual(attempts[0]["usage"]["actual"], {"tokens": 82})
 
+    def test_blocked_output_review_can_resume_only_a_successful_attempt(self):
+        for outcome in (None, "succeeded", "failed", "result_unknown"):
+            with self.subTest(outcome=outcome):
+                task_id, attempt_id = f"review-{outcome}", f"attempt-{outcome}"
+                self.tm.create(task_id, "review", {"objective": "check output"}, "composer")
+                self.tm.admit(task_id, "composer")
+                if outcome is not None:
+                    self.tm.start_attempt(task_id, attempt_id, owner="reviewer", lease_ttl_seconds=30)
+                    if outcome == "result_unknown":
+                        self.tm.reconcile_unknown(attempt_id, "scheduler")
+                    else:
+                        self.tm.finish_attempt(attempt_id, outcome, usage={"model_calls": 1})
+                if self.tm.get(task_id)["state"] != "blocked":
+                    self.tm.transition(task_id, "blocked", "controller", reason="output requires validation")
+                if outcome == "succeeded":
+                    self.tm.transition(task_id, "awaiting_review", "controller", reason="recorded output revalidated")
+                    self.assertEqual(len(self.tm.attempts_for_task(task_id)), 1)
+                    self.assertEqual(self.tm.get_attempt(attempt_id)["usage"]["actual"], {"model_calls": 1})
+                else:
+                    with self.assertRaisesRegex(StateError, "successful recorded attempt"):
+                        self.tm.transition(task_id, "awaiting_review", "controller")
+                    self.assertEqual(self.tm.get(task_id)["state"], "blocked")
+
     def test_t05_unknown_outcome_is_not_zero_cost(self):
         self.tm.create("t-2", "retrieval", {"objective": "fetch source"}, "composer")
         self.tm.admit("t-2", "composer")

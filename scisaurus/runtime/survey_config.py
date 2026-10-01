@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 
 from scisaurus.core.errors import ValidationError
+from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.config import _text, configured_worker_slots, validate_common
 from scisaurus.runtime.operation_adapters import get_adapter
 from scisaurus.runtime.scores import exact, identifier
@@ -13,6 +14,26 @@ from scisaurus.runtime.time_policy import validate_time_policy
 
 SEARCH_LIMITS = {"queries_per_role", "results_per_query", "max_works", "challenge_reserve", "expansion_rounds", "expansion_seed_count",
                  "references_per_work", "max_api_calls", "min_new_works", "saturation_rounds", "max_full_texts", "max_text_chars", "context_chars"}
+
+
+def validate_survey_work_orders(value):
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 32:
+        raise ValidationError("survey work_orders must be a list of at most 32 orders")
+    fields = {"id", "kind", "owner", "objective", "why", "success_condition", "evidence_needed"}
+    seen = set()
+    for order in value:
+        if not isinstance(order, dict) or not fields <= set(order):
+            raise ValidationError("survey work order requires routing, objective, success and evidence fields")
+        for field in fields:
+            _text(order[field], f"survey work order {field}")
+        if order["id"] in seen:
+            raise ValidationError("survey work order IDs must be unique")
+        seen.add(order["id"])
+    if len(canonical_bytes(value)) > 65536:
+        raise ValidationError("survey work orders exceed the 64 KiB input limit")
+    return deepcopy(value)
 
 
 def work_id(value):
@@ -39,7 +60,8 @@ def _strings(value, name, *, empty=False):
 
 
 def validate_survey_config(value):
-    validate_common(value, {"survey", "time_policy"}, retrieval=False)
+    validate_common(value, {"survey", "time_policy", "work_orders"}, retrieval=False)
+    validate_survey_work_orders(value.get("work_orders"))
     repair_mode = value.get("limits", {}).get("repair_mode")
     if repair_mode is not None and repair_mode not in {"bounded", "until_deadline"}:
         raise ValidationError("limits.repair_mode must be bounded or until_deadline")

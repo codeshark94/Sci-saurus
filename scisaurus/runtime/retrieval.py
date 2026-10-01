@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from http.client import HTTPException, IncompleteRead
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urljoin, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from urllib.robotparser import RobotFileParser
 
@@ -31,7 +31,7 @@ from scisaurus.runtime import pdf_text
 ADAPTER_VERSION = "4"
 MCP_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = {MCP_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"}
-CROSSREF_TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+CROSSREF_TRANSIENT_HTTP_STATUSES = {408, 425, 500, 502, 503, 504}
 SAFE_PROCESS_ENV = {
     "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT",
     "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "LANG", "LC_ALL",
@@ -176,11 +176,13 @@ def _robots_policy(url, *, deadline, cache):
                           "bytes": 0, "redirects": redirects,
                           "reason": "Origin has no robots policy file"}
             elif status in {401, 403, 429}:
-                policy = {"outcome": "robots_denied", "robots_url": initial_url,
+                policy = {"outcome": "rate_limited" if status == 429 else "robots_denied",
+                          "robots_url": initial_url,
                           "final_url_sha256": hashlib.sha256(current_url.encode("utf-8")).hexdigest(),
                           "status": status,
                           "redirects": redirects,
-                          "reason": "Robots policy access was denied or rate limited"}
+                          "reason": "Robots policy request was rate limited" if status == 429
+                          else "Robots policy access was denied"}
             else:
                 policy = {"outcome": "robots_unavailable", "robots_url": initial_url,
                           "final_url_sha256": hashlib.sha256(current_url.encode("utf-8")).hexdigest(),
@@ -305,8 +307,8 @@ class CrossrefClient:
         """Run one logical lookup inside one total timeout and retry budget.
 
         Crossref's response headers are part of the operational result. A
-        transient 429/5xx is retried only when the same bounded call still has
-        time left; permanent access and parse failures are returned immediately.
+        Transient failures are retried within the bounded call. Rate limits,
+        permanent access failures, and parse failures return immediately.
         """
         started = time.monotonic()
         deadline = started + self.timeout
@@ -321,6 +323,8 @@ class CrossrefClient:
             metadata = last.setdefault("metadata", {})
             metadata["attempts"] = attempt + 1
             status = metadata.get("http_status")
+            if status == 429:
+                metadata["retry_suppressed_reason"] = "provider_rate_limit_requires_operator_recovery"
             if status not in CROSSREF_TRANSIENT_HTTP_STATUSES or attempt >= self.max_retries:
                 metadata["retry_wait_seconds"] = retry_wait_seconds
                 if status in CROSSREF_TRANSIENT_HTTP_STATUSES:
@@ -349,8 +353,8 @@ class CrossrefClient:
                                     "retry_budget_exhausted": True, "completed_at": _now()})
         return result
 
-    def _search_once(self, query: str, *, limit: int = 5, cursor: str | None = None,
-                     request_timeout: float | None = None) -> dict:
+    @staticmethod
+    def request_parameters(query, *, limit=5, cursor=None):
         if not isinstance(query, str) or not query.strip() or len(query) > 2048:
             raise ValueError("search query must be nonempty and at most 2048 characters")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
@@ -363,11 +367,24 @@ class CrossrefClient:
             if not isinstance(cursor, str) or not cursor or len(cursor) > 8192:
                 raise ValueError("Crossref cursor must be a bounded nonempty string")
             params["cursor"] = cursor
+        return params
+
+    def request_url(self, query, *, limit=5, cursor=None):
+        params = self.request_parameters(query, limit=limit, cursor=cursor)
         if self.mailto:
             params["mailto"] = self.mailto
-        url = self.endpoint + ("&" if "?" in self.endpoint else "?") + urlencode(params)
+        endpoint = urlsplit(self.endpoint)
+        query_string = "&".join(part for part in (endpoint.query, urlencode(params)) if part)
+        return urlunsplit(endpoint._replace(query=query_string))
+
+    def _search_once(self, query: str, *, limit: int = 5, cursor: str | None = None,
+                     request_timeout: float | None = None) -> dict:
+        params = self.request_parameters(query, limit=limit, cursor=cursor)
+        exact_doi = "filter" in params
+        url = self.request_url(query, limit=limit, cursor=cursor)
         result = _result("crossref", "http_api", url)
         result["metadata"].update({"query": query, "rows": limit, "representation": "metadata",
+                                   "cursor": params["cursor"],
                                    "match_mode": "exact_doi" if exact_doi else "relevance"})
         request_timeout = self.timeout if request_timeout is None else request_timeout
         deadline = time.monotonic() + request_timeout

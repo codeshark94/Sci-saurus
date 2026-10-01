@@ -490,6 +490,7 @@ def project_writer_packet(packet, paper_config, *, abstract_chars=720,
         "scientific_interpretation", "research_argument", "research_argument_review",
         "argument_defense",
         "literature_evidence", "reference_cards", "evidence_ids", "asset_ids",
+        "survey_assessment", "survey_lineage",
         "research_program", "scientific_follow_up", "follow_up_instruction",
         "deferred_requirements", "argument", "evidence", "paper_contract",
     }
@@ -563,7 +564,7 @@ def project_writer_packet(packet, paper_config, *, abstract_chars=720,
             projected["literature_evidence"], (
                 "id", "kind", "source_ref", "work_id", "title", "authors", "year",
                 "locator", "claim", "evidence", "evidence_type", "source_location",
-                "relationship", "support", "status"))
+                "relationship", "support", "status", "quote", "start", "end", "quote_sha256", "relation"), limit=None)
     for key in ("evidence", "argument"):
         if key in projected and isinstance(projected[key], list):
             projected[key] = records(projected[key], (

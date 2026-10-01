@@ -1,18 +1,22 @@
 """Process-level dispatch evidence using explicit, local simulated workers."""
 from __future__ import annotations
+from contextlib import closing
 
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import multiprocessing
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
 
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import StateError, ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.store import ArtifactStore
 from scisaurus.runtime.config import MIN_WORKER_RESULT_BYTES, validate_config
@@ -35,6 +39,14 @@ def execution_worker(kind, params, channel):
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         Path(assignment["descendant"]).write_text(json.dumps({"worker": os.getpid(), "child": child.pid}))
     time.sleep(assignment["delay"])
+    if assignment.get("budget_admission"):
+        from scisaurus.runtime.models import ModelBudgetExceededError
+        error = ModelBudgetExceededError("request cannot fit", outcome_known=True,
+                                         budget_admission=assignment["budget_admission"],
+                                         attempts=assignment.get("attempts", 0))
+        error.usage = assignment.get("usage", {})
+        channel.put(_worker_error_payload(error, kind))
+        return
     if assignment.get("failure"):
         channel.put({"ok": False, "error": "simulated worker failure",
                      "outcome_known": "false" if assignment["failure"] == "malformed" else assignment["failure"] == "known"})
@@ -109,7 +121,212 @@ def same_pool_independent_quota_worker(kind, params, channel):
     channel.put({"ok": True, "result": result})
 
 
+def retrieval_usage_worker(kind, params, channel):
+    channel.put({"ok": True, "result": params["result"]})
+
+
 class TestExecutionRuntime(unittest.TestCase):
+    def test_openalex_http_costs_and_cycle_ownership_survive_resume(self):
+        from scisaurus.runtime.literature import openalex_request_usage
+        runtime = self.runtime()
+        runtime.worker_target = retrieval_usage_worker
+        def owner(key):
+            scope = {"model_call_budget_key": key, "model_call_budget_path": str(self.root / "parent.sqlite"),
+                     "model_call_budget_limit": 10}
+            runtime._publish("command/model-budget-delegations/" + key.split(":")[-1], "note",
+                             {"delegation": {"scope": scope}}, "command.controller")
+            return {"scope": scope}
+        owner("stage:survey:cycle:11")
+        for task, count in (("prior", 3), ("current", 2), ("cooldown", 0), ("unknown", None)):
+            if task == "current":
+                runtime.model_budget_delegation = owner("stage:survey:cycle:12")
+            result = {"metadata": {} if count is None else {"attempts": count}}
+            outcome = runtime._call_batch([{"task_id": task, "kind": "openalex",
+                "actor": "research.searcher", "task_kind": "service",
+                "params": {"client": {"timeout": 2}, "result": result}}])[task]
+            self.assertTrue(outcome["ok"], outcome)
+        usage = openalex_request_usage(runtime.control._conn, runtime.store.read_body)
+        self.assertEqual(usage["openalex_requests"], 5)
+        self.assertEqual(usage["unreported_task_ids"], ["unknown"])
+        for cycle, expected in ((11, 3), (12, 2)):
+            scoped = openalex_request_usage(runtime.control._conn, runtime.store.read_body,
+                                            owner_key=f"stage:survey:cycle:{cycle}")
+            self.assertTrue(scoped["owner_registered"])
+            self.assertEqual(scoped["openalex_requests"], expected)
+        pool = runtime.budget.get_window("run-window")["cumulative_usage"]
+        self.assertEqual(pool["openalex_requests"], 5)
+        with runtime.control.tx() as c:
+            c.execute("UPDATE resource_pools SET cumulative_usage_json=?",
+                      (json.dumps({k:v for k,v in pool.items() if k != "openalex_requests"}),))
+        runtime.control.close()
+        policy = {"additional_seconds": 10, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+                  "source_changes": {"mode": "reject", "reopen_scopes": []}}
+        for _ in range(2):
+            restored = ExecutionRuntime(runtime.dir, runtime.config, worker_target=retrieval_usage_worker,
+                                        resume_policy=policy)
+            self.runtimes.append(restored)
+            self.assertEqual(restored.budget.get_window("run-window")["cumulative_usage"]["openalex_requests"], 5)
+            restored.control.close()
+
+    def test_failed_resume_closes_constructor_owned_control(self):
+        value = validate_config(config())
+        project = self.root / "rejected-resume"
+        original = ExecutionRuntime(project, value, worker_target=execution_worker)
+        original.control.close()
+        acquired = []
+
+        def acquire(*args, **kwargs):
+            store = ControlStore(*args, **kwargs)
+            acquired.append(store._conn)
+            return store
+
+        with patch("scisaurus.runtime.execution.ControlStore", side_effect=acquire), \
+                patch("scisaurus.runtime.execution.ResumeController.prepare",
+                      side_effect=ValidationError("rejected resume")):
+            with self.assertRaisesRegex(ValidationError, "rejected resume"):
+                ExecutionRuntime(project, value, worker_target=execution_worker, resume_policy={})
+        self.assertEqual(len(acquired), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            acquired[0].execute("SELECT 1")
+
+    def test_progress_projects_exact_active_operations_and_settled_costs(self):
+        events = []
+        runtime = self.runtime(on_progress=events.append)
+        outcomes = runtime._call_batch([self.spec("live-task", delay=0.15)])
+        self.assertTrue(outcomes["live-task"]["ok"])
+        active = [event for event in events if event.get("active_operations")]
+        self.assertTrue(active)
+        self.assertEqual(active[-1]["active_operations"], [
+            {"task_id": "live-task", "actor": "strategy.worker", "kind": "model"}])
+        settled = events[-1]
+        self.assertEqual(settled["phase"], "calls_settled")
+        self.assertEqual(settled["active_operations"], [])
+        self.assertEqual(settled["cumulative_usage"]["model_calls"], 1)
+        self.assertEqual(settled["run_id"], runtime.run_id)
+        self.assertEqual(settled["project_dir"], str(runtime.dir.resolve()))
+
+    def test_delegated_http_window_preserves_costs_and_same_cycle_reservations(self):
+        import sqlite3
+        from scisaurus.runtime.models import _reserve_model_call_budgets
+        runtime = self.runtime()
+        runtime.config["limits"]["max_model_calls"] = 3
+        path = (self.root / "parent.sqlite").resolve()
+        scope = {"model_call_budget_path": str(path), "model_call_budget_key": "stage:survey:cycle:2",
+                 "model_call_budget_limit": 3}
+        with closing(sqlite3.connect(path)) as owner, owner:
+            owner.execute("CREATE TABLE model_call_budgets (budget_key TEXT PRIMARY KEY, max_calls INTEGER, used_calls INTEGER)")
+            owner.executemany("INSERT INTO model_call_budgets VALUES (?, 3, ?)",
+                              [(scope["model_call_budget_key"], 1), ("stage:survey:cycle:3", 0)])
+        runtime.model_call_budget_scopes = [scope]
+        runtime.model_budget_delegation = {"scope": scope, "used_calls": 1, "superseded_scopes": []}
+        runtime.budget.reserve(window_id="run-window", reservation_id="history", task_id="history",
+                               amount={"concurrent_calls": 1})
+        runtime.budget.settle(window_id="run-window", reservation_id="history", actual={"model_calls": 95})
+        first = runtime._model_dispatch_budget()
+        _reserve_model_call_budgets([first])
+        runtime.model_budget_delegation["used_calls"] = 0
+        repeated = runtime._model_dispatch_budget()
+        self.assertEqual(first, repeated)
+        _reserve_model_call_budgets([repeated])
+        with self.assertRaises(ModelCallError):
+            _reserve_model_call_budgets([runtime._model_dispatch_budget()])
+        next_scope = {**scope, "model_call_budget_key": "stage:survey:cycle:3"}
+        runtime.model_call_budget_scopes = [next_scope]
+        runtime.model_budget_delegation = {"scope": next_scope, "used_calls": 0,
+                                           "superseded_scopes": [scope]}
+        next_window = runtime._model_dispatch_budget()
+        self.assertNotEqual(first["model_call_budget_key"], next_window["model_call_budget_key"])
+        _reserve_model_call_budgets([next_window])
+        self.assertEqual(runtime.budget.get_window("run-window")["cumulative_usage"]["model_calls"], 95)
+        other = {**scope, "model_call_budget_key": "role:reviewer"}
+        with self.assertRaises(ValidationError):
+            runtime._validate_model_budget_delegation({"scope": next_scope, "superseded_scopes": [other]})
+        runtime.config["limits"].pop("max_model_calls")
+        self.assertEqual(runtime._model_dispatch_budget()["model_call_budget_limit"], 3)
+        runtime.model_budget_delegation["superseded_scopes"] = [other]
+        with self.assertRaises(ValidationError):
+            runtime._model_dispatch_budget()
+        runtime.model_budget_delegation["superseded_scopes"] = [scope]
+        routed = runtime._delegated_model_config({"model_call_budget_scopes": [scope, other],
+            "role_models": {"reviewer": {"model_call_budget_scopes": [scope, other]}}})
+        self.assertEqual(routed["model_call_budget_scopes"], [other])
+        self.assertEqual(routed["role_models"]["reviewer"]["model_call_budget_scopes"], [other])
+        upgraded = {**scope, "model_token_budget_limits": {"input_tokens": 1000, "output_tokens": 1000}}
+        runtime.model_budget_delegation["superseded_scopes"] = [upgraded]
+        migrated = runtime._delegated_model_config({"model_call_budget_scopes": [scope, other]})
+        self.assertEqual(migrated["model_call_budget_scopes"], [other])
+        runtime.model_budget_delegation["superseded_scopes"] = [scope]
+        spec = self.spec("delegated-route")
+        spec["params"]["client"] = {**runtime.config["model"], "model_call_budget_scopes": [scope, other]}
+        route = {"model_call_budget_scopes": [{**other, "model_call_budget_key": "route:alternate"}]}
+        selected = runtime._route_model_config(spec, route)
+        self.assertNotIn(scope, selected["model_call_budget_scopes"])
+        self.assertIn(next_scope, selected["model_call_budget_scopes"])
+        self.assertIn(other, selected["model_call_budget_scopes"])
+        self.assertIn(route["model_call_budget_scopes"][0], selected["model_call_budget_scopes"])
+        runtime.config["model"]["model_call_budget_scopes"] = [other]
+        spec["params"]["client"] = {"max_output_tokens": 20, "model_call_budget_scopes": []}
+        self.assertIn(other, runtime._base_model_config(spec)["model_call_budget_scopes"])
+
+    def test_dispatch_lifecycle_failure_preserves_type(self):
+        runtime = ExecutionRuntime.__new__(ExecutionRuntime)
+        with self.assertRaises(StateError):
+            runtime._raise_dispatch_failures([{"error_type": "StateError", "error": "stale binding"}], "model")
+
+    def test_http_call_limit_covers_continuation_and_survives_resume(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                requests.append(self.rfile.read(int(self.headers["Content-Length"])))
+                body = json.dumps({"model": "fixture", "choices": [{"message": {
+                    "content": '{"decision":'}, "finish_reason": "length"}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 2}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            value = config()
+            value["model"].update(protocol="openai_compatible", model="fixture",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1", timeout_seconds=5)
+            value["limits"].update(max_model_calls=1, wall_clock_seconds=15)
+            run_dir = self.root / "http-budget"
+            runtime = ExecutionRuntime(run_dir, validate_config(value), worker_target=_invoke_worker)
+            self.runtimes.append(runtime)
+            spec = self.spec("bounded-http")
+            spec["params"]["client"] = value["model"]
+            outcome = runtime._call_batch([spec])[spec["task_id"]]
+            self.assertFalse(outcome["ok"])
+            self.assertEqual(len(requests), 1)
+            usage = runtime.budget.get_window("run-window")["cumulative_usage"]
+            self.assertEqual(usage["model_calls"], 1)
+            self.assertEqual(usage["input_tokens"], 5)
+            self.assertEqual(usage["output_tokens"], 2)
+            journal = json.loads((run_dir / "runs" / spec["task_id"] / "model-continuation.json").read_text())
+            self.assertEqual(journal["status"], "incomplete")
+            self.assertEqual(journal["response"], '{"decision":')
+            runtime.control.close()
+            resumed = ExecutionRuntime(run_dir, validate_config(value), worker_target=_invoke_worker,
+                resume_policy={"additional_seconds": 10, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+                               "source_changes": {"mode": "reject", "reopen_scopes": []}})
+            self.runtimes.append(resumed)
+            spec = self.spec("after-resume")
+            spec["params"]["client"] = value["model"]
+            self.assertFalse(resumed._call_batch([spec])[spec["task_id"]]["ok"])
+            self.assertEqual(len(requests), 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_worker_failure_envelope_preserves_model_rate_limit_metadata(self):
         error = ModelCallError(
             "model HTTP request failed with status 429",
@@ -196,6 +413,123 @@ class TestExecutionRuntime(unittest.TestCase):
             self.assertEqual(len(saved["segments"]), 2)
             self.assertEqual(saved["response"], result["text"])
 
+    def test_http_budget_fence_survives_worker_and_dispatch_boundaries(self):
+        from scisaurus.core.errors import QuotaExceededError
+        from scisaurus.runtime.models import ModelBudgetExceededError
+        admission = {"path": str((self.root/"budget.sqlite").resolve()), "key": "stage:survey:cycle:1",
+                     "dimension": "output_tokens", "limit": 30, "observed": 7,
+                     "reserved": 0, "requested": 24}
+        error = ModelBudgetExceededError("request cannot fit", outcome_known=True, budget_admission=admission)
+        self.assertIsInstance(error, QuotaExceededError)
+        runtime = self.runtime()
+        usage = {"model_calls": 1, "input_tokens": 17, "output_tokens": 7}
+        outcome = runtime._call_batch([self.spec("budget-fence", delay=0.01,
+                                               budget_admission=admission,
+                                               attempts=1, usage=usage)])["budget-fence"]
+        self.assertEqual(outcome["budget_admission"], admission)
+        self.assertEqual(outcome["usage"], usage)
+        record = runtime.store.head("command/failures/budget-fence")
+        failure = json.loads(runtime.store.read_body(record["body_hash"]))
+        self.assertEqual(failure["budget_admission"], admission)
+        self.assertEqual(failure["usage"], usage)
+        with self.assertRaises(QuotaExceededError) as caught:
+            runtime._raise_dispatch_failures([outcome], "review")
+        self.assertEqual(caught.exception.budget_admission, admission)
+        self.assertEqual(caught.exception.dimension, "max_output_tokens")
+        self.assertEqual(caught.exception.attempts, 1)
+        self.assertEqual(caught.exception.usage, usage)
+        with self.assertRaises(QuotaExceededError) as single:
+            runtime._raise_model_failure(outcome)
+        self.assertEqual(single.exception.budget_admission, admission)
+        self.assertEqual(single.exception.usage, usage)
+
+    def test_failed_suffix_preserves_known_tokens_without_duplicate_calls(self):
+        from scisaurus.runtime.execution import _complete_model_with_continuation
+        from scisaurus.runtime.models import ModelResult
+        class Client:
+            output_format = "json_object"
+            calls = 0
+            def complete(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelResult('{"value": ', "test", {
+                        "model_calls": 1, "input_tokens": 10, "output_tokens": 5}, 0.1, "length")
+                error = ModelCallError("invalid response", outcome_known=True, attempts=1)
+                error.usage = {"model_calls": 1, "input_tokens": 17,
+                               "output_tokens": 9, "cache_read_tokens": 3}
+                raise error
+        journal = self.root / "known-suffix.json"
+        with self.assertRaises(ModelCallError) as failure:
+            _complete_model_with_continuation(Client(), system="Return JSON.", prompt="Review.",
+                                              journal_path=str(journal))
+        expected = {"model_calls": 2, "input_tokens": 27, "output_tokens": 14, "cache_read_tokens": 3}
+        self.assertEqual(failure.exception.usage, expected)
+        recorded = json.loads(journal.read_text())
+        self.assertEqual(recorded["usage"], expected)
+        self.assertEqual(recorded["request_attempts"], 2)
+        self.assertEqual(recorded["status"], "incomplete")
+
+    def test_structured_continuation_requires_payload_and_preserves_observed_cost(self):
+        from scisaurus.runtime.execution import _complete_model_with_continuation
+        from scisaurus.runtime.models import ModelResult
+
+        class Client:
+            model = "fixture"
+            output_format = "json_object"
+
+            def __init__(self, first):
+                self.first, self.calls = first, []
+
+            def complete(self, **kwargs):
+                self.calls.append(kwargs)
+                return ModelResult(self.first if len(self.calls) == 1 else '"passed"}',
+                                   self.model, {"model_calls": 1, "output_tokens": 8},
+                                   0.1, "length" if len(self.calls) == 1 else "stop")
+
+        for prefix in ('Let me carefully parse this assignment.', '<think>Still reasoning',
+                       '```json\n', '{"verdict":"passed"}', '{"verdict":"passed"} trailing prose',
+                       '```json\n{"ok":true}\n```\n```json\n{"extra":',
+                       '{"text":"literal </think> marker","verdict":',
+                       '```json\n{"text":"literal </think> marker","verdict":',
+                       '{"verdict":', '```json\n{"verdict":',
+                       '<think>Reasoning</think>\n{"verdict":'):
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as directory:
+                client = Client(prefix)
+                path = Path(directory) / "journal.json"
+                result = _complete_model_with_continuation(
+                    client, system="Return JSON.", prompt="Review.", journal_path=str(path))
+                continues = prefix.endswith('"verdict":')
+                self.assertEqual(len(client.calls), 2 if continues else 1)
+                self.assertEqual(result.usage["model_calls"], len(client.calls))
+                journal = json.loads(path.read_text())
+                self.assertEqual(journal["response"], result.text)
+                self.assertEqual(journal["usage"], result.usage)
+                if not continues:
+                    self.assertEqual(result.text, prefix)
+                    self.assertEqual(result.finish_reason, "length")
+                    self.assertEqual(journal["status"], "incomplete")
+                    self.assertIn("closed JSON object" if prefix.startswith('{"verdict":"passed"}')
+                                  or prefix.startswith('```json\n{"ok":true}')
+                                  else "no JSON object prefix", journal["error"])
+
+    def test_resumed_structured_reasoning_is_rejected_before_provider_admission(self):
+        from scisaurus.runtime.execution import _complete_model_with_continuation
+        from types import SimpleNamespace
+        client = SimpleNamespace(model="fixture", output_format="json_object")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.json"
+            with self.assertRaisesRegex(ValidationError, "no JSON object prefix") as caught:
+                _complete_model_with_continuation(client, system="Return JSON.", prompt="Review.",
+                                                  initial_prefix="Let me analyze.", journal_path=str(path))
+            payload = _worker_error_payload(caught.exception, "model")
+            self.assertTrue(payload["outcome_known"])
+            self.assertEqual(payload["attempts"], 0)
+            self.assertEqual(payload["usage"], {})
+            journal = json.loads(path.read_text())
+            self.assertEqual(journal["response"], "Let me analyze.")
+            self.assertEqual(journal["request_attempts"], 0)
+            self.assertEqual(journal["segments"], [])
+
     def test_rate_limit_during_continuation_preserves_prefix_and_does_not_retry(self):
         from types import SimpleNamespace
 
@@ -246,7 +580,7 @@ class TestExecutionRuntime(unittest.TestCase):
             self.assertEqual(channel.value["partial_output_journal_path"], str(journal))
             self.assertEqual(len(StubClient.calls), 2)
             saved = json.loads(journal.read_text())
-            self.assertEqual(saved["status"], "continuing")
+            self.assertEqual(saved["status"], "incomplete")
             self.assertEqual(saved["response"], '{"decision":')
             self.assertEqual(len(saved["segments"]), 1)
 

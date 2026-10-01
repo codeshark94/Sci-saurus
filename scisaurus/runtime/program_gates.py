@@ -5,7 +5,7 @@ Gate order (each independent, and each must pass before the next):
 1. static scan          -- ``program_admission.validate_program_candidate`` (P3.1)
 2. deterministic replay -- the same test vector must produce byte-identical
                            output on repeated sandboxed executions
-3. test-vector digest   -- the replay output must match the declared SHA-256
+3. test-vector digest   -- the admitted output projection must match the declared SHA-256
 4. independent recalc   -- a *separately authored* validator must recompute the
                            declared outcomes from the recorded observations and
                            accept the exact candidate bytes
@@ -93,7 +93,8 @@ def admit_program_candidate(candidate, *, execute, validate, readiness=None, rev
         raise ValidationError("admission replay_runs must be an integer between three and eight")
     payload = canonical_bytes(candidate["test_vector"]["input"])
     expected = candidate["test_vector"]["expected_output_sha256"]
-    replays = []
+    raw_replays = []
+    configured_input = program_validator_configured_input(candidate)
     for index in range(replay_runs):
         result = execute(payload)
         if getattr(result, "mode", None) != "sandbox-exec":
@@ -108,20 +109,20 @@ def admit_program_candidate(candidate, *, execute, validate, readiness=None, rev
             document = json.loads(result.stdout)
         except (ValueError, TypeError) as exc:
             raise ValidationError(f"deterministic replay {index + 1} did not return JSON") from exc
-        replays.append(canonical_bytes(document))
-    if any(replay != replays[0] for replay in replays[1:]):
+        raw_replays.append(canonical_bytes(document))
+    if any(replay != raw_replays[0] for replay in raw_replays[1:]):
         raise ValidationError("deterministic replay produced non-identical output")
-    digest = hashlib.sha256(replays[0]).hexdigest()
+    document = validate_program_output(
+        json.loads(raw_replays[0]), candidate["experiment_intent"],
+        configured_input.get("work_orders", []))
+    admitted_output = canonical_bytes(document)
+    digest = hashlib.sha256(admitted_output).hexdigest()
     if digest != expected:
         raise ValidationError("replay output does not match the declared test-vector digest")
-    document = json.loads(replays[0])
     digests = [digest]
     if (document.get("study_id") != candidate["study_id"]
             or document.get("revision") != candidate["revision"]):
         raise ValidationError("program output does not match the candidate study identity")
-    configured_input = program_validator_configured_input(candidate)
-    document = validate_program_output(
-        document, candidate["experiment_intent"], configured_input.get("work_orders", []))
     verdict_result = validate(canonical_bytes(experiment_validation_payload(
         candidate["experiment_intent"], configured_input, document, digests[0])))
     if getattr(verdict_result, "mode", None) != "sandbox-exec":

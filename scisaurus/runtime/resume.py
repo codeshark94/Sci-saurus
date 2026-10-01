@@ -15,7 +15,7 @@ from scisaurus.core.tasks import TaskManager
 
 
 RESUME_SCOPES = frozenset({"operations", "retrieval", "mapping", "focused_review",
-                           "integrated_review", "gap_assessment", "production", "rendering"})
+                           "integrated_review", "gap_assessment", "follow_up", "production", "rendering"})
 
 
 def source_manifest(root, paths=None):
@@ -163,7 +163,7 @@ class ResumeController:
         if changed and source_policy["mode"] != "reopen":
             raise ValidationError("executed source changed; resume requires explicit affected scopes")
         unknown_rows = self.control._conn.execute(
-            "SELECT a.attempt_id, a.task_id, r.reservation_id, r.window_id"
+            "SELECT a.attempt_id, a.task_id, a.usage_json, r.reservation_id, r.window_id"
             " FROM attempts a LEFT JOIN reservations r ON r.task_id=a.task_id AND r.state='reserved'"
             " WHERE a.state='result_unknown' ORDER BY a.attempt_id"
         ).fetchall()
@@ -172,6 +172,12 @@ class ResumeController:
         reconciled = []
         for row in unknown_rows:
             usage = dict(policy["unknown_outcomes"]["usage_per_attempt"])
+            observed = json.loads(row["usage_json"]).get("observed", {})
+            for key, amount in observed.items():
+                if (not isinstance(key, str) or type(amount) not in (int, float)
+                        or not math.isfinite(amount) or amount < 0):
+                    raise ValidationError("stored observed usage is invalid")
+                usage[key] = max(usage.get(key, 0), amount)
             self.tasks.finish_attempt(row["attempt_id"], "failed", usage=usage)
             if row["reservation_id"] is not None:
                 self.budget.settle(window_id=row["window_id"], reservation_id=row["reservation_id"], actual=usage)

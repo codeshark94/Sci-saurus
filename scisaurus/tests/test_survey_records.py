@@ -2,7 +2,7 @@
 from copy import deepcopy
 import unittest
 
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import ModelContractError, ValidationError
 from scisaurus.runtime.survey_records import (
     GAP_CHECKS,
     MAP_FIELDS,
@@ -12,15 +12,19 @@ from scisaurus.runtime.survey_records import (
     validate_assessment,
     validate_map,
     validate_survey_review,
+    validate_follow_up_result,
 )
 
 
 SOURCES = {
     "artifact:kb/source-one@1": {"work_id": "W1", "representation": "full_text", "identity_verified": True,
+                                "identity_checks": {"title_match": True, "section_markers": ["Results"]},
                                 "text": "Treatment A improves the measured outcome. Generalization was not tested."},
     "artifact:kb/source-two@1": {"work_id": "W2", "representation": "full_text", "identity_verified": True,
+                                "identity_checks": {"title_match": True, "section_markers": ["Results"]},
                                 "text": "Treatment B improves the same outcome in a different population."},
     "artifact:kb/source-three@1": {"work_id": "W3", "representation": "full_text", "identity_verified": True,
+                                  "identity_checks": {"title_match": True, "section_markers": ["Results"]},
                                   "text": "Treatment C has an uncertain effect."},
 }
 WORKS = {"W1", "W2", "W3"}
@@ -56,6 +60,49 @@ def assessment(state="refuted_by_prior_work"):
 
 
 class TestSurveyEvidence(unittest.TestCase):
+    def test_follow_up_source_and_search_binding_errors_are_model_contract_failures(self):
+        from scisaurus.core.source_spans import bind
+        row = {"id": "one", "status": "limited", "rationale": "The capture remains bounded.",
+               "evidence": bind([proof()], SOURCES), "query_refs": ["artifact:query@1"],
+               "limitation": "No independent measurement.", "next_action": "Acquire a measurement."}
+        windows = {ref: {"start": 0, "end": len(source["text"])} for ref, source in SOURCES.items()}
+        for field, replacement in (("query_refs", ["artifact:invented@1"]), ("limitation", "")):
+            with self.subTest(field=field), self.assertRaises(ModelContractError):
+                validate_follow_up_result({"orders": [{**row, field: replacement}]}, [{"id": "one"}],
+                                          SOURCES, row["query_refs"], windows=windows)
+        bad = deepcopy(row)
+        bad["evidence"][0]["work_id"] = "W2"
+        with self.assertRaises(ModelContractError):
+            validate_follow_up_result({"orders": [bad]}, [{"id": "one"}], SOURCES, row["query_refs"], windows=windows)
+
+    def test_follow_up_evidence_ids_require_the_exact_dispatched_catalog(self):
+        from scisaurus.core.source_spans import index_evidence
+        from scisaurus.runtime.survey import SurveyRunner
+        runner = object.__new__(SurveyRunner)
+        runner.source_docs = SOURCES
+        indexed, catalog = index_evidence({"orders": [{"evidence": [proof()]}]}, SOURCES)
+        assignment = {"sources": [{"source_ref": ref, "window": {"start": 0, "end": len(source["text"])}}
+                                  for ref, source in SOURCES.items()], "evidence_catalog": catalog}
+        bound = runner._normalize_follow_up_result(indexed, assignment)
+        self.assertEqual(bound["orders"][0]["evidence"][0]["quote"], proof()["quote"])
+        with self.assertRaises(ModelContractError):
+            runner._normalize_follow_up_result(indexed, {**assignment, "evidence_catalog": []})
+        forged = deepcopy(assignment)
+        forged["evidence_catalog"][0]["source_ref"] = "artifact:kb/source-two@1"
+        with self.assertRaises(ModelContractError):
+            runner._normalize_follow_up_result(indexed, forged)
+
+    def test_follow_up_schema_errors_retain_model_contract_type(self):
+        order = {"id": "one"}
+        row = {"id": "one", "status": "unresolved", "rationale": "Absent evidence.", "evidence": [],
+               "query_refs": [], "limitation": "Source absent.", "next_action": "Acquire exact sources."}
+        values = [{"orders": []}, {"orders": [{"id": "one", "status": "limited", "rationale": "Bounded."}]}]
+        values.extend({"orders": [{**row, field: replacement}]} for field, replacement in (
+            ("rationale", 42), ("limitation", 42), ("query_refs", None), ("evidence", None)))
+        for value in values:
+            with self.subTest(value=value), self.assertRaises(ModelContractError):
+                validate_follow_up_result(value, [order], SOURCES, [], windows={})
+
     def test_map_reports_all_invalid_fields_with_work_and_evidence_locations(self):
         first, second = entry("W1"), entry("W2")
         first["reason"] = {"text": "Incorrect type", "evidence": []}
@@ -122,6 +169,21 @@ class TestSurveyEvidence(unittest.TestCase):
 class TestSurveyMap(unittest.TestCase):
     def validate(self, value, requested=("W1",)):
         validate_map(value, requested, WORKS, SOURCES)
+
+    def test_unverified_and_untyped_captures_cannot_support_map_fields_or_links(self):
+        for changes in ({"representation": "unverified_text"}, {"representation": "other"},
+                        {"identity_verified": False}, {"identity_verified": 1},
+                        {"identity_checks": {"title_match": True, "section_markers": []}},
+                        {"identity_checks": {"title_match": True, "section_markers": ["Abstract"]}},
+                        {"identity_checks": {"title_match": True, "section_markers": ["**Abstract**"]}},
+                        {"identity_checks": {"title_match": True, "section_markers": ["Summary."]}}):
+            sources = deepcopy(SOURCES)
+            sources[proof()["source_ref"]].update(changes)
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValidationError, "identity-verified full text"):
+                validate_map({"entries": [entry()], "relationships": [relationship()]}, ["W1"], WORKS, sources)
+        sources = deepcopy(SOURCES)
+        sources[proof()["source_ref"]]["representation"] = "abstract"
+        validate_map({"entries": [entry()], "relationships": []}, ["W1"], WORKS, sources)
 
     def test_scoped_map_accepts_evidence_bound_links_to_other_known_works(self):
         value = {"entries": [entry()], "relationships": [relationship()]}
@@ -226,6 +288,14 @@ class TestGapAssessment(unittest.TestCase):
                 value["comparisons"][0]["relationship"] = relation
                 self.validate(value)
 
+    def test_nondecisive_comparison_cannot_quote_unverified_work(self):
+        value = assessment("insufficient_evidence")
+        value["comparisons"][0]["relationship"] = "different"
+        sources = deepcopy(SOURCES)
+        sources[proof()["source_ref"]].update(representation="unverified_text", identity_verified=False)
+        with self.assertRaisesRegex(ValidationError, "identity-verified full text"):
+            validate_assessment(value, sources, WORKS)
+
     def test_both_decisive_states_require_explicit_top_level_evidence(self):
         for state in ("refuted_by_prior_work", "eligible_for_experiment"):
             with self.subTest(state=state):
@@ -248,7 +318,7 @@ class TestGapAssessment(unittest.TestCase):
                     self.assertEqual(value["evidence"], [proof("W1")])
                     self.assertEqual(sources[proof("W1")["source_ref"]]["representation"], "full_text")
                     self.assertIs(sources[proof("W1")["source_ref"]]["identity_verified"], True)
-                    with self.assertRaisesRegex(ValidationError, "decisive comparison requires verified full text"):
+                    with self.assertRaisesRegex(ValidationError, "decisive comparison requires verified full text|identity-verified full text"):
                         validate_assessment(value, sources, WORKS)
 
     def test_available_full_text_must_be_cited_by_the_decisive_comparison(self):

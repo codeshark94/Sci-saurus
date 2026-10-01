@@ -264,7 +264,8 @@ def validate_review_draft(value, plan, evidence):
 class ReviewArticleRunner:
     """Bounded, resumable review work with per-call tasks and retained evidence."""
 
-    def __init__(self, config, *, retained_work_dir=None, deadline_seconds=None, on_progress=None):
+    def __init__(self, config, *, retained_work_dir=None, deadline_seconds=None, on_progress=None,
+                 model_config=None):
         self.config = deepcopy(validate_review_article_config(config))
         self.output = Path(config["output_dir"])
         self.output.mkdir(parents=True, exist_ok=True)
@@ -274,7 +275,8 @@ class ReviewArticleRunner:
         self.store.init_project(principal_note="critical review article")
         self.tasks = TaskManager(self.control)
         self.cache = ModelWorkCache(self.store, self._publish)
-        self.model = json.loads(Path(config["model_config_path"]).read_text())
+        self.model = deepcopy(model_config) if model_config is not None else json.loads(
+            Path(config["model_config_path"]).read_text())
         self.on_progress = on_progress or (lambda _: None)
         self.limits = config["limits"]
         self.budget = self._body("command/review-budget")

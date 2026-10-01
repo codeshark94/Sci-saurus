@@ -1268,6 +1268,7 @@ class DepartmentRuntime:
                 proposals.append(self.propose(
                     proposal, source_stage_id=feedback.get("stage_id"),
                     source_event_id=feedback.get("event_id"), note_ref=record["artifact_ref"],
+                    controller_metadata=request,
                 ))
             except (ValidationError, StateError) as exc:
                 request_id = request.get("id") if isinstance(request.get("id"), str) else hashlib.sha256(
@@ -1354,7 +1355,7 @@ class DepartmentRuntime:
                 continue
         return paused
 
-    def resolve_work_orders(self, requests, *, stage_kind, outcome, actor="command.composer"):
+    def resolve_work_orders(self, requests, *, stage_kind, outcome, stage_id=None, actor="command.composer"):
         """Close work orders whose owning stage produced an accepted result.
 
         A hold keeps its work order visible as running so the next autonomous
@@ -1363,7 +1364,15 @@ class DepartmentRuntime:
         """
         resolved = []
         for request in requests or []:
-            if not isinstance(request, dict) or REQUEST_STAGE_KINDS.get(request.get("kind")) != stage_kind:
+            if not isinstance(request, dict):
+                continue
+            target_id = request.get("target_stage_id")
+            if isinstance(target_id, str) and stage_id is not None:
+                owns_stage = target_id == stage_id
+            else:
+                owns_stage = (request.get("target_stage_kind")
+                              or REQUEST_STAGE_KINDS.get(request.get("kind"))) == stage_kind
+            if not owns_stage:
                 continue
             proposal = {key: request.get(key) for key in (
                 "id", "kind", "owner", "objective", "why", "success_condition", "evidence_needed")}

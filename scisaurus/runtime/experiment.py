@@ -76,6 +76,7 @@ class ExperimentProgramOutputContractError(ModelContractError):
 
 
 REVIEW_CHECKS = {"method_alignment", "calculation_trace", "inference_scope", "limitation_coverage"}
+REVIEW_RESULT_ROOTS = frozenset({"procedures", "observations", "metrics", "findings", "assets", "analysis"})
 REVIEW_DECISIONS = {"accepted", "accepted_with_limitations", "rejected"}
 _NONFINITE_NUMERIC_TOKEN = re.compile(
     r"(?<![\w.])(?P<sign>[+-]?)(?P<value>nan|inf(?:inity)?)(?!\w)",
@@ -313,9 +314,12 @@ def validate_program_output(value, experiment, work_orders=None):
     if len(null_primary) == len(configured):
         raise ValidationError(
             "all declared primary outcomes are null; the experiment has no estimable "
-            "primary result. Repair the parameter range or add a scientifically meaningful "
-            "non-null outcome derived from the observations; preserve censored values as null "
-            "and never substitute zero or a grid boundary")
+            "primary result. Diagnose the undefinedness against the executable model, "
+            "measurement procedure, and raw observations before proposing a repair. "
+            "Preserve the admitted research question and primary outcome definitions; "
+            "do not replace an outcome or change a parameter range merely to obtain a "
+            "non-null value. Preserve censored values as null and never substitute zero "
+            "or a grid boundary")
     null_metrics = {metric["id"]: metric for metric in value["metrics"]
                     if metric["value"] is None}
     for metric_id, metric in null_metrics.items():
@@ -545,8 +549,7 @@ def validate_model_review(value, reviewer_id, finding_ids, work_orders=None,
                             "review work-order evidence cites unavailable independent validation")
                     cited = _json_pointer_value(
                         {"deterministic_validation": deterministic_validation}, pointer)
-                elif root in {"procedures", "observations", "metrics", "findings",
-                              "assets", "analysis"}:
+                elif root in REVIEW_RESULT_ROOTS:
                     cited = _json_pointer_value(program_output, pointer)
                 else:
                     raise ValidationError(
@@ -558,7 +561,7 @@ def validate_model_review(value, reviewer_id, finding_ids, work_orders=None,
                 if (not isinstance(limitation_path, str)
                         or not limitation_path.startswith("/limitations/")):
                     raise ValidationError(
-                        "bounded or unresolved work orders require a result limitation path")
+                        "bounded work orders require a result limitation path; any supplied limitation path must resolve")
                 limitation = _json_pointer_value(program_output, limitation_path)
                 if not isinstance(limitation, str) or not limitation.strip():
                     raise ValidationError("work-order limitation path must resolve to nonempty text")
@@ -836,6 +839,8 @@ class ExperimentRunner(ExecutionRuntime):
         self.asset_records = []
         self.asset_files = []
         self.review_records = []
+        self.raw_results_path = None
+        self.raw_results_sha256 = None
         self.serial = 0
         self.literature = {"survey_ref": None, "assessment_ref": None, "state": None}
         self.literature_gate_mismatch = None
@@ -1040,7 +1045,10 @@ class ExperimentRunner(ExecutionRuntime):
                 "or a unique stable object identifier (an `id` or `*_id` field), for example /metrics/0, "
                 "/findings/finding_kill_condition, or /deterministic_validation/checks/independent_recalculation; "
                 "producer-authored assessments are not evidence. A bounded "
-                "outcome must cite its exact limitation_path. "
+                "outcome must cite its exact limitation_path. Use null when no result limitation is cited. "
+                "evidence_paths must use the result_reference_contract roots directly, without a "
+                "program_output_summary prefix. Artifact references, source hashes, work-order paths, "
+                "and prose belong in rationale and are not result pointers. "
                 "The work_order_resolution check must pass iff all orders are resolved or explicitly bounded; otherwise "
                 "mark it insufficient_evidence or failed and reject the review. Do not treat a narrative assertion "
                 "as evidence when the cited observations, metrics, findings, procedures, or analysis do not support it."
@@ -1056,6 +1064,16 @@ class ExperimentRunner(ExecutionRuntime):
         if self.work_orders:
             assignment["work_orders"] = deepcopy(self.work_orders)
             assignment["required_work_order_ids"] = [item["id"] for item in self.work_orders]
+            assignment["result_reference_contract"] = {
+                "evidence_path_roots": [f"/{root}" for root in sorted(REVIEW_RESULT_ROOTS)]
+                    + ["/deterministic_validation"],
+                "limitation_path": {
+                    "required_for": ["bounded"],
+                    "available_paths": [f"/limitations/{index}" for index in range(len(candidate["limitations"]))],
+                    "by_outcome": {"resolved": "null", "bounded": "an available limitation path",
+                                   "not_resolved": "null or an available limitation path"},
+                },
+            }
         return assignment
 
     def _model_checked(self, jobs, *, images, stage):
@@ -1092,16 +1110,8 @@ class ExperimentRunner(ExecutionRuntime):
             for job, spec in zip(pending, specs):
                 outcome = outcomes[spec["task_id"]]
                 if not outcome["ok"]:
-                    if outcome.get("error_type") == "ModelCallError":
-                        raise ModelCallError(
-                            outcome.get("error", "experiment model dispatch failed"),
-                            outcome_known=outcome.get("outcome_known", False),
-                            attempts=outcome.get("attempts", 0),
-                            elapsed_seconds=outcome.get("elapsed_seconds"),
-                            status_code=outcome.get("status_code"),
-                            retry_after_seconds=outcome.get("retry_after_seconds"),
-                            provider_error_kind=outcome.get("provider_error_kind"),
-                        )
+                    if outcome.get("error_type") in {"ModelCallError", "ModelBudgetExceededError"}:
+                        self._raise_model_failure(outcome)
                     raise ValidationError(f"experiment model dispatch failed: {job['name']}: {outcome['error']}")
                 result = ModelResult(**outcome["result"])
                 self.time_policy.observe(stage, result.elapsed_seconds)
@@ -1462,6 +1472,10 @@ class ExperimentRunner(ExecutionRuntime):
                 replay_assets = self._workspace_assets(replay)
                 if any(body != self.asset_files[index]["body"] for index, (_, body) in enumerate(replay_assets)):
                     raise ValidationError("frozen replay did not reproduce the exact experiment assets")
+                self.raw_results_path = self.dir / "output" / "raw-results.json"
+                self.raw_results_path.parent.mkdir(parents=True, exist_ok=True)
+                self.raw_results_path.write_bytes(canonical_bytes(candidate))
+                self.raw_results_sha256 = candidate_sha256
                 deterministic, validation_record, validator_execution_ref = self._deterministic_validate(
                     candidate, candidate_sha256)
                 reviews, images = self._model_reviews(candidate, deterministic, validation_record)
@@ -1566,6 +1580,8 @@ class ExperimentRunner(ExecutionRuntime):
             if isinstance(exc, KeyboardInterrupt):
                 status = "paused"
                 failure = {"kind": "process_interrupted"}
+            elif isinstance(exc, ModelCallError):
+                failure = exc.failure_details()
         finally:
             for row in self.control._conn.execute("SELECT task_id FROM tasks WHERE state='awaiting_review'").fetchall():
                 self.tasks.transition(row[0], "blocked", "command.controller",
@@ -1575,6 +1591,9 @@ class ExperimentRunner(ExecutionRuntime):
             "error": error, "failure": failure, "study_id": self.experiment["id"], "incumbent_ref": self.incumbent,
             "score_ref": getattr(self, "score_ref", None), "literature": self.literature,
             "execution_refs": self.execution_refs,
+            "research_question": self.experiment["research_question"],
+            "raw_results": str(self.raw_results_path.resolve()) if self.raw_results_path else None,
+            "raw_results_sha256": self.raw_results_sha256,
             "deterministic_validation_ref": validation_record["artifact_ref"] if validation_record else None,
             "model_review_refs": [record["artifact_ref"] for record in self.review_records],
             "assessment_ref": assessment_record["artifact_ref"] if assessment_record else None,

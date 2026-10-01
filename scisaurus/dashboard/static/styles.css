@@ -530,6 +530,8 @@ h2 { font-size: 17px; line-height: 1.2; }
 .toast.is-visible { opacity: 1; transform: translateY(0); }
 
 @media (max-width: 1180px) {
+  .hero { grid-template-columns: 1fr; gap: 20px; }
+  .hero-meta { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .department-grid { grid-template-columns: repeat(var(--department-columns, 1), minmax(0, 1fr)); }
   .research-grid { grid-template-columns: 1fr; }
   .research-evidence { grid-template-columns: repeat(3, minmax(0, 1fr)); }

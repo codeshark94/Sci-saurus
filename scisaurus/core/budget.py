@@ -64,6 +64,14 @@ class BudgetManager:
                                 raise ValidationError("window accounting contradicts settlement ledger")
                             if seed > 0 and not math.isclose(seed, 0, abs_tol=1e-12):
                                 usage[key] = usage.get(key, 0) + seed
+                for observation in conn.execute(
+                        "SELECT e.payload_json FROM events e JOIN allocation_windows w "
+                        "ON w.window_id=json_extract(e.payload_json,'$.window_id') "
+                        "WHERE e.event_type='budget.observed_floor' AND w.policy_id=?",
+                        (policy["policy_id"],)):
+                    delta = json.loads(observation["payload_json"])["delta"]
+                    _quantities(delta, "recorded observed usage")
+                    _add(usage, delta)
                 capacity = json.loads(windows[0]["capacity_json"])
                 _quantities(capacity, "capacity", nonempty=True)
                 _quantities(usage, "cumulative usage")
@@ -238,6 +246,30 @@ class BudgetManager:
                 conn, actor="scheduler", event_type="budget.settled",
                 payload={"reservation_id": reservation_id, "window_id": window_id, "actual": actual},
             )
+        return self.get_window(window_id)
+
+    def observe_usage_floor(self, *, window_id, observed, evidence_refs, actor="scheduler"):
+        """Reconcile measured lifetime costs without changing reservations."""
+        _quantities(observed, "observed usage")
+        if not isinstance(evidence_refs, list) or any(not isinstance(ref, str) for ref in evidence_refs):
+            raise ValidationError("observed usage requires evidence references")
+        with self.control.tx() as conn:
+            window = conn.execute("SELECT policy_id FROM allocation_windows WHERE window_id=?",
+                                  (window_id,)).fetchone()
+            if window is None:
+                raise NotFoundError(f"unknown window: {window_id}")
+            row = conn.execute("SELECT cumulative_usage_json FROM resource_pools WHERE policy_id=?",
+                               (window["policy_id"],)).fetchone()
+            usage = json.loads(row[0])
+            delta = {key: value - usage.get(key, 0) for key, value in observed.items()
+                     if value > usage.get(key, 0)}
+            if delta:
+                _add(usage, delta)
+                conn.execute("UPDATE resource_pools SET cumulative_usage_json=? WHERE policy_id=?",
+                             (canonical_bytes(usage).decode(), window["policy_id"]))
+                self.control.append_event(conn, actor=actor, event_type="budget.observed_floor",
+                    payload={"window_id": window_id, "observed": observed,
+                             "delta": delta, "evidence_refs": evidence_refs})
         return self.get_window(window_id)
 
     # -- stagnation (T42) -------------------------------------------------

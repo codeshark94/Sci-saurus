@@ -16,13 +16,14 @@ from scisaurus.core.store import ArtifactStore
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.capability_foundry import (
     CapabilityFoundry, CapabilityDeadlineError, CapabilityModelBudgetExceeded,
-    AUTHOR_CONTINUATION_MAX_OUTPUT_TOKENS, AUTHOR_PATCH_CONTEXT_MAX_CHARS,
+    AUTHOR_CONTINUATION_MAX_OUTPUT_TOKENS,
     AUTHOR_PATCH_MAX_OUTPUT_TOKENS,
     AUTHOR_PATCH_MAX_SOURCE_CHARS, AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS,
-    AUTHOR_PATCH_DUPLICATE_CONTEXT_MAX_CHARS,
     SourceDataUnavailable, _is_repeated_repair_failure, _sandbox_failure_signature,
     _program_gate_failure_signature,
     _authored_candidate_sha256, _candidate_bound_value, _source_patch_context,
+    _retained_candidate_failure,
+    _repair_scientific_input,
     _author_response_format_failure_signature,
     _sandbox_status_text,
     _author_request_signature, _author_request_was_attempted,
@@ -284,6 +285,39 @@ class CapabilityFoundryTests(unittest.TestCase):
             {"id": key, "outcome": "passed", "evidence": "Bound synthetic fixture verified."}
             for key in sorted(PROGRAM_REVIEW_CHECKS)]}
 
+    def test_authoring_patch_preserves_complete_admitted_plan(self):
+        plan = {"root_cause": {"statement": "Diagnosis " * 300},
+                "required_changes": [{"target": "executor", "instruction": "Exact operator " * 300}],
+                "acceptance_checks": [{"phase": "plan" if i == 0 else "execution",
+                                       "check": f"Check {i}: " + "Independent recalculation " * 100}
+                                      for i in range(16)]}
+        digest = hashlib.sha256(canonical_bytes(plan)).hexdigest()
+        prompt = authoring_patch_prompt(
+            brief=json.dumps({"capability_repair": {"repair_plan": plan}}), required_intent={},
+            configured_input={"work_orders": [{"objective": "Use methods_adjudication",
+                                                "methods_adjudication": plan}]},
+            candidate={"executor_source": "def run(): pass", "validator_source": "def check(): pass",
+                       "experiment_intent": {}},
+            feedback="Repair the source", validation_context={}, validation_feedback={}, format_repair={})
+        request = prompt["repair_request"]
+        self.assertEqual(request["repair_plan"], plan)
+        self.assertEqual(request["repair_plan_sha256"], digest)
+        self.assertEqual(request["work_orders"][0]["methods_adjudication"], plan)
+        self.assertEqual(request["work_orders"][0]["methods_adjudication_sha256"], digest)
+        from scisaurus.runtime.specialists import REPAIR_CHECK_PHASE_RULE
+        self.assertIn(REPAIR_CHECK_PHASE_RULE, prompt["instructions"])
+        initial = candidate_prompt(json.dumps({"capability_repair": {"repair_plan": plan}}), [], {})
+        self.assertEqual(initial["repair_check_phase_rule"], REPAIR_CHECK_PHASE_RULE)
+        self.assertEqual(json.loads(initial["capability_brief"])["capability_repair"]["repair_plan"], plan)
+        prompt = authoring_patch_prompt(
+            brief=json.dumps({"capability_repair": {"repair_plan": plan}}), required_intent={},
+            configured_input={"work_orders": []},
+            candidate={"executor_source": "def run(): pass", "validator_source": "def check(): pass",
+                       "experiment_intent": {}},
+            feedback="Repair the source", validation_context={}, validation_feedback={}, format_repair={})
+        self.assertEqual(prompt["repair_request"]["repair_plan"], plan)
+        self.assertEqual(prompt["repair_request"]["repair_plan_sha256"], digest)
+
     def test_authoring_repair_prompt_targets_one_blocker_and_defers_the_rest(self):
         primary = {
             "severity": "blocking", "finding": "The contrast is algebraic by construction.",
@@ -380,30 +414,158 @@ class CapabilityFoundryTests(unittest.TestCase):
         self.assertEqual(check_only["deferred_failed_check_ids"], ["independent_validation"])
         self.assertEqual(check_only["repair_scope"]["active_issue"], "failed_check")
 
-    def test_repair_prompt_includes_only_focused_complete_source_sections(self):
-        source = (
-            "def main():\n    return measure()\n\n"
-            "def measure():\n    return 2\n\n"
-            "def unrelated():\n    return 'large irrelevant body'\n"
-        )
-        context = _source_patch_context(source, "repair measure")
-        self.assertEqual([item["name"] for item in context["sections"]], ["measure"])
-        self.assertIn("def measure()", context["sections"][0]["source"])
-        self.assertNotIn("unrelated", json.dumps(context))
-        self.assertLessEqual(
-            sum(len(item["source"]) for item in context["sections"]),
-            AUTHOR_PATCH_CONTEXT_MAX_CHARS)
 
+
+
+
+
+
+
+
+
+
+
+    def test_repair_source_context_preserves_complete_bytes_and_physical_indices(self):
+        for newline in ["\n", "\r\n", "\r"]:
+            for separator in ["\u2028", "\u2029", "\x85", "\v", "\f"]:
+                with self.subTest(newline=repr(newline), separator=repr(separator)):
+                    source = newline.join([
+                        "label = 'before" + separator + "after'", "",
+                        "def measure():", "    return 1", "",
+                        "def measure():", "    return 2", "",
+                    ])
+                    context = _source_patch_context(source)
+                    self.assertEqual(context["source"], source)
+                    self.assertTrue(context["source_complete"])
+                    self.assertEqual(context["source_sha256"], hashlib.sha256(source.encode()).hexdigest())
+                    self.assertEqual(context["duplicate_definitions"],
+                                     [{"name": "measure", "line_starts": [3, 6]}])
+
+    def test_repair_prompt_includes_large_complete_source_without_feedback_selection(self):
+        source = ("def collect():\n    padding = '" + "x" * 50000 + "'\n"
+                  "    output = {'unrequested': True}\n    return output\n")
+        candidate = {"executor_source": source, "validator_source": source,
+                     "experiment_intent": {"id": "study"}}
         prompt = authoring_patch_prompt(
-            brief={}, required_intent={}, configured_input={},
-            candidate={"executor_source": source, "validator_source": "def validate(): pass",
-                       "experiment_intent": {"id": "study"}},
-            feedback="repair measure", validation_context={},
-            validation_feedback={}, format_repair={},
-        )
-        serialized = json.dumps(prompt)
-        self.assertNotIn(source, serialized)
-        self.assertIn("Do not emit internal reasoning", prompt["instructions"])
+            brief={}, required_intent={}, configured_input={}, candidate=candidate,
+            feedback="unknown failure", validation_context={}, validation_feedback={},
+            format_repair={})
+        for context in prompt["current_candidate"]["source_context"].values():
+            self.assertEqual(context["source"], source)
+            self.assertEqual(context["characters"], len(source))
+            self.assertTrue(context["source_complete"])
+        self.assertEqual(json.loads(json.dumps(prompt))["current_candidate"]["source_context"]
+                         ["executor_source"]["source"], source)
+
+    def test_repair_source_context_preserves_invalid_source_for_syntax_repair(self):
+        source = "def incomplete(:\n    return 1\n"
+        context = _source_patch_context(source)
+        self.assertEqual(context["source"], source)
+        self.assertEqual(context["syntax_error"]["line"], 1)
+
+    def test_candidate_failure_is_not_attached_to_a_different_revision(self):
+        candidate = {"executor_source": "def run(): return 1", "validator_source": "def check(): pass",
+                     "experiment_intent": {"id": "study"}}
+        state = {"candidate_failure": {"error": "old candidate failure"},
+                 "candidate_failure_sha256": _authored_candidate_sha256(candidate)}
+        self.assertEqual(_retained_candidate_failure(state, candidate)["error"], "old candidate failure")
+        revised = {**candidate, "executor_source": "def run(): return 2"}
+        self.assertEqual(_retained_candidate_failure(state, revised), {})
+
+    def test_candidate_failure_restores_only_exact_recorded_legacy_output_failure(self):
+        candidate = {"executor_source": "def run(): return 1", "validator_source": "def check(): pass",
+                     "experiment_intent": {"id": "study"}, "runtime": {"python": "3"},
+                     "test_input": {"conditions": [1]}}
+        details = {"repair_kind": "executor_output_contract", "previous_error": "undocumented field",
+                   "required_fields": ["observations"], "observed_fields": ["observations", "extra"],
+                   "missing_fields": [], "unexpected_fields": ["extra"]}
+        fingerprint = _authored_candidate_sha256(candidate)
+        current = {"experiment_intent": candidate["experiment_intent"],
+                   "source_context": {key: _source_patch_context(candidate[key])
+                                      for key in ("executor_source", "validator_source")}}
+        state = {"last_attempt": candidate,
+                 "repair_ledger": [{"candidate_sha256": hashlib.sha256(canonical_bytes(candidate)).hexdigest(),
+                                    "gate": "program_output_contract", "error": "undocumented field"}],
+                 "requests": [{"prompt": json.dumps({"candidate_sha256": fingerprint,
+                                                       "current_candidate": current,
+                                                       "format_repair": details})}]}
+        self.assertEqual(_retained_candidate_failure(state, candidate)["unexpected_fields"], ["extra"])
+        for newline in ["\n", "\r\n", "\r"]:
+            with self.subTest(legacy_newline=repr(newline)):
+                legacy_candidate = {**candidate, "executor_source": "def run():" + newline + "    return 1" + newline}
+                legacy = deepcopy(state)
+                legacy["last_attempt"] = legacy_candidate
+                legacy["repair_ledger"][0]["candidate_sha256"] = hashlib.sha256(canonical_bytes(legacy_candidate)).hexdigest()
+                context = {"experiment_intent": legacy_candidate["experiment_intent"], "source_context": {
+                    key: {"source_sha256": hashlib.sha256(legacy_candidate[key].encode()).hexdigest(),
+                          "sections": [{"line_start": 1, "line_end": len(legacy_candidate[key].splitlines()),
+                                        "source": "\n".join(legacy_candidate[key].splitlines())}]}
+                    for key in ("executor_source", "validator_source")}}
+                request = {"candidate_sha256": _authored_candidate_sha256(legacy_candidate),
+                           "current_candidate": context, "format_repair": details}
+                legacy["requests"][0]["prompt"] = json.dumps(request)
+                self.assertEqual(_retained_candidate_failure(legacy, legacy_candidate)["unexpected_fields"], ["extra"])
+                request["current_candidate"]["source_context"]["executor_source"]["sections"][0]["source"] += "forged"
+                legacy["requests"][0]["prompt"] = json.dumps(request)
+                self.assertEqual(_retained_candidate_failure(legacy, legacy_candidate), {})
+        mismatched = deepcopy(state)
+        mismatched["requests"][0]["prompt"] = json.dumps({"candidate_sha256": "0" * 64,
+                                                          "format_repair": details})
+        self.assertEqual(_retained_candidate_failure(mismatched, candidate), {})
+        conflicting = deepcopy(state)
+        request = json.loads(conflicting["requests"][0]["prompt"])
+        request["current_candidate"]["source_context"]["executor_source"]["source_sha256"] = "0" * 64
+        conflicting["requests"][0]["prompt"] = json.dumps(request)
+        self.assertEqual(_retained_candidate_failure(conflicting, candidate), {})
+        stale = deepcopy(state)
+        stale["repair_ledger"].append({**state["repair_ledger"][0], "gate": "scientific_review"})
+        self.assertEqual(_retained_candidate_failure(stale, candidate), {})
+        malformed = deepcopy(state)
+        malformed["requests"] = [{"prompt": "[]"}, {"prompt": "invalid"}]
+        self.assertEqual(_retained_candidate_failure(malformed, candidate), {})
+
+    def test_patch_prompt_preserves_exact_scoped_evidence_frontier(self):
+        frontier = {"receipt_ref": "artifact:methods-evidence/receipt@1",
+                    "origin_science_sha256": "a" * 64, "current_science_sha256": "b" * 64,
+                    "request": {"requested_actions": ["derive " + "x" * 2500]},
+                    "notes": [{"action_disposition": "superseded", "content": "analysis " + "y" * 5000}]}
+        digest = hashlib.sha256(canonical_bytes(frontier)).hexdigest()
+        brief = {"repair_evidence_frontier": frontier, "repair_evidence_frontier_sha256": digest}
+        candidate = {"executor_source": "def run(): return 1", "validator_source": "def check(): pass",
+                     "experiment_intent": {"id": "study"}}
+        def prompt(value):
+            return authoring_patch_prompt(
+                brief=value, required_intent={}, configured_input={}, candidate=candidate,
+                feedback="repair", validation_context={}, validation_feedback={}, format_repair={})
+        result = json.loads(json.dumps(prompt(brief)))["repair_request"]
+        self.assertEqual(result["repair_evidence_frontier"], frontier)
+        self.assertEqual(result["repair_evidence_frontier_sha256"], digest)
+        with self.assertRaisesRegex(ValidationError, "fingerprint does not match"):
+            prompt({**brief, "repair_evidence_frontier_sha256": "0" * 64})
+        with self.assertRaisesRegex(ValidationError, "frontier must be an object"):
+            prompt({"repair_evidence_frontier": []})
+
+    def test_duplicate_structure_patch_preserves_unicode_strings_and_physical_lines(self):
+        for newline in ["\n", "\r\n", "\r"]:
+            with self.subTest(newline=repr(newline)):
+                source = newline.join([
+                    "label = 'before\u2028after'", "",
+                    "def measure():", "    return 1", "",
+                    "def measure():", "    return 2", "",
+                ])
+                context = _source_patch_context(source)
+                previous = self._payload()
+                previous["executor_source"] = source
+                revised = apply_authoring_patch(previous, {"updates": {"executor_source": {
+                    "source_sha256": context["source_sha256"],
+                    "remove_duplicate_definitions": [{"name": "measure", "keep_line_start": 6}],
+                }}})
+                result = revised["executor_source"]
+                self.assertIn("label = 'before\u2028after'" + newline, result)
+                self.assertIn("def measure():" + newline + "    return 2", result)
+                self.assertNotIn("return 1", result)
+                self.assertEqual(result.count("def measure():"), 1)
+
 
     def test_duplicate_structure_patch_removes_only_model_selected_declarations(self):
         source = (
@@ -414,22 +576,13 @@ class CapabilityFoundryTests(unittest.TestCase):
             "if __name__ == '__main__':\n    main()\n\n"
             "if __name__ == '__main__':\n    main()\n"
         )
-        context = _source_patch_context(source, "duplicate measure definitions")
+        context = _source_patch_context(source)
         duplicate = next(item for item in context["duplicate_definitions"]
                          if item["name"] == "measure")
         self.assertEqual(len(duplicate["line_starts"]), 2)
         self.assertEqual(len(context["entry_guard_line_starts"]), 2)
-        self.assertEqual(len(context["entry_guard_source_sections"]), 2)
-        self.assertTrue(context["entry_guard_source_complete"])
-        self.assertTrue(all("main()" in item["source"]
-                            for item in context["entry_guard_source_sections"]))
-        measure_sources = [item["source"] for item in context["duplicate_source_sections"]
-                           if item["name"] == "measure"]
-        self.assertEqual(len(measure_sources), 2)
-        self.assertTrue(context["duplicate_source_complete"])
-        self.assertLessEqual(sum(len(item["source"])
-                                 for item in context["duplicate_source_sections"]),
-                             AUTHOR_PATCH_DUPLICATE_CONTEXT_MAX_CHARS)
+        self.assertEqual(context["source"], source)
+        self.assertTrue(context["source_complete"])
         prompt = authoring_patch_prompt(
             brief={}, required_intent={}, configured_input={},
             candidate={"executor_source": source,
@@ -461,8 +614,8 @@ class CapabilityFoundryTests(unittest.TestCase):
         self.assertNotIn("def measure():\n    return 1", repaired)
         self.assertIn("def unrelated():\n    return 'retain me'", repaired)
         self.assertEqual(repaired.count("if __name__ == '__main__':"), 1)
-        self.assertEqual(_source_patch_context(repaired, "")["duplicate_definitions"], [])
-        self.assertEqual(len(_source_patch_context(repaired, "")["entry_guard_line_starts"]), 1)
+        self.assertEqual(_source_patch_context(repaired)["duplicate_definitions"], [])
+        self.assertEqual(len(_source_patch_context(repaired)["entry_guard_line_starts"]), 1)
         from scisaurus.runtime.program_admission import scan_program_source
         scan_program_source(repaired, "program executor")
 
@@ -473,12 +626,10 @@ class CapabilityFoundryTests(unittest.TestCase):
             "if '__main__' == __name__:\n    first()\n\n"
             "if __name__ == '__main__':\n    second()\n"
         )
-        context = _source_patch_context(source, "duplicate entry guards")
+        context = _source_patch_context(source)
         self.assertEqual(len(context["entry_guard_line_starts"]), 2)
-        self.assertTrue(context["entry_guard_source_complete"])
-        guard_sources = [item["source"] for item in context["entry_guard_source_sections"]]
-        self.assertIn("first()", guard_sources[0])
-        self.assertIn("second()", guard_sources[1])
+        self.assertEqual(context["source"], source)
+        self.assertTrue(context["source_complete"])
         prompt = authoring_patch_prompt(
             brief={}, required_intent={}, configured_input={},
             candidate={"executor_source": source, "validator_source": "def check(): pass",
@@ -487,7 +638,7 @@ class CapabilityFoundryTests(unittest.TestCase):
             validation_feedback={}, format_repair={},
         )
         serialized = json.dumps(prompt)
-        self.assertIn("entry_guard_source_sections", serialized)
+        self.assertIn("entry_guard_line_starts", serialized)
         self.assertIn("first()", serialized)
         self.assertIn("second()", serialized)
         patch = {
@@ -505,29 +656,27 @@ class CapabilityFoundryTests(unittest.TestCase):
         from scisaurus.runtime.program_admission import scan_program_source
         scan_program_source(repaired, "program executor")
 
-    def test_duplicate_entry_guard_comparison_refuses_omitted_bodies(self):
+    def test_duplicate_entry_guard_patch_compares_large_complete_source(self):
         long_body = "    value = " + repr("x" * 24500) + "\n    consume(value)\n"
         source = (
             "if '__main__' == __name__:\n" + long_body + "\n"
             "if __name__ == '__main__':\n" + long_body
         )
-        context = _source_patch_context(source, "duplicate entry guards")
-        self.assertFalse(context["entry_guard_source_complete"])
+        context = _source_patch_context(source)
+        self.assertEqual(context["source"], source)
         patch = {
             "source_sha256": context["source_sha256"],
             "remove_duplicate_definitions": [],
             "keep_entry_guard_line_start": context["entry_guard_line_starts"][0],
         }
-        with self.assertRaisesRegex(ValidationError, "complete comparison context limit"):
-            apply_authoring_patch(
-                {"executor_source": source, "validator_source": "def check(): pass",
-                 "experiment_intent": {}},
-                {"updates": {"executor_source": patch}},
-            )
+        revised = apply_authoring_patch(
+            {"executor_source": source, "validator_source": "def check(): pass",
+             "experiment_intent": {}}, {"updates": {"executor_source": patch}})
+        self.assertEqual(revised["executor_source"].count("consume(value)"), 1)
 
     def test_duplicate_structure_patch_rejects_stale_hash_and_nonduplicate_targets(self):
         source = "def keep():\n    return 1\n\ndef keep():\n    return 2\n"
-        context = _source_patch_context(source, "duplicate keep")
+        context = _source_patch_context(source)
         starts = context["duplicate_definitions"][0]["line_starts"]
         base = {"executor_source": source, "validator_source": "def validate(): pass",
                 "experiment_intent": {}}
@@ -555,11 +704,9 @@ class CapabilityFoundryTests(unittest.TestCase):
 
     def test_duplicate_structure_patch_is_bounded(self):
         self.assertEqual(AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS, 8)
-        self.assertGreater(AUTHOR_PATCH_DUPLICATE_CONTEXT_MAX_CHARS,
-                           AUTHOR_PATCH_CONTEXT_MAX_CHARS)
         names = [f"def f{index}():\n    return 1\n" for index in range(9)]
         source = "\n".join(names + names)
-        context = _source_patch_context(source, "all duplicate functions")
+        context = _source_patch_context(source)
         patch = {
             "source_sha256": context["source_sha256"],
             "remove_duplicate_definitions": [
@@ -574,11 +721,11 @@ class CapabilityFoundryTests(unittest.TestCase):
                 {"updates": {"executor_source": patch}},
             )
 
-    def test_duplicate_structure_patch_requires_complete_comparison_context(self):
+    def test_duplicate_structure_patch_compares_large_complete_source(self):
         body = "    payload = " + repr("x" * 24500) + "\n    return payload\n"
         source = "def calculate():\n" + body + "\ndef calculate():\n" + body
-        context = _source_patch_context(source, "duplicate calculate definitions")
-        self.assertFalse(context["duplicate_source_complete"])
+        context = _source_patch_context(source)
+        self.assertEqual(context["source"], source)
         starts = context["duplicate_definitions"][0]["line_starts"]
         patch = {
             "source_sha256": context["source_sha256"],
@@ -586,12 +733,10 @@ class CapabilityFoundryTests(unittest.TestCase):
                 "name": "calculate", "keep_line_start": starts[0],
             }],
         }
-        with self.assertRaisesRegex(ValidationError, "complete comparison context limit"):
-            apply_authoring_patch(
-                {"executor_source": source, "validator_source": "def validate(): pass",
-                 "experiment_intent": {}},
-                {"updates": {"executor_source": patch}},
-            )
+        revised = apply_authoring_patch(
+            {"executor_source": source, "validator_source": "def validate(): pass",
+             "experiment_intent": {}}, {"updates": {"executor_source": patch}})
+        self.assertEqual(revised["executor_source"].count("def calculate():"), 1)
 
     def test_validation_feedback_is_bound_to_the_candidate_that_was_reviewed(self):
         candidate = {"executor_source": "def run(): return 1", "validator_source": "def check(): return 1",
@@ -921,7 +1066,7 @@ class CapabilityFoundryTests(unittest.TestCase):
         self.assertIn("A new independent defect remains.",
                       {item["finding"] for item in remaining})
 
-    def test_seeded_candidate_migrates_format_diagnosis_then_dedupes_across_provenance(self):
+    def test_seeded_candidate_preserves_format_progress_and_author_budget_across_provenance(self):
         payload = self._payload()
         rejected = self._review_payload()
         rejected["status"] = "rejected"
@@ -993,12 +1138,13 @@ class CapabilityFoundryTests(unittest.TestCase):
                                  repair_provenance={"review_revision": 3},
                                  on_progress=lambda phase, state: progress.append((phase, state)))
 
-        self.assertIn("unchanged experiment-author prompt", str(duplicate.exception))
+        self.assertIn("in 3 attempts", str(duplicate.exception))
         self.assertEqual(author.calls, 4)
         self.assertEqual(len(author.output_limits), author.calls)
         self.assertEqual(len(author.prompts), len(set(author.prompts)))
         self.assertEqual(reviewer.calls, 1)
         migrated_state = progress[-1][1]
+        self.assertEqual(migrated_state["attempts"], 3)
         self.assertIn("truncated", migrated_state["format_repair"]["instructions"])
         self.assertGreaterEqual(len(migrated_state["model_diagnostics"]), 2)
 
@@ -2280,6 +2426,104 @@ class CapabilityFoundryTests(unittest.TestCase):
             self.assertEqual(client.calls, 1)
             self.assertIn("candidate_seed_ref", cache.entries()[0])
 
+    def test_repair_seed_identity_preserves_scientific_fields_and_unrelated_lineages(self):
+        order = {
+            "kind": "analysis_repair", "objective": "Recalculate the primary contrast",
+            "attempt_lineage": {"failure_input_sha256": "a" * 64,
+                                "prior_attempt_reconciliation": {"attempt_count": 2}},
+            "experiment_repair_plan": {"schema_version": "experiment-repair-plan-1",
+                "lineage": {"failure_input_sha256": "a" * 64,
+                            "prior_attempt_reconciliation": {"attempt_count": 2}}},
+        }
+        revised = deepcopy(order)
+        revised["attempt_lineage"]["prior_attempt_reconciliation"]["attempt_count"] = 3
+        revised["experiment_repair_plan"]["lineage"]["prior_attempt_reconciliation"]["attempt_count"] = 3
+        self.assertEqual(_repair_scientific_input(order), _repair_scientific_input(revised))
+        self.assertEqual(order["attempt_lineage"]["prior_attempt_reconciliation"]["attempt_count"], 2)
+        for key in ("objective", "failure_input_sha256"):
+            changed = deepcopy(revised)
+            if key == "objective":
+                changed[key] = "Measure a different contrast"
+            else:
+                changed["attempt_lineage"][key] = "b" * 64
+            self.assertNotEqual(_repair_scientific_input(order), _repair_scientific_input(changed))
+        parameter = {"parameters": {"lineage": {"prior_attempt_reconciliation": {"value": 2}}}}
+        self.assertEqual(_repair_scientific_input(parameter), parameter)
+        for kind in ({}, [], None):
+            parameter = {"parameters": {"kind": kind,
+                         "attempt_lineage": {"prior_attempt_reconciliation": 7}}}
+            self.assertEqual(_repair_scientific_input(parameter), parameter)
+
+    def test_reconciled_repair_seed_retains_candidate_counters_and_current_validation_input(self):
+        order = {"kind": "analysis_repair", "objective": "Recalculate the primary contrast",
+                 "attempt_lineage": {"failure_input_sha256": "a" * 64,
+                                     "prior_attempt_reconciliation": {"attempt_count": 2}}}
+        updated_order = deepcopy(order)
+        updated_order["attempt_lineage"]["prior_attempt_reconciliation"]["attempt_count"] = 3
+        old_input = {"probe": True, "repair_order": order}
+        new_input = {"probe": True, "repair_order": updated_order}
+        old_brief = json.dumps({"continuation": {"requests": [order]}})
+        new_brief = json.dumps({"continuation": {"requests": [updated_order]}})
+        previous = self._payload()
+        previous["experiment_intent"]["unexpected"] = True
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            cache = self._cache(root)
+            cache.put("previous-contract", {"status": "repairing", "attempts": 2,
+                "assignment": {"capability_brief": old_brief, "configured_input": old_input},
+                "last_attempt": previous, "feedback": "remove unexpected field",
+                "usage": {"model_calls": 9, "input_tokens": 900},
+                "repair_gate_counts": {"author_response_contract": 1},
+                "repair_ledger": [{"attempt": 2, "gate": "author_response_contract"}],
+                "requests": []})
+            class PatchAuthor(StubClient):
+                def complete(inner_self, *, system, prompt):
+                    parsed = json.loads(prompt)
+                    self.assertEqual(parsed["assignment"], "repair_existing_experiment_candidate")
+                    return super().complete(system=system, prompt=prompt)
+            author = PatchAuthor({"updates": {"experiment_intent": {"unexpected": None}}})
+            foundry = self._foundry(root)
+            foundry.max_attempts = 3
+            progress = []
+            result = foundry.generate(new_brief, client=author, work_cache=cache,
+                test_input=new_input,
+                on_progress=lambda phase, state: progress.append((phase, state)))
+            final = progress[-1][1]
+            self.assertEqual(author.calls, 1)
+            self.assertEqual(result["status"], "registered")
+            self.assertEqual(final["attempts"], 3)
+            self.assertEqual(final["repair_gate_counts"]["author_response_contract"], 1)
+            self.assertEqual(final["repair_ledger"][0]["attempt"], 2)
+            self.assertEqual(result["candidate"]["test_vector"]["input"]["configured_input"], new_input)
+            self.assertEqual(final["usage"]["model_calls"], 2)
+            self.assertNotEqual(final["usage"].get("input_tokens"), 900)
+            self.assertIn("candidate_seed_ref", final)
+
+    def test_changed_scientific_repair_input_does_not_seed_prior_candidate(self):
+        order = {"kind": "analysis_repair", "objective": "Old contrast",
+                 "attempt_lineage": {"prior_attempt_reconciliation": {"attempt_count": 2}}}
+        changed = deepcopy(order)
+        changed["objective"] = "Different contrast"
+        old_input = {"probe": True, "repair_order": order}
+        new_input = {"probe": True, "repair_order": changed}
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            cache = self._cache(root)
+            cache.put("previous-contract", {"status": "repairing", "attempts": 2,
+                "assignment": {"capability_brief": "comparison", "configured_input": old_input},
+                "last_attempt": self._payload(), "feedback": "old failure", "requests": []})
+            payload = self._payload()
+            payload["test_input"] = new_input
+            author = StubClient(payload)
+            progress = []
+            result = self._foundry(root).generate("comparison", client=author, work_cache=cache,
+                test_input=new_input,
+                on_progress=lambda phase, state: progress.append((phase, state)))
+            self.assertEqual(result["status"], "registered")
+            self.assertEqual(author.calls, 1)
+            self.assertNotIn("candidate_seed_ref", progress[-1][1])
+            self.assertEqual(progress[-1][1]["attempts"], 1)
+
     def test_changed_patch_contract_replays_recorded_repair_before_spending_a_call(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -3146,10 +3390,9 @@ class CapabilityFoundryTests(unittest.TestCase):
         self.assertEqual(
             patch_prompt["current_candidate"]["source_context"]["executor_source"]["source_sha256"],
             hashlib.sha256(payload["executor_source"].encode()).hexdigest())
-        self.assertLess(
-            sum(len(item["source"]) for item in
-                patch_prompt["current_candidate"]["source_context"]["executor_source"]["sections"]),
-            len(payload["executor_source"]))
+        self.assertEqual(
+            patch_prompt["current_candidate"]["source_context"]["executor_source"]["source"],
+            payload["executor_source"])
         self.assertIn(
             "The primary slope is fixed by the equation",
             json.dumps(patch_prompt["repair_request"]["validation_feedback"]))
@@ -3187,6 +3430,8 @@ class CapabilityFoundryTests(unittest.TestCase):
                 inner_self.output_budgets.append(inner_self.max_output_tokens)
                 if inner_self.calls == 1:
                     value = payload
+                elif inner_self.calls == 2:
+                    value = {"invalid_author_envelope": True}
                 else:
                     value = {"updates": {"executor_source": {"edits": [
                         {"old": invalid_lines, "new": ""},
@@ -3200,16 +3445,32 @@ class CapabilityFoundryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
             foundry = self._foundry(root)
+            foundry.max_attempts = 3
             author = PatchingAuthor()
             outcome = foundry.generate("bounded comparison", client=author)
 
         self.assertEqual(outcome["status"], "registered")
-        self.assertEqual(author.calls, 2)
-        self.assertEqual(author.output_budgets, [24000, 4096])
+        self.assertEqual(author.calls, 3)
+        self.assertEqual(author.output_budgets, [24000, 4096, 4096])
         repair_prompt = json.loads(author.prompts[1])
         self.assertEqual(repair_prompt["format_repair"]["repair_kind"], "executor_output_contract")
         self.assertEqual(repair_prompt["format_repair"]["missing_fields"], ["observations"])
         self.assertEqual(repair_prompt["format_repair"]["unexpected_fields"], ["unrequested"])
+
+        retry_prompt = json.loads(author.prompts[2])
+        failure = retry_prompt["repair_request"]["candidate_failure"]
+        self.assertEqual(failure["gate"], "program_output_contract")
+        self.assertEqual(retry_prompt["repair_request"]["repair_scope"]["active_issue"], "candidate_failure")
+        self.assertIsNone(repair_prompt["repair_request"]["author_response_error"])
+        self.assertEqual(failure["missing_fields"], ["observations"])
+        self.assertEqual(failure["unexpected_fields"], ["unrequested"])
+        self.assertIn("unexpected=['unrequested']", retry_prompt["repair_request"]["previous_error"])
+        self.assertIn("observed keys", retry_prompt["repair_request"]["author_response_error"])
+        for prompt in (repair_prompt, retry_prompt):
+            context = prompt["current_candidate"]["source_context"]["executor_source"]
+            self.assertEqual(context["source"], payload["executor_source"])
+            self.assertIn(invalid_lines, context["source"])
+            self.assertEqual(context["source_sha256"], hashlib.sha256(context["source"].encode()).hexdigest())
 
     def test_repeated_admission_gate_stops_before_authoring_budget_is_spent(self):
         payload = self._payload()

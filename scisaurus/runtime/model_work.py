@@ -10,6 +10,19 @@ from scisaurus.core.schema import canonical_bytes
 class ModelWorkBlocked(ValidationError):
     """An unchanged assignment has exhausted its scoped repair allowance."""
 
+    def __init__(self, message, *, failure_class=None):
+        super().__init__(message)
+        if failure_class is not None:
+            self.failure_class = failure_class
+
+    @classmethod
+    def from_states(cls, states):
+        states = list(states)
+        failure_class = ("model_contract" if states and all(
+            state.get("failure_class") == "model_contract" for state in states) else None)
+        return cls("; ".join(state["error"] for state in states),
+                   failure_class=failure_class)
+
 
 class ModelWorkCache:
     """Retain checked results and repair state, never provider credentials.
@@ -25,6 +38,10 @@ class ModelWorkCache:
 
     @staticmethod
     def key(*, scope, role, system, prompt, model):
+        model = deepcopy(model)
+        for field in ("model_call_budget_scopes", "model_call_budget_path",
+                      "model_call_budget_key", "model_call_budget_limit"):
+            model.pop(field, None)
         return hashlib.sha256(canonical_bytes({
             "schema": "model-work-1", "scope": scope, "role": role,
             "system": system, "prompt": prompt, "model": model,

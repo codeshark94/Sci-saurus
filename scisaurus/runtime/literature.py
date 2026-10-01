@@ -34,7 +34,7 @@ DEFAULT_ENDPOINT = "https://api.openalex.org/works"
 MAX_REQUEST_URL_BYTES = 4094
 SEARCH_SYNTAX = "OpenAlex stemmed search: use search terms or quoted phrases, without '*' or '?' wildcards. The percent-encoded request URL must fit 4094 bytes."
 ARGUMENT_KEYS = {"operation", "query", "work_id", "limit", "cursor"}
-TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 500, 502, 503, 504})
 PROVIDER_THROTTLE_KINDS = frozenset({
     "anonymous_search_load", "daily_budget", "request_rate",
 })
@@ -927,6 +927,7 @@ class OpenAlexClient:
         last = None
         retry_wait_seconds = 0.0
         pacing_wait_seconds = 0.0
+        http_attempts = 0
         for attempt in range(self.max_retries + 1):
             waited = self._reserve_request_slot(deadline)
             if waited is None:
@@ -938,7 +939,11 @@ class OpenAlexClient:
             last = self._run_once(operation=operation, query=query, work_id=work_id,
                                   limit=limit, cursor=cursor, timeout=remaining,
                                   credential=credential, auth_required=auth_required)
-            last.setdefault("metadata", {})["attempts"] = attempt + 1
+            admitted = last["metadata"]["attempts"]
+            if type(admitted) is not int or admitted not in (0, 1):
+                raise ValidationError("OpenAlex transport attempt count is invalid")
+            http_attempts += admitted
+            last["metadata"]["attempts"] = http_attempts
             status = (last.get("metadata") or {}).get("http_status")
             provider_throttle = last.get("outcome") == "rate_limited"
             provider_response = last.get("raw_response")
@@ -983,6 +988,8 @@ class OpenAlexClient:
                         except (OSError, ValueError) as exc:
                             last.setdefault("metadata", {})["rate_state_error"] = (
                                 f"{type(exc).__name__}: {exc}")
+            if status == 429:
+                last.setdefault("metadata", {})["retry_suppressed_reason"] = "provider_rate_limit_requires_operator_recovery"
             if status not in TRANSIENT_HTTP_STATUSES or attempt >= self.max_retries:
                 last.setdefault("metadata", {})["retry_wait_seconds"] = retry_wait_seconds
                 last["metadata"]["pacing_wait_seconds"] = pacing_wait_seconds
@@ -1022,7 +1029,7 @@ class OpenAlexClient:
                   "metadata": {"provider": "openalex", "transport": "http_api", "adapter_version": ADAPTER_VERSION,
                                "schema_version": SCHEMA_VERSION, "representation": "scholarly_metadata",
                                "request": arguments, "started_at": _now(),
-                               "authenticated": credential is not None,
+                               "authenticated": credential is not None, "attempts": 0,
                                "capture_truncated": False, "capture_incomplete": False}}
         if auth_required is None:
             auth_required = self.auth_env is not None
@@ -1083,6 +1090,7 @@ class OpenAlexClient:
         response, body = None, bytearray()
         timer.start()
         try:
+            result["metadata"]["attempts"] = 1
             connection.request("GET", parsed.path + ("?" + parsed.query if parsed.query else ""), headers=headers)
             active_socket = connection.sock
             response = connection.getresponse()
@@ -1162,3 +1170,38 @@ class OpenAlexClient:
                 result["capture_sha256"] = result["capture"]["sha256"]
             result["metadata"]["completed_at"] = _now()
         return result
+
+
+def openalex_request_usage(connection, read_body, *, owner_key=None):
+    """Count captured HTTP attempts under their immutable dispatch owner."""
+    owners = []
+    for row in connection.execute(
+            "SELECT body_hash,created_at FROM artifacts WHERE logical_id LIKE "
+            "'command/model-budget-delegations/%' ORDER BY created_at"):
+        body = json.loads(read_body(row[0]))
+        scope = body.get("delegation", {}).get("scope", {})
+        if isinstance(scope.get("model_call_budget_key"), str):
+            owners.append((row[1], scope["model_call_budget_key"]))
+    total, evidence, gaps = 0, [], []
+    for row in connection.execute(
+            "SELECT t.task_id,p.payload_json,p.created_at,a.body_hash,a.artifact_ref "
+            "FROM tasks t JOIN attempts p USING(task_id) LEFT JOIN artifacts a "
+            "ON a.logical_id='command/executions/'||t.task_id "
+            "AND a.version=(SELECT MAX(h.version) FROM artifacts h WHERE h.logical_id=a.logical_id) "
+            "WHERE json_extract(t.payload_json,'$.operation')='openalex' "
+            "AND p.created_at=(SELECT MAX(q.created_at) FROM attempts q WHERE q.task_id=t.task_id)"):
+        payload = json.loads(row[1])
+        owner = payload.get("budget_scope", {}).get("model_call_budget_key")
+        if owner is None:
+            owner = next((key for created, key in reversed(owners) if created <= row[2]), None)
+        if owner_key is not None and owner != owner_key:
+            continue
+        body = json.loads(read_body(row[3])) if row[3] else {}
+        attempts = (body.get("metadata") or {}).get("attempts")
+        if type(attempts) is not int or attempts < 0:
+            gaps.append(row[0])
+            continue
+        total += attempts
+        evidence.append(row[4])
+    return {"openalex_requests": total, "evidence_refs": evidence, "unreported_task_ids": gaps,
+            "owner_registered": owner_key is None or any(key == owner_key for _, key in owners)}

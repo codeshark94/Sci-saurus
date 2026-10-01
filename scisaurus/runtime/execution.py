@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from contextlib import closing
 import hashlib
+from copy import deepcopy
 import json
 import math
 import multiprocessing
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import tempfile
 import threading
 import time
@@ -17,7 +20,7 @@ import uuid
 from scisaurus.core.budget import BudgetManager, _quantities
 from scisaurus.core.changes import ChangeService
 from scisaurus.core.documents import Documents
-from scisaurus.core.errors import QuotaExceededError, ValidationError
+from scisaurus.core.errors import QuotaExceededError, StateError, ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.progress import ProgressManager
 from scisaurus.core.schema import TASK_KINDS, canonical_bytes
@@ -26,10 +29,11 @@ from scisaurus.core.tasks import TaskManager
 from scisaurus.review.issues import IssueManager
 from scisaurus.runtime.models import (
     DEFAULT_MODEL_RATE_LIMIT_COOLDOWN_SECONDS,
-    ModelCallError, ModelClient, ModelResult, effective_model_timeout,
-    model_call_budget_available,
-    is_local_qwen_route, model_context_error, model_provider_quota_scope,
-    MODEL_CONTINUATION_INSTRUCTION, role_routes_for, resolve_model_config,
+    ModelCallError, ModelBudgetExceededError, ModelClient, ModelResult, effective_model_timeout,
+    model_call_budget_available, merge_model_config,
+    is_local_qwen_route, json_object_continuation_error, model_context_error, model_provider_quota_scope,
+    MODEL_CALL_BUDGET_FIELDS, MODEL_BUDGET_SCOPE_FIELDS, MODEL_CONTINUATION_INSTRUCTION, role_routes_for, resolve_model_config,
+    validate_model_budget_scope,
     with_runtime_cooldown_fallback,
 )
 from scisaurus.runtime.literature import ProviderCooldownError
@@ -110,10 +114,12 @@ def _invoke_worker(kind, params, channel):
                 images=params.get("images"),
                 initial_prefix=params.get("continuation_text"),
                 journal_path=params.get("_continuation_journal_path"),
+                dispatch_budget=params.get("_dispatch_budget"),
             ))
         elif kind == "crossref":
             from scisaurus.runtime.retrieval import CrossrefClient
-            result = CrossrefClient(**params["client"]).search(params["query"], limit=params["limit"])
+            result = CrossrefClient(**params["client"]).search(
+                params["query"], limit=params["limit"], cursor=params.get("cursor"))
         elif kind == "fetch":
             from scisaurus.runtime.retrieval import MCPFetchClient
             result = MCPFetchClient(**params["client"]).fetch(
@@ -139,7 +145,7 @@ def _invoke_worker(kind, params, channel):
 
 def _complete_model_with_continuation(client, *, system, prompt, images=None,
                                       initial_prefix=None, journal_path=None,
-                                      max_continuations=16):
+                                      max_continuations=16, dispatch_budget=None):
     """Continue truncated model output without replaying the original request.
 
     Every suffix request is a real provider call: ``ModelClient`` reserves its
@@ -154,6 +160,12 @@ def _complete_model_with_continuation(client, *, system, prompt, images=None,
     elapsed_seconds = 0.0
     request_attempts = 0
     complete_text = initial_prefix or ""
+    incomplete_reason = None
+
+    def continuation_block_reason(text):
+        if getattr(client, "output_format", None) != "json_object":
+            return None
+        return json_object_continuation_error(text)
 
     def persist(status, *, finish_reason=None, error=None):
         if not isinstance(journal_path, str) or not journal_path:
@@ -187,11 +199,42 @@ def _complete_model_with_continuation(client, *, system, prompt, images=None,
         os.replace(temporary, path)
 
     call_kwargs = {"system": system, "prompt": prompt, "images": images}
+    if dispatch_budget is not None:
+        call_kwargs["dispatch_budget"] = dispatch_budget
+
+    def complete(**kwargs):
+        nonlocal request_attempts
+        try:
+            return client.complete(**kwargs)
+        except Exception as exc:
+            observed = dict(usage)
+            failed_usage = getattr(exc, "usage", {})
+            if isinstance(failed_usage, dict):
+                for key, value in failed_usage.items():
+                    if key != "model_calls" and type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                        observed[key] = observed.get(key, 0) + value
+            failed_attempts = getattr(exc, "attempts", 0)
+            if type(failed_attempts) is int and failed_attempts > 0:
+                observed["model_calls"] = observed.get("model_calls", 0) + failed_attempts
+                request_attempts += failed_attempts
+            usage.update(observed)
+            exc.usage = observed
+            persist("incomplete", finish_reason="length" if complete_text else None,
+                    error=str(exc))
+            raise
     if initial_prefix is not None:
         if not isinstance(initial_prefix, str) or not initial_prefix:
             raise ValidationError("continuation_text must be nonempty when supplied")
+        reason = continuation_block_reason(initial_prefix)
+        if reason is not None:
+            persist("incomplete", finish_reason="length", error=reason)
+            rejection = ValidationError(reason)
+            rejection.outcome_known = True
+            rejection.attempts = 0
+            rejection.usage = {}
+            raise rejection
         call_kwargs["continuation_text"] = initial_prefix
-    result = client.complete(**call_kwargs)
+    result = complete(**call_kwargs)
     calls = 0
     while True:
         segment = result.text or ""
@@ -212,6 +255,9 @@ def _complete_model_with_continuation(client, *, system, prompt, images=None,
         request_attempts += result.request_attempts
         if result.finish_reason != "length" or calls > max_continuations:
             break
+        incomplete_reason = continuation_block_reason(complete_text)
+        if incomplete_reason is not None:
+            break
         if not segment:
             persist("incomplete", finish_reason="length",
                     error="provider returned an empty truncated response")
@@ -221,12 +267,13 @@ def _complete_model_with_continuation(client, *, system, prompt, images=None,
                 request_attempts=request_attempts,
             )
         persist("continuing", finish_reason=result.finish_reason)
-        result = client.complete(
+        result = complete(
             system=system, prompt=prompt, images=images,
             continuation_text=complete_text,
+            **({"dispatch_budget": dispatch_budget} if dispatch_budget is not None else {}),
         )
     status = "completed" if result.finish_reason == "stop" else "incomplete"
-    persist(status, finish_reason=result.finish_reason)
+    persist(status, finish_reason=result.finish_reason, error=incomplete_reason)
     return ModelResult(
         text=complete_text, model=result.model, usage=usage,
         elapsed_seconds=elapsed_seconds, finish_reason=result.finish_reason,
@@ -239,7 +286,7 @@ def _worker_error_payload(exc, kind):
     payload = {"ok": False, "error": str(exc), "error_type": type(exc).__name__,
                "outcome_known": bool(getattr(exc, "outcome_known", kind != "model"))}
     for key in ("status_code", "retry_after_seconds", "provider_error_kind",
-                "attempts", "elapsed_seconds"):
+                "attempts", "elapsed_seconds", "usage", "budget_admission"):
         value = getattr(exc, key, None)
         if value is not None:
             payload[key] = value
@@ -283,12 +330,27 @@ class ExecutionRuntime:
         return all(row["event_type"] == "project.created" for row in events)
 
     def __init__(self, project_dir, config, *, worker_target, on_progress=None,
-                 resume_policy=None, repository_root=None):
+                 resume_policy=None, repository_root=None, model_call_budget_scopes=None,
+                 model_budget_delegation=None):
+        self.control = None
+        try:
+            self._initialize_execution(project_dir, config, worker_target=worker_target,
+                on_progress=on_progress, resume_policy=resume_policy, repository_root=repository_root,
+                model_call_budget_scopes=model_call_budget_scopes, model_budget_delegation=model_budget_delegation)
+        except BaseException:
+            if self.control is not None:
+                self.control.close()
+            raise
+
+    def _initialize_execution(self, project_dir, config, *, worker_target, on_progress,
+                              resume_policy, repository_root, model_call_budget_scopes, model_budget_delegation):
         if isinstance(config.get("model"), dict):
             configured_model = with_runtime_cooldown_fallback(config["model"])
             if configured_model is not config["model"]:
                 config = {**config, "model": configured_model}
         self.config = config
+        self.model_call_budget_scopes = list(model_call_budget_scopes or [])
+        self.model_budget_delegation = model_budget_delegation
         self.worker_target = worker_target
         self.dir = Path(project_dir).resolve()
         existing = (self.dir / "state" / "control.sqlite").exists()
@@ -328,6 +390,7 @@ class ExecutionRuntime:
         self.verified_changes, self.information_changes, self.blockers = [], [], []
         self.active_task = None
         self.active_tasks = []
+        self.active_operations = []
         self.provider_pools = dict(config["limits"].get("provider_pools") or {})
         self.provider_active = {name: 0 for name in self.provider_pools}
         self.provider_route_cursors = {}
@@ -353,6 +416,123 @@ class ExecutionRuntime:
                                     capacity={"concurrent_calls": self.config["limits"]["concurrent_calls"]})
         elif self.budget.get_window("run-window")["state"] != "open":
             raise ValidationError("resume requires the original active accounting window")
+        self.dispatch_budget = self._model_dispatch_budget()
+        from scisaurus.runtime.literature import openalex_request_usage
+        observed = openalex_request_usage(self.control._conn, self.store.read_body)
+        self.budget.observe_usage_floor(window_id="run-window",
+            observed={"openalex_requests": observed["openalex_requests"]},
+            evidence_refs=observed["evidence_refs"])
+        self.usage_gaps.extend({"task_id": task_id, "unreported_dimensions": ["openalex_requests"]}
+                              for task_id in observed["unreported_task_ids"])
+
+
+    def _model_dispatch_budget(self):
+        """Persist HTTP allowances separately from lifetime cost accounting."""
+        limit = self.config["limits"].get("max_model_calls")
+        delegation = self.model_budget_delegation
+        seed_calls = self._validate_model_budget_delegation(delegation) if delegation is not None else None
+        if limit is None and delegation is not None:
+            limit = delegation["scope"]["model_call_budget_limit"]
+        if type(limit) is not int or limit <= 0:
+            return None
+        observed = self.budget.get_window("run-window")["cumulative_usage"].get("model_calls", 0)
+        for row in self.control._conn.execute("SELECT task_id, usage_json FROM attempts"):
+            journal_path = self.dir / "runs" / row["task_id"] / "model-continuation.json"
+            if not journal_path.is_file():
+                continue
+            journal = json.loads(journal_path.read_text())
+            recorded = json.loads(row["usage_json"]).get("actual", {})
+            journal_calls = max(journal.get("request_attempts", 0),
+                                journal.get("usage", {}).get("model_calls", 0))
+            observed += max(0, journal_calls - recorded.get("model_calls", 0))
+        path = self.dir / "state" / "model-call-budget.sqlite"
+        key = "run-window"
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("CREATE TABLE IF NOT EXISTS model_call_budgets ("
+                "budget_key TEXT PRIMARY KEY, max_calls INTEGER NOT NULL, used_calls INTEGER NOT NULL)")
+            if delegation is not None:
+                scope = delegation["scope"]
+                if scope not in self.model_call_budget_scopes:
+                    raise ValidationError("delegated model budget requires its parent scope")
+                limit = min(limit, scope["model_call_budget_limit"])
+                key = "delegation:" + hashlib.sha256(canonical_bytes(scope)).hexdigest()
+                connection.execute("CREATE TABLE IF NOT EXISTS model_budget_delegations ("
+                    "budget_key TEXT PRIMARY KEY, delegation_json TEXT NOT NULL, "
+                    "baseline_calls INTEGER NOT NULL, seed_calls INTEGER NOT NULL)")
+                connection.execute("INSERT OR IGNORE INTO model_budget_delegations VALUES (?, ?, ?, ?)",
+                    (key, json.dumps(delegation, sort_keys=True), observed, seed_calls))
+                baseline, seed = connection.execute("SELECT baseline_calls, seed_calls FROM "
+                    "model_budget_delegations WHERE budget_key=?", (key,)).fetchone()
+                observed = seed + max(0, observed - baseline)
+            connection.execute("INSERT OR IGNORE INTO model_call_budgets VALUES (?, ?, ?)",
+                               (key, limit, observed))
+            row = connection.execute("SELECT max_calls FROM model_call_budgets WHERE budget_key=?", (key,)).fetchone()
+            if row[0] != limit:
+                raise ValidationError("runtime model-call limit conflicts with its accounting window")
+            connection.execute("UPDATE model_call_budgets SET used_calls=MAX(used_calls, ?) "
+                               "WHERE budget_key=?", (observed, key))
+            connection.commit()
+        if self.model_budget_delegation is not None:
+            self._publish(f"command/model-budget-delegations/{key.split(':')[1]}", "note",
+                          {"delegation": self.model_budget_delegation, "dispatch_key": key,
+                           "limit": limit, "baseline_calls": baseline, "seed_calls": seed},
+                          "command.controller")
+        return {"model_call_budget_path": str(path), "model_call_budget_key": key,
+                "model_call_budget_limit": limit}
+
+    @staticmethod
+    def _validate_model_budget_delegation(delegation):
+        scope = delegation["scope"]
+        validate_model_budget_scope(scope)
+        key = scope["model_call_budget_key"]
+        prefix, separator, cycle = key.rpartition(":cycle:")
+        path = Path(scope["model_call_budget_path"])
+        limit = scope["model_call_budget_limit"]
+        if (not MODEL_CALL_BUDGET_FIELDS <= set(scope) or set(scope) - MODEL_BUDGET_SCOPE_FIELDS
+                or not separator or not prefix.startswith("stage:") or not cycle.isdigit()
+                or not path.is_absolute() or str(path.resolve()) != str(path)
+                or type(limit) is not int or limit <= 0):
+            raise ValidationError("invalid controller model budget delegation")
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as owner:
+            row = owner.execute("SELECT max_calls, used_calls FROM model_call_budgets WHERE budget_key=?",
+                                (key,)).fetchone()
+            if row is None or row[0] != limit:
+                raise ValidationError("model budget delegation is not registered by its owner")
+            tokens = scope.get("model_token_budget_limits")
+            if tokens is not None:
+                if not owner.execute("SELECT 1 FROM sqlite_master WHERE name='model_token_budgets'").fetchone():
+                    raise ValidationError("model token-budget delegation is not registered by its owner")
+                registered = owner.execute("SELECT max_input,max_output FROM model_token_budgets WHERE budget_key=?", (key,)).fetchone()
+                if registered != (tokens["input_tokens"], tokens["output_tokens"]):
+                    raise ValidationError("model token-budget delegation differs from its owner")
+            for retired in delegation.get("superseded_scopes", []):
+                retired_key = retired.get("model_call_budget_key", "")
+                prior_prefix, prior_separator, prior_cycle = retired_key.rpartition(":cycle:")
+                if (retired != {**scope, "model_call_budget_key": retired_key}
+                        or prior_separator != separator or prior_prefix != prefix
+                        or not prior_cycle.isdigit() or int(prior_cycle) >= int(cycle)):
+                    raise ValidationError("model budget retirement must name a prior cycle of the same owner")
+                prior = owner.execute("SELECT max_calls FROM model_call_budgets WHERE budget_key=?",
+                                      (retired_key,)).fetchone()
+                if prior is None or prior[0] != limit:
+                    raise ValidationError("retired model budget is not registered by its owner")
+        return row[1]
+
+    def _delegated_model_config(self, value):
+        """Retire only owner scopes explicitly superseded by the controller."""
+        if isinstance(value, list):
+            return [self._delegated_model_config(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        result = {key: self._delegated_model_config(item) for key, item in value.items()}
+        if self.model_budget_delegation and "model_call_budget_scopes" in result:
+            retired = self.model_budget_delegation.get("superseded_scopes", [])
+            result["model_call_budget_scopes"] = [
+                scope for scope in result["model_call_budget_scopes"] if not any(
+                    all(scope.get(field) == prior.get(field) for field in MODEL_CALL_BUDGET_FIELDS)
+                    for prior in retired)]
+        return result
 
     def _publish(self, logical, kind, body, author, *, subjects=()):
         return self.store.publish_artifact(
@@ -379,6 +559,10 @@ class ExecutionRuntime:
         )
         self.next_checkpoint = now + self.config["limits"]["checkpoint_seconds"]
         state = {"phase": phase, "checkpoint": self.checkpoint_number,
+                          "run_id": self.run_id, "project_dir": str(self.dir.resolve()),
+                          "active_operations": deepcopy(self.active_operations),
+                          "cumulative_usage": deepcopy(window["cumulative_usage"]),
+                          "reserved_usage": deepcopy(window["reserved"]),
                           "elapsed_seconds": round(now - self.started, 2), "incumbent_ref": self.incumbent,
                           "active_tasks": list(self.active_tasks)}
         output = self.dir / "output"
@@ -407,12 +591,12 @@ class ExecutionRuntime:
                     limit=self.config.get("limits", {}).get("max_model_calls"),
                     observed=self.model_calls_dispatched,
                 )
-            raise ModelCallError(
-                outcome["error"], outcome_known=outcome["outcome_known"],
-                status_code=outcome.get("status_code"),
-                retry_after_seconds=outcome.get("retry_after_seconds"),
-            )
+            self._raise_model_failure(outcome)
         return outcome["result"], outcome["record_ref"]
+
+    @staticmethod
+    def _raise_model_failure(outcome):
+        raise ModelCallError.from_failure(outcome["error"], outcome)
 
     def _ensure_active(self):
         if self.cancelled:
@@ -437,6 +621,25 @@ class ExecutionRuntime:
                 retry_after_seconds=delay,
                 rate_limit={"provider": "model", "status_code": 429,
                             "retry_after_known": bool(provider_delays)})
+        model_failures = [failure for failure in failures
+                          if failure.get("error_type") in {"ModelCallError", "ModelBudgetExceededError"}]
+        if model_failures:
+            failure = model_failures[0]
+            budget = next((item["budget_admission"] for item in model_failures if item.get("budget_admission") is not None), None)
+            error = ModelCallError.from_failure(
+                context + ": " + "; ".join(item["error"] for item in model_failures),
+                {**failure, "budget_admission": budget,
+                 "outcome_known": all(item.get("outcome_known") is True for item in model_failures),
+                 "attempts": sum(item.get("attempts", 0) for item in model_failures)})
+            error.usage = {}
+            for item in model_failures:
+                for key, value in item.get("usage", {}).items():
+                    if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                        error.usage[key] = error.usage.get(key, 0) + value
+            raise error
+        state_failures = [failure for failure in failures if failure.get("error_type") == "StateError"]
+        if state_failures:
+            raise StateError(context + ": " + "; ".join(item["error"] for item in state_failures))
         raise ValidationError(context + ": " + "; ".join(failure["error"] for failure in failures))
 
     def _call_batch(self, specs, *, max_parallel=None):
@@ -608,6 +811,7 @@ class ExecutionRuntime:
                 self._stop_worker(entry["process"])
                 self._release_provider(entry)
             self._set_active({})
+            self._checkpoint("calls_settled", force=True)
         if propagate_cancellation:
             raise cancellation_error
         return outcomes
@@ -653,6 +857,9 @@ class ExecutionRuntime:
 
     def _set_active(self, active):
         self.active_tasks = list(active)
+        self.active_operations = [{"task_id": task_id, "actor": entry["spec"]["actor"],
+                                   "kind": entry["spec"]["kind"]}
+                                  for task_id, entry in active.items()]
         self.active_task = self.active_tasks[0] if len(self.active_tasks) == 1 else None
 
     @staticmethod
@@ -666,23 +873,22 @@ class ExecutionRuntime:
         if not isinstance(client, dict):
             raise ValidationError("model operation requires a client object")
         role = params.get("role") or spec["actor"]
-        selected = dict(client)
+        selected = self._delegated_model_config(client)
         # Generic execution tests and a few adapters pass only per-call
         # overrides. Real model tasks pass the complete run model config.
         if "base_url" not in selected or "model" not in selected:
-            inherited = dict(self.config.get("model") or {})
-            inherited.update(selected)
-            selected = inherited
-        return resolve_model_config(selected, role=role)
+            inherited = self._delegated_model_config(self.config.get("model") or {})
+            selected = merge_model_config(inherited, selected)
+        return merge_model_config(resolve_model_config(selected, role=role),
+                                  {"model_call_budget_scopes": self.model_call_budget_scopes})
 
     def _route_model_config(self, spec, route):
         effective = self._base_model_config(spec)
         if isinstance(route, dict) and isinstance(route.get("_effective"), dict):
-            effective = dict(route["_effective"])
+            effective = merge_model_config(effective, self._delegated_model_config(route["_effective"]))
         if isinstance(route, dict):
-            for key, value in route.items():
-                if key not in {"id", "pool", "_effective"}:
-                    effective[key] = value
+            effective = merge_model_config(effective, self._delegated_model_config({
+                key: value for key, value in route.items() if key not in {"id", "pool", "_effective"}}))
         return effective
 
     def _model_context_error(self, spec, effective=None):
@@ -710,6 +916,7 @@ class ExecutionRuntime:
         client = params.get("_routing_client") or params.get("client")
         if not isinstance(client, dict):
             return None
+        client = self._delegated_model_config(client)
         fallback = client.get("provider_cooldown_fallback")
         if not isinstance(fallback, dict):
             return None
@@ -1187,16 +1394,16 @@ class ExecutionRuntime:
             spec["params"]["role"] = actor
             entry["spec"] = spec
         if spec["kind"] == "model":
-            client = dict(spec["params"]["client"])
+            client = self._delegated_model_config(spec["params"]["client"])
             if "base_url" not in client or "model" not in client:
-                inherited = dict(self.config.get("model") or {})
-                inherited.update(client)
-                client = inherited
+                inherited = self._delegated_model_config(self.config.get("model") or {})
+                client = merge_model_config(inherited, client)
             role = spec["params"].get("role") or actor
             client = resolve_model_config(
                 client, role=role,
                 overrides=spec["params"].get("sampling_overrides"),
             )
+            client = merge_model_config(client, {"model_call_budget_scopes": self.model_call_budget_scopes})
             client["timeout_seconds"] = effective_model_timeout(
                 client.get("timeout_seconds"), max(0.001, self.deadline - time.monotonic()))
             spec["params"] = dict(spec["params"])
@@ -1212,7 +1419,9 @@ class ExecutionRuntime:
         attempt_id = f"{task_id}-attempt"
         self.tasks.start_attempt(task_id, attempt_id, owner=actor,
                                  lease_ttl_seconds=max(0.001, self.deadline - time.monotonic()),
-                                 reserved={"concurrent_calls": 1})
+                                 reserved={"concurrent_calls": 1},
+                                 payload=({"budget_scope": self.model_budget_delegation["scope"]}
+                                          if self.model_budget_delegation else {}))
         entry["attempt_id"] = attempt_id
         entry["context"] = self._publish(f"command/contexts/{task_id}", "note", spec["params"], actor)
         self._checkpoint("executing", force=True)
@@ -1225,6 +1434,8 @@ class ExecutionRuntime:
             spec["params"] = dict(spec["params"])
             spec["params"]["_continuation_journal_path"] = str(
                 result_dir / "model-continuation.json")
+            if self.dispatch_budget is not None:
+                spec["params"]["_dispatch_budget"] = dict(self.dispatch_budget)
             entry["spec"] = spec
         entry["channel"] = _ResultFile(result_dir / "result.json", self.config["limits"]["max_result_bytes"])
         process = multiprocessing.get_context("spawn").Process(
@@ -1287,6 +1498,13 @@ class ExecutionRuntime:
                     usage = result["usage"]
                 else:
                     usage = {"program_calls" if spec["kind"] == "program" else "retrieval_calls": 1}
+                    if spec["kind"] == "openalex":
+                        attempts = (result.get("metadata") or {}).get("attempts")
+                        if type(attempts) is int and attempts >= 0:
+                            usage["openalex_requests"] = attempts
+                        else:
+                            self.usage_gaps.append({"task_id": task_id,
+                                "unreported_dimensions": ["openalex_requests"]})
                 _quantities(usage, "actual usage")
                 canonical_bytes(result)
             except Exception as exc:
@@ -1301,13 +1519,22 @@ class ExecutionRuntime:
                 self.budget.settle(window_id="run-window", reservation_id=spec["reservation_id"], actual=usage)
                 self.tasks.transition(task_id, "awaiting_review", actor)
                 return {"ok": True, "result": result, "record_ref": record["artifact_ref"]}
+        if message.get("budget_admission") is not None:
+            try:
+                ModelBudgetExceededError(str(message.get("error", "model budget exhausted")),
+                                         outcome_known=message.get("outcome_known") is True,
+                                         budget_admission=message["budget_admission"])
+            except ValidationError as exc:
+                message = {**message, "error": str(exc), "error_type": "ValidationError",
+                           "outcome_known": False}
+                message.pop("budget_admission", None)
         known = not entry["dispatched"] or bool(message.get("outcome_known"))
         reason = str(message.get("error", "worker failure omitted its error"))
         failure = {"error": reason, "outcome_known": known,
                    "dispatch_started": entry["dispatched"]}
         for key in ("status_code", "retry_after_seconds", "provider_error_kind",
                     "error_type", "attempts", "elapsed_seconds",
-                    "partial_output_journal_path"):
+                    "partial_output_journal_path", "usage", "budget_admission"):
             if message.get(key) is not None:
                 failure[key] = message[key]
         self._publish(f"command/failures/{task_id}", "report", failure,
@@ -1315,17 +1542,34 @@ class ExecutionRuntime:
         if entry["attempt_id"]:
             if known:
                 usage = {"failed_calls": int(entry["dispatched"])}
+                partial_usage = message.get("usage", {})
+                _quantities(partial_usage, "partial model usage")
+                usage.update(partial_usage)
                 self.tasks.finish_attempt(entry["attempt_id"], "failed", usage=usage)
                 if not defer_task_failure:
                     self.tasks.transition(task_id, "failed", actor, reason=reason)
                 self.budget.settle(window_id="run-window", reservation_id=spec["reservation_id"], actual=usage)
             else:
-                self.tasks.reconcile_unknown(entry["attempt_id"], "command.controller")
+                observed = dict(message.get("usage") or {})
+                journal_path = spec.get("params", {}).get("_continuation_journal_path")
+                if isinstance(journal_path, str) and Path(journal_path).is_file():
+                    try:
+                        journal = json.loads(Path(journal_path).read_bytes())
+                        journal_usage = journal.get("usage", {})
+                        _quantities(journal_usage, "partial model journal usage")
+                        for key, amount in journal_usage.items():
+                            observed[key] = max(observed.get(key, 0), amount)
+                    except (OSError, ValueError, TypeError, ValidationError) as exc:
+                        self.usage_gaps.append({"task_id": task_id,
+                                                "journal_error": str(exc)})
+                self.tasks.reconcile_unknown(entry["attempt_id"], "command.controller",
+                                             observed_usage=observed)
         else:
             self._block_pending(spec, reason)
         result = {"ok": False, "error": reason, "outcome_known": known}
         for key in ("status_code", "retry_after_seconds", "provider_error_kind",
-                    "attempts", "elapsed_seconds", "partial_output_journal_path"):
+                    "attempts", "elapsed_seconds", "partial_output_journal_path",
+                    "usage", "budget_admission"):
             if message.get(key) is not None:
                 result[key] = message[key]
         if message.get("error_type") is not None:

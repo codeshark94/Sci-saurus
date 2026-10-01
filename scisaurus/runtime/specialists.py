@@ -19,6 +19,8 @@ import threading
 import time
 
 from scisaurus.core.errors import ValidationError
+from scisaurus.core.schema import canonical_bytes
+from scisaurus.core.source_spans import SPAN_EVIDENCE_FIELDS
 from scisaurus.runtime.models import (
     ModelCallError,
     ModelClient,
@@ -26,6 +28,7 @@ from scisaurus.runtime.models import (
     admit_model_provider_call,
     effective_model_timeout,
     estimate_input_tokens,
+    json_object_continuation_error,
     clear_model_provider_cooldown,
     model_call_budget_available,
     model_context_error,
@@ -50,6 +53,41 @@ SPECIALIST_SYSTEM = (
     "state one bounded, verifiable change. Rank by importance and group duplicates. "
     "Refer to evidence by artifact, section, or field; do not copy long source passages."
 )
+SCIENTIFIC_REPAIR_ACCEPTANCE_RULE = (
+    "Preserve the admitted primary outcome and comparison. A changed estimand requires an explicit "
+    "scientific justification showing how it still answers the exact research question; another "
+    "quantity cannot silently replace it. Acceptance tests must distinguish valid measurement and "
+    "independent recalculation from support for the hypothesis. A valid zero, negative effect, or "
+    "interval containing zero is admissible disconfirming evidence, not a failed repair. Do not "
+    "require a nonzero effect, a preferred sign, statistical significance, or rejection of a null "
+    "as a condition for admitting valid observations. Check intervention handling with independent "
+    "controls, not by requiring the observed primary effect to be positive or nonzero."
+)
+REPAIR_CHECK_PHASE_RULE = (
+    "Each acceptance_checks entry has phase and check: phase=plan owns checks of the proposed "
+    "design against supplied evidence before authoring; phase=execution owns source tests, fresh "
+    "observations, replay, and independent recalculation during or after execution. Preserve the "
+    "literal check text. Legacy flat string checks are execution requirements, not proof that an "
+    "unrun plan failed. Missing execution results alone cannot block plan admission; unresolved "
+    "design defects, ambiguous primary estimands, or unsupported changes still can. Execution "
+    "checks remain mandatory before admitting results, and plan acceptance never certifies them."
+)
+REPAIR_EVIDENCE_SYSTEM = (
+    "You are the Methods evidence producer completing the exact bounded requested_actions in "
+    "repair_evidence_request before repair-plan adjudication. Produce a self-contained evidence "
+    "note from the supplied immutable sources and diagnostics. Preserve the admitted question "
+    "and primary comparison. Do not invent data, sources, executed tests, or observations. "
+    "Distinguish analytic derivation from actual execution; a note is not experiment admission. "
+    "Return exactly one JSON object with decision, summary, findings, evidence_gaps, requested_actions, "
+    "evidence_note. decision is pass or hold. For pass, evidence_note contains title, content, "
+    "source_refs, limitations, action_disposition; action_disposition is fulfilled or superseded. "
+    "Superseded requires a source-bound explanation of why the original action is inapplicable to "
+    "the separately supplied current candidate, not an invented completed result. Fulfilled records "
+    "evidence for its original scope only. Include the complete reasoning and evidence needed to review the "
+    "requested action, without clipping formulas or instructions. source_refs must come from the "
+    "supplied source_ref_catalog. For hold, evidence_note may be null; state the precise unavailable "
+    "evidence or unsupported step. Never force a positive result or approve the repair plan."
+)
 REPAIR_ADJUDICATION_SYSTEM = (
     "You are the Methods lead adjudicating a bounded scientific repair before code execution. "
     "Treat the supplied source, validation feedback, and independent reviewer reports as evidence; "
@@ -62,14 +100,16 @@ REPAIR_ADJUDICATION_SYSTEM = (
     "required_changes. "
     "Return exactly one JSON object with keys decision, summary, findings, evidence_gaps, "
     "requested_actions, repair_plan. decision must be repair or hold. For repair, repair_plan must "
-    "be an object with topic_id, disposition, root_cause, and required_changes; disposition must "
-    "be repair. For hold, repair_plan must be null and the "
+    "be an object with disposition, root_cause, and required_changes; disposition must "
+    "be repair. Omit topic_id: the controller binds the admitted topic identity; "
+    "experiment_intent.id identifies a program revision. For hold, repair_plan must be null and the "
     "evidence_gaps and requested_actions must identify the precise missing evidence and the next "
     "bounded action. Include no failure-lineage or schema-version fields; the controller binds "
     "identity and adds the canonical version. Prefer the smallest coherent set of findings, "
     "changes, and supplementary checks without omitting a material or mandatory repair. "
     "The controller appends every mandatory check in "
-    "repair_contract.must_prove, so do not repeat or weaken those checks to meet a length target. "
+    "repair_contract.must_prove as execution-phase checks, so do not repeat or weaken those checks "
+    "to meet a length target. " + REPAIR_CHECK_PHASE_RULE + " "
     "The failure dossier's verified identity is authoritative. Its failed-stage input digest and "
     "the repair-packet digest identify different objects; never attribute one digest to a reviewer "
     "unless that exact reviewer report states it. The controller binds the final plan to the "
@@ -84,7 +124,7 @@ REPAIR_ADJUDICATION_SYSTEM = (
     "Keep summary and each list item concise. Each required change needs target, "
     "instruction, scientific_basis, and source_refs. "
     "The root cause needs a statement and evidence list. Any supplementary acceptance checks "
-    "must be falsifiable."
+    "must be falsifiable. " + SCIENTIFIC_REPAIR_ACCEPTANCE_RULE
 )
 VERIFIER_SYSTEM = (
     "You are an independent adversarial verifier for a department chief synthesis. "
@@ -168,6 +208,11 @@ def _safe_value(value, *, depth=0):
             if str(key) in {"role_routes", "role_models", "role_model_fallbacks"}:
                 output[key] = "[configuration omitted]"
                 continue
+            if str(key) in {"candidate_program", "prior_plan_review", "repair_evidence_request",
+                            "repair_evidence_note", "repair_adjudication", "repair_contract",
+                            "prior_evidence_review", "evidence_experiment_intent"}:
+                output[key] = _preserve_response_value(item)
+                continue
             output[key] = _safe_value(item, depth=depth + 1)
         return output
     if isinstance(value, list):
@@ -207,10 +252,17 @@ def _bounded_value(value, *, depth=0, max_depth=5, max_keys=64, max_items=24,
         return "[truncated]"
     if isinstance(value, dict):
         output = {}
-        for index, (key, item) in enumerate(value.items()):
+        index = 0
+        for key, item in value.items():
+            if str(key) in {"candidate_program", "prior_plan_review", "repair_evidence_request",
+                            "repair_evidence_note", "repair_adjudication", "repair_contract",
+                            "prior_evidence_review", "evidence_experiment_intent"}:
+                output[key] = _preserve_response_value(item)
+                continue
             if index >= max_keys:
                 output["[truncated_keys]"] = True
-                break
+                continue
+            index += 1
             if not _safe_key(key):
                 output[key] = "[redacted]"
                 continue
@@ -356,6 +408,8 @@ def _verifier_record(value, *, text_limit=800, nested_limit=6):
         return _verifier_text(value, limit=text_limit)
     if not isinstance(value, dict):
         return _verifier_text(value, limit=text_limit)
+    if SPAN_EVIDENCE_FIELDS <= value.keys():
+        return {key: deepcopy(value[key]) for key in sorted(SPAN_EVIDENCE_FIELDS)}
     output = {}
     for key in _VERIFIER_RECORD_KEYS:
         if key not in value or not _safe_key(key) or key in _VERIFIER_OMIT_KEYS:
@@ -425,6 +479,61 @@ def _verifier_topic(value, *, max_items, text_limit):
     return output
 
 
+def _repair_candidate_program(repair_packet):
+    """Bind source evidence identically for plan authors and independent reviewers."""
+    foundry = repair_packet.get("prior_foundry_work")
+    foundry = foundry if isinstance(foundry, dict) else {}
+    attempt = foundry.get("last_attempt")
+    attempt = attempt if isinstance(attempt, dict) else {}
+    candidate_sources = repair_packet.get("exact_candidate_sources")
+    candidate_sources = candidate_sources if isinstance(candidate_sources, dict) else {}
+    source_files = {}
+    for source_name in ("executor", "validator"):
+        record = candidate_sources.get(source_name)
+        record = record if isinstance(record, dict) else {}
+        chunks = record.get("source_chunks")
+        chunks = chunks if isinstance(chunks, list) else []
+        reconstructed = "".join(chunk for chunk in chunks if isinstance(chunk, str))
+        digest = record.get("prompt_source_sha256")
+        complete = (
+            record.get("available") is True
+            and len(chunks) == len([chunk for chunk in chunks if isinstance(chunk, str)])
+            and isinstance(digest, str)
+            and hashlib.sha256(reconstructed.encode("utf-8")).hexdigest() == digest
+            and len(reconstructed) == record.get("prompt_source_characters")
+        )
+        source_files[source_name] = {
+            **{key: record.get(key) for key in (
+                "available", "source_sha256", "source_characters",
+                "prompt_source_sha256", "prompt_source_characters", "redaction_applied",
+                "omission_reason")},
+            "complete": complete,
+            "source_chunks": chunks if complete else [],
+        }
+    return {
+        "repair_subject_lineage": _bounded_value(
+            repair_packet.get("repair_subject_lineage", repair_packet.get("failure_lineage", {})),
+            max_depth=2, max_keys=12, max_items=8, max_text=400),
+        "experiment_intent": _bounded_value(
+            attempt.get("experiment_intent", {}), max_depth=5,
+            max_keys=24, max_items=12, max_text=1800),
+        "exact_execution_sources": source_files,
+        "source_authority": (
+            "Use exact_execution_sources when complete is true. Concatenate each file's "
+            "source_chunks in listed order and verify prompt_source_sha256 and "
+            "prompt_source_characters before making source-level claims. If a file is "
+            "incomplete, do not infer its missing code. repair_subject_lineage identifies "
+            "the candidate being repaired; failure_lineage identifies the latest failed "
+            "stage or plan review. A rejected plan does not produce a new experiment. "
+            "Historical execution sources "
+            "are separately linked to old worker results and are diagnostic only; verify "
+            "their redacted-source digest, do not treat them as current candidate code or "
+            "as evidence for the admitted question. program_snapshot below is not the "
+            "exact execution source."
+        ),
+    }
+
+
 def _verifier_repair_packet(value, *, detail="full"):
     """Project a repair dossier once, excluding duplicated code and failure dumps."""
     if not isinstance(value, dict):
@@ -489,6 +598,14 @@ def _verifier_repair_packet(value, *, detail="full"):
             "schema_version", "stage_id", "continuation_cycle", "input_sha256")
         if key in value and not isinstance(value[key], (dict, list))
     }
+    output["candidate_program"] = _repair_candidate_program(value)
+    output["failure_lineage"] = _bounded_value(
+        value.get("failure_lineage", {}), max_depth=2,
+        max_keys=12, max_items=8, max_text=400)
+    if isinstance(value.get("plan_review_failure"), dict):
+        output["plan_review_failure"] = _bounded_value(
+            value["plan_review_failure"], max_depth=3,
+            max_keys=12, max_items=8, max_text=1400)
     if isinstance(value.get("topic"), dict):
         output["topic"] = _verifier_topic(
             value["topic"], max_items=item_limit, text_limit=text_limit)
@@ -514,7 +631,7 @@ def _verifier_repair_packet(value, *, detail="full"):
         }
         for key in ("acceptance_checks", "repair_commands", "review_directives"):
             if key in recovery:
-                output["failure_recovery"][key] = compact_records(
+                output["failure_recovery"][key] = _preserve_response_value(recovery[key]) if key == "acceptance_checks" else compact_records(
                     recovery[key], ("id", "kind", "source", "operation", "target",
                                     "instruction", "text", "acceptance_check"),
                     count=item_limit, limit=text_limit)
@@ -559,13 +676,6 @@ def _verifier_repair_packet(value, *, detail="full"):
             output["prior_foundry_work"]["validation_context"] = context
         if feedback:
             output["prior_foundry_work"]["validation_feedback"] = feedback
-        intent = (foundry.get("last_attempt", {}).get("experiment_intent")
-                  if isinstance(foundry.get("last_attempt"), dict) else None)
-        if isinstance(intent, dict):
-            output["prior_foundry_work"]["experiment_intent"] = _bounded_value(
-                intent, max_depth=3, max_keys=12, max_items=item_limit,
-                max_text=text_limit)
-
     snapshots = value.get("program_snapshot")
     if isinstance(snapshots, list):
         output["program_snapshot"] = []
@@ -621,10 +731,12 @@ def _verifier_repair_packet(value, *, detail="full"):
             for key in ("must_preserve", "must_change", "must_prove", "prohibited")
             if isinstance(contract.get(key), list)
         }
+        if "check_phase_protocol" in contract:
+            output["repair_contract"]["check_phase_protocol"] = contract["check_phase_protocol"]
     for key in ("diagnostic_hypotheses", "proposed_changes", "root_causes",
                 "required_changes", "acceptance_checks", "repair_commands"):
         if isinstance(value.get(key), list):
-            output[key] = compact_records(
+            output[key] = _preserve_response_value(value[key]) if key == "acceptance_checks" else compact_records(
                 value[key], ("id", "kind", "source", "operation", "target",
                              "instruction", "text", "acceptance_check"),
                 count=item_limit, limit=text_limit)
@@ -662,12 +774,52 @@ def _verifier_report(report, *, detail="full"):
         if key in report
     }
     output["response"] = response
+    if isinstance(report.get("input_scope"), dict):
+        output["input_scope"] = deepcopy(report["input_scope"])
     if report.get("error"):
         output["error"] = _verifier_text(report["error"], limit=700)
     # Runtime telemetry is not evidence about the reviewed work. Excluding it
     # also keeps an identical verifier prompt stable when a cached specialist
     # report is replayed with zero incremental usage.
     return output
+
+
+def _verifier_survey_evidence(result):
+    """Keep the captured acquisition and disposition basis of a survey review."""
+    coverage = result.get("coverage")
+    if (not isinstance(coverage, dict)
+            or not isinstance(result.get("survey_ref"), str)):
+        return None
+    searches = []
+    for row in coverage.get("searches", []):
+        if not isinstance(row, dict):
+            continue
+        searches.append({key: deepcopy(row[key]) for key in (
+            "execution_ref", "plan_ref", "role", "request", "outcome", "count",
+            "provider_http_status", "provider_error", "has_more", "next_cursor") if key in row})
+    sources = [
+        {key: deepcopy(row[key]) for key in (
+            "source_ref", "work_id", "representation", "identity_verified", "available_chars", "window",
+            "source_availability")
+         if key in row}
+        for row in coverage.get("source_windows", []) if isinstance(row, dict)]
+    return {
+        "lineage": {key: deepcopy(result[key]) for key in (
+            "survey_ref", "assessment_ref", "survey_current", "assessment_current", "follow_up_ref") if key in result},
+        "coverage": _verifier_scalar_map(coverage, limit=len(coverage)),
+        "searches": searches,
+        "source_windows": sources,
+        "source_evidence_policy": deepcopy(coverage.get("source_evidence_policy")),
+        "source_availability": deepcopy(coverage.get("source_availability", [])),
+        "follow_up_result": deepcopy(result.get("follow_up_result")),
+        "revalidation": deepcopy(result.get("revalidation")),
+        "evidence_scope": (
+            "Coverage counts and captured search/source records belong to this producer result. "
+            "Specialist statements are limited to their declared input scope. Exact disposition "
+            "quotations retain their source, offsets and hash; missing evidence in another role's "
+            "planning input does not establish its absence from this producer result."
+        ),
+    }
 
 
 def _verifier_chief_result(result, *, detail="full"):
@@ -711,15 +863,22 @@ def _verifier_chief_result(result, *, detail="full"):
             )
     adjudication = result.get("repair_adjudication")
     if isinstance(adjudication, dict):
-        output["repair_adjudication"] = _bounded_value(
-            adjudication, max_depth=6, max_keys=24, max_items=max_items,
-            max_text=record_limit)
+        output["repair_adjudication"] = _preserve_response_value(adjudication)
+        output["repair_adjudication_sha256"] = hashlib.sha256(
+            canonical_bytes(output["repair_adjudication"])).hexdigest()
+    for key in ("repair_evidence_request", "repair_evidence_note", "prior_plan_review"):
+        if isinstance(result.get(key), dict):
+            output[key] = _preserve_response_value(result[key])
     if "frontier_seed_plan" in result:
         output["recent_papers_scope"] = (
             "recent_papers is a balanced discovery sample across frontier seeds; "
             "use candidate_prior_work, selected_seed_records, and source_challenge "
             "for selected-topic support."
         )
+    survey_evidence = _verifier_survey_evidence(result)
+    if survey_evidence is not None:
+        output["coverage"] = deepcopy(survey_evidence["coverage"])
+        output["survey_evidence"] = survey_evidence
     for key in ("maturity_reviews", "maturity_review_history"):
         if key in result:
             output[key] = _verifier_collection(
@@ -799,12 +958,29 @@ def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, det
             and isinstance(stage_packet.get("capability_repair_packet"), dict)):
         body["capability_repair_packet"] = _verifier_repair_packet(
             stage_packet["capability_repair_packet"], detail=detail)
-        if (stage_packet.get("repair_verification_scope") == "pre_execution_plan"
+        if stage_packet.get("repair_verification_scope") == "evidence_action":
+            body["verifier_contract"].update({
+                "acceptance_target": "the exact requested evidence note, not a repair plan or experimental result",
+                "repair_panel_rule": (
+                "Independently assess action_disposition=fulfilled versus superseded against the distinct "
+                "origin and current source scopes. A supersession requires supported relevance reasoning; "
+                "a fulfilled origin note is not automatically proof for another candidate. "
+                "Compare repair_evidence_note with every exact requested_actions entry in "
+                    "repair_evidence_request and the supplied immutable source. Independently check "
+                    "its derivation, assumptions, source references, completeness, and preserved "
+                    "question/primary comparison. Accept only if it actually satisfies the requested "
+                    "bounded evidence production; otherwise hold with precise required revisions. "
+                    "Do not certify a repair plan, observations, program execution, or recalculation "
+                    "through a textual note. Unsupported executed claims or invented data block acceptance."
+                ),
+            })
+        elif (stage_packet.get("repair_verification_scope") == "pre_execution_plan"
                 and isinstance(chief_result, dict)
                 and isinstance(chief_result.get("repair_adjudication"), dict)):
             body["verifier_contract"].update({
                 "acceptance_target": "the scoped methods repair plan before source authoring or execution",
                 "repair_panel_rule": (
+                    SCIENTIFIC_REPAIR_ACCEPTANCE_RULE + " "
                     "Review the methodologist's reconciled plan, not an experiment that has not yet run. "
                     "Accept only if its root cause is evidenced, its source/design changes are specific, "
                     "the question and lineage are preserved, and its checks can falsify the repair. "
@@ -813,12 +989,14 @@ def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, det
                     "paraphrases of reviewer positions. Put required design changes that leave the primary "
                     "estimand ambiguous in required_revisions. "
                     "Do not hold solely because repaired code, observations, or a completed independent "
-                    "recalculation are pending; those are deferred_gates that must be checked before "
-                    "execution, not evidence against the plan itself."
+                    "recalculation are pending; those are execution-phase gates checked during or after "
+                    "execution before result admission, not evidence against the plan itself. "
+                    + REPAIR_CHECK_PHASE_RULE
                 ),
             })
         else:
             body["verifier_contract"]["repair_panel_rule"] = (
+                SCIENTIFIC_REPAIR_ACCEPTANCE_RULE + " "
                 "Judge whether the proposed repair addresses the supplied root cause and changes the failed "
                 "mechanism. A complete executable and independently recalculable acceptance check are required."
             )
@@ -995,36 +1173,6 @@ def build_specialist_prompt(assignment, stage_packet):
 def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports, *,
                                      prior_plan_review=None):
     """Ask the methods lead to reconcile reviews into one executable plan."""
-    prior_foundry_work = repair_packet.get("prior_foundry_work")
-    prior_foundry_work = (
-        prior_foundry_work if isinstance(prior_foundry_work, dict) else {})
-    last_attempt = prior_foundry_work.get("last_attempt")
-    last_attempt = last_attempt if isinstance(last_attempt, dict) else {}
-    candidate_sources = repair_packet.get("exact_candidate_sources")
-    candidate_sources = candidate_sources if isinstance(candidate_sources, dict) else {}
-    source_files = {}
-    for source_name in ("executor", "validator"):
-        record = candidate_sources.get(source_name)
-        record = record if isinstance(record, dict) else {}
-        chunks = record.get("source_chunks")
-        chunks = chunks if isinstance(chunks, list) else []
-        reconstructed = "".join(chunk for chunk in chunks if isinstance(chunk, str))
-        digest = record.get("prompt_source_sha256")
-        complete = (
-            record.get("available") is True
-            and len(chunks) == len([chunk for chunk in chunks if isinstance(chunk, str)])
-            and isinstance(digest, str)
-            and hashlib.sha256(reconstructed.encode("utf-8")).hexdigest() == digest
-            and len(reconstructed) == record.get("prompt_source_characters")
-        )
-        source_files[source_name] = {
-            **{key: record.get(key) for key in (
-                "available", "source_sha256", "source_characters",
-                "prompt_source_sha256", "prompt_source_characters", "redaction_applied",
-                "omission_reason")},
-            "complete": complete,
-            "source_chunks": chunks if complete else [],
-        }
     compact_reports = []
     for report in reviewer_reports if isinstance(reviewer_reports, list) else []:
         if not isinstance(report, dict):
@@ -1145,6 +1293,10 @@ def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports
             },
             "topic": _bounded_value(repair_packet.get("topic", {}), max_depth=3,
                                     max_keys=16, max_items=6, max_text=1000),
+            "repair_contract": _preserve_response_value(repair_packet.get("repair_contract", {})),
+            "plan_review_failure": _bounded_value(
+                repair_packet.get("plan_review_failure", {}), max_depth=3,
+                max_keys=12, max_items=8, max_text=1400),
             "failure": _bounded_value(repair_packet.get("failure", {}), max_depth=4,
                                       max_keys=16, max_items=8, max_text=1400),
             "observed_result": _bounded_value(
@@ -1162,22 +1314,7 @@ def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports
             "historical_execution_sources": _bounded_value(
                 repair_packet.get("unresolved_attempt_sources", []),
                 max_depth=4, max_keys=24, max_items=16, max_text=7000),
-            "candidate_program": {
-                "experiment_intent": _bounded_value(
-                    last_attempt.get("experiment_intent", {}), max_depth=5,
-                    max_keys=24, max_items=12, max_text=1800),
-                "exact_execution_sources": source_files,
-                "source_authority": (
-                    "Use exact_execution_sources when complete is true. Concatenate each file's "
-                    "source_chunks in listed order and verify prompt_source_sha256 and "
-                    "prompt_source_characters before making source-level claims. If a file is "
-                    "incomplete, do not infer its missing code. Historical execution sources "
-                    "are separately linked to old worker results and are diagnostic only; verify "
-                    "their redacted-source digest, do not treat them as current candidate code or "
-                    "as evidence for the admitted question. program_snapshot below is not the "
-                    "exact execution source."
-                ),
-            },
+            "candidate_program": _repair_candidate_program(repair_packet),
             "program_snapshot": _bounded_value(
                 repair_packet.get("program_snapshot", []), max_depth=4,
                 max_keys=20, max_items=6, max_text=1800),
@@ -1185,14 +1322,18 @@ def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports
                 (repair_packet.get("prior_foundry_work") or {}).get(
                     "validation_feedback", {}), max_depth=4,
                 max_keys=16, max_items=8, max_text=1200),
-            "prior_plan_review": _bounded_value(
-                prior_plan_review if isinstance(prior_plan_review, dict) else {},
-                max_depth=6, max_keys=24, max_items=12, max_text=1600),
+            "validation_context": _bounded_value(
+                (repair_packet.get("prior_foundry_work") or {}).get(
+                    "validation_context", {}), max_depth=4,
+                max_keys=24, max_items=12, max_text=900),
+            "prior_plan_review": _preserve_response_value(
+                prior_plan_review if isinstance(prior_plan_review, dict) else {}),
             "reviewer_reports": compact_reports,
         },
         "decision_contract": {
             "purpose": "Select one scientifically defensible source/design repair before execution.",
             "rules": [
+                SCIENTIFIC_REPAIR_ACCEPTANCE_RULE,
                 "Reconcile the reviewers; do not concatenate competing suggestions into an authoring order.",
                 "Tie the root cause to an observed field, source location, equation, or deterministic gate.",
                 "Choose only changes that preserve the admitted topic and exact research question.",
@@ -1211,8 +1352,12 @@ def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports
                 "and residual_uncertainties do not resolve a pre-execution design defect.",
                 "The controller binds the returned plan to this verified assignment and failure dossier. "
                 "Omit failure_lineage rather than copying it inaccurately; never invent identity fields.",
-                "The controller assigns the plan schema version and appends repair_contract.must_prove; "
+                "The controller binds topic_id to the admitted topic. Omit topic_id; "
+                "candidate experiment_intent.id is a program revision identity, not a topic identity.",
+                "The controller assigns the plan schema version and appends repair_contract.must_prove "
+                "as execution-phase checks; "
                 "do not spend output tokens repeating those controller-owned fields.",
+                REPAIR_CHECK_PHASE_RULE,
             ],
             "output_schema": {
                     "decision": "repair | hold",
@@ -1221,7 +1366,6 @@ def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports
                     "evidence_gaps": ["unresolved evidence gaps; at most 3"],
                     "requested_actions": ["one bounded disposition; at most 3"],
                     "repair_plan": {
-                        "topic_id": "the exact topic id from the packet",
                         "disposition": "repair",
                         "root_cause": {"statement": "...", "evidence": ["..."]},
                         "required_changes": [{
@@ -1230,7 +1374,8 @@ def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports
                             "scientific_basis": "why the change is justified independently of the desired outcome",
                             "source_refs": ["existing source identifier or empty only for a labelled theoretical sensitivity analysis"],
                         }],
-                        "acceptance_checks": ["optional supplementary falsifiable checks"],
+                        "acceptance_checks": [{"phase": "plan | execution",
+                                               "check": "one complete falsifiable check owned by that phase"}],
                         "residual_uncertainties": ["..."],
                     },
                     "hold_rule": "When no evidence-bound repair is defensible, use decision=hold and repair_plan=null; state the exact missing evidence and one bounded evidence-gathering action.",
@@ -1240,6 +1385,26 @@ def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports
     return _json_with_budget(
         envelope, system=REPAIR_ADJUDICATION_SYSTEM,
         max_input_tokens=quota.get("max_input_tokens"))
+
+
+def build_repair_evidence_prompt(assignment, repair_packet, request, *, prior_review=None):
+    quota = assignment.get("quota") if isinstance(assignment.get("quota"), dict) else {}
+    work = repair_packet.get("prior_foundry_work")
+    work = work if isinstance(work, dict) else {}
+    last = work.get("last_attempt")
+    last = last if isinstance(last, dict) else {}
+    return _json_with_budget({
+        "assignment": {key: assignment.get(key) for key in ("assigned_role", "stage_id", "task_id")},
+        "repair_evidence_request": _preserve_response_value(request),
+        "topic": _preserve_response_value(repair_packet.get("topic", {})),
+        "evidence_experiment_intent": _preserve_response_value(last.get("experiment_intent", {})),
+        "candidate_program": _repair_candidate_program(repair_packet),
+        "prior_evidence_review": _preserve_response_value(prior_review),
+        "output_contract": {"decision": "pass | hold", "summary": "...", "findings": [],
+            "evidence_gaps": [], "requested_actions": [], "evidence_note": {
+                "title": "...", "content": "complete evidence note", "source_refs": [], "limitations": [],
+                "action_disposition": "fulfilled | superseded"}},
+    }, system=REPAIR_EVIDENCE_SYSTEM, max_input_tokens=quota.get("max_input_tokens"))
 
 
 def build_verifier_prompt(stage, stage_packet, specialist_reports, chief_result,
@@ -1369,7 +1534,7 @@ def _verifier_repair_prompt(prompt, error, previous_text, *, max_input_tokens):
     return prompt
 
 
-def _specialist_repair_prompt(prompt, error, previous_text, *, max_input_tokens):
+def _specialist_repair_prompt(prompt, error, previous_text, *, max_input_tokens, response_contract=None):
     """Add one bounded JSON-only repair for an invalid specialist response."""
     instruction = (
         "The previous specialist response was invalid. Return one complete JSON object with only "
@@ -1378,6 +1543,10 @@ def _specialist_repair_prompt(prompt, error, previous_text, *, max_input_tokens)
         "bounded actions; group duplicates, but use no word-count ceiling. Preserve uncertainty "
         "and do not claim checks that are not in the packet."
     )
+    system = SPECIALIST_SYSTEM
+    if response_contract == "repair_evidence":
+        instruction = REPAIR_EVIDENCE_SYSTEM + " Regenerate the original evidence-note JSON contract."
+        system = REPAIR_EVIDENCE_SYSTEM
     try:
         payload = json.loads(prompt)
     except (TypeError, ValueError):
@@ -1387,13 +1556,24 @@ def _specialist_repair_prompt(prompt, error, previous_text, *, max_input_tokens)
     payload["repair_instruction"] = instruction
     payload["validation_error"] = str(error)[:500]
     candidate = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    if estimate_input_tokens(SPECIALIST_SYSTEM, candidate) <= max_input_tokens:
+    if estimate_input_tokens(system, candidate) <= max_input_tokens:
         return candidate
     payload.pop("previous_response_excerpt", None)
     candidate = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    if estimate_input_tokens(SPECIALIST_SYSTEM, candidate) <= max_input_tokens:
+    if estimate_input_tokens(system, candidate) <= max_input_tokens:
         return candidate
     return prompt
+
+
+def specialist_system(assignment, *, verifier=False):
+    """Select the system contract used for both dispatch and cache identity."""
+    if verifier:
+        return VERIFIER_SYSTEM
+    if assignment.get("_response_contract") == "repair_adjudication":
+        return REPAIR_ADJUDICATION_SYSTEM
+    if assignment.get("_response_contract") == "repair_evidence":
+        return REPAIR_EVIDENCE_SYSTEM
+    return SPECIALIST_SYSTEM
 
 
 class SpecialistDispatcher:
@@ -1453,7 +1633,9 @@ class SpecialistDispatcher:
             metadata = {"id", "pool"}
             effective = {key: deepcopy(value) for key, value in self.model_config.items()
                          if key not in {"role_models", "role_model_fallbacks", "role_routes", "role_profiles"}}
-            effective.update({key: deepcopy(value) for key, value in route.items() if key not in metadata})
+            from scisaurus.runtime.models import merge_model_config
+            effective = merge_model_config(
+                effective, {key: deepcopy(value) for key, value in route.items() if key not in metadata})
         effective = resolve_model_config(effective, role=role)
         return effective
 
@@ -1774,6 +1956,17 @@ class SpecialistDispatcher:
 
     def _execute(self, assignment, packet, *, verifier=False):
         assigned_role = assignment.get("assigned_role") or assignment.get("agent")
+        event_identity = {
+            "role": assigned_role,
+            "role_id": assignment.get("role_id"),
+            "task_id": assignment.get("task_id"),
+            "stage_id": assignment.get("stage_id"),
+            "assignment_attempt_number": assignment.get("attempt_number"),
+        }
+
+        def emit(event):
+            self.on_progress({**event, **event_identity})
+
         model_role = assignment.get("model_role") or assigned_role
         execution_kind = assignment.get("execution_kind", "model")
         quota = deepcopy(assignment.get("quota")) if isinstance(assignment.get("quota"), dict) else {}
@@ -1798,7 +1991,7 @@ class SpecialistDispatcher:
                 "usage": {}, "elapsed_seconds": time.monotonic() - started,
                 "route_id": None, "provider_pool": None,
             }
-            self.on_progress({"event": "failed", **report})
+            emit({"event": "failed", **report})
             return report
         if execution_kind == "deterministic":
             output_path = packet.get("stage_result", {}).get("output_path") if isinstance(
@@ -1816,18 +2009,13 @@ class SpecialistDispatcher:
                 "elapsed_seconds": time.monotonic() - started,
                 "route_id": None, "provider_pool": None,
             }
-            self.on_progress({"event": "completed", "role": assigned_role, **report})
+            emit({"event": "completed", "role": assigned_role, **report})
             return report
         prompt = assignment.pop("_prompt", None) if "_prompt" in assignment else None
+        system = specialist_system(assignment, verifier=verifier)
         response_contract = assignment.pop("_response_contract", None)
         if not isinstance(prompt, str):
             prompt = build_specialist_prompt(assignment, packet)
-        if verifier:
-            system = VERIFIER_SYSTEM
-        elif response_contract == "repair_adjudication":
-            system = REPAIR_ADJUDICATION_SYSTEM
-        else:
-            system = SPECIALIST_SYSTEM
         max_input_tokens = self.input_limit_for_role(
             model_role, quota.get("max_input_tokens"))
         quota["max_input_tokens"] = max_input_tokens
@@ -1855,18 +2043,25 @@ class SpecialistDispatcher:
         if type(output_per_call) is not int or output_per_call <= 0:
             output_per_call = output_budget
         retry_history = []
+        request_inputs = []
         failed_primary_routes = set()
         previous_text = None
         continue_previous_output = False
         last_validation_error = None
+        last_model_failure = None
         report = None
         while report is None:
             route = None
+            result = None
+            request_input = None
             response_received = False
             remaining_output_budget = output_budget - output_budget_used
             if remaining_output_budget <= 0:
                 report = {
-                    "status": "failed", "execution_mode": "model",
+                    **(last_model_failure or {}),
+                    "status": ("result_unknown" if last_model_failure is not None
+                               and last_model_failure["failure"].get("outcome_known") is not True
+                               else "failed"), "execution_mode": "model",
                     "assigned_role": assigned_role, "role_id": assignment.get("role_id"),
                     "model_role": model_role,
                     "error": "specialist response exhausted its cumulative output-token budget",
@@ -1877,7 +2072,7 @@ class SpecialistDispatcher:
                     "provider_retries": provider_retries,
                     "retry_history": deepcopy(retry_history),
                 }
-                self.on_progress({"event": "output_budget_exhausted",
+                emit({"event": "output_budget_exhausted",
                                   "role": assigned_role,
                                   "role_id": assignment.get("role_id"),
                                   "output_budget": output_budget,
@@ -1898,7 +2093,7 @@ class SpecialistDispatcher:
                 else:
                     current_prompt = _specialist_repair_prompt(
                         prompt, last_validation_error, previous_text,
-                        max_input_tokens=max_input_tokens)
+                        max_input_tokens=max_input_tokens, response_contract=response_contract)
                     continuation_prefix = None
                 primary_routes = self._routes(model_role)
                 primary_route_ids = {route_id for route_id, _pool, _route in primary_routes}
@@ -1959,7 +2154,7 @@ class SpecialistDispatcher:
                     timeout_bounds.append(float(role_seconds))
                 config["timeout_seconds"] = effective_model_timeout(
                     config.get("timeout_seconds"), *timeout_bounds)
-                self.on_progress({"event": "dispatched", "role": assigned_role,
+                emit({"event": "dispatched", "role": assigned_role,
                                   "role_id": assignment.get("role_id"),
                                   "task_id": assignment.get("task_id"),
                                   "stage_id": assignment.get("stage_id"),
@@ -1979,10 +2174,19 @@ class SpecialistDispatcher:
                 call_kwargs = {"system": system, "prompt": current_prompt}
                 if continuation_prefix is not None:
                     call_kwargs["continuation_text"] = continuation_prefix
-                result = ModelClient(**config).complete(**call_kwargs)
+                client = ModelClient(**config)
+                request_input = {"input": deepcopy(call_kwargs), "route_id": route["route_id"],
+                                 "provider_pool": route["pool"], "request_attempts": None,
+                                 "input_sha256": hashlib.sha256(json.dumps(
+                                     call_kwargs, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()}
+                request_inputs.append(request_input)
+                result = client.complete(**call_kwargs)
+                request_input["request_attempts"] = result.request_attempts
                 clear_model_provider_cooldown(
                     config, expected_generation=cooldown_generation)
                 response_received = True
+                last_model_failure = None
                 response_text = result.text
                 if continuation_prefix is not None:
                     result = type(result)(
@@ -2004,6 +2208,30 @@ class SpecialistDispatcher:
                         f"specialist response did not finish normally: {result.finish_reason}")
                 parsed = result.json_object()
                 normalized = _normalise_verdict(parsed) if verifier else _normalise_report(parsed)
+                if response_contract == "repair_evidence" and not verifier:
+                    if (set(parsed) != {"decision", "summary", "findings", "evidence_gaps", "requested_actions", "evidence_note"}
+                            or not isinstance(parsed.get("summary"), str)
+                            or any(not isinstance(parsed.get(key), list)
+                                   or any(not isinstance(item, str) for item in parsed[key])
+                                   for key in ("findings", "evidence_gaps", "requested_actions"))):
+                        raise ValidationError("evidence-note response must satisfy its complete declared contract")
+                    note = parsed.get("evidence_note")
+                    if parsed.get("decision") not in {"pass", "hold"}:
+                        raise ValidationError("evidence-note decision must be pass or hold")
+                    if parsed["decision"] == "pass":
+                        if (not isinstance(note, dict) or set(note) != {"title", "content", "source_refs", "limitations", "action_disposition"}
+                                or note.get("action_disposition") not in {"fulfilled", "superseded"}
+                                or any(not isinstance(note.get(key), str) or not note[key].strip()
+                                       for key in ("title", "content"))
+                                or any(not isinstance(note.get(key), list) or any(not isinstance(item, str) for item in note[key])
+                                       for key in ("source_refs", "limitations"))):
+                            raise ValidationError("evidence note must contain complete title, content, source_refs, limitations")
+                        supplied = json.loads(prompt).get("repair_evidence_request", {}).get("source_ref_catalog", [])
+                        if any(ref not in supplied for ref in note["source_refs"]):
+                            raise ValidationError("evidence note cites an unbound source")
+                    elif note is not None:
+                        raise ValidationError("a held evidence action must not publish a completed note")
+                    normalized["evidence_note"] = _preserve_response_value(note)
                 report = {
                     "status": "succeeded", "execution_mode": "model",
                     "assigned_role": assigned_role, "role_id": assignment.get("role_id"),
@@ -2011,6 +2239,7 @@ class SpecialistDispatcher:
                     "route_id": route["route_id"], "provider_pool": route["pool"],
                     "context_window_tokens": config.get("context_window_tokens"),
                     "max_input_tokens": config.get("max_input_tokens"),
+                    "finish_reason": result.finish_reason,
                     "response": normalized, "usage": deepcopy(accumulated_usage),
                     "elapsed_seconds": time.monotonic() - started,
                     "request_attempts": sum(
@@ -2022,6 +2251,23 @@ class SpecialistDispatcher:
                 }
                 continue
             except ModelCallError as exc:
+                last_model_failure = {
+                    "error_type": type(exc).__name__, "failure": exc.failure_details(),
+                    "budget_admission": deepcopy(getattr(exc, "budget_admission", None)),
+                    "status_code": exc.status_code,
+                    "retry_after_seconds": exc.retry_after_seconds,
+                    "provider_error_kind": exc.provider_error_kind,
+                }
+                failed_usage = getattr(exc, "usage", {})
+                if isinstance(failed_usage, dict):
+                    for key, value in failed_usage.items():
+                        if type(value) is int and value >= 0:
+                            accumulated_usage[key] = accumulated_usage.get(key, 0) + value
+                    failed_output = failed_usage.get("output_tokens", 0)
+                    if type(failed_output) is int and failed_output >= 0:
+                        output_budget_used += failed_output
+                if request_input is not None:
+                    request_input.update(request_attempts=exc.attempts, outcome_known=exc.outcome_known)
                 if self._provider_route_failure(exc):
                     self._mark_provider_cooldown(route, exc)
                     self._record_shared_quota_failure(route, exc)
@@ -2033,6 +2279,9 @@ class SpecialistDispatcher:
                             "route_id": route["route_id"] if route else None,
                             "provider_pool": route["pool"] if route else None,
                             "error": str(exc), "attempts": exc.attempts,
+                            "error_type": type(exc).__name__,
+                            "budget_admission": deepcopy(getattr(exc, "budget_admission", None)),
+                            "failure": exc.failure_details(),
                             "elapsed_seconds": exc.elapsed_seconds if exc.elapsed_seconds is not None
                             else time.monotonic() - started,
                             "partial_response": previous_text if previous_text else None,
@@ -2071,7 +2320,7 @@ class SpecialistDispatcher:
                         "error": str(exc)[:1000],
                         "request_attempts": exc.attempts,
                     })
-                    self.on_progress({"event": "provider_route_failed",
+                    emit({"event": "provider_route_failed",
                                       "role": assigned_role,
                                       "role_id": assignment.get("role_id"),
                                       "model_role": model_role,
@@ -2089,6 +2338,9 @@ class SpecialistDispatcher:
                     "route_id": route["route_id"] if route else None,
                     "provider_pool": route["pool"] if route else None,
                     "error": str(exc), "attempts": exc.attempts,
+                    "error_type": type(exc).__name__,
+                    "budget_admission": deepcopy(getattr(exc, "budget_admission", None)),
+                    "failure": exc.failure_details(),
                     "elapsed_seconds": exc.elapsed_seconds if exc.elapsed_seconds is not None
                     else time.monotonic() - started,
                     "partial_response": previous_text if previous_text else None,
@@ -2101,7 +2353,14 @@ class SpecialistDispatcher:
                 }
                 continue
             except ValidationError as exc:
-                continuing = result.finish_reason == "length"
+                continuing = response_received and result is not None and result.finish_reason == "length"
+                if continuing:
+                    continuation_error = json_object_continuation_error(previous_text)
+                    if continuation_error is not None:
+                        continuing = False
+                        exc = ValidationError(continuation_error)
+                if request_input is not None and not response_received:
+                    request_input.update(request_attempts=0, outcome_known=True)
                 retry_available = call_attempts < max_call_attempts
                 can_repair_schema = not schema_repair_used
                 if (response_received and retry_available
@@ -2124,7 +2383,7 @@ class SpecialistDispatcher:
                                 (previous_text or "").encode("utf-8")).hexdigest(),
                         } if continuing else {}),
                     })
-                    self.on_progress({"event": "continuing" if continuing else "retrying",
+                    emit({"event": "continuing" if continuing else "retrying",
                                       "role": assigned_role,
                                       "role_id": assignment.get("role_id"),
                                       "model_role": model_role, "route_id": route["route_id"],
@@ -2180,7 +2439,8 @@ class SpecialistDispatcher:
                 "provider_retries": provider_retries,
                 "retry_history": deepcopy(retry_history),
             }
-        self.on_progress({"event": "completed", "role": assigned_role, **report})
+        emit({"event": "completed", "role": assigned_role, **report})
+        report["request_inputs"] = request_inputs
         return report
 
     def dispatch(self, assignments, stage_packet, *, verifier=False, on_result=None):
@@ -2215,5 +2475,5 @@ class SpecialistDispatcher:
 __all__ = [
     "SPECIALIST_SYSTEM", "REPAIR_ADJUDICATION_SYSTEM", "VERIFIER_SYSTEM", "SpecialistDispatcher",
     "build_specialist_prompt", "build_repair_adjudication_prompt",
-    "build_verifier_prompt",
+    "build_verifier_prompt", "specialist_system",
 ]

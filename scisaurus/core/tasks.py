@@ -11,6 +11,7 @@ An external call of unknown completion is never a zero-cost success (T05).
 from __future__ import annotations
 
 import json
+import math
 import time
 
 from scisaurus.core.errors import NotFoundError, StateError, ValidationError
@@ -24,7 +25,7 @@ TRANSITIONS = {
     "queued": {"running", "blocked", "cancelled", "stale"},
     "running": {"awaiting_review", "blocked", "failed", "paused", "cancelled", "stale"},
     "awaiting_review": {"queued", "blocked", "stale", "completed", "cancelled"},
-    "blocked": {"queued", "cancelled", "stale"},
+    "blocked": {"queued", "awaiting_review", "cancelled", "stale"},
     "paused": {"queued", "cancelled", "stale"},
 }
 
@@ -77,6 +78,13 @@ class TaskManager:
                 raise StateError(f"task {task_id} is terminal ({current})")
             if new_state != current and new_state not in allowed:
                 raise StateError(f"illegal transition {current} -> {new_state}")
+            if current == "blocked" and new_state == "awaiting_review":
+                attempt = conn.execute(
+                    "SELECT state FROM attempts WHERE task_id=? ORDER BY lease_fence DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if attempt is None or attempt["state"] != "succeeded":
+                    raise StateError("review resumption requires a successful recorded attempt")
             conn.execute(
                 "UPDATE tasks SET state = ?, updated_at = ? WHERE task_id = ?",
                 (new_state, now_iso(), task_id),
@@ -187,13 +195,20 @@ class TaskManager:
                          **({"accounting": accounting} if accounting is not None else {})},
             )
 
-    def reconcile_unknown(self, attempt_id: str, actor: str) -> dict:
+    def reconcile_unknown(self, attempt_id: str, actor: str, *, observed_usage=None) -> dict:
         """Record uncertainty for an external call whose completion is unknown (T05).
 
         The attempt is marked ``result_unknown``; its reserved resources stay
         conservatively accounted (never zero-cost). Active tasks enter blocked
         when their lifecycle permits it; terminal and paused decisions remain.
         """
+        if observed_usage is not None and (
+                not isinstance(observed_usage, dict)
+                or any(not isinstance(key, str) or not key
+                       or type(value) not in (int, float)
+                       or not math.isfinite(value) or value < 0
+                       for key, value in observed_usage.items())):
+            raise ValidationError("observed unknown usage must contain nonnegative finite quantities")
         with self.control.tx() as conn:
             row = conn.execute(
                 "SELECT * FROM attempts WHERE attempt_id = ?", (attempt_id,)
@@ -204,6 +219,8 @@ class TaskManager:
                 raise StateError(f"attempt not running: {row['state']}")
             usage = json.loads(row["usage_json"])
             usage["accounting"] = "conservative_pending_reconciliation"
+            if observed_usage:
+                usage["observed"] = dict(observed_usage)
             conn.execute(
                 "UPDATE attempts SET state='result_unknown', usage_json = ?"
                 " WHERE attempt_id = ?",

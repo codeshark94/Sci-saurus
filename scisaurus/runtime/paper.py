@@ -108,6 +108,8 @@ def load_paper_survey(config, *, require_eligible=True):
         gate.require_current(config["survey_ref"])
         assessment = gate.require_current_assessment(config["assessment_ref"])
         body = json.loads(store.read_body(assessment["body_hash"]))
+        if body.get("survey_ref") != config["survey_ref"]:
+            raise ValidationError("accepted assessment does not reference the supplied survey")
         if require_eligible and config["document_type"] == "research_paper" and body["state"] != "eligible_for_experiment":
             raise ValidationError("a research paper candidate requires an experiment-eligible accepted gap assessment")
         survey_record = store.get(config["survey_ref"])
@@ -117,6 +119,7 @@ def load_paper_survey(config, *, require_eligible=True):
         identities = {ref: json.loads(store.read_body(store.get(ref)["body_hash"]))
                       for ref in survey.get("identity_refs", [])}
         return {"state": body["state"], "sources": sources,
+                "assessment": body,
                 "schema_version": survey["schema_version"], "identities": identities,
                 "survey_ref": config["survey_ref"], "assessment_ref": config["assessment_ref"],
                 "event_chain": control.verify_chain()}

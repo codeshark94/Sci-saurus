@@ -183,21 +183,25 @@ class ControlStore:
         os.makedirs(os.path.join(self.dir, "state"), exist_ok=True)
         self.path = os.path.join(self.dir, "state", "control.sqlite")
         self._conn = sqlite3.connect(self.path, isolation_level=None)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=FULL")
-        self._conn.executescript(SCHEMA_SQL)
-        if self._conn.execute(
-            "SELECT 1 FROM meta WHERE key='genesis'"
-        ).fetchone() is None:
-            self._conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('genesis', ?)",
-                (GENESIS_HASH,),
-            )
-            self._conn.execute(
-                "INSERT OR IGNORE INTO meta(key, value) VALUES ('event_head', ?)",
-                (GENESIS_HASH,),
-            )
+        try:
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=FULL")
+            self._conn.executescript(SCHEMA_SQL)
+            if self._conn.execute(
+                "SELECT 1 FROM meta WHERE key='genesis'"
+            ).fetchone() is None:
+                self._conn.execute(
+                    "INSERT INTO meta(key, value) VALUES ('genesis', ?)",
+                    (GENESIS_HASH,),
+                )
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO meta(key, value) VALUES ('event_head', ?)",
+                    (GENESIS_HASH,),
+                )
+        except BaseException:
+            self._conn.close()
+            raise
 
     # -- transactions ----------------------------------------------------
     @contextmanager

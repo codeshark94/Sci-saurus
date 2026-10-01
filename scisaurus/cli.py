@@ -56,7 +56,8 @@ def _composer_progress_line(state):
                 active.extend(record.get("active_agents", []))
             elif stage_id == current:
                 continue
-    usage = state.get("usage") if isinstance(state.get("usage"), dict) else {}
+    usage = state.get("observed_usage") if isinstance(state.get("observed_usage"), dict) else (
+        state.get("usage") if isinstance(state.get("usage"), dict) else {})
     active_blockers = state.get("active_blockers")
     if not isinstance(active_blockers, list):
         active_blockers = state.get("blockers") if isinstance(state.get("blockers"), list) else []

@@ -39,12 +39,13 @@ from scisaurus.runtime.experiment import (
     PROGRAM_OUTPUT_FIELDS, ExperimentProgramOutputContractError,
     validate_program_output,
 )
-from scisaurus.runtime.experiment_config import validate_work_orders
+from scisaurus.runtime.experiment_config import EXPERIMENT_WORK_ORDER_KINDS, validate_work_orders
 from scisaurus.runtime.models import (
     ModelCallError, ModelClient, ModelResult, effective_model_timeout,
     resolve_model_config,
 )
 from scisaurus.runtime.model_work import ModelWorkBlocked
+from scisaurus.runtime.specialists import _preserve_response_value, REPAIR_CHECK_PHASE_RULE
 from scisaurus.runtime.program_admission import (
     ExperimentIntentContractError, is_main_entry_guard, scan_program_source,
     validate_experiment_intent,
@@ -205,9 +206,7 @@ IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 AUTHOR_PATCH_MAX_OUTPUT_TOKENS = 4096
 AUTHOR_PATCH_MAX_EDITS = 4
 AUTHOR_PATCH_MAX_SOURCE_CHARS = 12000
-AUTHOR_PATCH_CONTEXT_MAX_CHARS = 9000
 AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS = 8
-AUTHOR_PATCH_DUPLICATE_CONTEXT_MAX_CHARS = 48000
 AUTHOR_CONTINUATION_MAX_OUTPUT_TOKENS = 24000
 AUTHOR_MAX_CONTINUATIONS = 4
 CONFIG_SCHEMA = "capability-foundry-config-1"
@@ -740,6 +739,7 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             "outside it; keep descriptions concise and place implementation only in the source fields."
         ),
         "capability_brief": brief,
+        "repair_check_phase_rule": REPAIR_CHECK_PHASE_RULE,
         "output_contract": {
             "executor_source": "complete Python source; reads {'configured_input','experiment'} from stdin, "
                                f"writes one JSON object with exactly {executor_fields} "
@@ -1095,6 +1095,11 @@ def _definition_line_start(node):
     return min([node.lineno] + [item.lineno for item in node.decorator_list])
 
 
+def _physical_source_lines(source):
+    """Preserve bytes while matching the Python parser's newline boundaries."""
+    return re.split(r"(?<=\n)|(?<=\r)(?!\n)", source)
+
+
 def _apply_duplicate_structure_patch(source, patch, *, name):
     if not isinstance(patch.get("source_sha256"), str):
         raise ValidationError(f"{name} structural patch requires the current source SHA-256")
@@ -1117,24 +1122,7 @@ def _apply_duplicate_structure_patch(source, patch, *, name):
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             definitions.setdefault(node.name, []).append(node)
-    duplicate_nodes = [
-        node for matches in definitions.values() if len(matches) > 1
-        for node in matches
-    ]
     guards = [node for node in tree.body if is_main_entry_guard(node)]
-    if duplicate_nodes or len(guards) > 1:
-        lines = source.splitlines()
-        duplicate_context_chars = sum(
-            len("\n".join(lines[_definition_line_start(node) - 1:
-                                  node.end_lineno or node.lineno]))
-            for node in duplicate_nodes)
-        guard_context_chars = sum(
-            len("\n".join(lines[node.lineno - 1:node.end_lineno or node.lineno]))
-            for node in guards)
-        if duplicate_context_chars + guard_context_chars > AUTHOR_PATCH_DUPLICATE_CONTEXT_MAX_CHARS:
-            raise ValidationError(
-                f"{name} duplicate source sections exceed the complete comparison context limit; "
-                "structural removal is not safe")
     ranges = []
     selected_names = set()
     removed_count = 0
@@ -1182,7 +1170,7 @@ def _apply_duplicate_structure_patch(source, patch, *, name):
     if any(current[0] <= previous[1] for previous, current in zip(ranges, ranges[1:])):
         raise ValidationError(f"{name} structural patch selected overlapping duplicate declarations")
 
-    lines = source.splitlines(keepends=True)
+    lines = _physical_source_lines(source)
     for start, end in reversed(ranges):
         del lines[start - 1:end]
     return "".join(lines)
@@ -1341,131 +1329,133 @@ def _candidate_bound_value(state, candidate, value_key, fingerprint_key):
     return value
 
 
-def _source_patch_context(source, focus_text):
-    """Project only complete, relevant functions into a bounded patch request."""
+def _repair_request_matches_candidate(prompt, candidate):
+    if prompt.get("candidate_sha256") != _authored_candidate_sha256(candidate):
+        return False
+    current = prompt.get("current_candidate")
+    if not isinstance(current, dict) or current.get("experiment_intent") != candidate.get("experiment_intent"):
+        return False
+    contexts = current.get("source_context")
+    if not isinstance(contexts, dict):
+        return False
+    for key in ("executor_source", "validator_source"):
+        source = candidate.get(key)
+        context = contexts.get(key)
+        if (not isinstance(source, str) or not isinstance(context, dict)
+                or context.get("source_sha256") != hashlib.sha256(source.encode("utf-8")).hexdigest()):
+            return False
+        if "source" in context:
+            if context["source"] != source or context.get("source_complete") is not True:
+                return False
+        elif isinstance(context.get("sections"), list):
+            lines = _physical_source_lines(source)
+            for section in context["sections"]:
+                if not isinstance(section, dict):
+                    return False
+                start, end = section.get("line_start"), section.get("line_end")
+                if type(start) is not int or type(end) is not int or not 1 <= start <= end:
+                    return False
+                excerpts = []
+                if end <= len(lines):
+                    excerpts.append("".join(lines[start - 1:end]))
+                # Earlier projections normalized newline boundaries and omitted the final newline.
+                normalized_lines = source.splitlines()
+                if end <= len(normalized_lines):
+                    excerpts.append("\n".join(normalized_lines[start - 1:end]))
+                if section.get("source") not in excerpts:
+                    return False
+        else:
+            return False
+    return True
+
+
+def _retained_candidate_failure(state, candidate):
+    bound = _candidate_bound_value(
+        state, candidate, "candidate_failure", "candidate_failure_sha256")
+    if bound:
+        return deepcopy_config(bound)
+    retained = state.get("last_attempt")
+    fingerprint = _authored_candidate_sha256(candidate)
+    if fingerprint is None or _authored_candidate_sha256(retained) != fingerprint:
+        return {}
+    full_fingerprint = hashlib.sha256(canonical_bytes(retained)).hexdigest()
+    failures = [item for item in state.get("repair_ledger", [])
+                if isinstance(item, dict) and item.get("candidate_sha256") == full_fingerprint
+                and item.get("gate")]
+    if not failures or failures[-1].get("gate") != "program_output_contract":
+        return {}
+    for request in reversed(state.get("requests", [])):
+        if not isinstance(request, dict) or not isinstance(request.get("prompt"), str):
+            continue
+        try:
+            prompt = json.loads(request["prompt"])
+        except ValueError:
+            continue
+        if not isinstance(prompt, dict):
+            continue
+        details = prompt.get("format_repair", {})
+        if (_repair_request_matches_candidate(prompt, candidate)
+                and isinstance(details, dict)
+                and details.get("repair_kind") == "executor_output_contract"
+                and all(isinstance(details.get(key), list) for key in (
+                    "required_fields", "observed_fields", "missing_fields", "unexpected_fields"))
+                and details.get("previous_error") == failures[-1].get("error")):
+            return {**deepcopy_config(details), "error": failures[-1]["error"],
+                    "gate": "program_output_contract"}
+    return {}
+
+
+def _repair_scientific_input(value):
+    """Exclude controller reconciliation diagnostics from repair seed identity."""
+    if isinstance(value, list):
+        return [_repair_scientific_input(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if key == "capability_brief" and isinstance(item, str):
+            try:
+                item = json.loads(item)
+            except ValueError:
+                pass
+        controller_lineage = (
+            key == "attempt_lineage" and isinstance(value.get("kind"), str)
+            and value["kind"] in EXPERIMENT_WORK_ORDER_KINDS
+            or key == "lineage" and value.get("schema_version") == "experiment-repair-plan-1"
+        )
+        if controller_lineage and isinstance(item, dict):
+            item = {name: field for name, field in item.items()
+                    if name != "prior_attempt_reconciliation"}
+        result[key] = _repair_scientific_input(item)
+    return result
+
+
+def _source_patch_context(source):
+    """Carry exact source bytes with physical indices for structural edits."""
     if not isinstance(source, str):
-        return {"source_sha256": None, "sections": [], "omitted": []}
-    source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
-    lines = source.splitlines()
+        raise ValidationError("candidate repair source must be text")
+    context = {
+        "source": source, "source_complete": True,
+        "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "characters": len(source),
+    }
     try:
         tree = ast.parse(source)
     except SyntaxError as exc:
-        line_number = exc.lineno or 1
-        start = max(1, line_number - 12)
-        end = min(len(lines), line_number + 12)
-        excerpt = "\n".join(lines[start - 1:end])
-        return {
-            "source_sha256": source_hash,
-            "syntax_error": {"line": line_number, "message": exc.msg},
-            "sections": ([{"name": "syntax_error_context", "line_start": start,
-                           "line_end": end, "source": excerpt}] if excerpt else []),
-            "omitted": [],
-        }
-
-    nodes = [node for node in tree.body
-             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
-    by_name = {}
-    for node in nodes:
-        by_name.setdefault(node.name, []).append(node)
-    duplicate_definitions = [
-        {"name": name, "line_starts": [
-            _definition_line_start(node)
-            for node in matches]}
-        for name, matches in sorted(by_name.items()) if len(matches) > 1
+        context["syntax_error"] = {"line": exc.lineno, "message": exc.msg}
+        return context
+    definitions = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definitions.setdefault(node.name, []).append(_definition_line_start(node))
+    context["duplicate_definitions"] = [
+        {"name": name, "line_starts": starts}
+        for name, starts in sorted(definitions.items()) if len(starts) > 1
     ]
-    duplicate_names = {item["name"] for item in duplicate_definitions}
-    entry_guards = [node for node in tree.body if is_main_entry_guard(node)]
-    identifiers = set(re.findall(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_])",
-                                 str(focus_text)))
-    selected = []
-    for name in sorted(identifiers):
-        if name not in duplicate_names:
-            selected.extend(by_name.get(name, []))
-    if not selected:
-        if "main" not in duplicate_names:
-            selected.extend(by_name.get("main", []))
-    if not selected and nodes:
-        selected.extend(nodes[:2])
-
-    def callees(node):
-        return {
-            item.func.id if isinstance(item.func, ast.Name) else item.func.attr
-            for item in ast.walk(node) if isinstance(item, ast.Call)
-            and isinstance(item.func, (ast.Name, ast.Attribute))
-        }
-
-    initial = list(selected)
-    for node in initial:
-        for name in sorted(callees(node)):
-            if name not in duplicate_names:
-                selected.extend(by_name.get(name, []))
-    unique = []
-    seen = set()
-    for node in selected:
-        identity = (node.name, node.lineno, node.end_lineno)
-        if identity not in seen:
-            seen.add(identity)
-            unique.append(node)
-    unique.sort(key=lambda node: (node.name not in identifiers,
-                                  node.name != "main", node.lineno))
-
-    sections, omitted, used = [], [], 0
-    for node in unique:
-        start = min([node.lineno] + [item.lineno for item in node.decorator_list])
-        end = node.end_lineno or node.lineno
-        excerpt = "\n".join(lines[start - 1:end])
-        if used + len(excerpt) > AUTHOR_PATCH_CONTEXT_MAX_CHARS:
-            omitted.append({"name": node.name, "line_start": start, "line_end": end})
-            continue
-        sections.append({"name": node.name, "line_start": start,
-                         "line_end": end, "source": excerpt})
-        used += len(excerpt)
-    duplicate_source_sections, duplicate_source_omitted, duplicate_used = [], [], 0
-    duplicate_nodes = sorted(
-        (node for name in duplicate_names for node in by_name[name]),
-        key=lambda node: (node.lineno, node.name))
-    for node in duplicate_nodes:
-        start = _definition_line_start(node)
-        end = node.end_lineno or node.lineno
-        excerpt = "\n".join(lines[start - 1:end])
-        if duplicate_used + len(excerpt) > AUTHOR_PATCH_DUPLICATE_CONTEXT_MAX_CHARS:
-            duplicate_source_omitted.append({
-                "name": node.name, "line_start": start, "line_end": end,
-            })
-            continue
-        duplicate_source_sections.append({
-            "name": node.name, "line_start": start,
-            "line_end": end, "source": excerpt,
-        })
-        duplicate_used += len(excerpt)
-    entry_guard_source_sections, entry_guard_source_omitted = [], []
-    for node in entry_guards:
-        start = node.lineno
-        end = node.end_lineno or node.lineno
-        excerpt = "\n".join(lines[start - 1:end])
-        if duplicate_used + len(excerpt) > AUTHOR_PATCH_DUPLICATE_CONTEXT_MAX_CHARS:
-            entry_guard_source_omitted.append({
-                "line_start": start, "line_end": end,
-            })
-            continue
-        entry_guard_source_sections.append({
-            "line_start": start, "line_end": end, "source": excerpt,
-        })
-        duplicate_used += len(excerpt)
-    return {
-        "source_sha256": source_hash,
-        "sections": sections,
-        "omitted": omitted,
-        "duplicate_definitions": duplicate_definitions,
-        "duplicate_source_sections": duplicate_source_sections,
-        "duplicate_source_omitted": duplicate_source_omitted,
-        "duplicate_source_complete": (
-            not duplicate_source_omitted and not entry_guard_source_omitted),
-        "entry_guard_source_sections": entry_guard_source_sections,
-        "entry_guard_source_omitted": entry_guard_source_omitted,
-        "entry_guard_source_complete": not entry_guard_source_omitted,
-        "entry_guard_line_starts": [node.lineno for node in entry_guards],
-    }
+    context["entry_guard_line_starts"] = [
+        node.lineno for node in tree.body if is_main_entry_guard(node)
+    ]
+    return context
 
 
 def _record_program_gate_feedback(state, feedback, candidate=None):
@@ -1641,6 +1631,11 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
                            candidate, feedback, validation_context,
                            validation_feedback, format_repair):
     """Ask for a compact patch without repeating the full authoring contract."""
+    if isinstance(brief, str):
+        try:
+            brief = json.loads(brief)
+        except ValueError:
+            brief = {}
     topic = brief.get("topic") if isinstance(brief, dict) else None
     topic_fields = (
         "id", "title", "domain", "research_question", "scope",
@@ -1661,6 +1656,24 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
             for key in ("id", "objective", "success_condition", "evidence_needed")
             if key in order
         })
+        if isinstance(order.get("methods_adjudication"), dict):
+            plan = _preserve_response_value(order["methods_adjudication"])
+            compact_orders[-1]["methods_adjudication"] = plan
+            compact_orders[-1]["methods_adjudication_sha256"] = hashlib.sha256(
+                canonical_bytes(plan)).hexdigest()
+    repair_context = brief.get("capability_repair") if isinstance(brief, dict) else None
+    repair_plan = (repair_context.get("repair_plan")
+                   if isinstance(repair_context, dict) else None)
+    selected_plan = (_preserve_response_value(repair_plan)
+                     if isinstance(repair_plan, dict) else None)
+    frontier = brief.get("repair_evidence_frontier") if isinstance(brief, dict) else None
+    if frontier is not None and not isinstance(frontier, dict):
+        raise ValidationError("repair evidence frontier must be an object")
+    frontier = _preserve_response_value(frontier) if frontier is not None else None
+    frontier_sha256 = hashlib.sha256(canonical_bytes(frontier)).hexdigest() if frontier is not None else None
+    if (isinstance(brief, dict) and "repair_evidence_frontier_sha256" in brief
+            and brief["repair_evidence_frontier_sha256"] != frontier_sha256):
+        raise ValidationError("repair evidence frontier fingerprint does not match its exact content")
     output_contract = {"updates": {
         "executor_source": (
             "optional {'edits':[{'old':unique_text,'new':replacement}]} or a fingerprinted duplicate-only "
@@ -1687,29 +1700,28 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
             if isinstance(value, list) else _bounded_repair_text(value, 1400)
         )
     compact_feedback = _compact_repair_findings(validation_feedback)
-    repair_scope = compact_feedback.get("repair_scope", {})
+    candidate_failure = format_repair.get("candidate_failure")
+    candidate_failure = candidate_failure if isinstance(candidate_failure, dict) else {}
+    repair_scope = deepcopy_config(compact_feedback.get("repair_scope", {}))
     active_issue = repair_scope.get("active_issue", "none")
-    if active_issue != "none" and "previous_error" in format_details:
+    if candidate_failure:
+        repair_scope = {"policy": "one_issue_per_candidate_revision",
+                        "active_issue": "candidate_failure",
+                        "gate": candidate_failure.get("gate")}
+    elif active_issue != "none" and "previous_error" in format_details:
         format_details["previous_error"] = (
             "The prior response did not satisfy the requested JSON format. Return one complete JSON "
             "object matching output_contract and address only the single active issue below; "
             "deferred scientific findings remain recorded for later review."
         )
     format_error = format_details.get("previous_error")
-    previous_error_source = feedback if feedback is not None else format_error
+    previous_error_source = candidate_failure.get("error") or feedback or format_error
     previous_error = (
         f"The prior candidate failed {compact_feedback.get('gate', 'validation')}; "
         "see the single active issue below."
-        if active_issue != "none" else _bounded_repair_text(previous_error_source, 2200)
+        if active_issue != "none" and not candidate_failure
+        else _bounded_repair_text(previous_error_source, 2200)
     )
-    repair_focus_error = previous_error if active_issue != "none" else feedback
-    repair_focus = "\n".join((
-        _bounded_repair_text(repair_focus_error, 1800),
-        json.dumps(compact_feedback, ensure_ascii=False, sort_keys=True),
-        json.dumps(format_details, ensure_ascii=False, sort_keys=True),
-        json.dumps(_compact_repair_context(validation_context),
-                   ensure_ascii=False, sort_keys=True),
-    ))
     return {
         "assignment": "repair_existing_experiment_candidate",
         "topic": topic,
@@ -1718,35 +1730,41 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
         "current_candidate": {
             "experiment_intent": candidate.get("experiment_intent", {}),
             "source_context": {
-                "executor_source": _source_patch_context(
-                    candidate.get("executor_source"), repair_focus),
-                "validator_source": _source_patch_context(
-                    candidate.get("validator_source"), repair_focus),
+                key: _source_patch_context(candidate[key])
+                for key in ("executor_source", "validator_source")
             },
         },
         "repair_request": {
             "previous_error": previous_error,
+            "candidate_failure": deepcopy_config(candidate_failure),
+            "author_response_error": (None if format_repair.get("repair_kind") == "executor_output_contract"
+                                      else format_error),
+            "repair_scope": repair_scope,
             "observed_failure_context": _compact_repair_context(validation_context),
             "validation_feedback": compact_feedback,
             "work_orders": compact_orders,
+            "repair_plan": selected_plan,
+            "repair_evidence_frontier": frontier,
+            "repair_evidence_frontier_sha256": frontier_sha256,
+            "repair_plan_sha256": (hashlib.sha256(canonical_bytes(selected_plan)).hexdigest()
+                                   if selected_plan is not None else None),
         },
         "format_repair": format_details,
         "output_contract": output_contract,
         "instructions": (
             "Return exactly one JSON object with only the updates key. Make the smallest exact source edits "
-            "that resolve only the single active issue identified in repair_scope. Do not attempt deferred "
+            "that resolve only the single active issue identified in repair_request.repair_scope. Do not attempt deferred "
             "findings or checks in this revision; they remain recorded and will be independently reviewed "
             "after the candidate is replayed. Preserve the frozen estimand and controller-owned inputs; "
             "do not change results or invent observations. "
+            + REPAIR_CHECK_PHASE_RULE + " "
             "Do not emit internal reasoning, deliberation, alternative hypotheses, or narration. "
-            "Use only the supplied complete source sections and do not reconstruct omitted source. "
+            "The source_context contains the complete exact executor and validator bytes, each bound "
+            "to source_sha256. Preserve indentation, enclosing scopes, and unchanged source. "
             "Do not repeat the candidate, include rationale, or rewrite either source file. For duplicate "
-            "definitions, compare every supplied complete duplicate_source_section and choose the exact "
-            "line_start to retain from duplicate_definitions. Use the fingerprinted structural patch "
-            "only when duplicate_source_complete is true; otherwise do not guess which source to retain. "
-            "For duplicate __main__ guards, compare every complete entry_guard_source_section and choose "
-            "the exact line_start to retain; use the structural guard patch only when "
-            "entry_guard_source_complete is true. The structural patch can remove only "
+            "definitions, compare their full definitions in the exact source and choose the physical "
+            "line_start to retain. For duplicate __main__ guards, compare their complete source and "
+            "choose the physical line_start to retain. The structural patch can remove only "
             "other duplicate declarations, never arbitrary line ranges. The source_sha256 must match the "
             "current source context. Otherwise use exact edits whose old source excerpt occurs exactly once. "
             "Use at most "
@@ -2115,9 +2133,11 @@ class CapabilityFoundry:
                     original_input = original.get("configured_input", original.get("output_contract", {}).get("test_input"))
                     prior_required = original.get("required_intent_fields") or {}
                     required = base_prompt.get("required_intent_fields") or {}
-                    if (original.get("capability_brief") != brief
+                    if (_repair_scientific_input({"capability_brief": original.get("capability_brief")})
+                            != _repair_scientific_input({"capability_brief": brief})
                             or any(required.get(name) != value for name, value in prior_required.items())
-                            or original_input != configured_input
+                            or _repair_scientific_input(original_input)
+                            != _repair_scientific_input(configured_input)
                             or not (prior.get("feedback") or prior.get("status") == "succeeded")):
                         return None
                     return requests, candidate
@@ -2209,6 +2229,14 @@ class CapabilityFoundry:
                                  validation_feedback_candidate_sha256=(
                                      _authored_candidate_sha256(candidate) if prior_feedback else None),
                                  candidate_seed_ref=prior["cache_ref"])
+                    if type(prior.get("attempts")) is int and prior["attempts"] >= 0:
+                        state["attempts"] = prior["attempts"]
+                    prior_failure = _retained_candidate_failure(prior, candidate)
+                    if prior_failure:
+                        state["candidate_failure"] = prior_failure
+                        state["candidate_failure_sha256"] = _authored_candidate_sha256(candidate)
+                    state["repair_gate_counts"] = _seed_repair_gate_counts(prior)
+                    state["repair_ledger"] = deepcopy_config(prior.get("repair_ledger", [])[-12:])
                     prior_diagnostics = prior.get("model_diagnostics")
                     if isinstance(prior_diagnostics, list):
                         state["model_diagnostics"] = deepcopy_config(prior_diagnostics[-12:])
@@ -2367,6 +2395,7 @@ class CapabilityFoundry:
                     deepcopy_config(state.get("blocking_issue_ledger", []))
                     if not ledger_is_current else []),
                 "candidate_sha256": current_candidate_sha256,
+                "candidate_failure": _retained_candidate_failure(state, retained_candidate),
             })
             error.model_diagnostics = {
                 "author_responses": deepcopy_config(
@@ -2418,6 +2447,10 @@ class CapabilityFoundry:
                         "source update envelope requested by output_contract."
                     ),
                 }
+                state["candidate_failure"] = deepcopy_config(state["format_repair"])
+                state["candidate_failure"]["error"] = str(reason)
+                state["candidate_failure"]["gate"] = "program_output_contract"
+                state["candidate_failure_sha256"] = _authored_candidate_sha256(state["last_attempt"])
             else:
                 state["format_repair"] = {
                     "previous_error": str(reason)[:1200],
@@ -3349,8 +3382,9 @@ class CapabilityFoundry:
                         "previous_error": _bounded_repair_text(feedback, 1400),
                     }
                 )
+                patch_repair = {**deepcopy_config(patch_repair), "candidate_failure": _retained_candidate_failure(state, last_attempt)}
                 prompt_value = authoring_patch_prompt(
-                    brief=brief if isinstance(brief, dict) else {},
+                    brief=brief,
                     required_intent=required_intent,
                     configured_input=configured_input,
                     candidate=last_attempt,

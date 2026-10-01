@@ -1,4 +1,5 @@
 """Wire-level model protocol checks against an explicit local test server."""
+from contextlib import closing
 import json
 import base64
 import hashlib
@@ -23,6 +24,176 @@ from scisaurus.runtime.models import (
 
 
 class TestModelClient(unittest.TestCase):
+    def test_model_failure_round_trip_preserves_admission_and_provider_facts(self):
+        from scisaurus.runtime.models import ModelBudgetExceededError
+        from scisaurus.core.errors import QuotaExceededError
+        admission = {"path": "/tmp/owner.sqlite", "key": "stage", "dimension": "input_tokens",
+                     "limit": 100, "observed": 70, "reserved": 20, "requested": 11}
+        error = ModelBudgetExceededError("admission rejected", budget_admission=admission,
+            outcome_known=True, elapsed_seconds=0.25)
+        error.usage = {"input_tokens": 7}
+        for original in (error, ModelCallError("rate limited", status_code=429,
+                retry_after_seconds=60, provider_error_kind="rate_limited", attempts=1)):
+            details = original.failure_details()
+            restored = ModelCallError.from_failure(str(original), json.loads(json.dumps(details)))
+            self.assertEqual(restored.failure_details(), details)
+            self.assertEqual(type(restored), type(original))
+        self.assertIsInstance(ModelCallError.from_failure(str(error), error.failure_details()), QuotaExceededError)
+        with self.assertRaises(ValidationError):
+            ModelCallError.from_failure("bad fence", {"budget_admission": {"dimension": "input_tokens"}})
+
+    def test_token_reservations_are_atomic_and_settle_once(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from scisaurus.runtime.models import (_reserve_model_call_budgets,
+            _settle_model_token_budgets, model_token_budget_usage, register_model_token_budget)
+        with tempfile.TemporaryDirectory() as path:
+            scope = {"model_call_budget_path": str(Path(path)/"budget.sqlite"),
+                     "model_call_budget_key": "stage", "model_call_budget_limit": 20,
+                     "model_token_budget_limits": {"input_tokens": 30, "output_tokens": 30}}
+            register_model_token_budget(scope)
+            def reserve(_):
+                try:
+                    legacy = {key: value for key, value in scope.items() if key != "model_token_budget_limits"}
+                    return _reserve_model_call_budgets([legacy, scope, scope],
+                        token_reservation={"input_tokens": 20, "output_tokens": 20})
+                except ModelCallError:
+                    return None
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                receipts = [value for value in pool.map(reserve, range(8)) if value]
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(len(receipts[0]), 1)
+            _settle_model_token_budgets(receipts[0], None)
+            self.assertEqual(model_token_budget_usage(scope), {"input_tokens": 0, "output_tokens": 0})
+            self.assertIsNone(reserve(0))
+            _settle_model_token_budgets(receipts[0], {"input_tokens": 7, "output_tokens": 4})
+            _settle_model_token_budgets(receipts[0], {"input_tokens": 7, "output_tokens": 4})
+            register_model_token_budget(scope, {"input_tokens": 3, "output_tokens": 2})
+            self.assertEqual(model_token_budget_usage(scope), {"input_tokens": 7, "output_tokens": 4})
+            self.assertIsNotNone(reserve(0))
+            with closing(sqlite3.connect(scope["model_call_budget_path"])) as connection:
+                self.assertEqual(connection.execute("SELECT used_calls FROM model_call_budgets").fetchone()[0], 2)
+
+    def test_rejected_owner_releases_call_and_token_reservations(self):
+        from scisaurus.runtime.models import _reserve_model_call_budgets, register_model_token_budget
+        with tempfile.TemporaryDirectory() as path:
+            primary = {"model_call_budget_path": str(Path(path)/"budget.sqlite"),
+                       "model_call_budget_key": "stage", "model_call_budget_limit": 10,
+                       "model_token_budget_limits": {"input_tokens": 100, "output_tokens": 100}}
+            owner = {**primary, "model_call_budget_key": "owner", "model_call_budget_limit": 1}
+            register_model_token_budget(primary)
+            register_model_token_budget(owner)
+            _reserve_model_call_budgets([owner], token_reservation={"input_tokens": 1, "output_tokens": 1})
+            with self.assertRaisesRegex(ModelCallError, "budget exhausted"):
+                _reserve_model_call_budgets([primary, owner],
+                    token_reservation={"input_tokens": 50, "output_tokens": 50})
+            with closing(sqlite3.connect(primary["model_call_budget_path"])) as connection:
+                self.assertEqual(connection.execute("SELECT used_calls FROM model_call_budgets WHERE budget_key='stage'").fetchone()[0], 0)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM model_token_reservations WHERE budget_key='stage'").fetchone()[0], 0)
+
+    def test_http_token_cost_restores_and_blocks_before_provider(self):
+        from scisaurus.runtime.models import model_token_budget_usage, register_model_token_budget
+        with tempfile.TemporaryDirectory() as path:
+            scope = {"model_call_budget_path": str(Path(path)/"budget.sqlite"),
+                     "model_call_budget_key": "stage", "model_call_budget_limit": 10,
+                     "model_token_budget_limits": {"input_tokens": 500, "output_tokens": 100}}
+            client = ModelClient(base_url=self.url, protocol="ollama", model="test", timeout_seconds=1,
+                                 max_output_tokens=64, model_call_budget_scopes=[scope])
+            result = client.complete(system="instruction", prompt="data")
+            self.assertEqual(result.usage, {"model_calls": 1, "input_tokens": 10, "output_tokens": 5})
+            self.assertEqual(model_token_budget_usage(scope), {"input_tokens": 10, "output_tokens": 5})
+            register_model_token_budget(scope, {"input_tokens": 501, "output_tokens": 5})
+            with self.assertRaisesRegex(ModelCallError, "token budget exhausted") as failure:
+                client.complete(system="instruction", prompt="data")
+            self.assertEqual(self.calls, 1)
+            self.assertEqual(failure.exception.attempts, 0)
+            from scisaurus.core.errors import QuotaExceededError
+            self.assertIsInstance(failure.exception, QuotaExceededError)
+            self.assertEqual(failure.exception.budget_admission["dimension"], "input_tokens")
+            self.assertTrue(failure.exception.outcome_known)
+
+    def test_unknown_http_token_reservation_survives_restart(self):
+        from scisaurus.runtime.models import model_token_budget_usage
+        with tempfile.TemporaryDirectory() as path:
+            scope = {"model_call_budget_path": str(Path(path)/"budget.sqlite"),
+                     "model_call_budget_key": "stage", "model_call_budget_limit": 10,
+                     "model_token_budget_limits": {"input_tokens": 500, "output_tokens": 100}}
+            def client():
+                return ModelClient(base_url=self.url, protocol="ollama", model="test", timeout_seconds=1,
+                                   max_output_tokens=64, model_call_budget_scopes=[scope])
+            self.response = b"broken"
+            with self.assertRaises(ModelCallError):
+                client().complete(system="instruction", prompt="data")
+            self.assertEqual(model_token_budget_usage(scope), {"input_tokens": 0, "output_tokens": 0})
+            with self.assertRaisesRegex(ModelCallError, "token budget exhausted"):
+                client().complete(system="instruction", prompt="data")
+            self.assertEqual(self.calls, 1)
+            with closing(sqlite3.connect(scope["model_call_budget_path"])) as connection:
+                self.assertEqual(connection.execute("SELECT state FROM model_token_reservations").fetchone()[0], "unknown")
+
+    def test_invalid_output_retains_known_token_costs(self):
+        from scisaurus.runtime.models import model_token_budget_usage
+        for content, reason in (("", "stop"), ("valid", "unsupported")):
+            with self.subTest(content=content, reason=reason), tempfile.TemporaryDirectory() as path:
+                scope = {"model_call_budget_path": str(Path(path)/"budget.sqlite"),
+                         "model_call_budget_key": "stage", "model_call_budget_limit": 10,
+                         "model_token_budget_limits": {"input_tokens": 500, "output_tokens": 100}}
+                self.response = {"model": "test", "done": True, "done_reason": reason,
+                                 "message": {"content": content}, "prompt_eval_count": 17, "eval_count": 9}
+                client = ModelClient(base_url=self.url, protocol="ollama", model="test", timeout_seconds=1,
+                                     max_output_tokens=64, model_call_budget_scopes=[scope])
+                with self.assertRaisesRegex(ModelCallError, "invalid or incomplete") as error:
+                    client.complete(system="instruction", prompt="data")
+                self.assertEqual(model_token_budget_usage(scope), {"input_tokens": 17, "output_tokens": 9})
+                self.assertEqual(error.exception.usage, {"model_calls": 1, "input_tokens": 17, "output_tokens": 9})
+                self.assertTrue(error.exception.outcome_known)
+
+    def test_partial_token_usage_preserves_only_unknown_reservations(self):
+        from scisaurus.runtime.models import (_reserve_model_call_budgets,
+            _settle_model_token_budgets, model_token_budget_usage)
+        with tempfile.TemporaryDirectory() as path:
+            scope = {"model_call_budget_path": str(Path(path)/"budget.sqlite"),
+                     "model_call_budget_key": "stage", "model_call_budget_limit": 10,
+                     "model_token_budget_limits": {"input_tokens": 100, "output_tokens": 100}}
+            reservation = _reserve_model_call_budgets([scope],
+                token_reservation={"input_tokens": 80, "output_tokens": 70})
+            _settle_model_token_budgets(reservation, {"input_tokens": 11})
+            _settle_model_token_budgets(reservation, {"input_tokens": 11})
+            self.assertEqual(model_token_budget_usage(scope), {"input_tokens": 11, "output_tokens": 0})
+            with closing(sqlite3.connect(scope["model_call_budget_path"])) as connection:
+                self.assertEqual(connection.execute("SELECT input_tokens,output_tokens,state FROM model_token_reservations").fetchone(), (0,70,"unknown"))
+            with self.assertRaisesRegex(ValidationError, "immutable"):
+                _settle_model_token_budgets(reservation, {"input_tokens": 12})
+            _settle_model_token_budgets(reservation, {"input_tokens": 11, "output_tokens": 9})
+            self.assertEqual(model_token_budget_usage(scope), {"input_tokens": 11, "output_tokens": 9})
+
+    def test_route_primary_budget_preserves_parent_http_owner(self):
+        from scisaurus.runtime.models import merge_model_config, _reserve_model_call_budgets
+        with tempfile.TemporaryDirectory() as directory:
+            parent = {"model_call_budget_path": str(Path(directory) / "owners.sqlite"),
+                      "model_call_budget_key": "owner:base", "model_call_budget_limit": 1}
+            route = {**parent, "model_call_budget_key": "owner:route", "model_call_budget_limit": 3}
+            merged = merge_model_config(parent, route)
+            self.assertIn(parent, merged["model_call_budget_scopes"])
+            _reserve_model_call_budgets([parent])
+            connections = []
+            connect = sqlite3.connect
+
+            def track(*args, **kwargs):
+                connection = connect(*args, **kwargs)
+                connections.append(connection)
+                return connection
+
+            with patch("scisaurus.runtime.models.sqlite3.connect", side_effect=track):
+                with self.assertRaisesRegex(ModelCallError, "budget exhausted"):
+                    _reserve_model_call_budgets([merged, *merged["model_call_budget_scopes"]])
+            self.assertEqual(len(connections), 3)
+            for connection in connections:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+            with closing(sqlite3.connect(parent["model_call_budget_path"])) as connection, connection:
+                self.assertEqual(connection.execute("SELECT used_calls FROM model_call_budgets WHERE budget_key=?",
+                                                   (route["model_call_budget_key"],)).fetchone()[0], 0)
+
     def test_local_qwen_routes_are_rejected_but_remote_qwen_is_allowed(self):
         for base_url in (
                 "http://127.0.0.1:11434/v1", "http://localhost:11434/v1",
@@ -270,7 +441,10 @@ class TestModelClient(unittest.TestCase):
                     except BrokenPipeError:
                         pass
                 else:
-                    self.wfile.write(body)
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
             def log_message(self, *args):
                 pass
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)

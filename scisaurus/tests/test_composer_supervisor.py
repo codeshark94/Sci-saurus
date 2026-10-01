@@ -1,16 +1,299 @@
+from contextlib import closing
 import tempfile
 import unittest
 import json
 import sqlite3
 import time
+import os
+import signal
+import subprocess
+import sys
+import threading
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.composer_supervisor import ComposerSupervisor, supervise_composer
 
 
+
+class _FixtureRunner:
+    def close(self):
+        pass
+
+
+class SignalFixtureRunner(_FixtureRunner):
+    def __init__(self, workflow, **kwargs):
+        self.root = Path(workflow["project_id"])
+        self.ignore = workflow["fixture_ignore_sigterm"]
+
+    def run(self):
+        if self.ignore:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        try:
+            (self.root / "worker.pid").write_text(str(worker.pid))
+            (self.root / "child.pid").write_text(str(os.getpid()))
+            time.sleep(60)
+            return {"status": "completed"}
+        finally:
+            worker.terminate()
+            worker.wait(timeout=5)
+
+
+class InitializingFixtureRunner(_FixtureRunner):
+    def __init__(self, workflow, **kwargs):
+        time.sleep(0.4)
+        self.progress = Path(workflow["project_id"]) / "output/progress.json"
+        self.deadline = workflow["fixture_deadline"] + kwargs["additional_seconds"]
+
+    def run(self):
+        result = {"status": "completed", "deadline_at_epoch": self.deadline,
+                  "remaining_seconds": self.deadline - time.time()}
+        self.progress.write_text(json.dumps(result))
+        return result
+
+
+class SlowFixtureRunner(_FixtureRunner):
+    def __init__(self, workflow, **kwargs):
+        self.delay = workflow.get("fixture_delay", 0.75)
+
+    def run(self):
+        time.sleep(self.delay)
+        return {"status": "completed", "remaining_seconds": 60}
+
+
+class CompletedFixtureRunner(_FixtureRunner):
+    def __init__(self, value, *, resume, on_progress, **kwargs):
+        self.additional_seconds = kwargs.get("additional_seconds")
+        self.on_progress = on_progress
+        self.root = Path(value["project_id"])
+        self.delay = value.get("fixture_delay", 0)
+
+    def run(self):
+        from scisaurus.runtime.models import _MODEL_PROVIDER_COOLDOWN_LOCK
+        acquired = _MODEL_PROVIDER_COOLDOWN_LOCK.acquire(timeout=0.1)
+        if acquired:
+            _MODEL_PROVIDER_COOLDOWN_LOCK.release()
+        self.on_progress({"fixture_pid": os.getpid(), "fresh_model_lock": acquired})
+        time.sleep(self.delay)
+        return {"status": "completed", "remaining_seconds": 10, "stages": {}, "blockers": [],
+                "continuation_cycles": 0, "additional_seconds": self.additional_seconds}
+
+
 class ComposerSupervisorTests(unittest.TestCase):
+    def test_spawn_does_not_inherit_thread_locks_and_calls_progress_in_parent(self):
+        from scisaurus.runtime.models import _MODEL_PROVIDER_COOLDOWN_LOCK
+        with tempfile.TemporaryDirectory() as path:
+            held, release = threading.Event(), threading.Event()
+
+            def hold():
+                with _MODEL_PROVIDER_COOLDOWN_LOCK:
+                    held.set()
+                    release.wait(10)
+
+            thread = threading.Thread(target=hold)
+            thread.start()
+            self.assertTrue(held.wait(2))
+            events = []
+            supervisor = ComposerSupervisor({"project_id": path}, poll_seconds=0,
+                on_progress=lambda state: events.append((os.getpid(), state)))
+            try:
+                with patch("scisaurus.runtime.composer_supervisor.ComposerRunner", CompletedFixtureRunner):
+                    self.assertEqual(supervisor._run_one_process(False)["status"], "completed")
+            finally:
+                release.set()
+                thread.join(timeout=2)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0][0], os.getpid())
+            self.assertNotEqual(events[0][1]["fixture_pid"], os.getpid())
+            self.assertTrue(events[0][1]["fresh_model_lock"])
+
+    def test_progress_callback_failure_stops_owned_child(self):
+        with tempfile.TemporaryDirectory() as path:
+            observed = []
+
+            def fail(state):
+                observed.append(state["fixture_pid"])
+                raise RuntimeError("progress callback failed")
+
+            supervisor = ComposerSupervisor({"project_id": path, "fixture_delay": 60},
+                                            poll_seconds=0, on_progress=fail)
+            with patch("scisaurus.runtime.composer_supervisor.ComposerRunner", CompletedFixtureRunner):
+                with self.assertRaisesRegex(RuntimeError, "progress callback failed"):
+                    supervisor._run_one_process(False)
+            self.assertEqual(len(observed), 1)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(observed[0], 0)
+
+    def test_diagnostic_database_failures_close_readers_without_creating_ledgers(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            (root / "state").mkdir()
+            supervisor = ComposerSupervisor({"project_id": path})
+            self.assertIsNone(supervisor._stage_progress_signature(path))
+            self.assertFalse((root / "state/control.sqlite").exists())
+            with closing(sqlite3.connect(root / "state/control.sqlite")) as connection:
+                connection.execute("CREATE TABLE scaffold (id INTEGER)")
+            acquired = []
+            connect = sqlite3.connect
+
+            def track(*args, **kwargs):
+                connection = connect(*args, **kwargs)
+                acquired.append(connection)
+                return connection
+
+            with patch("scisaurus.runtime.composer_supervisor.sqlite3.connect", side_effect=track):
+                self.assertIsNone(supervisor._stage_progress_signature(path))
+                supervisor._live_snapshot()
+            self.assertEqual(len(acquired), 2)
+            for connection in acquired:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+    def test_inventory_failure_still_terminates_child_and_reports_unverified_descendants(self):
+        child = Mock()
+        child.is_alive.return_value = True
+        with patch.object(ComposerSupervisor, "_process_tree", side_effect=TimeoutError("inventory timeout")):
+            with self.assertRaisesRegex(ValidationError, "descendant cleanup could not be verified"):
+                ComposerSupervisor._stop_child(child)
+        child.terminate.assert_called_once()
+        child.kill.assert_called_once()
+        self.assertEqual(child.join.call_count, 2)
+
+    def test_sigterm_stops_child_restores_handler_and_releases_project_lock(self):
+        for ignores_termination in (False, True):
+            with self.subTest(ignores_termination=ignores_termination), tempfile.TemporaryDirectory() as path:
+                project = Path(path)
+                pid_path = project / "child.pid"
+                worker_path = project / "worker.pid"
+                previous_handler = signal.getsignal(signal.SIGTERM)
+
+
+                def request_stop():
+                    until = time.monotonic() + 5
+                    while not pid_path.is_file() and time.monotonic() < until:
+                        time.sleep(0.01)
+                    if pid_path.is_file():
+                        os.kill(os.getpid(), signal.SIGTERM)
+
+                supervisor = ComposerSupervisor({"id": "signal-test", "project_id": path, "fixture_ignore_sigterm": ignores_termination},
+                                                poll_seconds=0.01)
+                sender = threading.Thread(target=request_stop)
+                sender.start()
+                started = time.monotonic()
+                with patch("scisaurus.runtime.composer_supervisor.ComposerRunner", SignalFixtureRunner):
+                    with self.assertRaisesRegex(KeyboardInterrupt, "termination requested"):
+                        supervisor.run()
+                sender.join(timeout=6)
+                self.assertLess(time.monotonic() - started, 12)
+                self.assertFalse(sender.is_alive())
+                self.assertEqual(signal.getsignal(signal.SIGTERM), previous_handler)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pid_path.read_text()), 0)
+                worker_pid = int(worker_path.read_text())
+                until = time.monotonic() + 2
+                while time.monotonic() < until:
+                    worker_state = subprocess.run(["ps", "-o", "stat=", "-p", str(worker_pid)],
+                                                  capture_output=True, text=True).stdout.strip()
+                    if not worker_state or worker_state.startswith("Z"):
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(not worker_state or worker_state.startswith("Z"), worker_state)
+                other = ComposerSupervisor({"project_id": path})
+                try:
+                    other._acquire_project_lock()
+                finally:
+                    other._release_project_lock()
+
+    def test_authorized_extension_survives_expired_initial_checkpoint(self):
+        with tempfile.TemporaryDirectory() as path:
+            project = Path(path)
+            (project / "output").mkdir()
+            progress = project / "output" / "progress.json"
+            old_deadline = time.time() - 1
+            progress.write_text(json.dumps({"status": "paused", "remaining_seconds": 0,
+                                           "deadline_at_epoch": old_deadline}))
+
+
+            supervisor = ComposerSupervisor({"project_id": path, "fixture_deadline": old_deadline}, poll_seconds=0)
+            with patch("scisaurus.runtime.composer_supervisor.ComposerRunner", InitializingFixtureRunner):
+                result = supervisor._run_one_process(True, additional_seconds=60)
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["deadline_at_epoch"], old_deadline + 60)
+
+    def test_legacy_aggregate_lease_is_bounded_by_stage_admission_time(self):
+        from datetime import datetime, timezone
+        with tempfile.TemporaryDirectory() as path:
+            project = Path(path)
+            (project / "state").mkdir()
+            admitted = time.time() - 120
+            with closing(sqlite3.connect(project / "state" / "control.sqlite")) as connection, connection:
+                connection.executescript(
+                    "CREATE TABLE events (seq INTEGER);"
+                    "CREATE TABLE attempts (task_id TEXT, state TEXT, created_at TEXT, lease_expiry REAL, payload_json TEXT);"
+                )
+                connection.execute("INSERT INTO attempts VALUES ('aggregate', 'started', ?, ?, ?)", (
+                    datetime.fromtimestamp(admitted, timezone.utc).isoformat(), time.time() + 3600,
+                    json.dumps({"stage_id": "experiment"})))
+            supervisor = ComposerSupervisor({"project_id": str(project), "stages": [
+                {"id": "experiment", "deadline_seconds": 60}]})
+            snapshot = supervisor._live_snapshot()
+            self.assertEqual(snapshot["leased_attempts"], [])
+            self.assertAlmostEqual(snapshot["active_attempts"][0]["lease_expiry"], admitted + 60, delta=0.001)
+
+    def test_only_unexpired_leases_protect_started_attempts(self):
+        with tempfile.TemporaryDirectory() as path:
+            project = Path(path)
+            (project / "state").mkdir()
+            with closing(sqlite3.connect(project / "state" / "control.sqlite")) as connection, connection:
+                connection.executescript(
+                    "CREATE TABLE events (seq INTEGER);"
+                    "CREATE TABLE attempts (task_id TEXT, state TEXT, created_at TEXT, lease_expiry REAL, payload_json TEXT);"
+                )
+                connection.executemany("INSERT INTO attempts VALUES (?, 'started', '', ?, '{}')", [
+                    ("expired", time.time() - 3600),
+                    ("leased", time.time() + 3600),
+                    ("missing-lease", None),
+                ])
+            supervisor = ComposerSupervisor({"project_id": str(project)})
+            snapshot = supervisor._live_snapshot()
+            self.assertEqual({a["task_id"] for a in snapshot["active_attempts"]},
+                             {"expired", "leased", "missing-lease"})
+            self.assertEqual([a["task_id"] for a in snapshot["leased_attempts"]], ["leased"])
+
+    def test_process_watchdog_spares_valid_lease_and_bounds_expired_lease(self):
+        with tempfile.TemporaryDirectory() as path:
+
+            supervisor = ComposerSupervisor({"project_id": path}, poll_seconds=0)
+            supervisor.watchdog_seconds = 0.05
+            attempt = {"task_id": "provider-1", "lease_expiry": time.time() + 60}
+            snapshot = {"signature": (1,), "progress": {"remaining_seconds": 60},
+                        "active_attempts": [attempt], "leased_attempts": [attempt]}
+            with patch("scisaurus.runtime.composer_supervisor.ComposerRunner", SlowFixtureRunner), \
+                    patch.object(supervisor, "_live_snapshot", return_value=snapshot):
+                self.assertEqual(supervisor._run_one_process(True)["status"], "completed")
+                snapshot["leased_attempts"] = []
+                attempt["lease_expiry"] = time.time() - 60
+                result = supervisor._run_one_process(True)
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["blockers"][0]["active_attempts"], ["provider-1"])
+            self.assertTrue(supervisor._should_resume(result))
+
+    def test_persisted_deadline_stops_hung_child_even_with_live_lease(self):
+        with tempfile.TemporaryDirectory() as path:
+
+            supervisor = ComposerSupervisor({"project_id": path, "fixture_delay": 10}, poll_seconds=0)
+            attempt = {"task_id": "provider-1", "lease_expiry": time.time() + 60}
+            snapshot = {"signature": (1,), "progress": {
+                "remaining_seconds": 60, "deadline_at_epoch": time.time() + 0.1},
+                "active_attempts": [attempt], "leased_attempts": [attempt]}
+            with patch("scisaurus.runtime.composer_supervisor.ComposerRunner", SlowFixtureRunner), \
+                    patch.object(supervisor, "_live_snapshot", return_value=snapshot):
+                result = supervisor._run_one_process(True)
+            self.assertEqual(result["remaining_seconds"], 0)
+            self.assertEqual(result["blockers"][0]["reason"], "hard_deadline")
+            self.assertFalse(supervisor._should_resume(result))
+
     def test_supervisor_rejects_a_second_owner_of_the_same_project(self):
         with tempfile.TemporaryDirectory() as path:
             project = Path(path) / "project"
@@ -29,16 +312,8 @@ class ComposerSupervisorTests(unittest.TestCase):
             root = Path(path)
             workflow = {"id": "watch-process-test", "project_id": str(root / "project")}
 
-            class FakeRunner:
-                def __init__(self, value, *, resume, on_progress, **kwargs):
-                    self.additional_seconds = kwargs.get("additional_seconds")
 
-                def run(self):
-                    return {"status": "completed", "remaining_seconds": 10,
-                            "stages": {}, "blockers": [], "continuation_cycles": 0,
-                            "additional_seconds": self.additional_seconds}
-
-            with patch("scisaurus.runtime.composer_supervisor.ComposerRunner", FakeRunner):
+            with patch("scisaurus.runtime.composer_supervisor.ComposerRunner", CompletedFixtureRunner):
                 result = supervise_composer(
                     workflow, initial_resume=True, initial_additional_seconds=3600,
                     poll_seconds=0.01, process_watchdog=True,
@@ -69,7 +344,7 @@ class ComposerSupervisorTests(unittest.TestCase):
             ]
             calls = []
 
-            class FakeRunner:
+            class FakeRunner(_FixtureRunner):
                 def __init__(self, value, *, resume, on_progress, **kwargs):
                     calls.append({"resume": resume,
                                   "additional_seconds": kwargs.get("additional_seconds")})
@@ -148,6 +423,21 @@ class ComposerSupervisorTests(unittest.TestCase):
             })
             snapshot = supervisor._live_snapshot()
             self.assertTrue(supervisor._scheduled_retry_wait(snapshot))
+
+    def test_provider_429_stops_supervisor_before_pending_requests_or_fallback(self):
+        with tempfile.TemporaryDirectory() as path:
+            supervisor = ComposerSupervisor({"id": "provider-rate-limit-stop-test", "project_id": str(Path(path) / "project")})
+            base = {"status": "paused", "remaining_seconds": 3600,
+                    "active_research_requests": [{"objective": "Review retained literature"}]}
+            for blocker in (
+                {"reason": "source quota exhausted", "stop_reason": "provider_rate_limit",
+                 "provider": "full_text", "details": {"metadata": {"http_status": 429}}},
+                {"reason": "provider_cooldown", "rate_limit": {"provider": "openalex", "status_code": 429}},
+            ):
+                with self.subTest(blocker=blocker):
+                    self.assertFalse(supervisor._should_resume({**base, "active_blockers": [blocker]}))
+                    self.assertTrue(supervisor._should_resume({**base, "active_blockers": [], "blockers": [blocker]}))
+            self.assertFalse(supervisor._should_resume({**base, "stop_reason": "provider_rate_limit", "active_blockers": []}))
 
     def test_model_429_stops_supervisor_without_replaying_the_mission(self):
         with tempfile.TemporaryDirectory() as path:
@@ -852,6 +1142,7 @@ class ComposerSupervisorTests(unittest.TestCase):
             for name in ("progress.json", "run.json", "interim_report.json"):
                 value = json.loads((output / name).read_text())
                 self.assertEqual(value["status"], "paused")
+                self.assertEqual(value["stop_reason"], "process_interrupted")
                 self.assertTrue(any(
                     item.get("stop_reason") == "process_interrupted"
                     for item in value["blockers"]
@@ -900,7 +1191,7 @@ class ComposerSupervisorTests(unittest.TestCase):
             ]
             calls = []
 
-            class FakeRunner:
+            class FakeRunner(_FixtureRunner):
                 def __init__(self, value, *, resume, on_progress):
                     calls.append(resume)
 
@@ -938,7 +1229,7 @@ class ComposerSupervisorTests(unittest.TestCase):
             root = Path(path)
             workflow = {"id": "validation-stop-test", "project_id": str(root / "project")}
 
-            class InvalidRunner:
+            class InvalidRunner(_FixtureRunner):
                 def __init__(self, value, *, resume, on_progress):
                     pass
 

@@ -1,6 +1,7 @@
 """Independent bibliographic observations and deterministic identity reconciliation."""
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from html import unescape
@@ -112,3 +113,55 @@ def reconcile_result(work, work_ref, result, execution_ref):
         identity["status"] = "conflicted"
         identity["checks"] = [{"field": "crossref_record", "outcome": "conflict", "matches": len(matches)}]
     return identity
+
+
+def project_crossref_work(source):
+    """Project a verified Crossref metadata item into the survey card shape.
+
+    Crossref has no OpenAlex work identifier or citation graph.  A stable
+    local identifier keeps the provenance graph addressable while the
+    source URL, DOI, and provider are retained so the projection cannot be
+    mistaken for an OpenAlex record.
+    """
+    doi = source.get("doi")
+    if not isinstance(doi, str) or not doi.strip():
+        raise ValidationError("Crossref fallback item has no DOI")
+    doi = doi.strip().lower()
+    number = int(hashlib.sha256(doi.encode("utf-8")).hexdigest()[:16], 16) or 1
+    wid = "W" + str(number)
+    title = source.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise ValidationError("Crossref fallback item has no title")
+    year = None
+    for field in ("published", "published-print", "published-online", "issued"):
+        value = source.get(field)
+        parts = value.get("date-parts") if isinstance(value, dict) else None
+        if isinstance(parts, list) and parts and isinstance(parts[0], list) and parts[0]:
+            candidate = parts[0][0]
+            if type(candidate) is int and 1 <= candidate <= 9999:
+                year = candidate
+                break
+    abstract = source.get("abstract")
+    if abstract is not None and not isinstance(abstract, str):
+        abstract = None
+    if isinstance(abstract, str):
+        abstract = re.sub(r"<[^>]+>", " ", abstract)
+        abstract = re.sub(r"\s+", " ", abstract).strip() or None
+    authors = []
+    for author in source.get("authors", []):
+        if not isinstance(author, dict):
+            continue
+        name = " ".join(str(author.get(key, "")).strip()
+                        for key in ("given", "family")
+                        if isinstance(author.get(key), str) and author.get(key).strip())
+        if name and name not in authors:
+            authors.append(name)
+    source_url = source.get("source_url") or ("https://doi.org/" + doi)
+    return {
+        "id": wid, "doi": doi, "title": title.strip(), "year": year,
+        "abstract": abstract, "referenced_works": [], "related_works": [],
+        "locations": [{"is_oa": False, "version": None,
+                       "landing_page_url": source_url, "pdf_url": None}],
+        "source_url": source_url, "bibliography_provider": "crossref",
+        **({"authors": authors} if authors else {}),
+    }

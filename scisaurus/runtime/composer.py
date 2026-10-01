@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import ast
 from copy import deepcopy
+from contextlib import closing
+from datetime import datetime
 import hashlib
 import itertools
 import json
@@ -27,14 +29,15 @@ import threading
 import time
 import traceback
 import uuid
+from types import SimpleNamespace
 
 from scisaurus.core.errors import (
-    NotFoundError, ProviderConfigurationError, QuotaExceededError, StateError,
+    ConflictError, NotFoundError, ProviderConfigurationError, ProviderRateLimitError, QuotaExceededError, StateError,
     ValidationError,
 )
 from scisaurus.core.events import ControlStore
 from scisaurus.core.messages import MessageBus
-from scisaurus.core.schema import canonical_bytes, now_iso, safe_artifact_component
+from scisaurus.core.schema import canonical_bytes, now_iso, parse_ref, safe_artifact_component
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.tasks import TaskManager
 from scisaurus.runtime.literature import (
@@ -46,9 +49,10 @@ from scisaurus.runtime.departments import (
     stage_role,
 )
 from scisaurus.runtime.specialists import (
-    REPAIR_ADJUDICATION_SYSTEM, SPECIALIST_SYSTEM, VERIFIER_SYSTEM, SpecialistDispatcher,
-    build_repair_adjudication_prompt, build_specialist_prompt,
-    build_verifier_prompt, redact_sensitive_text,
+    VERIFIER_SYSTEM, SpecialistDispatcher,
+    specialist_system,
+    build_repair_adjudication_prompt, build_repair_evidence_prompt, build_specialist_prompt,
+    build_verifier_prompt, redact_sensitive_text, _preserve_response_value, _repair_candidate_program,
 )
 from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
 from scisaurus.runtime.experiment_config import (
@@ -59,6 +63,8 @@ from scisaurus.runtime.models import (
     MAX_MODEL_RATE_LIMIT_COOLDOWN_SECONDS,
     ModelCallError, ModelContextBudgetError, effective_model_timeout,
     with_runtime_cooldown_fallback,
+    register_model_token_budget, model_token_budget_usage,
+    validate_model_budget_scope,
 )
 from scisaurus.runtime.failure_recovery import (
     build_failure_dossier, build_repair_commands, build_repair_request,
@@ -74,6 +80,9 @@ from scisaurus.runtime.topic_discovery import (
     validate_topic_refinement,
     _topic_validation_rejection_type,
 )
+
+
+PROVIDER_OPERATOR_STOP_ERRORS = (ProviderConfigurationError, ProviderRateLimitError)
 
 
 SCHEMA_VERSION = "composer-workflow-1"
@@ -112,6 +121,23 @@ def _atomic_write_bytes(path, body):
         except OSError:
             pass
         raise
+
+
+def _report_has_model_call_failure(report):
+    if not isinstance(report, dict):
+        return False
+    if isinstance(report.get("budget_admission"), dict):
+        return True
+    if report.get("error_type") in {"ModelCallError", "ModelBudgetExceededError"}:
+        return True
+    if isinstance(report.get("failure"), dict) and report["failure"].get("kind") == "model_call":
+        return True
+    # Older receipts predate structured model-call failure metadata.
+    error = str(report.get("error") or "").casefold()
+    return any(token in error for token in (
+        "modelcallerror:", "modelbudgetexceedederror:", "model call budget exhausted",
+        "model token budget exhausted", "model-call budget exhausted",
+        "model-token budget exhausted"))
 
 
 # These are the only stage outcomes that satisfy a downstream dependency in
@@ -183,7 +209,8 @@ EXPERIMENT_RESULT_METADATA_FIELDS = frozenset({
 MAX_EXPERIMENT_RESULT_PACKAGE_BYTES = 16 * 1024 * 1024
 CAPABILITY_REPAIR_SOURCE_CHARS = 64_000
 CAPABILITY_REPAIR_PANEL_SCHEMA_VERSION = "capability-repair-panel-8"
-CAPABILITY_REPAIR_PANEL_PROMPT_REVISION = "stage-scoped-verifier-and-report-reuse-8"
+CAPABILITY_REPAIR_PANEL_PROMPT_REVISION = "repair-plan-owned-evidence-actions-14"
+SURVEY_EVIDENCE_REQUEST_POLICY_REVISION = 1
 CAPABILITY_REPAIR_REVIEW_EVIDENCE_REVISION = "immutable-research-evidence-v2"
 CAPABILITY_REPAIR_UNRESOLVED_SOURCE_FILES = 2
 CAPABILITY_REPAIR_PLAN_SCHEMA_VERSIONS = frozenset({
@@ -385,6 +412,10 @@ DEFAULT_AGENDA_POLICY = {"mode": "ordered"}
 
 class ComposerHardDeadlineExceeded(ValidationError):
     """The immutable mission wall was reached during control-plane work."""
+
+
+class ComposerStageDeadlineExceeded(ValidationError):
+    """An admitted stage attempt consumed its execution grant."""
 
 
 class ComposerLateStageResult(ValidationError):
@@ -855,19 +886,63 @@ class ComposerRunner:
     project-scoped runner.
     """
 
+    @property
+    def usage(self):
+        return self._accounting_state["usage"]
+
+    @usage.setter
+    def usage(self, value):
+        if not hasattr(self, "_accounting_state"):
+            self._accounting_state = {"usage": value, "stage_usage_totals": {},
+                                      "pending_stage_usage": {}, "foundry_usage": {}}
+        else:
+            self._accounting_state["usage"] = value
+
+    @property
+    def foundry_usage(self):
+        return self._accounting_state["foundry_usage"]
+
+    @foundry_usage.setter
+    def foundry_usage(self, value):
+        self._accounting_state["foundry_usage"] = value
+
+    @property
+    def stage_usage_totals(self):
+        return self._accounting_state["stage_usage_totals"]
+
+    @stage_usage_totals.setter
+    def stage_usage_totals(self, value):
+        self._accounting_state["stage_usage_totals"] = value
+
+    @property
+    def pending_stage_usage(self):
+        return self._accounting_state["pending_stage_usage"]
+
+    @pending_stage_usage.setter
+    def pending_stage_usage(self, value):
+        self._accounting_state["pending_stage_usage"] = value
+
+
     def __init__(self, workflow, *, resume=False, clock=time.monotonic, on_progress=None,
                  additional_seconds=None):
-        self.workflow = deepcopy(validate_workflow(workflow))
-        self._runtime_environment_before = {
-            key: value for key, value in os.environ.items()
-            if key.startswith("SCISAURUS_")
-        }
+        self.control = None
+        self._runtime_environment_before = None
         self._runtime_environment_after = None
-        self._load_runtime_environment()
-        self._runtime_environment_after = {
-            key: value for key, value in os.environ.items()
-            if key.startswith("SCISAURUS_")
-        }
+        try:
+            self._initialize_composer(workflow, resume=resume, clock=clock,
+                                      on_progress=on_progress, additional_seconds=additional_seconds)
+        except BaseException:
+            self.close()
+            raise
+
+    def _initialize_composer(self, workflow, *, resume, clock, on_progress, additional_seconds):
+        self.workflow = deepcopy(validate_workflow(workflow))
+        self._runtime_environment_before = dict(os.environ)
+        self._runtime_environment_after = None
+        try:
+            self._load_runtime_environment()
+        finally:
+            self._runtime_environment_after = dict(os.environ)
         if additional_seconds is not None and not resume:
             raise ValidationError("additional_seconds is only valid when resuming a Composer project")
         self.root = Path(self.workflow["project_id"]).resolve()
@@ -962,6 +1037,9 @@ class ComposerRunner:
         self._attempted_request_signatures = set()
         self.format_recovery_ledger = {}
         self.status = "running"
+        self._child_progress = {}
+        self.stage_usage_totals = {}
+        self.pending_stage_usage = {}
         self._progress_snapshot = {
             "schema_version": "composer-checkpoint-1", "workflow_id": self.workflow["id"],
             "run_id": self.run_id,
@@ -1098,6 +1176,8 @@ class ComposerRunner:
                 })
             if self._sync_foundry_usage():
                 self._checkpoint("recovered_usage", force=True)
+            if self._reconcile_duplicate_foundry_settlements():
+                self._checkpoint("recovered_duplicate_settlement", force=True)
         if additional_seconds is not None:
             self._extend_deadline(additional_seconds)
 
@@ -1147,7 +1227,7 @@ class ComposerRunner:
                                            inputs=[{"ref": ref, "purpose": "subject"} for ref in dict.fromkeys(subjects)],
                                            media_type="application/json")
 
-    def _record_failed_stage_usage(self, error):
+    def _record_failed_stage_usage(self, error, *, stage_id=None):
         """Merge bounded work consumed by a failed stage into run accounting."""
         # A Composer-level budget admission failure reports the observed
         # ledger snapshot in its diagnostics.  That snapshot is not work
@@ -1165,9 +1245,409 @@ class ComposerRunner:
         for key in self.usage:
             value = usage.get(key, 0)
             if type(value) in (int, float) and math.isfinite(value) and value >= 0:
-                self.usage[key] += value
                 actual[key] = value
+        panel_charged = getattr(error, "repair_panel_usage", {})
+        panel_charged = panel_charged if isinstance(panel_charged, dict) else {}
+        foundry_charged = getattr(error, "foundry_usage", {})
+        foundry_charged = foundry_charged if isinstance(foundry_charged, dict) else {}
+        uncharged = {
+            key: max(0, value - panel_charged.get(key, 0) - foundry_charged.get(key, 0))
+            for key, value in actual.items()
+        }
+        self._settle_pending_stage_usage(
+            stage_id, already_charged=True, additional_usage=uncharged,
+            settle_pending=stage_id is not None)
         return actual
+
+    @staticmethod
+    def _copy_error_accounting(source, target):
+        """Preserve cost ownership when changing an error's runtime type."""
+        for name in ("usage", "usage_is_snapshot", "foundry_usage", "repair_panel_usage", "usage_includes_foundry"):
+            if hasattr(source, name):
+                setattr(target, name, deepcopy(getattr(source, name)))
+        return target
+
+    def _record_capability_repair_panel_usage(self, stage, panel, *, already_charged=False):
+        """Settle a completed Methods invoice before downstream authoring."""
+        usage = panel.get("usage")
+        if not isinstance(usage, dict):
+            return {}
+        totals = {key: usage.get(key, 0) for key in self.usage}
+        if any(type(value) not in (int, float) or not math.isfinite(value)
+               or value < 0 for value in totals.values()):
+            raise ValidationError("Methods repair invoice has invalid usage")
+        ledger = panel.get("ledger")
+        ledger = ledger if isinstance(ledger, dict) else {}
+        plan_ref = ledger.get("assignment_plan_ref")
+        if not isinstance(plan_ref, str) or not plan_ref:
+            raise ValidationError("Methods invoice requires its assignment plan identity")
+        invoice = {
+            "schema_version": "capability-repair-usage-1", "stage_id": stage["id"],
+            "input_sha256": panel.get("input_sha256"),
+            "assignment_plan_ref": ledger.get("assignment_plan_ref"),
+            "chief_synthesis_ref": ledger.get("chief_synthesis_ref"),
+            "verifier_artifact_ref": ledger.get("verifier_artifact_ref"),
+            "usage": totals,
+            "settled_before_invoice": already_charged,
+        }
+        if isinstance(panel.get("model_budget_owner"), dict):
+            invoice["model_budget_owner"] = deepcopy(panel["model_budget_owner"])
+        digest = hashlib.sha256(canonical_bytes({
+            "stage_id": stage["id"], "assignment_plan_ref": plan_ref,
+        })).hexdigest()
+        namespace = f"repair-panel:{stage['id']}:{digest}"
+        prior = self.stage_usage_totals.get(namespace, {})
+        delta = {key: max(0, value - prior.get(key, 0))
+                 for key, value in totals.items()}
+        record = self.store.head(f"command/capability-repair-usage/{digest}")
+        if record is None:
+            record = self._publish(f"command/capability-repair-usage/{digest}",
+                                   "note", invoice, "command.composer")
+        else:
+            stored_invoice = json.loads(self.store.read_body(record["body_hash"]))
+            if stored_invoice["usage"] != totals:
+                raise ValidationError("Methods invoice changes a completed assignment's usage")
+            if ("model_budget_owner" in stored_invoice
+                    and stored_invoice["model_budget_owner"] != invoice.get("model_budget_owner")):
+                raise ValidationError("Methods invoice changes a completed assignment's budget owner")
+            already_charged = already_charged or stored_invoice.get("settled_before_invoice") is True
+        panel["usage_invoice_ref"] = record["artifact_ref"]
+        self.pending_stage_usage[namespace] = {
+            "stage_id": stage["id"], "totals": totals, "delta": delta,
+        }
+        self._settle_pending_stage_usage(stage["id"], namespaces={namespace},
+                                        already_charged=already_charged)
+        return {key: 0 for key in delta} if already_charged else delta
+
+    def _reconcile_repair_panel_invoices(self):
+        """Recover durable invoices; require attempt evidence for legacy panels."""
+        rows = self.control._conn.execute(
+            "SELECT a.logical_id,a.body_hash FROM artifacts a JOIN "
+            "(SELECT logical_id,MAX(version) version FROM artifacts "
+            "WHERE logical_id LIKE 'command/capability-repair-usage/%' GROUP BY logical_id) h "
+            "ON a.logical_id=h.logical_id AND a.version=h.version").fetchall()
+        stage_ids = {stage["id"] for stage in self.workflow["stages"]}
+        for row in rows:
+            try:
+                invoice = json.loads(self.store.read_body(row["body_hash"]))
+                if (not isinstance(invoice, dict) or not isinstance(invoice.get("usage"), dict)
+                        or ("settled_before_invoice" in invoice
+                            and type(invoice["settled_before_invoice"]) is not bool)):
+                    raise ValidationError("Methods invoice has invalid accounting fields")
+                stage_id = invoice["stage_id"]
+                plan_ref = invoice["assignment_plan_ref"]
+                digest = hashlib.sha256(canonical_bytes({
+                    "stage_id": stage_id, "assignment_plan_ref": plan_ref,
+                })).hexdigest()
+                if (invoice["schema_version"] != "capability-repair-usage-1"
+                        or stage_id not in stage_ids
+                        or row["logical_id"] != f"command/capability-repair-usage/{digest}"):
+                    raise ValidationError("Methods invoice has invalid stage ownership")
+                self.store.get(plan_ref)
+                chief = self.store.get(invoice["chief_synthesis_ref"])
+                chief_usage = json.loads(self.store.read_body(chief["body_hash"]))["usage"]
+                if not isinstance(chief_usage, dict):
+                    raise ValidationError("Methods synthesis has invalid accounting fields")
+                if any(chief_usage.get(key, 0) != invoice["usage"].get(key, 0)
+                       for key in self.usage):
+                    raise ValidationError("Methods invoice differs from its immutable synthesis")
+                panel = {"usage": invoice["usage"], "input_sha256": invoice.get("input_sha256"),
+                         "ledger": {name: invoice.get(name) for name in (
+                             "assignment_plan_ref", "chief_synthesis_ref", "verifier_artifact_ref")}}
+                if "model_budget_owner" in invoice:
+                    panel["model_budget_owner"] = deepcopy(invoice["model_budget_owner"])
+                self._record_capability_repair_panel_usage({"id": stage_id}, panel)
+            except (KeyError, NotFoundError, TypeError, ValueError) as exc:
+                raise ValidationError("Methods invoice accounting evidence is unavailable") from exc
+        for stage_id, context in self.context.items():
+            panel = context.get("capability_repair_panel") if isinstance(context, dict) else None
+            if not isinstance(panel, dict):
+                continue
+            usage = panel.get("usage")
+            if not isinstance(usage, dict) or not any(usage.get(key, 0) for key in self.usage):
+                continue
+            ledger = panel.get("ledger")
+            ledger = ledger if isinstance(ledger, dict) else {}
+            try:
+                digest = hashlib.sha256(canonical_bytes({
+                    "stage_id": stage_id, "assignment_plan_ref": ledger["assignment_plan_ref"],
+                })).hexdigest()
+                if self.store.head(f"command/capability-repair-usage/{digest}") is not None:
+                    self._record_capability_repair_panel_usage({"id": stage_id}, panel)
+                    continue
+                plan = self.store.get(ledger["assignment_plan_ref"])
+                chief = self.store.get(ledger["chief_synthesis_ref"])
+                chief_body = json.loads(self.store.read_body(chief["body_hash"]))
+                chief_usage = chief_body["usage"]
+                if any(chief_usage.get(key, 0) != usage.get(key, 0) for key in self.usage):
+                    raise ValidationError("Methods invoice differs from its immutable synthesis")
+                created = datetime.fromisoformat(plan["created_at"]).timestamp()
+                record = self.stage_records.get(stage_id, {})
+                attempt_ids = {item.get("attempt_id") for item in record.get("attempts", [])
+                               if isinstance(item, dict)} | {record.get("attempt_id")}
+                owners = []
+                for attempt_id in attempt_ids - {None}:
+                    attempt = self.tasks.get_attempt(attempt_id)
+                    start = datetime.fromisoformat(attempt["created_at"]).timestamp()
+                    end = (datetime.fromisoformat(attempt["finished_at"]).timestamp()
+                           if attempt.get("finished_at") else None)
+                    if start <= created:
+                        owners.append((start, end, attempt))
+                latest_start = max((item[0] for item in owners), default=None)
+                owners = [item for item in owners if item[0] == latest_start
+                          and (item[1] is None or created <= item[1])]
+                if len(owners) != 1:
+                    raise ValidationError("Methods invoice has no unique stage attempt owner")
+                owner = owners[0][2]
+                if owner["state"] in {"started", "result_unknown"}:
+                    self._record_capability_repair_panel_usage({"id": stage_id}, panel)
+                elif (owner["state"] == "failed"
+                      and all(owner["usage"].get("actual", {}).get(key, 0) == usage.get(key, 0)
+                              for key in self.usage)):
+                    # A failed attempt consisting solely of this invoice has
+                    # already settled its exact aggregate in the old owner.
+                    self._record_capability_repair_panel_usage(
+                        {"id": stage_id}, panel, already_charged=True)
+                else:
+                    raise ValidationError("legacy Methods invoice payment is ambiguous")
+            except (KeyError, NotFoundError, TypeError, ValueError) as exc:
+                raise ValidationError("Methods invoice accounting evidence is unavailable") from exc
+
+    def _repair_panel_usage_total(self, stage_id):
+        prefix = f"repair-panel:{stage_id}:"
+        return {key: sum(totals.get(key, 0)
+                         for namespace, totals in self.stage_usage_totals.items()
+                         if namespace.startswith(prefix))
+                for key in self.usage}
+
+    def _repair_panel_invoice_owner(self, stage_id, invoice):
+        """Bind immutable Methods costs to the unique containing parent attempt."""
+        bodies, records = {}, {}
+        for name, schema in (("assignment_plan_ref", "department-stage-assignment-1"),
+                             ("chief_synthesis_ref", "department-chief-synthesis-1")):
+            record = self.store.get(invoice[name])
+            raw = self.store.read_body(record["body_hash"])
+            body = json.loads(raw)
+            if (hashlib.sha256(raw).hexdigest() != record["body_hash"]
+                    or body.get("schema_version") != schema
+                    or body.get("project_id") != self.workflow["project_id"]
+                    or body.get("stage_kind") != "experiment"):
+                raise ValidationError("Methods budget invoice has invalid immutable provenance")
+            bodies[name], records[name] = body, record
+        plan, chief = bodies["assignment_plan_ref"], bodies["chief_synthesis_ref"]
+        panel_id = plan.get("stage_id")
+        base = re.sub(r"[^a-z0-9-]+", "-", str(stage_id).casefold()).strip("-") or "experiment"
+        suffix = ("-repair-panel-" + panel_id.rsplit("-repair-panel-", 1)[1]
+                  if isinstance(panel_id, str) and "-repair-panel-" in panel_id else None)
+        if (plan.get("stage_id") != chief.get("stage_id")
+                or suffix is None or panel_id != base[:64 - len(suffix)] + suffix
+                or plan.get("attempt_number") != chief.get("attempt_number")
+                or any(chief.get("usage", {}).get(key, 0) != invoice["usage"].get(key, 0)
+                       for key in self.usage)):
+            raise ValidationError("Methods budget invoice differs from its immutable synthesis")
+        start = datetime.fromisoformat(records["assignment_plan_ref"]["created_at"]).timestamp()
+        finish = datetime.fromisoformat(records["chief_synthesis_ref"]["created_at"]).timestamp()
+        if finish < start:
+            raise ValidationError("Methods budget invoice has reversed provenance interval")
+        record = self.stage_records.get(stage_id, {})
+        candidates = {item.get("attempt_id"): item.get("cycle")
+                      for item in record.get("attempts", []) if isinstance(item, dict)}
+        if isinstance(record.get("attempt_id"), str):
+            candidates.setdefault(record["attempt_id"], None)
+        owners = []
+        for attempt_id, cycle in candidates.items():
+            if not isinstance(attempt_id, str):
+                continue
+            attempt = self.tasks.get_attempt(attempt_id)
+            task = self.tasks.get(attempt["task_id"])
+            opened = datetime.fromisoformat(attempt["created_at"]).timestamp()
+            closed = (datetime.fromisoformat(attempt["finished_at"]).timestamp()
+                      if attempt.get("finished_at") else None)
+            if (attempt.get("lease_owner") == "command.composer"
+                    and task.get("payload", {}).get("stage_id") == stage_id
+                    and opened <= start):
+                owners.append((opened, closed, attempt_id, cycle))
+        latest = max((item[0] for item in owners), default=None)
+        owners = [item for item in owners if item[0] == latest
+                  and (item[1] is None or finish <= item[1])]
+        if len(owners) != 1:
+            raise ValidationError("Methods budget invoice has ambiguous parent attempt/cycle ownership")
+        attempt_id, cycle = owners[0][2:]
+        attempt = self.tasks.get_attempt(attempt_id)
+        if "model_budget_cycle" in attempt.get("payload", {}):
+            cycle = attempt["payload"]["model_budget_cycle"]
+        elif invoice.get("model_budget_owner") is None:
+            if cycle is not None and (type(cycle) is not int or cycle < 0):
+                raise ValidationError("Methods budget invoice has invalid admitted cycle ownership")
+            checkpoint_row = self.control._conn.execute(
+                "SELECT body_hash FROM artifacts WHERE artifact_type='progress_checkpoint' "
+                "AND logical_id LIKE 'command/composer/checkpoints/%' AND created_at>=? AND created_at<=? "
+                "ORDER BY created_at ASC LIMIT 1", (attempt["created_at"], records["assignment_plan_ref"]["created_at"])).fetchone()
+            checkpoint_raw = self.store.read_body(checkpoint_row["body_hash"]) if checkpoint_row else None
+            if checkpoint_raw is not None and hashlib.sha256(checkpoint_raw).hexdigest() != checkpoint_row["body_hash"]:
+                raise ValidationError("Methods budget admission checkpoint digest differs from its artifact")
+            checkpoint = json.loads(checkpoint_raw) if checkpoint_raw is not None else None
+            if (not isinstance(checkpoint, dict)
+                    or checkpoint.get("schema_version") != "composer-checkpoint-1"
+                    or checkpoint.get("workflow_id") != self.workflow["id"]
+                    or checkpoint.get("stages", {}).get(stage_id, {}).get("attempt_id") != attempt_id):
+                raise ValidationError("Methods budget invoice has ambiguous admitted cycle ownership")
+            admitted_global_cycle = checkpoint.get("continuation_cycles")
+            reopened = checkpoint.get("reopened_stage_ids")
+            if (type(admitted_global_cycle) is not int or admitted_global_cycle < 0
+                    or not isinstance(reopened, list)
+                    or any(not isinstance(item, str) for item in reopened)):
+                raise ValidationError("Methods budget invoice has invalid immutable admission scope")
+            admitted_model_cycle = (admitted_global_cycle
+                                    if stage_id in reopened else 0)
+            if cycle is not None and cycle not in (admitted_global_cycle, admitted_model_cycle):
+                raise ValidationError("Methods budget invoice has ambiguous admitted cycle ownership")
+            cycle = admitted_model_cycle
+        elif isinstance(invoice.get("model_budget_owner"), dict):
+            cycle = invoice["model_budget_owner"].get("cycle")
+        if type(cycle) is not int or cycle < 0:
+            raise ValidationError("Methods budget invoice has invalid admitted cycle ownership")
+        return {"attempt_id": attempt_id, "cycle": cycle,
+                "cycle_pinned": "model_budget_cycle" in attempt.get("payload", {})}
+
+    def _legacy_stage_model_invoices(self, stage_id, scope):
+        """Return exact old-scope contributions belonging to this admitted window."""
+        contributions = {}
+        rows = self.control._conn.execute(
+            "SELECT a.logical_id,a.body_hash FROM artifacts a JOIN "
+            "(SELECT logical_id,MAX(version) version FROM artifacts "
+            "WHERE logical_id LIKE 'command/capability-repair-usage/%' GROUP BY logical_id) h "
+            "ON a.logical_id=h.logical_id AND a.version=h.version")
+        for row in rows:
+            raw = self.store.read_body(row["body_hash"])
+            invoice = json.loads(raw)
+            if invoice.get("stage_id") != stage_id:
+                continue
+            invoice_digest = hashlib.sha256(canonical_bytes({
+                "stage_id": stage_id, "assignment_plan_ref": invoice.get("assignment_plan_ref")})).hexdigest()
+            if (invoice.get("schema_version") != "capability-repair-usage-1"
+                    or row["logical_id"] != f"command/capability-repair-usage/{invoice_digest}"):
+                raise ValidationError("Methods budget invoice has invalid assignment identity")
+            if hashlib.sha256(raw).hexdigest() != row["body_hash"]:
+                raise ValidationError("Methods budget invoice digest differs from its artifact")
+            owner = self._repair_panel_invoice_owner(stage_id, invoice)
+            declared = invoice.get("model_budget_owner")
+            expected_key = f"stage:{stage_id}:cycle:{owner['cycle']}"
+            if declared is not None:
+                bound = None
+                plan_record = self.store.get(invoice["assignment_plan_ref"])
+                plan_input = json.loads(self.store.read_body(plan_record["body_hash"])).get("input_ref", {})
+                if isinstance(plan_input, dict) and isinstance(plan_input.get("ref"), str):
+                    binding_record = self.store.get(plan_input["ref"])
+                    binding_raw = self.store.read_body(binding_record["body_hash"])
+                    if hashlib.sha256(binding_raw).hexdigest() != binding_record["body_hash"]:
+                        raise ValidationError("Methods budget owner binding digest differs from its artifact")
+                    binding = json.loads(binding_raw)
+                    plan_body = json.loads(self.store.read_body(plan_record["body_hash"]))
+                    if (binding.get("schema_version") != "capability-repair-budget-owner-1"
+                            or binding.get("panel_stage_id") != plan_body.get("stage_id")
+                            or binding.get("assignment_attempt_number") != plan_body.get("attempt_number")
+                            or binding_record.get("author") != "command.composer"
+                            or not self.tasks.get_attempt(owner["attempt_id"])["created_at"] <= binding_record["created_at"] <= plan_record["created_at"]):
+                        raise ValidationError("Methods budget owner binding differs from its assignment")
+                    bound = binding.get("model_budget_owner")
+                declared_scope = declared.get("scope") if isinstance(declared, dict) else None
+                if isinstance(declared_scope, dict):
+                    validate_model_budget_scope(declared_scope)
+                if (not isinstance(declared, dict) or set(declared) != {"scope", "attempt_id", "cycle"}
+                        or type(declared.get("cycle")) is not int
+                        or declared.get("cycle", -1) < 0
+                        or declared.get("attempt_id") != owner["attempt_id"]
+                        or bound != declared
+                        or not isinstance(declared_scope, dict)
+                        or (owner["cycle_pinned"] and declared.get("cycle") != owner["cycle"])
+                        or declared_scope.get("model_call_budget_key") != f"stage:{stage_id}:cycle:{declared.get('cycle')}"
+                        or declared_scope.get("model_call_budget_path") != scope["model_call_budget_path"]
+                        or declared_scope.get("model_call_budget_limit") != scope["model_call_budget_limit"]
+                        or declared_scope.get("model_token_budget_limits") != scope["model_token_budget_limits"]):
+                    raise ValidationError("Methods budget invoice changes its admitted owner")
+                continue
+            if expected_key != scope["model_call_budget_key"]:
+                continue
+            usage = {key: invoice["usage"].get(key, 0)
+                     for key in ("model_calls", "input_tokens", "output_tokens")}
+            if any(type(value) is not int or value < 0 for value in usage.values()):
+                raise ValidationError("Methods budget invoice has invalid physical usage")
+            if not any(usage.values()):
+                continue
+            identity = invoice["assignment_plan_ref"]
+            if identity in contributions and contributions[identity] != usage:
+                raise ValidationError("Methods budget invoice changes an assignment's physical usage")
+            contributions[identity] = usage
+        return contributions
+
+    @staticmethod
+    def _legacy_stage_budget_projection(connection, scope, contributions):
+        """Combine scoped HTTP rows with exact external costs without seed overlap."""
+        key = scope["model_call_budget_key"]
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        physical = (connection.execute(
+            "SELECT COUNT(*),COALESCE(SUM(observed_input),0),COALESCE(SUM(observed_output),0) "
+            "FROM model_token_reservations WHERE budget_key=?", (key,)).fetchone()
+            if "model_token_reservations" in tables else (0, 0, 0))
+        prior = (connection.execute(
+            "SELECT COALESCE(SUM(model_calls),0),COALESCE(SUM(input_tokens),0),"
+            "COALESCE(SUM(output_tokens),0) FROM stage_model_budget_legacy_usage WHERE budget_key=?",
+            (key,)).fetchone() if "stage_model_budget_legacy_usage" in tables else (0, 0, 0))
+        if "stage_model_budget_legacy_usage" in tables:
+            for row in connection.execute("SELECT invoice_id,model_calls,input_tokens,output_tokens "
+                                          "FROM stage_model_budget_legacy_usage WHERE budget_key=?", (key,)):
+                value = contributions.get(row[0])
+                if value is None or tuple(value[name] for name in ("model_calls", "input_tokens", "output_tokens")) != tuple(row[1:]):
+                    raise ValidationError("Methods budget migration lost its exact invoice provenance")
+        if physical[0]:
+            retained_ids = ({row[0] for row in connection.execute(
+                "SELECT invoice_id FROM stage_model_budget_legacy_usage WHERE budget_key=?", (key,))}
+                if "stage_model_budget_legacy_usage" in tables else set())
+            if any(identity not in retained_ids for identity in contributions):
+                raise ValidationError("Methods budget migration has ambiguous physical request overlap")
+        calls = (connection.execute("SELECT used_calls FROM model_call_budgets WHERE budget_key=?", (key,)).fetchone()
+                 if "model_call_budgets" in tables else None)
+        tokens = (connection.execute("SELECT used_input,used_output FROM model_token_budgets WHERE budget_key=?", (key,)).fetchone()
+                  if "model_token_budgets" in tables else None)
+        recorded = (calls[0] if calls else 0, *(tokens or (0, 0)))
+        if any(value > physical[i] + prior[i] for i, value in enumerate(recorded)):
+            raise ValidationError("Methods budget migration has ambiguous preexisting seed ownership")
+        dimensions = ("model_calls", "input_tokens", "output_tokens")
+        return {name: physical[i] + sum(item[name] for item in contributions.values())
+                for i, name in enumerate(dimensions)}
+
+    def _restore_legacy_stage_model_budget(self, scope, contributions):
+        if not contributions:
+            return
+        register_model_token_budget(scope)
+        with closing(sqlite3.connect(scope["model_call_budget_path"], timeout=30)) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE name='model_call_budgets'").fetchone():
+                limit = connection.execute("SELECT max_calls FROM model_call_budgets WHERE budget_key=?",
+                                           (scope["model_call_budget_key"],)).fetchone()
+                if limit is not None and limit[0] != scope["model_call_budget_limit"]:
+                    raise ValidationError("persisted stage model-call limit changed")
+            usage = self._legacy_stage_budget_projection(connection, scope, contributions)
+            connection.execute("CREATE TABLE IF NOT EXISTS model_call_budgets "
+                               "(budget_key TEXT PRIMARY KEY,max_calls INTEGER NOT NULL,used_calls INTEGER NOT NULL)")
+            connection.execute("CREATE TABLE IF NOT EXISTS stage_model_budget_legacy_usage "
+                "(budget_key TEXT NOT NULL,invoice_id TEXT NOT NULL,model_calls INTEGER NOT NULL,"
+                "input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,PRIMARY KEY(budget_key,invoice_id))")
+            key = scope["model_call_budget_key"]
+            for identity, value in contributions.items():
+                prior = connection.execute("SELECT model_calls,input_tokens,output_tokens "
+                    "FROM stage_model_budget_legacy_usage WHERE budget_key=? AND invoice_id=?", (key, identity)).fetchone()
+                amounts = tuple(value[name] for name in ("model_calls", "input_tokens", "output_tokens"))
+                if prior is not None and prior != amounts:
+                    raise ValidationError("Methods budget migration changes a completed invoice")
+                connection.execute("INSERT OR IGNORE INTO stage_model_budget_legacy_usage VALUES (?,?,?,?,?)",
+                                   (key, identity, *amounts))
+            connection.execute("INSERT INTO model_call_budgets VALUES (?,?,?) ON CONFLICT(budget_key) "
+                "DO UPDATE SET used_calls=MAX(used_calls,excluded.used_calls)",
+                (key, scope["model_call_budget_limit"], usage["model_calls"]))
+            connection.execute("UPDATE model_token_budgets SET used_input=MAX(used_input,?),used_output=MAX(used_output,?) "
+                               "WHERE budget_key=?", (usage["input_tokens"], usage["output_tokens"], key))
 
     def _merge_incremental_error_usage(self, error, incremental_usage):
         """Attach newly consumed work without charging a restored usage snapshot."""
@@ -1201,15 +1681,217 @@ class ComposerRunner:
             for key, amount in body.get("usage", {}).items():
                 if key in self.usage and type(amount) in (int, float) and math.isfinite(amount) and amount >= 0:
                     totals[key] = totals.get(key, 0) + amount
-        changed = False
+        incremental_usage = {}
         for key, total in totals.items():
             delta = total - self.foundry_usage.get(key, 0)
             if delta < 0:
                 raise ValidationError("foundry usage ledger regressed below its recorded checkpoint")
-            if delta:
-                self.usage[key] += delta
-                changed = True
-        self.foundry_usage = totals
+            incremental_usage[key] = delta
+        self._settle_pending_stage_usage(
+            additional_usage=incremental_usage, settle_pending=False, foundry_totals=totals)
+        return any(incremental_usage.values())
+
+    def _duplicate_foundry_settlement_proofs(self):
+        """Find repeated global payments whose complete owner costs are immutable."""
+        keys = ("model_calls", "input_tokens", "output_tokens")
+        def amounts(value):
+            if not isinstance(value, dict):
+                raise ValidationError("settlement evidence has invalid usage")
+            result = {key: value.get(key, 0) for key in keys}
+            if any(type(v) is not int or v < 0 for v in result.values()):
+                raise ValidationError("settlement evidence has invalid usage")
+            return result
+        def difference(left, right):
+            result = {key: amounts(left)[key] - amounts(right)[key] for key in keys}
+            if any(v < 0 for v in result.values()):
+                raise ValidationError("settlement evidence regresses")
+            return result
+        def plus(left, right):
+            return {key: left[key] + right[key] for key in keys}
+        rows = self.control._conn.execute(
+            "SELECT artifact_ref,created_at FROM artifacts WHERE artifact_type='progress_checkpoint' "
+            "AND logical_id LIKE 'command/composer/checkpoints/%' ORDER BY created_at,artifact_ref").fetchall()
+        checkpoints = []
+        for row in rows:
+            manifest, digest, body = self._read_verified_artifact_json(row["artifact_ref"])
+            if (manifest.get("author") == "command.composer"
+                    and body.get("schema_version") == "composer-checkpoint-1"
+                    and body.get("workflow_id") == self.workflow["id"]):
+                checkpoints.append((manifest, digest, body))
+        foundry_rows = self.control._conn.execute(
+            "SELECT artifact_ref,created_at FROM artifacts WHERE logical_id LIKE 'command/foundry-work/%' "
+            "ORDER BY created_at,version").fetchall()
+        foundry = [self._read_verified_artifact_json(row["artifact_ref"]) for row in foundry_rows]
+        def heads(at):
+            result = {}
+            for manifest, digest, body in foundry:
+                if manifest["created_at"] <= at:
+                    result[manifest["artifact_id"]] = (manifest, digest, body)
+            return result
+        def invoices(previous, current, stage_id, owner):
+            refs, total = [], {key: 0 for key in keys}
+            old, new = previous.get("stage_usage_totals", {}), current.get("stage_usage_totals", {})
+            for name, value in new.items():
+                if not name.startswith(f"repair-panel:{stage_id}:"):
+                    continue
+                delta = difference(value, old.get(name, {}))
+                if not any(delta.values()):
+                    continue
+                ref = self.store.head("command/capability-repair-usage/" + name.rsplit(":", 1)[1])
+                if ref is None:
+                    raise ValidationError("settlement lacks its paid Methods invoice")
+                manifest, digest, invoice = self._read_verified_artifact_json(ref["artifact_ref"])
+                plan_manifest, _, plan = self._read_verified_artifact_json(invoice["assignment_plan_ref"])
+                _, _, chief = self._read_verified_artifact_json(invoice["chief_synthesis_ref"])
+                if (invoice.get("schema_version") != "capability-repair-usage-1"
+                        or invoice.get("stage_id") != stage_id or amounts(invoice["usage"]) != amounts(value)
+                        or chief.get("schema_version") != "department-chief-synthesis-1"
+                        or plan.get("schema_version") != "department-stage-assignment-1"
+                        or plan.get("project_id") != self.workflow["project_id"]
+                        or chief.get("project_id") != self.workflow["project_id"]
+                        or chief.get("stage_id") != plan.get("stage_id")
+                        or chief.get("attempt_number") != plan.get("attempt_number")
+                        or amounts(chief["usage"]) != amounts(value)
+                        or not owner["created_at"] <= plan_manifest["created_at"] <= owner["finished_at"]):
+                    raise ValidationError("settlement Methods invoice changes owner costs")
+                refs.append({"ref": manifest["artifact_ref"], "sha256": digest})
+                total = plus(total, delta)
+            return total, refs
+        def physical_reviews(start_at, end_at, stage_id, owner, paid_invoices):
+            total, refs = {key: 0 for key in keys}, []
+            paid_assignments = set()
+            for item in paid_invoices:
+                invoice = self._read_verified_artifact_json(item["ref"])[2]
+                plan = self._read_verified_artifact_json(invoice["assignment_plan_ref"])[2]
+                paid_assignments.add((plan["stage_id"], plan["attempt_number"]))
+            rows = self.control._conn.execute(
+                "SELECT artifact_ref FROM artifacts WHERE logical_id LIKE "
+                "'command/departments/methods/assignments/%/execution' "
+                "AND created_at>? AND created_at<=?", (start_at, end_at)).fetchall()
+            for row in rows:
+                manifest, digest, body = self._read_verified_artifact_json(row["artifact_ref"])
+                report = body.get("report", {})
+                if (body.get("stage_id"), body.get("attempt_number")) in paid_assignments:
+                    continue
+                if (report.get("provider_call_reused") is True
+                        or not any(amounts(report.get("usage", {})).values())):
+                    continue
+                task = self.tasks.get(body["task_id"])
+                payload = task.get("payload", {})
+                physical = self.tasks.get_attempt(payload["attempt_id"])
+                base = re.sub(r"[^a-z0-9-]+", "-", stage_id.casefold()).strip("-")
+                panel_id = body.get("stage_id", "")
+                if (body.get("schema_version") not in {"specialist-execution-1", "specialist-verifier-execution-1"}
+                        or body.get("project_id") != self.workflow["project_id"]
+                        or not panel_id.startswith(base + "-repair-panel-")
+                        or payload.get("stage_id") != panel_id
+                        or payload.get("assigned_role") != body.get("assigned_role")
+                        or payload.get("assignment_id") != body.get("assignment_id")
+                        or manifest.get("author") != body.get("assigned_role")
+                        or physical.get("task_id") != body.get("task_id")
+                        or physical.get("state") not in {"succeeded", "failed"}
+                        or amounts(physical.get("usage", {}).get("actual", {})) != amounts(report["usage"])
+                        or not owner["created_at"] <= manifest["created_at"] <= owner["finished_at"]):
+                    raise ValidationError("unattributed physical review at a foundry settlement")
+                refs.append({"ref": manifest["artifact_ref"], "sha256": digest})
+                total = plus(total, amounts(report["usage"]))
+            return total, refs
+        proofs = []
+        for index, (bm, bh, before) in enumerate(checkpoints[:-1]):
+            phase = before.get("phase", "")
+            if not phase.endswith(":capability_validation_failed"):
+                continue
+            stage_id = phase.rsplit(":", 1)[0]
+            am, ah, after = checkpoints[index + 1]
+            if after.get("phase") not in {f"{stage_id}:failed", f"{stage_id}:retrying"}:
+                continue
+            br, ar = before.get("stages", {}).get(stage_id, {}), after.get("stages", {}).get(stage_id, {})
+            attempt_id = br.get("attempt_id")
+            if not attempt_id or ar.get("attempt_id") != attempt_id:
+                continue
+            starts = [item for item in checkpoints[:index + 1]
+                      if item[2].get("phase") == f"{stage_id}:admitted"
+                      and item[2].get("stages", {}).get(stage_id, {}).get("attempt_id") == attempt_id]
+            if len(starts) != 1:
+                continue
+            sm, sh, start = starts[0]
+            owner = self.tasks.get_attempt(attempt_id)
+            task = self.tasks.get(owner["task_id"])
+            if (owner.get("state") != "failed" or not owner.get("finished_at")
+                    or task.get("payload", {}).get("stage_id") != stage_id
+                    or not owner["created_at"] <= sm["created_at"] <= bm["created_at"] <= am["created_at"]):
+                continue
+            try:
+                paid = difference(before.get("foundry_usage", {}), start.get("foundry_usage", {}))
+                if not any(paid.values()) or amounts(before.get("foundry_usage", {})) != amounts(after.get("foundry_usage", {})):
+                    continue
+                old_heads, paid_heads = heads(sm["created_at"]), heads(bm["created_at"])
+                head_delta, head_proof = {key: 0 for key in keys}, []
+                for logical, (manifest, digest, body) in paid_heads.items():
+                    old = old_heads.get(logical)
+                    delta = difference(body.get("usage", {}), old[2].get("usage", {}) if old else {})
+                    if any(delta.values()):
+                        if not owner["created_at"] <= manifest["created_at"] <= bm["created_at"]:
+                            raise ValidationError("foundry payment lies outside its owner interval")
+                        head_delta = plus(head_delta, delta)
+                        head_proof.append({"ref": manifest["artifact_ref"], "sha256": digest,
+                                           "previous_ref": old[0]["artifact_ref"] if old else None,
+                                           "usage": delta})
+                if head_delta != paid:
+                    continue
+                pre_other, pre_refs = invoices(start, before, stage_id, owner)
+                post_other, post_refs = invoices(before, after, stage_id, owner)
+                pre = difference(before["usage"], start["usage"])
+                closure = difference(after["usage"], before["usage"])
+                if closure != plus(paid, post_other) and not any(post_other.values()):
+                    post_other, post_refs = physical_reviews(sm["created_at"], am["created_at"], stage_id, owner, pre_refs)
+                recorded = next((item.get("usage") for item in ar.get("attempts", [])
+                                 if item.get("attempt_id") == attempt_id), ar.get("usage"))
+                if (pre != plus(paid, pre_other) or closure != plus(paid, post_other)
+                        or amounts(recorded) != plus(pre, closure)
+                        or amounts(owner.get("usage", {}).get("actual", {})) != amounts(recorded)):
+                    continue
+                proofs.append({"schema_version": "composer-accounting-correction-1",
+                    "stage_id": stage_id, "attempt_id": attempt_id,
+                    "checkpoint_refs": [{"ref": m["artifact_ref"], "sha256": h}
+                                        for m, h in ((sm, sh), (bm, bh), (am, ah))],
+                    "foundry_heads": head_proof, "other_invoices": pre_refs + post_refs,
+                    "duplicate_usage": paid})
+            except (KeyError, TypeError, ValueError, NotFoundError, ValidationError):
+                # Incomplete or concurrent ownership cannot prove a refund.
+                continue
+        return proofs
+
+    def _reconcile_duplicate_foundry_settlements(self):
+        """Correct proven repeated global payments without altering physical quotas."""
+        changed = False
+        for proof in self._duplicate_foundry_settlement_proofs():
+            identity = {"stage_id": proof["stage_id"], "attempt_id": proof["attempt_id"],
+                        "closing_checkpoint": proof["checkpoint_refs"][-1]}
+            digest = hashlib.sha256(canonical_bytes(identity)).hexdigest()
+            namespace = f"accounting-correction:{digest}"
+            logical = f"command/accounting-corrections/{digest}"
+            record = self.store.head(logical)
+            if record is not None and self._read_verified_artifact_json(record["artifact_ref"])[2] != proof:
+                raise ValidationError("accounting correction changes its immutable proof")
+            if namespace in self.stage_usage_totals:
+                if self.stage_usage_totals[namespace] != proof["duplicate_usage"]:
+                    raise ValidationError("accounting correction changes a settled proof")
+                continue
+            subjects = [item["ref"] for item in proof["checkpoint_refs"] + proof["foundry_heads"] + proof["other_invoices"]]
+            if record is None:
+                self._publish(logical, "note", proof, "command.composer", subjects=subjects)
+            elif self._read_verified_artifact_json(record["artifact_ref"])[2] != proof:
+                raise ValidationError("accounting correction changes its immutable proof")
+            with self._progress_lock:
+                state = deepcopy(self._accounting_state)
+                for key, amount in proof["duplicate_usage"].items():
+                    if state["usage"].get(key, 0) < amount:
+                        raise ValidationError("accounting correction exceeds observed global usage")
+                    state["usage"][key] -= amount
+                state["stage_usage_totals"][namespace] = deepcopy(proof["duplicate_usage"])
+                self._accounting_state = state
+            changed = True
         return changed
 
     @staticmethod
@@ -1250,11 +1932,12 @@ class ComposerRunner:
         else:
             panel_calls = repair_panel_usage.get("model_calls") \
                 if isinstance(repair_panel_usage, dict) else None
-            repair_panel_reserve = (
-                panel_calls if type(panel_calls) is int and panel_calls >= 0
-                else self._capability_repair_panel_model_call_reserve(stage)
-                if panel_required else 0
-            )
+            if type(panel_calls) is int and panel_calls >= 0:
+                repair_panel_reserve = panel_calls
+            elif panel_required:
+                repair_panel_reserve = self._capability_repair_panel_model_call_reserve(stage)
+            else:
+                repair_panel_reserve = 0
         available = quota["max_model_calls"] - prior \
             - FOUNDRY_VERIFIER_MODEL_CALL_RESERVE - repair_panel_reserve
         return max(0, min(AUTONOMOUS_FOUNDRY_MODEL_CALL_LIMIT, available))
@@ -1395,19 +2078,75 @@ class ComposerRunner:
         return topic_requires_source_data(
             topic, additional_requirements=requirement_scope["active"])
 
+    def _stage_usage_baseline(self, project_dir):
+        namespace = hashlib.sha256(str(Path(project_dir).resolve()).encode()).hexdigest()
+        if namespace in self.stage_usage_totals:
+            return namespace, self.stage_usage_totals[namespace]
+        record = self.store.head(f"command/stage-usage/{namespace}")
+        prior = json.loads(self.store.read_body(record["body_hash"])) if record else {}
+        return namespace, prior
+
     def _incremental_stage_usage(self, stage, usage):
-        """Charge only newly consumed work from a resumed runner window."""
+        """Defer baseline advancement until the corresponding cost is settled."""
         if not isinstance(usage, dict) or not isinstance(usage.get("cumulative_usage"), dict):
             return usage
-        totals = usage["cumulative_usage"]
-        namespace = hashlib.sha256(str(Path(stage["project_dir"]).resolve()).encode()).hexdigest()
-        logical_id = f"command/stage-usage/{namespace}"
-        record = self.store.head(logical_id)
-        prior = json.loads(self.store.read_body(record["body_hash"])) if record else {}
-        delta = {key: max(0, value - prior.get(key, 0)) for key, value in totals.items()
-                 if type(value) in (int, float) and math.isfinite(value) and value >= 0}
-        self._publish(logical_id, "note", totals, "command.controller")
+        totals = {key: value for key, value in usage["cumulative_usage"].items()
+                  if type(value) in (int, float) and math.isfinite(value) and value >= 0}
+        namespace, prior = self._stage_usage_baseline(stage["project_dir"])
+        totals = {**prior, **{key: max(value, prior.get(key, 0))
+                             for key, value in totals.items()}}
+        delta = {key: max(0, value - prior.get(key, 0)) for key, value in totals.items()}
+        self.pending_stage_usage[namespace] = {"stage_id": stage["id"],
+                                               "totals": totals, "delta": delta}
         return delta
+
+    def _settle_pending_stage_usage(self, stage_id=None, *, already_charged=False,
+                                    additional_usage=None, settle_pending=True, foundry_totals=None,
+                                    namespaces=None):
+        """Commit costs and replay baselines as one interrupt-safe state swap."""
+        original = self._accounting_state
+
+        def commit():
+            state = deepcopy(original)
+            if foundry_totals is not None:
+                state["foundry_usage"] = deepcopy(foundry_totals)
+            for key, amount in (additional_usage or {}).items():
+                if key in state["usage"]:
+                    state["usage"][key] += amount
+            settled_stages = []
+            for namespace, pending in (list(state["pending_stage_usage"].items()) if settle_pending else []):
+                if namespaces is not None and namespace not in namespaces:
+                    continue
+                if stage_id is not None and pending["stage_id"] != stage_id:
+                    continue
+                if not already_charged:
+                    committed = state["stage_usage_totals"].get(namespace, {})
+                    for key in state["usage"]:
+                        delta = pending["delta"].get(key, 0)
+                        if key in committed:
+                            delta = max(0, pending["totals"].get(key, committed[key]) - committed[key])
+                        state["usage"][key] += delta
+                state["stage_usage_totals"][namespace] = deepcopy(pending["totals"])
+                del state["pending_stage_usage"][namespace]
+                settled_stages.append(pending["stage_id"])
+            with self._progress_lock:
+                self._accounting_state = state
+            return settled_stages
+
+        try:
+            settled_stages = commit()
+        except KeyboardInterrupt:
+            if self._accounting_state is original:
+                commit()
+            raise
+        for settled_stage in settled_stages:
+            self._clear_child_progress(settled_stage)
+
+    def _end_child_activity(self, stage_id):
+        with self._progress_lock:
+            child = self._child_progress.get(stage_id)
+            if child:
+                child["activity_active"] = False
 
     @staticmethod
     def _topic_attempt_usage(attempt):
@@ -1606,7 +2345,8 @@ class ComposerRunner:
     def _is_topic_intake_retry(error, stage):
         """Return whether a topic intake has an autonomous retry path."""
         return (
-            stage.get("kind") == "topic_discovery"
+            not isinstance(error, PROVIDER_OPERATOR_STOP_ERRORS)
+            and stage.get("kind") == "topic_discovery"
             and bool(getattr(error, "retryable_topic_intake", False))
         )
 
@@ -1621,6 +2361,8 @@ class ComposerRunner:
         reject or replace the scientific question.
         """
         if stage.get("kind") != "topic_discovery":
+            return error
+        if isinstance(error, (*PROVIDER_OPERATOR_STOP_ERRORS, ProviderCooldownError)):
             return error
         if getattr(error, "retryable_topic_intake", False):
             return error
@@ -1648,7 +2390,8 @@ class ComposerRunner:
         capacity as evidence against the selected topic. Provider/model quotas
         remain hard resource fences and do not match this predicate.
         """
-        if stage.get("kind") != "topic_discovery":
+        if (stage.get("kind") != "topic_discovery"
+                or isinstance(error, PROVIDER_OPERATOR_STOP_ERRORS)):
             return False
         # Candidate/contract rejection is wrapped in QuotaExceededError only
         # to carry the bounded intake usage snapshot.  It is not permission to
@@ -1771,8 +2514,9 @@ class ComposerRunner:
         """Classify a failed attempt without turning every defect into a stop."""
         if getattr(error, "failure_class", None) == "context_budget":
             return "resource_fence"
-        if isinstance(error, (ProviderConfigurationError, ProviderCooldownError, QuotaExceededError,
-                              ComposerHardDeadlineExceeded, ComposerLateStageResult)):
+        if isinstance(error, (*PROVIDER_OPERATOR_STOP_ERRORS, ProviderCooldownError, QuotaExceededError,
+                              ComposerHardDeadlineExceeded, ComposerStageDeadlineExceeded,
+                              ComposerLateStageResult)):
             return "resource_fence"
         if isinstance(error, ModelCallError) and not getattr(error, "outcome_known", True):
             return "unknown_external_outcome"
@@ -2876,11 +3620,53 @@ class ComposerRunner:
             return None
         expansion_history = context.get("survey_evidence_expansion_history")
         expansion_history = expansion_history if isinstance(expansion_history, list) else []
-        if any(isinstance(item, dict)
-               and item.get("topic_id") == identity["topic_id"]
-               and item.get("topic_cycle") == identity["topic_cycle"]
-               for item in expansion_history):
-            return None
+        prior_expansion = next((item for item in reversed(expansion_history)
+                                if isinstance(item, dict)
+                                and item.get("topic_id") == identity["topic_id"]
+                                and item.get("topic_cycle") == identity["topic_cycle"]), None)
+        retained_request = None
+        if prior_expansion is not None:
+            request_id = prior_expansion.get("request_id")
+            admissions = []
+            candidates = [*self.active_research_requests]
+            for decision in reversed(self.feedback):
+                if (not isinstance(decision, dict)
+                        or decision.get("action") != "continue_research"
+                        or not isinstance(decision.get("research_requests"), list)):
+                    continue
+                for item in decision.get("research_requests", []):
+                    if (isinstance(item, dict) and item.get("id") == request_id
+                            and item.get("topic_id") == identity["topic_id"]
+                            and item.get("topic_cycle") == identity["topic_cycle"]):
+                        candidates.append(item)
+                        if type(decision.get("cycle")) is int:
+                            admissions.append((decision["cycle"], item))
+            for value in self.context.values():
+                if not isinstance(value, dict):
+                    continue
+                for key in ("research_requests", "research_expansion_requests"):
+                    if isinstance(value.get(key), list):
+                        candidates.extend(value[key])
+            retained_request = next((deepcopy(item) for item in candidates
+                                     if isinstance(item, dict)
+                                     and item.get("id") == request_id
+                                     and item.get("topic_id") == identity["topic_id"]
+                                     and item.get("topic_cycle") == identity["topic_cycle"]
+                                     and self._request_target_kind(item) == "survey"), None)
+            admitted_cycles = [cycle for cycle, item in admissions
+                               if isinstance(retained_request, dict)
+                               and self._research_request_signature(item)
+                               == self._research_request_signature(retained_request)]
+            retained = (self._survey_acquisition_frontier_for_topic(
+                survey_stage["id"], identity["topic_id"], identity["topic_cycle"], retained_request)
+                if isinstance(retained_request, dict) else None)
+            if retained is not None and admitted_cycles:
+                attempt, project_dir, run, _ = retained
+                if (type(attempt.get("cycle")) is int
+                        and attempt["cycle"] >= min(admitted_cycles)
+                        and isinstance(retained_request, dict)
+                        and self._survey_request_was_fulfilled(project_dir, run, retained_request)):
+                    return None
         survey_lineage = survey_context.get("topic_lineage")
         survey_cycles = [value for value in (
             survey_lineage.get("topic_cycle") if isinstance(survey_lineage, dict) else None,
@@ -2889,7 +3675,7 @@ class ComposerRunner:
         if any(value != identity["topic_cycle"] for value in survey_cycles):
             return None
         deferred_survey_orders = survey_context.get("deferred_research_requests")
-        if isinstance(deferred_survey_orders, list) and any(
+        if retained_request is None and isinstance(deferred_survey_orders, list) and any(
                 isinstance(item, dict)
                 and item.get("kind") == "literature_expansion"
                 and item.get("owner") == "research.intelligence"
@@ -2936,6 +3722,7 @@ class ComposerRunner:
             "target_stage_kind": "survey",
             "topic_id": topic_id,
             "topic_cycle": topic_cycle,
+            "repair_policy_revision": SURVEY_EVIDENCE_REQUEST_POLICY_REVISION,
             "repair_priority": "immediate",
             "recovery_mode": "survey_evidence_before_experiment_repair",
             "objective": (
@@ -2953,8 +3740,8 @@ class ComposerRunner:
             ),
             "success_condition": (
                 "Publish a current survey and gap assessment that either (a) contains source-traceable "
-                "measurements for the declared comparison, including geometry/gap, sweep direction, "
-                "onset definition, uncertainty, and exact page/figure/table, or (b) records a bounded "
+                "measurements for the declared comparison, including definitions of the study variables "
+                "and outcomes, units, controls, uncertainty, and exact page/figure/table, or (b) records a bounded "
                 "targeted negative search with source coverage and the precise unavailable evidence. "
                 "Then issue an evidence-based same-phenomenon decision: admit a feasible experiment, "
                 "narrow the empirical claim, or explicitly reframe as a prediction/model study without "
@@ -2979,6 +3766,8 @@ class ComposerRunner:
         }
         if topic_cycle is not None:
             request["topic_cycle"] = topic_cycle
+        if retained_request is not None:
+            request = retained_request
 
         if self._has_executed_experiment_result(
                 context, self._stage_experiment_capability_id(stage),
@@ -3071,13 +3860,15 @@ class ComposerRunner:
             context["research_requests"] = requests
             self.active_research_requests.append(deepcopy(request))
         expansion_history = deepcopy(expansion_history)
-        expansion_history.append({
-            "topic_id": topic_id,
-            "topic_cycle": topic_cycle,
-            "source_survey_ref": survey_ref,
-            "source_assessment_ref": assessment_ref,
-            "request_id": request["id"],
-        })
+        if prior_expansion is None:
+            expansion_history.append({
+                "topic_id": topic_id,
+                "topic_cycle": topic_cycle,
+                "source_survey_ref": survey_ref,
+                "source_assessment_ref": assessment_ref,
+                "source_project_dir": survey_context.get("project_dir"),
+                "request_id": request["id"],
+            })
         context["survey_evidence_expansion_history"] = expansion_history[-8:]
         context.update({
             "stage_id": stage["id"],
@@ -3553,6 +4344,20 @@ class ComposerRunner:
             remaining = min(remaining, self.deadline_epoch - time.time())
         if remaining <= 0:
             raise ComposerHardDeadlineExceeded("composer hard deadline exceeded")
+        return remaining
+
+    def _stage_remaining(self, stage):
+        """Consume the admitted attempt's wall time across all of its phases."""
+        if isinstance(stage, str):
+            stage = next(item for item in self.workflow["stages"] if item["id"] == stage)
+        remaining = min(float(stage["deadline_seconds"]), self._remaining())
+        deadline = stage.get("attempt_deadline_at_epoch")
+        if deadline is None:
+            deadline = self.stage_records.get(stage["id"], {}).get("attempt_deadline_at_epoch")
+        if type(deadline) in (int, float) and math.isfinite(deadline):
+            remaining = min(remaining, deadline - time.time())
+        if remaining <= 0:
+            raise ComposerStageDeadlineExceeded(f"stage attempt deadline exceeded: {stage['id']}")
         return remaining
 
     def _deadline_dispatch_floor(self):
@@ -4423,6 +5228,8 @@ class ComposerRunner:
                     item["schema_version"] = "department-work-order-1"
                     try:
                         self.departments.validate_request(item)
+                        if "resume_scopes" in request:
+                            self._validate_survey_revalidation_scopes(request)
                     except ValidationError as exc:
                         rejection = self.departments.reject_request(
                             request, source_stage_id=stage_id,
@@ -4447,6 +5254,7 @@ class ComposerRunner:
                             "repair_commands", "acceptance_checks", "review_directives",
                             "model_diagnostics", "recovery_mode", "target_stage_id",
                             "target_stage_kind", "repair_priority", "repair_policy_revision",
+                            "recovery_generation", "resume_scopes",
                             "source_survey_ref", "source_assessment_ref",
                             "experiment_repair_plan",
                             "repair_strategy", "attempt_lineage"):
@@ -4623,6 +5431,37 @@ class ComposerRunner:
         self._remaining()
         previous_cycle = self.continuation_cycles
         requests = self._continuation_requests()
+        if not any(self._is_topic_pivot_request(item) for item in requests):
+            def scope(item):
+                return (item.get("source_stage_id"),
+                        item.get("target_stage_id") or self._request_target_kind(item))
+
+            revised_scopes = {scope(item) for item in requests}
+            request_ids = {item.get("id") for item in requests}
+            for item in self._scope_active_research_requests(self.active_research_requests):
+                if item.get("id") in request_ids or scope(item) in revised_scopes:
+                    continue
+                signature = self._research_request_signature(item)
+                if not self._research_request_was_admitted(item):
+                    continue
+                targets = [stage_id for stage_id, stage in by_id.items()
+                           if (item.get("target_stage_id") == stage_id
+                               if isinstance(item.get("target_stage_id"), str)
+                               else self._request_target_kind(item) == stage.get("kind"))]
+                fulfilled = (
+                    signature in self._attempted_request_signatures
+                    and bool(targets)
+                    and all(
+                        self._survey_acquisition_frontier_for_topic(
+                            stage_id, item.get("topic_id"), item.get("topic_cycle"), item) is not None
+                        if item.get("kind") == "literature_expansion" else
+                        self.stage_records.get(stage_id, {}).get("status") in {"completed", "accepted"}
+                        and not self.context.get(stage_id, {}).get("preserve_work_orders")
+                        for stage_id in targets)
+                )
+                if not fulfilled:
+                    requests.append(deepcopy(item))
+                    request_ids.add(item.get("id"))
         experiment_repair_override = (
             self._forward_first()
             and any(self._is_experiment_repair_request(item) for item in requests)
@@ -4920,7 +5759,9 @@ class ComposerRunner:
         # dependency and should be left alone when another continuation is
         # admitted for a downstream scope.
         if payload.get("assessment_current") is True and payload.get("assessment_ref"):
-            return None
+            if not (payload.get("status") in {"blocked", "paused"}
+                    and payload.get("work_orders") and not payload.get("follow_up_result")):
+                return None
         return payload
 
     @staticmethod
@@ -4969,6 +5810,7 @@ class ComposerRunner:
         topic_identity = self._current_topic_identity()
         candidates = []
         context = self.context.get(stage.get("id"), {})
+        revalidation = bool(self._survey_revalidation_scopes(stage))
         aggregate_review_repair = (
             isinstance(context, dict)
             and context.get("review_status") == "survey_integrity_repair"
@@ -4993,6 +5835,7 @@ class ComposerRunner:
             )
         candidates.append((stage.get("project_dir"), None, None))
         seen = set()
+        partials = []
         for candidate, candidate_topic_id, candidate_topic_cycle in candidates:
             if not isinstance(candidate, str):
                 continue
@@ -5008,8 +5851,20 @@ class ComposerRunner:
                         and candidate_topic_cycle != topic_identity["topic_cycle"]):
                     continue
             checkpoint = self._survey_checkpoint(resolved)
+            if checkpoint is None and revalidation:
+                output = Path(resolved) / "output/run.json"
+                durable = self._durable_stage_config(resolved)
+                try:
+                    retained = json.loads(output.read_text())
+                except (OSError, TypeError, ValueError):
+                    retained = None
+                if isinstance(retained, dict) and isinstance(durable, dict):
+                    checkpoint = {**retained, "nomination": durable.get("survey", {}).get("proposed_gap")}
             if checkpoint is None and aggregate_review_repair:
                 checkpoint = self._survey_review_repair_checkpoint(resolved)
+            partial = checkpoint is None
+            if partial:
+                checkpoint = self._survey_partial_checkpoint(resolved)
             if checkpoint is None:
                 continue
             if (isinstance(topic_identity, dict)
@@ -5036,8 +5891,33 @@ class ComposerRunner:
                         "reason": "a resumable literature map is reusable only for the exact admitted topic lineage",
                     })
                 continue
-            return Path(resolved)
-        return None
+            if not partial:
+                return Path(resolved)
+            coverage = checkpoint.get("coverage", {})
+            partials.append(((coverage.get("map_entry_count", 0),
+                              coverage.get("verified_full_texts", 0),
+                              coverage.get("unique_works", 0)), Path(resolved)))
+        return max(partials, key=lambda item: item[0])[1] if partials else None
+
+    @classmethod
+    def _survey_partial_checkpoint(cls, project_dir):
+        """Retain captured sources and checked work before aggregate acceptance."""
+        root = Path(project_dir)
+        output = root / "output" / "run.json"
+        if not output.is_file():
+            return None
+        try:
+            payload = json.loads(output.read_text())
+        except (OSError, ValueError):
+            return None
+        if (not isinstance(payload, dict)
+                or payload.get("status") not in {"blocked", "paused", "running"}
+                or payload.get("survey_ref")):
+            return None
+        config = cls._durable_stage_config(root)
+        if not isinstance(config, dict):
+            return None
+        return {**payload, "nomination": config.get("survey", {}).get("proposed_gap")}
 
     @staticmethod
     def _survey_checkpoint_topic_id(checkpoint):
@@ -6293,7 +7173,7 @@ class ComposerRunner:
                 "source_stage_id", "target_stage_id", "target_stage_kind",
                 "topic_id", "topic_cycle", "source_survey_ref", "source_assessment_ref",
                 "failure_input_sha256",
-                "recovery_mode", "repair_policy_revision", "repair_commands", "acceptance_checks",
+                "recovery_mode", "repair_policy_revision", "resume_scopes", "repair_commands", "acceptance_checks",
                 "review_directives", "experiment_repair_plan", "repair_strategy",
             )
             if key in request
@@ -6302,6 +7182,77 @@ class ComposerRunner:
             if key in request:
                 stable[key] = deepcopy(request[key])
         return hashlib.sha256(canonical_bytes(stable)).hexdigest()
+
+    def _research_request_was_admitted(self, request, *, failure_dossier_ref=None):
+        signature = self._research_request_signature(request)
+        return any(
+            isinstance(decision, dict) and decision.get("action") == "continue_research"
+            and isinstance(decision.get("research_requests"), list)
+            and any(isinstance(item, dict)
+                    and (failure_dossier_ref is None or item.get("failure_dossier_ref") == failure_dossier_ref)
+                    and self._research_request_signature(item) == signature
+                    for item in decision["research_requests"])
+            for decision in self.feedback)
+
+    def _recovery_input_matches(self, stage, request, context, current_input):
+        declared = request.get("failure_input_sha256")
+        if declared == current_input:
+            return True
+        if (request.get("kind") != "recovery"
+                or request.get("recovery_mode") != "format_repair_then_rerun"
+                or not isinstance(declared, str) or re.fullmatch(r"[0-9a-f]{16}", declared) is None
+                or not isinstance(current_input, str) or re.fullmatch(r"[0-9a-f]{64}", current_input) is None):
+            return False
+        recovery = context.get("failure_recovery") or {}
+        ref = context.get("failure_dossier_ref") or recovery.get("dossier_ref")
+        if (not isinstance(ref, str) or request.get("failure_dossier_ref") != ref
+                or not self._research_request_was_admitted(request, failure_dossier_ref=ref)):
+            return False
+        try:
+            manifest, _, dossier = self._read_verified_artifact_json(ref)
+        except (NotFoundError, KeyError, OSError, TypeError, ValueError, ValidationError):
+            return False
+        if (manifest.get("author") != "command.composer"
+                or dossier.get("schema_version") != "composer-failure-recovery-1"):
+            return False
+        evidence = self._failure_dossier_evidence(ref, expected_stage_id=stage["id"])
+        if (not isinstance(evidence, dict) or evidence.get("available") is not True
+                or evidence.get("input_sha256") != current_input):
+            return False
+        return declared == current_input[:16]
+
+    def _has_pending_admitted_recovery(self, stage, by_id):
+        identity = self._current_topic_identity()
+        context = self.context.get(stage["id"], {})
+        recovery = context.get("failure_recovery")
+        current_input = context.get("failure_input_sha256") or (
+            recovery.get("input_sha256") if isinstance(recovery, dict) else None)
+        for request in self.active_research_requests:
+            if not isinstance(request, dict) or request.get("source_stage_id") != stage["id"]:
+                continue
+            if identity is not None and any(request.get(key) != identity[key]
+                                            for key in ("topic_id", "topic_cycle")):
+                continue
+            if (current_input and request.get("failure_input_sha256")
+                    and not self._recovery_input_matches(stage, request, context, current_input)):
+                continue
+            target_id = request.get("target_stage_id")
+            if (not isinstance(target_id, str) or target_id not in by_id
+                    or self._request_target_kind(request) != by_id[target_id].get("kind")
+                    or not self._research_request_was_admitted(request)):
+                continue
+            closure = self._continuation_targets([request], by_id)
+            if stage["id"] not in closure or not closure <= self.continuation_pending_stage_ids:
+                continue
+            target_context = self.context.get(target_id, {})
+            if (self.stage_records.get(target_id, {}).get("status") not in {"completed", "accepted"}
+                    or target_context.get("preserve_work_orders")
+                    or request.get("kind") == "literature_expansion"
+                    and not self._survey_request_was_fulfilled(
+                        target_context.get("project_dir") or by_id[target_id]["project_dir"],
+                        target_context, request)):
+                return True
+        return False
 
     def _restore_attempted_research_request_signatures(self, checkpoint):
         """Restore persisted work-order fences and migrate completed legacy cycles."""
@@ -7062,6 +8013,21 @@ class ComposerRunner:
         context["specialist_verifier"] = deepcopy(verifier_result)
         return True
 
+    def _gate_survey_work_orders(self, stage, result):
+        if (stage.get("kind") != "survey" or not isinstance(result, dict)
+                or result.get("status") not in {"completed", "accepted"}):
+            return result
+        outstanding = [request for request in self._requests_for_stage(stage)
+                       if request.get("kind") == "literature_expansion"
+                       and not self._survey_request_was_fulfilled(stage["project_dir"], result, request)]
+        if outstanding:
+            result = deepcopy(result)
+            result.update({"status": "research_expansion_required", "preserve_work_orders": True,
+                           "review_status": "survey_follow_up_unresolved",
+                           "research_requests": deepcopy(outstanding),
+                           "research_expansion_requests": deepcopy(outstanding)})
+        return result
+
     def _gate_free_topic_survey(self, result, *, stage=None):
         """Hold a free-topic mission until its question survives literature review.
 
@@ -7623,6 +8589,12 @@ class ComposerRunner:
             "failure": ComposerRunner._capability_repair_projection(
                 packet.get("failure"), max_depth=4, max_keys=20, max_items=8, max_text=1600),
             "failure_recovery": recovery_projection,
+            "failure_lineage": deepcopy(packet.get("failure_lineage", {})),
+            "repair_subject_lineage": deepcopy(packet.get(
+                "repair_subject_lineage", packet.get("failure_lineage", {}))),
+            "plan_review_failure": ComposerRunner._capability_repair_projection(
+                packet.get("plan_review_failure", {}), max_depth=3,
+                max_keys=12, max_items=8, max_text=1400),
             "failed_program": {
                 "source_manifest": [{key: item.get(key) for key in (
                     "path", "sha256", "size_bytes", "source_truncated") if key in item}
@@ -7659,20 +8631,19 @@ class ComposerRunner:
             "prior_verifier": ComposerRunner._capability_repair_projection(
                 packet.get("prior_verifier"), max_depth=4, max_keys=20, max_items=8, max_text=1400),
             "decision": context.get("decision"),
-            "repair_plan": ComposerRunner._capability_repair_projection(
-                selected_plan, max_depth=5, max_keys=24, max_items=10, max_text=1600)
+            "repair_plan": _preserve_response_value(selected_plan)
+            if has_adjudicated_plan else None,
+            "repair_plan_sha256": hashlib.sha256(canonical_bytes(
+                _preserve_response_value(selected_plan))).hexdigest()
             if has_adjudicated_plan else None,
             "diagnostic_hypotheses": compact_list(
-                [selected_plan.get("root_cause", {}).get("statement", "")]
-                if has_adjudicated_plan and isinstance(selected_plan.get("root_cause"), dict)
+                [] if has_adjudicated_plan
                 else context.get("diagnostic_hypotheses") or context.get("root_causes"), 12, 1400),
             "proposed_changes": compact_list(
-                [item.get("instruction", "") for item in selected_plan.get("required_changes", [])
-                 if isinstance(item, dict)]
-                if has_adjudicated_plan else
+                [] if has_adjudicated_plan else
                 context.get("proposed_changes") or context.get("required_changes"), 12, 1400),
             "acceptance_checks": compact_list(
-                selected_plan.get("acceptance_checks") if has_adjudicated_plan
+                [] if has_adjudicated_plan
                 else context.get("acceptance_checks"), 8, 900),
             "repair_commands": compact_list(context.get("repair_commands"), 8, 1100),
             "verifier": ComposerRunner._capability_repair_projection(
@@ -7758,6 +8729,9 @@ class ComposerRunner:
                 if key in item:
                     value = item.get(key)
                     if isinstance(value, list):
+                        if key == "acceptance_checks":
+                            entry[key] = _preserve_response_value(value)
+                            continue
                         compacted = []
                         for child in value[:count]:
                             if isinstance(child, dict):
@@ -7777,17 +8751,19 @@ class ComposerRunner:
                          or item.get("kind") == "additional_experiment")):
                 if adjudicated:
                     entry["objective"] = (
-                        "Implement only the single Methods-lead plan below against the immutable failure. "
+                        "Implement only the complete plan in methods_adjudication against the immutable failure. "
                         "Do not add competing reviewer proposals, change the admitted question, tune an "
                         "outcome threshold, or substitute values for censored observations. Preserve the "
-                        "plan's uncertainty and prove each acceptance check with source tests, a fresh "
-                        "execution, and an independent recalculation. Adjudicated plan: "
-                        + json.dumps(adjudicated_plan, ensure_ascii=False, sort_keys=True)
-                    )[:4000]
+                        "plan's uncertainty and phase ownership: plan checks concern the proposed design; "
+                        "execution checks require source tests, a fresh execution, and independent "
+                        "recalculation before result admission. Plan acceptance does not certify execution checks."
+                    )
                     entry["repair_strategy"] = "methods_adjudicated"
-                    entry["methods_adjudication"] = deepcopy(adjudicated_plan)
+                    entry["methods_adjudication"] = _preserve_response_value(adjudicated_plan)
+                    entry["methods_adjudication_sha256"] = hashlib.sha256(
+                        canonical_bytes(entry["methods_adjudication"])).hexdigest()
                     entry["experiment_repair_plan"] = {
-                        "schema_version": "experiment-repair-plan-2",
+                        "schema_version": "experiment-repair-plan-3",
                         "mode": "diagnose_patch_execute_recalculate",
                         "design_axis": "methods_adjudicated",
                         "failure_lineage": deepcopy(adjudicated_plan.get("failure_lineage")),
@@ -7930,11 +8906,10 @@ class ComposerRunner:
                     or verified_required.get("research_question") != question
                     or verified_required.get("domain") != domain):
                 continue
-            # A successful authoring cache can retain feedback from an earlier
-            # repair. It is not evidence for the current failed attempt; the
-            # admitted descriptor and execution result are captured separately.
+            # The latest admission supersedes older rejected candidates for
+            # this intent; its retained repair feedback is historical evidence.
             if entry.get("status") == "succeeded":
-                continue
+                return {}
             last_attempt = entry.get("last_attempt")
             source_files = {}
             if isinstance(last_attempt, dict):
@@ -8126,10 +9101,14 @@ class ComposerRunner:
 
             run_path = bound_file(prior_context.get("output_path"))
             package_path = bound_file(prior_context.get("results_package"))
-            if run_path is None or package_path is None:
+            if run_path is None:
                 return {**unavailable, "reason": "prior_attempt_output_missing_or_out_of_scope"}
             run_record = _read_experiment_result_payload(
                 str(run_path), base_dir=attempt_root)
+            if package_path is None:
+                return self._executed_candidate_evidence(
+                    prior_context, run_record, run_path, attempt_root,
+                    bound_file, selected_topic=selected_topic)
             package = _read_experiment_result_payload(
                 str(package_path), base_dir=attempt_root)
             if not isinstance(run_record, dict) or not isinstance(package, dict):
@@ -8413,8 +9392,84 @@ class ComposerRunner:
                 "figures": _bounded_experiment_result_projection(figures),
             }
             return result_record
-        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError, sqlite3.Error):
             return {**unavailable, "reason": "prior_attempt_evidence_failed_scope_or_integrity_check"}
+
+    @staticmethod
+    def _executed_candidate_evidence(context, run, run_path, attempt_root,
+                                     bound_file, *, selected_topic=None):
+        """Bind unreviewed observations to immutable execution bodies."""
+        unavailable = {"available": False, "identity_verified": False,
+                       "admissible_as_verified_claims": False}
+        if not isinstance(run, dict) or run.get("status") in {
+                "queued", "pending", "running", "in_progress", "starting"}:
+            return {**unavailable, "reason": "prior_attempt_is_still_running"}
+        raw_path = bound_file(run.get("raw_results"))
+        refs = run.get("execution_refs")
+        if (raw_path is None or refs != context.get("execution_refs")
+                or not isinstance(refs, list) or len(refs) < 2
+                or not all(isinstance(ref, str) for ref in refs)
+                or len(set(refs)) != len(refs)):
+            return {**unavailable, "reason": "executed_candidate_lineage_incomplete"}
+        expected_question = (selected_topic.get("research_question")
+                             if isinstance(selected_topic, dict) else None)
+        if expected_question is not None and run.get("research_question") != expected_question:
+            return {**unavailable, "reason": "prior_attempt_research_question_mismatch"}
+        raw_bytes = raw_path.read_bytes()
+        digest = hashlib.sha256(raw_bytes).hexdigest()
+        candidate = json.loads(raw_bytes)
+        if (digest != run.get("raw_results_sha256") or not isinstance(candidate, dict)
+                or candidate.get("study_id") != run.get("study_id")):
+            return {**unavailable, "reason": "executed_candidate_identity_mismatch"}
+        for key in ("project_id", "study_id", "attempt_number"):
+            if context.get(key) is not None and run.get(key) is not None and context[key] != run[key]:
+                return {**unavailable, "reason": f"prior_attempt_{key}_mismatch"}
+        database = attempt_root / "state" / "control.sqlite"
+        if not database.is_file():
+            return {**unavailable, "reason": "executed_candidate_ledger_missing"}
+        with closing(sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)) as connection:
+            for ref in refs:
+                row = connection.execute(
+                    "SELECT body_hash FROM artifacts WHERE artifact_ref=?", (ref,)).fetchone()
+                if row is None or not re.fullmatch(r"[0-9a-f]{64}", row[0] or ""):
+                    return {**unavailable, "reason": "executed_candidate_execution_missing"}
+                body_path = attempt_root / "objects" / "sha256" / row[0]
+                if body_path.stat().st_size > MAX_EXPERIMENT_RESULT_PACKAGE_BYTES:
+                    return {**unavailable, "reason": "executed_candidate_execution_oversized"}
+                body = body_path.read_bytes()
+                execution = json.loads(body)
+                if (hashlib.sha256(body).hexdigest() != row[0]
+                        or execution.get("outcome") != "ok"
+                        or canonical_bytes(execution.get("document")) != canonical_bytes(candidate)):
+                    return {**unavailable, "reason": "executed_candidate_execution_mismatch"}
+        observations = candidate.get("observations", [])
+        observations = observations if isinstance(observations, list) else []
+        size = min(24, len(observations))
+        indices = sorted({round(index * (len(observations) - 1) / max(1, size - 1))
+                          for index in range(size)})
+        derived = {key: candidate[key] for key in (
+            "metrics", "analysis", "findings", "limitations") if key in candidate}
+        return {
+            **unavailable, "available": True, "identity_verified": True,
+            "evidence_kind": "executed_unreviewed_candidate",
+            "stage_id": context.get("stage_id"), "attempt_number": context.get("attempt_number"),
+            "run_status": run.get("status"), "prior_status": context.get("status"),
+            "execution_refs": refs, "scientific_sha256": digest,
+            "measurement_sha256": hashlib.sha256(canonical_bytes({
+                "observations": observations, "metrics": candidate.get("metrics", [])})).hexdigest(),
+            "files": {
+                "run_record": {"path": run_path.relative_to(attempt_root).as_posix(),
+                               "sha256": hashlib.sha256(run_path.read_bytes()).hexdigest()},
+                "raw_data": {"available": True,
+                             "path": raw_path.relative_to(attempt_root).as_posix(),
+                             "sha256": digest, "observation_count": len(observations),
+                             "sample_indices": indices,
+                             "sample_rows": _bounded_experiment_result_projection(
+                                 [observations[index] for index in indices])}},
+            "executed_candidate": _bounded_experiment_result_projection(candidate),
+            "derived_results": _bounded_experiment_result_projection(derived),
+            "review_evidence": [], "figures": [],
+        }
 
     def _unresolved_prior_attempt_evidence(self, stage, attempts, *, selected_topic=None):
         """Project durable evidence for unresolved attempts without promoting results.
@@ -9110,6 +10165,14 @@ class ComposerRunner:
             dossier_evidence if isinstance(dossier_evidence, dict)
             and dossier_evidence.get("available") is True else None
         )
+        subject_lineage = verified_dossier.get("repair_subject_lineage") if verified_dossier else None
+        if isinstance(subject_lineage, dict):
+            subject_topic = verified_dossier.get("topic_identity")
+            if (not isinstance(subject_topic, dict)
+                    or subject_topic.get("topic_id") != selected.get("id")
+                    or subject_topic.get("research_question") != selected.get("research_question")
+                    or subject_topic.get("domain") != selected.get("domain")):
+                raise ValidationError("Methods repair subject belongs to a different topic")
         failure_input_sha256 = (
             verified_dossier.get("input_sha256") if verified_dossier else None
         )
@@ -9298,6 +10361,24 @@ class ComposerRunner:
         candidate_source_files = foundry_attempt.get("source_files")
         candidate_source_files = (
             candidate_source_files if isinstance(candidate_source_files, dict) else {})
+        exact_observed = (verified_dossier.get("scientific_observed_result",
+                                             verified_dossier.get("observed_result"))
+                          if verified_dossier else None)
+        executed_refs = (exact_observed.get("execution_refs")
+                         if isinstance(exact_observed, dict) else None)
+        snapshot_hashes = {item.get("sha256") for item in program_snapshot
+                           if isinstance(item, dict) and item.get("sha256")}
+        source_applicability = None
+        if isinstance(executed_refs, list) and executed_refs and candidate_source_files:
+            source_applicability = all(
+                isinstance(candidate_source_files.get(name), dict)
+                and candidate_source_files[name].get("expected_sha256") in snapshot_hashes
+                for name in ("executor", "validator"))
+            if not source_applicability:
+                # An internally valid authoring failure can precede a later
+                # admitted program. Its source is not this execution's source.
+                candidate_source_files = {}
+                foundry_failure = {}
         exact_candidate_sources = {}
         for source_name in ("executor", "validator"):
             source_record = candidate_source_files.get(source_name)
@@ -9335,8 +10416,6 @@ class ComposerRunner:
                     or "The source chunks are unavailable or fail integrity verification."
                 ),
             }
-        exact_observed = (verified_dossier.get("observed_result")
-                          if verified_dossier else None)
         failure_lineage = {
             "stage_id": stage.get("id"),
             "failure_dossier_ref": failure_dossier_ref,
@@ -9363,7 +10442,8 @@ class ComposerRunner:
                 "comparison", "measurement", "disconfirmation_test", "resource_plan",
             )},
             "failure": {
-                "error": (verified_dossier.get("error") if verified_dossier
+                "error": (verified_dossier.get("scientific_failure_error",
+                                               verified_dossier.get("error")) if verified_dossier
                           else str(error)[:4096]),
                 "prior_status": (exact_observed.get("status")
                                  if isinstance(exact_observed, dict)
@@ -9383,6 +10463,7 @@ class ComposerRunner:
             "unresolved_attempt_evidence": unresolved_attempt_evidence,
             "unresolved_attempt_sources": unresolved_attempt_sources,
             "prior_foundry_work": foundry_failure,
+            "foundry_source_applicable_to_execution": source_applicability,
             "exact_candidate_sources": exact_candidate_sources,
             "experiment_repair_plan": self._capability_repair_projection(
                 repair_plan, max_text=4200),
@@ -9416,15 +10497,22 @@ class ComposerRunner:
                     conflicting_repair_history_count
                 ),
                 "policy": (
-                    "Only evidence bound to this immutable failure dossier, stage attempt, and input "
-                    "digest is included, and its narrative must not cite a different attempt or "
-                    "failure digest; prior result packages are separately bound to their exact "
+                    "Plan-review evidence is bound to failure_lineage. Candidate sources, intent, "
+                    "and measurements are bound to repair_subject_lineage when present, otherwise "
+                    "to failure_lineage. These identities must remain distinct; prior result packages "
+                    "are separately bound to their exact "
                     "attempt directory and execution refs, remain explicitly unadmitted, and "
                     "excluded history remains in the ledger."
                 ),
             },
             "repair_contract": {
-                "must_preserve": ["the admitted topic domain", "the exact research question"],
+                "check_phase_protocol": "repair-check-phases-1",
+                "must_preserve": [
+                    "the admitted topic domain", "the exact research question",
+                    "the admitted primary outcome and comparison, unless a scientifically justified "
+                    "change explicitly preserves the same question",
+                    "valid zero, negative, and statistically inconclusive results as evidence",
+                ],
                 "must_change": [
                     "the mechanism or estimand responsible for the recorded failure",
                     "the validator and acceptance checks when the prior validator accepted invalid evidence",
@@ -9433,15 +10521,25 @@ class ComposerRunner:
                 "must_prove": [
                     "finite non-degenerate observations",
                     "an independent validator that recalculates every primary outcome",
-                    "a result that is sensitive to the declared intervention",
+                    "correct handling of the declared intervention, established by independent "
+                    "controls rather than a required nonzero primary effect",
                 ],
                 "prohibited": [
                     "repeating the same executor with a renamed threshold",
                     "endpoint or NaN fallback for undefined crossings",
                     "claiming an unobserved mechanism from an analytic comparator",
+                    "requiring a preferred sign, nonzero effect, statistical significance, or "
+                    "null rejection to admit valid observations",
                 ],
             },
         }
+        if isinstance(subject_lineage, dict):
+            packet["repair_subject_lineage"] = deepcopy(subject_lineage)
+            packet["plan_review_failure"] = {
+                "error": verified_dossier.get("error"),
+                "failure_lineage": deepcopy(failure_lineage),
+                "source_authority": "The current plan review failed; the candidate evidence belongs to repair_subject_lineage.",
+            }
         intent = foundry_failure.get("last_attempt")
         intent = intent.get("experiment_intent") if isinstance(intent, dict) else None
         prior_measurements = [{
@@ -9659,6 +10757,8 @@ class ComposerRunner:
         raw = response.get("raw") if isinstance(response.get("raw"), dict) else {}
         plan = raw.get("repair_plan")
         if report.get("status") != "succeeded" or response.get("decision") != "repair":
+            if report.get("status") != "succeeded" and report.get("error"):
+                return None, f"the methods lead could not produce a plan: {report['error']}"
             return None, "the methods lead did not issue a repair decision"
         if not isinstance(plan, dict):
             return None, "the methods lead did not provide a substantive repair plan"
@@ -9675,7 +10775,9 @@ class ComposerRunner:
                 or any(character not in "0123456789abcdef" for character in expected_hash)):
             return None, "the current failure dossier identity is not verified"
         topic = packet.get("topic") if isinstance(packet.get("topic"), dict) else {}
-        if plan.get("topic_id") != topic.get("id"):
+        if not isinstance(topic.get("id"), str) or not topic["id"].strip():
+            return None, "the admitted topic identity is not verified"
+        if "topic_id" in plan and plan.get("topic_id") != topic["id"]:
             return None, "the repair plan changes or omits the admitted topic identity"
         if plan.get("disposition") != "repair":
             return None, "the methods lead requested evidence or declined a repair"
@@ -9686,13 +10788,18 @@ class ComposerRunner:
         evidence = root_cause.get("evidence")
         if (not isinstance(statement, str) or not statement.strip()
                 or not isinstance(evidence, list)
-                or not any(isinstance(item, str) and item.strip() for item in evidence)):
+                or not evidence
+                or any(not isinstance(item, str) or not item.strip() for item in evidence)):
             return None, "the root cause is missing a concrete evidence link"
+        if len(evidence) > 8:
+            return None, "the repair plan has more than 8 root-cause evidence links"
         changes = plan.get("required_changes")
         if not isinstance(changes, list) or not changes:
             return None, "the repair plan has no selected source or design change"
+        if len(changes) > 6:
+            return None, "the repair plan has more than 6 selected changes"
         normalized_changes = []
-        for change in changes[:6]:
+        for change in changes:
             if not isinstance(change, dict):
                 return None, "a selected repair change is not a structured instruction"
             fields = {key: change.get(key) for key in (
@@ -9700,39 +10807,68 @@ class ComposerRunner:
             if any(not isinstance(fields[key], str) or not fields[key].strip()
                    for key in ("target", "instruction", "scientific_basis")):
                 return None, "a selected repair change lacks its target, instruction, or scientific basis"
-            if not isinstance(fields["source_refs"], list):
+            if "source_refs" not in change:
                 fields["source_refs"] = []
-            fields["source_refs"] = [str(item)[:300] for item in fields["source_refs"][:6]]
-            normalized_changes.append({key: value[:1600] if isinstance(value, str) else value
-                                       for key, value in fields.items()})
-        checks = plan.get("acceptance_checks")
-        checks = checks if isinstance(checks, list) else []
+            if not isinstance(fields["source_refs"], list) or len(fields["source_refs"]) > 6 or any(
+                    not isinstance(item, str) for item in fields["source_refs"]):
+                return None, "a selected repair change has invalid source references"
+            normalized_changes.append(deepcopy(fields))
+        checks = plan.get("acceptance_checks", [])
+        if not isinstance(checks, list):
+            return None, "the repair plan has invalid acceptance checks"
+        if any(key in plan for key in ("plan_acceptance_checks", "execution_acceptance_checks", "deferred_gates")):
+            return None, "repair checks must use acceptance_checks entries with explicit phase and check"
         repair_contract = packet.get("repair_contract")
         repair_contract = repair_contract if isinstance(repair_contract, dict) else {}
+        if ("check_phase_protocol" in repair_contract
+                and repair_contract["check_phase_protocol"] != "repair-check-phases-1"):
+            return None, "the repair contract has an unsupported check phase protocol"
         mandatory_checks = repair_contract.get("must_prove", [])
         if not isinstance(mandatory_checks, list):
             return None, "the repair contract has an invalid must_prove list"
         normalized_checks = []
-        for value in [*checks, *mandatory_checks]:
+        explicit_phases = repair_contract.get("check_phase_protocol") == "repair-check-phases-1"
+        if any(isinstance(value, dict) for value in checks) and any(isinstance(value, str) for value in checks):
+            return None, "the repair plan mixes legacy and phase-owned acceptance checks"
+        for value in checks:
+            if isinstance(value, str) and not explicit_phases and value.strip():
+                normalized = {"phase": "execution", "check": value}
+            elif (isinstance(value, dict) and set(value) == {"phase", "check"}
+                  and value.get("phase") in ("plan", "execution")
+                  and isinstance(value.get("check"), str) and value["check"].strip()):
+                normalized = deepcopy(value)
+            else:
+                return None, "the repair plan has an invalid phase-owned acceptance check"
+            if any(item["check"] == normalized["check"] and item["phase"] != normalized["phase"]
+                   for item in normalized_checks):
+                return None, "an acceptance check has conflicting phase ownership"
+            if normalized not in normalized_checks:
+                normalized_checks.append(normalized)
+        for value in mandatory_checks:
             if not isinstance(value, str) or not value.strip():
-                continue
-            normalized = value.strip()[:1200]
+                return None, "the repair contract has an invalid must_prove check"
+            normalized = {"phase": "execution", "check": value}
+            if any(item["check"] == value and item["phase"] != "execution" for item in normalized_checks):
+                return None, "a mandatory execution check has conflicting phase ownership"
             if normalized not in normalized_checks:
                 normalized_checks.append(normalized)
         if not normalized_checks:
             return None, "the repair plan has no falsifiable acceptance checks"
         if len(normalized_checks) > 16:
             return None, "the bounded repair contract has more than 16 acceptance checks"
+        uncertainties = plan.get("residual_uncertainties", [])
+        if (not isinstance(uncertainties, list) or len(uncertainties) > 8
+                or any(not isinstance(item, str) for item in uncertainties)):
+            return None, "the repair plan has invalid residual uncertainties"
         return {
-            "schema_version": "experiment-repair-adjudication-1",
+            "schema_version": "experiment-repair-adjudication-2",
             "topic_id": topic.get("id"),
             "failure_lineage": {key: expected_lineage.get(key)
                                 for key in required_lineage},
             "disposition": "repair",
             "root_cause": {
-                "statement": statement[:1800],
-                "evidence": [str(item)[:1400] for item in evidence[:8]
-                             if isinstance(item, str) and item.strip()],
+                "statement": statement,
+                "evidence": deepcopy(evidence),
             },
             "required_changes": normalized_changes,
             "acceptance_checks": normalized_checks,
@@ -9740,10 +10876,7 @@ class ComposerRunner:
             # attribution prose is not an admission field: an inaccurate paraphrase
             # must not veto an otherwise evidence-bound experimental design.
             "dissent_resolution": [],
-            "residual_uncertainties": [str(item)[:900] for item in
-                                       plan.get("residual_uncertainties", [])[:8]
-                                       if isinstance(item, str) and item.strip()]
-            if isinstance(plan.get("residual_uncertainties"), list) else [],
+            "residual_uncertainties": deepcopy(uncertainties),
         }, None
 
     @staticmethod
@@ -9818,6 +10951,9 @@ class ComposerRunner:
         """
         if not isinstance(reports, list) or not isinstance(packet, dict):
             return None
+        contract = packet.get("repair_contract")
+        if isinstance(contract, dict) and "check_phase_protocol" in contract:
+            return None
         normalized_reports = []
         for report in reports:
             if not isinstance(report, dict) or report.get("status") != "succeeded":
@@ -9852,6 +10988,8 @@ class ComposerRunner:
             return None
 
         lead_response = lead["response"]
+        if "repair_plan" in lead_response or "repair_plan" in lead_response.get("raw", {}):
+            return None
         summary = lead_response.get("summary")
         summary = summary.strip() if isinstance(summary, str) else ""
         if not summary:
@@ -9958,7 +11096,7 @@ class ComposerRunner:
             "disposition": "repair",
             "root_cause": {"statement": summary[:1800], "evidence": evidence[:6]},
             "required_changes": changes[:3],
-            "acceptance_checks": checks,
+            "acceptance_checks": [{"phase": "execution", "check": value} for value in checks],
         }
         adapted_report = {
             "status": "succeeded",
@@ -10208,6 +11346,377 @@ class ComposerRunner:
             cached[item["role_id"]] = deepcopy(item)
         return cached
 
+    def _owned_repair_evidence_execution(self, ref, plan_ref, *, verifier=False):
+        manifest, digest, body = self._read_verified_artifact_json(ref)
+        _, _, plan = self._read_verified_artifact_json(plan_ref)
+        task = self.tasks.get(body.get("task_id"))
+        payload = task.get("payload", {})
+        row = next((item for item in plan.get("assignments", [])
+                    if item.get("task_id") == body.get("task_id")), None)
+        schema = "specialist-verifier-execution-1" if verifier else "specialist-execution-1"
+        if (body.get("schema_version") != schema or not isinstance(row, dict)
+                or body.get("project_id") != self.workflow["project_id"]
+                or plan.get("schema_version") != "department-stage-assignment-1"
+                or plan.get("project_id") != self.workflow["project_id"]
+                or manifest.get("author") != body.get("assigned_role")
+                or body.get("stage_id") != plan.get("stage_id")
+                or body.get("attempt_number") != plan.get("attempt_number")
+                or any(row.get(key) != body.get(key) for key in ("assignment_id", "assigned_role", "task_id"))
+                or any(payload.get(key) != body.get(key) for key in
+                       ("assignment_id", "assigned_role", "stage_id", "attempt_number"))
+                or payload.get("input_ref") != plan.get("input_ref")
+                or (not verifier and body.get("input_ref") != plan.get("input_ref"))):
+            raise ValidationError("Methods evidence execution has no exact owned assignment")
+        attempts = self.tasks.attempts_for_task(body["task_id"])
+        report = body.get("report", {})
+        if report.get("status") == "succeeded" and not any(
+                item.get("state") == "succeeded" or (item.get("state") == "cancelled"
+                and report.get("provider_call_reused") is True) for item in attempts):
+            raise ValidationError("Methods evidence execution has no observed successful attempt")
+        return manifest, digest, body, plan, task
+
+    def _retained_capability_evidence_actions(self, stage, packet):
+        """Recover owned HOLD actions even when a later plan omitted them."""
+        rows = self.control._conn.execute(
+            "SELECT artifact_ref FROM artifacts WHERE artifact_type='progress_checkpoint' "
+            "AND logical_id LIKE 'command/composer/checkpoints/%' ORDER BY created_at DESC,version DESC").fetchall()
+        pending, seen = [], set()
+        for row in rows:
+            manifest, _, checkpoint = self._read_verified_artifact_json(row["artifact_ref"])
+            if (manifest.get("author") != "command.composer"
+                    or checkpoint.get("workflow_id") != self.workflow["id"]):
+                continue
+            context = checkpoint.get("context", {}).get(stage["id"], {})
+            panel = context.get("capability_repair_panel") if isinstance(context, dict) else None
+            if not isinstance(panel, dict) or panel.get("repair_plan") is not None:
+                continue
+            origin = panel.get("evidence_origin_packet", panel.get("packet", {}))
+            if any((origin.get("topic") or {}).get(key) != (packet.get("topic") or {}).get(key)
+                   for key in ("id", "domain", "research_question")):
+                continue
+            lead = next((item for item in panel.get("reports", []) if isinstance(item, dict)
+                         and item.get("role_id") == "methodologist" and item.get("decision") == "hold"
+                         and item.get("requested_actions")), None)
+            if not isinstance(lead, dict):
+                continue
+            if lead.get("artifact_ref") in seen:
+                continue
+            seen.add(lead.get("artifact_ref"))
+            _, _, execution, _, _ = self._owned_repair_evidence_execution(
+                lead["artifact_ref"], panel.get("ledger", {}).get("assignment_plan_ref"))
+            if (execution.get("report", {}).get("response", {}).get("requested_actions") != lead["requested_actions"]
+                    or origin.get("failure_lineage", {}).get("stage_id") != stage["id"]):
+                raise ValidationError("retained Methods evidence action changes its owned scope")
+            self._verify_repair_evidence_origin(execution, origin)
+            selected = deepcopy(panel)
+            selected["evidence_origin_packet"] = deepcopy(origin)
+            pending.append(selected)
+        return pending
+
+    @staticmethod
+    def _verify_repair_evidence_origin(execution, packet):
+        inputs = execution.get("report", {}).get("request_inputs", [])
+        original = json.loads(inputs[0]["input"]["prompt"]) if inputs else {}
+        original = original.get("repair_adjudication_packet", {})
+        supplied = original.get("candidate_program", {})
+        expected = _repair_candidate_program(packet)
+        if (any(supplied.get(key) != expected.get(key) for key in
+                ("exact_execution_sources", "experiment_intent", "repair_subject_lineage"))
+                or any(original.get("topic", {}).get(key) != packet.get("topic", {}).get(key)
+                       for key in ("id", "research_question"))):
+            raise ValidationError("Methods evidence action changes its immutable original source scope")
+
+    def _run_capability_repair_evidence(self, stage, descriptor, packet, retained, prior_review):
+        """Produce and independently review an immutable Methods evidence dependency."""
+        lead = next((item for item in retained.get("reports", [])
+                     if isinstance(item, dict) and item.get("role_id") == "methodologist"), None)
+        if not isinstance(lead, dict) or lead.get("decision") != "hold":
+            return None
+        actions = lead.get("requested_actions")
+        if not isinstance(actions, list) or not actions:
+            return {"status": "blocked", "reason": "the retained Methods HOLD has no bounded evidence action"}
+        if any(not isinstance(item, str) or not item.strip() for item in actions):
+            raise ValidationError("Methods evidence action has an invalid objective")
+        ref = lead.get("artifact_ref")
+        plan_ref = retained.get("ledger", {}).get("assignment_plan_ref")
+        _manifest, _digest, execution, origin_plan, task = self._owned_repair_evidence_execution(ref, plan_ref)
+        report = execution.get("report", {})
+        response = report.get("response", {})
+        origin_packet = retained.get("evidence_origin_packet", retained.get("packet", {}))
+        self._verify_repair_evidence_origin(execution, origin_packet)
+        if (execution.get("schema_version") != "specialist-execution-1"
+                or execution.get("project_id") != self.workflow["project_id"]
+                or execution.get("assigned_role") != "methods.methodologist"
+                or execution.get("stage_id") != origin_plan.get("stage_id")
+                or execution.get("attempt_number") != origin_plan.get("attempt_number")
+                or origin_plan.get("input_ref", {}).get("stage_id") != stage["id"]
+                or task.get("payload", {}).get("stage_id") != execution.get("stage_id")
+                or report.get("status") != "succeeded" or response.get("decision") != "hold"
+                or response.get("requested_actions") != actions):
+            raise ValidationError("Methods evidence action lacks its immutable owned HOLD execution")
+        identity = {"requested_actions": actions, "topic": packet.get("topic"),
+                    "review_input_sha256": packet.get("review_input_sha256"),
+                    "science_input_sha256": packet.get("science_input_sha256"),
+                    "lead_findings": response.get("findings", []),
+                    "lead_evidence_gaps": response.get("evidence_gaps", []),
+                    "origin_review_input_sha256": origin_packet.get("review_input_sha256"),
+                    "origin_science_input_sha256": origin_packet.get("science_input_sha256"),
+                    "origin_verifier_review": {key: deepcopy(retained.get("verifier", {}).get(key)) for key in
+                        ("decision", "rationale", "blocking_findings", "required_revisions", "deferred_gates",
+                         "critical_findings", "repair_scope", "open_concerns")}}
+        digest = hashlib.sha256(canonical_bytes(identity)).hexdigest()
+        logical = f"command/capability-repair-evidence/{digest}"
+        request = {"schema_version": "capability-repair-evidence-request-1", **deepcopy(identity),
+                   "source_execution_ref": ref, "source_execution_sha256": _digest,
+                   "lead_review": deepcopy(response),
+                   "origin_verifier_record": deepcopy(retained.get("verifier", {})),
+                   "origin_candidate_program": _repair_candidate_program(origin_packet),
+                   "origin_failure_lineage": deepcopy(origin_packet.get("failure_lineage")),
+                   "origin_repair_subject_lineage": deepcopy(origin_packet.get("repair_subject_lineage")),
+                   "origin_topic": deepcopy(origin_packet.get("topic")),
+                   "current_scope_matches_origin": origin_packet.get("science_input_sha256") == packet.get("science_input_sha256"),
+                   "failure_lineage": deepcopy(packet.get("failure_lineage")),
+                   "repair_subject_lineage": deepcopy(packet.get("repair_subject_lineage")),
+                   "source_ref_catalog": [item for item in ["candidate_program.executor", "candidate_program.validator",
+                                          "origin_candidate_program.executor", "origin_candidate_program.validator",
+                                          "experiment_intent", ref,
+                                          packet.get("failure_lineage", {}).get("failure_dossier_ref")]
+                                          if isinstance(item, str)]}
+        request_record = self.store.head(f"{logical}/request")
+        if request_record is None:
+            request_record = self._publish(f"{logical}/request", "note", request, "command.composer", subjects=[ref])
+        else:
+            _, _, request = self._read_verified_artifact_json(request_record["artifact_ref"])
+            if any(request.get(key) != value for key, value in identity.items()):
+                raise ValidationError("Methods evidence dependency changes its admitted input")
+        previous = self.store.head(f"{logical}/receipt")
+        previous_review = None
+        if previous is not None:
+            _, _, receipt = self._read_verified_artifact_json(previous["artifact_ref"])
+            if receipt.get("request_ref") != request_record["artifact_ref"]:
+                raise ValidationError("Methods evidence receipt is bound to another request")
+            _, note_sha, note = self._read_verified_artifact_json(receipt["note_ref"])
+            _, _, producer_body = self._read_verified_artifact_json(receipt["producer_execution_ref"])
+            verifier_body = (self._read_verified_artifact_json(receipt["verifier_execution_ref"])[2]
+                             if isinstance(receipt.get("verifier_execution_ref"), str) else {})
+            verifier_report = verifier_body.get("report", {})
+            verdict = verifier_report.get("response", {})
+            if (note_sha != receipt.get("note_sha256") or note.get("request_ref") != receipt["request_ref"]
+                    or producer_body.get("report", {}).get("response", {}).get("evidence_note") != note.get("document")
+                    or (verifier_body and verifier_body.get("chief_result", {}).get("repair_evidence_note") != note)):
+                raise ValidationError("Methods evidence receipt loses its exact note/review dependency")
+            if receipt.get("status") == "accepted" and (verifier_report.get("status") != "succeeded"
+                    or verdict.get("decision") != "accept" or verdict.get("blocking_findings")
+                    or verdict.get("critical_findings") or verdict.get("required_revisions")):
+                raise ValidationError("Methods evidence receipt fabricates scientific admission")
+            if (receipt.get("status") == "accepted" and verifier_report.get("status") == "succeeded"
+                    and verdict.get("decision") == "accept" and not verdict.get("blocking_findings")
+                    and not verdict.get("critical_findings") and not verdict.get("required_revisions")):
+                if (producer_body.get("schema_version") != "specialist-execution-1"
+                        or verifier_body.get("schema_version") != "specialist-verifier-execution-1"
+                        or producer_body.get("project_id") != self.workflow["project_id"]
+                        or verifier_body.get("project_id") != self.workflow["project_id"]
+                        or producer_body.get("stage_id") != verifier_body.get("stage_id")
+                        or producer_body.get("attempt_number") != verifier_body.get("attempt_number")
+                        or producer_body.get("assigned_role") == verifier_body.get("assigned_role")
+                        or producer_body.get("report", {}).get("status") != "succeeded"
+                        or producer_body.get("report", {}).get("response", {}).get("decision") != "pass"):
+                    raise ValidationError("Methods evidence receipt has no independent owned admission")
+                evidence_plan_ref = receipt.get("ledger", {}).get("assignment_plan_ref")
+                _, _, producer_body, plan, producer_task = self._owned_repair_evidence_execution(
+                    receipt["producer_execution_ref"], evidence_plan_ref)
+                _, _, verifier_body, _, verifier_task = self._owned_repair_evidence_execution(
+                    receipt["verifier_execution_ref"], evidence_plan_ref, verifier=True)
+                initial = producer_body.get("report", {}).get("request_inputs", [])
+                prompt = json.loads(initial[0]["input"]["prompt"]) if initial else {}
+                input_binding = plan.get("input_ref", {}).get("ref")
+                bound_request = (self._read_verified_artifact_json(input_binding)[2].get("evidence_request_ref")
+                                 if input_binding != request_record["artifact_ref"] else input_binding)
+                if (bound_request != request_record["artifact_ref"]
+                        or prompt.get("repair_evidence_request") != request
+                        or producer_task.get("state") != "completed" or verifier_task.get("state") != "completed"
+                        or verifier_body.get("chief_result", {}).get("repair_evidence_request") != request
+                        or note.get("producer_execution_ref") != receipt["producer_execution_ref"]
+                        or note.get("request_sha256") != request_record["body_hash"]
+                        or receipt.get("review") != verdict):
+                    raise ValidationError("Methods evidence receipt changes its exact admitted dependency")
+                if (producer_body["report"].get("finish_reason") != "stop"
+                        or verifier_report.get("finish_reason") != "stop"
+                        or producer_body["report"].get("response", {}).get("raw", {}).get("evidence_note") != note.get("document")):
+                    raise ValidationError("Methods evidence receipt lacks a completed literal model note")
+                ledger = receipt["ledger"]
+                _, _, chief = self._read_verified_artifact_json(ledger["chief_synthesis_ref"])
+                _, _, admission = self._read_verified_artifact_json(ledger["verifier_artifact_ref"])
+                if (chief.get("schema_version") != "department-chief-synthesis-1"
+                        or admission.get("schema_version") != "department-adversarial-verdict-1"
+                        or chief.get("project_id") != self.workflow["project_id"]
+                        or admission.get("project_id") != self.workflow["project_id"]
+                        or chief.get("stage_id") != plan.get("stage_id")
+                        or admission.get("stage_id") != plan.get("stage_id")
+                        or chief.get("attempt_number") != plan.get("attempt_number")
+                        or admission.get("attempt_number") != plan.get("attempt_number")
+                        or chief.get("outcome") != "completed" or chief.get("output_ref") != receipt["note_ref"]
+                        or admission.get("verdict") != "accepted" or admission.get("attempt_state") != "succeeded"
+                        or admission.get("independence_check") is not True
+                        or admission.get("chief_synthesis_ref") != ledger["chief_synthesis_ref"]
+                        or admission.get("verifier_execution_artifact_ref") != receipt["verifier_execution_ref"]
+                        or admission.get("verifier_report") != verdict):
+                    raise ValidationError("Methods evidence receipt lacks its exact departmental admission")
+                return {**receipt, "artifact_ref": previous["artifact_ref"], "note": note, "request": request, "dispatch_usage": {}}
+            previous_review = {"note": note, "review": verdict,
+                               "producer": producer_body.get("report", {}).get("response", {})}
+        panel_id = self._capability_repair_panel_stage_id(stage["id"], digest, self.continuation_cycles, 1)
+        attempt = self._next_capability_repair_assignment_attempt(panel_id)
+        evidence_stage = {**deepcopy(stage), "id": panel_id, "_model_budget_owner_stage_id": stage["id"],
+                          "deadline_seconds": self._stage_remaining(stage)}
+        owner = None
+        input_ref = {"kind": "capability_repair_panel", "stage_id": stage["id"],
+                     "digest": digest, "ref": request_record["artifact_ref"]}
+        if isinstance(stage.get("quota"), dict):
+            owner = {"scope": self._stage_model_config(stage, {})["model_call_budget_scopes"][0],
+                     "attempt_id": self.stage_records.get(stage["id"], {}).get("attempt_id"),
+                     "cycle": self.continuation_cycles if stage["id"] in self.reopened_stage_ids else 0}
+            binding = {"schema_version": "capability-repair-budget-owner-1", "panel_stage_id": panel_id,
+                       "assignment_attempt_number": attempt, "model_budget_owner": owner,
+                       "evidence_request_ref": request_record["artifact_ref"]}
+            binding_sha = hashlib.sha256(canonical_bytes(binding)).hexdigest()
+            input_ref["ref"] = self._publish(f"command/capability-repair-budget/{binding_sha}",
+                                            "note", binding, "command.composer")["artifact_ref"]
+        assignment = self.departments.begin_stage(panel_id, "experiment", attempt_number=attempt,
+            input_ref=input_ref, deadline_seconds=evidence_stage["deadline_seconds"], active_role_ids=["methodologist"])
+        producer = next(item for item in assignment["assignments"] if item.get("assignment_phase") == "specialist")
+        producer = {**deepcopy(producer), "_response_contract": "repair_evidence"}
+        try:
+            producer["_prompt"] = build_repair_evidence_prompt(producer, packet, request, prior_review=previous_review)
+        except ValidationError as exc:
+            produced_error = {"status": "failed", "assigned_role": producer["assigned_role"],
+                              "role_id": producer["role_id"], "error": str(exc), "usage": {}}
+        else:
+            produced_error = None
+        producer_assignment = {**deepcopy(assignment), "assignments": [producer]}
+        stage_result = {"_repair_panel": True, "capability_repair_packet": packet,
+                        "repair_verification_scope": "evidence_action"}
+        bundle = (self._run_specialist_pool(evidence_stage, producer_assignment, descriptor,
+            stage_result=stage_result, cache_input_digest=hashlib.sha256(producer["_prompt"].encode()).hexdigest())
+                  if produced_error is None else {"model_enabled": True, "by_role": {"methodologist": produced_error}})
+        if not bundle.get("model_enabled"):
+            bundle = {"model_enabled": True, "by_role": {"methodologist": {
+                "status": "failed", "assigned_role": producer["assigned_role"], "role_id": "methodologist",
+                "error": "Methods evidence producer has no configured model route", "usage": {}}}}
+        bundle = self._publish_specialist_reports(evidence_stage, producer_assignment, bundle)
+        produced = bundle.get("by_role", {}).get("methodologist", {})
+        produced_response = produced.get("response", {})
+        document = produced_response.get("evidence_note")
+        note = {"schema_version": "capability-repair-evidence-note-1", "request_ref": request_record["artifact_ref"],
+                "request_sha256": request_record["body_hash"], "topic": deepcopy(packet.get("topic")),
+                "producer_execution_ref": produced.get("artifact_ref"), "document": deepcopy(document)}
+        note_record = self._publish(f"{producer['assignment_logical_id']}/evidence-note", "report", note,
+            producer["assigned_role"], subjects=[request_record["artifact_ref"], produced["artifact_ref"]])
+        chief = {"repair_evidence_request": request, "repair_evidence_note": note}
+        verifier = None
+        if produced.get("status") == "succeeded" and produced_response.get("decision") == "pass" and isinstance(document, dict):
+            try:
+                verifier = self._run_specialist_verifier(evidence_stage, assignment, descriptor, bundle, chief,
+                                                        stage_result=stage_result)
+            except ValidationError as exc:
+                verifier = {"status": "failed", "error": str(exc), "usage": {}}
+        usage = self._specialist_usage([*bundle.get("reports", []), *([verifier] if isinstance(verifier, dict) else [])])
+        verdict = verifier.get("response", {}) if isinstance(verifier, dict) else {}
+        accepted = (isinstance(document, dict) and produced.get("status") == "succeeded"
+                    and isinstance(verifier, dict) and verifier.get("status") == "succeeded"
+                    and verdict.get("decision") == "accept" and not verdict.get("blocking_findings")
+                    and not verdict.get("critical_findings") and not verdict.get("required_revisions"))
+        finished = self.departments.finish_stage(panel_id, "experiment", attempt_number=attempt,
+            outcome="completed" if accepted else "blocked", output_ref=note_record["artifact_ref"], usage=usage,
+            error=None if accepted else "Methods evidence dependency was not independently admitted",
+            specialist_results=bundle.get("by_role", {}), verifier_result=verifier)
+        ledger = {"panel_stage_id": panel_id, "assignment_attempt_number": attempt,
+                  "assignment_plan_ref": assignment["plan_ref"],
+                  "chief_synthesis_ref": finished.get("chief_synthesis_ref"),
+                  "verifier_artifact_ref": finished.get("verifier_artifact_ref")}
+        invoice = {"input_sha256": digest, "usage": usage, "ledger": ledger,
+                   **({"model_budget_owner": owner} if owner else {})}
+        self._record_capability_repair_panel_usage(stage, invoice)
+        failures = [item for item in [produced, verifier] if isinstance(item, dict)
+                    and item.get("status") != "succeeded" and isinstance(item.get("failure"), dict)]
+        receipt = {"schema_version": "capability-repair-evidence-receipt-1",
+                   "status": "accepted" if accepted else "blocked", "request_ref": request_record["artifact_ref"],
+                   "note_ref": note_record["artifact_ref"], "note_sha256": note_record["body_hash"],
+                   "producer_execution_ref": produced.get("artifact_ref"),
+                   "verifier_execution_ref": verifier.get("artifact_ref") if isinstance(verifier, dict) else None,
+                   "review": deepcopy(verdict), "ledger": ledger, "usage_invoice_ref": invoice["usage_invoice_ref"],
+                   "dispatch_usage": deepcopy(usage), "model_failure": deepcopy(failures[0]) if failures else None}
+        record = self._publish(f"{logical}/receipt", "note", receipt, "command.composer",
+                               subjects=[request_record["artifact_ref"], note_record["artifact_ref"]])
+        return {**receipt, "artifact_ref": record["artifact_ref"], "note": note, "request": request}
+
+    def _run_pending_capability_evidence(self, stage, descriptor, packet):
+        origins = self._retained_capability_evidence_actions(stage, packet)
+        if not origins:
+            return None
+        catalog = [{"lead_review": deepcopy(next(item for item in origin["reports"] if item.get("role_id") == "methodologist")),
+                    "verifier_review": deepcopy(origin.get("verifier")),
+                    "failure_lineage": deepcopy(origin["evidence_origin_packet"].get("failure_lineage")),
+                    "repair_subject_lineage": deepcopy(origin["evidence_origin_packet"].get("repair_subject_lineage")),
+                    "origin_science_input_sha256": origin["evidence_origin_packet"].get("science_input_sha256"),
+                    "current_science_input_sha256": packet.get("science_input_sha256")} for origin in origins]
+        dependencies, usage, blocked_origin = [], {}, None
+        for origin in origins:
+            dependency = self._run_capability_repair_evidence(stage, descriptor, packet, origin, {})
+            if dependency is None:
+                continue
+            dependencies.append(dependency)
+            for key in ("model_calls", "input_tokens", "output_tokens"):
+                usage[key] = usage.get(key, 0) + dependency.get("dispatch_usage", {}).get(key, 0)
+            if dependency.get("status") != "accepted":
+                blocked_origin = origin
+                break
+        frontier = {"schema_version": "capability-repair-evidence-frontier-1", "topic": packet.get("topic"),
+                    "current_science_input_sha256": packet.get("science_input_sha256"),
+                    "status": "blocked" if blocked_origin else "accepted",
+                    "origin_actions": catalog, "receipt_refs": [item["artifact_ref"] for item in dependencies if item.get("artifact_ref")]}
+        digest = hashlib.sha256(canonical_bytes(frontier)).hexdigest()
+        record = self.store.head(f"command/capability-repair-evidence-frontiers/{digest}")
+        if record is None:
+            record = self._publish(f"command/capability-repair-evidence-frontiers/{digest}", "note", frontier,
+                "command.composer", subjects=frontier["receipt_refs"])
+        return {**frontier, "artifact_ref": record["artifact_ref"], "dependencies": dependencies,
+                "dispatch_usage": usage, "blocked_origin": blocked_origin}
+
+    def _require_capability_evidence_before_authoring(self, stage, topic_result, descriptor):
+        if not self._retained_capability_evidence_actions(stage, {"topic": topic_result.get("topic")}):
+            return None
+        prior = self.context.get(stage["id"], {})
+        packet = self._build_capability_repair_packet(stage, topic_result, prior, prior.get("error") or "pending Methods evidence action")
+        frontier = self._run_pending_capability_evidence(stage, descriptor, packet)
+        self.context.setdefault(stage["id"], {})["repair_evidence_frontier"] = deepcopy(frontier)
+        self._checkpoint(f"{stage['id']}:capability_repair_evidence", force=True)
+        if frontier["status"] == "accepted":
+            return frontier
+        dependency = frontier["dependencies"][-1]
+        failure = dependency.get("model_failure")
+        if isinstance(failure, dict):
+            error = ModelCallError.from_failure(failure.get("error") or "Methods evidence request unavailable",
+                                               {**failure["failure"], "usage": {}})
+        else:
+            error = ModelWorkBlocked("Methods evidence action remains independently held; source authoring is not admitted")
+        error.usage = deepcopy(frontier["dispatch_usage"])
+        error.repair_panel_usage = deepcopy(frontier["dispatch_usage"])
+        if packet.get("failure_lineage", {}).get("identity_verified") is True:
+            error.repair_subject = deepcopy(packet.get("repair_subject_lineage", packet["failure_lineage"]))
+        raise error
+
+    @staticmethod
+    def _capability_evidence_projection(frontier):
+        if frontier is None:
+            return None
+        projected = deepcopy(frontier)
+        projected.pop("dispatch_usage", None)
+        projected.pop("blocked_origin", None)
+        for dependency in projected.get("dependencies", []):
+            dependency.pop("dispatch_usage", None)
+        return _preserve_response_value(projected)
+
     def _run_capability_repair_panel(self, stage, descriptor, topic_result,
                                      prior_context, error):
         """Run upper-model methods roles before a capability redesign."""
@@ -10217,6 +11726,8 @@ class ComposerRunner:
         retained = prior_context.get("capability_repair_panel")
         cached_review_reports = None
         prior_plan_review = None
+        repair_evidence = None
+        evidence_dispatch_usage = {}
         retained_packet = retained.get("packet") if isinstance(retained, dict) else None
         retained_lineage = (retained_packet.get("failure_lineage")
                             if isinstance(retained_packet, dict) else None)
@@ -10240,12 +11751,47 @@ class ComposerRunner:
                 key: current_failure_lineage.get(key) for key in retained_input_lineage
             }
         )
+        if isinstance(retained, dict):
+            retained_lead = next((item for item in retained.get("reports", [])
+                                  if isinstance(item, dict) and item.get("role_id") == "methodologist"), None)
+            if isinstance(retained_lead, dict):
+                prior_plan_review = {
+                    "prior_plan": deepcopy(retained.get("repair_plan")),
+                    "lead_review": deepcopy(retained_lead),
+                    "verifier_review": deepcopy(retained.get("verifier")),
+                    "source_scope_matches": retained_review_digest == current_review_digest,
+                    "instruction": "Preserve the recorded HOLD and its exact actions; reassess changed-source findings against the current bound candidate.",
+                }
+        repair_evidence = self._run_pending_capability_evidence(stage, descriptor, packet)
+        if repair_evidence is not None:
+            evidence_dispatch_usage = deepcopy(repair_evidence["dispatch_usage"])
+            prior_plan_review = prior_plan_review or {}
+            prior_plan_review["pending_origin_actions"] = deepcopy(repair_evidence["origin_actions"])
+            prior_plan_review["evidence_dependencies"] = deepcopy(repair_evidence["dependencies"])
+            if len(repair_evidence["dependencies"]) == 1:
+                prior_plan_review["evidence_dependency"] = deepcopy(repair_evidence["dependencies"][0])
+            if repair_evidence["status"] != "accepted":
+                origin = repair_evidence["blocked_origin"]
+                held = {**deepcopy(origin), "packet": packet, "input_sha256": packet.get("input_sha256"),
+                        "evidence_origin_packet": deepcopy(origin["evidence_origin_packet"]),
+                        "prompt_revision": CAPABILITY_REPAIR_PANEL_PROMPT_REVISION,
+                        "repair_plan": None, "decision": "hold", "prior_plan_review": prior_plan_review,
+                        "repair_evidence": repair_evidence, "dispatch_usage": evidence_dispatch_usage,
+                        "plan_validation_error": "the requested Methods evidence dependency is not admitted"}
+                failure = repair_evidence["dependencies"][-1].get("model_failure")
+                if isinstance(failure, dict):
+                    held.update({"status": "unavailable", "decision": "defer", "model_failure": {
+                        "error": failure.get("error"), "failure": deepcopy(failure.get("failure"))}})
+                self.context.setdefault(stage["id"], {})["capability_repair_panel"] = deepcopy(held)
+                self._checkpoint(f"{stage['id']}:capability_repair_evidence", force=True)
+                return held
         if (isinstance(retained, dict)
                 and retained.get("schema_version") in CAPABILITY_REPAIR_PLAN_SCHEMA_VERSIONS
                 and retained.get("prompt_revision") == CAPABILITY_REPAIR_PANEL_PROMPT_REVISION
                 and retained.get("input_sha256") == packet.get("input_sha256")
                 and same_failure_identity
                 and retained_review_digest == current_review_digest
+                and (repair_evidence is None or (retained.get("repair_evidence") or {}).get("artifact_ref") == repair_evidence.get("artifact_ref"))
                 and self._capability_repair_plan_admitted(retained)):
             cached = deepcopy(retained)
             cached["dispatch_usage"] = {
@@ -10276,7 +11822,7 @@ class ComposerRunner:
                      or bool(retained_revisions))
             )
             if verifier_rejected_plan:
-                prior_plan_review = {
+                prior_plan_review = {**(prior_plan_review or {}),
                     "prior_plan": deepcopy(retained["repair_plan"]),
                     "verifier_decision": retained_verifier.get("decision"),
                     "verifier_rationale": str(retained_verifier.get("rationale") or ""),
@@ -10352,10 +11898,20 @@ class ComposerRunner:
         panel_stage = deepcopy(stage)
         panel_stage.update({
             "id": panel_id,
+            "_model_budget_owner_stage_id": stage["id"],
             "kind": "experiment",
-            "deadline_seconds": min(float(stage.get("deadline_seconds", 900)),
-                                     max(1.0, self._remaining())),
+            "deadline_seconds": self._stage_remaining(stage),
+            "attempt_deadline_at_epoch": (stage.get("attempt_deadline_at_epoch")
+                or self.stage_records.get(stage["id"], {}).get("attempt_deadline_at_epoch")),
         })
+        model_budget_owner = None
+        if isinstance(stage.get("quota"), dict):
+            owner_scope = self._stage_model_config(stage, {})["model_call_budget_scopes"][0]
+            model_budget_owner = {
+                "scope": owner_scope,
+                "attempt_id": self.stage_records.get(stage["id"], {}).get("attempt_id"),
+                "cycle": self.continuation_cycles if stage["id"] in self.reopened_stage_ids else 0,
+            }
         prior_evidence = packet.get("prior_attempt_result_evidence", {})
         prior_evidence = prior_evidence if isinstance(prior_evidence, dict) else {}
         prior_raw_data = prior_evidence.get("files", {}).get("raw_data", {})
@@ -10470,6 +12026,19 @@ class ComposerRunner:
             "panel_id": panel_id,
             "digest": packet["input_sha256"],
         }
+        if isinstance(repair_evidence, dict) and repair_evidence.get("status") == "accepted":
+            input_ref["ref"] = repair_evidence["artifact_ref"]
+        if model_budget_owner is not None:
+            owner_binding = {"schema_version": "capability-repair-budget-owner-1",
+                             "panel_stage_id": panel_id,
+                             "assignment_attempt_number": assignment_attempt,
+                             "model_budget_owner": deepcopy(model_budget_owner)}
+            if isinstance(repair_evidence, dict) and repair_evidence.get("status") == "accepted":
+                owner_binding["evidence_dependency_ref"] = repair_evidence["artifact_ref"]
+            owner_digest = hashlib.sha256(canonical_bytes(owner_binding)).hexdigest()
+            binding = self._publish(f"command/capability-repair-budget/{owner_digest}",
+                                    "note", owner_binding, "command.composer")
+            input_ref["ref"] = binding["artifact_ref"]
         active_roles = (["methodologist", *[
             role_id for role_id in reviewer_role_ids
             if role_id not in (cached_review_reports or {})
@@ -10543,7 +12112,17 @@ class ComposerRunner:
         plan_validation_error = "methods lead assignment is unavailable"
         repair_plan = None
         repair_plan_source = None
-        if isinstance(lead, dict) and reviewer_bundle.get("model_enabled") is True:
+        lead_report = None
+        def model_failure_report(reports):
+            return next((report for report in reports if isinstance(report, dict)
+                         and report.get("status") != "succeeded"
+                         and isinstance(report.get("failure"), dict)
+                         and report["failure"].get("kind") == "model_call"), None)
+        reviewer_failure = model_failure_report(reviewer_bundle.get("reports", []))
+        if reviewer_failure is not None:
+            plan_validation_error = str(reviewer_failure.get("error") or "required Methods role is unavailable")
+        if (isinstance(lead, dict) and reviewer_bundle.get("model_enabled") is True
+                and reviewer_failure is None):
             lead_assignment_row = deepcopy(lead)
             lead_assignment_row["_response_contract"] = "repair_adjudication"
             lead_assignment_row["_prompt"] = build_repair_adjudication_prompt(
@@ -10599,6 +12178,7 @@ class ComposerRunner:
         chief_result = {
             "status": "pre_execution_repair_plan",
             "decision": "repair" if repair_plan else "hold",
+            "prior_plan_review": deepcopy(prior_plan_review),
             "repair_adjudication": repair_plan or {
                 "status": "invalid_or_unavailable",
                 "reason": plan_validation_error,
@@ -10611,22 +12191,36 @@ class ComposerRunner:
             "prior_plan_review": deepcopy(prior_plan_review),
             "repair_adjudication": deepcopy(chief_result["repair_adjudication"]),
         }
-        verifier = self._run_specialist_verifier(
-            panel_stage, assignment, descriptor, bundle, chief_result,
-            stage_result=verification_result)
+        verifier = (None if model_failure_report(bundle.get("reports", [])) is not None
+                    else self._run_specialist_verifier(
+                        panel_stage, assignment, descriptor, bundle, chief_result,
+                        stage_result=verification_result))
         panel_usage = self._specialist_usage(bundle.get("reports", []))
         if isinstance(verifier, dict):
             verifier_usage = self._specialist_usage([verifier])
             for key in ("model_calls", "input_tokens", "output_tokens"):
                 panel_usage[key] = panel_usage.get(key, 0) + verifier_usage.get(key, 0)
         model_enabled = bundle.get("model_enabled") is True
-        panel_error = None if model_enabled else "capability repair panel has no configured model route"
-        panel_outcome = "completed" if model_enabled else "blocked"
+        failed_reports = [report for report in [*bundle.get("reports", []), verifier]
+                          if isinstance(report, dict) and report.get("status") != "succeeded"]
+        panel_error = (str(failed_reports[0].get("error") or "required Methods role is unavailable")
+                       if failed_reports else None)
+        if panel_error is None and lead_report is None:
+            panel_error = "methods lead assignment is unavailable"
+        if panel_error is None:
+            panel_error = self._capability_repair_verifier_unavailable_reason(verifier)
+        if not model_enabled:
+            panel_error = "capability repair panel has no configured model route"
+        panel_outcome = "blocked" if panel_error else "completed"
+        failed_model_report = model_failure_report(failed_reports)
+        model_failure = ({"error": failed_model_report.get("error"),
+                          "failure": deepcopy(failed_model_report["failure"])}
+                         if failed_model_report is not None else None)
         assignment_result = self.departments.finish_stage(
             panel_id, "experiment", attempt_number=assignment_attempt, outcome=panel_outcome,
             output_ref=None, usage=panel_usage, error=panel_error,
             actor="command.composer", specialist_results=bundle.get("by_role", {}),
-            verifier_result=verifier, failure_scope=None if model_enabled else "stage",
+            verifier_result=verifier, failure_scope="stage" if panel_error else None,
         )
         reports = []
         for report in bundle.get("reports", []):
@@ -10635,6 +12229,11 @@ class ComposerRunner:
                 "role_id": report.get("role_id"),
                 "assigned_role": report.get("assigned_role"),
                 "status": report.get("status"),
+                "error": report.get("error"),
+                "budget_admission": deepcopy(report.get("budget_admission")),
+                "failure": deepcopy(report.get("failure")),
+                "status_code": report.get("status_code"),
+                "retry_after_seconds": report.get("retry_after_seconds"),
                 "decision": response.get("decision", report.get("decision")),
                 "summary": str(response.get("summary", report.get("summary", ""))),
                 "findings": [str(item) for item in response.get("findings", [])]
@@ -10660,8 +12259,9 @@ class ComposerRunner:
         panel = {
             "schema_version": CAPABILITY_REPAIR_PANEL_SCHEMA_VERSION,
             "prompt_revision": CAPABILITY_REPAIR_PANEL_PROMPT_REVISION,
-            "status": "completed" if model_enabled else "unavailable",
-            "decision": panel_decision if model_enabled else "defer",
+            "status": "unavailable" if panel_error else "completed",
+            "decision": "defer" if panel_error else panel_decision,
+            "model_failure": model_failure,
             "repair_plan_source": repair_plan_source,
             "input_sha256": packet["input_sha256"],
             "science_input_sha256": packet.get("science_input_sha256"),
@@ -10669,12 +12269,14 @@ class ComposerRunner:
             "packet": packet,
             "repair_plan": repair_plan,
             "prior_plan_review": prior_plan_review,
+            "repair_evidence": deepcopy(repair_evidence),
             "plan_validation_error": plan_validation_error if not repair_plan else None,
             "diagnostic_hypotheses": list(dict.fromkeys(diagnostic_hypotheses))[:8],
             "proposed_changes": list(dict.fromkeys(proposed_changes))[:6],
             "acceptance_checks": deepcopy(
                 repair_plan["acceptance_checks"] if repair_plan
-                else packet["repair_contract"]["must_prove"]),
+                else [{"phase": "execution", "check": value}
+                      for value in packet["repair_contract"]["must_prove"]]),
             "repair_commands": deepcopy(
                 prior_context.get("repair_commands", [])
                 if isinstance(prior_context.get("repair_commands"), list) else []
@@ -10713,7 +12315,10 @@ class ComposerRunner:
                 "verifier_agent": assignment.get("verifier_agent"),
             },
             "usage": panel_usage,
-            "dispatch_usage": deepcopy(panel_usage),
+            "dispatch_usage": {**deepcopy(panel_usage), **{
+                key: panel_usage.get(key, 0) + evidence_dispatch_usage.get(key, 0)
+                for key in ("model_calls", "input_tokens", "output_tokens")}},
+            **({"model_budget_owner": model_budget_owner} if model_budget_owner else {}),
             "error": panel_error,
         }
         self.department_activity.append({
@@ -10729,6 +12334,8 @@ class ComposerRunner:
             "verifier_artifact_ref": assignment_result.get("verifier_artifact_ref"),
             "input_sha256": packet["input_sha256"],
         })
+        self._record_capability_repair_panel_usage(stage, panel)
+        self.context.setdefault(stage["id"], {})["capability_repair_panel"] = deepcopy(panel)
         self._checkpoint(f"{stage.get('id')}:capability_repair_panel", force=True)
         return panel
 
@@ -10837,7 +12444,24 @@ class ComposerRunner:
         if not isinstance(question, str) or not isinstance(domain, str):
             raise ValidationError("capability foundry requires topic domain and research question")
 
+        foundry_stage = next((item for item in self.workflow["stages"] if item["id"] == stage_id), None)
+        evidence_frontier = None
+        if foundry_stage is not None and foundry_stage["kind"] == "experiment":
+            descriptor = json.loads(Path(foundry_stage["config_path"]).read_text())
+            evidence_frontier = self._require_capability_evidence_before_authoring(foundry_stage, result, descriptor)
+            if (evidence_frontier is not None and isinstance(repair_context, dict)
+                    and repair_context.get("schema_version") in CAPABILITY_REPAIR_PLAN_SCHEMA_VERSIONS
+                    and (repair_context.get("repair_evidence") or {}).get("artifact_ref") != evidence_frontier["artifact_ref"]):
+                error = ModelWorkBlocked("Methods repair plan has not reviewed the admitted evidence frontier")
+                error.usage = deepcopy(evidence_frontier["dispatch_usage"])
+                error.repair_panel_usage = deepcopy(evidence_frontier["dispatch_usage"])
+                raise error
+
         registry_root = Path(configured["registry_root"])
+        evidence_binding = ({
+            "artifact_ref": evidence_frontier["artifact_ref"],
+            "sha256": self._read_verified_artifact_json(evidence_frontier["artifact_ref"])[1],
+        } if evidence_frontier is not None else None)
         existing = None
         superseded = None
         prior_capability = deepcopy(result.get("generated_capability"))
@@ -10853,6 +12477,10 @@ class ComposerRunner:
                 admission = json.loads((path.parent / "admission.json").read_text())
                 review = admission.get("adversarial_review") or {}
                 repair = admission.get("repair_provenance") or {}
+                if (evidence_binding is not None
+                        and (not isinstance(repair, dict)
+                             or repair.get("repair_evidence_frontier") != evidence_binding)):
+                    continue
                 if force_regenerate:
                     if (not isinstance(repair, dict)
                             or repair.get("kind") != "independent_repair"
@@ -10892,6 +12520,10 @@ class ComposerRunner:
 
         if existing is None:
             model = json.loads(Path(configured["model_config_path"]).read_text())
+            if evidence_frontier is not None:
+                available = self._foundry_model_call_budget(foundry_stage, repair_panel_usage={})
+                model_call_budget = available if model_call_budget is None else min(model_call_budget, available)
+            model = self._stage_model_config(foundry_stage, model)
             # The foundry sandbox limit bounds generated code execution. Model
             # calls follow the configured route timeout and are additionally
             # bounded by this mission and any explicit foundry call limit.
@@ -10933,12 +12565,16 @@ class ComposerRunner:
                 foundry_input["work_orders"] = executable_work_orders
             if source_data_manifest is not None:
                 foundry_input["source_data_manifest"] = source_data_manifest
+            evidence_projection = self._capability_evidence_projection(evidence_frontier)
             brief = {
                 "topic": {key: selected.get(key) for key in (
                     "id", "title", "domain", "research_question", "scope",
                     "disconfirmation_test", "resource_plan", "data_regime",
                     "research_form", "evidence_mode", "comparison_type",
                     "feasibility_plan")},
+                "repair_evidence_frontier": evidence_projection,
+                "repair_evidence_frontier_sha256": hashlib.sha256(canonical_bytes(evidence_projection)).hexdigest()
+                    if evidence_projection is not None else None,
                 "evidence_policy": {
                     "requires_source_data_manifest": requires_source_data,
                     "source_data_status": (
@@ -11038,20 +12674,29 @@ class ComposerRunner:
                     "revision": revision,
                 })
             try:
+                repair_provenance = self._capability_repair_provenance(repair_context)
+                if evidence_binding is not None:
+                    repair_provenance = {**(repair_provenance or {}),
+                                         "repair_evidence_frontier": evidence_binding}
                 outcome = foundry.generate(
                     json.dumps(brief, ensure_ascii=False, sort_keys=True),
                     test_input=foundry_input or None,
                     required_intent=required_intent,
                     work_cache=ModelWorkCache(self.store, self._publish, namespace="command/foundry-work"),
                     on_progress=lambda phase, state: self._foundry_progress(stage_id or selected["id"], phase, state),
-                    deadline=time.monotonic() + self._remaining(),
+                    deadline=time.monotonic() + (
+                        self._stage_remaining(stage_id)
+                        if stage_id is not None else self._remaining()),
                     model_call_budget=model_call_budget,
-                    repair_provenance=self._capability_repair_provenance(repair_context),
+                    repair_provenance=repair_provenance,
                 )
             except Exception as exc:
                 self._sync_foundry_usage()
                 setattr(exc, "foundry_usage", self._usage_delta(
                     self.foundry_usage, foundry_usage_before))
+                exc.usage = deepcopy(exc.foundry_usage)
+                exc.usage_includes_foundry = True
+                exc.usage_is_snapshot = False
                 raise
             self._sync_foundry_usage()
             existing = {
@@ -11204,6 +12849,22 @@ class ComposerRunner:
             if fresh_pre_execution_repair:
                 prior_experiment["review_status"] = "scientific_assignment_blocked"
             self.context[stage["id"]] = prior_experiment
+            panel_usage_delta = self._record_capability_repair_panel_usage(stage, repair_context)
+            prior_experiment["capability_repair_panel"] = deepcopy(repair_context)
+            if any(panel_usage_delta.values()):
+                self._checkpoint(f"{stage['id']}:capability_repair_usage_charged", force=True)
+            model_failure = repair_context.get("model_failure")
+            if isinstance(model_failure, dict):
+                fenced = ModelCallError.from_failure(
+                    model_failure.get("error") or "Methods panel model request unavailable",
+                    {**model_failure["failure"], "usage": {}})
+                fenced.capability_repair_panel_attempted = True
+                reviewed_packet = repair_context.get("packet")
+                if (isinstance(reviewed_packet, dict)
+                        and reviewed_packet.get("failure_lineage", {}).get("identity_verified") is True):
+                    fenced.repair_subject = deepcopy(reviewed_packet.get(
+                        "repair_subject_lineage", reviewed_packet.get("failure_lineage")))
+                raise fenced
             if (repair_context.get("schema_version") in CAPABILITY_REPAIR_PLAN_SCHEMA_VERSIONS
                     and not self._capability_repair_plan_admitted(repair_context)):
                 reason = repair_context.get("plan_validation_error")
@@ -11225,8 +12886,14 @@ class ComposerRunner:
                     f"plan was not admitted: {reason}"
                 )
                 blocked.capability_repair_panel_attempted = True
+                reviewed_packet = repair_context.get("packet")
+                if (isinstance(reviewed_packet, dict)
+                        and reviewed_packet.get("failure_lineage", {}).get("identity_verified") is True):
+                    blocked.repair_subject = deepcopy(reviewed_packet.get(
+                        "repair_subject_lineage", reviewed_packet.get("failure_lineage")))
                 self._merge_incremental_error_usage(
                     blocked, repair_context.get("dispatch_usage"))
+                blocked.repair_panel_usage = deepcopy(repair_context.get("dispatch_usage", {}))
                 raise blocked
         if needs_fresh_capability and self.workflow.get("capability_foundry_config_path"):
             if repair_panel_required and isinstance(prior_experiment, dict):
@@ -11252,6 +12919,7 @@ class ComposerRunner:
                     exc.capability_repair_panel_completed = True
                 self._merge_incremental_error_usage(
                     exc, repair_context.get("dispatch_usage"))
+                exc.repair_panel_usage = deepcopy(repair_context.get("dispatch_usage", {}))
                 raise
             generated = topic_context.get("generated_capability")
         elif self.workflow.get("capability_foundry_config_path"):
@@ -11405,6 +13073,31 @@ class ComposerRunner:
         packet["evidence_ids"] = list(dict.fromkeys(result_ids))
         packet["literature_evidence"] = []
         packet["reference_cards"] = []
+        packet.pop("survey_assessment", None)
+        packet.pop("survey_lineage", None)
+        return packet
+
+    def _attach_stage_survey_evidence(self, packet, stage):
+        """Use current accepted literature from this stage's dependency branch."""
+        from scisaurus.runtime.paper import load_paper_survey
+        from scisaurus.runtime.evidence import survey_evidence_projection
+        ancestors = self._stage_ancestor_ids(stage)
+        contexts = []
+        for candidate in self.workflow.get("stages", []):
+            if candidate["id"] not in ancestors or candidate.get("kind") != "survey":
+                continue
+            context = self.context.get(candidate["id"], {})
+            if not context.get("survey_ref") or not context.get("assessment_ref"):
+                continue
+            contexts.append(context)
+        if len(contexts) > 1:
+            raise StateError("scientific evidence input has ambiguous accepted survey ancestors")
+        for context in contexts:
+            survey = load_paper_survey({"survey_project_dir": context["project_dir"],
+                                       "survey_ref": context["survey_ref"],
+                                       "assessment_ref": context["assessment_ref"],
+                                       "document_type": "research_paper"}, require_eligible=False)
+            packet.update(survey_evidence_projection(survey))
         return packet
 
     def _downstream_paper_stage(self, stage_id):
@@ -11631,37 +13324,8 @@ class ComposerRunner:
             survey = load_paper_survey(paper_config,
                 require_eligible=not self._allows_provisional_progress())
         if isinstance(survey, dict):
-            cards, literature = [], []
-            for source_ref, source in list(survey.get("sources", {}).items())[:50]:
-                if not isinstance(source, dict):
-                    continue
-                work_id = source.get("work_id")
-                if not isinstance(work_id, str) or not work_id:
-                    continue
-                title = source.get("title") or work_id
-                abstract = source.get("abstract") or source.get("text") or ""
-                if not isinstance(abstract, str):
-                    abstract = str(abstract)
-                authors = source.get("authors") or "Authors not supplied by the survey."
-                if isinstance(authors, list):
-                    authors = ", ".join(
-                        item if isinstance(item, str) else str(item)
-                        for item in authors)
-                cards.append({
-                    "source_ref": source_ref, "work_id": work_id,
-                    "title": str(title), "authors": str(authors),
-                    "year": source.get("year"),
-                    "abstract": abstract[:1800],
-                    "representation": source.get("representation"),
-                    "reader_use": "Use this record only for the background and related-work context supported by the survey.",
-                })
-                literature.append({
-                    "id": f"literature-{len(literature)}", "work_id": work_id,
-                    "source_ref": source_ref, "quote": str(title),
-                    "relation": "context",
-                })
-            packet["reference_cards"] = cards
-            packet["literature_evidence"] = literature
+            from scisaurus.runtime.evidence import survey_evidence_projection
+            packet.update(survey_evidence_projection(survey))
 
         unit_ids = self._packet_unit_ids(packet)
         if not unit_ids:
@@ -11865,6 +13529,7 @@ class ComposerRunner:
         quota_recovery = quota_recovery if isinstance(quota_recovery, dict) else None
         if kind == "survey":
             config["project_id"] = str(Path(stage["project_dir"]).resolve())
+            config["work_orders"] = self._follow_up_projection(requests)
             survey = config.get("survey", {})
             search = survey.get("search", {})
             if quota_recovery is not None:
@@ -12066,14 +13731,67 @@ class ComposerRunner:
         return candidate
 
     @staticmethod
+    def _validate_survey_revalidation_scopes(request):
+        from scisaurus.runtime.resume import RESUME_SCOPES
+        scopes = request.get("resume_scopes")
+        allowed = RESUME_SCOPES & {
+            "mapping", "focused_review", "integrated_review", "gap_assessment", "follow_up"}
+        if (request.get("kind") != "literature_expansion"
+                or not isinstance(request.get("target_stage_id"), str)
+                or request.get("target_stage_kind") != "survey"
+                or not isinstance(scopes, list) or not scopes
+                or any(not isinstance(scope, str) or scope not in allowed for scope in scopes)
+                or len(scopes) != len(set(scopes))):
+            raise ValidationError("survey revalidation requires an addressed literature order and unique analysis/review resume_scopes")
+        return scopes
+
+    def _survey_revalidation_scopes(self, stage):
+        requests = [request for request in self._requests_for_stage(stage)
+                    if "resume_scopes" in request]
+        if not requests:
+            return []
+        if (stage.get("kind") != "survey" or stage["id"] not in self.reopened_stage_ids
+                or stage["id"] not in self.continuation_pending_stage_ids):
+            raise StateError("survey revalidation is not a pending admitted stage")
+        head = self.store.head(f"command/composer/continuation/{self.continuation_cycles}")
+        if head is None:
+            raise StateError("survey revalidation has no immutable continuation admission")
+        manifest, _, decision = self._read_verified_artifact_json(head["artifact_ref"])
+        if (manifest.get("author") != "command.composer"
+                or decision.get("action") != "continue_research"
+                or decision.get("cycle") != self.continuation_cycles
+                or stage["id"] not in decision.get("reopened_stage_ids", [])):
+            raise StateError("survey revalidation continuation admission is not owned by its current cycle")
+        scoped = self._scope_active_research_requests(requests)
+        if len(scoped) != len(requests):
+            raise StateError("survey revalidation request belongs to another topic")
+        scopes = []
+        for request in requests:
+            declared = self._validate_survey_revalidation_scopes(request)
+            signature = self._research_request_signature(request)
+            if not self._research_request_was_admitted(request) or not any(
+                    isinstance(item, dict) and item.get("id") == request.get("id")
+                    and self._research_request_signature(item) == signature
+                    and item.get("resume_scopes") == declared
+                    for item in decision.get("research_requests", [])):
+                raise StateError("survey revalidation request does not match its immutable admission")
+            scopes.extend(scope for scope in declared if scope not in scopes)
+        return scopes
+
+    @staticmethod
     def _survey_resume_scope(prior, *, stage_context=None):
         """Resume from the last accepted milestone, subject to fresh gate checks."""
         context = stage_context if isinstance(stage_context, dict) else {}
         if (context.get("review_status") == "survey_integrity_repair"
                 and context.get("resume_scope") == "integrated_review"):
             return "integrated_review"
+        if (prior.get("survey_current") is True and prior.get("assessment_current") is True
+                and prior.get("work_orders") and not prior.get("follow_up_result")):
+            return "follow_up"
         if prior.get("survey_current") is True and prior.get("survey_ref"):
             return "gap_assessment"
+        if isinstance(prior.get("coverage"), dict) and prior["coverage"].get("map_entry_count", 0) > 0:
+            return "operations"
         return "focused_review"
 
     @staticmethod
@@ -12456,6 +14174,7 @@ class ComposerRunner:
                 }
             if live:
                 record["specialist_live"] = live
+                record["active_agents"] = self._active_specialist_roles(live)
         active_blockers = self._active_blockers()
         blocker_projection = {
             "active_blockers": active_blockers,
@@ -12493,6 +14212,8 @@ class ComposerRunner:
             "feedback": deepcopy(self.feedback),
             "blockers": deepcopy(self.blockers), **blocker_projection,
             "usage": deepcopy(self.usage),
+            "stage_usage_totals": deepcopy(self.stage_usage_totals),
+            "pending_stage_usage": deepcopy(self.pending_stage_usage),
             "foundry_usage": deepcopy(self.foundry_usage),
             "deadline_decisions": deepcopy(self.deadline_decisions),
             "organization": deepcopy(self.organization_snapshot),
@@ -12501,6 +14222,7 @@ class ComposerRunner:
             "topic_history_entries": len(self.topic_history.get("entries", [])),
         }
         with self._progress_lock:
+            self._overlay_child_progress(state)
             self._progress_snapshot = deepcopy(state)
         self._publish(f"command/composer/checkpoints/{len(self.feedback) + len(self.stage_records) + 1}",
                       "progress_checkpoint", state, "command.composer")
@@ -12509,13 +14231,14 @@ class ComposerRunner:
             output.mkdir(parents=True, exist_ok=True)
             _atomic_write_bytes(output / "progress.json", canonical_bytes(state))
         self.next_checkpoint = now + float(self.workflow["time_policy"]["checkpoint_seconds"])
-        self.on_progress({"phase": phase, "elapsed_seconds": round(state["elapsed_seconds"], 2),
+        self.on_progress({"phase": state["phase"], "elapsed_seconds": round(state["elapsed_seconds"], 2),
                           "remaining_seconds": round(state["remaining_seconds"], 2),
                           "stages": deepcopy(state.get("stages", {})),
                           "blockers": deepcopy(state.get("active_blockers", [])),
                           "active_blockers": deepcopy(state.get("active_blockers", [])),
                           "blocker_counts": deepcopy(state.get("blocker_counts", {})),
                           "usage": deepcopy(state.get("usage", {})),
+                          "observed_usage": deepcopy(state.get("observed_usage", state.get("usage", {}))),
                           "foundry_usage": deepcopy(state.get("foundry_usage", {})),
                           "organization": deepcopy(state["organization"])})
 
@@ -12538,14 +14261,18 @@ class ComposerRunner:
             if epoch is not None and epoch != self._live_progress_epoch:
                 return
             state = deepcopy(self._progress_snapshot)
+            state["usage"] = deepcopy(self.usage)
             state.setdefault("organization", deepcopy(self.organization_snapshot))
             state.update({
                 "schema_version": "composer-checkpoint-1", "workflow_id": self.workflow["id"],
                 "run_id": self.run_id,
-                "phase": phase, "elapsed_seconds": max(0.0, now - self.started),
+                "phase": (state.get("phase") if phase.endswith(":running")
+                          and state.get("phase") == phase.split(":", 1)[0] + ":specialists" else phase),
+                "elapsed_seconds": max(0.0, now - self.started),
                 "remaining_seconds": max(0.0, remaining_snapshot),
                 "started_at_epoch": self.started_epoch, "deadline_at_epoch": self.deadline_epoch,
             })
+            self._overlay_child_progress(state)
             output = self.root / "output"
             output.mkdir(parents=True, exist_ok=True)
             _atomic_write_bytes(output / "progress.json", canonical_bytes(state))
@@ -12553,13 +14280,14 @@ class ComposerRunner:
             # base as well. The next specialist event must build on the latest
             # live state instead of restoring the last stage-boundary snapshot.
             self._progress_snapshot = deepcopy(state)
-        self.on_progress({"phase": phase, "elapsed_seconds": round(state["elapsed_seconds"], 2),
+        self.on_progress({"phase": state["phase"], "elapsed_seconds": round(state["elapsed_seconds"], 2),
                           "remaining_seconds": round(state["remaining_seconds"], 2),
                           "stages": deepcopy(state.get("stages", {})),
                           "blockers": deepcopy(state.get("active_blockers", [])),
                           "active_blockers": deepcopy(state.get("active_blockers", [])),
                           "blocker_counts": deepcopy(state.get("blocker_counts", {})),
                           "usage": deepcopy(state.get("usage", {})),
+                          "observed_usage": deepcopy(state.get("observed_usage", state.get("usage", {}))),
                           "foundry_usage": deepcopy(state.get("foundry_usage", {})),
                           "organization": deepcopy(state["organization"])})
 
@@ -12608,7 +14336,10 @@ class ComposerRunner:
     @classmethod
     def _checkpoint_advances_terminal_state(cls, checkpoint, terminal):
         """Recognize an in-flight checkpoint that supersedes a stale final report."""
-        if not isinstance(checkpoint, dict) or checkpoint.get("status") != "running":
+        if (not isinstance(checkpoint, dict)
+                or not (checkpoint.get("status") == "running"
+                        or checkpoint.get("status") == "paused"
+                        and cls._is_process_interruption_state(checkpoint))):
             return False
         if not isinstance(terminal, dict):
             return True
@@ -12665,6 +14396,13 @@ class ComposerRunner:
         if state.get("phase") == "paused_process_interruption":
             return True
         if state.get("stop_reason") == "process_interrupted":
+            return True
+        blockers = state.get("blockers")
+        if isinstance(blockers, list) and any(
+                isinstance(item, dict)
+                and item.get("stage_id") == "workflow"
+                and item.get("stop_reason") == "process_interrupted"
+                for item in blockers):
             return True
         interim = state.get("interim_report")
         return (isinstance(interim, dict)
@@ -12825,7 +14563,8 @@ class ComposerRunner:
         # bad topic branch is quarantined. Never refund real provider usage or
         # extend a deadline by restoring an older snapshot.
         for field in (
-            "usage", "foundry_usage", "deadline_at_epoch", "deadline_seconds",
+            "usage", "stage_usage_totals",
+            "foundry_usage", "deadline_at_epoch", "deadline_seconds",
             "started_at_epoch", "elapsed_seconds", "remaining_seconds",
             "deadline_extensions", "deadline_decisions", "continuation_cycles",
             "continuation_budget_baseline", "continuation_budget_used",
@@ -12835,6 +14574,8 @@ class ComposerRunner:
             if field in newer:
                 restored[field] = self._merge_cumulative_usage(
                     restored.get(field), newer[field])
+        if "pending_stage_usage" in newer:
+            restored["pending_stage_usage"] = deepcopy(newer["pending_stage_usage"])
         restored["status"] = "running"
         restored["phase"] = "resume:unjustified_topic_refinement_rejected"
         if (type(older.get("remaining_seconds")) in (int, float)
@@ -12928,6 +14669,8 @@ class ComposerRunner:
             self.feedback = body.get("feedback", [])
             self.blockers = body.get("blockers", [])
             self.usage = body.get("usage", self.usage)
+            self.stage_usage_totals = body.get("stage_usage_totals", {})
+            self.pending_stage_usage = body.get("pending_stage_usage", {})
             self.foundry_usage = body.get("foundry_usage", {})
             self.deadline_decisions = body.get("deadline_decisions", [])
             self.agenda_decisions = body.get("agenda_decisions", [])
@@ -13009,6 +14752,8 @@ class ComposerRunner:
             self.feedback = live_checkpoint.get("feedback", self.feedback)
             self.blockers = live_checkpoint.get("blockers", self.blockers)
             self.usage = live_checkpoint.get("usage", self.usage)
+            self.stage_usage_totals = live_checkpoint.get("stage_usage_totals", {})
+            self.pending_stage_usage = live_checkpoint.get("pending_stage_usage", {})
             self.foundry_usage = live_checkpoint.get("foundry_usage", {})
             self.deadline_decisions = live_checkpoint.get("deadline_decisions", self.deadline_decisions)
             self.agenda_decisions = live_checkpoint.get(
@@ -13068,6 +14813,8 @@ class ComposerRunner:
                 # previously recorded extension on the next resume.
                 wall_remaining = self.deadline_epoch - time.time()
                 self.deadline = self.clock() + wall_remaining
+        self._reconcile_repair_panel_invoices()
+        self._settle_pending_stage_usage()
         if self.status in {"completed", "candidate_needs_review", "research_expansion_required", "review_rejected",
                            "blocked", "paused"}:
             # A resumed workflow must explicitly continue from a non-terminal
@@ -13550,6 +15297,7 @@ class ComposerRunner:
         was observed; an unobserved result stays ``unknown`` and is retried
         under a new task identity while nested ledgers settle their own calls.
         """
+        workspace_costs = self._reconcile_producer_workspace_costs()
         reconciled = []
         for stage_id, record in list(self.stage_records.items()):
             if (not isinstance(record, dict)
@@ -13558,6 +15306,15 @@ class ComposerRunner:
                 continue
             attempt_id = record["attempt_id"]
             task_id = record.get("task_id")
+            stage = next(item for item in self.workflow["stages"] if item["id"] == stage_id)
+            if stage.get("kind") == "survey":
+                scopes = self._survey_revalidation_scopes(stage)
+                if scopes:
+                    _, milestone = self._survey_revalidation_resume_plan(
+                        {**stage, "project_dir": record.get("project_dir", stage["project_dir"])}, scopes)
+                    if milestone is not None:
+                        record["completed_mapping"] = milestone
+            self._reconcile_interrupted_specialist_payments(stage, record)
             self._reconcile_interrupted_attempt(attempt_id)
             history = self._archive_stage_attempt(
                 record,
@@ -13585,6 +15342,12 @@ class ComposerRunner:
                 "outcome": outcome,
                 "next_action": "dispatch a fresh aggregate task while preserving nested run checkpoints",
             })
+        if workspace_costs:
+            self.department_activity.append({
+                "cycle": self.continuation_cycles,
+                "action": "settle_retained_producer_workspace_costs",
+                "workspaces": workspace_costs,
+            })
         if reconciled:
             self.department_activity.append({
                 "cycle": self.continuation_cycles,
@@ -13593,6 +15356,166 @@ class ComposerRunner:
                 "model_calls": 0,
             })
             self._checkpoint("resume:reconcile_interrupted_stage_attempts", force=True)
+        elif workspace_costs:
+            self._checkpoint("resume:settle_producer_workspace_costs", force=True)
+        return reconciled
+
+    @staticmethod
+    def _producer_checkpoint_evidence(project, snapshot):
+        run_id, number = snapshot.get("run_id"), snapshot.get("checkpoint")
+        if not isinstance(run_id, str) or type(number) is not int or number <= 0:
+            return None
+        try:
+            with closing(sqlite3.connect((Path(project) / "state/control.sqlite").resolve().as_uri()
+                                         + "?mode=ro", uri=True, timeout=2.0)) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only=ON")
+                store = ArtifactStore(SimpleNamespace(dir=str(Path(project).resolve()), _conn=connection))
+                record = store.head(f"command/progress/{run_id}-{number}")
+                if record is None:
+                    return None
+                raw = store.read_body(record["body_hash"])
+                body = json.loads(raw)
+                actual = body.get("cumulative_usage", {}).get("actual")
+                if (record.get("author") != "command.controller" or record.get("artifact_type") != "progress_checkpoint"
+                        or hashlib.sha256(raw).hexdigest() != record["body_hash"]
+                        or actual != snapshot.get("cumulative_usage")
+                        or body.get("next_action", {}).get("decision") != snapshot.get("phase")):
+                    return None
+                return {"ref": record["artifact_ref"], "body_sha256": record["body_hash"],
+                        "created_at": record["created_at"], "run_id": run_id, "actual_usage": actual}
+        except (sqlite3.Error, OSError, KeyError, TypeError, ValueError, NotFoundError):
+            return None
+
+    def _survey_revalidation_resume_plan(self, stage, declared_scopes):
+        proof = None
+        record = self.stage_records.get(stage["id"], {})
+        retained_mapping = record.get("completed_mapping")
+        observed = record.get("child_progress") or {}
+        if isinstance(retained_mapping, dict):
+            original = retained_mapping.get("producer_checkpoint") or {}
+            try:
+                with closing(sqlite3.connect((Path(stage["project_dir"]) / "state/control.sqlite").resolve().as_uri()
+                                             + "?mode=ro", uri=True, timeout=2.0)) as connection:
+                    connection.row_factory = sqlite3.Row
+                    connection.execute("PRAGMA query_only=ON")
+                    store = ArtifactStore(SimpleNamespace(dir=str(Path(stage["project_dir"]).resolve()), _conn=connection))
+                    saved = store.get(original["ref"])
+                    raw = store.read_body(saved["body_hash"])
+                    match = re.fullmatch(r"artifact:command/progress/" + re.escape(original["run_id"]) + r"-([1-9][0-9]*)@[1-9][0-9]*", original["ref"])
+                    if saved["body_hash"] != original["body_sha256"] or hashlib.sha256(raw).hexdigest() != saved["body_hash"] or match is None:
+                        raise ValueError("retained mapping checkpoint is not exact")
+                    value = json.loads(raw)
+                    observed = {"run_id": original["run_id"], "checkpoint": int(match.group(1)),
+                                "phase": value["next_action"]["decision"],
+                                "cumulative_usage": value["cumulative_usage"]["actual"]}
+            except (sqlite3.Error, NotFoundError, KeyError, TypeError, ValueError, OSError):
+                return declared_scopes, None
+        expected_run_id = observed.get("run_id") or (record.get("producer_checkpoint") or {}).get("run_id")
+        if type(observed.get("checkpoint")) is not int and isinstance(expected_run_id, str):
+            captured = self._read_json_object(Path(stage["project_dir"]) / "output/progress.json") or {}
+            observed = captured if captured.get("run_id") == expected_run_id else {}
+        if "mapping" not in declared_scopes or len(declared_scopes) < 2 or not observed:
+            return declared_scopes, proof
+        evidence = self._producer_checkpoint_evidence(stage["project_dir"], observed)
+        if evidence is None:
+            return declared_scopes, proof
+        attempt_id = (retained_mapping.get("aggregate_attempt_id") if isinstance(retained_mapping, dict)
+                      else record.get("attempt_id") or record.get("last_attempt_id"))
+        try:
+            attempt = self.tasks.get_attempt(attempt_id)
+            payload = attempt.get("payload") or {}
+            with closing(sqlite3.connect((Path(stage["project_dir"]) / "state/control.sqlite").resolve().as_uri()
+                                         + "?mode=ro", uri=True, timeout=2.0)) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only=ON")
+                store = ArtifactStore(SimpleNamespace(dir=str(Path(stage["project_dir"]).resolve()), _conn=connection))
+                config = store.head("inputs/run-config")
+                row = connection.execute("SELECT artifact_ref FROM artifacts WHERE logical_id LIKE 'command/resume-sessions/%' "
+                                         "AND created_at <= ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                                         (evidence["created_at"],)).fetchone()
+                session = (store.get(retained_mapping["resume_ref"]) if isinstance(retained_mapping, dict)
+                           else store.get(row["artifact_ref"]) if row else None)
+                mapping = (store.get(retained_mapping["map_ref"]) if isinstance(retained_mapping, dict)
+                           else store.head("kb/literature-map"))
+                if isinstance(retained_mapping, dict) and (
+                        config is None or session is None or mapping is None
+                        or retained_mapping.get("config_ref") != config["artifact_ref"]
+                        or retained_mapping.get("config_sha256") != config["body_hash"]
+                        or retained_mapping.get("map_sha256") != mapping["body_hash"]
+                        or retained_mapping.get("resume_sha256") != session["body_hash"]):
+                    return declared_scopes, None
+                if (payload.get("stage_id") != stage["id"] or payload.get("model_budget_cycle") != self.continuation_cycles
+                        or payload.get("project_dir") != str(Path(stage["project_dir"]).resolve())
+                        or config is None or session is None or mapping is None
+                        or not attempt["created_at"] <= session["created_at"] <= mapping["created_at"] <= evidence["created_at"]
+                        or mapping.get("author") != "research.literature-mapper"):
+                    return declared_scopes, proof
+                def body(item):
+                    raw = store.read_body(item["body_hash"])
+                    if hashlib.sha256(raw).hexdigest() != item["body_hash"]:
+                        raise ValueError("milestone body hash mismatch")
+                    return json.loads(raw)
+                resumed, mapped, configured = body(session), body(mapping), body(config)
+                if (resumed.get("config_ref") != config["artifact_ref"] or "mapping" not in resumed.get("reopened_scopes", [])
+                        or mapped.get("question") != configured.get("survey", {}).get("question")
+                        or not isinstance(mapped.get("entry_refs"), list) or not mapped["entry_refs"]):
+                    return declared_scopes, proof
+                for ref in [*mapped["entry_refs"], *mapped.get("relationship_refs", [])]:
+                    item = store.get(ref)
+                    body(item)
+                proof = {"phase": "mapping", "map_ref": mapping["artifact_ref"], "map_sha256": mapping["body_hash"],
+                         "resume_ref": session["artifact_ref"], "resume_sha256": session["body_hash"],
+                         "config_ref": config["artifact_ref"], "config_sha256": config["body_hash"],
+                         "producer_checkpoint": evidence, "aggregate_attempt_id": attempt_id}
+                return [scope for scope in declared_scopes if scope != "mapping"], proof
+        except (sqlite3.Error, NotFoundError, KeyError, TypeError, ValueError, OSError):
+            return declared_scopes, proof
+
+    def _reconcile_producer_workspace_costs(self):
+        """Settle observed child costs before choosing another retained frontier."""
+        reconciled, seen = [], set()
+        for stage in self.workflow.get("stages", []):
+            if stage.get("kind") not in {"survey", "experiment"}:
+                continue
+            record = self.stage_records.get(stage["id"], {})
+            candidates = [record, *record.get("attempts", [])] if isinstance(record, dict) else []
+            for candidate in candidates:
+                if not isinstance(candidate, dict) or not isinstance(candidate.get("project_dir"), str):
+                    continue
+                project = Path(candidate["project_dir"]).resolve()
+                if project in seen:
+                    continue
+                seen.add(project)
+                totals = {}
+                for filename in ("run.json", "progress.json"):
+                    snapshot = self._read_json_object(project / "output" / filename)
+                    if not isinstance(snapshot, dict):
+                        continue
+                    if filename == "progress.json":
+                        evidence = self._producer_checkpoint_evidence(project, snapshot)
+                        if evidence is None:
+                            continue
+                        usage = evidence["actual_usage"]
+                        if candidate is record:
+                            record["producer_checkpoint"] = evidence
+                    else:
+                        usage = (snapshot.get("usage") or {}).get("cumulative_usage")
+                    if not isinstance(usage, dict):
+                        continue
+                    for key, amount in usage.items():
+                        if type(amount) in (int, float) and math.isfinite(amount) and amount >= 0:
+                            totals[key] = max(totals.get(key, 0), amount)
+                if not totals:
+                    continue
+                _, baseline = self._stage_usage_baseline(project)
+                if not any(totals.get(key, 0) > baseline.get(key, 0) for key in self.usage):
+                    continue
+                delta = self._incremental_stage_usage(
+                    {"id": stage["id"], "project_dir": str(project)}, {"cumulative_usage": totals})
+                self._settle_pending_stage_usage(stage["id"])
+                reconciled.append({"stage_id": stage["id"], "project_dir": str(project),
+                                   "observed_totals": totals, "settled_delta": delta})
         return reconciled
 
     def _reconcile_orphaned_duplicate_stage_attempts(self):
@@ -13972,6 +15895,25 @@ class ComposerRunner:
                 value = usage.get(key, 0)
                 if type(value) in (int, float) and math.isfinite(value) and value >= 0:
                     totals[key] += value
+        unfinished_projects = {
+            item["project_dir"] for item in attempts if isinstance(item, dict)
+            and not isinstance(item.get("usage"), dict)
+            and isinstance(item.get("project_dir"), str)
+        } if isinstance(attempts, list) else set()
+        for project_dir in unfinished_projects:
+            progress_path = Path(project_dir) / "output" / "progress.json"
+            if not progress_path.is_file():
+                continue
+            child = json.loads(progress_path.read_text())
+            quantities = child.get("cumulative_usage")
+            if not isinstance(quantities, dict) or child.get("project_dir") != str(Path(project_dir).resolve()):
+                continue
+            _, baseline = self._stage_usage_baseline(project_dir)
+            for key in totals:
+                quantity = quantities.get(key, 0)
+                if type(quantity) in (int, float) and math.isfinite(quantity) and quantity >= 0:
+                    totals[key] += max(0, quantity - baseline.get(key, 0))
+            observed = True
         # A reopened stage has an isolated quota envelope for the admitted
         # continuation cycle.  Its top-level ``usage`` is the previous
         # attempt's snapshot; using it as a fallback before the new cycle has
@@ -13984,6 +15926,55 @@ class ComposerRunner:
                 value = record["usage"].get(key, 0)
                 if type(value) in (int, float) and math.isfinite(value) and value >= 0:
                     totals[key] += value
+        stage = next((item for item in self.workflow.get("stages", [])
+                      if isinstance(item, dict) and item.get("id") == stage_id), {})
+        quota = stage.get("quota")
+        ledger = self.root / "state" / "stage-model-call-budget.sqlite"
+        if isinstance(quota, dict) and ledger.is_file():
+            cycle = active_cycle if stage_id in self.reopened_stage_ids else 0
+            with closing(sqlite3.connect(ledger.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+                row = connection.execute("SELECT max_calls, used_calls FROM model_call_budgets WHERE budget_key=?",
+                    (f"stage:{stage_id}:cycle:{cycle}",)).fetchone()
+            if row is not None:
+                if row[0] != quota["max_model_calls"]:
+                    raise ValidationError("persisted stage model-call limit changed")
+                # Registered scopes already include legacy seed floors and every
+                # physical dispatch. Lifetime settlement deltas can contain
+                # other cycles and must not be promoted into this allowance.
+                totals["model_calls"] = row[1]
+            scope = {"model_call_budget_path": str(ledger.resolve()),
+                     "model_call_budget_key": f"stage:{stage_id}:cycle:{cycle}",
+                     "model_call_budget_limit": quota["max_model_calls"],
+                     "model_token_budget_limits": {"input_tokens": quota["max_input_tokens"],
+                                                   "output_tokens": quota["max_output_tokens"]}}
+            for key, quantity in model_token_budget_usage(scope).items():
+                totals[key] = quantity
+            contributions = self._legacy_stage_model_invoices(stage_id, scope)
+            if contributions:
+                with closing(sqlite3.connect(ledger.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+                    totals.update(self._legacy_stage_budget_projection(connection, scope, contributions))
+        if stage_kind == "survey":
+            from scisaurus.runtime.literature import openalex_request_usage
+            projects = {item["project_dir"] for item in attempts if isinstance(item, dict)
+                        and isinstance(item.get("project_dir"), str)}
+            if isinstance(record.get("project_dir"), str):
+                projects.add(record["project_dir"])
+            provider_total, provider_observed = 0, False
+            cycle = active_cycle if stage_id in self.reopened_stage_ids else 0
+            for project_dir in projects:
+                project = Path(project_dir)
+                database = project / "state" / "control.sqlite"
+                if not database.is_file():
+                    continue
+                with closing(sqlite3.connect(database.resolve().as_uri()+"?mode=ro", uri=True)) as connection:
+                    usage = openalex_request_usage(connection,
+                        lambda digest: (project / "objects" / "sha256" / digest).read_bytes(),
+                        owner_key=f"stage:{stage_id}:cycle:{cycle}")
+                if usage["owner_registered"]:
+                    provider_observed = True
+                    provider_total += usage["openalex_requests"]
+            if provider_observed:
+                totals["openalex_requests"] = provider_total
         return totals
 
     def _stage_quota_error(self, stage):
@@ -13999,9 +15990,9 @@ class ComposerRunner:
             "max_openalex_requests": ("openalex_requests", quota["max_openalex_requests"]),
         }
         for dimension, (usage_key, limit) in dimensions.items():
-            if usage[usage_key] > limit:
+            if usage[usage_key] > limit or (limit > 0 and usage[usage_key] == limit):
                 error = QuotaExceededError(
-                    f"stage {stage['id']} quota exhausted: {usage_key}={usage[usage_key]} > {limit}",
+                    f"stage {stage['id']} quota exhausted: {usage_key}={usage[usage_key]} >= {limit}",
                     dimension=dimension, limit=limit, observed=usage[usage_key], usage=usage,
                 )
                 error.usage_is_snapshot = True
@@ -14026,6 +16017,14 @@ class ComposerRunner:
             return False
         if not isinstance(quota_error, QuotaExceededError):
             return False
+        admission = getattr(quota_error, "budget_admission", None)
+        if admission is not None:
+            cycle = self.continuation_cycles if stage["id"] in self.reopened_stage_ids else 0
+            quota = stage.get("quota") or {}
+            if (admission.get("path") != str((self.root/"state/stage-model-call-budget.sqlite").resolve())
+                    or admission.get("key") != f"stage:{stage['id']}:cycle:{cycle}"
+                    or quota.get(quota_error.dimension) != admission.get("limit")):
+                return False
         if stage.get("kind") == "topic_discovery":
             # A combined topic stage can include specialist and verifier calls
             # in addition to the topic runner's own envelope. If that aggregate
@@ -14190,6 +16189,7 @@ class ComposerRunner:
                 "limit": getattr(quota_error, "limit", None),
                 "observed": getattr(quota_error, "observed", None),
                 "reason": "the local stage allocation was consumed before the decisive gate completed",
+                **({"budget_admission": deepcopy(admission)} if admission is not None else {}),
             },
             "research_expansion_requests": [],
             "research_requests": [],
@@ -14318,6 +16318,394 @@ class ComposerRunner:
             self._checkpoint("resume:stale_stage_quota_blockers_reconciled", force=True)
         return False
 
+    def _survey_attempt_was_accepted(self, stage_id, attempt, run):
+        rows = self.departments._assignment_task_rows(
+            stage_id=stage_id, attempt_number=attempt.get("attempt_number"))
+        verifier = next((item for item in rows if item.get("assignment_phase") == "verifier"), None)
+        if verifier is None:
+            return False
+        try:
+            verdict_record = self.store.head(verifier["assignment_logical_id"])
+            verdict = json.loads(self.store.read_body(verdict_record["body_hash"]))
+            chief_record = self.store.get(verdict["chief_synthesis_ref"])
+            chief = json.loads(self.store.read_body(chief_record["body_hash"]))
+            execution_record = self.store.get(verdict["verifier_execution_artifact_ref"])
+            execution = json.loads(self.store.read_body(execution_record["body_hash"]))
+            report = execution["report"]
+            reviewed = execution["chief_result"]
+            if (not all(isinstance(body, dict) for body in (chief, verdict, execution, report, reviewed))
+                    or not isinstance(report.get("response"), dict)):
+                return False
+            identity = {"stage_id": stage_id, "stage_kind": "survey",
+                        "attempt_number": attempt["attempt_number"]}
+            return (
+                all(all(body.get(key) == value for key, value in identity.items())
+                    for body in (chief, verdict, execution))
+                and chief.get("schema_version") == "department-chief-synthesis-1"
+                and chief.get("outcome") in {"completed", "accepted"}
+                and verdict.get("schema_version") == "department-adversarial-verdict-1"
+                and verdict.get("verdict") == "accepted"
+                and verdict.get("attempt_state") == "succeeded"
+                and verdict.get("task_state") == "completed"
+                and verdict.get("independence_check") is True
+                and execution.get("schema_version") == "specialist-verifier-execution-1"
+                and report.get("status") == "succeeded"
+                and report.get("response", {}).get("decision") == "accept"
+                and canonical_bytes(report.get("response")) == canonical_bytes(verdict.get("verifier_report"))
+                and reviewed.get("survey_ref") == run["survey_ref"]
+                and reviewed.get("assessment_ref") == run["assessment_ref"]
+                and (self._survey_revalidation_reference(stage_id, run) is None
+                     or reviewed.get("revalidation") == self._survey_revalidation_reference(stage_id, run))
+                and (not isinstance(run.get("follow_up_result"), dict)
+                     or reviewed.get("follow_up_result") == run["follow_up_result"])
+            )
+        except (KeyError, TypeError, ValueError, OSError, NotFoundError, ValidationError):
+            return False
+
+    def _survey_revalidation_reference(self, stage_id, run):
+        if isinstance(run.get("revalidation"), dict):
+            return run["revalidation"]
+        run_id = run.get("run_id")
+        if not isinstance(run_id, str):
+            return None
+        head = self.store.head(f"command/composer/survey-revalidations/{stage_id}/{run_id}")
+        return {"ref": head["artifact_ref"], "body_sha256": head["body_hash"]} if head else None
+
+    def _survey_request_was_fulfilled(self, project_dir, run, request):
+        if "resume_scopes" not in request:
+            return self._survey_work_order_was_fulfilled(project_dir, run, request)
+        try:
+            scopes = self._validate_survey_revalidation_scopes(request)
+            receipt = self._survey_revalidation_reference(request["target_stage_id"], run) or {}
+            record, _, body = self._read_verified_artifact_json(receipt["ref"])
+            if (record.get("author") != "command.composer" or record["body_hash"] != receipt.get("body_sha256")
+                    or body.get("schema_version") != "composer-survey-revalidation-1"
+                    or body.get("project_dir") != str(Path(project_dir).resolve())
+                    or body.get("stage_id") != request["target_stage_id"]
+                    or request.get("id") not in body.get("request_ids", [])
+                    or self._research_request_signature(request) not in body.get("request_signatures", [])
+                    or not set(scopes).issubset(body.get("declared_scopes", body.get("reopened_scopes", [])))
+                    or any(body.get(key) != run.get(key) for key in ("run_id", "survey_ref", "assessment_ref"))):
+                return False
+            admission, _, decision = self._read_verified_artifact_json(body["continuation_ref"])
+            if (admission.get("author") != "command.composer"
+                    or decision.get("action") != "continue_research"
+                    or decision.get("cycle") != body.get("cycle")
+                    or body["stage_id"] not in decision.get("reopened_stage_ids", [])
+                    or not any(isinstance(item, dict) and item.get("id") == request.get("id")
+                               and self._research_request_signature(item) == self._research_request_signature(request)
+                               for item in decision.get("research_requests", []))):
+                return False
+            with closing(sqlite3.connect((Path(project_dir) / "state/control.sqlite").resolve().as_uri()
+                                         + "?mode=ro", uri=True, timeout=2.0)) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only=ON")
+                store = ArtifactStore(SimpleNamespace(dir=str(Path(project_dir).resolve()), _conn=connection))
+                for key, hash_key in (("config_ref", "config_sha256"), ("resume_ref", "resume_sha256"),
+                                      ("result_ref", "result_sha256"), ("survey_ref", "survey_sha256"),
+                                      ("assessment_ref", "assessment_sha256")):
+                    artifact = store.get(body[key])
+                    raw = store.read_body(artifact["body_hash"])
+                    if hashlib.sha256(raw).hexdigest() != body[hash_key] or artifact["body_hash"] != body[hash_key]:
+                        return False
+                skipped = set(body.get("declared_scopes", body["reopened_scopes"])) - set(body["reopened_scopes"])
+                if skipped:
+                    milestone = body.get("completed_mapping") or {}
+                    if skipped != {"mapping"} or milestone.get("phase") != "mapping":
+                        return False
+                    for key in ("map", "resume", "config"):
+                        artifact = store.get(milestone[key + "_ref"])
+                        raw = store.read_body(artifact["body_hash"])
+                        if hashlib.sha256(raw).hexdigest() != milestone[key + "_sha256"]:
+                            return False
+                    if milestone["config_ref"] != body["config_ref"]:
+                        return False
+                    checkpoint = milestone.get("producer_checkpoint") or {}
+                    artifact = store.get(checkpoint["ref"])
+                    if artifact["body_hash"] != checkpoint.get("body_sha256"):
+                        return False
+                    owner = self.tasks.get_attempt(milestone["aggregate_attempt_id"])
+                    mapped_record, original_session = store.get(milestone["map_ref"]), store.get(milestone["resume_ref"])
+                    mapped = json.loads(store.read_body(milestone["map_sha256"]))
+                    resumed_mapping = json.loads(store.read_body(milestone["resume_sha256"]))
+                    configured = json.loads(store.read_body(milestone["config_sha256"]))
+                    checkpoint_record = store.get(checkpoint["ref"])
+                    checkpoint_raw = store.read_body(checkpoint_record["body_hash"])
+                    if (hashlib.sha256(checkpoint_raw).hexdigest() != checkpoint["body_sha256"]
+                            or json.loads(checkpoint_raw).get("cumulative_usage", {}).get("actual") != checkpoint.get("actual_usage")
+                            or mapped_record.get("author") != "research.literature-mapper"
+                            or mapped.get("question") != configured.get("survey", {}).get("question")
+                            or resumed_mapping.get("config_ref") != body["config_ref"]
+                            or "mapping" not in resumed_mapping.get("reopened_scopes", [])
+                            or not owner["created_at"] <= original_session["created_at"] <= mapped_record["created_at"] <= checkpoint_record["created_at"]
+                            or owner.get("payload", {}).get("project_dir") != body["project_dir"]
+                            or owner.get("payload", {}).get("stage_id") != body["stage_id"]
+                            or owner.get("payload", {}).get("model_budget_cycle") != body["cycle"]):
+                        return False
+                final_record = store.get(body["result_ref"])
+                resume_record = store.get(body["resume_ref"])
+                if (final_record.get("author") != "command.controller"
+                        or resume_record.get("author") != "command.controller"
+                        or resume_record["created_at"] > final_record["created_at"]):
+                    return False
+                result = json.loads(store.read_body(body["result_sha256"]))
+                resumed = json.loads(store.read_body(body["resume_sha256"]))
+                if (result.get("status") not in {"completed", "accepted"}
+                        or any(result.get(key) != body[key] for key in ("run_id", "survey_ref", "assessment_ref"))
+                        or resumed.get("schema_version") != "resume-session-1"
+                        or resumed.get("config_ref") != body["config_ref"]
+                        or resumed.get("reopened_scopes") != body["reopened_scopes"]):
+                    return False
+            return self._survey_references_are_current(project_dir, run)
+        except (KeyError, TypeError, ValueError, OSError, NotFoundError, ValidationError, sqlite3.Error):
+            return False
+
+    def _record_survey_revalidation(self, stage, result, scopes, prior_run_id, *, declared_scopes=None, mapping_milestone=None):
+        if result.get("status") not in {"completed", "accepted"}:
+            return
+        if not isinstance(result.get("run_id"), str) or result["run_id"] == prior_run_id:
+            raise StateError("survey revalidation did not produce a fresh owned run")
+        project = Path(stage["project_dir"]).resolve()
+        with closing(sqlite3.connect((project / "state/control.sqlite").as_uri() + "?mode=ro", uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            store = ArtifactStore(SimpleNamespace(dir=str(project), _conn=connection))
+            row = connection.execute("SELECT artifact_ref FROM artifacts WHERE logical_id LIKE 'command/resume-sessions/%' "
+                                     "ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone()
+            artifacts = {"config": store.head("inputs/run-config"), "result": store.head("command/results/final"),
+                         "resume": store.get(row["artifact_ref"]) if row else None,
+                         "survey": store.get(result["survey_ref"]), "assessment": store.get(result["assessment_ref"])}
+            if any(record is None for record in artifacts.values()):
+                raise StateError("survey revalidation lacks immutable completion dependencies")
+            requests = [item for item in self._requests_for_stage(stage) if "resume_scopes" in item]
+            body = {"schema_version": "composer-survey-revalidation-1", "stage_id": stage["id"],
+                    "cycle": self.continuation_cycles, "project_dir": str(project),
+                    "run_id": result["run_id"], "reopened_scopes": scopes,
+                    "declared_scopes": declared_scopes or scopes, "completed_mapping": mapping_milestone,
+                    "request_ids": [item["id"] for item in requests],
+                    "request_signatures": [self._research_request_signature(item) for item in requests],
+                    "continuation_ref": self.store.head(f"command/composer/continuation/{self.continuation_cycles}")["artifact_ref"],
+                    "retained_follow_up_ref": self.context.get(stage["id"], {}).get("follow_up_ref"),
+                    "retained_follow_up_result": deepcopy(self.context.get(stage["id"], {}).get("follow_up_result"))}
+            for key, record in artifacts.items():
+                body[key + "_ref"] = record["artifact_ref"]
+                body[key + "_sha256"] = record["body_hash"]
+        record = self._publish(f"command/composer/survey-revalidations/{stage['id']}/{result['run_id']}",
+                               "report", body, "command.composer")
+        result["revalidation"] = {"ref": record["artifact_ref"], "body_sha256": record["body_hash"]}
+        if not all(self._survey_request_was_fulfilled(project, result, item) for item in requests):
+            raise StateError("survey revalidation completion failed immutable replay")
+
+    @staticmethod
+    def _survey_work_order_was_fulfilled(project_dir, run, request):
+        from scisaurus.core.source_spans import bind as bind_spans, expand_evidence
+        from scisaurus.core.surveys import SurveyGate
+        from scisaurus.runtime.models import ModelResult
+        from scisaurus.runtime.survey import acquisition_succeeded
+        from scisaurus.runtime.survey_records import validate_follow_up_result
+        result = run.get("follow_up_result")
+        if (not isinstance(result, dict) or not isinstance(result.get("ref"), str)
+                or any(not isinstance(run.get(key), str) for key in ("survey_ref", "assessment_ref"))):
+            return False
+        try:
+            with closing(sqlite3.connect(
+                    (Path(project_dir) / "state/control.sqlite").resolve().as_uri() + "?mode=ro",
+                    uri=True, timeout=2.0)) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only=ON")
+                control = SimpleNamespace(dir=str(Path(project_dir).resolve()), _conn=connection)
+                store = ArtifactStore(control)
+                gate = SurveyGate(control, store)
+                record, raw_result = gate._artifact(result["ref"])
+                body = json.loads(raw_result)
+                packet, raw_packet = gate._artifact(body["follow_up_ref"])
+                packet_body = json.loads(raw_packet)
+                orders = packet_body["work_orders"]
+                if (packet_body.get("schema_version") != "survey-follow-up-1"
+                        or packet.get("author") != "command.controller"
+                        or record.get("author") != "methods.evidence-verifier"):
+                    return False
+                execution_refs = body.get("execution_refs", [body["execution_ref"]])
+                if (not isinstance(execution_refs, list) or not execution_refs
+                        or any(not isinstance(ref, str) for ref in execution_refs)
+                        or len(set(execution_refs)) != len(execution_refs)
+                        or body.get("execution_ref") != execution_refs[-1]):
+                    return False
+                _, survey = gate._note(run["survey_ref"])
+                _, assessment = gate._note(run["assessment_ref"])
+                if assessment.get("survey_ref") != run["survey_ref"]:
+                    return False
+                gate.require_current_assessment(run["assessment_ref"])
+                works = {}
+                for ref in survey["work_refs"]:
+                    _, raw_work = gate._artifact(ref)
+                    work = json.loads(raw_work)
+                    works[work["work_id"]] = work
+                checked = {}
+                for execution_ref in execution_refs:
+                    execution, _, execution_body, model_params = gate._recorded_execution(
+                        execution_ref, "methods.evidence-verifier", operation="model", task_kinds={"review"})
+                    assignment = json.loads(model_params["prompt"])
+                    assigned = assignment.get("work_orders")
+                    if (execution.get("author") != "methods.evidence-verifier"
+                            or execution_ref not in {item["ref"] for item in record["inputs"]}
+                            or assignment.get("phase") != "survey_follow_up"
+                            or assignment.get("follow_up_ref") != body["follow_up_ref"]
+                            or not isinstance(assigned, list) or not assigned
+                            or any(order not in orders for order in assigned)
+                            or assignment.get("survey_ref") != run["survey_ref"]
+                            or assignment.get("assessment_ref") != run["assessment_ref"]):
+                        return False
+                    windows = {source["source_ref"]: source["window"] for source in assignment["sources"]}
+                    sources = {ref: json.loads(store.read_body(store.get(ref)["body_hash"])) for ref in windows}
+                    query_refs = []
+                    for ref in assignment["query_refs"]:
+                        query = json.loads(store.read_body(store.get(ref)["body_hash"]))
+                        plan = json.loads(store.read_body(store.get(query["plan_ref"])["body_hash"]))
+                        if (query.get("request", {}).get("operation") == "search" and acquisition_succeeded(query)
+                                and plan.get("follow_up_ref") == body["follow_up_ref"]):
+                            query_refs.append(ref)
+                    if execution_body.get("finish_reason", "stop") not in {"stop", "length"}:
+                        return False
+                    response = ModelResult(text=execution_body["text"], model="retained", usage={},
+                                           elapsed_seconds=0, finish_reason=execution_body.get("finish_reason", "stop")).json_object(
+                                               allow_missing_closers=True)
+                    response = expand_evidence(response, assignment.get("evidence_catalog", []), sources, windows=windows)
+                    response = bind_spans(response, sources, windows=windows)
+                    validate_follow_up_result(response, assigned, sources, query_refs, windows=windows)
+                    for row in response["orders"]:
+                        if row["id"] in checked:
+                            return False
+                        gate._evidence(row["evidence"], works, survey, required=row["status"] == "resolved")
+                        for query_ref in row["query_refs"]:
+                            gate.require_successful_follow_up_search(query_ref, survey, body["follow_up_ref"])
+                        checked[row["id"]] = row
+                if (set(checked) != {order["id"] for order in orders}
+                        or [checked[order["id"]] for order in orders] != body.get("orders")):
+                    return False
+                projected = ComposerRunner._follow_up_projection([request])[0]
+                return (body.get("schema_version") == "survey-follow-up-result-1"
+                        and body.get("survey_ref") == run["survey_ref"]
+                        and body.get("assessment_ref") == run["assessment_ref"]
+                        and body.get("orders") == result.get("orders")
+                        and any(isinstance(order, dict)
+                                and ComposerRunner._follow_up_projection([order])[0] == projected for order in orders)
+                        and any(isinstance(row, dict) and row.get("id") == request.get("id")
+                                and row.get("status") in {"resolved", "limited"}
+                                for row in body["orders"]))
+        except (sqlite3.Error, IndexError, KeyError, TypeError, ValueError, OSError, NotFoundError, ValidationError, ConflictError):
+            return False
+
+    @staticmethod
+    def _survey_references_are_current(project_dir, run):
+        from scisaurus.core.surveys import SurveyGate
+        try:
+            with closing(sqlite3.connect(
+                    (Path(project_dir) / "state/control.sqlite").resolve().as_uri() + "?mode=ro",
+                    uri=True, timeout=2.0)) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only=ON")
+                control = SimpleNamespace(dir=str(Path(project_dir).resolve()), _conn=connection)
+                gate = SurveyGate(control, ArtifactStore(control))
+                _, assessment = gate._note(run["assessment_ref"])
+                if assessment.get("survey_ref") != run["survey_ref"]:
+                    return False
+                gate.require_current_assessment(run["assessment_ref"])
+                return True
+        except (sqlite3.Error, KeyError, TypeError, ValueError, OSError, NotFoundError, ValidationError, ConflictError):
+            return False
+
+    def _survey_acquisition_frontier_for_topic(self, stage_id, topic_id, topic_cycle, request):
+        """Find the current immutable disposition for one exact acquisition scope."""
+        if topic_id is None or topic_cycle is None:
+            identity = self._current_topic_identity()
+            if (not isinstance(identity, dict)
+                    or topic_id is not None and topic_id != identity["topic_id"]
+                    or topic_cycle is not None and topic_cycle != identity["topic_cycle"]
+                    or not self._research_request_was_admitted(request)):
+                return None
+            topic_id, topic_cycle = identity["topic_id"], identity["topic_cycle"]
+        if (request.get("topic_id") not in (None, topic_id)
+                or request.get("topic_cycle") not in (None, topic_cycle)
+                or request.get("topic_cycle") is not None and type(request["topic_cycle"]) is not int):
+            return None
+        record = self.stage_records.get(stage_id, {})
+        attempts = record.get("attempts", []) if isinstance(record, dict) else []
+        seen = set()
+        for attempt in reversed(attempts if isinstance(attempts, list) else []):
+            if (not isinstance(attempt, dict)
+                    or attempt.get("state") not in {"succeeded", "completed"}
+                    or attempt.get("topic_id") != topic_id
+                    or attempt.get("topic_cycle") != topic_cycle
+                    or not isinstance(attempt.get("project_dir"), str)):
+                continue
+            project = Path(attempt["project_dir"]).resolve()
+            if project in seen:
+                continue
+            seen.add(project)
+            run = self._read_json_object(project / "output" / "run.json")
+            if (not isinstance(run, dict) or run.get("status") != "completed"
+                    or run.get("survey_current") is not True
+                    or run.get("assessment_current") is not True
+                    or not self._survey_request_was_fulfilled(project, run, request)):
+                continue
+            gated = self._read_json_object(project / "output" / "composer-gated-run.json")
+            return attempt, project, run, gated or run
+        return None
+
+    def _restore_interrupted_completed_survey_acquisition(self, completed, by_id):
+        """Resume downstream work when an interrupted replay has no new acquisition scope."""
+        identity = self._current_topic_identity()
+        if not isinstance(identity, dict):
+            return False
+        restored = False
+        for stage_id in list(self.continuation_pending_stage_ids):
+            stage = by_id.get(stage_id, {})
+            record = self.stage_records.get(stage_id, {})
+            attempts = record.get("attempts", [])
+            latest = next((item for item in reversed(attempts)
+                           if isinstance(item, dict)), None) if isinstance(attempts, list) else None
+            if (stage.get("kind") != "survey" or record.get("status") != "retrying"
+                    or not isinstance(latest, dict) or latest.get("state") != "unknown"
+                    or latest.get("attempt_id") != record.get("last_attempt_id")):
+                continue
+            orders = [item for item in self.active_research_requests
+                      if isinstance(item, dict)
+                      and (item.get("target_stage_id") == stage_id
+                           or not item.get("target_stage_id") and self._request_target_kind(item) == "survey")]
+            if not orders or any(item.get("kind") != "literature_expansion" for item in orders):
+                continue
+            frontiers = [self._survey_acquisition_frontier_for_topic(
+                stage_id, identity["topic_id"], identity["topic_cycle"], order) for order in orders]
+            if any(frontier is None for frontier in frontiers):
+                continue
+            _, project, run, result = frontiers[0]
+            incumbent = self.context.get(stage_id, {})
+            if (any(item[1] != project for item in frontiers)
+                    or result.get("status") not in {"completed", "accepted", "candidate_needs_review"}
+                    or incumbent.get("status") != "candidate_needs_review"
+                    or not self._stage_releases_dependencies(incumbent, stage_kind="survey")
+                    or incumbent.get("survey_ref") != run.get("survey_ref")
+                    or incumbent.get("assessment_ref") != run.get("assessment_ref")
+                    or result.get("survey_ref") != run.get("survey_ref")
+                    or result.get("assessment_ref") != run.get("assessment_ref")):
+                continue
+            context = deepcopy(incumbent)
+            context.update(stage_id=stage_id, kind="survey", project_dir=str(project))
+            self.context[stage_id] = context
+            record.update(status=context["status"], project_dir=str(project), recovery_admitted=False)
+            self.stage_records[stage_id] = record
+            self.continuation_pending_stage_ids.discard(stage_id)
+            completed.add(stage_id)
+            self.department_activity.append({
+                "cycle": self.continuation_cycles, "action": "reuse_completed_survey_acquisition",
+                "stage_id": stage_id, "request_ids": [item["id"] for item in orders],
+                "survey_ref": run["survey_ref"], "assessment_ref": run["assessment_ref"],
+                "scientific_status": context["status"], "model_calls": 0,
+            })
+            restored = True
+        return restored
+
     def _completed_survey_frontier_for_topic(self, stage_id, topic_id, topic_cycle):
         """Find a completed, durable survey/assessment pair for one topic."""
         record = self.stage_records.get(stage_id)
@@ -14351,7 +16739,9 @@ class ComposerRunner:
                     and result.get("topic_admission") != "exploratory_pilot"):
                 continue
             references = [run["survey_ref"], run["assessment_ref"]]
-            if not self._survey_references_are_durable(project_dir, references):
+            if (not self._survey_references_are_durable(project_dir, references)
+                    or not self._survey_attempt_was_accepted(stage_id, attempt, run)
+                    or not self._survey_references_are_current(project_dir, run)):
                 continue
             return attempt, project_dir, run, result
         return None
@@ -14405,6 +16795,9 @@ class ComposerRunner:
         request_id = recovery.get("request_id")
         if not isinstance(request_id, str) and type(recovery_cycle) is int:
             request_id = self._autonomous_recovery_request_id(stage_id, recovery_cycle)
+        if any(item.get("id") != request_id
+               for item in self._requests_for_stage(stage)):
+            return False
         deferred = []
         active = []
         for request in self.active_research_requests:
@@ -14505,10 +16898,13 @@ class ComposerRunner:
     def _is_openalex_provider_cooldown(value):
         """Recognize an OpenAlex quota fence without matching model failures."""
         if isinstance(value, dict):
-            try:
-                value = json.dumps(value, ensure_ascii=False, sort_keys=True)
-            except (TypeError, ValueError):
-                value = str(value)
+            rate_limit = value.get("rate_limit")
+            if (isinstance(rate_limit, dict)
+                    and rate_limit.get("provider") == "openalex"
+                    and rate_limit.get("status_code") == 429):
+                return True
+            return any(ComposerRunner._is_openalex_provider_cooldown(value.get(key))
+                       for key in ("reason", "error", "message", "provider_error", "failure"))
         text = str(value or "").casefold()
         return (
             "openalex" in text
@@ -14540,11 +16936,9 @@ class ComposerRunner:
         stage_id = stage["id"]
         record = self.stage_records.get(stage_id, {})
         schedule = self.retry_schedule.get(stage_id, {})
+        if self._stage_releases_dependencies(record, stage_kind=stage.get("kind")):
+            return False
         candidates = [error, record.get("error"), schedule.get("error")]
-        candidates.extend(
-            item for item in reversed(self.blockers)
-            if isinstance(item, dict) and item.get("stage_id") == stage_id
-        )
         if not any(self._is_openalex_provider_cooldown(item) for item in candidates):
             return False
         context = deepcopy(self.context.get(stage_id, {}))
@@ -14656,6 +17050,68 @@ class ComposerRunner:
             if type(current) is int else quota["max_model_calls"]
         )
         return config
+
+    def _stage_model_config(self, stage, model):
+        """Give every producer and reviewer the same durable stage allowance."""
+        if not isinstance(model, dict) or not isinstance(stage, dict):
+            return model
+        owner_id = stage.get("_model_budget_owner_stage_id")
+        if owner_id is not None:
+            owner = next((item for item in self.workflow["stages"]
+                          if item["id"] == owner_id), None)
+            if owner is None or owner.get("quota") != stage.get("quota"):
+                raise ValidationError("auxiliary stage has no matching admitted model-budget owner")
+            return self._stage_model_config(owner, model)
+        quota = stage.get("quota")
+        if not isinstance(quota, dict):
+            return model
+        limit = quota["max_model_calls"]
+        scope_cycle = (self.continuation_cycles
+                       if stage["id"] in self.reopened_stage_ids else 0)
+        key = f"stage:{stage['id']}:cycle:{scope_cycle}"
+        path = self.root / "state" / "stage-model-call-budget.sqlite"
+        scope = {"model_call_budget_path": str(path.resolve()),
+                 "model_call_budget_key": key, "model_call_budget_limit": limit,
+                 "model_token_budget_limits": {"input_tokens": quota["max_input_tokens"],
+                                               "output_tokens": quota["max_output_tokens"]}}
+        contributions = self._legacy_stage_model_invoices(stage["id"], scope)
+        self._restore_legacy_stage_model_budget(scope, contributions)
+        floor = math.ceil(self._stage_usage(stage["id"])["model_calls"])
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS model_call_budgets "
+                               "(budget_key TEXT PRIMARY KEY, max_calls INTEGER NOT NULL, "
+                               "used_calls INTEGER NOT NULL)")
+            row = connection.execute("SELECT max_calls FROM model_call_budgets WHERE budget_key=?",
+                                     (key,)).fetchone()
+            if row is not None and row[0] != limit:
+                raise ValidationError("persisted stage model-call limit changed")
+            connection.execute("INSERT INTO model_call_budgets VALUES (?, ?, ?) "
+                               "ON CONFLICT(budget_key) DO UPDATE SET "
+                               "used_calls=MAX(used_calls, excluded.used_calls)", (key, limit, floor))
+            connection.commit()
+        register_model_token_budget(scope, self._stage_usage(stage["id"]))
+        configured = deepcopy(model)
+        configured.setdefault("model_call_budget_scopes", []).append(scope)
+        return configured
+
+    def _stage_model_delegation(self, stage):
+        if not isinstance(stage.get("quota"), dict):
+            return None
+        scope = self._stage_model_config(stage, {})["model_call_budget_scopes"][0]
+        path = scope["model_call_budget_path"]
+        key = scope["model_call_budget_key"]
+        prefix = f"stage:{stage['id']}:cycle:"
+        cycle = int(key.removeprefix(prefix))
+        with closing(sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True)) as connection:
+            used = connection.execute("SELECT used_calls FROM model_call_budgets WHERE budget_key=?",
+                                      (key,)).fetchone()[0]
+            retired = [{**scope, "model_call_budget_key": prior_key}
+                       for prior_key, limit in connection.execute(
+                           "SELECT budget_key, max_calls FROM model_call_budgets")
+                       if prior_key.startswith(prefix) and prior_key.removeprefix(prefix).isdigit()
+                       and int(prior_key.removeprefix(prefix)) < cycle
+                       and limit == scope["model_call_budget_limit"]]
+        return {"scope": scope, "used_calls": used, "superseded_scopes": retired}
 
     @staticmethod
     def _stage_releases_dependencies(record, *, stage_kind=None):
@@ -14802,7 +17258,58 @@ class ComposerRunner:
                     "status": context_status or record_status or "pending",
                     "reasons": list(dict.fromkeys(reasons)),
                 })
+        requirements = self._active_maturity_requirements(paper_stage)
+        resolved = set()
+        assessment_stage = next((by_id[key] for key in reversed(workflow_order)
+                                 if by_id[key].get("kind") == "interpretation"), None)
+        for stage_id in workflow_order:
+            context = self.context.get(stage_id, {})
+            package = context.get("interpretation", {}) if isinstance(context, dict) else {}
+            interpretation = package.get("interpretation", {}) if isinstance(package, dict) else {}
+            assessments = interpretation.get("requirement_assessments", []) if isinstance(interpretation, dict) else []
+            resolved.update(item.get("requirement_id") for item in assessments
+                            if isinstance(item, dict) and item.get("disposition") == "resolved"
+                            and item.get("evidence_ids"))
+        if {item["id"] for item in requirements} - resolved:
+            target = assessment_stage or by_id[workflow_order[-1]] if workflow_order else paper_stage
+            existing = next((item for item in blockers if item["stage_id"] == target["id"]), None)
+            if existing is None:
+                blockers.append({"stage_id": target["id"], "kind": target["kind"],
+                                 "status": self.context.get(target["id"], {}).get("status", "pending"),
+                                 "reasons": ["maturity_requirements_unresolved"]})
+            else:
+                existing["reasons"].append("maturity_requirements_unresolved")
         return blockers
+
+    def _active_maturity_requirements(self, target_stage):
+        from scisaurus.runtime.evidence import maturity_requirement_id
+        requirements = []
+        by_id = {item["id"]: item for item in self.workflow.get("stages", [])}
+        ancestors = set()
+        pending = [target_stage["id"]]
+        while pending:
+            stage_id = pending.pop()
+            if stage_id in ancestors or stage_id not in by_id:
+                continue
+            ancestors.add(stage_id)
+            pending.extend(by_id[stage_id].get("depends_on", []))
+        for stage in self.workflow.get("stages", []):
+            if stage["id"] not in ancestors:
+                continue
+            context = self.context.get(stage["id"], {})
+            if not isinstance(context, dict):
+                continue
+            if stage.get("kind") == "topic_discovery":
+                scope = self._topic_maturity_requirement_scope(context.get("topic"), context)
+                values = scope["active"]
+            elif stage.get("kind") == "survey":
+                values = context.get("carried_maturity_requirements", [])
+            else:
+                continue
+            for item in values if isinstance(values, list) else []:
+                if isinstance(item, str) and item.strip() and item not in requirements:
+                    requirements.append(item)
+        return [{"id": maturity_requirement_id(item), "requirement": item} for item in requirements]
 
     def _ensure_paper_gate_repair_requests(self, blockers, *, synthesize=True):
         """Create one scoped repair order without discarding the current branch."""
@@ -15433,15 +17940,14 @@ class ComposerRunner:
             return ["search-strategist"]
         return None
 
-    @staticmethod
-    def _specialist_model_config(stage, descriptor):
+    def _specialist_model_config(self, stage, descriptor):
         """Load the model config used by a stage, when one is declared."""
         if not isinstance(descriptor, dict):
             return None
         model = descriptor.get("model")
         if isinstance(model, dict):
             configured = with_runtime_cooldown_fallback(model)
-            return deepcopy(configured) if configured.get("base_url") and configured.get("model") else None
+            return self._stage_model_config(stage, configured) if configured.get("base_url") and configured.get("model") else None
         model_path = descriptor.get("model_config_path")
         if not isinstance(model_path, str) or not model_path:
             return None
@@ -15453,7 +17959,7 @@ class ComposerRunner:
         except (OSError, ValueError, TypeError):
             return None
         configured = with_runtime_cooldown_fallback(model)
-        return (deepcopy(configured) if isinstance(configured, dict)
+        return (self._stage_model_config(stage, configured) if isinstance(configured, dict)
                 and configured.get("base_url") and configured.get("model") else None)
 
     @staticmethod
@@ -16356,12 +18862,46 @@ class ComposerRunner:
                 packet["runtime_context"] = self._runtime_context(model)
         return packet
 
-    def _specialist_progress(self, stage_id, event):
+    @staticmethod
+    def _active_specialist_roles(live):
+        return [role for role, event in live.items() if isinstance(event, dict)
+                and event.get("event") != "completed"
+                and (event.get("event") == "dispatched"
+                     or event.get("status") in {"running", "started", "dispatched"})]
+
+    def _specialist_progress(self, stage_id, event, *, assignment=None):
         """Publish a thread-safe live projection without touching SQLite."""
         if not isinstance(event, dict):
             return
         role = event.get("role")
         if not isinstance(role, str):
+            return
+        if event.get("stage_id") is not None and event["stage_id"] != stage_id:
+            return
+        current = self.stage_records.get(stage_id)
+        if isinstance(assignment, dict):
+            if assignment.get("stage_id") != stage_id:
+                return
+            rows = assignment.get("assignments", [])
+            matched = next((row for row in rows if isinstance(row, dict)
+                            and row.get("task_id") == event.get("task_id")
+                            and row.get("assigned_role") == role), None)
+            if matched is None:
+                return
+            if not isinstance(current, dict):
+                current = {"status": "running", "attempt_number": assignment.get("attempt_number"),
+                           "assignment_task_ids": assignment.get("task_ids", [])}
+            elif (current.get("attempt_number") is not None
+                  and current["attempt_number"] != assignment.get("attempt_number")):
+                return
+        if not isinstance(current, dict) or current.get("status") != "running":
+            return
+        allowed_tasks = current.get("assignment_task_ids", [])
+        if allowed_tasks and event.get("task_id") not in allowed_tasks:
+            return
+        if (event.get("assignment_attempt_number") is not None
+                and current.get("attempt_number") is not None
+                and event["assignment_attempt_number"] != current["attempt_number"]):
             return
         live = {key: deepcopy(event.get(key)) for key in (
             "event", "role", "role_id", "task_id", "stage_id", "model_role", "route_id",
@@ -16376,6 +18916,7 @@ class ComposerRunner:
         remaining_snapshot = self.deadline - now
         if isinstance(self.deadline_epoch, (int, float)) and math.isfinite(self.deadline_epoch):
             remaining_snapshot = min(remaining_snapshot, self.deadline_epoch - time.time())
+        self._end_child_activity(stage_id)
         with self._progress_lock:
             state = deepcopy(self._progress_snapshot)
             state.update({
@@ -16386,6 +18927,8 @@ class ComposerRunner:
                 "deadline_at_epoch": self.deadline_epoch,
             })
             stage_record = state.setdefault("stages", {}).setdefault(stage_id, {})
+            stage_record.update({key: deepcopy(current[key]) for key in (
+                "status", "attempt_number", "assignment_task_ids") if key in current})
             previous = stage_record.setdefault("specialist_live", {}).get(role, {})
             if isinstance(previous, dict) and event.get("event") == "completed":
                 live = {**previous, **live}
@@ -16394,6 +18937,8 @@ class ComposerRunner:
                 live["started_at"] = live["observed_at"]
             live["updated_at"] = live["observed_at"]
             stage_record["specialist_live"][role] = live
+            stage_record["active_agents"] = self._active_specialist_roles(
+                stage_record["specialist_live"])
             self._progress_snapshot = deepcopy(state)
             output = self.root / "output"
             output.mkdir(parents=True, exist_ok=True)
@@ -16408,6 +18953,8 @@ class ComposerRunner:
             """Keep transport failures out of the scientific result cache."""
             if not isinstance(value, dict):
                 return False
+            if _report_has_model_call_failure(value):
+                return False
             if value.get("status") == "result_unknown":
                 return False
             if value.get("status_code") in {408, 425, 429, 500, 502, 503, 504}:
@@ -16421,7 +18968,7 @@ class ComposerRunner:
         for assignment in assignments:
             prompt = assignment.get("_prompt") or build_specialist_prompt(assignment, packet)
             key = cache.key(scope=f"specialist:{assignment['stage_id']}:{verifier}",
-                role=assignment.get("assigned_role"), system=VERIFIER_SYSTEM if verifier else SPECIALIST_SYSTEM,
+                role=assignment.get("assigned_role"), system=specialist_system(assignment, verifier=verifier),
                 prompt=prompt, model=dispatcher.model_config)
             keys[assignment["role_id"]] = key
             retained = cache.get(key)
@@ -16469,8 +19016,7 @@ class ComposerRunner:
         def retain(report):
             if report.get("status") == "succeeded":
                 cache.put(keys[report["role_id"]], {"status": "succeeded", "report": report})
-            elif (report.get("status_code") not in {408, 425, 429, 500, 502, 503, 504}
-                  and report.get("status") != "result_unknown"):
+            elif reusable_cached_report(report):
                 # Failed/unknown reports remain failures. Retaining the exact
                 # assignment prevents a new outer stage attempt from silently
                 # replenishing its specialist call allowance.
@@ -16499,7 +19045,7 @@ class ComposerRunner:
         max_parallel = limits.get("concurrent_calls") if isinstance(limits, dict) else None
         if type(max_parallel) is not int or max_parallel < 1:
             max_parallel = min(4, len(assignments))
-        deadline = time.monotonic() + min(float(stage["deadline_seconds"]), self._remaining())
+        deadline = time.monotonic() + self._stage_remaining(stage)
         packet = self._specialist_stage_packet(
             stage, descriptor, stage_result=stage_result)
         packet_digest = (
@@ -16556,7 +19102,7 @@ class ComposerRunner:
                     "status": report.get("status"),
                     "artifact_ref": prior.get("artifact_ref"),
                     "reused_from_attempt_number": prior.get("attempt_number"),
-                })
+                }, assignment=stage_assignment)
             else:
                 pending_assignments.append(assignment)
         if pending_assignments:
@@ -16566,7 +19112,7 @@ class ComposerRunner:
                 max_parallel=min(max_parallel, len(pending_assignments)), deadline=deadline,
                 on_progress=lambda event: self._specialist_progress(stage["id"], {
                     **event, "assignment_attempt_number": assignment_number,
-                }),
+                }, assignment=stage_assignment),
             )
             for report in self._dispatch_specialist_work(dispatcher, pending_assignments, packet):
                 role_id = report.get("role_id")
@@ -16761,10 +19307,11 @@ class ComposerRunner:
         from scisaurus.runtime.capability_foundry import CapabilityDeadlineError
         if isinstance(error, (
             ProviderCooldownError,
-            ProviderConfigurationError,
+            *PROVIDER_OPERATOR_STOP_ERRORS,
             QuotaExceededError,
             ComposerLateStageResult,
             ComposerHardDeadlineExceeded,
+            ComposerStageDeadlineExceeded,
             CapabilityDeadlineError,
                 KeyboardInterrupt,
         )) or (isinstance(error, ModelCallError) and error.status_code == 429):
@@ -16821,6 +19368,87 @@ class ComposerRunner:
                 usage[key] = max(0, observed - amount)
         return usage
 
+    def _stage_specialist_payment_proof(self, stage, plan_ref, execution_ref):
+        if not any(item.get("id") == stage["id"] and item.get("kind") == stage["kind"]
+                   for item in self.workflow["stages"]):
+            return {}
+        plan_record, _, plan = self._read_verified_artifact_json(plan_ref)
+        execution_record, _, execution = self._read_verified_artifact_json(execution_ref)
+        if (plan_record.get("author") != "command.composer"
+                or plan.get("schema_version") != "department-stage-assignment-1"
+                or execution.get("schema_version") not in {"specialist-execution-1", "specialist-verifier-execution-1"}
+                or any(plan.get(key) != execution.get(key) for key in ("project_id", "stage_id", "stage_kind", "attempt_number"))
+                or plan.get("project_id") != self.workflow["project_id"]
+                or plan.get("stage_id") != stage["id"] or plan.get("stage_kind") != stage["kind"]
+                or execution_record.get("author") != execution.get("assigned_role")):
+            raise StateError("specialist payment does not match its owned stage plan")
+        rows = self.departments._assignment_task_rows(stage_id=stage["id"], attempt_number=plan["attempt_number"])
+        row = next((row for row in rows if row.get("task_id") == execution.get("task_id")), None)
+        if (row is None or execution_ref.split("@")[0] != "artifact:" + row["assignment_logical_id"] + "/execution"
+                or any(row.get(key) != execution.get(key) for key in ("assignment_id", "assigned_role", "role_id"))
+                or (execution.get("schema_version") == "specialist-execution-1"
+                    and row.get("input_ref") != execution.get("input_ref"))):
+            raise StateError("specialist payment execution is not its exact admitted assignment")
+        report = execution.get("report") or {}
+        usage = report.get("usage") or {}
+        cost = {key: usage.get(key, 0) for key in self.usage}
+        if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in cost.values()):
+            raise StateError("specialist payment has invalid actual usage")
+        if not any(cost.values()):
+            return cost
+        namespace = hashlib.sha256(canonical_bytes({"specialist_execution_ref": execution_ref,
+                                                    "body_sha256": execution_record["body_hash"]})).hexdigest()
+        proof = {"schema_version": "composer-specialist-payment-1", "stage_id": stage["id"],
+                 "plan_ref": plan_ref, "plan_sha256": plan_record["body_hash"],
+                 "execution_ref": execution_ref, "execution_sha256": execution_record["body_hash"],
+                 "usage": cost, "namespace": namespace}
+        return proof
+
+    def _settle_stage_specialist_payment(self, stage, plan_ref, execution_ref):
+        proof = self._stage_specialist_payment_proof(stage, plan_ref, execution_ref)
+        if not isinstance(proof, dict) or "usage" not in proof:
+            return {}
+        cost, namespace = proof["usage"], proof["namespace"]
+        prior = self.stage_usage_totals.get(namespace, {})
+        if prior and prior != cost:
+            raise StateError("specialist payment conflicts with its settled immutable execution")
+        self._publish(f"command/composer/specialist-payments/{namespace}", "report", proof, "command.composer")
+        self.pending_stage_usage[namespace] = {"stage_id": stage["id"], "totals": cost,
+                                               "delta": {key: max(0, value - prior.get(key, 0)) for key, value in cost.items()}}
+        self._settle_pending_stage_usage(stage["id"], namespaces={namespace})
+        self._checkpoint(f"{stage['id']}:specialist_payment_settled", force=True)
+        return cost
+
+    def _paid_stage_specialist_usage(self, reports):
+        total = {key: 0 for key in self.usage}
+        for report in reports:
+            if not isinstance(report, dict) or not isinstance(report.get("artifact_ref"), str):
+                continue
+            record = self.store.get(report["artifact_ref"])
+            namespace = hashlib.sha256(canonical_bytes({"specialist_execution_ref": report["artifact_ref"],
+                                                        "body_sha256": record["body_hash"]})).hexdigest()
+            paid = self.stage_usage_totals.get(namespace, {})
+            for key in total:
+                current = (report.get("usage") or {}).get(key, 0)
+                if type(current) in (int, float) and math.isfinite(current) and current >= 0:
+                    total[key] += min(paid.get(key, 0), current)
+        return total
+
+    def _reconcile_interrupted_specialist_payments(self, stage, record):
+        if not isinstance(record.get("attempt_id"), str) or not isinstance(record.get("assignment_plan_ref"), str):
+            return
+        attempt = self.tasks.get_attempt(record["attempt_id"])
+        if attempt.get("state") not in {"started", "result_unknown"}:
+            return
+        plan_record, _, plan = self._read_verified_artifact_json(record["assignment_plan_ref"])
+        if plan.get("input_ref", {}).get("ref") != record.get("task_id"):
+            raise StateError("interrupted specialist plan does not own the aggregate attempt")
+        rows = self.departments._assignment_task_rows(stage_id=stage["id"], attempt_number=record.get("attempt_number"))
+        for row in rows:
+            head = self.store.head(row["assignment_logical_id"] + "/execution")
+            if head is not None:
+                self._settle_stage_specialist_payment(stage, record["assignment_plan_ref"], head["artifact_ref"])
+
     def _publish_specialist_reports(self, stage, stage_assignment, bundle):
         """Persist each specialist's independent response in its own namespace."""
         if not bundle.get("model_enabled"):
@@ -16858,6 +19486,7 @@ class ComposerRunner:
             )
             report["artifact_ref"] = artifact["artifact_ref"]
             self._settle_specialist_execution_attempt(row, report)
+            self._settle_stage_specialist_payment(stage, stage_assignment["plan_ref"], artifact["artifact_ref"])
             self._specialist_progress(stage["id"], {
                 "event": "completed", "role": row.get("assigned_role"),
                 "role_id": row.get("role_id"), "task_id": row.get("task_id"),
@@ -16867,7 +19496,7 @@ class ComposerRunner:
                 "artifact_ref": report.get("artifact_ref"),
                 "response_ref": self._specialist_file_ref(artifact),
                 "error": report.get("error"),
-            })
+            }, assignment=stage_assignment)
             updated[row.get("role_id")] = report
         bundle["by_role"] = updated
         bundle["reports"] = list(updated.values())
@@ -16916,13 +19545,13 @@ class ComposerRunner:
         if verifier is None:
             return None
         verifier = deepcopy(verifier)
-        deadline = time.monotonic() + min(float(stage["deadline_seconds"]), self._remaining())
+        deadline = time.monotonic() + self._stage_remaining(stage)
 
         def on_progress(event):
             self._specialist_progress(stage["id"], {
                 **event,
                 "assignment_attempt_number": stage_assignment.get("attempt_number"),
-            })
+            }, assignment=stage_assignment)
 
         dispatcher = SpecialistDispatcher(
             model, provider_pools=self._specialist_provider_pools(descriptor),
@@ -16939,7 +19568,14 @@ class ComposerRunner:
         if isinstance(stage_result, dict) and stage_result.get("repair_verification_scope"):
             packet["repair_verification_scope"] = stage_result["repair_verification_scope"]
         packet["chief_result"] = deepcopy(chief_result)
-        packet["specialist_reports"] = deepcopy(bundle.get("reports", []))
+        reports = deepcopy(bundle.get("reports", []))
+        assigned_roles = {item.get("role_id"): item for item in stage_assignment.get("assignments", [])
+                          if isinstance(item, dict)}
+        for report in reports:
+            role = assigned_roles.get(report.get("role_id"), {})
+            report["input_scope"] = {"declared_fields": deepcopy(role.get("input_projection", [])),
+                                     "assignment_phase": role.get("assignment_phase")}
+        packet["specialist_reports"] = reports
         if stage.get("kind") == "topic_discovery":
             topic = (stage_result.get("topic")
                      if isinstance(stage_result, dict) else None)
@@ -16976,7 +19612,7 @@ class ComposerRunner:
         context_limit = dispatcher.input_limit_for_role(
             verifier.get("model_role"), verifier_quota.get("max_input_tokens"))
         verifier["_prompt"] = build_verifier_prompt(
-            stage, packet, bundle.get("reports", []), chief_result,
+            stage, packet, reports, chief_result,
             max_input_tokens=context_limit)
         model_identity = {
             key: value for key, value in model.items()
@@ -17014,7 +19650,7 @@ class ComposerRunner:
                 "status": report.get("status"),
                 "artifact_ref": retained["artifact_ref"],
                 "usage": {},
-            })
+            }, assignment=stage_assignment)
             return report
         verifier["quota"] = {**verifier_quota, "max_input_tokens": context_limit}
         # Attempt bookkeeping uses the control-store connection owned by the
@@ -17031,6 +19667,10 @@ class ComposerRunner:
             "stage_id": stage["id"], "stage_kind": stage["kind"],
             "attempt_number": stage_assignment.get("attempt_number"),
             "input_digest": input_digest,
+            "initial_review_input": {
+                "system": VERIFIER_SYSTEM, "prompt": verifier["_prompt"],
+                "prompt_sha256": hashlib.sha256(verifier["_prompt"].encode("utf-8")).hexdigest(),
+            },
             "assigned_role": verifier.get("assigned_role"), "role_id": verifier.get("role_id"),
             "model_role": verifier.get("model_role"),
             "assignment_id": verifier.get("assignment_id"), "task_id": verifier.get("task_id"),
@@ -17042,6 +19682,7 @@ class ComposerRunner:
             verifier["assigned_role"],
         )
         report["artifact_ref"] = artifact["artifact_ref"]
+        self._settle_stage_specialist_payment(stage, stage_assignment["plan_ref"], artifact["artifact_ref"])
         self._specialist_progress(stage["id"], {
             "event": "completed", "role": verifier.get("assigned_role"),
             "role_id": verifier.get("role_id"), "task_id": verifier.get("task_id"),
@@ -17052,7 +19693,7 @@ class ComposerRunner:
             "artifact_ref": report.get("artifact_ref"),
             "response_ref": self._specialist_file_ref(artifact),
             "error": report.get("error"),
-        })
+        }, assignment=stage_assignment)
         return report
 
     def _stage_input_files(self, stage, descriptor, *, include_dependencies=True):
@@ -17149,6 +19790,8 @@ class ComposerRunner:
         key = cache.key(scope=f"stage:{stage['id']}", role=stage["kind"],
                         system="checked-stage-output-1", prompt=packet, model={})
         retained = cache.get(key)
+        if _report_has_model_call_failure(retained):
+            retained = None
         if retained and retained.get("status") == "blocked":
             # A scientific recovery cycle is a new execution boundary.  The
             # old stage cache records why the previous program was rejected,
@@ -17180,7 +19823,8 @@ class ComposerRunner:
                 and recovery_context.get("format_recovery_dispatched") is not True
             )
             if not scientific_recovery and not format_recovery:
-                blocked = ModelWorkBlocked(retained["error"])
+                blocked = ModelWorkBlocked(retained["error"],
+                                           failure_class=retained.get("failure_class"))
                 if retained.get("failure_class") == "context_budget":
                     blocked.failure_class = "context_budget"
                     blocked.context_budget = deepcopy(retained.get("context_budget", {}))
@@ -17191,6 +19835,9 @@ class ComposerRunner:
                     == retained.get("output_sha256")):
             result = deepcopy(retained["result"])
             result.update(usage={}, reused_from=retained["cache_ref"])
+            for name in ("foundry_usage", "repair_panel_usage"):
+                if name in result:
+                    result[name] = {}
             return result
         try:
             result = self._execute_stage(
@@ -17198,15 +19845,12 @@ class ComposerRunner:
                 specialist_reports=specialist_reports,
                 stage_assignment=stage_assignment)
             self._raise_stage_failure(result)
-            if result.get("status") not in STAGE_READY_STATUSES | STAGE_HOLD_STATUSES:
-                error = ValidationError(result.get("error") or f"stage {stage['id']} did not complete: {result.get('status')}")
-                error.usage = result.get("usage", {})
-                raise error
         except Exception as exc:
             # A provider reset is a time boundary, not a failed scientific
             # revision. Scoped research holds likewise return work orders.
             from scisaurus.runtime.capability_foundry import CapabilityDeadlineError
-            if isinstance(exc, (ProviderConfigurationError, ProviderCooldownError, CapabilityDeadlineError)) or (
+            if isinstance(exc, (ModelCallError, QuotaExceededError, *PROVIDER_OPERATOR_STOP_ERRORS, ProviderCooldownError, CapabilityDeadlineError,
+                                ComposerHardDeadlineExceeded, ComposerStageDeadlineExceeded)) or (
                     isinstance(exc, ModelCallError) and exc.status_code == 429):
                 raise
             if stage["kind"] == "topic_discovery":
@@ -17240,7 +19884,7 @@ class ComposerRunner:
                 blocked = ModelWorkBlocked(error)
                 blocked.failure_class = "context_budget"
                 blocked.context_budget = budget
-                blocked.usage = getattr(exc, "usage", {})
+                self._copy_error_accounting(exc, blocked)
                 if getattr(exc, "capability_repair_panel_completed", False):
                     blocked.capability_repair_panel_completed = True
                 if getattr(exc, "capability_repair_panel_attempted", False):
@@ -17252,14 +19896,15 @@ class ComposerRunner:
             exhausted = isinstance(exc, ModelWorkBlocked) or failures >= limit
             error = f"Unchanged {stage['id']} input failed {failures} time(s): {type(exc).__name__}: {exc}"
             cache.put(key, {"status": "blocked" if exhausted else "repairing",
-                            "failed_attempts": failures, "error": error})
+                            "failed_attempts": failures, "error": error,
+                            "failure_class": getattr(exc, "failure_class", None)})
             if exhausted:
                 blocked = ModelWorkBlocked(error)
                 for attribute in (
                         "failure_class", "recovery_mode", "repair_gate",
                         "repair_attempts", "repair_ledger", "repair_feedback",
                         "model_diagnostics", "capability_repair_panel_completed",
-                        "capability_repair_panel_attempted"):
+                        "capability_repair_panel_attempted", "repair_subject"):
                     if hasattr(exc, attribute):
                         setattr(blocked, attribute, deepcopy(getattr(exc, attribute)))
                 for attribute in ("research_argument", "research_review", "research_feedback",
@@ -17267,8 +19912,7 @@ class ComposerRunner:
                     value = getattr(exc, attribute, None)
                     if value is not None:
                         setattr(blocked, attribute, deepcopy(value))
-                blocked.usage = getattr(exc, "usage", {})
-                blocked.foundry_usage = deepcopy(getattr(exc, "foundry_usage", {}))
+                self._copy_error_accounting(exc, blocked)
                 stage_result = getattr(exc, "stage_result", None)
                 if isinstance(stage_result, dict):
                     blocked.stage_result = deepcopy(stage_result)
@@ -17292,14 +19936,28 @@ class ComposerRunner:
                 provider=failure.get("provider"),
                 credential_env=failure.get("credential_env"),
             )
+        elif failure.get("kind") == "provider_rate_limit":
+            error = ProviderRateLimitError(
+                result.get("error") or "stage provider rejected work with a rate limit",
+                provider=failure.get("provider"), details=failure.get("details"),
+            )
+            error.stage_result = deepcopy(result)
+        elif failure.get("kind") == "model_call":
+            error = ModelCallError.from_failure(
+                result.get("error") or "stage model request failed", failure)
+            error.stage_result = deepcopy(result)
         elif failure.get("kind") == "unchanged_assignment_exhausted":
-            error = ModelWorkBlocked(result.get("error") or "unchanged stage assignment exhausted")
+            error = ModelWorkBlocked(result.get("error") or "unchanged stage assignment exhausted",
+                                     failure_class=failure.get("failure_class"))
             # The runner still returned its complete scientific envelope.  Do
             # not reduce an exhausted model-contract retry to a bare string;
             # the Composer's failure panel needs the observed refs and gate
             # state to issue a useful repair order.
             error.stage_result = deepcopy(result)
             error.failure_scope = "stage"
+        elif failure.get("kind") == "operational_state":
+            error = StateError(result.get("error") or "stage lifecycle prerequisite failed")
+            error.stage_result = deepcopy(result)
         elif failure.get("kind") == "process_interrupted":
             raise KeyboardInterrupt(result.get("error") or "stage process interrupted")
         else:
@@ -17314,7 +19972,17 @@ class ComposerRunner:
                 result.get("error") or f"stage returned non-admissible status: {status}")
             error.stage_result = deepcopy(result)
             error.failure_scope = "stage"
-        error.usage = result.get("usage", {})
+        usage = result.get("usage")
+        error.usage = deepcopy(usage) if isinstance(usage, dict) else {}
+        for name in ("foundry_usage", "repair_panel_usage"):
+            owned_usage = result.get(name)
+            if isinstance(owned_usage, dict):
+                setattr(error, name, deepcopy(owned_usage))
+        # Producer usage excludes the already settled Methods invoice. Failed
+        # attempts retain its full cost while settlement subtracts its owner.
+        for key, value in getattr(error, "repair_panel_usage", {}).items():
+            error.usage[key] = error.usage.get(key, 0) + value
+        error.usage_is_snapshot = result.get("usage_is_snapshot", False)
         raise error
 
     def _failure_program_snapshot(self, stage, *, topic_context=None):
@@ -17414,8 +20082,131 @@ class ComposerRunner:
                 break
         return snapshots
 
+    def _read_verified_artifact_json(self, ref):
+        manifest = self.store.get(ref)
+        body_hash = manifest.get("body_hash")
+        body = self.store.read_body(body_hash)
+        actual_hash = hashlib.sha256(body).hexdigest()
+        if actual_hash != body_hash:
+            raise ValueError("artifact body does not match its manifest hash")
+        value = json.loads(body)
+        if not isinstance(value, dict):
+            raise ValueError("artifact body is not a JSON object")
+        return manifest, actual_hash, value
+
+    def _legacy_plan_repair_subject(self, stage_id, dossier_ref, dossier):
+        """Recover a plan's input subject from its completed, owned Methods receipt."""
+        observed = dossier.get("observed_result")
+        if isinstance(observed, dict) and observed.get("execution_refs"):
+            return None
+        record = self.stage_records.get(stage_id, {})
+        attempts = [*record.get("attempts", []), record]
+        owners = {item.get("attempt_id") for item in attempts
+                  if isinstance(item, dict) and item.get("failure_dossier_ref") == dossier_ref
+                  and item.get("attempt_id")}
+        if len(owners) != 1:
+            return None
+        owner = self.tasks.get_attempt(next(iter(owners)))
+        start = datetime.fromisoformat(owner["created_at"]).timestamp()
+        end = (datetime.fromisoformat(owner["finished_at"]).timestamp()
+               if owner.get("finished_at") else None)
+        if end is None:
+            return None
+        subjects = []
+        verdict_rows = self.control._conn.execute(
+            "SELECT artifact_ref,created_at FROM artifacts WHERE logical_id LIKE "
+            "'command/departments/methods/assignments/%/verifier-adversarial-reviewer'").fetchall()
+        for row in verdict_rows:
+            completed = datetime.fromisoformat(row["created_at"]).timestamp()
+            if not start <= completed <= end:
+                continue
+            _, _, verdict = self._read_verified_artifact_json(row["artifact_ref"])
+            if (verdict.get("schema_version") != "department-adversarial-verdict-1"
+                    or verdict.get("verdict") != "hold"
+                    or verdict.get("attempt_state") != "succeeded"):
+                continue
+            namespace, logical_name, _ = parse_ref(row["artifact_ref"])
+            plan_logical_id = namespace + "/" + logical_name.rsplit("/", 1)[0] + "/plan"
+            plan_rows = self.control._conn.execute(
+                "SELECT artifact_ref FROM artifacts WHERE logical_id=?", (plan_logical_id,)).fetchall()
+            plans = []
+            for plan_row in plan_rows:
+                plan_manifest, _, plan = self._read_verified_artifact_json(plan_row["artifact_ref"])
+                created = datetime.fromisoformat(plan_manifest["created_at"]).timestamp()
+                input_ref = plan.get("input_ref")
+                if (start <= created <= completed
+                        and isinstance(input_ref, dict)
+                        and input_ref.get("kind") == "capability_repair_panel"
+                        and input_ref.get("stage_id") == stage_id):
+                    plans.append(plan)
+            if not plans:
+                continue
+            if len(plans) != 1:
+                raise ValidationError("Methods repair subject has ambiguous plan ownership")
+            plan = plans[0]
+            input_ref = plan["input_ref"]
+            chief_manifest, _, chief = self._read_verified_artifact_json(verdict["chief_synthesis_ref"])
+            chief_created = datetime.fromisoformat(chief_manifest["created_at"]).timestamp()
+            identity_keys = ("stage_id", "attempt_number", "department", "project_id")
+            if (not start <= chief_created <= completed
+                    or chief.get("schema_version") != "department-chief-synthesis-1"
+                    or chief.get("outcome") != "completed"
+                    or any(plan.get(key) != chief.get(key) or plan.get(key) != verdict.get(key)
+                           for key in identity_keys)
+                    or chief.get("assignment_refs") != verdict.get("assignment_refs")):
+                raise ValidationError("Methods repair subject has inconsistent completion evidence")
+            planned_assignments = {item.get("assignment_id"): item for item in plan.get("assignments", [])
+                                   if isinstance(item, dict)}
+            for assignment_ref in chief.get("assignment_refs", []):
+                _, _, assignment = self._read_verified_artifact_json(assignment_ref)
+                if assignment.get("role_id") != "methodologist":
+                    continue
+                planned = planned_assignments.get(assignment.get("assignment_id"))
+                if (not isinstance(planned, dict) or planned.get("role_id") != "methodologist"
+                        or planned.get("task_id") != assignment.get("task_id")
+                        or assignment.get("input_ref") != input_ref
+                        or assignment.get("attempt_state") != "succeeded"
+                        or assignment.get("stage_id") != plan.get("stage_id")):
+                    raise ValidationError("Methods repair subject has inconsistent assignment evidence")
+                execution_manifest, _, execution = self._read_verified_artifact_json(assignment["execution_artifact_ref"])
+                execution_created = datetime.fromisoformat(execution_manifest["created_at"]).timestamp()
+                if (execution.get("schema_version") != "specialist-execution-1"
+                        or execution.get("input_ref") != input_ref
+                        or not isinstance(execution.get("input_digest"), str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", execution["input_digest"])
+                        or not start <= execution_created <= chief_created
+                        or any(execution.get(key) != assignment.get(key)
+                               for key in ("assignment_id", "task_id", "role_id", "stage_id"))
+                        or any(execution.get(key) != plan.get(key)
+                               for key in ("attempt_number", "project_id"))):
+                    raise ValidationError("Methods repair subject has inconsistent execution evidence")
+                for request in execution.get("report", {}).get("request_inputs", []):
+                    inputs = request.get("input") if isinstance(request, dict) else None
+                    if not isinstance(inputs, dict) or not isinstance(inputs.get("prompt"), str):
+                        continue
+                    payload = json.loads(inputs["prompt"])
+                    packet = payload.get("repair_adjudication_packet") if isinstance(payload, dict) else None
+                    lineage = packet.get("failure_lineage") if isinstance(packet, dict) else None
+                    if not isinstance(lineage, dict):
+                        continue
+                    if (lineage.get("stage_id") != stage_id
+                            or lineage.get("identity_verified") is not True
+                            or lineage.get("adjudication_packet_input_sha256") != input_ref["digest"]):
+                        raise ValidationError("Methods repair subject has inconsistent input evidence")
+                    subjects.append({
+                        "stage_id": stage_id,
+                        "failure_dossier_ref": lineage.get("failure_dossier_ref"),
+                        "attempt_number": lineage.get("failed_stage_attempt_number"),
+                        "failure_input_sha256": lineage.get("failed_stage_input_sha256"),
+                        "failure_dossier_body_sha256": lineage.get("failure_dossier_body_sha256"),
+                    })
+        unique = {canonical_bytes(subject): subject for subject in subjects}
+        if len(unique) > 1:
+            raise ValidationError("Methods repair subject has ambiguous input evidence")
+        return next(iter(unique.values()), None)
+
     def _failure_dossier_evidence(self, artifact_ref, *, expected_stage_id=None,
-                                  expected_attempt_number=None):
+                                  expected_attempt_number=None, _visited=None):
         """Resolve a failed attempt's immutable evidence for bounded review.
 
         A reference alone is not review evidence: specialist workers cannot
@@ -17428,17 +20219,11 @@ class ComposerRunner:
         if not isinstance(artifact_ref, str) or not artifact_ref.strip():
             return None
 
-        def read_verified_json(ref):
-            artifact_manifest = self.store.get(ref)
-            body_hash = artifact_manifest.get("body_hash")
-            body = self.store.read_body(body_hash)
-            actual_body_hash = hashlib.sha256(body).hexdigest()
-            if actual_body_hash != body_hash:
-                raise ValueError("artifact body does not match its manifest hash")
-            value = json.loads(body)
-            if not isinstance(value, dict):
-                raise ValueError("artifact body is not a JSON object")
-            return artifact_manifest, actual_body_hash, value
+        visited = set(_visited or ())
+        if artifact_ref in visited:
+            raise ValidationError("Methods repair subject contains a cyclic dossier reference")
+        visited.add(artifact_ref)
+        read_verified_json = self._read_verified_artifact_json
 
         try:
             manifest, dossier_body_hash, dossier = read_verified_json(artifact_ref)
@@ -17617,7 +20402,8 @@ class ComposerRunner:
         if isinstance(observed, dict):
             observed = {key: observed.get(key) for key in (
                 "status", "error", "usage", "raw_results", "derived_results",
-                "execution_manifest", "input_digests") if key in observed}
+                "execution_manifest", "input_digests", "execution_refs",
+                "raw_results_sha256", "derived_results_sha256") if key in observed}
 
         response = foundry_cache.get("last_response")
         if isinstance(response, dict):
@@ -17701,6 +20487,13 @@ class ComposerRunner:
                 "acceptance_check_lineage_conflicts": omitted_acceptance_check_lineage_count,
             },
             "experiment_intent": last_attempt.get("experiment_intent"),
+            "candidate_input_sha256": hashlib.sha256(canonical_bytes({
+                key: last_attempt.get(key) for key in (
+                    "experiment_intent", "runtime", "test_input", "source_integrity")})).hexdigest(),
+            "validation_context_sha256": hashlib.sha256(canonical_bytes(
+                foundry_cache.get("validation_context"))).hexdigest(),
+            "topic_identity": {key: foundry.get(key) for key in (
+                "topic_id", "research_question", "domain")},
             "source_integrity": integrity,
             "source_files": source_files,
             "runtime": last_attempt.get("runtime"),
@@ -17721,6 +20514,56 @@ class ComposerRunner:
             "repair_ledger": foundry_cache.get("repair_ledger", [])[-6:]
             if isinstance(foundry_cache.get("repair_ledger"), list) else [],
         }
+        subject = dossier.get("repair_subject")
+        if subject is None:
+            subject = self._legacy_plan_repair_subject(
+                dossier_stage_id, artifact_ref, dossier)
+        if subject is not None:
+            if (not isinstance(subject, dict) or subject.get("stage_id") != dossier_stage_id
+                    or not isinstance(subject.get("failure_dossier_ref"), str)
+                    or type(subject.get("attempt_number")) is not int
+                    or subject["attempt_number"] >= dossier_attempt_number):
+                raise ValidationError("Methods repair subject has invalid dossier identity")
+            if dossier.get("repair_subject") is not None and (
+                    dossier.get("repair_phase") != "pre_execution_plan_review"
+                    or isinstance(observed, dict) and observed.get("execution_refs")
+                    or bool(dossier_attempt)):
+                raise ValidationError("Methods repair subject conflicts with newly produced candidate evidence")
+            origin = self._failure_dossier_evidence(
+                subject["failure_dossier_ref"], expected_stage_id=dossier_stage_id,
+                expected_attempt_number=subject["attempt_number"], _visited=visited)
+            if (not isinstance(origin, dict) or origin.get("available") is not True
+                    or origin.get("input_sha256") != subject.get("failure_input_sha256")
+                    or origin.get("artifact_body_sha256") != subject.get("failure_dossier_body_sha256")):
+                raise ValidationError("Methods repair subject does not match its immutable dossier")
+            if dossier.get("repair_subject") is None and any(
+                    isinstance(last_attempt.get(name + "_source"), str)
+                    for name in ("executor", "validator")):
+                if (evidence["candidate_input_sha256"] != origin.get("candidate_input_sha256")
+                        or foundry_cache_ref is not None and foundry_cache_ref != origin.get("foundry_work_artifact_ref")
+                        or evidence.get("validation_context") is not None and (
+                            evidence["validation_context_sha256"]
+                            != origin.get("validation_context_sha256"))
+                        or any(isinstance(last_attempt.get(name + "_source"), str) and (
+                            item.get("available") is not True
+                            or item.get("integrity_verified") is not True
+                            or item.get("expected_sha256") != origin.get("source_files", {}).get(name, {}).get("expected_sha256")
+                            or item.get("prompt_source_sha256") != origin.get("source_files", {}).get(name, {}).get("prompt_source_sha256"))
+                            for name, item in source_files.items())):
+                    raise ValidationError("Methods repair subject conflicts with newly produced candidate evidence")
+            for key in ("experiment_intent", "candidate_input_sha256", "validation_context_sha256",
+                        "topic_identity", "source_integrity", "source_files",
+                        "runtime", "test_input", "program_snapshot", "prior_foundry_feedback",
+                        "foundry_work_artifact_ref", "foundry_work_body_sha256",
+                        "foundry_work_body_verified", "foundry_work_identity_verified",
+                        "foundry_work_unavailable_reason", "foundry_status", "foundry_work_attempts",
+                        "repair_gate_counts", "validation_feedback", "validation_context", "repair_ledger"):
+                evidence[key] = deepcopy(origin.get(key))
+            evidence["repair_subject_lineage"] = deepcopy(
+                origin.get("repair_subject_lineage", subject))
+            evidence["scientific_failure_error"] = origin.get("scientific_failure_error", origin.get("error"))
+            evidence["scientific_observed_result"] = deepcopy(
+                origin.get("scientific_observed_result", origin.get("observed_result")))
         return self._capability_repair_projection(
             evidence, max_depth=7, max_keys=40, max_items=12, max_text=20_000)
 
@@ -17820,7 +20663,7 @@ class ComposerRunner:
             (dossier or {}).get("input_sha256")
             if isinstance(dossier, dict) else None
         ) or recovery.get("input_sha256") or context.get("failure_input_sha256") or ""
-        digest = re.sub(r"[^a-z0-9]", "", str(digest).casefold())[:16] or "undigested"
+        digest = re.sub(r"[^a-z0-9]", "", str(digest).casefold()) or "undigested"
         safe_stage = re.sub(r"[^a-z0-9_.-]+", "-", str(stage["id"]).casefold()).strip("-")
         safe_stage = safe_stage[:24] or "stage"
         attempt = context.get("format_recovery_attempts", 1)
@@ -17854,7 +20697,7 @@ class ComposerRunner:
                 "was never admitted or executed, so do not issue a scientific experiment/code-repair "
                 "order or claim new observations."
             )
-        request_digest = digest
+        request_digest = digest[:16]
         if policy_revision:
             request_digest = hashlib.sha256(
                 f"{digest}:{policy_revision}".encode("utf-8")).hexdigest()[:16]
@@ -18667,16 +21510,21 @@ class ComposerRunner:
                 recovered_base.update(deepcopy(context))
             context = recovered_base
         stage_result = current_stage_result
+        subject = getattr(error, "repair_subject", None)
+        plan_review_failure = isinstance(subject, dict)
         dossier = build_failure_dossier(
             stage=stage, attempt_stage=attempt_stage, error=error,
             stage_result=stage_result,
             specialist_reports=(specialist_bundle or {}).get("reports", [])
             if isinstance(specialist_bundle, dict) else [],
             verifier=specialist_verifier,
-            program_snapshot=self._failure_program_snapshot(stage),
-            foundry_work_snapshot=self._failed_foundry_work_for_stage(stage),
+            program_snapshot=[] if plan_review_failure else self._failure_program_snapshot(stage),
+            foundry_work_snapshot={} if plan_review_failure else self._failed_foundry_work_for_stage(stage),
             attempt_number=attempt_number,
         )
+        if plan_review_failure:
+            dossier["repair_subject"] = deepcopy(subject)
+            dossier["repair_phase"] = "pre_execution_plan_review"
         # Resource fences still get a dossier for the ledger, but they do not
         # create a scientific work order or consume a repair call.
         dossier_record = self._publish(
@@ -19004,13 +21852,42 @@ class ComposerRunner:
 
     def _execute_stage(self, stage, *, attempt_number=1, specialist_reports=None,
                        stage_assignment=None):
+        """Preserve authoring usage across every producer failure boundary."""
+        before = deepcopy(self.foundry_usage)
+        panel_before = self._repair_panel_usage_total(stage["id"])
+        try:
+            result = self._produce_stage(stage, attempt_number=attempt_number,
+                specialist_reports=specialist_reports, stage_assignment=stage_assignment)
+            if stage["kind"] == "experiment":
+                result["repair_panel_usage"] = self._usage_delta(
+                    self._repair_panel_usage_total(stage["id"]), panel_before)
+            return result
+        except Exception as exc:
+            if stage["kind"] == "experiment":
+                self._sync_foundry_usage()
+                if getattr(exc, "usage_is_snapshot", False):
+                    exc.usage = {}
+                    exc.usage_is_snapshot = False
+                exc.foundry_usage = self._usage_delta(self.foundry_usage, before)
+                if not getattr(exc, "usage_includes_foundry", False):
+                    self._merge_incremental_error_usage(exc, exc.foundry_usage)
+                exc.usage_includes_foundry = True
+                panel_usage = self._usage_delta(
+                    self._repair_panel_usage_total(stage["id"]), panel_before)
+                if not isinstance(getattr(exc, "repair_panel_usage", None), dict):
+                    self._merge_incremental_error_usage(exc, panel_usage)
+                exc.repair_panel_usage = panel_usage
+            raise
+
+    def _produce_stage(self, stage, *, attempt_number=1, specialist_reports=None,
+                       stage_assignment=None):
         """Dispatch one allowlisted specialist runner and return its context."""
         kind = stage["kind"]
         foundry_usage_before = deepcopy(self.foundry_usage) if kind == "experiment" else {}
         foundry_usage_delta = {}
         project_dir = Path(stage["project_dir"])
         output_path = None
-        stage_deadline = min(float(stage["deadline_seconds"]), self._remaining())
+        stage_deadline = self._stage_remaining(stage)
         retained_topic = stage.get("_resume_topic_result")
         if kind == "topic_discovery" and isinstance(retained_topic, dict):
             retained_path = Path(retained_topic["output_path"]).resolve()
@@ -19072,6 +21949,8 @@ class ComposerRunner:
         config = json.loads(Path(stage["config_path"]).read_text())
         config = self._adapt_continuation_config(stage, config)
         config = self._apply_stage_quota(config, stage)
+        if kind != "survey" and isinstance(config.get("model"), dict):
+            config["model"] = self._stage_model_config(stage, config["model"])
         # The mission deadline governs total autonomy, not the number of
         # attempts spent repairing one unchanged model assignment.
         if kind in {"survey", "experiment"} and self._allows_provisional_progress():
@@ -19112,7 +21991,7 @@ class ComposerRunner:
             # completed selection before they ask the model for a topic.
             self.topic_history = self._load_topic_history()
             descriptor = validate_topic_stage_config(config)
-            model = json.loads(Path(descriptor["model_config_path"]).read_text())
+            model = self._stage_model_config(stage, json.loads(Path(descriptor["model_config_path"]).read_text()))
             runner = TopicDiscoveryRunner(model, deadline_seconds=stage_deadline)
             maturity_rounds = descriptor.get("maturity_review_rounds", 0)
             # Journal-oriented free-topic missions target a research paper,
@@ -19176,7 +22055,7 @@ class ComposerRunner:
                 else:
                     result = runner.run(**topic_kwargs)
                     self._validate_refined_topic_result(result, topic_refinement)
-            except ProviderCooldownError:
+            except (*PROVIDER_OPERATOR_STOP_ERRORS, ProviderCooldownError):
                 raise
             except ValidationError as exc:
                 # The bounded descriptor owns one isolated intake. A
@@ -19286,6 +22165,7 @@ class ComposerRunner:
                 foundry_usage_delta = self._usage_delta(
                     self.foundry_usage, foundry_usage_before)
             config = self._apply_bindings(config, stage["bindings"])
+            stage_deadline = self._stage_remaining(stage)
             if kind == "experiment":
                 config = self._ensure_journal_quality_contract(stage, config)
             config.setdefault("limits", {})["wall_clock_seconds"] = min(
@@ -19304,6 +22184,8 @@ class ComposerRunner:
                 project_dir = Path(stage["project_dir"])
                 prior_run = project_dir / "output" / "run.json"
                 resume_policy = None
+                declared_revalidation_scopes = self._survey_revalidation_scopes(stage)
+                revalidation_scopes, mapping_milestone = self._survey_revalidation_resume_plan(stage, declared_revalidation_scopes)
                 project_has_checkpoint = (project_dir / "state" / "control.sqlite").is_file()
                 prior = {}
                 if prior_run.is_file():
@@ -19324,9 +22206,11 @@ class ComposerRunner:
                 resumable_checkpoint = (
                     project_has_checkpoint
                     and durable_config is not None
-                    and (not prior_run.is_file()
+                    and (bool(revalidation_scopes) or not prior_run.is_file()
                          or prior.get("status") in {"blocked", "paused", "running"})
                 )
+                if revalidation_scopes and not resumable_checkpoint:
+                    raise StateError("survey revalidation requires the retained immutable runner input")
                 provider_fallback = None
                 if resumable_checkpoint:
                     # The durable runner input is authoritative for a
@@ -19339,8 +22223,8 @@ class ComposerRunner:
                     if (isinstance(fallback, dict)
                             and fallback.get("mode") == "crossref_metadata"):
                         provider_fallback = "crossref_metadata"
-                    scope = self._survey_resume_scope(
-                        prior, stage_context=self.context.get(stage["id"]))
+                    scopes = revalidation_scopes or [self._survey_resume_scope(
+                        prior, stage_context=self.context.get(stage["id"]))]
                     resume_policy = {
                         # Composer owns autonomous recovery.  A process
                         # interruption cannot observe an in-flight model
@@ -19348,35 +22232,41 @@ class ComposerRunner:
                         # model call before retrying the scoped survey.
                         "additional_seconds": min(
                             float(config["limits"]["wall_clock_seconds"]),
-                            max(1.0, self._remaining()),
+                            self._stage_remaining(stage),
                         ),
                         "unknown_outcomes": {
                             "mode": "charge_and_retry",
                             "usage_per_attempt": {"model_calls": 1},
                         },
-                        "source_changes": {"mode": "reopen", "reopen_scopes": [scope]},
+                        "source_changes": {"mode": "reopen", "reopen_scopes": scopes},
                     }
                     self._publish(f"command/composer/recovery/{stage['id']}-{len(self.feedback) + 1}",
                                   "decision_note", {
                                       "stage_id": stage["id"], "action": "resume_scoped_stage",
-                                      "scope": scope, "reason": prior.get("error", "recoverable stage blocker"),
+                                      "scopes": scopes, "reason": prior.get("error", "scoped stage revalidation"),
                                       "additional_seconds": resume_policy["additional_seconds"],
                                   }, "command.composer")
+                delegation = self._stage_model_delegation(stage)
                 result = SurveyRunner(stage["project_dir"], config, on_progress=self._stage_progress(stage),
+                                      work_orders=self._follow_up_projection([item for item in self._requests_for_stage(stage)
+                                                                             if "resume_scopes" not in item]),
                                       resume_policy=resume_policy,
-                                      provider_fallback=provider_fallback).run()
+                                      provider_fallback=provider_fallback,
+                                      model_call_budget_scopes=[delegation["scope"]] if delegation else [],
+                                      model_budget_delegation=delegation).run()
                 result["usage"] = self._incremental_stage_usage(stage, result.get("usage", {}))
+                if revalidation_scopes:
+                    try:
+                        self._record_survey_revalidation(stage, result, revalidation_scopes, prior.get("run_id"),
+                                                         declared_scopes=declared_revalidation_scopes, mapping_milestone=mapping_milestone)
+                    except Exception as exc:
+                        exc.usage = deepcopy(result["usage"])
+                        raise
                 self._raise_stage_failure(result)
             else:
                 from scisaurus.runtime.experiment import ExperimentRunner
-                try:
-                    result = ExperimentRunner(stage["project_dir"], config,
-                                              on_progress=self._stage_progress(stage)).run()
-                except Exception as exc:
-                    self._sync_foundry_usage()
-                    setattr(exc, "foundry_usage", self._usage_delta(
-                        self.foundry_usage, foundry_usage_before))
-                    raise
+                result = ExperimentRunner(stage["project_dir"], config,
+                                          on_progress=self._stage_progress(stage)).run()
                 result["usage"] = self._incremental_stage_usage(stage, result.get("usage", {}))
             if kind == "experiment":
                 result["foundry_usage"] = deepcopy(foundry_usage_delta)
@@ -19420,12 +22310,15 @@ class ComposerRunner:
                         value = json.loads(Path(value).read_text())
                     _set_path(packet, binding["target"][len("packet."):], value)
             self._synchronize_research_packet_identity(packet)
+            packet["maturity_requirements"] = self._active_maturity_requirements(stage)
+            self._attach_stage_survey_evidence(packet, stage)
             result = ScientificInterpretationRunner(
-                json.loads(model_path.read_text()), deadline_seconds=stage_deadline).run(packet)
+                self._stage_model_config(stage, json.loads(model_path.read_text())),
+                deadline_seconds=stage_deadline).run(packet)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(canonical_bytes(result))
             result = {"status": "completed", "output_path": str(output_path.resolve()),
-                      "interpretation": result}
+                      "usage": deepcopy(result.get("usage", {})), "interpretation": result}
         elif kind == "argument":
             from scisaurus.runtime.research_argument import ResearchArgumentRunner, argument_evidence_packet
             descriptor_bindings = [item for item in stage["bindings"]
@@ -19451,7 +22344,8 @@ class ComposerRunner:
                         value = json.loads(Path(value).read_text())
                     _set_path(packet, binding["target"][len("packet."):], value)
             self._synchronize_research_packet_identity(packet)
-            model = json.loads(model_path.read_text())
+            model = self._stage_model_config(stage, json.loads(model_path.read_text()))
+            self._attach_stage_survey_evidence(packet, stage)
             minimums = self._argument_minimums(stage["id"], config)
             result = ResearchArgumentRunner(model, deadline_seconds=stage_deadline).run(
                 argument_evidence_packet(packet), max_attempts=1,
@@ -19461,6 +22355,7 @@ class ComposerRunner:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(canonical_bytes(result))
             result = {"status": "completed", "output_path": str(output_path.resolve()),
+                      "usage": deepcopy(result.get("usage", {})),
                       "argument_package": result, "argument": result.get("argument")}
         elif kind == "paper" and config.get("schema_version") == "review-article-config-1":
             from scisaurus.runtime.review_article import ReviewArticleRunner
@@ -19468,6 +22363,8 @@ class ComposerRunner:
             config["work_orders"] = self._follow_up_projection(self._requests_for_stage(stage))
             result = ReviewArticleRunner(
                 config, retained_work_dir=self.root / "retained-review-work" / stage["id"],
+                model_config=self._stage_model_config(
+                    stage, json.loads(Path(config["model_config_path"]).read_text())),
                 deadline_seconds=stage_deadline,
                 on_progress=lambda event: self._record_internal_feedback(stage, event),
             ).run()
@@ -19510,7 +22407,7 @@ class ComposerRunner:
             packet = json.loads(Path(config["packet_path"]).read_text())
             packet = self._project_continuation_requests(packet, stage)
             packet = self._attach_topic_program(packet)
-            model = json.loads(Path(config["model_config_path"]).read_text())
+            model = self._stage_model_config(stage, json.loads(Path(config["model_config_path"]).read_text()))
             paper_config = json.loads(Path(config["paper_config_path"]).read_text())
             draft = (json.loads(Path(config["draft_path"]).read_text())
                      if config.get("draft_path") else None)
@@ -19608,9 +22505,75 @@ class ComposerRunner:
             context["argument_package_path"] = context["output_path"]
         return context
 
+    def _overlay_child_progress(self, state):
+        """Project observed work without changing settled costs or stage authority."""
+        settled = state.get("usage", {})
+        state["observed_usage"] = deepcopy(settled)
+        for stage_id, record in state.get("stages", {}).items():
+            record.pop("child_progress", None)
+            child = self._child_progress.get(stage_id)
+            if (not child or record.get("status") != "running"
+                    or record.get("attempt_id") != child["attempt_id"]):
+                continue
+            record["child_progress"] = deepcopy(child["state"])
+            if child["activity_active"]:
+                record["active_agents"] = list(dict.fromkeys(
+                    operation["actor"] for operation in child["state"]["active_operations"]))
+                if state.get("phase", "").split(":", 1)[0] == stage_id:
+                    state["phase"] = f"{stage_id}:{child['state']['phase']}"
+            namespace = hashlib.sha256(child["state"]["project_dir"].encode()).hexdigest()
+            committed = self.stage_usage_totals.get(namespace, {})
+            for key, quantity in child["state"]["cumulative_usage"].items():
+                baseline = max(child["baseline"].get(key, 0), committed.get(key, 0))
+                state["observed_usage"][key] = state["observed_usage"].get(key, 0) + max(0, quantity - baseline)
+
+    def _clear_child_progress(self, stage_id):
+        with self._progress_lock:
+            self._child_progress.pop(stage_id, None)
+            record = self._progress_snapshot.get("stages", {}).get(stage_id, {})
+            record.pop("child_progress", None)
+            self._progress_snapshot["usage"] = deepcopy(self.usage)
+            self._progress_snapshot["observed_usage"] = deepcopy(self.usage)
+
     def _stage_progress(self, stage):
+        attempt_id = self.stage_records.get(stage["id"], {}).get("attempt_id")
+        project_dir = str(Path(stage["project_dir"]).resolve())
+        _, baseline = self._stage_usage_baseline(project_dir)
+        run_id = None
+
         def callback(state):
-            self._checkpoint(f"{stage['id']}:{state.get('phase', 'progress')}")
+            nonlocal run_id
+            current = self.stage_records.get(stage["id"], {})
+            if current.get("status") != "running" or current.get("attempt_id") != attempt_id:
+                return
+            if not isinstance(state.get("run_id"), str):
+                self._checkpoint(f"{stage['id']}:{state.get('phase', 'progress')}")
+                return
+            if state.get("project_dir") != project_dir or run_id not in (None, state["run_id"]):
+                return
+            operations = state.get("active_operations")
+            usage = state.get("cumulative_usage")
+            if (not isinstance(operations, list) or not isinstance(usage, dict)
+                    or any(not isinstance(operation, dict) or any(
+                        not isinstance(operation.get(key), str) for key in ("task_id", "actor", "kind"))
+                        for operation in operations)
+                    or any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                           for value in usage.values())):
+                return
+            run_id = state["run_id"]
+            telemetry = {key: deepcopy(state[key]) for key in (
+                "run_id", "project_dir", "phase", "active_tasks", "active_operations",
+                "cumulative_usage", "reserved_usage", "time_plan") if key in state}
+            with self._progress_lock:
+                self._child_progress[stage["id"]] = {"attempt_id": attempt_id,
+                    "baseline": baseline, "state": telemetry, "activity_active": True}
+                snapshot = deepcopy(self._progress_snapshot)
+                snapshot["usage"] = deepcopy(self.usage)
+                snapshot["phase"] = f"{stage['id']}:{state.get('phase', 'progress')}"
+                snapshot.setdefault("stages", {})[stage["id"]] = deepcopy(current)
+                self._overlay_child_progress(snapshot)
+                self._progress_snapshot = snapshot
+            self._live_progress(snapshot["phase"])
         return callback
 
     def _record_feedback(self, stage, context):
@@ -19896,7 +22859,7 @@ class ComposerRunner:
         if not self.active_research_requests:
             return []
         resolved = self.departments.resolve_work_orders(
-            self.active_research_requests, stage_kind=stage["kind"], outcome="blocked")
+            self.active_research_requests, stage_kind=stage["kind"], stage_id=stage["id"], outcome="blocked")
         if resolved:
             self.department_activity.append({
                 "cycle": self.continuation_cycles,
@@ -20364,6 +23327,7 @@ class ComposerRunner:
             isinstance(stage, dict)
             and stage.get("kind") == "survey"
             and isinstance(error, (ModelWorkBlocked, str))
+            and getattr(error, "failure_class", None) != "model_contract"
             and any(marker in str(error).casefold() for marker in (
                 "did not satisfy its evidence contract",
                 "gap-assessment",
@@ -21240,7 +24204,9 @@ class ComposerRunner:
                     or assessment.get("state") != report.get("gap_state")
                     or assessment.get("survey_ref") != report.get("survey_ref")
                     or not self._survey_references_are_durable(
-                        project, [report["survey_ref"], report["assessment_ref"]])):
+                        project, [report["survey_ref"], report["assessment_ref"]])
+                    or not self._survey_attempt_was_accepted(survey_id, attempt, report)
+                    or not self._survey_references_are_current(project, report)):
                 continue
             nomination = report.get("nomination")
             if (isinstance(nomination, dict)
@@ -21423,40 +24389,14 @@ class ComposerRunner:
                 "assessment_ref": retained_survey["assessment_ref"],
                 "reason": "the exact current assessment was completed before the invalid topic branch",
             },
+            **{key: deepcopy(retained_survey[key]) for key in
+               ("work_orders", "follow_up_ref", "follow_up_result") if key in retained_survey},
         }
         survey_context = self._gate_free_topic_survey(
             survey_context, stage=survey_stage)
         if survey_context.get("topic_admission") not in {
                 "provisional_supported_for_experiment", "exploratory_pilot"}:
             return False
-        completed_survey_expansion = next((attempt for attempt in reversed(survey_attempts)
-            if isinstance(attempt, dict)
-            and attempt.get("state") in {"succeeded", "completed"}
-            and attempt.get("cycle") == self.continuation_cycles
-            and attempt.get("topic_id") == topic["id"]
-            and attempt.get("topic_cycle") == topic_cycle), None)
-        deferred_survey_requests = []
-        if (gap_state == "insufficient_evidence"
-                and isinstance(completed_survey_expansion, dict)):
-            deferred_survey_requests = [
-                deepcopy(request) for request in self.active_research_requests
-                if isinstance(request, dict)
-                and request.get("kind") == "literature_expansion"
-                and request.get("owner") == "research.intelligence"
-                and request.get("target_stage_id") in {None, survey_id}
-            ]
-            if deferred_survey_requests:
-                survey_context["deferred_research_requests"] = [
-                    {
-                        **request,
-                        "deferred_reason": (
-                            "A same-lineage focused survey expansion completed without resolving "
-                            "the gap; continue with an explicitly exploratory experiment and reopen "
-                            "literature work only for a concrete evidence need."
-                        ),
-                    }
-                    for request in deferred_survey_requests
-                ]
         self.context[survey_id] = survey_context
         survey_record.update({
             "kind": "survey", "status": "completed",
@@ -21573,24 +24513,6 @@ class ComposerRunner:
                 ),
                 "next_action": "retry the original same-topic experiment failure, not the admission error",
             })
-        if deferred_survey_requests:
-            deferred_ids = {request.get("id") for request in deferred_survey_requests}
-            self.active_research_requests = [
-                request for request in self.active_research_requests
-                if not (isinstance(request, dict) and request.get("id") in deferred_ids)
-            ]
-            self.department_activity.append({
-                "cycle": self.continuation_cycles,
-                "action": "defer_unresolved_survey_expansion_after_attempt",
-                "stage_id": survey_id,
-                "topic_id": topic["id"],
-                "topic_cycle": topic_cycle,
-                "survey_attempt": completed_survey_expansion.get("attempt_number"),
-                "gap_state": gap_state,
-                "request_ids": sorted(item for item in deferred_ids if isinstance(item, str)),
-                "next_action": "preserve the novelty limitation and proceed with the exploratory experiment",
-            })
-
         request = self._autonomous_experiment_repair_request(
             experiment_stage, experiment_context, dossier["error"], prior_repair_count)
         if request is None:
@@ -21673,6 +24595,19 @@ class ComposerRunner:
             context = self.context.get(stage_id)
             record = self.stage_records.get(stage_id, {})
             if not isinstance(context, dict) or not isinstance(record, dict):
+                continue
+            attempts = record.get("attempts", [])
+            latest_attempt = next((item for item in reversed(attempts)
+                                   if isinstance(item, dict)), None) if isinstance(attempts, list) else None
+            if (stage_id in self.continuation_pending_stage_ids
+                    and record.get("status") == "retrying"
+                    and isinstance(latest_attempt, dict)
+                    and latest_attempt.get("state") == "unknown"
+                    and latest_attempt.get("cycle") == self.continuation_cycles
+                    and latest_attempt.get("attempt_id") == record.get("last_attempt_id")):
+                # An interrupted aggregate has no new scientific verdict.
+                # Resume its admitted producer frontier before deriving any
+                # new repair order from the previous completed result.
                 continue
             if context.get("pivoted_to_topic"):
                 current_topic = self._current_topic_identity()
@@ -21797,6 +24732,8 @@ class ComposerRunner:
                     continue
             if not self._is_pre_execution_capability_failure(
                     stage, context, record.get("error")):
+                continue
+            if self._has_pending_admitted_recovery(stage, by_id):
                 continue
             if any(
                     self._is_experiment_repair_request(item)
@@ -22611,6 +25548,8 @@ class ComposerRunner:
             completed = {stage_id for stage_id, row in self.stage_records.items()
                          if self._stage_releases_dependencies(
                              row, stage_kind=by_id.get(stage_id, {}).get("kind"))}
+            if self._restore_interrupted_completed_survey_acquisition(completed, by_id):
+                self._checkpoint("resume:completed_survey_acquisition_reused", force=True)
             restored_lineage_frontier = self._restore_unjustified_refinement_frontier(
                 completed, by_id)
             if (isinstance(self._restored_topic_lineage_reconciliation, dict)
@@ -23150,11 +26089,17 @@ class ComposerRunner:
                         task_id = task["task_id"]
                         attempt_id = f"{task_id}-{uuid.uuid4().hex}"
                         attempt_started = self.clock()
+                        attempt_seconds = min(float(stage["deadline_seconds"]), self._remaining())
+                        attempt_stage["attempt_deadline_at_epoch"] = min(
+                            self.deadline_epoch, time.time() + attempt_seconds)
                         self.tasks.start_attempt(
                             task_id, attempt_id, owner="command.composer",
-                            lease_ttl_seconds=max(1.0, self._remaining()),
+                            lease_ttl_seconds=attempt_seconds,
                             payload={"stage_id": stage_id, "kind": stage["kind"],
                                      "attempt_number": attempt_number,
+                                     "model_budget_cycle": (self.continuation_cycles
+                                         if stage_id in self.reopened_stage_ids else 0),
+                                     "attempt_deadline_at_epoch": attempt_stage["attempt_deadline_at_epoch"],
                                      "project_dir": attempt_stage["project_dir"]})
                         topic_lineage = (
                             self._current_topic_identity()
@@ -23165,8 +26110,11 @@ class ComposerRunner:
                             "task_id": task_id, "attempt_id": attempt_id, "attempt_number": attempt_number,
                             "attempt_count": attempt_number,
                             "started_elapsed": attempt_started - self.started,
+                            "attempt_deadline_at_epoch": attempt_stage["attempt_deadline_at_epoch"],
                             "project_dir": attempt_stage["project_dir"],
                             "attempts": deepcopy(attempt_history),
+                            **({"completed_mapping": deepcopy(prior_record["completed_mapping"])}
+                               if isinstance(prior_record.get("completed_mapping"), dict) else {}),
                             **({"topic_id": topic_lineage["topic_id"],
                                 "topic_cycle": topic_lineage["topic_cycle"]}
                                if isinstance(topic_lineage, dict) else {}),
@@ -23184,6 +26132,9 @@ class ComposerRunner:
                         specialist_verifier = None
                         failure_dossier = None
                         usage_recorded = False
+                        producer_usage = None
+                        producer_foundry_usage = {}
+                        producer_repair_panel_usage = {}
                         try:
                             stage_assignment = self.departments.begin_stage(
                                 stage_id, stage["kind"], attempt_number=attempt_number,
@@ -23194,7 +26145,7 @@ class ComposerRunner:
                                         "project_dir": attempt_stage["project_dir"],
                                     })).hexdigest(),
                                 },
-                                deadline_seconds=min(float(stage["deadline_seconds"]), self._remaining()),
+                                deadline_seconds=self._stage_remaining(attempt_stage),
                                 active_role_ids=self._active_stage_role_ids(
                                     stage, stage_context=self.context.get(stage_id)),
                             )
@@ -23271,6 +26222,7 @@ class ComposerRunner:
                                     # reviewers the exact returned package (or
                                     # a bounded failure envelope) before the
                                     # outer recovery path records the dossier.
+                                    self._end_child_activity(stage_id)
                                     reviewable_failure = self._should_run_failure_specialist_review(
                                         producer_error, attempt_stage)
                                     if reviewable_failure:
@@ -23287,6 +26239,10 @@ class ComposerRunner:
                                                 context["specialist_verifier"] = deepcopy(
                                                     specialist_verifier)
                                     raise
+                                self._end_child_activity(stage_id)
+                                producer_usage = self._current_attempt_usage(context)
+                                producer_foundry_usage = deepcopy(context.get("foundry_usage", {}))
+                                producer_repair_panel_usage = deepcopy(context.get("repair_panel_usage", {}))
                                 specialist_bundle = self._run_specialist_pool(
                                     attempt_stage, stage_assignment, descriptor,
                                     stage_result=context)
@@ -23327,9 +26283,14 @@ class ComposerRunner:
                                         if specialist_reports else self._run_stage(
                                             attempt_stage, attempt_number=attempt_number,
                                             stage_assignment=stage_assignment))
+                                self._end_child_activity(stage_id)
+                                producer_usage = self._current_attempt_usage(context)
+                                producer_foundry_usage = deepcopy(context.get("foundry_usage", {}))
+                                producer_repair_panel_usage = deepcopy(context.get("repair_panel_usage", {}))
                             if self._deadline_exhausted():
                                 raise ComposerLateStageResult(
                                     "stage result exceeded the Composer hard deadline")
+                            context = self._gate_survey_work_orders(attempt_stage, context)
                             outcome = context.get("status")
                             if outcome not in {"completed", "accepted", "candidate_needs_review",
                                                "research_expansion_required", "review_rejected"}:
@@ -23350,6 +26311,10 @@ class ComposerRunner:
                                 value = foundry_usage.get(key, 0)
                                 if type(value) in (int, float) and math.isfinite(value) and value >= 0:
                                     merged_usage[key] = merged_usage.get(key, 0) + value
+                            repair_panel_usage = context.get("repair_panel_usage", {})
+                            if isinstance(repair_panel_usage, dict):
+                                for key in ("model_calls", "input_tokens", "output_tokens"):
+                                    merged_usage[key] = merged_usage.get(key, 0) + repair_panel_usage.get(key, 0)
                             merged_usage["by_role"] = deepcopy(
                                 specialist_bundle.get("usage", {}).get("by_role", {}))
                             context["usage"] = merged_usage
@@ -23450,14 +26415,23 @@ class ComposerRunner:
                             foundry_charged = context.get("foundry_usage", {})
                             if not isinstance(foundry_charged, dict):
                                 foundry_charged = {}
+                            paid_specialists = self._paid_stage_specialist_usage([*specialist_bundle.get("reports", []),
+                                *([specialist_verifier] if isinstance(specialist_verifier, dict) else [])])
+                            incremental_usage = {}
                             for key in self.usage:
                                 value = attempt_usage.get(key, 0)
                                 if type(value) in (int, float) and math.isfinite(value) and value >= 0:
-                                    already_charged = foundry_charged.get(key, 0)
+                                    already_charged = foundry_charged.get(key, 0) + paid_specialists.get(key, 0)
+                                    repair_charged = context.get("repair_panel_usage", {})
+                                    if isinstance(repair_charged, dict):
+                                        already_charged += repair_charged.get(key, 0)
                                     if type(already_charged) not in (int, float) or already_charged < 0:
                                         already_charged = 0
-                                    self.usage[key] += max(0, value - already_charged)
+                                    incremental_usage[key] = max(0, value - already_charged)
+                            self._settle_pending_stage_usage(
+                                stage_id, already_charged=True, additional_usage=incremental_usage)
                             usage_recorded = True
+                            self._clear_child_progress(stage_id)
                             assignment_result = self.departments.finish_stage(
                                 stage_id, stage["kind"], attempt_number=attempt_number,
                                 outcome=outcome, output_ref=context.get("output_path"),
@@ -23500,7 +26474,7 @@ class ComposerRunner:
                                     "outcome": outcome,
                                     "work_orders": self.departments.resolve_work_orders(
                                         self.active_research_requests,
-                                        stage_kind=stage["kind"], outcome=outcome),
+                                        stage_kind=stage["kind"], stage_id=stage_id, outcome=outcome),
                                 })
                             elif self.active_research_requests:
                                 self.department_activity.append({
@@ -23548,8 +26522,8 @@ class ComposerRunner:
                             stage_succeeded = True
                             break
                         except Exception as exc:
-                            original_usage = getattr(exc, "usage", {})
                             if isinstance(exc, ModelCallError) and exc.status_code == 429:
+                                provider_error = exc
                                 retry_after_known = (
                                     type(exc.retry_after_seconds) in (int, float)
                                     and math.isfinite(exc.retry_after_seconds)
@@ -23561,7 +26535,7 @@ class ComposerRunner:
                                     rate_limit={"provider": "model", "status_code": 429,
                                                 "retry_after_known": retry_after_known,
                                                 "provider_error_kind": exc.provider_error_kind})
-                                exc.usage = original_usage
+                                self._copy_error_accounting(provider_error, exc)
                             self._normalize_topic_intake_failure(exc, stage)
                             if classify_failure(
                                     stage.get("kind"), exc,
@@ -23575,25 +26549,36 @@ class ComposerRunner:
                                 except (AttributeError, TypeError):
                                     exc.runtime_frames = []
                             last_error = exc
+                            if not usage_recorded and producer_usage is not None:
+                                self._merge_incremental_error_usage(exc, producer_usage)
+                                if isinstance(producer_foundry_usage, dict):
+                                    if not getattr(exc, "usage_includes_foundry", False):
+                                        self._merge_incremental_error_usage(exc, producer_foundry_usage)
+                                    exc.foundry_usage = deepcopy(producer_foundry_usage)
+                                    exc.usage_includes_foundry = True
+                                if isinstance(producer_repair_panel_usage, dict):
+                                    self._merge_incremental_error_usage(exc, producer_repair_panel_usage)
+                                    exc.repair_panel_usage = deepcopy(producer_repair_panel_usage)
                             failure_usage = (deepcopy(context.get("usage", {})) if usage_recorded
-                                             else self._record_failed_stage_usage(exc))
-                            foundry_failure_usage = getattr(exc, "foundry_usage", {})
-                            if isinstance(foundry_failure_usage, dict):
-                                for key in ("model_calls", "input_tokens", "output_tokens"):
-                                    amount = foundry_failure_usage.get(key, 0)
-                                    if type(amount) in (int, float) and math.isfinite(amount) and amount >= 0:
-                                        failure_usage[key] = failure_usage.get(key, 0) + amount
+                                             else self._record_failed_stage_usage(exc, stage_id=stage_id))
                             specialist_usage = self._specialist_usage([
                                 *specialist_bundle.get("reports", []),
                                 *([specialist_verifier] if isinstance(specialist_verifier, dict) else []),
                             ])
+                            paid_specialists = self._paid_stage_specialist_usage([*specialist_bundle.get("reports", []),
+                                *([specialist_verifier] if isinstance(specialist_verifier, dict) else [])])
+                            incremental_specialist_usage = {}
                             for key in (() if usage_recorded else self.usage):
                                 amount = specialist_usage.get(key, 0)
                                 if type(amount) in (int, float) and amount >= 0:
-                                    self.usage[key] += amount
+                                    incremental_specialist_usage[key] = max(0, amount - paid_specialists.get(key, 0))
                                     failure_usage[key] = failure_usage.get(key, 0) + amount
+                            self._settle_pending_stage_usage(
+                                stage_id, already_charged=True, additional_usage=incremental_specialist_usage)
+                            self._clear_child_progress(stage_id)
                             provider_paused = isinstance(exc, ProviderCooldownError)
-                            provider_configuration = isinstance(exc, ProviderConfigurationError)
+                            provider_operator_stop = isinstance(exc, PROVIDER_OPERATOR_STOP_ERRORS)
+                            provider_rate_limited = isinstance(exc, ProviderRateLimitError)
                             rate_limit = getattr(exc, "rate_limit", None)
                             model_rate_limited = (
                                 provider_paused
@@ -23616,10 +26601,11 @@ class ComposerRunner:
                                     getattr(exc, "stage_result", None)) == "harness_bug"
                             )
                             resource_or_control_failure = (
-                                provider_paused or provider_configuration
+                                provider_paused or provider_operator_stop
                                 or isinstance(exc, QuotaExceededError)
                                 or isinstance(exc, (ComposerLateStageResult,
                                                     ComposerHardDeadlineExceeded,
+                                                    ComposerStageDeadlineExceeded,
                                                     KeyboardInterrupt))
                                 or (isinstance(exc, ModelCallError)
                                     and exc.status_code in {408, 425, 429, 500, 502, 503, 504})
@@ -23791,7 +26777,7 @@ class ComposerRunner:
                                     attempt_id, "failed", usage=failure_usage)
                                 self.tasks.transition(
                                     task_id,
-                                    "paused" if (provider_paused or provider_configuration) else "blocked",
+                                    "paused" if (provider_paused or provider_operator_stop) else "blocked",
                                     "command.composer",
                                     reason=str(exc),
                                 )
@@ -23816,6 +26802,10 @@ class ComposerRunner:
                             }
                             if provider_paused:
                                 failed_attempt["failure_kind"] = "provider_cooldown"
+                            if provider_rate_limited:
+                                failed_attempt["failure_kind"] = "provider_rate_limit"
+                                failed_attempt["provider"] = exc.provider
+                                failed_attempt["details"] = deepcopy(exc.details)
                             if isinstance(failure_dossier, dict):
                                 failed_attempt["failure_dossier_ref"] = failure_dossier.get("artifact_ref")
                                 failed_attempt["failure_class"] = failure_dossier.get("failure_class")
@@ -23848,7 +26838,7 @@ class ComposerRunner:
                             # an escalating cooldown and retry under the same
                             # mission deadline without replaying the blocked call.
                             retry_open = (
-                                not provider_configuration
+                                not provider_operator_stop
                                 and not quota_exhausted
                                 and not model_rate_limited
                                 # Topic intake already has an explicit
@@ -23899,7 +26889,7 @@ class ComposerRunner:
                             self.stage_records[stage_id] = {
                                 "kind": stage["kind"],
                                 "status": ("retrying" if adaptive_retry_scheduled
-                                           else "paused" if (provider_paused or provider_configuration)
+                                           else "paused" if (provider_paused or provider_operator_stop)
                                            else "retrying" if retry_open else "blocked"),
                                 "task_id": task_id, "attempt_id": attempt_id, "attempt_number": attempt_number,
                                 "attempt_count": attempt_number, "attempts": deepcopy(attempt_history),
@@ -23973,17 +26963,20 @@ class ComposerRunner:
                                 self.retry_schedule.pop(stage_id, None)
                                 self.stage_records.setdefault(stage_id, {})["status"] = "retrying"
                                 adaptive_retry_scheduled = True
-                            if provider_configuration:
+                            if provider_operator_stop:
+                                stop_reason = ("provider_rate_limit" if provider_rate_limited
+                                               else "provider_configuration")
                                 self.blockers.append({
                                     "stage_id": stage_id,
                                     "reason": str(exc),
-                                    "stop_reason": "provider_configuration",
+                                    "stop_reason": stop_reason,
                                     "provider": exc.provider,
-                                    "credential_env": exc.credential_env,
+                                    **({"details": deepcopy(exc.details)} if provider_rate_limited
+                                       else {"credential_env": exc.credential_env}),
                                     "model_calls_dispatched": failure_usage.get("model_calls", 0),
                                 })
                                 self.status = "paused"
-                                self._checkpoint(f"{stage_id}:provider_configuration", force=True)
+                                self._checkpoint(f"{stage_id}:{stop_reason}", force=True)
                                 return self._finish()
                             self._checkpoint(f"{stage_id}:retrying" if retry_open else f"{stage_id}:failed", force=True)
                             if isinstance(exc, ComposerLateStageResult):
@@ -24144,6 +27137,19 @@ class ComposerRunner:
                             blocker[attribute] = deepcopy(value)
                     self.blockers.append(blocker)
                     self._record_blocker_feedback(stage, error)
+                    if isinstance(error, QuotaExceededError) and getattr(error, "budget_admission", None) is not None:
+                        blocker["budget_admission"] = deepcopy(error.budget_admission)
+                        blocker.update(dimension=error.dimension, limit=error.limit, observed=error.observed)
+                        if self._admit_stage_quota_recovery(stage, error, completed, by_id):
+                            blocker.update(stop_reason="stage_quota_exhausted", recovery="cycle_admitted")
+                            self.stage_records[stage_id]["status"] = "retrying"
+                            self._checkpoint(f"{stage_id}:quota_recovery_admitted", force=True)
+                            progress = True
+                            break
+                        blocker["stop_reason"] = "model_budget_owner_exhausted"
+                        self.status = "blocked"
+                        self._checkpoint(f"{stage_id}:model_budget_owner_exhausted", force=True)
+                        return self._finish()
                     # A failed continuation has consumed the current scoped
                     # work order even when no stage result exists to reach the
                     # normal success bookkeeping.  Fence that exact request
@@ -24199,6 +27205,7 @@ class ComposerRunner:
             self._checkpoint("complete_proposed", force=True)
             return self._finish()
         except ComposerHardDeadlineExceeded as exc:
+            self._settle_pending_stage_usage()
             # Reaching the wall after useful research is a resumable mission
             # pause, not a scientific blocker.  A workflow that was already
             # expired before doing any work remains blocked because there is
@@ -24216,6 +27223,7 @@ class ComposerRunner:
                 force=True)
             return self._finish()
         except KeyboardInterrupt as exc:
+            self._settle_pending_stage_usage()
             # A process-level stop is a resumable pause, not a failed
             # workflow.  Persist it here so the dashboard and the next
             # resume observe the same durable state.
@@ -24228,6 +27236,7 @@ class ComposerRunner:
             self._checkpoint("paused_process_interruption", force=True)
             return self._finish()
         except Exception as exc:
+            self._settle_pending_stage_usage()
             self.status = "blocked"
             self.blockers.append({"reason": f"{type(exc).__name__}: {exc}"})
             self._checkpoint("blocked", force=True)
@@ -24278,11 +27287,12 @@ class ComposerRunner:
                         and item.get("reason") == "provider_cooldown"
                         for item in active_blockers):
                     stop_reason = "provider_cooldown"
-                if stop_reason is None and self.status in {"paused", "blocked"} and any(
-                        isinstance(item, dict)
-                        and item.get("stop_reason") == "provider_configuration"
-                        for item in active_blockers):
-                    stop_reason = "provider_configuration"
+                if stop_reason is None and self.status in {"paused", "blocked"}:
+                    stop_reason = next((
+                        item["stop_reason"] for item in active_blockers
+                        if isinstance(item, dict) and item.get("stop_reason") in {
+                            "provider_configuration", "provider_rate_limit"}
+                    ), None)
                 if stop_reason is None and self.status in {"paused", "blocked"} and any(
                         isinstance(item, dict)
                         and item.get("stop_reason") == "missing_stage_input"
@@ -24318,6 +27328,8 @@ class ComposerRunner:
                 "historical": len(self.blockers),
             },
             "usage": deepcopy(self.usage),
+            "stage_usage_totals": deepcopy(self.stage_usage_totals),
+            "pending_stage_usage": deepcopy(self.pending_stage_usage),
             "foundry_usage": deepcopy(self.foundry_usage),
             "organization": deepcopy(self.organization_snapshot),
             "retry_policy": self._retry_policy(),

@@ -224,9 +224,9 @@ class ResearchArgumentTests(unittest.TestCase):
 
         self.assertEqual(
             projected["scientific_interpretation"]["result_patterns"], [pattern])
-        self.assertEqual(evidence_ids_from_packet(packet), ["e1", "e2", "e3"])
-        self.assertIn("e1", projected["evidence_ids"])
-        self.assertIn("e2", projected["evidence_ids"])
+        self.assertEqual(evidence_ids_from_packet(packet), ["e3"])
+        self.assertNotIn("e1", projected["evidence_ids"])
+        self.assertNotIn("e2", projected["evidence_ids"])
 
     def test_argument_normalizer_restores_referenced_patterns_only_from_authoritative_source(self):
         value = argument()

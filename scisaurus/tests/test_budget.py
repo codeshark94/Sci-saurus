@@ -126,6 +126,24 @@ class TestT52Completion(BudgetFixture):
             )
 
 class TestPoolAccounting(BudgetFixture):
+    def test_observed_cost_floor_is_idempotent_and_keeps_unknown_reservations(self):
+        self.budget.reserve(window_id="w-1", reservation_id="pending", task_id="task",
+                            amount={"tokens": 100})
+        for observed in (7, 7, 3):
+            state = self.budget.observe_usage_floor(window_id="w-1",
+                observed={"openalex_requests": observed}, evidence_refs=["artifact:execution@1"])
+            self.assertEqual(state["cumulative_usage"], {"openalex_requests": 7})
+            self.assertEqual(state["reserved"], {"tokens": 100})
+        self.budget.renew(prior_window_id="w-1", new_window_id="w-2", rationale="continue")
+        self.budget.observe_usage_floor(window_id="w-2", observed={"openalex_requests": 9},
+                                        evidence_refs=["artifact:execution@2"])
+        self.budget.settle(window_id="w-1", reservation_id="pending", actual={"tokens": 12})
+        with self.control.tx() as c:
+            c.execute("DELETE FROM resource_pools")
+        restored = BudgetManager(self.control).get_window("w-2")
+        self.assertEqual(restored["cumulative_usage"], {"openalex_requests": 9, "tokens": 12})
+        self.assertEqual(restored["reserved"], {})
+
     def test_outstanding_reservations_and_late_settlements_survive_renewals(self):
         self.budget.reserve(window_id="w-1", reservation_id="r-1", task_id="t-1",
                             amount={"tokens": 10000})

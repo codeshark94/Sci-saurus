@@ -179,17 +179,29 @@ class TestCrossrefRetrieval(unittest.TestCase):
         self.assertEqual(limited["sources"], [])
         self.assertEqual(client.search("malformed")["outcome"], "parse_error")
 
-    def test_transient_rate_limit_retries_inside_one_call_budget(self):
+    def test_rate_limit_returns_without_transport_retry(self):
         CrossrefFixture.rate_limit_once = True
         with patch("scisaurus.runtime.retrieval.time.sleep") as sleep:
             result = CrossrefClient(
                 endpoint=self.endpoint, timeout=10, max_retries=2,
                 retry_backoff_seconds=0,
             ).search("rate limited once")
+        self.assertEqual(result["outcome"], "rate_limited")
+        self.assertEqual(result["metadata"]["attempts"], 1)
+        self.assertEqual(result["metadata"]["http_status"], 429)
+        self.assertEqual(result["metadata"]["retry_wait_seconds"], 0.0)
+        self.assertEqual(result["metadata"]["retry_suppressed_reason"], "provider_rate_limit_requires_operator_recovery")
+        sleep.assert_not_called()
+
+    def test_non_rate_limit_transient_response_still_retries(self):
+        replies = [{"outcome": "provider_error", "metadata": {"http_status": 503}},
+                   {"outcome": "ok", "metadata": {"http_status": 200}}]
+        client = CrossrefClient(endpoint=self.endpoint, max_retries=2, retry_backoff_seconds=0)
+        with patch.object(client, "_search_once", side_effect=replies) as transport:
+            result = client.search("temporary outage")
         self.assertEqual(result["outcome"], "ok")
         self.assertEqual(result["metadata"]["attempts"], 2)
-        self.assertEqual(result["metadata"]["retry_wait_seconds"], 5.0)
-        sleep.assert_called_once_with(5.0)
+        self.assertEqual(transport.call_count, 2)
 
     def test_bytes_and_network_wait_are_bounded(self):
         result = CrossrefClient(endpoint=self.endpoint, max_bytes=100).search("huge")
@@ -506,6 +518,20 @@ class BinarySourceFixture(BaseHTTPRequestHandler):
 
 
 class TestOfficialMCPFetch(unittest.TestCase):
+    def test_robots_http_rate_limit_is_not_access_denial(self):
+        response = FixturePDFResponse(
+            b"", url="https://example.org/robots.txt", status=429,
+            content_type="text/plain")
+        with patch("scisaurus.runtime.retrieval._open_http", return_value=response) as request:
+            result = MCPFetchClient(["/usr/bin/true"], timeout=2)._fetch_pdf(
+                "https://example.org/paper.pdf", max_length=1000)
+        self.assertEqual(result["outcome"], "rate_limited")
+        checks = result["metadata"]["pdf_extraction"]["robots_checks"]
+        self.assertEqual(checks[0]["status"], 429)
+        self.assertEqual(result["metadata"]["pdf_extraction"]["download_bytes"], 0)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(result["sources"], [])
+
     def test_robots_cache_normalizes_default_port_and_rechecks_path(self):
         cache = {}
         response = FixturePDFResponse(

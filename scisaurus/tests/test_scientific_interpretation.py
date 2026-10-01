@@ -127,6 +127,19 @@ class ScientificInterpretationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "unknown evidence"):
             validate_interpretation(value, evidence_ids={"finding-1"})
 
+    def test_maturity_closure_requires_complete_scoped_evidence_assessments(self):
+        value = interpretation()
+        requirements = [{"id": "requirement-1", "requirement": "Check the independent comparator."}]
+        with self.assertRaises(ValidationError):
+            validate_interpretation(value, evidence_ids={"finding-1"}, requirements=requirements)
+        value["requirement_assessments"] = [{
+            "requirement_id": "requirement-1", "disposition": "resolved",
+            "evidence_ids": ["finding-1"], "rationale": "The independent comparator is present in the supplied finding."}]
+        validate_interpretation(value, evidence_ids={"finding-1"}, requirements=requirements)
+        value["requirement_assessments"][0]["evidence_ids"] = []
+        with self.assertRaisesRegex(ValidationError, "needs supplied evidence"):
+            validate_interpretation(value, evidence_ids={"finding-1"}, requirements=requirements)
+
     def test_known_429_stops_without_dispatching_model_fallback(self):
         primary = {
             "protocol": "openai_compatible", "base_url": "http://127.0.0.1:11434/v1",

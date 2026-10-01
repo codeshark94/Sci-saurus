@@ -1,7 +1,9 @@
 """Evidence-bound literature statements and scoped map updates."""
 from copy import deepcopy
+import re
+import unicodedata
 
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import ModelContractError, ValidationError
 from scisaurus.runtime.config import _text
 from scisaurus.runtime.scores import exact
 from scisaurus.core.source_spans import validate as validate_source_span
@@ -10,6 +12,42 @@ from scisaurus.core.source_spans import validate as validate_source_span
 MAP_FIELDS = ("problem", "approach", "finding", "limitations")
 SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
 GAP_CHECKS = ("closest-prior-work", "scope-comparability", "counterevidence", "full-text-support")
+
+
+BODY_SECTION_MARKERS = ("Introduction", "Background", "Methods", "Materials and Methods",
+                        "Methodology", "Results", "Discussion", "Conclusions", "Conclusion")
+
+
+def section_identity(value):
+    return " ".join(re.findall(r"\w+", unicodedata.normalize("NFKC", value).casefold()))
+
+
+def has_section_heading(text, marker):
+    expected = section_identity(marker)
+    if not expected:
+        return False
+    for line in text.splitlines():
+        candidate = re.sub(r"^\s*#{1,6}\s*", "", line).strip()
+        candidate = re.sub(r"^\d+(?:\.\d+)*[.)]?\s+", "", candidate)
+        if section_identity(candidate.strip(" -*_`")) == expected:
+            return True
+    return False
+
+
+def authoritative_source(source):
+    """Only identified captures can support work-specific scientific assertions."""
+    if not isinstance(source, dict):
+        return False
+    if source.get("representation") == "abstract":
+        return True
+    identity = source.get("identity_checks")
+    markers = identity.get("section_markers") if isinstance(identity, dict) else None
+    return (source.get("representation") == "full_text"
+            and source.get("identity_verified") is True
+            and isinstance(identity, dict) and identity.get("title_match") is True
+            and isinstance(markers, list) and bool(markers)
+            and all(isinstance(marker, str) and marker.strip() for marker in markers)
+            and any(section_identity(marker) not in {"", "abstract", "summary"} for marker in markers))
 
 
 def normalize_check_envelope(value, required):
@@ -328,7 +366,7 @@ def normalize_gap_assessment_envelope(value, *, evidence_catalog=None,
     return projected
 
 
-def evidence(items, sources, *, required=False, require_spans=False, windows=None):
+def evidence(items, sources, *, required=False, require_spans=False, windows=None, require_authority=False):
     if not isinstance(items, list) or (required and not items):
         raise ValidationError("asserted statements require explicit source evidence")
     errors = []
@@ -342,12 +380,66 @@ def evidence(items, sources, *, required=False, require_spans=False, windows=Non
             source = sources.get(item["source_ref"])
             if source is None or source["work_id"] != item["work_id"]:
                 raise ValidationError(f"must quote the exact captured text of its identified work ({item['source_ref']})")
+            if require_authority and not authoritative_source(source):
+                raise ValidationError("scientific statements require an abstract or identity-verified full text")
             validate_source_span(item, source, require_span=require_spans,
                                  window=(windows or {}).get(item["source_ref"]))
         except ValidationError as exc:
             errors.append(f"evidence[{index}]: {exc}")
     if errors:
         raise ValidationError("; ".join(errors))
+
+
+def validate_follow_up_result(value, work_orders, sources, query_refs, *, windows):
+    def response_exact(value, fields, name):
+        try:
+            exact(value, fields, name)
+        except ValidationError as exc:
+            raise ModelContractError(str(exc)) from exc
+
+    def response_text(value, name):
+        try:
+            _text(value, name)
+        except ValidationError as exc:
+            raise ModelContractError(str(exc)) from exc
+
+    response_exact(value, {"orders"}, "survey follow-up result")
+    rows = value["orders"]
+    if not isinstance(rows, list) or len(rows) != len(work_orders):
+        raise ModelContractError("survey follow-up must account for every work order")
+    expected, seen = {order["id"] for order in work_orders}, set()
+    for row in rows:
+        response_exact(row, {"id", "status", "rationale", "evidence", "query_refs", "limitation", "next_action"},
+              "survey follow-up disposition")
+        response_text(row["id"], "survey follow-up order ID")
+        response_text(row["status"], "survey follow-up status")
+        if row["id"] not in expected or row["id"] in seen:
+            raise ModelContractError("survey follow-up has an unassigned or duplicate order")
+        seen.add(row["id"])
+        if row["status"] not in {"resolved", "limited", "unresolved"}:
+            raise ModelContractError("survey follow-up status must be resolved, limited or unresolved")
+        for field in ("rationale", "next_action"):
+            response_text(row[field], f"survey follow-up {field}")
+        if not isinstance(row["limitation"], str):
+            raise ModelContractError("survey follow-up limitation must be text")
+        if not isinstance(row["query_refs"], list) or any(not isinstance(ref, str) for ref in row["query_refs"]):
+            raise ModelContractError("survey follow-up query_refs must be a list of references")
+        if any(ref not in query_refs for ref in row["query_refs"]):
+            raise ModelContractError("survey follow-up cites an unrecorded targeted search")
+        if not isinstance(row["evidence"], list) or any(
+                not isinstance(proof, dict)
+                or set(proof) != {"work_id", "source_ref", "quote", "start", "end", "quote_sha256"}
+                or not isinstance(proof["source_ref"], str) for proof in row["evidence"]):
+            raise ModelContractError("survey follow-up requires evidence rows with exact source span fields")
+        if any(proof["source_ref"] not in windows for proof in row["evidence"]):
+            raise ModelContractError("survey follow-up requires exact displayed source spans")
+        try:
+            evidence(row["evidence"], sources, required=row["status"] == "resolved",
+                     require_spans=True, windows=windows, require_authority=True)
+        except ValidationError as exc:
+            raise ModelContractError(str(exc)) from exc
+        if row["status"] == "limited" and (not row["query_refs"] or not row["limitation"].strip()):
+            raise ModelContractError("limited survey follow-up requires targeted searches and an explicit limitation")
 
 
 def statement(value, sources, *, work_id=None, require_spans=False):
@@ -357,7 +449,7 @@ def statement(value, sources, *, work_id=None, require_spans=False):
             raise ValidationError("an unknown statement cannot claim supporting evidence")
         return
     _text(value["text"], "statement text")
-    evidence(value["evidence"], sources, required=True, require_spans=require_spans)
+    evidence(value["evidence"], sources, required=True, require_spans=require_spans, require_authority=True)
     if work_id and any(item["work_id"] != work_id for item in value["evidence"]):
         raise ValidationError("a work assessment must use evidence from that work")
 
@@ -445,11 +537,19 @@ def validate_survey_review(value):
     _text(value["rationale"], "survey review rationale")
 
 
-def validate_work_review(value, relationship_refs):
+def validate_work_review(value, relationship_refs, *, entry=None):
     from scisaurus.core.surveys import work_review_checks
     exact(value, {"checks", "rationale"}, "work review")
     checks(value["checks"], work_review_checks(relationship_refs))
     _text(value["rationale"], "work review rationale")
+    if isinstance(entry, dict):
+        for check in value["checks"]:
+            field = check["check_id"]
+            if (field in MAP_FIELDS and entry[field] == {"text": None, "evidence": []}
+                    and check["outcome"] != "passed"):
+                raise ModelContractError(
+                    f"{field} is an explicit unknown, not an assertion that the work has no {field}; "
+                    "verify the absence of an admitted claim, not a nonexistent scientific assertion")
 
 
 def validate_assessment(value, sources, works, *, require_spans=False, windows=None):
@@ -462,7 +562,7 @@ def validate_assessment(value, sources, works, *, require_spans=False, windows=N
             check["outcome"] != "passed" for check in value["checks"]):
         raise ValidationError("decisive gap assessment requires every check to pass")
     evidence(value["evidence"], sources, required=value["state"] != "insufficient_evidence",
-             require_spans=require_spans, windows=windows)
+             require_spans=require_spans, windows=windows, require_authority=True)
     if not isinstance(value["comparisons"], list):
         raise ValidationError("comparisons must be an explicit list")
     seen = set()
@@ -475,7 +575,7 @@ def validate_assessment(value, sources, works, *, require_spans=False, windows=N
             raise ValidationError("unknown comparison relationship")
         _text(item["statement"], "comparison statement")
         evidence(item["evidence"], sources, required=item["relationship"] != "uncertain",
-                 require_spans=require_spans, windows=windows)
+                 require_spans=require_spans, windows=windows, require_authority=True)
         if any(proof["work_id"] != item["work_id"] for proof in item["evidence"]):
             raise ValidationError("comparison must cite its own work")
         decisive = value["state"] == "eligible_for_experiment" or (

@@ -2,11 +2,13 @@
 from copy import deepcopy
 import base64
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 from scisaurus.core.errors import StateError, ValidationError
 from scisaurus.core.events import ControlStore
@@ -15,6 +17,7 @@ from scisaurus.core.store import ArtifactStore
 from scisaurus.core.tasks import TaskManager
 from scisaurus.runtime.operations import OperationsCell
 from scisaurus.runtime.programs import LocalProgramClient
+from scisaurus.runtime.retrieval import CrossrefClient
 
 
 def capture(data):
@@ -23,14 +26,22 @@ def capture(data):
 
 
 def crossref_result(params):
+    url = "https://api.crossref.org/works?" + urlencode(
+        CrossrefClient.request_parameters(params["query"], limit=params["limit"], cursor=params.get("cursor")))
     payload = {"status": "ok", "message-version": "1.0.0", "message": {
-        "items": [{"DOI": "10.1234/example", "title": ["Example paper"]}]}}
+        "items": [{"DOI": "10.1234/example", "title": ["Example paper"]}],
+        "total-results": 1, "next-cursor": None}}
     captured = capture(canonical_bytes(payload))
     return {"outcome": "ok", "text": "Example paper — https://doi.org/10.1234/example",
-            "sources": [{"doi": "10.1234/example", "source_url": "https://doi.org/10.1234/example", "representation": "metadata"}],
+            "source_url": url,
+            "sources": [{"doi": "10.1234/example", "title": "Example paper",
+                         "source_url": "https://doi.org/10.1234/example", "representation": "metadata",
+                         "publisher": None, "published": None, "authors": [], "abstract": None}],
             "capture": captured, "capture_sha256": captured["sha256"], "raw_response": payload,
             "metadata": {"provider": "crossref", "transport": "http_api", "representation": "metadata", "http_status": 200,
-                         "schema_version": "1.0.0", "query": params["query"], "rows": params["limit"]}}
+                         "schema_version": "1.0.0", "query": params["query"], "rows": params["limit"], "final_url": url,
+                         "cursor": params.get("cursor") or "*", "total_results": 1,
+                         "next_cursor": None, "result_set_complete": 1 < params["limit"]}}
 
 
 def empty_crossref_result(result):
@@ -38,6 +49,7 @@ def empty_crossref_result(result):
     result["raw_response"]["message"]["items"] = []
     result["capture"] = capture(canonical_bytes(result["raw_response"]))
     result["capture_sha256"] = result["capture"]["sha256"]
+    result["metadata"]["result_set_complete"] = True
 
 
 def mcp_result(params):
@@ -95,6 +107,77 @@ class RecordedExecutor:
 
 
 class TestOperationsCell(unittest.TestCase):
+    def test_crossref_capture_binds_optional_request_metadata_and_entire_source_cards(self):
+        from scisaurus.runtime.operation_adapters import get_adapter
+        params = {"query": "10.1234/example", "limit": 3}
+        result = crossref_result(params)
+        result["metadata"].pop("cursor")
+        inspect = get_adapter("crossref").inspect_result
+        checks, _ = inspect({"adapter": "crossref"}, result, params, representative=False)
+        self.assertTrue(all(check["outcome"] == "passed" for check in checks), checks)
+        for change in ("wire_cursor", "metadata_cursor", "scheme", "host", "path", "fragment", "final_url", "missing_final_url",
+                       "title", "published", "authors", "abstract", "text"):
+            forged = deepcopy(result)
+            if change == "wire_cursor":
+                forged["source_url"] = forged["source_url"].replace("&cursor=%2A", "")
+            elif change == "scheme":
+                forged["source_url"] = forged["source_url"].replace("https:", "http:")
+            elif change == "host":
+                forged["source_url"] = forged["source_url"].replace("api.crossref.org", "attacker.invalid")
+            elif change == "path":
+                forged["source_url"] = forged["source_url"].replace("/works?", "/other?")
+            elif change == "fragment":
+                forged["source_url"] += "#other"
+            elif change == "final_url":
+                forged["metadata"]["final_url"] = "https://attacker.invalid/works"
+            elif change == "missing_final_url":
+                forged["metadata"].pop("final_url")
+            elif change == "metadata_cursor":
+                forged["metadata"]["cursor"] = "another-page"
+            elif change == "text":
+                forged["text"] = "A forged citation"
+            else:
+                forged["sources"][0][change] = {"date-parts": [[1900]]} if change == "published" else "Forged field"
+            with self.subTest(change=change):
+                checks, _ = inspect({"adapter": "crossref"}, forged, params, representative=False)
+                self.assertEqual(next(check for check in checks if check["check_id"] == "crossref-response")["outcome"], "failed")
+
+    def test_crossref_route_uses_the_admitted_configured_endpoint(self):
+        from scisaurus.runtime.operation_adapters import get_adapter
+        params = {"query": "10.1234/example", "limit": 3}
+        result = crossref_result(params)
+        endpoint = "http://127.0.0.1:8765/catalog/works"
+        result["source_url"] = result["source_url"].replace("https://api.crossref.org/works", endpoint)
+        result["metadata"]["final_url"] = result["source_url"]
+        checks, _ = get_adapter("crossref").inspect_result(
+            {"adapter": "crossref", "client": {"endpoint": endpoint}}, result, params, representative=False)
+        self.assertTrue(all(check["outcome"] == "passed" for check in checks), checks)
+
+    def test_crossref_capture_binds_entire_authorized_request(self):
+        from scisaurus.runtime.operation_adapters import get_adapter
+        params = {"query": "quantum work efficiency", "limit": 3}
+        inspect = get_adapter("crossref").inspect_result
+        result = crossref_result(params)
+        for extra in ("filter=from-pub-date%3A2025-01-01", "query.title=unrelated",
+                      "select=DOI%2Ctitle", "rows=100", "unknown=", "mailto=forged%40example.org"):
+            forged = deepcopy(result)
+            forged["source_url"] += "&" + extra
+            forged["metadata"]["final_url"] = forged["source_url"]
+            with self.subTest(extra=extra):
+                checks, _ = inspect({"adapter": "crossref"}, forged, params, representative=False)
+                self.assertEqual(next(check for check in checks if check["check_id"] == "crossref-response")["outcome"], "failed")
+        with patch.dict(os.environ, {"SCISAURUS_TEST_CROSSREF_CONTACT": "contact@example.org"}):
+            for client in ({"mailto": "contact@example.org"},
+                           {"mailto_env": "SCISAURUS_TEST_CROSSREF_CONTACT"},
+                           {"endpoint": "http://127.0.0.1:8765/catalog/works?filter=type%3Ajournal-article",
+                            "mailto": "contact@example.org"}):
+                admitted = deepcopy(result)
+                admitted["source_url"] = CrossrefClient(**client).request_url(**params)
+                admitted["metadata"]["final_url"] = admitted["source_url"]
+                with self.subTest(client=client):
+                    checks, _ = inspect({"adapter": "crossref", "client": client}, admitted, params, representative=False)
+                    self.assertTrue(all(check["outcome"] == "passed" for check in checks), checks)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="scisaurus-operations-test-")
         self.root = Path(self.temp.name)

@@ -20,6 +20,7 @@ from scisaurus.runtime.models import (
     ModelClient, complete_with_role_fallbacks, normalize_generated_string_list,
 )
 from scisaurus.runtime.scientific_surface import find_control_leaks
+from scisaurus.runtime.evidence import evidence_ids_from_packet
 
 
 SCHEMA_VERSION = "scientific-interpretation-1"
@@ -73,15 +74,39 @@ def _normalize_generated_interpretation(value):
     return normalized
 
 
-def validate_interpretation(value, *, evidence_ids=None):
+def validate_interpretation(value, *, evidence_ids=None, requirements=None):
     fields = {"schema_version", "research_question", "result_patterns", "competing_explanations",
               "discriminating_experiments", "prioritization", "conclusion"}
+    if requirements or (isinstance(value, dict) and "requirement_assessments" in value):
+        fields.add("requirement_assessments")
     if not isinstance(value, dict) or set(value) != fields:
         raise ValidationError(f"scientific interpretation requires exactly {sorted(fields)}")
     if value["schema_version"] != SCHEMA_VERSION:
         raise ValidationError("scientific interpretation schema version is unsupported")
     _public_text(value["research_question"], "research_question")
     evidence_ids = None if evidence_ids is None else set(evidence_ids)
+    if "requirement_assessments" in value:
+        assessments = value.get("requirement_assessments")
+        expected_ids = ({item["id"] for item in requirements} if requirements else
+                        {item.get("requirement_id") for item in assessments
+                         if isinstance(item, dict)} if isinstance(assessments, list) else set())
+        if (not isinstance(assessments, list)
+                or len(assessments) != len(expected_ids)
+                or {item.get("requirement_id") for item in assessments
+                    if isinstance(item, dict)} != expected_ids):
+            raise ValidationError("interpretation must assess every scoped maturity requirement")
+        for item in assessments:
+            if not isinstance(item, dict) or set(item) != {
+                    "requirement_id", "disposition", "evidence_ids", "rationale"}:
+                raise ValidationError("maturity requirement assessment has an invalid shape")
+            if item["disposition"] not in {"resolved", "open"}:
+                raise ValidationError("maturity requirement disposition is unsupported")
+            _strings(item["evidence_ids"], "maturity requirement evidence_ids")
+            _text(item["rationale"], "maturity requirement rationale")
+            if evidence_ids is not None and set(item["evidence_ids"]) - evidence_ids:
+                raise ValidationError("maturity requirement references unknown evidence")
+            if item["disposition"] == "resolved" and not item["evidence_ids"]:
+                raise ValidationError("resolved maturity requirement needs supplied evidence")
 
     patterns = value["result_patterns"]
     if not isinstance(patterns, list) or not patterns:
@@ -203,6 +228,12 @@ def interpretation_prompt(evidence_packet, *, validation_feedback=None):
             "previous_response": validation_feedback.get("previous_response"),
             "instructions": "Repair only the contract violations; preserve valid scientific content and return the exact top-level shape.",
         }
+    if isinstance(evidence_packet, dict) and evidence_packet.get("maturity_requirements"):
+        packet["output_contract"]["requirement_assessments"] = (
+            "One {requirement_id,disposition,evidence_ids,rationale} for every maturity_requirements item. "
+            "Copy its id exactly. disposition is resolved or open. Use resolved only when supplied evidence "
+            "actually completes the requirement, with nonempty evidence_ids and a specific rationale. "
+            "Otherwise keep open; interpretation cannot substitute missing source evidence or new experiments.")
     follow_up = evidence_packet.get("scientific_follow_up") if isinstance(evidence_packet, dict) else None
     if isinstance(follow_up, list) and follow_up:
         packet["follow_up_contract"] = {
@@ -228,6 +259,10 @@ class ScientificInterpretationRunner:
         self.deadline_seconds = float(deadline_seconds) if deadline_seconds is not None else None
 
     def run(self, evidence_packet, *, evidence_ids=None, max_attempts=3):
+        if evidence_ids is None:
+            evidence_ids = evidence_ids_from_packet(evidence_packet)
+        evidence_packet = deepcopy(evidence_packet)
+        evidence_packet["evidence_ids"] = sorted(evidence_ids)
         if type(max_attempts) is not int or max_attempts < 1 or max_attempts > 8:
             raise ValidationError("scientific interpretation max_attempts must be between 1 and 8")
         feedback = None
@@ -244,7 +279,7 @@ class ScientificInterpretationRunner:
                 deadline=deadline, client_factory=ModelClient,
             )
             route_history.extend(attempted_routes)
-            total_usage["model_calls"] += 1
+            total_usage["model_calls"] += result.usage.get("model_calls", 1)
             for key in ("input_tokens", "output_tokens"):
                 total_usage[key] += result.usage.get(key, 0)
             parsed = None
@@ -253,7 +288,8 @@ class ScientificInterpretationRunner:
                     raise ValidationError("scientific interpretation did not finish normally")
                 parsed = result.json_object()
                 interpretation = _normalize_generated_interpretation(parsed)
-                validate_interpretation(interpretation, evidence_ids=evidence_ids)
+                validate_interpretation(interpretation, evidence_ids=evidence_ids,
+                                        requirements=evidence_packet.get("maturity_requirements"))
             except ValidationError as exc:
                 last_error = exc
                 if attempt + 1 >= max_attempts:

@@ -244,6 +244,20 @@ class TestSurveyGate(unittest.TestCase):
     def commit(self, ref, **kwargs):
         return self.gate.commit_assessment(ref, survey_ref=self.survey, author="command.controller", **kwargs)
 
+    def test_composer_currentness_requires_assessment_of_exact_survey(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        self.accept()
+        survey_a = self.survey
+        self.survey = self.publish("kb/parallel-survey", self.survey_body)
+        self.review = self.review_for(self.survey)
+        self.accept()
+        assessment_b = self.assessment()
+        self.commit(assessment_b)
+        self.assertTrue(ComposerRunner._survey_references_are_current(
+            self.directory.name, {"survey_ref": self.survey, "assessment_ref": assessment_b}))
+        self.assertFalse(ComposerRunner._survey_references_are_current(
+            self.directory.name, {"survey_ref": survey_a, "assessment_ref": assessment_b}))
+
     def test_independent_acceptance_and_assessment_are_durable(self):
         self.assertEqual(self.accept()["artifact_ref"], self.survey)
         self.assertEqual(self.gate.require_current(self.survey)["artifact_ref"], self.survey)
@@ -359,6 +373,25 @@ class TestSurveyGate(unittest.TestCase):
                 self.survey_with_work_reviews([review])
                 with self.assertRaisesRegex(ValidationError, "focused review"):
                     self.accept()
+
+    def test_focused_review_protocol_is_bound_to_dispatch_and_scope(self):
+        protocol = "source-fidelity-review-1"
+        for contract, scope, valid in ((protocol, protocol, True),
+                                       (None, protocol, False),
+                                       ("other-protocol", protocol, False),
+                                       (protocol, "other-protocol", False)):
+            with self.subTest(contract=contract, scope=scope):
+                prompt = self.work_prompt(self.entry)
+                if contract is not None:
+                    prompt["review_contract"] = {"protocol": contract}
+                review = self.work_review_for(self.entry, prompt=prompt, overrides={
+                    "review_protocol": protocol, "evidence_scope": {"review_protocol": scope}})
+                self.survey_with_work_reviews([review])
+                if valid:
+                    self.gate._work_reviews(self.body(self.survey))
+                else:
+                    with self.assertRaisesRegex(ValidationError, "focused review protocol"):
+                        self.gate._work_reviews(self.body(self.survey))
 
     def test_focused_execution_cannot_inspect_a_modified_entry_body(self):
         body = self.body(self.entry)
@@ -759,6 +792,10 @@ class TestSurveyGate(unittest.TestCase):
             with self.subTest(change=change):
                 source = self.publish(f"kb/invalid-source-{index}", {**self.source_body, **change}, kind="source_capture")
                 self.survey_with_source(source)
+                if change.get("representation") != "abstract":
+                    with self.assertRaises(ValidationError):
+                        self.accept()
+                    continue
                 self.accept()
                 evidence = [{"work_id": "doi:10.1000/known", "source_ref": source,
                              "quote": "The treatment also works in condition B."}]
@@ -788,6 +825,53 @@ class TestSurveyGate(unittest.TestCase):
             self.commit(ref)
         self.assertIsNone(self.store.accepted(self.store.get(ref)["artifact_id"]))
 
+    def test_full_text_claim_replay_loads_production_reference_cards(self):
+        work = self.publish("kb/production-work", self.body(self.work), kind="reference_card")
+        self.survey = self.publish("kb/production-survey", {**self.survey_body,
+            "work_refs": [work], "dependency_refs": [*self.survey_body["dependency_refs"], work]})
+        self.review = self.review_for(self.survey)
+        self.accept()
+
+    def test_nondeterminative_assessment_quote_requires_identified_source(self):
+        source = self.publish("kb/unverified-assessment", {**self.source_body,
+            "representation": "unverified_text", "identity_verified": False}, kind="source_capture")
+        proof = {"work_id": self.source_body["work_id"], "source_ref": source,
+                 "quote": "The treatment also works in condition B."}
+        with self.assertRaisesRegex(ValidationError, "identity-verified full text"):
+            self.gate._evidence([proof], {proof["work_id"]: self.body(self.work)},
+                                {**self.survey_body, "source_refs": [source]}, required=True)
+
+    def test_passing_peer_cannot_authorize_unverified_source_claims(self):
+        source = self.publish("kb/title-mismatch", {**self.source_body,
+            "representation": "unverified_text", "identity_verified": False}, kind="source_capture")
+        self.survey_with_source(source)
+        with self.assertRaisesRegex(ValidationError, "identity-verified full text"):
+            self.accept()
+
+    def test_inline_body_words_are_not_full_text_section_headings(self):
+        text = "Known Treatment\nThe Methods and Results show the treatment also works in condition B."
+        execution = self.fetch(text)
+        source = {**self.source_body, "text": text, "execution_ref": execution}
+        with self.assertRaisesRegex(ValidationError, "section marker"):
+            self.gate._full_text(source, self.body(self.work), {"dependency_refs": [execution]})
+
+    def test_abstract_heading_aliases_cannot_authorize_full_text(self):
+        text = "Known Treatment\nAbstract\nThe treatment also works in condition B."
+        execution = self.fetch(text)
+        for marker in ("Abstract", "Abstract.", "**Abstract**", "Summary."):
+            source = {**self.source_body, "text": text, "execution_ref": execution,
+                      "identity_checks": {"title_match": True, "section_markers": [marker]}}
+            with self.subTest(marker=marker), self.assertRaisesRegex(ValidationError, "identity-verified full text"):
+                self.gate._full_text(source, self.body(self.work), {"dependency_refs": [execution]})
+
+    def test_prompt_flags_cannot_forge_source_authority(self):
+        prompt = self.work_prompt(self.entry)
+        prompt["sources"][0]["identity_verified"] = False
+        review = self.work_review_for(self.entry, prompt=prompt)
+        self.survey_with_work_reviews([review])
+        with self.assertRaisesRegex(ValidationError, "immutable capture"):
+            self.accept()
+
     def test_full_text_requires_matching_complete_fetch_capture(self):
         metadata = {"representation": "extracted_text", "provider": "mcp-fetch", "transport": "mcp_stdio"}
         variants = [
@@ -803,11 +887,8 @@ class TestSurveyGate(unittest.TestCase):
                 source = self.publish(f"kb/unverified-capture-{index}",
                     {**self.source_body, "execution_ref": execution, **source_changes}, kind="source_capture")
                 self.survey_with_source(source)
-                self.accept()
-                evidence = [{"work_id": "doi:10.1000/known", "source_ref": source,
-                             "quote": "The treatment also works in condition B."}]
                 with self.assertRaisesRegex(ValidationError, "full.text"):
-                    self.commit(self.assessment(evidence=evidence))
+                    self.accept()
 
     def test_decisive_evidence_cannot_import_an_unpinned_source_or_work(self):
         self.accept()

@@ -14,10 +14,10 @@ from scisaurus.core.errors import ConflictError, ValidationError
 from scisaurus.core.schema import canonical_bytes, json_object, parse_ref, sha256_hex
 from scisaurus.core.source_spans import (bind as bind_source_spans, expand_evidence,
                                         validate as validate_source_span)
-from scisaurus.runtime.bibliographic_identity import normalize_doi, reconcile_result
+from scisaurus.runtime.bibliographic_identity import normalize_doi, project_crossref_work, reconcile_result
 from scisaurus.runtime.operation_adapters import get_adapter
 from scisaurus.runtime.survey_records import (
-    normalize_check_envelope, normalize_gap_assessment_envelope,
+    normalize_check_envelope, normalize_gap_assessment_envelope, authoritative_source, has_section_heading,
 )
 
 
@@ -182,7 +182,8 @@ class SurveyGate:
             _, _, result, params = self._recorded_execution(
                 lookup, execution["author"], operation="crossref", task_kinds={"retrieval"})
             operational_checks, _ = get_adapter("crossref").inspect_result(
-                {"adapter": "crossref"}, result, params, representative=False)
+                {"adapter": "crossref", "client": params.get("client", {})},
+                result, params, representative=False)
             work_ref, work = works[work_id]
             if (normalize_doi(params.get("query")) != normalize_doi(work.get("doi"))
                     or result.get("metadata", {}).get("match_mode") != "exact_doi"
@@ -276,6 +277,13 @@ class SurveyGate:
                 raise ValidationError("survey dependencies must pin every focused review execution")
             if prompt.get("entry_ref") != entry_ref or prompt.get("relationship_refs") != relationships:
                 raise ValidationError("focused review dispatch must inspect the exact entry and relationships")
+            if "review_protocol" in body:
+                protocol = self._text(body["review_protocol"], "focused review protocol")
+                contract = prompt.get("review_contract")
+                scope = body.get("evidence_scope")
+                if (not isinstance(contract, dict) or contract.get("protocol") != protocol
+                        or not isinstance(scope, dict) or scope.get("review_protocol") != protocol):
+                    raise ValidationError("focused review protocol must match its exact dispatch and evidence scope")
             self._work_review_context(survey, prompt, entry_body,
                 [{**relationship_bodies[ref], "artifact_ref": ref} for ref in relationships])
             if reply.get("checks") != checks or reply.get("rationale") != body["rationale"]:
@@ -315,7 +323,26 @@ class SurveyGate:
                     or not 0 <= window["start"] <= window["end"] <= len(text)
                     or source.get("text") != text[window["start"]:window["end"]]):
                 raise ValidationError("focused review source window must contain the exact captured text slice")
-            visible[source["source_ref"]] = {**source, "text": text}
+            for key in ("identity_verified", "identity_checks", "url"):
+                if key in source and source[key] != captured.get(key, False if key == "identity_verified" else None):
+                    raise ValidationError("focused review source authority must match its immutable capture")
+            visible[source["source_ref"]] = {**source, **captured, "window": window, "text": text}
+        proof_refs = {proof.get("source_ref") for statement in
+                      [*(entry.get(field) for field in WORK_CHECKS[2:]),
+                       *(relation.get("claim") for relation in relationships)]
+                      if isinstance(statement, dict) for proof in statement.get("evidence", [])
+                      if isinstance(proof, dict)}
+        works = None
+        for ref in proof_refs:
+            captured = visible.get(ref)
+            if captured and captured.get("representation") == "full_text":
+                if works is None:
+                    works = {}
+                    for work_ref in survey["work_refs"]:
+                        _, work_raw = self._artifact(work_ref)
+                        work = self._json(work_raw, "survey work")
+                        works[work["work_id"]] = work
+                self._full_text(captured, works.get(captured["work_id"], {}), survey)
         for field in WORK_CHECKS[2:]:
             self._visible_evidence(entry.get(field), visible, work_id=entry["work_id"],
                                    require_spans=survey["schema_version"] == "literature-survey-3")
@@ -345,6 +372,8 @@ class SurveyGate:
             if (source is None or source["work_id"] != proof["work_id"]
                     or work_id is not None and proof["work_id"] != work_id):
                 raise ValidationError("focused review evidence must identify the correct visible source and work")
+            if not authoritative_source(source):
+                raise ValidationError("scientific statements require an abstract or identity-verified full text")
             validate_source_span(proof, source, require_span=require_spans, window=source["window"])
 
     def _review(self, survey, review_ref):
@@ -710,6 +739,55 @@ class SurveyGate:
                 repair(comparison.get("evidence"))
         return value
 
+    def require_successful_follow_up_search(self, query_ref, survey, follow_up_ref):
+        if query_ref not in survey["query_refs"]:
+            raise ValidationError("follow-up search must be pinned by the accepted survey")
+        manifest, raw = self._artifact(query_ref)
+        query = self._json(raw, "follow-up query")
+        if (any(not isinstance(query.get(key), str) or not query[key].strip()
+                for key in ("role", "plan_ref", "execution_ref"))
+                or not isinstance(query.get("request"), dict)):
+            raise ValidationError("follow-up search requires its exact retrieval execution and plan")
+        _, plan = self._note(query["plan_ref"])
+        request = query["request"]
+        if (manifest["artifact_type"] != "query_record"
+                or manifest["author"] != query["role"]
+                or query.get("outcome") not in {"ok", "empty"}
+                or request.get("operation") != "search"
+                or plan.get("follow_up_ref") != follow_up_ref
+                or " ".join(unicodedata.normalize("NFC", request["query"]).split()) not in {
+                    " ".join(unicodedata.normalize("NFC", value).split()) for value in plan["queries"]}
+                or {query["execution_ref"], query["plan_ref"]} - {item["ref"] for item in manifest["inputs"]}):
+            raise ValidationError("follow-up query does not match its admitted search plan")
+        adapter = "crossref" if query.get("provider") == "crossref" else "openalex"
+        _, _, captured, params = self._recorded_execution(
+            query["execution_ref"], query["role"], operation=adapter, task_kinds={"retrieval"})
+        expected = query.get("provider_request") if adapter == "crossref" else request
+        if ({key: value for key, value in params.items() if key != "client"} != expected
+                or adapter == "crossref" and (
+                    params.get("query") != request.get("query")
+                    or params.get("cursor") != request.get("cursor"))
+                or captured.get("outcome") != query["outcome"]):
+            raise ValidationError("follow-up query differs from its exact retrieval execution")
+        checks, _ = get_adapter(adapter).inspect_result(
+            {"adapter": adapter, "client": params["client"]}, captured, params, representative=False)
+        if not checks or any(check["outcome"] != "passed" for check in checks):
+            raise ValidationError("follow-up retrieval capture failed independent replay")
+        metadata = captured["metadata"]
+        if adapter == "crossref":
+            summary = {
+                "returned_work_ids": [project_crossref_work(source)["id"] for source in captured["sources"]],
+                "count": len(captured["sources"]), "provider_total_results": metadata.get("total_results"),
+                "next_cursor": metadata.get("next_cursor"),
+                "has_more": captured["outcome"] == "ok" and metadata.get("result_set_complete") is False,
+            }
+        else:
+            summary = {"returned_work_ids": [work["id"] for work in captured["works"]],
+                       **{key: metadata[key] for key in ("count", "next_cursor", "has_more")}}
+        if any(query.get(key) != value or type(query.get(key)) is not type(value) for key, value in summary.items()):
+            raise ValidationError("follow-up query summary differs from its captured retrieval result")
+        return query
+
     def _evidence(self, evidence, works, survey, *, required=False, full_text=False, work_id=None):
         if not isinstance(evidence, list) or required and not evidence:
             raise ValidationError("asserted comparisons require explicit evidence from their own work")
@@ -727,16 +805,18 @@ class SurveyGate:
             source = self._json(raw, "assessment source")
             if source.get("work_id") != item["work_id"] or not isinstance(source.get("text"), str):
                 raise ValidationError("assessment evidence identity or exact quotation is unsupported")
+            if not authoritative_source(source):
+                raise ValidationError("scientific statements require an abstract or identity-verified full text")
             validate_source_span(item, source,
                                  require_span=survey["schema_version"] == "literature-survey-3")
-            if full_text and source.get("representation") == "full_text":
+            if source.get("representation") == "full_text":
                 self._full_text(source, works[item["work_id"]], survey)
                 verified_full_text = True
         if full_text and not verified_full_text:
             raise ValidationError("decisive evidence requires identity-verified full text from the compared work")
 
     def _full_text(self, source, work, survey):
-        if source.get("representation") != "full_text" or source.get("identity_verified") is not True:
+        if not authoritative_source(source) or source.get("representation") != "full_text":
             raise ValidationError("decisive gap assessment requires identity-verified full text")
         identity = source.get("identity_checks")
         if (not isinstance(identity, dict) or identity.get("title_match") is not True
@@ -749,8 +829,8 @@ class SurveyGate:
         if not title or title not in text:
             raise ValidationError("full text does not contain the registered work title")
         for marker in identity["section_markers"]:
-            marker = normalize(self._text(marker, "full-text section marker"))
-            if not marker or marker not in text:
+            marker = self._text(marker, "full-text section marker")
+            if not has_section_heading(source["text"], marker):
                 raise ValidationError("full text is missing a verified section marker")
         if source.get("execution_ref") not in survey["dependency_refs"]:
             raise ValidationError("full-text execution must be pinned by the accepted survey")

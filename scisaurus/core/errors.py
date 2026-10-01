@@ -33,6 +33,15 @@ class ProviderConfigurationError(ValidationError):
         self.credential_env = credential_env
 
 
+class ProviderRateLimitError(ValidationError):
+    """A provider rejected work with a rate limit requiring operator recovery."""
+
+    def __init__(self, message, *, provider=None, details=None):
+        super().__init__(message)
+        self.provider = provider
+        self.details = deepcopy(details) if isinstance(details, dict) else {}
+
+
 class QuotaExceededError(ContractError):
     """A declared execution quota was exhausted before more work could run."""
 

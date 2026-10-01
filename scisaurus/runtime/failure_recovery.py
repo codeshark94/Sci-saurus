@@ -103,6 +103,8 @@ def classify_failure(stage_kind, error, stage_result=None):
         return "evidence_input_unavailable"
     if getattr(error, "failure_class", None) == "harness_bug":
         return "harness_bug"
+    if error_type == "StateError" or failure_kind == "operational_state":
+        return "operational_recovery"
     if (stage_kind == "topic_discovery"
             and getattr(error, "retryable_topic_intake", False)
             and status_code not in {408, 425, 429, 500, 502, 503, 504}):
@@ -117,12 +119,12 @@ def classify_failure(stage_kind, error, stage_result=None):
         if getattr(error, "topic_retry_reason", None) == "scientific_candidate_rejected":
             return "scientific_review"
     if (error_type in {
-            "ProviderCooldownError", "ProviderConfigurationError", "QuotaExceededError",
+            "ProviderCooldownError", "ProviderConfigurationError", "ProviderRateLimitError", "QuotaExceededError",
             "ComposerHardDeadlineExceeded", "ComposerLateStageResult",
             "CapabilityDeadlineError", "CapabilityModelBudgetExceeded",
             "ModelCallError",
         }
-            or failure_kind in {"provider_cooldown", "provider_configuration",
+            or failure_kind in {"provider_cooldown", "provider_configuration", "provider_rate_limit",
                                 "process_interrupted"}
             or status_code in {408, 425, 429, 500, 502, 503, 504}):
         return "resource_fence"
@@ -133,7 +135,18 @@ def classify_failure(stage_kind, error, stage_result=None):
         # These are failures in the harness/runtime contract, not evidence
         # that a scientific claim or experiment design needs model review.
         return "harness_bug"
-    if isinstance(error, ModelContractError):
+    repair_feedback = getattr(error, "repair_feedback", None)
+    observed = repair_feedback.get("validation_context") if isinstance(repair_feedback, dict) else None
+    if (stage_kind == "experiment"
+            and getattr(error, "failure_class", None) == "experiment_capability_repair"
+            and isinstance(observed, dict)
+            and type(observed.get("observation_count")) is int
+            and observed["observation_count"] > 0):
+        return "experiment_failure"
+    if (isinstance(error, ModelContractError)
+            or (isinstance(stage_result, dict)
+                and isinstance(stage_result.get("failure"), dict)
+                and stage_result["failure"].get("failure_class") == "model_contract")):
         return "model_contract"
     if "work order requires its routing, objective, success and evidence fields" in text:
         # Historical checkpoints contain this untyped validator error from a
@@ -238,7 +251,8 @@ def _result_projection(stage_result):
         "status", "error", "failure", "study_id", "run_id", "project_id", "incumbent_ref",
         "project_dir", "survey_ref", "nomination_ref", "survey_current",
         "assessment_current", "gap_state", "topic_admission",
-        "results_package", "output_path", "execution_refs", "deterministic_validation_ref",
+        "results_package", "raw_results", "raw_results_sha256", "research_question",
+        "output_path", "execution_refs", "deterministic_validation_ref",
         "model_review_refs", "assessment_ref", "metrics", "findings", "limitations",
         "analysis", "blockers", "research_expansion_requests", "usage", "time_plan",
         "stage_id", "kind", "attempt_id", "attempt_number", "topic_id", "topic_cycle",
@@ -249,7 +263,7 @@ def _result_projection(stage_result):
     # A runner may only return a path after a late validation failure. Include
     # the bounded JSON body as evidence so the next repair does not have to
     # guess which result existed before the failure.
-    for key in ("results_package", "output_path"):
+    for key in ("results_package", "raw_results", "output_path"):
         value = stage_result.get(key)
         if not isinstance(value, str):
             continue
@@ -257,10 +271,12 @@ def _result_projection(stage_result):
         if not path.is_file() or path.suffix.lower() != ".json":
             continue
         try:
-            payload = json.loads(path.read_text())
+            body = path.read_bytes()
+            payload = json.loads(body)
         except (OSError, ValueError, TypeError):
             continue
         projected[f"{key}_snapshot"] = _bounded(payload, max_depth=7, max_items=24, max_text=5000)
+        projected[f"{key}_sha256"] = hashlib.sha256(body).hexdigest()
     return _bounded(projected, max_depth=7)
 
 

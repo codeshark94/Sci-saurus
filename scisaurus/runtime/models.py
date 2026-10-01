@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from contextlib import closing
 from email.utils import parsedate_to_datetime
 import base64
 import hashlib
@@ -17,8 +18,9 @@ import sqlite3
 import threading
 import time
 import urllib.parse
+import uuid
 
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import QuotaExceededError, ValidationError
 from scisaurus.core.schema import json_object
 
 
@@ -39,11 +41,14 @@ MODEL_CONFIG_FIELDS = frozenset({
     "max_image_bytes", "max_request_bytes", "max_retries", "retry_backoff_seconds",
     "cache_prompt", "model_call_budget_path", "model_call_budget_key",
     "model_call_budget_limit",
+    "model_call_budget_scopes",
 }) | SAMPLING_FIELDS
 ROLE_ROUTE_FIELDS = frozenset({"id", "pool"}) | MODEL_CONFIG_FIELDS
 MODEL_CALL_BUDGET_FIELDS = frozenset({
     "model_call_budget_path", "model_call_budget_key", "model_call_budget_limit",
 })
+MODEL_TOKEN_BUDGET_FIELD = "model_token_budget_limits"
+MODEL_BUDGET_SCOPE_FIELDS = MODEL_CALL_BUDGET_FIELDS | {MODEL_TOKEN_BUDGET_FIELD}
 
 
 def is_local_qwen_route(config):
@@ -271,7 +276,19 @@ def _validate_model_call_budget(config, *, name="model call budget"):
     limit = config["model_call_budget_limit"]
     if type(limit) is not int or limit <= 0:
         raise ValidationError(f"{name} limit must be a positive integer")
+    tokens = config.get(MODEL_TOKEN_BUDGET_FIELD)
+    if MODEL_TOKEN_BUDGET_FIELD in config and (
+            not isinstance(tokens, dict) or set(tokens) != {"input_tokens", "output_tokens"}
+            or any(type(value) is not int or value <= 0 for value in tokens.values())):
+        raise ValidationError(f"{name} token limits require positive input_tokens and output_tokens")
     return config
+
+
+def validate_model_budget_scope(scope):
+    if (not isinstance(scope, dict) or not MODEL_CALL_BUDGET_FIELDS <= set(scope)
+            or set(scope) - MODEL_BUDGET_SCOPE_FIELDS):
+        raise ValidationError("model call budget scope requires a complete budget")
+    return _validate_model_call_budget(scope)
 
 
 def _budget_config(config):
@@ -283,11 +300,100 @@ def _budget_config(config):
     if not present:
         return None
     _validate_model_call_budget(config)
-    return {
+    value = {
         "path": config["model_call_budget_path"],
         "key": config["model_call_budget_key"],
         "limit": config["model_call_budget_limit"],
     }
+    if MODEL_TOKEN_BUDGET_FIELD in config:
+        value["token_limits"] = dict(config[MODEL_TOKEN_BUDGET_FIELD])
+    return value
+
+
+def _token_budget_tables(connection):
+    connection.execute("CREATE TABLE IF NOT EXISTS model_token_budgets ("
+        "budget_key TEXT PRIMARY KEY, max_input INTEGER NOT NULL, max_output INTEGER NOT NULL, "
+        "used_input INTEGER NOT NULL, used_output INTEGER NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS model_token_reservations ("
+        "reservation_id TEXT PRIMARY KEY, budget_key TEXT NOT NULL, "
+        "input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, state TEXT NOT NULL, "
+        "observed_input INTEGER, observed_output INTEGER)")
+
+
+def register_model_token_budget(config, usage_floor=None):
+    """Register immutable token ceilings and monotonically restore observed costs."""
+    budget = _budget_config(config)
+    if not budget or "token_limits" not in budget:
+        return
+    limits = budget["token_limits"]
+    quantities = {key: (usage_floor or {}).get(key, 0) for key in limits}
+    if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
+           for value in quantities.values()):
+        raise ValidationError("token budget usage floors must be nonnegative")
+    floor = {key: math.ceil(value) for key, value in quantities.items()}
+    Path(budget["path"]).parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(budget["path"], timeout=30.0)) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        _token_budget_tables(connection)
+        row = connection.execute("SELECT max_input,max_output FROM model_token_budgets "
+                                 "WHERE budget_key=?", (budget["key"],)).fetchone()
+        if row and row != (limits["input_tokens"], limits["output_tokens"]):
+            raise ValidationError("persisted model token-budget limit changed")
+        connection.execute("INSERT INTO model_token_budgets VALUES (?,?,?,?,?) "
+            "ON CONFLICT(budget_key) DO UPDATE SET used_input=MAX(used_input,excluded.used_input), "
+            "used_output=MAX(used_output,excluded.used_output)",
+            (budget["key"], limits["input_tokens"], limits["output_tokens"],
+             floor["input_tokens"], floor["output_tokens"]))
+
+
+def model_token_budget_usage(config):
+    """Read observed token costs independently of outstanding reservations."""
+    budget = _budget_config(config)
+    if not budget or "token_limits" not in budget or not Path(budget["path"]).is_file():
+        return {}
+    with closing(sqlite3.connect(Path(budget["path"]).as_uri()+"?mode=ro", uri=True)) as connection:
+        if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='model_token_budgets'").fetchone():
+            return {}
+        row = connection.execute("SELECT max_input,max_output,used_input,used_output "
+                                 "FROM model_token_budgets WHERE budget_key=?", (budget["key"],)).fetchone()
+    if row is None:
+        return {}
+    if row[:2] != tuple(budget["token_limits"][key] for key in ("input_tokens", "output_tokens")):
+        raise ValidationError("persisted model token-budget limit changed")
+    return dict(zip(("input_tokens", "output_tokens"), row[2:]))
+
+
+def _settle_model_token_budgets(reserved, usage):
+    """Settle a physical HTTP reservation once; unknown costs remain reserved."""
+    for budget in reserved:
+        reservation_id = budget.get("reservation_id")
+        if reservation_id is None:
+            continue
+        with closing(sqlite3.connect(budget["path"], timeout=30.0)) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT state,observed_input,observed_output FROM model_token_reservations WHERE reservation_id=?",
+                                     (reservation_id,)).fetchone()
+            if row is None or row[0] == "settled":
+                continue
+            known = list(row[1:])
+            for offset, dimension in enumerate(("input_tokens", "output_tokens")):
+                value = (usage or {}).get(dimension)
+                if value is None:
+                    continue
+                if type(value) is not int or value < 0:
+                    raise ValidationError("observed model token usage must be nonnegative integers")
+                if known[offset] is not None:
+                    if known[offset] != value:
+                        raise ValidationError("observed model token settlement is immutable")
+                    continue
+                suffix = "input" if offset == 0 else "output"
+                connection.execute(f"UPDATE model_token_budgets SET used_{suffix}=used_{suffix}+? WHERE budget_key=?",
+                                   (value, budget["key"]))
+                connection.execute(f"UPDATE model_token_reservations SET observed_{suffix}=?, {dimension}=0 WHERE reservation_id=?",
+                                   (value, reservation_id))
+                known[offset] = value
+            state = "settled" if all(value is not None for value in known) else "unknown"
+            connection.execute("UPDATE model_token_reservations SET state=? WHERE reservation_id=?", (state,reservation_id))
 
 
 def model_call_budget_available(config):
@@ -328,7 +434,46 @@ def model_call_budget_available(config):
     return row[1] < row[0]
 
 
-def _reserve_model_call_budget(config):
+def _reserve_model_call_budgets(configs, *, token_reservation=None):
+    """Reserve every applicable scope before I/O, undoing rejected admission."""
+    owners = {}
+    for config in configs:
+        budget = _budget_config(config)
+        if budget is None:
+            continue
+        identity = (str(Path(budget["path"]).resolve()), budget["key"])
+        prior = owners.get(identity)
+        if prior is not None:
+            previous = _budget_config(prior)
+            if previous["limit"] != budget["limit"] or (
+                    previous.get("token_limits") is not None and budget.get("token_limits") is not None
+                    and previous["token_limits"] != budget["token_limits"]):
+                raise ModelCallError("model call budget scopes have conflicting limits", outcome_known=True)
+            if budget.get("token_limits") is None:
+                continue
+        owners[identity] = config
+    reserved = []
+    try:
+        for config in owners.values():
+            receipt = _reserve_model_call_budget(config, token_reservation=token_reservation)
+            reserved.append(receipt)
+    except ModelCallError:
+        for budget in reversed(reserved):
+            try:
+                with closing(sqlite3.connect(budget["path"], timeout=30.0)) as connection:
+                    with connection:
+                        connection.execute("UPDATE model_call_budgets SET used_calls=used_calls-1 "
+                            "WHERE budget_key=? AND used_calls>0", (budget["key"],))
+                        if budget.get("reservation_id"):
+                            connection.execute("DELETE FROM model_token_reservations WHERE reservation_id=?",
+                                               (budget["reservation_id"],))
+            except (OSError, sqlite3.Error) as exc:
+                raise ModelCallError("model call budget reservation could not be released", outcome_known=True) from exc
+        raise
+    return reserved
+
+
+def _reserve_model_call_budget(config, *, token_reservation=None):
     """Atomically spend one model-call budget before provider I/O."""
     budget = _budget_config(config)
     if budget is None:
@@ -358,8 +503,10 @@ def _reserve_model_call_budget(config):
                 "VALUES (?, ?, 1)",
                 (budget["key"], budget["limit"]),
             )
-            connection.commit()
-            return
+            row = (budget["limit"], 0)
+            inserted = True
+        else:
+            inserted = False
         if row[0] != budget["limit"]:
             raise ModelCallError(
                 "model call budget limit conflicts with the existing ledger",
@@ -369,14 +516,43 @@ def _reserve_model_call_budget(config):
             "UPDATE model_call_budgets SET used_calls=used_calls+1 "
             "WHERE budget_key=? AND used_calls < max_calls",
             (budget["key"],),
-        )
-        if updated.rowcount != 1:
+        ) if not inserted else None
+        if updated is not None and updated.rowcount != 1:
             connection.rollback()
-            raise ModelCallError(
+            raise ModelBudgetExceededError(
                 f"model call budget exhausted: {budget['key']}",
                 outcome_known=True,
+                budget_admission={"path": str(path.resolve()), "key": budget["key"],
+                    "dimension": "model_calls", "limit": row[0], "observed": row[1],
+                    "reserved": 0, "requested": 1},
             )
+        if "token_limits" in budget:
+            if not isinstance(token_reservation, dict) or any(
+                    type(token_reservation.get(key)) is not int or token_reservation[key] < 0
+                    for key in ("input_tokens", "output_tokens")):
+                raise ModelCallError("model token-budget admission requires request bounds", outcome_known=True)
+            _token_budget_tables(connection)
+            limits = budget["token_limits"]
+            connection.execute("INSERT OR IGNORE INTO model_token_budgets VALUES (?,?,?,0,0)",
+                (budget["key"], limits["input_tokens"], limits["output_tokens"]))
+            tokens = connection.execute("SELECT max_input,max_output,used_input,used_output "
+                "FROM model_token_budgets WHERE budget_key=?", (budget["key"],)).fetchone()
+            if tokens[:2] != (limits["input_tokens"], limits["output_tokens"]):
+                raise ModelCallError("model token-budget limit conflicts with existing ledger", outcome_known=True)
+            pending = connection.execute("SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0) "
+                "FROM model_token_reservations WHERE budget_key=? AND state!='settled'", (budget["key"],)).fetchone()
+            for offset, dimension in enumerate(("input_tokens", "output_tokens")):
+                if tokens[offset+2] + pending[offset] + token_reservation[dimension] > tokens[offset]:
+                    raise ModelBudgetExceededError(f"model token budget exhausted: {budget['key']} {dimension}",
+                        outcome_known=True, budget_admission={"path": str(path.resolve()), "key": budget["key"],
+                            "dimension": dimension, "limit": tokens[offset], "observed": tokens[offset+2],
+                            "reserved": pending[offset], "requested": token_reservation[dimension]})
+            budget["reservation_id"] = uuid.uuid4().hex
+            connection.execute("INSERT INTO model_token_reservations (reservation_id,budget_key,input_tokens,output_tokens,state) VALUES (?,?,?,?, 'reserved')",
+                (budget["reservation_id"], budget["key"], token_reservation["input_tokens"],
+                 token_reservation["output_tokens"]))
         connection.commit()
+        return budget
     except ModelCallError:
         if connection is not None:
             connection.rollback()
@@ -681,7 +857,7 @@ def resolve_model_config(model, *, role=None, overrides=None):
             key: selected_model.pop(key)
             for key in list(selected_model) if key in SAMPLING_FIELDS
         }
-        base.update(selected_model)
+        base = merge_model_config(base, selected_model)
     sampling = dict(DEFAULT_ROLE_PROFILES.get(role, {}))
     sampling.update(global_sampling)
     sampling.update(selected_sampling)
@@ -693,6 +869,29 @@ def resolve_model_config(model, *, role=None, overrides=None):
     base.update(sampling)
     reject_local_qwen_route(base)
     return base
+
+
+def merge_model_config(parent, overrides):
+    """Route settings may add budget owners, never remove existing owners."""
+    merged = dict(parent)
+    merged.update(overrides)
+    scopes = []
+    for source in (parent, overrides):
+        values = source.get("model_call_budget_scopes", [])
+        if not isinstance(values, list):
+            raise ValidationError("model call budget scopes must be a list")
+        for value in values:
+            if value not in scopes:
+                scopes.append(value)
+    parent_budget = _budget_config(parent)
+    merged_budget = _budget_config(merged)
+    if parent_budget is not None and parent_budget != merged_budget:
+        scope = {field: parent[field] for field in MODEL_CALL_BUDGET_FIELDS}
+        if scope not in scopes:
+            scopes.append(scope)
+    if scopes or "model_call_budget_scopes" in merged:
+        merged["model_call_budget_scopes"] = scopes
+    return merged
 
 
 def with_runtime_cooldown_fallback(model, *, env=None):
@@ -1155,6 +1354,53 @@ class ModelCallError(RuntimeError):
             } else None
         )
 
+    def failure_details(self):
+        """Serialize admission and provider facts across runner boundaries."""
+        failure = {"kind": "model_call", "outcome_known": self.outcome_known,
+                   "attempts": self.attempts, "elapsed_seconds": self.elapsed_seconds,
+                   "status_code": self.status_code,
+                   "retry_after_seconds": self.retry_after_seconds,
+                   "provider_error_kind": self.provider_error_kind,
+                   "usage": dict(getattr(self, "usage", {}))}
+        if getattr(self, "budget_admission", None) is not None:
+            failure["budget_admission"] = dict(self.budget_admission)
+        return failure
+
+    @staticmethod
+    def from_failure(message, failure):
+        """Reconstruct the same typed fence without parsing its message."""
+        admission = failure.get("budget_admission")
+        error_type = ModelBudgetExceededError if admission is not None else ModelCallError
+        error = error_type(message, outcome_known=failure.get("outcome_known", False),
+            attempts=failure.get("attempts", 0), elapsed_seconds=failure.get("elapsed_seconds"),
+            status_code=failure.get("status_code"),
+            retry_after_seconds=failure.get("retry_after_seconds"),
+            provider_error_kind=failure.get("provider_error_kind"),
+            **({"budget_admission": admission} if admission is not None else {}))
+        error.usage = dict(failure.get("usage", {}))
+        return error
+
+
+class ModelBudgetExceededError(ModelCallError, QuotaExceededError):
+    """A registered owner rejected a request before provider admission."""
+    def __init__(self, message, *, budget_admission, **kwargs):
+        fields = {"path", "key", "dimension", "limit", "observed", "reserved", "requested"}
+        if (not isinstance(budget_admission, dict) or set(budget_admission) != fields
+                or not isinstance(budget_admission["path"], str) or not Path(budget_admission["path"]).is_absolute()
+                or not isinstance(budget_admission["key"], str) or not budget_admission["key"]
+                or budget_admission["dimension"] not in {"model_calls", "input_tokens", "output_tokens"}
+                or any(type(budget_admission[key]) is not int or budget_admission[key] < 0
+                       for key in ("limit", "observed", "reserved", "requested"))
+                or budget_admission["limit"] < 1):
+            raise ValidationError("invalid model budget-admission fence")
+        ModelCallError.__init__(self, message, **kwargs)
+        self.budget_admission = dict(budget_admission)
+        self.dimension = "max_" + budget_admission["dimension"]
+        self.limit = budget_admission["limit"]
+        self.observed = budget_admission["observed"]
+        self.usage = {}
+        self.diagnostics = [dict(budget_admission)]
+
 
 class ModelContextBudgetError(ValidationError):
     """A request was rejected locally because its input cannot fit the route.
@@ -1227,6 +1473,53 @@ def _provider_http_error_kind(body):
     return None
 
 
+def json_object_continuation_error(text):
+    """Reject prefixes that cannot become one JSON object by appending a suffix."""
+    def unfence(candidate):
+        lines = candidate.splitlines(keepends=True)
+        if lines and lines[0].strip().casefold() in {"```json", "```jsonc"}:
+            return "".join(lines[1:]).lstrip()
+        return candidate
+
+    payload_prefix = unfence(text.lstrip())
+    if not payload_prefix.startswith("{") and "</think>" in payload_prefix:
+        payload_prefix = unfence(payload_prefix.split("</think>", 1)[1].lstrip())
+    if not payload_prefix.startswith("{"):
+        return "truncated structured response has no JSON object prefix"
+
+    def reject_nonfinite(value):
+        raise ValueError("nonfinite JSON")
+
+    def finite_float(value):
+        number = float(value)
+        if not math.isfinite(number):
+            reject_nonfinite(value)
+        return number
+
+    try:
+        json.JSONDecoder(parse_constant=reject_nonfinite,
+                         parse_float=finite_float).raw_decode(payload_prefix)
+    except json.JSONDecodeError as error:
+        remaining = payload_prefix[error.pos:]
+        if error.pos >= len(payload_prefix) or error.msg.startswith("Unterminated string"):
+            return None
+        if error.msg == "Expecting value" and (
+                any(token.startswith(remaining) for token in ("true", "false", "null"))
+                or remaining == "-"):
+            return None
+        if (error.msg.startswith("Invalid \\u") and remaining.startswith("u")
+                and re.fullmatch(r"u[0-9a-fA-F]{0,3}", remaining)):
+            return None
+        if (error.msg.startswith("Expecting ',' delimiter")
+                and error.pos > 0 and payload_prefix[error.pos - 1].isdigit()
+                and re.fullmatch(r"(?:\.[0-9]+)?[eE][+-]?|\.[0-9]*", remaining)):
+            return None
+        return "truncated structured response has an invalid JSON object prefix"
+    except ValueError:
+        return "truncated structured response has an invalid JSON object prefix"
+    return "structured response already contains a closed JSON object"
+
+
 @dataclass(frozen=True)
 class ModelResult:
     text: str
@@ -1283,7 +1576,8 @@ class ModelClient:
                  provider_quota_scope: str | None = None,
                  model_call_budget_path: str | None = None,
                  model_call_budget_key: str | None = None,
-                 model_call_budget_limit: int | None = None):
+                 model_call_budget_limit: int | None = None,
+                 model_call_budget_scopes: list | None = None):
         if not isinstance(base_url, str):
             raise ValidationError("model base_url must be a URL string")
         parsed = urllib.parse.urlsplit(base_url)
@@ -1337,6 +1631,12 @@ class ModelClient:
             "model_call_budget_key": model_call_budget_key,
             "model_call_budget_limit": model_call_budget_limit,
         }, name="model call budget")
+        if model_call_budget_scopes is not None:
+            if not isinstance(model_call_budget_scopes, list):
+                raise ValidationError("model call budget scopes must be a list")
+            for scope in model_call_budget_scopes:
+                validate_model_budget_scope(scope)
+        self.model_call_budget_scopes = [dict(scope) for scope in model_call_budget_scopes or []]
         sampling = {
             key: value for key, value in {
                 "temperature": temperature, "top_p": top_p, "seed": seed,
@@ -1392,10 +1692,13 @@ class ModelClient:
         return body, media_type
 
     def complete(self, *, system: str, prompt: str, images=None,
-                 continuation_text: str | None = None) -> ModelResult:
+                 continuation_text: str | None = None,
+                 dispatch_budget: dict | None = None) -> ModelResult:
         request_model = self.model
         request_base_url = self.base_url
         reject_local_qwen_route({"base_url": request_base_url, "model": request_model})
+        if dispatch_budget is not None:
+            _validate_model_call_budget(dispatch_budget, name="dispatch budget")
         if not isinstance(system, str) or not isinstance(prompt, str):
             raise ValidationError("model system and prompt content must be strings")
         if continuation_text is not None and (
@@ -1507,26 +1810,51 @@ class ModelClient:
         attempt = 0
         attempts_made = 0
         parsed = None
+        reserved = []
+        reported_usage = {}
+
+        def settle(usage):
+            try:
+                _settle_model_token_budgets(reserved, usage)
+            except (OSError, sqlite3.Error, ValidationError) as exc:
+                error = ValidationError("model token-budget settlement failed")
+                error.usage = {"model_calls": attempts_made, **reported_usage}
+                error.attempts = attempts_made
+                error.outcome_known = all(key in reported_usage for key in ("input_tokens", "output_tokens"))
+                raise error from exc
 
         def failure(message, *, outcome_known=False, status_code=None,
-                    retry_after_seconds=None, provider_error_kind=None):
-            return ModelCallError(
+                    retry_after_seconds=None, provider_error_kind=None, budget_admission=None):
+            settle(reported_usage or None)
+            error_type = ModelBudgetExceededError if budget_admission is not None else ModelCallError
+            error = error_type(
                 message, outcome_known=outcome_known, attempts=attempts_made,
                 elapsed_seconds=time.monotonic() - started,
                 status_code=status_code,
                 retry_after_seconds=retry_after_seconds,
                 provider_error_kind=provider_error_kind,
+                **({"budget_admission": budget_admission} if budget_admission is not None else {}),
             )
+            error.usage = {"model_calls": attempts_made, **reported_usage} if attempts_made else {}
+            return error
 
         while True:
+            reported_usage = {}
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise failure("model request deadline exceeded") from None
-            _reserve_model_call_budget({
-                "model_call_budget_path": self.model_call_budget_path,
-                "model_call_budget_key": self.model_call_budget_key,
-                "model_call_budget_limit": self.model_call_budget_limit,
-            })
+            try:
+                reserved = _reserve_model_call_budgets([*self.model_call_budget_scopes, dispatch_budget or {}, {
+                    "model_call_budget_path": self.model_call_budget_path,
+                    "model_call_budget_key": self.model_call_budget_key,
+                    "model_call_budget_limit": self.model_call_budget_limit,
+                }], token_reservation={"input_tokens": estimate_input_tokens(system, budget_prompt, image_count=len(images)),
+                                       "output_tokens": self.max_output_tokens})
+            except ModelCallError as exc:
+                raise failure(str(exc), outcome_known=exc.outcome_known,
+                    status_code=exc.status_code, retry_after_seconds=exc.retry_after_seconds,
+                    provider_error_kind=exc.provider_error_kind,
+                    budget_admission=getattr(exc, "budget_admission", None)) from exc
             attempts_made += 1
             connection = connection_type(parsed_base.hostname, parsed_base.port,
                                          timeout=max(0.1, remaining))
@@ -1620,6 +1948,7 @@ class ModelClient:
                 code = exc.code
                 retry_after = exc.retry_after
                 if code in retryable_statuses and attempt < self.max_retries:
+                    settle(None)
                     delay = self.retry_backoff_seconds * (2 ** attempt)
                     try:
                         if retry_after is not None:
@@ -1663,6 +1992,16 @@ class ModelClient:
                 raise failure("model response exceeded the configured byte limit")
             try:
                 data = json.loads(raw)
+                if not isinstance(data, dict):
+                    raise ValueError("response must be an object")
+                usage_container = data if self.protocol == "ollama" else data.get("usage", {})
+                token_fields = (("input_tokens", "prompt_eval_count"), ("output_tokens", "eval_count")) if self.protocol == "ollama" else (
+                    ("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens"))
+                reported_usage = {key: usage_container[source] for key, source in token_fields
+                                  if isinstance(usage_container, dict) and type(usage_container.get(source)) is int
+                                  and usage_container[source] >= 0}
+                reported_usage.update(_cache_usage(data))
+                settle(reported_usage)
                 if self.protocol == "ollama":
                     if data.get("done") is not True:
                         raise ValueError("incomplete response")
@@ -1688,10 +2027,12 @@ class ModelClient:
                 # A received HTTP 200 may already have consumed a complete
                 # generation. Its unknown usage must not be hidden by a
                 # transparent second generation of the same request.
-                raise failure("model returned an invalid or incomplete response") from None
+                raise failure("model returned an invalid or incomplete response",
+                              outcome_known=all(key in reported_usage for key in ("input_tokens", "output_tokens"))) from None
             break
         elapsed = time.monotonic() - started
         text, reason, usage, served_model = parsed
+        settle(usage)
         return ModelResult(text, served_model,
-                           {"model_calls": 1, **usage}, elapsed, reason,
+                           {"model_calls": attempts_made, **usage}, elapsed, reason,
                            request_attempts=attempts_made)

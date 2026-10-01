@@ -193,6 +193,8 @@ class OpenAlexFixture(BaseHTTPRequestHandler):
         status, body = 200, json.dumps(payload, indent=2).encode()
         if parsed.path != "/works" and parsed.path.endswith("/W404"):
             status, body = 404, b'{"error":"work not found"}'
+        elif parsed.path.endswith("/W405"):
+            status, body = 404, b"<html><body>Work unavailable</body></html>"
         if mode == "rate-limited":
             status, body = 429, b'{"error": "slow down"}'
         elif mode == "anonymous-load":
@@ -245,7 +247,7 @@ class OpenAlexFixture(BaseHTTPRequestHandler):
         self.bodies.append(body)
         try:
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "text/html" if parsed.path.endswith("/W405") else "application/json")
             self.send_header("Content-Length", str(len(body) + (10 if mode == "short-body" else 0)))
             self.send_header("X-RateLimit-Limit", "100000")
             self.send_header("X-RateLimit-Remaining", (
@@ -323,15 +325,20 @@ class TestOpenAlex(unittest.TestCase):
         self.assertEqual(result["sources"][0]["authors"], ["Ada Lovelace", "Alan Turing"])
         self.assertTrue(all(check["outcome"] == "passed" for check in self.inspect(result, arguments)))
 
-    def test_transient_rate_limit_is_retried_inside_total_timeout(self):
+    def test_rate_limit_returns_without_transport_retry(self):
+        before = len(OpenAlexFixture.requests)
         result = self.client(max_retries=1, retry_backoff_seconds=0).run(
             **self.arguments("rate-limit-once"))
-        self.assertEqual(result["outcome"], "ok")
-        self.assertEqual(result["metadata"]["attempts"], 2)
+        self.assertEqual(result["outcome"], "rate_limited")
+        self.assertEqual(result["metadata"]["attempts"], 1)
         self.assertEqual(result["metadata"]["retry_wait_seconds"], 0.0)
+        self.assertEqual(result["metadata"]["retry_suppressed_reason"], "provider_rate_limit_requires_operator_recovery")
+        self.assertEqual(len(OpenAlexFixture.requests) - before, 1)
         self.assertEqual(OpenAlexFixture.rate_limit_count, 1)
-        self.assertTrue(all(check["outcome"] == "passed" for check in self.inspect(result,
-                                                                                       self.arguments("rate-limit-once"))))
+        checks = {check["check_id"]: check["outcome"] for check in self.inspect(
+            result, self.arguments("rate-limit-once"), representative=False)}
+        self.assertEqual(checks["outcome"], "failed")
+        self.assertEqual(checks["usable-output"], "failed")
 
     def test_query_timeout_is_recorded_without_repeating_the_same_search(self):
         arguments = self.arguments("reentrant jamming shear thickening down-sweep unjamming onset confinement gap")
@@ -350,6 +357,16 @@ class TestOpenAlex(unittest.TestCase):
         checks = self.inspect(result, {**arguments, "query": "query-timeout"}, representative=False)
         self.assertTrue(all(check["outcome"] == "passed" for check in checks), checks)
 
+    def test_non_rate_limit_transient_response_still_retries(self):
+        replies = [{"outcome": "provider_error", "metadata": {"http_status": 503, "attempts": 1}},
+                   {"outcome": "ok", "metadata": {"http_status": 200, "attempts": 1}}]
+        client = self.client(max_retries=2, retry_backoff_seconds=0)
+        with patch.object(client, "_run_once", side_effect=replies) as transport:
+            result = client.run(**self.arguments("temporary outage"))
+        self.assertEqual(result["outcome"], "ok")
+        self.assertEqual(result["metadata"]["attempts"], 2)
+        self.assertEqual(transport.call_count, 2)
+
     def test_rate_limit_cause_and_retry_budget_are_preserved(self):
         started = time.monotonic()
         result = self.client(timeout=0.2, max_retries=2).run(**self.arguments("anonymous-load"))
@@ -359,7 +376,7 @@ class TestOpenAlex(unittest.TestCase):
         self.assertEqual(limit["kind"], "anonymous_search_load")
         self.assertEqual(limit["retry_after_seconds"], 37.0)
         self.assertFalse(limit["authenticated"])
-        self.assertTrue(result["metadata"]["retry_budget_exhausted"])
+        self.assertEqual(result["metadata"]["retry_suppressed_reason"], "provider_rate_limit_requires_operator_recovery")
         self.assertIn("elevated load", result["error"])
 
         daily = self.client(max_retries=0).run(**self.arguments("daily-budget"))
@@ -627,6 +644,15 @@ class TestOpenAlex(unittest.TestCase):
             self.assertTrue(all(check["outcome"] == "passed" for check in self.inspect(result, arguments, representative=False)))
             self.assertTrue(any(check["outcome"] == "failed" for check in self.inspect(result, arguments)))
 
+    def test_html_missing_work_is_verified_unavailable(self):
+        arguments = self.arguments(None, operation="work", work_id="W405")
+        result = self.client().run(**arguments)
+        self.assertEqual(result["outcome"], "not_found")
+        self.assertIsNone(result["raw_response"])
+        self.assertEqual(result["works"], [])
+        self.assertTrue(all(check["outcome"] == "passed" for check in self.inspect(result, arguments, representative=False)))
+        self.assertTrue(any(check["outcome"] == "failed" for check in self.inspect(result, arguments)))
+
     def test_location_and_abstract_metadata_do_not_claim_full_text(self):
         result = self.client().run(**self.arguments("no-abstract"))
         self.assertEqual(result["outcome"], "ok")
@@ -711,6 +737,7 @@ class TestOpenAlex(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             result = self.client(auth_env="SCISAURUS_OPENALEX_TEST").run(**self.arguments())
         self.assertEqual(result["outcome"], "auth_required")
+        self.assertEqual(result["metadata"]["attempts"], 0)
         self.assertEqual(len(OpenAlexFixture.requests), before)
 
     def test_configured_auth_can_explicitly_fall_back_to_anonymous_request(self):

@@ -15,6 +15,7 @@ from scisaurus.runtime.capability_registry import (
 )
 from scisaurus.runtime.program_admission import SCHEMA_VERSION, validate_program_candidate
 from scisaurus.runtime.program_gates import ProgramGateRejected, admit_program_candidate
+from scisaurus.runtime.experiment import validate_program_output
 from scisaurus.runtime.program_sandbox import (
     _macho_dependency_paths, run_sandboxed, sandbox_profile, sandbox_status,
 )
@@ -233,6 +234,49 @@ class GateTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValidationError, "non-identical"):
             admit_program_candidate(candidate(), execute=execute, validate=self._validate())
+
+    def test_normalized_output_digest_matches_validator_candidate(self):
+        document = output_document()
+        document["analysis"] = {"comparisons": ["Reference condition."]}
+        normalized = validate_program_output(json.loads(json.dumps(document)), INTENT)
+        self.assertNotEqual(expected_digest(document), expected_digest(normalized))
+        value = candidate()
+        value["test_vector"]["expected_output_sha256"] = expected_digest(normalized)
+        observed = []
+        validator = self._validate()
+
+        def validate(data):
+            request = json.loads(data)
+            observed.append(request)
+            self.assertEqual(request["candidate"], normalized)
+            self.assertEqual(request["candidate_sha256"], expected_digest(request["candidate"]))
+            return validator(data)
+
+        record = admit_program_candidate(value, execute=self._execute(document), validate=validate)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(record["output_sha256"], expected_digest(normalized))
+        self.assertEqual(document["analysis"], {"comparisons": ["Reference condition."]})
+
+    def test_normalization_cannot_hide_non_deterministic_raw_output(self):
+        document = output_document()
+        document["analysis"] = {"comparisons": ["Reference condition."]}
+        normalized = validate_program_output(json.loads(json.dumps(document)), INTENT)
+        value = candidate()
+        value["test_vector"]["expected_output_sha256"] = expected_digest(normalized)
+        documents = iter([document, normalized, document])
+        with self.assertRaisesRegex(ValidationError, "non-identical"):
+            admit_program_candidate(value, execute=lambda _: Result(json.dumps(next(documents)).encode()),
+                                    validate=lambda _: self.fail("non-deterministic output reached validator"))
+
+    def test_normalization_preserves_frozen_primary_outcome_contract(self):
+        document = output_document()
+        document["analysis"] = {"comparisons": ["Reference condition."]}
+        document["metrics"][0]["unit"] = "wrong_unit"
+        value = candidate()
+        value["test_vector"]["expected_output_sha256"] = expected_digest(document)
+        with self.assertRaisesRegex(ValidationError, "primary outcome unit"):
+            admit_program_candidate(value, execute=self._execute(document),
+                                    validate=lambda _: self.fail("invalid result reached validator"))
 
     def test_digest_mismatch_is_rejected(self):
         value = candidate()
