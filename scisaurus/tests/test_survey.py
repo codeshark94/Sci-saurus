@@ -1908,9 +1908,13 @@ class TestSurveyRunner(unittest.TestCase):
             "body_hash": receipt["body_hash"], "body": runner._body(receipt)})
         self.assertIn(receipt["artifact_ref"], runner._work_review_basis("W101"))
         contracts = prompt["response_contract"]["checks"]
-        self.assertEqual([row["check_id"] for row in contracts], prompt["required_checks"])
+        adjudications = prompt["response_contract"]["critique_adjudications"]
+        self.assertEqual([row["check_id"] for row in [*contracts, *adjudications]], prompt["required_checks"])
         for row in contracts:
-            self.assertEqual("affected_check_ids" in row["required_fields"], row["check_id"].startswith("critique:"))
+            self.assertEqual(row["required_fields"], ["check_id", "outcome", "method", "result"])
+        for row in adjudications:
+            self.assertTrue(row["check_id"].startswith("critique:"))
+            self.assertEqual(row["required_fields"], ["check_id", "disposition", "method", "result", "affected_check_ids"])
         old_review = runner._body(runner.work_reviews["W101"])
         self.assertTrue(runner._review_protocol_matches(old_review))
         renewed = runner._publish("command/survey-abstentions/W101", "note", runner._body(receipt),
@@ -2453,7 +2457,7 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(context["changed_entry_fields"], ["reason"])
         self.assertEqual(focused["review_obligations"], [obligation])
         self.assertIn(context["check_id"], focused["required_checks"])
-        self.assertEqual(context["protocol"], "literature-critique-transition-2")
+        self.assertEqual(context["protocol"], "literature-critique-transition-3")
         aggregate = next(prompt for prompt in reversed(prompts) if prompt.get("phase") == "survey_review")
         self.assertNotIn("critique_contexts", aggregate)
         self.assertNotIn("review_obligations", aggregate)
