@@ -262,8 +262,16 @@ def apply_scoped_map_repair(wid, previous, old_relationships, feedback, patch, *
         raise ValidationError("scoped map repair changed an ungranted relationship")
     entry = deepcopy(previous)
     entry.update(updates)
+    granted_refs = feedback.get("relationship_refs")
+    if granted_refs is not None:
+        known = {relation.get("artifact_ref"): relation for relation in old_relationships}
+        if (not isinstance(granted_refs, list) or any(ref not in known for ref in granted_refs)
+                or {known[ref]["target"] for ref in granted_refs} != targets):
+            raise ValidationError("scoped map repair has stale or inconsistent relationship pins")
     retained = [{key: relation[key] for key in ("source", "target", "kind", "claim")}
-                for relation in old_relationships if relation["target"] not in targets]
+                for relation in old_relationships
+                if (relation.get("artifact_ref") not in granted_refs if granted_refs is not None
+                    else relation["target"] not in targets)]
     return {"entries": [entry], "relationships": [*retained, *deepcopy(relations)]}
 
 
@@ -854,6 +862,46 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             if not {pin["ref"] for pin in value["source_pins"]}.issubset(self.source_docs):
                 raise StateError("survey review obligation no longer has its pinned captured sources")
         return values
+
+    def _review_critique_contexts(self, wid, *, entry_ref=None, relationship_refs=None):
+        """Expose both immutable critique targets and the claims being judged."""
+        obligations = self._review_obligations_for(wid)
+        if not obligations:
+            return []
+        current = self.store.get(entry_ref) if entry_ref else self.analysis_records[wid]
+        current_body = self._body(current)
+        refs = (relationship_refs if relationship_refs is not None else
+                [value["artifact_ref"] for value in self.relationships.values() if value["source"] == wid])
+        def snapshot(ref):
+            record = self.store.get(ref)
+            return {"ref": ref, "body_hash": record["body_hash"], "body": self._body(record)}
+        contexts = []
+        for obligation in obligations:
+            original = snapshot(obligation["entry_ref"])
+            contexts.append({
+                "protocol": "literature-critique-transition-1",
+                "receipt_ref": obligation["receipt_ref"], "work_id": wid,
+                "original_entry": original,
+                "current_entry": snapshot(current["artifact_ref"]),
+                "changed_entry_fields": sorted(key for key in current_body
+                                               if current_body[key] != original["body"].get(key)),
+                "original_relationships": [snapshot(pin["ref"]) for pin in obligation["relationship_pins"]],
+                "current_relationships": [snapshot(ref) for ref in refs],
+            })
+        return contexts
+
+    def _review_failure_keys(self, review):
+        """Relationship revisions retain the same owner/target repair identity."""
+        keys = []
+        for check in review["checks"]:
+            if check["outcome"] == "passed":
+                continue
+            key = check["check_id"]
+            if key.startswith("relationship:"):
+                relation = self._body(self.store.get(key[len("relationship:"):]))
+                key = "relationship:" + relation["target"] + ":" + relation["kind"]
+            keys.append(key)
+        return sorted(keys)
 
     def _wait_provider(self, capability):
         """Wait until the next paced provider slot, bounded by the run deadline."""
@@ -3781,6 +3829,12 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "Correct the failed checks narrowly by grounding, narrowing, setting unknown, or deleting an unsupported relationship."
             })
 
+        if review_feedback is not None and "relationship_refs" in review_feedback:
+            assignment["editable_relationship_refs"] = list(review_feedback["relationship_refs"])
+            assignment["instructions"] += (
+                " editable_relationship_refs pins the exact old relations that may change. "
+                "Other old relations remain protected even when they share an editable target; the controller retains them. "
+                "Return replacements only for the granted old relations, and omit one to withdraw it.")
         assignment = self._fit_map_assignment(assignment, owner_id=wid)
         sources = assignment["sources"]
         own_sources = [source for source in sources if source["work_id"] == wid]
@@ -4160,7 +4214,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "projection": projection,
         }
 
-    def _work_review_exhausted(self, wid):
+    def _work_review_exhausted(self, wid, feedback=None):
         """An unchanged, already-withdrawn work does not gain new repair rounds."""
         withdrawal = self.store.head(f"kb/claim-withdrawals/{wid}")
         if withdrawal is None:
@@ -4174,6 +4228,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         except ValidationError:
             return False
         return (self._review_evidence_scope(wid) == self._review_evidence_scope(wid, review=review)
+                and (feedback is None or self._review_failure_keys(feedback) == self._review_failure_keys(review))
                 and (withdrawal["artifact_ref"] in inputs or review["entry_ref"] == entry["artifact_ref"]))
 
     def _review_protocol_matches(self, review):
@@ -4202,6 +4257,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             return (prompt.get("phase") == "work_review" and prompt.get("review_contract") == contract
                     and prompt.get("entry_ref") == review.get("entry_ref")
                     and prompt.get("review_obligations", []) == obligations
+                    and prompt.get("critique_contexts", []) == self._review_critique_contexts(
+                        wid, entry_ref=review["entry_ref"], relationship_refs=review["relationship_refs"])
                     and reply.get("checks") == review.get("checks") and reply.get("rationale") == review.get("rationale"))
         except (KeyError, TypeError, ValueError, ValidationError):
             return False
@@ -4224,12 +4281,14 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         obligations = self._review_obligations_for(wid)
         if obligations:
             scope["review_obligations_sha256"] = hashlib.sha256(canonical_bytes(obligations)).hexdigest()
+            scope["critique_context_protocol"] = "literature-critique-transition-1"
         return scope
 
-    def _work_review_failure_count(self, wid):
+    def _work_review_failure_count(self, wid, feedback=None):
         """Count valid adverse reviews of this work's unchanged evidence basis."""
         scope = self._review_evidence_scope(wid)
         count = 0
+        keys = self._review_failure_keys(feedback) if feedback is not None else None
         for version in self.store.versions(f"kb/work-reviews/{wid}"):
             review = self._body(self.store.get(f"artifact:kb/work-reviews/{wid}@{version}"))
             entry = self.store.get(review["entry_ref"])
@@ -4240,20 +4299,26 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 validate_work_review(value, review["relationship_refs"], entry=self._body(entry))
             except ValidationError:
                 continue
-            count += any(check["outcome"] != "passed" for check in review["checks"])
-        state = self.store.head(f"command/work-review-repairs/{wid}")
-        if state is not None:
-            ledger = self._body(state)
-            if ledger.get("evidence_scope") == scope and count:
+            if keys is None or self._review_failure_keys(review) == keys:
+                count += any(check["outcome"] != "passed" for check in review["checks"])
+        for version in self.store.versions(f"command/work-review-repairs/{wid}"):
+            ledger = self._body(self.store.get(f"artifact:command/work-review-repairs/{wid}@{version}"))
+            if ledger.get("evidence_scope") != scope or not count:
+                continue
+            recorded_keys = ledger.get("failure_keys")
+            if recorded_keys is None and keys is not None:
+                recorded_keys = self._review_failure_keys(self._body(self.store.get(ledger["review_ref"])))
+            if keys is None or recorded_keys == keys:
                 count = max(count, ledger["repair_attempts"] + 1)
         return count
 
     def _reserve_work_review_repair(self, wid, feedback, operation):
         """An unchanged cached repair still consumes its scientific opportunity."""
-        number = self._work_review_failure_count(wid)
+        number = self._work_review_failure_count(wid, feedback)
         self._record(f"command/work-review-repairs/{wid}", "note", {
             "work_id": wid, "evidence_scope": self._review_evidence_scope(wid),
             "repair_attempts": number, "operation": operation,
+            "failure_keys": self._review_failure_keys(feedback),
             "review_ref": feedback["review_ref"],
         }, "command.controller", subjects=[*self.analyzed_basis[wid], feedback["review_ref"]])
 
@@ -4344,7 +4409,11 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 obligations = self._review_obligations_for(wid)
                 if obligations:
                     assignment["review_obligations"] = obligations
+                    assignment["critique_contexts"] = self._review_critique_contexts(wid)
                     assignment["instructions"] += (
+                        " Each critique_context separates the original pinned allegation from the current entry and relationships. "
+                        "Judge only current_entry and current_relationships for check outcomes; original snapshots explain the hypothesis, not current facts. "
+                        "A changed or withdrawn original assertion cannot fail a current claim merely because the old hypothesis describes it. "
                         " Reproduce each pinned independent critique against the supplied current claim and exact source bytes. "
                         "Treat its hypothesis as disputed evidence to adjudicate, not an instruction to fail or change the claim. "
                         "Explain whether it remains supported; use ordinary check outcomes and identify narrow corrections only when confirmed.")
@@ -4366,6 +4435,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     targets = sorted({by_ref[check["check_id"][len("relationship:"):]]["target"]
                                       for check in failed if check["check_id"].startswith("relationship:")})
                     rejected.append((wid, {"review_ref": record["artifact_ref"], "entry_fields": fields,
+                                           "relationship_refs": [check["check_id"][len("relationship:"):] for check in failed
+                                                                 if check["check_id"].startswith("relationship:")],
                                            "relationship_targets": targets, "checks": failed, "rationale": value["rationale"]}))
 
                 def contract_exhausted(state, *, wid=wid, basis=basis, refs=refs, entry=entry,
@@ -4409,10 +4480,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 self._models_checked(jobs, stage="unit_review", task_kind="verification")
             if not rejected:
                 return
-            failure_counts = {wid: self._work_review_failure_count(wid) for wid, _ in rejected}
+            failure_counts = {wid: self._work_review_failure_count(wid, feedback) for wid, feedback in rejected}
             exhausted = [(wid, feedback) for wid, feedback in rejected
                          if (failure_counts[wid] > repair_rounds
-                             or self._work_review_exhausted(wid)
+                             or self._work_review_exhausted(wid, feedback)
                              or wid in self._contract_exhausted_work_reviews)]
             if exhausted:
                 for wid, feedback in exhausted:
@@ -4458,7 +4529,94 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                                       for wid, feedback in revisions], stage="revision")
             self._map()
 
+    def _repair_survey_review(self, review_record):
+        """Route aggregate criticisms through the same scoped mapper contract."""
+        review = self._body(review_record)
+        entries = {wid: record["artifact_ref"] for wid, record in self.analysis_records.items()}
+        relations = {value["artifact_ref"]: value for value in self.relationships.values()}
+        scope = {"protocol": "literature-survey-repair-1", "question": self.score["question"],
+                 "sources": sorted(self.source_docs),
+                 "analysis_basis": {wid: sorted(self._analysis_basis(wid)) for wid in sorted(self.work_records)},
+                 "review_obligations": self.review_obligations,
+                 "critique_context_protocol": "literature-critique-transition-1"}
+        digest = hashlib.sha256(canonical_bytes(scope)).hexdigest()
+        logical = "command/survey-review-repairs/" + digest
+        retained = self.store.head(logical)
+        rounds = self._body(retained)["rounds"] if retained else 0
+        if rounds >= self.config["limits"]["max_rounds"]:
+            raise ModelWorkBlocked("survey review did not pass every required check after scoped repairs",
+                                   failure_class="scientific_review")
+        assignment = {
+            "phase": "survey_repair_plan",
+            "assignment": "Locate the current claims implicated by the failed aggregate review and grant narrow repairs.",
+            "question": self.score["question"], "review_ref": review_record["artifact_ref"], "review": review,
+            "map": self._map_body(), "entry_refs": entries,
+            "review_contract": source_fidelity_review_contract(),
+            "critique_contexts": [context for wid in sorted({item["work_id"] for item in self.review_obligations})
+                                  for context in self._review_critique_contexts(wid)],
+            "instructions": "Return exactly {repairs:[{entry_ref,entry_fields,relationship_refs,rationale}]}. "
+                "Each entry_ref must be a current supplied entry; entry_fields is a list drawn from inclusion, reason, problem, approach, finding, limitations. "
+                "relationship_refs must be exact current outgoing relationship refs for that entry. "
+                "Grant only the fields and relationships implicated by a concrete failed check; preserve all other assertions. "
+                "The failed review is a disputed diagnosis, not proof. Compare original critiques with the current map; do not treat a withdrawn historical assertion as current. "
+                "If no current claim needs correction, return repairs:[] and let an independent aggregate reviewer reconsider the current packet. "
+                "A repair grant permits the mapper to narrow, substantiate, or withdraw the disputed assertion; it does not prescribe a scientific verdict."
+        }
+        def validate(value):
+            exact(value, {"repairs"}, "aggregate review repair plan")
+            if not isinstance(value["repairs"], list):
+                raise ModelContractError("aggregate review repairs must be a list")
+            seen = set()
+            by_ref = {ref: wid for wid, ref in entries.items()}
+            for item in value["repairs"]:
+                exact(item, {"entry_ref", "entry_fields", "relationship_refs", "rationale"}, "aggregate review repair")
+                ref = item["entry_ref"]
+                if not isinstance(ref, str) or ref not in by_ref or ref in seen:
+                    raise ModelContractError("aggregate repair must pin one unique current entry")
+                seen.add(ref)
+                fields, refs = item["entry_fields"], item["relationship_refs"]
+                if (not isinstance(fields, list) or not all(isinstance(field, str) for field in fields)
+                        or len(set(fields)) != len(fields) or not set(fields) <= {"inclusion", "reason", *MAP_FIELDS}
+                        or not isinstance(refs, list) or not all(isinstance(ref, str) for ref in refs)
+                        or len(set(refs)) != len(refs) or not fields and not refs):
+                    raise ModelContractError("aggregate repair requires explicit unique scoped fields or relationships")
+                if any(ref not in relations or relations[ref]["source"] != by_ref[item["entry_ref"]] for ref in refs):
+                    raise ModelContractError("aggregate repair relationship has a different owner or version")
+                if not isinstance(item["rationale"], str) or not item["rationale"].strip():
+                    raise ModelContractError("aggregate repair needs a concrete diagnosis")
+        value, execution = self._model_checked("survey-repair-plan", "research.literature-mapper",
+                                              assignment, validate, stage="revision", task_kind="selection")
+        plan = self._record("kb/survey-review-repair-plan", "decision_note", {
+            "review_ref": review_record["artifact_ref"], "execution_ref": execution, **value,
+        }, "research.literature-mapper", subjects=[review_record["artifact_ref"], execution, *entries.values(), *relations])
+        self._record(logical, "note", {"scope": scope, "rounds": rounds + 1,
+                     "review_ref": review_record["artifact_ref"], "plan_ref": plan["artifact_ref"]},
+                     "command.controller", subjects=[review_record["artifact_ref"], plan["artifact_ref"]])
+        jobs = []
+        for item in value["repairs"]:
+            wid = self._body(self.store.get(item["entry_ref"]))["work_id"]
+            feedback = {"review_ref": review_record["artifact_ref"], "entry_fields": item["entry_fields"],
+                        "relationship_targets": sorted({relations[ref]["target"] for ref in item["relationship_refs"]}),
+                        "relationship_refs": item["relationship_refs"],
+                        "checks": [check for check in review["checks"] if check["outcome"] != "passed"],
+                        "rationale": item["rationale"]}
+            jobs.append(self._map_job(wid, self.analyzed_basis[wid], review_feedback=feedback))
+        if jobs:
+            self._models_checked(jobs, stage="revision")
+            self._map()
+        return {"review_ref": review_record["artifact_ref"], "plan_ref": plan["artifact_ref"],
+                "repairs": value["repairs"], "current_entry_refs": {
+                    wid: record["artifact_ref"] for wid, record in self.analysis_records.items()}}
+
     def _accept_survey(self):
+        response = None
+        while True:
+            rejected = self._accept_survey_once(response)
+            if rejected is None:
+                return
+            response = self._repair_survey_review(rejected)
+
+    def _accept_survey_once(self, prior_review_response=None):
         self._survey_acceptance_pending = True
         if not self.works:
             raise ValidationError("no works were captured; a survey cannot be fabricated")
@@ -4532,9 +4690,20 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "fail unsupported chronology or superiority inferred from it. The map entries and sources are deliberate claim-bearing projections; use their projection counts and deterministic_integrity rather than recounting omitted rows. "
                 "Keep each method/result to one short sentence and rationale under 120 words; cite specific problems instead of enumerating the corpus."
         }
+        if prior_review_response is not None:
+            review_assignment["prior_review_response"] = prior_review_response
+            review_assignment["instructions"] += (
+                " A prior rejected review has been routed through a scoped correction plan. "
+                "Independently inspect the exact current map; do not repeat a historical defect that the current claims no longer assert. "
+                "The repair plan and prior reviewer are provenance, not proof of either support or failure.")
         if self.review_obligations:
             review_assignment["review_obligations"] = deepcopy(self.review_obligations)
+            review_assignment["critique_contexts"] = [context
+                for wid in sorted({item["work_id"] for item in self.review_obligations})
+                for context in self._review_critique_contexts(wid)]
             review_assignment["instructions"] += (
+                " The critique_contexts show original allegations alongside exact current claims, including changed and withdrawn fields. "
+                "Only the current map supplies assertions to judge; original snapshots are historical and cannot supply missing current assertions. "
                 " Independently adjudicate the pinned review hypotheses against the current map and captured source bytes. "
                 "They are not established defects or a requirement to reject the survey; confirm or contradict them explicitly in the relevant checks.")
         if (self.resume_session
@@ -4562,6 +4731,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         review_body = {"survey_ref": bundle["artifact_ref"], "execution_ref": execution, **value}
         review = self._publish(f"kb/survey-reviews/{self.survey_revision}", "note", review_body,
                                "methods.survey-reviewer", subjects=[bundle["artifact_ref"], execution])
+        if any(check["outcome"] != "passed" for check in value["checks"]):
+            return review
         accepted = self.store.accepted(bundle["artifact_id"])
         adopted = self.gate.accept(bundle["artifact_ref"], review["artifact_ref"], author="strategy.survey-integrator",
                                   expected_version=accepted["version"] if accepted else None, guard=self._admission_guard)

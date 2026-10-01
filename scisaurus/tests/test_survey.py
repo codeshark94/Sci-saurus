@@ -280,7 +280,7 @@ def simulated_survey_worker(kind, params, channel):
                     value["entry_updates"]["finding"] = deepcopy(entries[0]["problem"])
             else:
                 value["entries"][0]["reason"] = "The method generalizes to every task."
-        if mode == "review-obligation-adversary" and assignment.get("semantic_feedback") is not None:
+        if mode in {"review-obligation-adversary", "aggregate-scoped-repair"} and assignment.get("semantic_feedback") is not None:
             value = {"entry_updates": {"reason": "The captured study examines recall timing."}, "relationships": []}
         if mode.startswith("map-links") and assignment["requested_work_ids"] == ["W101"]:
             proofs = [source_quote(next(source for source in assignment["sources"] if source["work_id"] == wid))
@@ -289,10 +289,20 @@ def simulated_survey_worker(kind, params, channel):
                                        "claim": {"text": "Both works examine recall timing.", "evidence": proofs}}]
             if mode == "map-links-rewrite" and assignment.get("entry_editable") is False:
                 value["entries"][0]["reason"] = "A changed screening rationale without new evidence."
+    elif phase == "survey_repair_plan":
+        value = {"repairs": []}
+        if mode in {"aggregate-scoped-repair", "aggregate-ungranted-repair"}:
+            value["repairs"] = [{"entry_ref": assignment["entry_refs"]["W101"],
+                "entry_fields": ["reason"] if mode == "aggregate-scoped-repair" else ["invented_field"],
+                "relationship_refs": [], "rationale": "The retained screening qualifier is unsupported."}]
     elif phase == "survey_review":
         value = {"checks": check_rows(SURVEY_CHECKS), "rationale": "The map preserves unknown facts and bounded coverage."}
         if mode == "survey-review-malformed":
             value = {"checks": [], "rationale": "Incomplete review envelope."}
+        elif mode in {"aggregate-scoped-repair", "aggregate-ungranted-repair"}:
+            if any(entry["work_id"] == "W101" and entry["reason"] == "Explicitly examines recall timing."
+                   for entry in assignment["map"]["entries"]):
+                value["checks"][1].update(outcome="failed", result="The W101 screening qualifier is unsupported.")
         elif mode == "survey-fails":
             value["checks"][1].update(outcome="failed", result="The independent fixture review rejects source fidelity.")
         elif (mode == "survey-coverage-insufficient"
@@ -308,7 +318,7 @@ def simulated_survey_worker(kind, params, channel):
                               if row["check_id"] == failed_check)
                 failed.update(outcome="failed", result="The fixture requires this gate to remain blocking.")
         elif (mode == "survey-review-fails-second"
-              and assignment.get("survey_ref", "").endswith("@2")
+              and int(assignment.get("survey_ref", "@1").rsplit("@", 1)[1]) >= 2
               and not assignment.get("resume_boundary")):
             value["checks"][2].update(
                 outcome="failed",
@@ -2178,6 +2188,102 @@ class TestSurveyRunner(unittest.TestCase):
                                       for value in relations],
                 "source_pins": [{"ref": ref, "body_hash": runner.store.get(ref)["body_hash"]} for ref in sorted(source_refs)],
                 "hypothesis": "Independently determine whether every qualification in this screening rationale is supported by the pinned source text."}
+
+    def test_critique_context_preserves_original_and_exact_current_revision(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map(); runner._review_work_claims()
+        obligation = self.review_obligation(runner, "W101")
+        original = deepcopy(runner._body(runner.analysis_records["W101"]))
+        runner.review_obligations = runner._validate_review_obligations([obligation])
+        revised = deepcopy(original); revised["reason"] = "The captured study examines recall timing."
+        runner.analysis_records["W101"] = runner._record("kb/work-analyses/W101", "note", revised,
+            "research.literature-mapper", subjects=runner.analyzed_basis["W101"])
+        runner._accept_survey()
+        prompts = [prompt for _, prompt in self.model_contexts(runner.control, runner.store)]
+        focused = next(prompt for prompt in reversed(prompts) if prompt.get("phase") == "work_review")
+        context = focused["critique_contexts"][0]
+        self.assertEqual(context["original_entry"]["body"], original)
+        self.assertEqual(context["current_entry"]["body"], revised)
+        self.assertEqual(context["current_entry"]["ref"], focused["entry_ref"])
+        self.assertEqual(context["changed_entry_fields"], ["reason"])
+        self.assertEqual(focused["review_obligations"], [obligation])
+        aggregate = next(prompt for prompt in reversed(prompts) if prompt.get("phase") == "survey_review")
+        self.assertEqual(aggregate["critique_contexts"], focused["critique_contexts"])
+        self.assertTrue(runner._review_protocol_matches(runner._body(runner.work_reviews["W101"])))
+
+    def test_distinct_review_failures_preserve_each_durable_repair_allowance(self):
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        scope = runner._review_evidence_scope("W101")
+        def failure(field):
+            checks = check_rows(work_review_checks([]))
+            next(check for check in checks if check["check_id"] == field)["outcome"] = "failed"
+            return {"entry_ref": runner.analysis_records["W101"]["artifact_ref"], "relationship_refs": [],
+                    "checks": checks, "rationale": "A scoped test failure.", "evidence_scope": scope}
+        a, b = failure("reason"), failure("problem")
+        ar = runner._record("kb/work-reviews/W101", "note", a, "methods.work-reviewer")
+        runner._record("kb/work-reviews/W101", "note", b, "methods.work-reviewer")
+        with patch.object(runner, "_review_evidence_scope", side_effect=lambda wid, review=None: review.get("evidence_scope") if review else scope):
+            runner._record("command/work-review-repairs/W101", "note", {
+                "evidence_scope": scope, "repair_attempts": 3, "failure_keys": ["reason"], "review_ref": ar["artifact_ref"]}, "command.controller")
+            runner._record("command/work-review-repairs/W101", "note", {
+                "evidence_scope": scope, "repair_attempts": 1, "failure_keys": ["problem"], "review_ref": ar["artifact_ref"]}, "command.controller")
+            self.assertEqual(runner._work_review_failure_count("W101", a), 4)
+            self.assertEqual(runner._work_review_failure_count("W101", b), 2)
+        relation = runner._record("kb/relationships/repair-target", "note", {"source": "W101", "target": "W102", "kind": "related", "claim": "First claim"}, "research.literature-mapper")
+        revision = runner._record("kb/relationships/repair-target", "note", {"source": "W101", "target": "W102", "kind": "related"}, "research.literature-mapper")
+        self.assertEqual(runner._review_failure_keys({"checks": [{"check_id": "relationship:"+relation["artifact_ref"], "outcome": "failed"}]}),
+                         runner._review_failure_keys({"checks": [{"check_id": "relationship:"+revision["artifact_ref"], "outcome": "failed"}]}))
+
+    def test_exact_relationship_grant_preserves_other_kinds_for_same_target(self):
+        previous = {"work_id": "W101", "reason": "A retained reason."}
+        relations = [{"source": "W101", "target": "W102", "kind": kind,
+                      "claim": {"text": kind, "evidence": []}, "artifact_ref": "artifact:kb/relationships/"+kind+"@1"}
+                     for kind in ("extends", "related")]
+        feedback = {"entry_fields": [], "relationship_targets": ["W102"],
+                    "relationship_refs": [relations[0]["artifact_ref"]]}
+        repaired = apply_scoped_map_repair("W101", previous, relations, feedback,
+                                          {"entry_updates": {}, "relationships": []}, reject_ungranted_changes=True)
+        self.assertEqual(repaired["relationships"], [{key:value for key,value in relations[1].items() if key != "artifact_ref"}])
+        self.assertEqual(repaired["entries"], [previous])
+        with self.assertRaisesRegex(ValidationError, "relationship pins"):
+            apply_scoped_map_repair("W101", previous, relations,
+                {**feedback, "relationship_refs": ["artifact:kb/relationships/extends@999"]},
+                {"entry_updates": {}, "relationships": []}, reject_ungranted_changes=True)
+
+    def test_aggregate_failure_routes_narrow_repair_and_preserves_siblings(self):
+        runner = self.runtime(survey_config(self.endpoint, "aggregate-scoped-repair"))
+        runner._initialize(); runner._setup()
+        for wid in ("W101", "W102"):
+            runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+        runner._map(); runner._review_work_claims()
+        before = {wid: deepcopy(record) for wid, record in runner.analysis_records.items()}
+        requests = len(SurveyHTTPFixture.requests)
+        runner._accept_survey()
+        self.assertIsNotNone(runner.survey_ref)
+        self.assertEqual(len(SurveyHTTPFixture.requests), requests)
+        self.assertEqual(runner.analysis_records["W102"]["artifact_ref"], before["W102"]["artifact_ref"])
+        prior = runner._body(before["W101"]); current = runner._body(runner.analysis_records["W101"])
+        self.assertEqual({key:value for key,value in prior.items() if key != "reason"},
+                         {key:value for key,value in current.items() if key != "reason"})
+        self.assertEqual(current["reason"], "The captured study examines recall timing.")
+        prompts = [prompt for _, prompt in self.model_contexts(runner.control, runner.store)]
+        repair = next(prompt for prompt in prompts if prompt.get("phase") == "map" and prompt.get("semantic_feedback"))
+        self.assertEqual(repair["editable_entry_fields"], ["reason"])
+        aggregate = [prompt for prompt in prompts if prompt.get("phase") == "survey_review"]
+        self.assertEqual(len(aggregate), 2)
+        self.assertIn("prior_review_response", aggregate[-1])
+
+    def test_aggregate_repair_rejects_ungranted_fields(self):
+        runner = self.runtime(survey_config(self.endpoint, "aggregate-ungranted-repair"))
+        result = runner.run()
+        self.assertEqual(result["status"], "blocked")
+        self.assertFalse(result["survey_current"])
+        self.assertIn("scoped fields", result["error"])
 
     def test_durable_independent_critique_reopens_only_the_pinned_review(self):
         config = survey_config(self.endpoint, "review-obligation-adversary")
