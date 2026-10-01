@@ -1966,7 +1966,15 @@ class TestSurveyRunner(unittest.TestCase):
         config = survey_config(self.endpoint)
         config["survey"]["seed_work_ids"] = ["W101", "W102", "W201", "W301"]
         config["survey"]["search"]["max_analyzed_works"] = 3
-        result = self.runtime(config).run()
+        runner = self.runtime(config)
+        setup = runner._setup
+        def retained_catalog():
+            setup()
+            for wid in config["survey"]["seed_work_ids"]:
+                runner._bibliographic_call("work", role="research.search-planner", work_id=wid,
+                                          result_limit=1, plan_ref=runner.protocol["artifact_ref"])
+        with patch.object(runner, "_setup", side_effect=retained_catalog):
+            result = runner.run()
         self.assertEqual(result["status"], "completed", result["error"])
         control, store = self.open_store()
         contexts = [prompt for _, prompt in self.model_contexts(control, store)]
