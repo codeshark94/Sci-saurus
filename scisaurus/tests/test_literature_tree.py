@@ -5,7 +5,7 @@ import unittest
 
 from scisaurus.core.errors import ValidationError, StateError
 from scisaurus.core.source_spans import bind
-from scisaurus.runtime.literature_tree import validate_plan, validate_reading_selection
+from scisaurus.runtime.literature_tree import validate_plan, validate_reading_selection, reading_selection_parts
 from scisaurus.tests import test_survey as fixtures
 from scisaurus.tests.test_survey import simulated_survey_worker, source_quote, survey_config
 
@@ -132,6 +132,29 @@ class TestExplorationContract(unittest.TestCase):
         with self.assertRaises(ValidationError): validate_reading_selection(value, {"W1", "W2"})
         value["candidates"][0]["work_id"] = "W1"
         with self.assertRaises(ValidationError): validate_reading_selection(value, {"W1", "W2"})
+
+    def test_selection_preserves_valid_siblings_and_reports_all_identity_errors(self):
+        choice = lambda wid, decision="read": {"work_id": wid, "decision": decision, "rationale": "Compare evidence."}
+        value = {"rationale": "Investigate mechanisms.", "candidates": [
+            choice("W1"), choice("W2"), choice("W2", "defer"), choice("W_BAD"), choice("W4")]}
+        valid, issues = reading_selection_parts(value, {"W1", "W2", "W3", "W4"})
+        self.assertEqual([row["work_id"] for row in valid], ["W1", "W4"])
+        unresolved = {row["work_id"]: row for row in issues["unresolved"]}
+        self.assertEqual(unresolved["W2"]["reason"], "duplicate")
+        self.assertEqual([row["choice"]["decision"] for row in unresolved["W2"]["rows"]], ["read", "defer"])
+        self.assertEqual(unresolved["W3"]["reason"], "missing")
+        self.assertEqual(issues["unknown"][0]["choice"]["work_id"], "W_BAD")
+        with self.assertRaisesRegex(ValidationError, "W2"):
+            validate_reading_selection(value, {"W1", "W2", "W3", "W4"})
+
+    def test_malformed_duplicate_cannot_resolve_a_conflicting_decision(self):
+        value = {"rationale": "Investigate evidence.", "candidates": [
+            {"work_id": "W1", "decision": "read", "rationale": "Read."},
+            {"work_id": "W1", "decision": "defer", "rationale": "Defer.", "extra": True}]}
+        valid, issues = reading_selection_parts(value, {"W1"})
+        self.assertEqual(valid, [])
+        self.assertEqual(issues["unresolved"][0]["reason"], "duplicate")
+        with self.assertRaises(ValidationError): validate_reading_selection(value, {"W1"})
 
     def test_reading_selection_can_defer_every_candidate(self):
         value = {"rationale": "These candidates do not address the inquiry.", "candidates": [
@@ -505,6 +528,42 @@ class TestExplorationExecution(unittest.TestCase):
                       if node["kind"] == "acquisition" and node["request"].get("query") == "candidate comparison")
         self.assertEqual(action["selected_work_ids"], ["W201"])
         self.assertTrue(action["selection_ref"])
+
+    def test_reading_conflict_repair_preserves_valid_decisions(self):
+        from unittest.mock import patch
+        self.config["limits"]["max_rounds"] = 2
+        runner = self.runner(); runner._initialize(); runner._setup(); runner._tree_load()
+        root = runner.exploration_tree["nodes"][0]
+        ids = ["W101", "W201", "W301"]
+        for wid in ids:
+            runner._bibliographic_call("work", role="research.search-planner", work_id=wid,
+                                      result_limit=1, plan_ref=runner.protocol["artifact_ref"])
+        action = {"kind": "acquisition", "id": "conflict", "parent_id": root["id"], "depth": 1,
+                  "state": "captured", "question": "Compare recall studies.", "rationale": "Find relevant evidence.",
+                  "query_ref": runner.query_refs[-1], "returned_work_ids": ids}
+        runner.exploration_tree["nodes"].append(action)
+        assignments = []
+        def choose(name, role, assignment, validator, **kwargs):
+            assignments.append(deepcopy(assignment))
+            candidates = assignment["candidates"]
+            choices = [{"work_id": row["work_id"], "decision": "read", "rationale": "Investigate evidence."} for row in candidates]
+            if len(candidates) == 3:
+                choices.append({"work_id": "W201", "decision": "defer", "rationale": "Conflicting initial decision."})
+            result = {"rationale": "Resolve inquiry coverage.", "candidates": choices}
+            if "retained_decisions" in assignment:
+                result["read_priority"] = ["W201", "W101", "W301"]
+            validator(result)
+            return result, runner.protocol["artifact_ref"]
+        with patch.object(runner, "_model_checked", side_effect=choose):
+            runner._tree_select_reads([action])
+        self.assertEqual(len(assignments), 2)
+        self.assertEqual([row["work_id"] for row in assignments[1]["candidates"]], ["W201"])
+        self.assertEqual({row["work_id"] for row in assignments[1]["retained_decisions"]}, {"W101", "W301"})
+        self.assertEqual(action["selected_work_ids"], ["W201", "W101", "W301"])
+        action.pop("selection_ref")
+        with patch.object(runner, "_model_checked", side_effect=AssertionError("paid decisions replayed")):
+            runner._tree_select_reads([action])
+        runner.control.close()
 
     def test_interrupted_selection_recovers_checked_choice_without_another_call(self):
         from unittest.mock import patch

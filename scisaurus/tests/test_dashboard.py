@@ -1096,6 +1096,15 @@ assert(wrapped.includes('Internal transport'));
         completed = subprocess.run([node, str(script), str(root)], check=True, capture_output=True, text=True)
         self.assertEqual(json.loads(completed.stdout)["cases"], 5)
 
+    def test_sidebar_routes_show_exclusive_pages(self):
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js unavailable")
+        script = Path(__file__).with_name("dashboard_navigation_regression.js")
+        root = Path(__file__).parents[2]
+        completed = subprocess.run([node, str(script), str(root)], check=True, capture_output=True, text=True)
+        self.assertEqual(json.loads(completed.stdout)["cases"], 11)
+
     def test_required_controls_exist_once(self):
         static = Path(__file__).parents[1] / "dashboard/static"
         html = (static / "index.html").read_text()

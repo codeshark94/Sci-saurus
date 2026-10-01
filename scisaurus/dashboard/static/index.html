@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>Sci-saurus · Research Console</title>
   <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/styles.css?v=25">
+    <link rel="stylesheet" href="/assets/styles.css?v=26">
 </head>
 <body>
   <div class="app-shell">
@@ -144,6 +144,7 @@
           </div>
         </section>
 
+        <div id="research-stage-view">
         <section class="stage-workspace section-anchor" id="stage-workspace" aria-label="Stage results">
           <div class="section-heading"><div><div class="eyebrow">Research workflow</div><h2 id="stage-heading">Stage results</h2></div><span id="stage-caption" class="section-caption"></span></div>
           <div id="stage-result-summary" class="stage-result-summary"></div>
@@ -210,8 +211,9 @@
           <div id="topic-paper-list" class="literature-list"></div>
         </section>
         <div id="stage-argument-context" hidden></div>
-        <details class="operations-details" id="operations-details"><summary>Operations <span>Execution · agents · logs · budgets · files</span></summary>
-        <div class="metrics-grid" aria-label="Mission metrics">
+        </div>
+        <div id="operations-view" hidden>
+        <div class="metrics-grid" id="mission-metrics" aria-label="Mission metrics">
           <article class="metric-card">
             <div class="metric-label">ACTIVE CALLS</div>
             <div class="metric-value" id="metric-calls">—</div>
@@ -280,7 +282,7 @@
           </div>
         </section>
 
-        <div class="split-grid">
+        <div id="operations-status">
           <section class="section-anchor panel-section" id="activity">
             <div class="section-heading">
               <div>
@@ -351,7 +353,7 @@
           </div>
         </section>
 
-        </details>
+        </div>
         <footer class="footer">
           <span>SCI-SAURUS LOCAL CONSOLE</span>
           <span>Source of truth remains the project checkpoint, artifact store, and event ledger.</span>
@@ -412,6 +414,6 @@
   </dialog>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script src="/assets/output-view.js?v=1" defer></script>
-  <script src="/assets/app.js?v=15" defer></script>
+  <script src="/assets/app.js?v=16" defer></script>
 </body>
 </html>

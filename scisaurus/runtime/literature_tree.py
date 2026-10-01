@@ -2,11 +2,12 @@
 
 from copy import deepcopy
 import hashlib
+import json
 import os
 import tempfile
 
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.core.errors import ProviderRateLimitError, StateError, ValidationError
+from scisaurus.core.errors import ModelContractError, ProviderRateLimitError, StateError, ValidationError
 from scisaurus.core.source_spans import bind, validate as validate_span
 from scisaurus.runtime.survey_config import search_query, work_id
 from scisaurus.runtime.survey_records import MAP_FIELDS, authoritative_source
@@ -78,27 +79,57 @@ def validate_plan(value, parents, sources, *, max_branches):
         seen.add(key)
 
 
-def validate_reading_selection(value, candidates):
-    if not isinstance(value, dict) or set(value) != {"rationale", "candidates"}:
-        raise ValidationError("reading selection requires rationale and candidates")
+def validate_reading_proposal(value, *, require_priority=False):
+    fields = {"rationale", "candidates"} | ({"read_priority"} if require_priority else set())
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ModelContractError("reading selection requires rationale and candidates")
     if not isinstance(value["rationale"], str) or not value["rationale"].strip():
-        raise ValidationError("reading selection requires a rationale")
+        raise ModelContractError("reading selection requires a rationale")
     if not isinstance(value["candidates"], list):
-        raise ValidationError("reading decisions must be a list")
-    seen = set()
-    for choice in value["candidates"]:
+        raise ModelContractError("reading decisions must be a list")
+    if require_priority and (not isinstance(value["read_priority"], list)
+            or any(not isinstance(wid, str) for wid in value["read_priority"])):
+        raise ModelContractError("read_priority must be a list of captured work IDs")
+
+
+def reading_selection_parts(value, candidates):
+    """Keep unique valid decisions; unresolved identities require model judgment."""
+    validate_reading_proposal(value, require_priority=isinstance(value, dict) and "read_priority" in value)
+    grouped = {wid: [] for wid in candidates}
+    invalid, unknown = [], []
+    for index, choice in enumerate(value["candidates"]):
+        wid = choice.get("work_id") if isinstance(choice, dict) else None
+        identifiable = isinstance(wid, str) and wid in grouped
+        if identifiable:
+            grouped[wid].append((index, choice))
+        else:
+            unknown.append({"index": index, "choice": choice})
         if not isinstance(choice, dict) or set(choice) != {"work_id", "decision", "rationale"}:
-            raise ValidationError("reading choice requires work_id, decision, and rationale")
-        wid = choice["work_id"]
-        if not isinstance(wid, str) or wid not in candidates or wid in seen:
-            raise ValidationError("reading choice must identify one captured candidate exactly once")
-        if choice["decision"] not in {"read", "defer"}:
-            raise ValidationError("reading decision must be read or defer")
-        if not isinstance(choice["rationale"], str) or not choice["rationale"].strip():
-            raise ValidationError("reading choice requires a rationale")
-        seen.add(wid)
-    if seen != set(candidates):
-        raise ValidationError("reading selection must account for every captured candidate")
+            invalid.append({"index": index, "choice": choice, "reason": "required fields"})
+    accepted, unresolved = [], []
+    for wid, rows in grouped.items():
+        if len(rows) != 1:
+            unresolved.append({"work_id": wid, "reason": "missing" if not rows else "duplicate",
+                               "rows": [{"index": i, "choice": row} for i, row in rows]})
+            continue
+        index, choice = rows[0]
+        if (set(choice) != {"work_id", "decision", "rationale"}
+                or not isinstance(choice.get("decision"), str) or choice["decision"] not in {"read", "defer"}
+                or not isinstance(choice["rationale"], str) or not choice["rationale"].strip()):
+            unresolved.append({"work_id": wid, "reason": "invalid decision or rationale",
+                               "rows": [{"index": index, "choice": choice}]})
+        else:
+            accepted.append((index, deepcopy(choice)))
+    accepted.sort(key=lambda item: item[0])
+    return [choice for _, choice in accepted], {
+        "unresolved": unresolved, "unknown": unknown, "invalid": invalid}
+
+
+def validate_reading_selection(value, candidates):
+    validate_reading_proposal(value)
+    _, issues = reading_selection_parts(value, candidates)
+    if any(issues.values()):
+        raise ModelContractError("reading selection identity violations: " + json.dumps(issues, ensure_ascii=False))
 
 
 class LiteratureTree:
@@ -199,17 +230,74 @@ class LiteratureTree:
         else:
             self._record("kb/reading-selection-inputs/" + identity, "note", assignment, "research.search-planner",
                          subjects=[action["query_ref"] for action in pending])
-        if candidates:
-            value, execution = self._model_checked("reading-selection-" + identity, "research.search-planner",
-                assignment, lambda value: validate_reading_selection(value, candidates), stage="supervision", task_kind="service")
-            subjects = [execution]
-        else:
-            value = {"rationale": "All returned candidates already have substantive entries or no admitted catalog record.",
-                     "candidates": []}
-            execution = None
-            subjects = []
+        progress_id = "kb/reading-selection-progress/" + identity
+        retained = self.store.head(progress_id)
+        progress = self._body(retained) if retained else {
+            "rationale": None, "candidates": [], "execution_refs": [], "issues": None,
+            "read_priority": [], "priority_complete": not candidates}
+        completed = {choice["work_id"] for choice in progress["candidates"]}
+        subjects = list(progress["execution_refs"])
+        pending_ids = candidates - completed
+        for attempt in range(self.config["limits"]["max_rounds"]):
+            if not pending_ids and progress["priority_complete"]:
+                break
+            scoped = deepcopy(assignment)
+            repairing = bool(progress["execution_refs"])
+            if repairing:
+                scoped["candidates"] = [item for item in assignment["candidates"] if item["work_id"] in pending_ids]
+                scoped["retained_decisions"] = deepcopy(progress["candidates"])
+                scoped["validation_feedback"] = {"issues": progress["issues"],
+                    "previous_execution_ref": progress["execution_refs"][-1],
+                    "scope": "Decide only the candidates supplied in this assignment. Unique valid earlier decisions are retained. "
+                             "Resolve contradictory prior decisions explicitly; do not repeat retained or unknown work IDs."}
+                scoped["instructions"] += (
+                    " Return exactly {rationale:string,candidates:[{work_id,decision:read|defer,rationale:string}],read_priority:[work_id]}. "
+                    "Decide only the supplied unresolved candidates; retained_decisions are immutable. "
+                    "read_priority must order every retained or newly selected READ work exactly once, by scientific importance. "
+                    "Do not put deferred IDs in read_priority. Resolve placement of repaired reads explicitly. "
+                    "If no unresolved candidate remains, return candidates:[] and repair only read_priority.")
+            repair_identity = identity if not progress["execution_refs"] else identity + "-repair-" + node_id(scoped)
+            proposal, execution = self._model_checked("reading-selection-" + repair_identity,
+                "research.search-planner", scoped,
+                lambda value: validate_reading_proposal(value, require_priority=repairing),
+                stage="supervision", task_kind="service")
+            valid, issues = reading_selection_parts(proposal, pending_ids)
+            progress["rationale"] = progress["rationale"] or proposal["rationale"]
+            progress["candidates"].extend(valid)
+            progress["execution_refs"].append(execution)
+            expected_reads = {choice["work_id"] for choice in progress["candidates"] if choice["decision"] == "read"}
+            priority = proposal.get("read_priority", [choice["work_id"] for choice in valid if choice["decision"] == "read"])
+            if repairing:
+                progress["priority_complete"] = len(priority) == len(set(priority)) and set(priority) == expected_reads
+                if not progress["priority_complete"]:
+                    issues["priority"] = {"received": priority, "expected_read_ids": sorted(expected_reads)}
+            else:
+                progress["priority_complete"] = not issues["unresolved"]
+            if progress["priority_complete"] or not repairing:
+                progress["read_priority"] = priority
+            progress["issues"] = issues
+            completed.update(choice["work_id"] for choice in valid)
+            pending_ids = candidates - completed
+            self._record(progress_id, "note", progress, "research.search-planner",
+                subjects=[*progress["execution_refs"], *[action["query_ref"] for action in pending]])
+            subjects = list(progress["execution_refs"])
+            if not pending_ids and (issues["unknown"] or issues["invalid"]):
+                # Unknown rows carry no admitted decision. Record the rejection
+                # without inferring an identity from spelling or source titles.
+                self._record("kb/reading-selection-rejections/" + identity, "note", issues,
+                             "command.controller", subjects=[execution])
+        if pending_ids or not progress["priority_complete"]:
+            raise ModelContractError("reading selection has unresolved decisions or priority: " + json.dumps(
+                {"work_ids": sorted(pending_ids), "issues": progress["issues"]}, ensure_ascii=False))
+        value = {"rationale": progress["rationale"] or
+                 "All returned candidates already have substantive entries or no admitted catalog record.",
+                 "candidates": sorted(progress["candidates"], key=lambda choice:
+                    (choice["decision"] != "read", progress["read_priority"].index(choice["work_id"])
+                     if choice["decision"] == "read" else 0))}
+        validate_reading_selection(value, candidates)
+        execution = subjects[-1] if subjects else None
         record = self._record("kb/reading-selections/" + identity, "note",
-            {**value, "assignment_sha256": identity, "execution_ref": execution,
+            {**value, "assignment_sha256": identity, "execution_ref": execution, "execution_refs": subjects,
              "candidate_work_refs": [self.work_records[wid]["artifact_ref"] for wid in sorted(candidate_ids)]},
             "research.search-planner", subjects=[*subjects, *[action["query_ref"] for action in pending],
                 *[self.work_records[wid]["artifact_ref"] for wid in sorted(candidate_ids)]])

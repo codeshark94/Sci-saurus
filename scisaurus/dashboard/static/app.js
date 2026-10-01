@@ -134,37 +134,47 @@
       : "loading project state";
   }
 
-  let navSyncFrame = null;
+  const OPERATION_PAGES = {
+    calls: ["mission-metrics", "calls", "activity"],
+    specialists: ["specialists"],
+    resources: ["resources"],
+    inventory: ["structure", "inventory"],
+  };
 
-  function syncProjectNav() {
-    navSyncFrame = null;
-    if (state.view !== "project" || !$("#operations-details").open) return;
-    const links = $$("#project-nav .nav-link");
-    const sections = links.map((link) => {
-      const id = link.getAttribute("href")?.replace(/^#/, "");
-      const section = id ? document.getElementById(id) : null;
-      return section?.getClientRects().length ? { id, section, link } : null;
-    }).filter(Boolean);
-    if (!sections.length) return;
-    const threshold = ($(".topbar")?.offsetHeight || 54) + 26;
-    let active = sections[0].id;
-    sections.forEach((item) => {
-      if (item.section.getBoundingClientRect().top <= threshold) active = item.id;
+  function renderProjectPage() {
+    const route = window.location.hash.replace(/^#/, "");
+    const operation = Object.hasOwn(OPERATION_PAGES, route) ? route : null;
+    const stagePage = !operation;
+    $("#research-stage-view").hidden = !stagePage;
+    $("#overview").hidden = !stagePage;
+    $("#operations-view").hidden = stagePage;
+    const visible = new Set(operation ? OPERATION_PAGES[operation] : []);
+    new Set(Object.values(OPERATION_PAGES).flat()).forEach((id) => {
+      document.getElementById(id).hidden = !visible.has(id);
     });
-    if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 4) {
-      active = sections[sections.length - 1].id;
-    }
-    links.forEach((link) => link.classList.toggle("is-active", link.getAttribute("href") === `#${active}`));
-    if (window.location.hash !== `#${active}`) {
-      const url = new URL(window.location.href);
-      url.hash = active;
-      window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
-    }
+    $("#operations-status").hidden = !visible.has("activity") && !visible.has("resources");
+    $$("#stage-navigation .stage-nav-item").forEach((button) => {
+      const active = stagePage && button.dataset.stageId === state.stageId;
+      button.classList.toggle("is-active", active);
+      if (active) button.setAttribute("aria-current", "page");
+      else button.removeAttribute("aria-current");
+    });
+    $$("#project-nav .nav-link").forEach((link) => {
+      const active = link.getAttribute("href") === `#${operation}`;
+      link.classList.toggle("is-active", active);
+      if (active) link.setAttribute("aria-current", "page");
+      else link.removeAttribute("aria-current");
+    });
   }
 
-  function scheduleProjectNavSync() {
-    if (navSyncFrame !== null) return;
-    navSyncFrame = window.requestAnimationFrame(syncProjectNav);
+  function navigateOperation(id) {
+    if (!Object.hasOwn(OPERATION_PAGES, id)) return;
+    closeInspector();
+    const url = new URL(window.location.href);
+    url.hash = id;
+    window.history.pushState({}, "", `${url.pathname}${url.search}${url.hash}`);
+    renderProjectPage();
+    window.scrollTo(0, 0);
   }
 
   function setView(view, projectRef = null) {
@@ -189,7 +199,7 @@
     });
     renderCurrentProject();
     renderSidebar(state.workspace?.projects || state.projects);
-    scheduleProjectNavSync();
+    renderProjectPage();
   }
 
   function navigateWorkspace() {
@@ -325,7 +335,8 @@
       window.history.pushState({}, "", `${url.pathname}${url.search}${url.hash}`);
     }
     if (state.snapshot) renderStageResults(state.snapshot);
-    $("#stage-workspace").scrollIntoView({block: "start"});
+    renderProjectPage();
+    window.scrollTo(0, 0);
   }
   function renderStageResults(snapshot) {
     const stages = snapshot.stage_results || snapshot.pipeline?.stages || [];
@@ -965,7 +976,7 @@
     renderResources(snapshot);
     renderStructure(snapshot);
     renderInventory(snapshot);
-    scheduleProjectNavSync();
+    renderProjectPage();
     $$("[data-agent-role]").forEach((element) => {
       const inspect = () => openAgentInspector(element.dataset.agentRole, element.dataset.agentTask || null);
       element.addEventListener("click", inspect);
@@ -1366,10 +1377,9 @@
     $("#inspector").addEventListener("click", (event) => {
       if (event.target === $("#inspector")) closeInspector();
     });
-    $$("#project-nav .nav-link").forEach((link) => link.addEventListener("click", () => {
-      $("#operations-details").open = true;
-      $$("#project-nav .nav-link").forEach((item) => item.classList.toggle("is-active", item === link));
-      window.setTimeout(scheduleProjectNavSync, 80);
+    $$("#project-nav .nav-link").forEach((link) => link.addEventListener("click", (event) => {
+      event.preventDefault();
+      navigateOperation(link.getAttribute("href").slice(1));
     }));
     window.addEventListener("popstate", () => {
       closeInspector();
@@ -1385,14 +1395,8 @@
       }
     });
     window.addEventListener("hashchange", () => {
-      if (state.view !== "project") return;
-      const activeHash = window.location.hash.replace(/^#/, "") || "research";
-      $$("#project-nav .nav-link").forEach((link) => {
-        link.classList.toggle("is-active", link.getAttribute("href") === `#${activeHash}`);
-      });
-      scheduleProjectNavSync();
+      if (state.view === "project") renderProjectPage();
     });
-    window.addEventListener("scroll", scheduleProjectNavSync, { passive: true });
   }
 
   bindControls();
@@ -1406,7 +1410,7 @@
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => {
       if (state.snapshot && state.view === "project") render(state.snapshot);
-      scheduleProjectNavSync();
+      renderProjectPage();
     }, 120);
   });
 })();
