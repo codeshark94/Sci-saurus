@@ -237,14 +237,26 @@ def normalize_survey_repair_owners(value, entries, relationships):
     """Route exact relationship grants by their immutable source ownership."""
     if not isinstance(value, dict) or set(value) != {"repairs"} or not isinstance(value["repairs"], list):
         return value
+    original = value
+    value = deepcopy(value)
     for item in value["repairs"]:
+        if not isinstance(item, dict):
+            return original
+        if "entry_fields" not in item and isinstance(item.get("relationship_refs"), list) and item["relationship_refs"]:
+            item["entry_fields"] = []
+        if "relationship_refs" not in item and isinstance(item.get("entry_fields"), list) and item["entry_fields"]:
+            item["relationship_refs"] = []
         if (not isinstance(item, dict) or set(item) != {"entry_ref", "entry_fields", "relationship_refs", "rationale"}
                 or not isinstance(item["entry_ref"], str) or not isinstance(item["rationale"], str)
                 or not item["rationale"].strip()):
-            return value
+            return original
         entry_ref = entries.get(item["entry_ref"], item["entry_ref"])
+        if (not item["entry_fields"] and isinstance(item["relationship_refs"], list) and entry_ref in relationships
+                and entry_ref in item["relationship_refs"]):
+            entry_ref = entries.get(relationships[entry_ref]["source"], entry_ref)
+            item["entry_ref"] = entry_ref
         if entry_ref not in entries.values():
-            return value
+            return original
         fields, refs = item["entry_fields"], item["relationship_refs"]
         if (not isinstance(fields, list) or not all(isinstance(field, str) for field in fields)
                 or not set(fields) <= {"inclusion", "reason", *MAP_FIELDS}
@@ -252,7 +264,7 @@ def normalize_survey_repair_owners(value, entries, relationships):
                 or not fields and not refs
                 or any(ref not in relationships
                        or relationships[ref]["source"] not in entries for ref in refs)):
-            return value
+            return original
     grants = {}
     def grant(ref, rationale):
         item = grants.setdefault(ref, {"entry_ref": ref, "entry_fields": [], "relationship_refs": [], "rationales": []})
@@ -4768,12 +4780,19 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "review_contract": source_fidelity_review_contract(),
             "sources": self._survey_review_packet()["sources"],
             "review_context_protocol": _CURRENT_MAP_REVIEW_PROTOCOL,
+            "repair_target_catalog": [{"entry_ref": ref,
+                "entry_fields": sorted(permitted_fields.get(ref, set())),
+                "relationship_refs": sorted(target for target in permitted_relations
+                    if relations[target]["source"] == wid)} for wid, ref in entries.items()
+                if ref in permitted_fields or any(relations[target]["source"] == wid for target in permitted_relations)],
             "instructions": "Return exactly {repairs:[{entry_ref,entry_fields,relationship_refs,rationale}]}. "
                 "Each entry_ref must be a current supplied entry; entry_fields is a list drawn from inclusion, reason, problem, approach, finding, limitations. "
                 "Copy the artifact_ref value, not the work_id key, for entry_ref. A known work ID can be resolved only to its supplied current entry; an explicit stale artifact_ref is never advanced. "
                 "relationship_refs must be exact current outgoing relationship refs for that entry. "
                 "Grant only the fields and relationships implicated by a concrete failed check; preserve all other assertions. "
                 "Scientific grants must be a subset of review.findings target_ref/field bindings. A relationship grant belongs to that relationship's source work. Coverage-only diagnoses may return no claim repairs. "
+                "Choose only entry_ref, entry_fields, and relationship_refs from repair_target_catalog. "
+                "Finding quote_field locates evidence and does not grant edits; a reason quote under field=inclusion permits only inclusion edits. "
                 "The failed review is a disputed diagnosis, not proof. Compare its concrete allegations against the supplied current map; do not treat a withdrawn historical assertion as current. "
                 "If no current claim needs correction, return repairs:[] and let an independent aggregate reviewer reconsider the current packet. "
                 "A repair grant permits the mapper to narrow, substantiate, or withdraw the disputed assertion; it does not prescribe a scientific verdict."
@@ -4784,7 +4803,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 raise ModelContractError("aggregate review repairs must be a list")
             seen = set()
             by_ref = {ref: wid for wid, ref in entries.items()}
-            for item in value["repairs"]:
+            scope_errors = []
+            for index, item in enumerate(value["repairs"]):
                 exact(item, {"entry_ref", "entry_fields", "relationship_refs", "rationale"}, "aggregate review repair")
                 ref = item["entry_ref"]
                 if not isinstance(ref, str) or ref not in by_ref or ref in seen:
@@ -4799,9 +4819,15 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 if any(ref not in relations or relations[ref]["source"] != by_ref[item["entry_ref"]] for ref in refs):
                     raise ModelContractError("aggregate repair relationship has a different owner or version")
                 if not set(fields) <= permitted_fields.get(ref, set()) or not set(refs) <= permitted_relations:
-                    raise ModelContractError("aggregate repair must bind the rejected review's exact current findings")
+                    scope_errors.append(f"repairs[{index}] entry_ref={ref!r}: aggregate repair must bind the rejected review's exact current findings; "
+                        f"requested entry_fields={fields!r}, allowed entry_fields={sorted(permitted_fields.get(ref, set()))!r}; "
+                        f"requested relationship_refs={refs!r}, allowed relationship_refs="
+                        f"{sorted(target for target in permitted_relations if relations[target]['source'] == by_ref[ref])!r}. "
+                        "quote_field identifies supporting text and grants no additional field authority.")
                 if not isinstance(item["rationale"], str) or not item["rationale"].strip():
                     raise ModelContractError("aggregate repair needs a concrete diagnosis")
+            if scope_errors:
+                raise ModelContractError("\n".join(scope_errors))
         value, execution = self._model_checked("survey-repair-plan", "research.literature-mapper",
                                               assignment, validate, stage="revision", task_kind="selection",
                                               normalizer=lambda value: normalize_survey_repair_owners(value, entries, relations))

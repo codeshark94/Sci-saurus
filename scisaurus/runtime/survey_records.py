@@ -13,7 +13,7 @@ MAP_FIELDS = ("problem", "approach", "finding", "limitations")
 SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
 GAP_CHECKS = ("closest-prior-work", "scope-comparability", "counterevidence", "full-text-support")
 REVIEW_CHECK_FIELDS = frozenset({"check_id", "outcome", "method", "result"})
-SURVEY_RESPONSE_CONTRACT_REVISION = "survey-finding-quote-location-1"
+SURVEY_RESPONSE_CONTRACT_REVISION = "survey-finding-repair-target-catalog-2"
 SURVEY_QUOTE_LOCATION_INSTRUCTION = (
     "Finding field identifies the affected decision or assertion and controls repair authority; "
     "quote_field separately identifies the field containing the exact quote on the same target_ref. "

@@ -2826,7 +2826,20 @@ class TestSurveyRunner(unittest.TestCase):
             runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
         runner._map(); runner._review_work_claims()
         before = {wid: deepcopy(record) for wid, record in runner.analysis_records.items()}
-        runner._accept_survey()
+        checked = runner._model_checked
+        def inspect_catalog(name, actor, assignment, validator, **options):
+            if name == "survey-repair-plan":
+                ref = before["W101"]["artifact_ref"]
+                self.assertEqual(assignment["repair_target_catalog"], [
+                    {"entry_ref": ref, "entry_fields": ["inclusion"], "relationship_refs": []}])
+                with self.assertRaises(ModelContractError) as caught:
+                    validator({"repairs": [{"entry_ref": ref, "entry_fields": ["reason"],
+                        "relationship_refs": [], "rationale": "Inspect the quoted reason."}]})
+                self.assertIn("requested entry_fields=['reason'], allowed entry_fields=['inclusion']", str(caught.exception))
+                self.assertIn("quote_field identifies supporting text and grants no additional field authority", str(caught.exception))
+            return checked(name, actor, assignment, validator, **options)
+        with patch.object(runner, "_model_checked", side_effect=inspect_catalog):
+            runner._accept_survey()
         self.assertIsNotNone(runner.survey_ref)
         self.assertEqual(runner.analysis_records["W102"]["artifact_ref"], before["W102"]["artifact_ref"])
         old, current = runner._body(before["W101"]), runner._body(runner.analysis_records["W101"])
@@ -4937,6 +4950,22 @@ class TestSurveyRunner(unittest.TestCase):
 
 
 class TestSurveyContracts(unittest.TestCase):
+    def test_exact_relationship_target_grant_routes_to_owner_with_empty_entry_authority(self):
+        entries = {"W1": "artifact:kb/entry/W1@1", "W2": "artifact:kb/entry/W2@1"}
+        ref = "artifact:kb/relationship/W1-W2@1"
+        relations = {ref: {"source": "W1", "target": "W2"}}
+        raw = {"repairs": [{"entry_ref": ref, "relationship_refs": [ref], "rationale": "Inspect this relationship."}]}
+        original = deepcopy(raw)
+        result = normalize_survey_repair_owners(raw, entries, relations)
+        self.assertEqual(result, {"repairs": [{"entry_ref": entries["W1"], "entry_fields": [],
+            "relationship_refs": [ref], "rationale": "Inspect this relationship."}]})
+        self.assertEqual(raw, original)
+        self.assertEqual(normalize_survey_repair_owners(result, entries, relations), result)
+        for changes in ({"entry_ref": ref.replace("@1", "@2")}, {"entry_fields": ["reason"]},
+                        {"relationship_refs": []}, {"relationship_refs": None}):
+            invalid = {"repairs": [{**raw["repairs"][0], **changes}]}
+            self.assertIs(normalize_survey_repair_owners(invalid, entries, relations), invalid)
+
     def test_typed_critique_rejection_is_separate_from_claim_admission(self):
         obligations = [{"work_id": "W1", "hypothesis": "The current finding is unsupported."}]
         required = work_review_checks([], obligations)
