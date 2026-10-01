@@ -126,12 +126,14 @@ class SurveyGate:
     def _artifact(self, ref, *, current=True):
         if not isinstance(ref, str):
             raise ValidationError("survey dependency must be an exact artifact reference")
-        parse_ref(ref)
+        namespace, name, version = parse_ref(ref)
+        logical_id = f"{namespace}/{name}"
         manifest = self.store.get(ref)
         row = self.control._conn.execute(
-            "SELECT manifest_hash FROM artifacts WHERE artifact_ref=?", (ref,),
+            "SELECT artifact_ref,manifest_hash FROM artifacts WHERE logical_id=? AND version=?",
+            (logical_id, version),
         ).fetchone()
-        if (row is None or manifest["artifact_ref"] != ref
+        if (row is None or row["artifact_ref"] != ref or manifest["artifact_ref"] != ref
                 or row["manifest_hash"] != sha256_hex(canonical_bytes(manifest))):
             raise ValidationError(f"artifact manifest integrity failed: {ref}")
         if current and self.store.head(manifest["artifact_id"])["artifact_ref"] != ref:

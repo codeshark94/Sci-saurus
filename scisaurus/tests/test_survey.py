@@ -2829,6 +2829,10 @@ class TestSurveyRunner(unittest.TestCase):
         mapper = next(p for p in prompts if p["phase"] == "map")
         reviewer = next(p for p in prompts if p["phase"] == "work_review")
         self.assertEqual(mapper["source_fidelity_contract"], source_fidelity_review_contract())
+        numerical = mapper["source_fidelity_contract"]["numerical_scope"]
+        self.assertIn("temperature for a reaction-rate coefficient", numerical)
+        self.assertIn("plus/minus magnitude alone", numerical)
+        self.assertIn("reviewer rationale cannot supply conditions", numerical)
         for key, value in mapper["source_fidelity_contract"].items():
             self.assertEqual(reviewer["review_contract"][key], value)
 
@@ -3025,7 +3029,7 @@ class TestSurveyRunner(unittest.TestCase):
             self.assertEqual(outcomes["inclusion"], expected)
             self.assertEqual(outcomes["reason"], expected)
             self.assertEqual(outcomes["problem"], "passed")
-        self.assertEqual(source_fidelity_review_contract()["protocol"], "literature-source-fidelity-4")
+        self.assertEqual(source_fidelity_review_contract()["protocol"], "literature-source-fidelity-5")
 
     def test_focused_relationship_qualifier_is_a_separate_entailed_clause(self):
         runner = self.runtime(survey_config(self.endpoint, "relationship-qualifier-adversary"))

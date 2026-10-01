@@ -751,6 +751,25 @@ class TestSurveyGate(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "manifest integrity"):
             self.accept()
 
+    def test_artifact_integrity_lookup_uses_the_requested_indexed_identity(self):
+        queries = []
+        self.control._conn.set_trace_callback(queries.append)
+        try:
+            manifest, _ = self.gate._artifact(self.map)
+        finally:
+            self.control._conn.set_trace_callback(None)
+        self.assertEqual(manifest["artifact_ref"], self.map)
+        integrity_queries = [query for query in queries if "SELECT artifact_ref,manifest_hash" in query]
+        self.assertEqual(len(integrity_queries), 1)
+        self.assertIn("WHERE logical_id=", integrity_queries[0])
+        plan = self.control._conn.execute("EXPLAIN QUERY PLAN " + integrity_queries[0]).fetchall()
+        self.assertTrue(any("SEARCH artifacts USING INDEX" in row["detail"] for row in plan))
+
+    def test_database_reference_corruption_is_rejected(self):
+        self.control._conn.execute("UPDATE artifacts SET artifact_ref='artifact:kb/forged@1' WHERE artifact_ref=?", (self.map,))
+        with self.assertRaisesRegex(ValidationError, "manifest integrity"):
+            self.gate._artifact(self.map)
+
     def test_cross_store_gate_is_rejected(self):
         other = ControlStore(self.directory.name)
         try:
