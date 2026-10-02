@@ -93,7 +93,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-response-owner-recovery-11")
+    "experiment-response-owner-recovery-12")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -22582,7 +22582,9 @@ class ComposerRunner:
         current = None
         if isinstance(current_ref, str):
             _, _, current = self._read_verified_artifact_json(current_ref)
-        native_owner = isinstance(current, dict) and self._methods_panel_response_failure(current)
+        native_owner = (isinstance(current, dict)
+                        and current.get("failure_class") == "model_contract"
+                        and self._methods_panel_response_failure(current))
         if native_owner:
             if (current.get("stage_id") != stage["id"]
                     or current.get("failure_class") != "model_contract"

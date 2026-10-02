@@ -17476,6 +17476,25 @@ class ComposerWorkflowTests(unittest.TestCase):
                 finally:
                     runner.close()
 
+    def test_scientific_plan_failure_is_not_response_failure_despite_stale_metadata(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            _, _, _, prior, order, body = self._methods_response_recovery_fixture(runner)
+            body.update(failure_class="experiment_failure")
+            body.pop("model_diagnostics")
+            receipt = runner._publish("fixtures/subject/scientific-plan", "note", body, "command.composer")
+            prior.update(failure_dossier_ref=receipt["artifact_ref"], failure_class="model_contract",
+                         review_status="scientific_assignment_blocked")
+            runner.stage_records["experiment"]["attempts"][1]["failure_dossier_ref"] = receipt["artifact_ref"]
+            stage = runner.workflow["stages"][1]
+            self.assertFalse(runner._format_recovery_requires_methods_panel(stage, [], prior))
+            self.assertFalse(runner._format_recovery_requires_methods_panel(stage,
+                [{"kind": "additional_experiment", "failure_dossier_ref": receipt["artifact_ref"]}], prior))
+            order["failure_dossier_ref"] = receipt["artifact_ref"]
+            with self.assertRaises(ValidationError):
+                runner._format_recovery_requires_methods_panel(stage, [order], prior)
+
     def test_completed_experiment_cannot_reopen_historical_response_failure(self):
         with tempfile.TemporaryDirectory() as path:
             runner = ComposerRunner(self._workflow(Path(path)))
