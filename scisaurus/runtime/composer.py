@@ -7621,6 +7621,9 @@ class ComposerRunner:
             self.department_activity.append({"action": "resolve_stage_review_revalidation_blockers",
                 "stage_id": stage_id, "admission_ref": admission["artifact_ref"],
                 "verifier_execution_ref": report["artifact_ref"], "prior_blockers": deepcopy(retired)})
+        self._settle_stage_work_orders(stage, context, outcome)
+        if outcome == "completed":
+            self.continuation_pending_stage_ids.discard(stage_id)
         self._archive_stage_attempt(self.stage_records[stage_id], cycle=self.continuation_cycles,
                                     default_project_dir=stage["project_dir"])
         self._checkpoint(f"{stage_id}:review_revalidation_completed", force=True)
@@ -7808,6 +7811,25 @@ class ComposerRunner:
                 "runtime_feasibility_revalidation_same_question",
             }
         )
+
+    def _settle_stage_work_orders(self, stage, context, outcome):
+        """Resolve owned work through the department ledger and retain other owners' inputs."""
+        self._mark_research_requests_attempted(stage)
+        if not self.active_research_requests:
+            return
+        if context.get("preserve_work_orders"):
+            self.department_activity.append({"cycle": self.continuation_cycles,
+                "action": "retain_work_orders_for_backfill", "stage_id": stage["id"], "outcome": outcome,
+                "work_orders": deepcopy(self.active_research_requests)})
+            return
+        resolved = self.departments.resolve_work_orders(self.active_research_requests,
+            stage_kind=stage["kind"], stage_id=stage["id"], outcome=outcome)
+        self.department_activity.append({"cycle": self.continuation_cycles,
+            "action": "resolve_work_orders", "stage_id": stage["id"], "outcome": outcome,
+            "work_orders": deepcopy(resolved)})
+        closed = {row["request_id"] for row in resolved if row.get("state") == "completed"}
+        self.active_research_requests = [request for request in self.active_research_requests
+                                        if request.get("id") not in closed]
 
     def _mark_research_requests_attempted(self, stage):
         """Fence echoed work orders after their owning stage has returned.
@@ -14928,7 +14950,7 @@ class ComposerRunner:
         ), None)
         topic = topic_context.get("topic", {}) if topic_context else {}
         program = topic_context.get("research_program", {}) if topic_context else {}
-        if self.active_research_requests or self.reopened_stage_ids:
+        if self.active_research_requests or self.continuation_pending_stage_ids:
             phase = "repair_and_revalidation"
         elif any(self.stage_records.get(stage["id"], {}).get("status") in STAGE_READY_STATUSES
                  for stage in self.workflow["stages"] if stage["kind"] == "paper"):
@@ -26955,6 +26977,9 @@ class ComposerRunner:
                     return self._finish()
             self._reconcile_interrupted_stage_attempts()
             self._reconcile_latest_survey_results()
+            for stage in self.workflow["stages"]:
+                if self._stage_boundary_is_settled(stage["id"]) and not self._stage_has_pending_continuation(stage["id"]):
+                    self._settle_stage_work_orders(stage, self.context.get(stage["id"], {}), self.stage_records[stage["id"]]["status"])
             if self.stop_after_stage is not None and self._pause_at_stage_boundary(self.stop_after_stage):
                 return self._finish()
             if (self.stop_after_stage is not None
@@ -27919,26 +27944,7 @@ class ComposerRunner:
                             if stage["kind"] == "topic_discovery":
                                 self._retire_requests_after_topic_change(
                                     previous_stage_context, context)
-                            self._mark_research_requests_attempted(stage)
-                            if self.active_research_requests and not context.get(
-                                    "preserve_work_orders"):
-                                self.department_activity.append({
-                                    "cycle": self.continuation_cycles,
-                                    "action": "resolve_work_orders",
-                                    "stage_id": stage_id,
-                                    "outcome": outcome,
-                                    "work_orders": self.departments.resolve_work_orders(
-                                        self.active_research_requests,
-                                        stage_kind=stage["kind"], stage_id=stage_id, outcome=outcome),
-                                })
-                            elif self.active_research_requests:
-                                self.department_activity.append({
-                                    "cycle": self.continuation_cycles,
-                                    "action": "retain_work_orders_for_backfill",
-                                    "stage_id": stage_id,
-                                    "outcome": outcome,
-                                    "work_orders": deepcopy(self.active_research_requests),
-                                })
+                            self._settle_stage_work_orders(stage, context, outcome)
                             self.continuation_pending_stage_ids.discard(stage_id)
                             topic_usage = {}
                             if isinstance(context.get("budget"), dict):

@@ -687,6 +687,32 @@ class ComposerWorkflowTests(unittest.TestCase):
             retired = [x for x in result["blockers"] if x.get("recovery") == "superseded_by_current_stage_state"]
             self.assertEqual(len(retired), 3)
 
+    def test_stage_work_order_settlement_closes_only_owned_accepted_requests(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path))); self.addCleanup(runner.close)
+            survey = runner.workflow["stages"][0]
+            def request(identity, kind, target):
+                return {"id": identity, "kind": kind, "target_stage_id": target, "owner": "research.intelligence",
+                    "objective": "Resolve the scoped evidence requirement.", "why": "The evidence requirement is explicit.",
+                    "success_condition": "The scoped requirement is independently accepted.", "evidence_needed": "Captured evidence."}
+            owned = request("owned-survey", "literature_expansion", "survey")
+            other = request("other-stage", "additional_experiment", "experiment")
+            runner.active_research_requests = [owned, other]
+            runner._settle_stage_work_orders(survey, {}, "candidate_needs_review")
+            self.assertEqual(runner.active_research_requests, [owned, other])
+            runner._settle_stage_work_orders(survey, {"preserve_work_orders": True}, "completed")
+            self.assertEqual(runner.active_research_requests, [owned, other])
+            runner._settle_stage_work_orders(survey, {}, "completed")
+            self.assertEqual(runner.active_research_requests, [other])
+            self.assertEqual(runner.department_activity[-1]["work_orders"][0]["state"], "completed")
+            runner.active_research_requests = []
+            runner.reopened_stage_ids = {"survey"}
+            runner.stage_records = {"survey": {"status": "completed"}, "experiment": {"status": "completed"}}
+            self.assertNotEqual(runner._research_state()["phase"], "repair_and_revalidation")
+            self.assertEqual(runner.reopened_stage_ids, {"survey"})
+            runner.continuation_pending_stage_ids = {"survey"}
+            self.assertEqual(runner._research_state()["phase"], "repair_and_revalidation")
+
     def test_review_revalidation_accepts_immutable_review_candidates_without_a_pause_roundtrip(self):
         for status in ("candidate_needs_review", "research_expansion_required", "review_rejected", "completed", "running"):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as path:
@@ -18489,9 +18515,17 @@ class ComposerWorkflowTests(unittest.TestCase):
                         if isinstance(request, dict)]
             self.assertEqual(len({runner._research_request_signature(item)
                                   for item in requests}), len(requests))
-            self.assertEqual(len(result["active_research_requests"]), 1)
-            self.assertEqual(result["active_research_requests"][0]["kind"], "topic_refinement")
-            self.assertIn("parent phenomenon", result["active_research_requests"][0]["objective"])
+            self.assertEqual(result["active_research_requests"], [])
+            refinement = next(item for item in requests if item.get("kind") == "topic_refinement")
+            self.assertIn("parent phenomenon", refinement["objective"])
+            self.assertTrue(any(row.get("request_id") == refinement["id"] and row.get("state") == "completed"
+                for activity in result["department_activity"] if activity.get("action") == "resolve_work_orders"
+                and activity.get("stage_id") == "topic" for row in activity.get("work_orders", [])))
+            current = result["context"]["survey"]
+            self.assertEqual(current["status"], "research_expansion_required")
+            self.assertEqual(current["gap_state"], "insufficient_evidence")
+            self.assertTrue(any(item.get("kind") == "literature_expansion"
+                                for item in current.get("research_expansion_requests", [])))
             runner.close()
 
     def test_free_topic_selection_switches_between_pinned_experiment_capabilities(self):
