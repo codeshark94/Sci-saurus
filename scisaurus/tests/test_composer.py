@@ -17388,6 +17388,130 @@ class ComposerWorkflowTests(unittest.TestCase):
             {"attempt_number": 2, "failure_dossier_ref": current["artifact_ref"]}]}
         return topic, sources, subject, current, current_body
 
+    def _methods_response_recovery_fixture(self, runner):
+        topic, sources, subject, _, body = self._repair_subject_fixture(runner)
+        body.update(failure_class="model_contract", model_diagnostics={
+            "repair_gate": "repair_adjudication_response"})
+        failed = runner._publish("fixtures/subject/response", "note", body, "command.composer")
+        runner.stage_records["experiment"]["attempts"][1]["failure_dossier_ref"] = failed["artifact_ref"]
+        runner.workflow["capability_foundry_config_path"] = "configured-by-test"
+        runner.context["topic"] = {"kind": "topic_discovery", "topic": topic}
+        prior = {"kind": "experiment", "status": "research_expansion_required",
+                 "review_status": "model_contract_repair", "attempt_number": 2,
+                 "error": "invalid repair adjudication response",
+                 "failure_dossier_ref": failed["artifact_ref"]}
+        runner.context["experiment"] = prior
+        runner.continuation_cycles = 1
+        runner.reopened_stage_ids = {"experiment"}
+        order = {"id": "repair-response", "kind": "recovery", "owner": "methods.validation",
+                 "target_stage_id": "experiment", "target_stage_kind": "experiment",
+                 "recovery_mode": "format_repair_then_rerun",
+                 "failure_dossier_ref": failed["artifact_ref"],
+                 "failure_input_sha256": body["input_sha256"]}
+        runner.active_research_requests = [order]
+        return topic, sources, subject, prior, order, body
+
+    def test_methods_response_recovery_runs_bound_panel_before_author(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            topic, sources, subject, prior, _, _ = self._methods_response_recovery_fixture(runner)
+            stage = runner.workflow["stages"][1]
+            packet = runner._build_capability_repair_packet(stage, {"topic": topic}, prior, prior["error"])
+            self.assertEqual(packet["repair_subject_lineage"], subject)
+            for name, source in sources.items():
+                self.assertEqual("".join(packet["exact_candidate_sources"][name]["source_chunks"]), source)
+            panel = {"schema_version": "capability-repair-panel-6", "packet": packet,
+                     "status": "unavailable", "decision": "defer", "dispatch_usage": {},
+                     "model_failure": {"error": "invalid response", "failure": {"kind": "output_contract"}}}
+            config = {"experiment": {"revision": 1, "literature_gate": {}}, "supplied_context": "base"}
+            with patch.object(runner, "_run_capability_repair_panel", return_value=panel) as call, \
+                    patch.object(runner, "_materialize_topic_capability") as author:
+                with self.assertRaises(ModelWorkBlocked) as failed:
+                    runner._apply_topic_to_experiment_config(stage, config)
+                call.assert_called_once()
+                author.assert_not_called()
+                self.assertEqual(failed.exception.repair_subject, subject)
+                self.assertEqual(failed.exception.failure_class, "model_contract")
+            panel.pop("model_failure")
+            panel.update(status="completed", decision="repair")
+            with patch.object(runner, "_run_capability_repair_panel", return_value=panel), \
+                    patch.object(runner, "_capability_repair_plan_admitted", return_value=False), \
+                    patch.object(runner, "_materialize_topic_capability") as author:
+                with self.assertRaises(ModelWorkBlocked):
+                    runner._apply_topic_to_experiment_config(stage, config)
+                author.assert_not_called()
+            with patch.object(runner, "_run_capability_repair_panel", return_value=panel), \
+                    patch.object(runner, "_capability_repair_plan_admitted", return_value=True), \
+                    patch.object(runner, "_materialize_topic_capability", side_effect=RuntimeError("author boundary")) as author:
+                with self.assertRaisesRegex(RuntimeError, "author boundary"):
+                    runner._apply_topic_to_experiment_config(stage, config)
+                self.assertTrue(author.call_args.kwargs["force_regenerate"])
+                self.assertEqual(author.call_args.kwargs["repair_context"]["packet"], packet)
+
+    def test_methods_response_owner_never_resumes_foreign_foundry_assignment(self):
+        for diagnostics in (None, {}, {"repair_feedback": {"foundry_work_ref":
+                "artifact:command/foundry-work/stale@1"}}):
+            with self.subTest(diagnostics=diagnostics), tempfile.TemporaryDirectory() as path:
+                runner = ComposerRunner(self._workflow(Path(path)))
+                try:
+                    _, _, _, prior, order, body = self._methods_response_recovery_fixture(runner)
+                    if diagnostics is None: body.pop("model_diagnostics")
+                    else: body["model_diagnostics"] = diagnostics
+                    receipt = runner._publish("fixtures/subject/native-owner", "note", body, "command.composer")
+                    prior["failure_dossier_ref"] = order["failure_dossier_ref"] = receipt["artifact_ref"]
+                    order["foundry_work_ref"] = "artifact:command/foundry-work/stale@1"
+                    runner.stage_records["experiment"]["attempts"][1]["failure_dossier_ref"] = receipt["artifact_ref"]
+                    self.assertTrue(runner._format_recovery_requires_methods_panel(
+                        runner.workflow["stages"][1], [order], prior))
+                    self.assertIsNone(runner._format_recovery_foundry_assignment(
+                        [order], question="Does C change eta?", domain="physics"))
+                finally:
+                    runner.close()
+
+    def test_methods_response_recovery_rejects_mixed_and_stale_foundry_orders(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            _, _, _, prior, order, _ = self._methods_response_recovery_fixture(runner)
+            stale = runner._publish("fixtures/subject/foreign-foundry", "note", {
+                "stage_id": "experiment", "input_sha256": "d" * 64,
+                "failure_class": "model_contract", "model_diagnostics": {
+                    "repair_feedback": {"foundry_work_ref": "artifact:command/foundry-work/stale@1"}}},
+                "command.composer")
+            foreign = {**order, "failure_dossier_ref": stale["artifact_ref"],
+                       "failure_input_sha256": "d" * 64}
+            stage = runner.workflow["stages"][1]
+            for orders in ([foreign], [order, foreign], [foreign, order]):
+                with self.subTest(orders=orders), self.assertRaises(ValidationError):
+                    runner._format_recovery_requires_methods_panel(stage, orders, prior)
+
+    def test_methods_response_recovery_rejects_unbound_owner(self):
+        cases = ("input", "stage", "missing_ref", "phase", "subject", "class", "foreign_ref", "attempt")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as path:
+                runner = ComposerRunner(self._workflow(Path(path)))
+                try:
+                    _, _, _, prior, order, body = self._methods_response_recovery_fixture(runner)
+                    if case in ("input", "stage", "missing_ref", "foreign_ref"):
+                        if case == "input": order["failure_input_sha256"] = "c" * 64
+                        elif case == "stage": order["target_stage_id"] = "other"
+                        elif case == "missing_ref": order.pop("failure_dossier_ref")
+                        else: prior["failure_dossier_ref"] = "artifact:foreign@1"
+                    else:
+                        if case == "phase": body.pop("repair_phase")
+                        elif case == "subject": body["repair_subject"]["failure_dossier_body_sha256"] = "c" * 64
+                        elif case == "class": body["failure_class"] = "scientific_assignment"
+                        else: runner.stage_records["experiment"]["attempts"][1]["attempt_number"] = 3
+                        if case != "attempt":
+                            receipt = runner._publish("fixtures/subject/mutated", "note", body, "command.composer")
+                            order["failure_dossier_ref"] = prior["failure_dossier_ref"] = receipt["artifact_ref"]
+                            runner.stage_records["experiment"]["attempts"][1]["failure_dossier_ref"] = receipt["artifact_ref"]
+                    with self.assertRaises(ValidationError):
+                        runner._format_recovery_requires_methods_panel(runner.workflow["stages"][1], [order], prior)
+                finally:
+                    runner.close()
+
     def test_plan_review_failure_preserves_immutable_scientific_subject(self):
         with tempfile.TemporaryDirectory() as path:
             runner = ComposerRunner(self._workflow(Path(path)))

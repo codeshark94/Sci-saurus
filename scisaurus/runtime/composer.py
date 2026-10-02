@@ -93,7 +93,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-subject-owned-author-recovery-9")
+    "experiment-response-owner-recovery-10")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -13987,6 +13987,8 @@ class ComposerRunner:
         generated = topic_context.get("generated_capability")
         continuation_requests = self._requests_for_stage(stage)
         prior_experiment = self.context.get(stage["id"])
+        methods_response_repair = self._format_recovery_requires_methods_panel(
+            stage, continuation_requests, prior_experiment)
         expected_capability_id = (
             generated.get("capability_id") if isinstance(generated, dict)
             else selected.get("experiment_capability_id")
@@ -14036,13 +14038,14 @@ class ComposerRunner:
             and any(item.get("kind") in EXPERIMENT_WORK_ORDER_KINDS
                     for item in continuation_requests)
                     and has_observed_experiment
-        ) or fresh_pre_execution_repair
+        ) or fresh_pre_execution_repair or methods_response_repair
         if needs_fresh_capability and not self.workflow.get("capability_foundry_config_path"):
             raise ValidationError(
                 "a substantive experiment continuation requires capability_foundry_config_path; "
                 "a pinned catalog cannot silently repeat the prior experiment")
         repair_context = None
-        repair_panel_required = fresh_pre_execution_repair or observed_experiment_repair
+        repair_panel_required = (fresh_pre_execution_repair or observed_experiment_repair
+                                 or methods_response_repair)
         if repair_panel_required and isinstance(prior_experiment, dict):
             # A failed capability or an observed scientific hold is a design
             # failure, not merely a malformed transport response. Ask the
@@ -22551,6 +22554,52 @@ class ComposerRunner:
             request["failure_gate"] = feedback.get("gate")
         return request
 
+    @staticmethod
+    def _methods_panel_response_failure(dossier):
+        diagnostics = dossier.get("model_diagnostics")
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        return (dossier.get("repair_phase") == "pre_execution_plan_review"
+                or dossier.get("repair_subject") is not None
+                or diagnostics.get("repair_gate") == "repair_adjudication_response")
+
+    def _format_recovery_requires_methods_panel(self, stage, requests, prior_context):
+        """Resume a Methods response failure at its bound scientific repair panel."""
+        orders = [order for order in requests if isinstance(order, dict)
+                  and order.get("kind") == "recovery"
+                  and order.get("recovery_mode") == "format_repair_then_rerun"]
+        if not orders:
+            return False
+        prior_context = prior_context if isinstance(prior_context, dict) else {}
+        recovery = prior_context.get("failure_recovery")
+        recovery = recovery if isinstance(recovery, dict) else {}
+        current_ref = prior_context.get("failure_dossier_ref") or recovery.get("dossier_ref")
+
+        current = None
+        if isinstance(current_ref, str):
+            _, _, current = self._read_verified_artifact_json(current_ref)
+        native_owner = isinstance(current, dict) and self._methods_panel_response_failure(current)
+        for order in orders:
+            ref = order.get("failure_dossier_ref")
+            if native_owner and ref != current_ref:
+                raise ValidationError("Methods response recovery has a foreign or missing response owner")
+            if not isinstance(ref, str):
+                continue
+            _, _, dossier = self._read_verified_artifact_json(ref)
+            if not self._methods_panel_response_failure(dossier):
+                continue
+            if (ref != current_ref or dossier.get("stage_id") != stage["id"]
+                    or order.get("target_stage_id") != stage["id"]
+                    or dossier.get("input_sha256") != order.get("failure_input_sha256")
+                    or dossier.get("failure_class") != "model_contract"
+                    or dossier.get("repair_phase") != "pre_execution_plan_review"):
+                raise ValidationError("Methods response recovery does not bind the current repair panel")
+            evidence = self._failure_dossier_evidence(ref, expected_stage_id=stage["id"],
+                expected_attempt_number=dossier.get("attempt_number"))
+            if (not isinstance(evidence, dict) or evidence.get("available") is not True
+                    or not isinstance(evidence.get("repair_subject_lineage"), dict)):
+                raise ValidationError("Methods response recovery has no verified scientific repair subject")
+        return native_owner
+
     def _format_recovery_foundry_assignment(self, requests, *, question, domain):
         refs = set()
         for order in requests:
@@ -22565,12 +22614,14 @@ class ComposerRunner:
                         or dossier.get("input_sha256") != order.get("failure_input_sha256")
                         or dossier.get("failure_class") != "model_contract"):
                     raise ValidationError("format recovery does not bind its response failure dossier")
-                if "model_diagnostics" in dossier:
-                    diagnostics = dossier["model_diagnostics"]
+                if ("model_diagnostics" in dossier
+                        or self._methods_panel_response_failure(dossier)):
+                    diagnostics = dossier.get("model_diagnostics")
                     diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
                     feedback = diagnostics.get("repair_feedback")
                     feedback = feedback if isinstance(feedback, dict) else {}
-                    authoritative_ref = feedback.get("foundry_work_ref")
+                    authoritative_ref = (None if self._methods_panel_response_failure(dossier)
+                                         else feedback.get("foundry_work_ref"))
                     if ref != authoritative_ref:
                         self.department_activity.append({
                             "action": "reconcile_format_recovery_owner",
