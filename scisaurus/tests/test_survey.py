@@ -246,6 +246,10 @@ def simulated_survey_worker(kind, params, channel):
                     "operation": operation, "query": query, "work_id": wid, "evidence": [source_quote(source)]})
         value = {"decision": "expand" if branches else "stop", "rationale": "Retain bounded recall evidence.",
                  "branches": branches}
+    elif phase == "survey_operation_completion":
+        disposition = assignment["disposition"]
+        value = {"outcome": "unmet" if mode in {"follow-up-capture-required", "follow-up-records-only"} else "met",
+                 "rationale": "The exact operation's permitted availability record is present."}
     elif phase == "survey_follow_up":
         value = {"orders": [{
             "id": order["id"], "status": "limited", "rationale": "The bounded evidence does not resolve this measurement.",
@@ -254,7 +258,7 @@ def simulated_survey_worker(kind, params, channel):
             "next_action": "Keep the measurement claim provisional and narrow the study.",
             "completion": {"outcome": "met", "rationale": "The bounded negative search is recorded as allowed."},
         } for order in assignment["work_orders"]]}
-        if mode == "follow-up-capture-required":
+        if mode in {"follow-up-capture-required", "follow-up-conflicted-completion"}:
             for row in value["orders"]:
                 row["completion"] = {"outcome": "unmet", "rationale": "The required numeric capture is absent."}
         if mode == "follow-up-missing-completion":
@@ -1748,6 +1752,62 @@ class TestSurveyRunner(unittest.TestCase):
                     forged_summary["artifact_ref"], {"query_refs": [forged_summary["artifact_ref"]]},
                     result["follow_up_ref"])
 
+    def test_operation_acceptance_is_independent_and_immutable(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        from scisaurus.core.surveys import SurveyGate
+        order = self.follow_up_order()
+        runner = self.runtime(survey_config(self.endpoint, "follow-up-conflicted-completion"), work_orders=[order])
+        result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        row = result["follow_up_result"]["orders"][0]
+        self.assertEqual(row["status"], "limited")
+        self.assertEqual(row["completion"]["outcome"], "met")
+        self.assertTrue(row["limitation"])
+        self.assertTrue(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, order))
+        control, store = self.open_store()
+        body = json.loads(store.read_body(store.get(result["follow_up_result"]["ref"])["body_hash"]))
+        completion_ref = body["completion_execution_refs"][0]
+        recorded = SurveyGate._recorded_execution
+        assignments = []
+        def inspect(gate, ref, *args, **kwargs):
+            value = recorded(gate, ref, *args, **kwargs)
+            if ref == completion_ref:
+                assignment = json.loads(value[3]["prompt"])
+                assignments.append(assignment)
+            return value
+        with patch.object(SurveyGate, "_recorded_execution", new=inspect):
+            self.assertTrue(ComposerRunner._survey_follow_up_was_replayed(self.root / "run", result, order))
+        assignment = assignments[0]
+        self.assertNotIn("scientific_input_recovery", assignment)
+        self.assertEqual(assignment["disposition"]["completion"]["outcome"], "unmet")
+        self.assertEqual({k:v for k,v in assignment["disposition"].items() if k != "completion"},
+                         {k:v for k,v in row.items() if k != "completion"})
+        self.assertEqual(assignment["work_orders"], [order])
+        for changed in ({"completion_execution_refs": []}, {"completion_execution_refs": [body["execution_ref"]]},
+                        {"completion_execution_refs": None},
+                        {"orders": [{**row, "completion": {"outcome": "unmet", "rationale": "Operator rewrite."}}]}):
+            invalid = {**body, **changed}
+            record = store.publish_artifact(logical_id="command/survey-follow-up-results/invalid-review",
+                artifact_type="report", author="methods.evidence-verifier", body=canonical_bytes(invalid),
+                inputs=[{"ref": ref, "purpose": "subject"} for ref in [body["follow_up_ref"], body["survey_ref"],
+                    body["assessment_ref"], *body["execution_refs"], completion_ref]])
+            forged = {**result, "follow_up_result": {"ref": record["artifact_ref"], "orders": invalid["orders"]}}
+            with self.subTest(changed=changed):
+                self.assertFalse(ComposerRunner._survey_follow_up_was_replayed(self.root / "run", forged, order))
+        for field, value in (("disposition_execution_ref", "artifact:foreign/execution@1"),
+                             ("work_orders", [{**order, "success_condition": "Different acceptance."}]),
+                             ("survey_ref", "artifact:foreign/survey@1"),
+                             ("disposition", {**assignment["disposition"], "limitation": ""})):
+            def altered(gate, ref, *args, **kwargs):
+                values = list(recorded(gate, ref, *args, **kwargs))
+                if ref == completion_ref:
+                    changed = json.loads(values[3]["prompt"])
+                    changed[field] = value
+                    values[3] = {**values[3], "prompt": json.dumps(changed)}
+                return tuple(values)
+            with self.subTest(field=field), patch.object(SurveyGate, "_recorded_execution", new=altered):
+                self.assertFalse(ComposerRunner._survey_follow_up_was_replayed(self.root / "run", result, order))
+
     def test_capture_required_follow_up_does_not_close_on_unavailable_evidence(self):
         from scisaurus.runtime.composer import ComposerRunner
         order = {**self.follow_up_order(), "success_condition": "Capture the numeric measurement with units."}
@@ -1769,7 +1829,7 @@ class TestSurveyRunner(unittest.TestCase):
         with patch.object(runner, "_validate_follow_up_result", side_effect=legacy_validation):
             result = runner.run()
         self.assertEqual(result["status"], "completed", result["error"])
-        self.assertNotIn("completion", result["follow_up_result"]["orders"][0])
+        self.assertEqual(result["follow_up_result"]["orders"][0]["completion"]["outcome"], "met")
         self.assertFalse(ComposerRunner._survey_follow_up_was_replayed(self.root / "run", result, order))
         self.assertFalse(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, order))
 
@@ -1785,11 +1845,22 @@ class TestSurveyRunner(unittest.TestCase):
         def legacy_assignment(assignment):
             value = original_assignment(assignment)
             value.pop("completion_contract", None)
+            value.pop("completion_review_contract", None)
             return value
         with patch.object(runner, "_validate_follow_up_result", side_effect=legacy_validation), \
              patch.object(runner, "_follow_up_assignment", side_effect=legacy_assignment):
             result = runner.run()
         self.assertEqual(result["status"], "completed", result["error"])
+        control, store = self.open_store()
+        body = json.loads(store.read_body(store.get(result["follow_up_result"]["ref"])["body_hash"]))
+        body.pop("completion_execution_refs")
+        for row in body["orders"]:
+            row.pop("completion")
+        record = store.publish_artifact(logical_id="command/survey-follow-up-results/legacy-fixture",
+            artifact_type="report", author="methods.evidence-verifier", body=canonical_bytes(body),
+            inputs=[{"ref": ref, "purpose": "subject"} for ref in [body["follow_up_ref"], body["survey_ref"],
+                body["assessment_ref"], *body["execution_refs"]]])
+        result = {**result, "follow_up_result": {"ref": record["artifact_ref"], "orders": body["orders"]}}
         self.assertTrue(ComposerRunner._survey_follow_up_was_replayed(self.root / "run", result, order))
         self.assertTrue(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, order))
 

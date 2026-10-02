@@ -13,6 +13,7 @@ from scisaurus.core.schema import canonical_bytes
 
 
 FOLLOW_UP_COMPLETION_CONTRACT = "survey-operation-completion-1"
+FOLLOW_UP_COMPLETION_REVIEW_CONTRACT = "survey-operation-acceptance-1"
 
 MAP_FIELDS = ("problem", "approach", "finding", "limitations")
 SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
@@ -655,6 +656,17 @@ def follow_up_completion_met(row, *, require_resolved=False):
     return row.get("status") == "resolved" if require_resolved else row.get("status") in {"resolved", "limited"}
 
 
+def validate_follow_up_completion(value):
+    try:
+        exact(value, {"outcome", "rationale"}, "survey follow-up completion")
+        _text(value["outcome"], "survey follow-up completion outcome")
+        _text(value["rationale"], "survey follow-up completion rationale")
+    except ValidationError as exc:
+        raise ModelContractError(str(exc)) from exc
+    if value["outcome"] not in {"met", "unmet"}:
+        raise ModelContractError("survey follow-up completion outcome must be met or unmet")
+
+
 def validate_follow_up_result(value, work_orders, sources, query_refs, *, windows, record_inventory=None,
                               require_completion=False):
     def response_exact(value, fields, name):
@@ -718,11 +730,7 @@ def validate_follow_up_result(value, work_orders, sources, query_refs, *, window
                                      "record-only provenance must remain unresolved")
         if "completion" in row:
             completion = row["completion"]
-            response_exact(completion, {"outcome", "rationale"}, "survey follow-up completion")
-            response_text(completion["outcome"], "survey follow-up completion outcome")
-            if completion["outcome"] not in {"met", "unmet"}:
-                raise ModelContractError("survey follow-up completion outcome must be met or unmet")
-            response_text(completion["rationale"], "survey follow-up completion rationale")
+            validate_follow_up_completion(completion)
             if completion["outcome"] == "met":
                 if not (row["evidence"] or record_refs or row["query_refs"]):
                     raise ModelContractError("completed survey work requires recorded source, inventory or search provenance")

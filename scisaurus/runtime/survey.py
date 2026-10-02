@@ -38,7 +38,8 @@ from scisaurus.runtime.operation_adapters import get_adapter
 from scisaurus.runtime.scores import exact, identifier
 from scisaurus.runtime.survey_config import validate_survey_config, search_query
 from scisaurus.runtime.survey_records import (
-    FOLLOW_UP_COMPLETION_CONTRACT, MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, CRITIQUE_DISPOSITIONS, normalize_check_envelope,
+    FOLLOW_UP_COMPLETION_CONTRACT, FOLLOW_UP_COMPLETION_REVIEW_CONTRACT, validate_follow_up_completion,
+    MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, CRITIQUE_DISPOSITIONS, normalize_check_envelope,
     BODY_SECTION_MARKERS, authoritative_source, has_section_heading as _has_section_heading,
     normalize_gap_assessment_envelope, validate_map,
     validate_survey_review, validate_assessment, validate_work_review, survey_review_response_contract,
@@ -704,7 +705,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             self._restore()
 
     def _follow_up_assignment(self, assignment):
-        assignment = {**assignment, "scientific_input_recovery": scientific_input_recovery_contract()}
+        if assignment.get("phase") != "survey_operation_completion":
+            assignment = {**assignment, "scientific_input_recovery": scientific_input_recovery_contract()}
         if "sources" in assignment or "coverage" in assignment:
             assignment = {**assignment, "source_evidence_policy": _SOURCE_EVIDENCE_POLICY}
         if not getattr(self, "work_orders", None):
@@ -813,6 +815,28 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         from scisaurus.runtime.survey_records import project_follow_up_inventory
         return project_follow_up_inventory(inventory, order)
 
+    def _review_follow_up_completion(self, order, disposition, execution_ref):
+        """Assess operation acceptance against an immutable scientific disposition."""
+        assignment = {
+            "phase": "survey_operation_completion", "completion_review_contract": FOLLOW_UP_COMPLETION_REVIEW_CONTRACT,
+            "work_orders": [order], "follow_up_ref": self.follow_up_ref,
+            "survey_ref": self.survey_ref, "assessment_ref": self.assessment_ref,
+            "disposition_execution_ref": execution_ref, "disposition": deepcopy(disposition),
+            "instructions": (
+                "Return only {outcome:met|unmet,rationale:string}. Independently evaluate the assigned order's "
+                "exact success_condition against the validated disposition, not the producer's completion verdict. "
+                "The objective describes desired scientific inputs; success_condition controls operation acceptance. "
+                "Explain how each requested deliverable meets or fails that condition. Honor its explicit alternatives. "
+                "If it permits recording unavailable inputs, the disposition's itemized, scoped availability record "
+                "backed by retained source, inventory or search provenance can meet that branch without obtaining values. "
+                "Do not require a paper to assert global unavailability. If it requires an actual capture or measurement, "
+                "an absence record cannot meet that requirement. Do not alter scientific status, limitations, source "
+                "proofs or the assessment; operation completion establishes neither novelty nor a scientific answer. "
+                "Return unmet if the exact requested deliverables or permitted availability records are absent.")}
+        identity = hashlib.sha256(canonical_bytes({"order": order, "execution_ref": execution_ref})).hexdigest()
+        return self._model_checked(f"follow-up-acceptance-{identity}", "methods.evidence-verifier", assignment,
+                                   validate_follow_up_completion, stage="supervision", task_kind="review")
+
     def _resolve_follow_up(self):
         if not self.work_orders:
             return
@@ -820,6 +844,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         assignment = {
             "phase": "survey_follow_up", "question": self.score["question"],
             "completion_contract": FOLLOW_UP_COMPLETION_CONTRACT,
+            "completion_review_contract": FOLLOW_UP_COMPLETION_REVIEW_CONTRACT,
             "response_contract": {
                 "envelope": {"orders": "one disposition for the assigned order"},
                 "required_order_fields": ["id", "status", "rationale", "evidence", "query_refs",
@@ -868,7 +893,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "Return all eight fields for the single assigned order, including empty evidence/query_refs lists "
                 "and an empty limitation string when appropriate. Keep rationale and next_action concise.")}
         limit = self._map_input_limit("methods.evidence-verifier")
-        orders, executions = [], []
+        orders, executions, completion_executions = [], [], []
         for order in self.work_orders:
             scoped = self._follow_up_assignment({**assignment, "work_orders": [order]})
             scoped["survey_inventory"] = self._project_follow_up_inventory(
@@ -889,16 +914,23 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                                                              require_completion=True),
                 normalizer=self._normalize_follow_up_result, normalizer_uses_assignment=True,
                 stage="supervision", task_kind="review")
-            orders.extend(value["orders"])
+            row = value["orders"][0]
+            completion, completion_execution = self._review_follow_up_completion(order, row, execution)
+            row = {**row, "completion": completion}
+            self._validate_follow_up_result({"orders": [row]}, sources=displayed, work_orders=[order],
+                                            record_inventory=scoped["survey_inventory"], require_completion=True)
+            orders.append(row)
+            completion_executions.append(completion_execution)
             executions.append(execution)
             self._follow_up_decisions.add(identity)
         value = {"orders": orders}
         record = self._publish(f"command/survey-follow-up-results/{self.run_id}", "report", {
             "schema_version": "survey-follow-up-result-1", "follow_up_ref": self.follow_up_ref,
             "execution_ref": executions[-1], "execution_refs": executions,
+            "completion_execution_refs": completion_executions,
             "survey_ref": self.survey_ref, "assessment_ref": self.assessment_ref, **value,
         }, "methods.evidence-verifier", subjects=[self.follow_up_ref, self.survey_ref,
-                                                   self.assessment_ref, *executions])
+                                                   self.assessment_ref, *executions, *completion_executions])
         self.follow_up_result = {"ref": record["artifact_ref"], **value}
 
     def _plan_work_budget(self):

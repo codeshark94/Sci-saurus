@@ -17417,8 +17417,8 @@ class ComposerRunner:
         from scisaurus.core.surveys import SurveyGate
         from scisaurus.runtime.models import ModelResult
         from scisaurus.runtime.survey import acquisition_succeeded
-        from scisaurus.runtime.survey_records import (FOLLOW_UP_COMPLETION_CONTRACT, follow_up_inventory,
-                                                      project_follow_up_inventory, validate_follow_up_result)
+        from scisaurus.runtime.survey_records import (FOLLOW_UP_COMPLETION_CONTRACT, FOLLOW_UP_COMPLETION_REVIEW_CONTRACT,
+                    follow_up_inventory, project_follow_up_inventory, validate_follow_up_result, validate_follow_up_completion)
         result = run.get("follow_up_result")
         if (not isinstance(result, dict) or not isinstance(result.get("ref"), str)
                 or any(not isinstance(run.get(key), str) for key in ("survey_ref", "assessment_ref"))):
@@ -17457,8 +17457,14 @@ class ComposerRunner:
                     _, raw_work = gate._artifact(ref)
                     work = json.loads(raw_work)
                     works[work["work_id"]] = work
+                completion_refs = body.get("completion_execution_refs")
+                if completion_refs is not None and (not isinstance(completion_refs, list)
+                        or len(completion_refs) != len(execution_refs)
+                        or any(not isinstance(ref, str) for ref in completion_refs)
+                        or len(set(completion_refs)) != len(completion_refs)):
+                    return False
                 checked = {}
-                for execution_ref in execution_refs:
+                for execution_index, execution_ref in enumerate(execution_refs):
                     execution, _, execution_body, model_params = gate._recorded_execution(
                         execution_ref, "methods.evidence-verifier", operation="model", task_kinds={"review"})
                     assignment = json.loads(model_params["prompt"])
@@ -17499,6 +17505,37 @@ class ComposerRunner:
                     validate_follow_up_result(response, assigned, sources, query_refs, windows=windows,
                                               record_inventory=record_inventory,
                                               require_completion=completion_contract == FOLLOW_UP_COMPLETION_CONTRACT)
+                    completion_review_contract = assignment.get("completion_review_contract")
+                    if completion_review_contract not in (None, FOLLOW_UP_COMPLETION_REVIEW_CONTRACT):
+                        return False
+                    if completion_review_contract is not None:
+                        if completion_refs is None or len(assigned) != 1 or len(response["orders"]) != 1:
+                            return False
+                        completion_ref = completion_refs[execution_index]
+                        completion_execution, _, completion_body, completion_params = gate._recorded_execution(
+                            completion_ref, "methods.evidence-verifier", operation="model", task_kinds={"review"})
+                        completion_assignment = json.loads(completion_params["prompt"])
+                        if (completion_execution.get("author") != "methods.evidence-verifier"
+                                or completion_ref not in {item["ref"] for item in record["inputs"]}
+                                or completion_assignment.get("phase") != "survey_operation_completion"
+                                or completion_assignment.get("completion_review_contract") != completion_review_contract
+                                or completion_assignment.get("work_orders") != assigned
+                                or completion_assignment.get("follow_up_ref") != body["follow_up_ref"]
+                                or completion_assignment.get("survey_ref") != run["survey_ref"]
+                                or completion_assignment.get("assessment_ref") != run["assessment_ref"]
+                                or completion_assignment.get("disposition_execution_ref") != execution_ref
+                                or completion_assignment.get("disposition") != response["orders"][0]
+                                or completion_body.get("finish_reason", "stop") not in {"stop", "length"}):
+                            return False
+                        completion = ModelResult(text=completion_body["text"], model="retained", usage={},
+                            elapsed_seconds=0, finish_reason=completion_body.get("finish_reason", "stop")).json_object(
+                                allow_missing_closers=True)
+                        validate_follow_up_completion(completion)
+                        response = {"orders": [{**response["orders"][0], "completion": completion}]}
+                        validate_follow_up_result(response, assigned, sources, query_refs, windows=windows,
+                                                  record_inventory=record_inventory, require_completion=True)
+                    elif completion_refs is not None:
+                        return False
                     for row in response["orders"]:
                         if row["id"] in checked:
                             return False
