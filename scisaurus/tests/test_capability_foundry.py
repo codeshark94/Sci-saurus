@@ -3803,6 +3803,46 @@ if __name__ == "__main__":
 
 
 class IndependentValidatorAuthorshipTests(unittest.TestCase):
+    def test_validator_protocol_deadline_retains_captured_response(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            cache = CapabilityFoundryTests._cache(self, root)
+            producer = StubClient(CapabilityFoundryTests._payload())
+            execute = foundry._execute
+            def deadline_at_validation(source, payload):
+                if source == MINI_VALIDATOR and not json.loads(payload).get('readiness_probe'):
+                    raise CapabilityDeadlineError('validator protocol deadline')
+                return execute(source, payload)
+            with patch.object(foundry, '_execute', side_effect=deadline_at_validation):
+                with self.assertRaises(CapabilityDeadlineError):
+                    foundry.generate('bounded comparison', client=producer, work_cache=cache)
+            outcome = foundry.generate('bounded comparison', client=producer, work_cache=cache)
+            self.assertEqual(outcome['status'], 'registered')
+            self.assertEqual((producer.calls, foundry.validator_client.calls), (1, 1))
+
+    def test_validator_protocol_format_repair_stays_with_its_independent_author(self):
+        with tempfile.TemporaryDirectory() as path:
+            foundry = CapabilityFoundryTests._foundry(Path(path))
+            producer = StubClient(CapabilityFoundryTests._payload())
+            class Independent:
+                calls = 0
+                def complete(inner, *, system, prompt):
+                    inner.calls += 1
+                    packet = json.loads(prompt)
+                    self.assertEqual(set(packet['validator_output_exact_shapes']['checks'][0]),
+                                     {'id', 'outcome', 'evidence'})
+                    if inner.calls > 1:
+                        self.assertIn('validator_repair', packet)
+                    source = (MINI_VALIDATOR.replace('"evidence":', '"message":')
+                              if inner.calls == 1 else MINI_VALIDATOR)
+                    return ModelResult(json.dumps({'validator_source': source}),
+                                       'independent', {'model_calls': 1}, 0, 'stop')
+            foundry.validator_client = Independent()
+            outcome = foundry.generate('bounded comparison', client=producer)
+            self.assertEqual(outcome['status'], 'registered')
+            self.assertEqual((producer.calls, foundry.validator_client.calls), (1, 2))
+
     def test_repaired_approval_retains_prior_issue_contract_on_cached_reuse(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)

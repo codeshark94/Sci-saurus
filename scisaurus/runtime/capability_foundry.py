@@ -38,7 +38,7 @@ from scisaurus.runtime.capability_registry import (
 )
 from scisaurus.runtime.experiment import (
     PROGRAM_OUTPUT_FIELDS, ExperimentProgramOutputContractError,
-    validate_program_output,
+    validate_program_output, validate_deterministic_validation, bind_deterministic_validation,
 )
 from scisaurus.runtime.experiment_config import EXPERIMENT_WORK_ORDER_KINDS, validate_work_orders
 from scisaurus.runtime.models import (
@@ -2223,6 +2223,10 @@ class CapabilityFoundry:
                                 and prior.get("attempts", 0) > 0
                         ):
                             resumable_response = deepcopy_config(prior)
+                            resumable_response["usage_inheritance"] = {
+                                "source_ref": prior["cache_ref"],
+                                "source_request_count": len(prior.get("requests", [])),
+                            }
                             resumable_response.pop("cache_ref", None)
                             break
 
@@ -3308,6 +3312,7 @@ class CapabilityFoundry:
                 "configured_input": payload["configured_input"],
                 "observation_schema": schema,
                 "contract": base_prompt["independent_validation_contract"],
+                "validator_output_exact_shapes": base_prompt["validator_output_exact_shapes"],
                 "response_contract": {"validator_source": "complete Python source"},
                 "instructions": "Implement recalculation from raw observations and the frozen estimand. Never trust candidate metric values as recalculated values. Check every declared primary outcome, raw-data consistency, frozen limitations and finite values. No executor source or producer validator is available. Use only the declared runtime packages and permitted modules. Return only the complete JSON object.",
                 "runtime": runtime,
@@ -3371,16 +3376,36 @@ class CapabilityFoundry:
                     scan_program_source(source, "independent program validator")
                     retained["source"] = source
                     probe = self._execute(source, canonical_bytes({"readiness_probe": True}))
+                    if probe.timed_out and deadline is not None and time.monotonic() >= deadline:
+                        raise CapabilityDeadlineError("independent validator readiness reached the mission deadline")
                     validate_validator_readiness(probe)
+                    digest = hashlib.sha256(canonical_bytes(document)).hexdigest()
+                    preview = self._execute(source, canonical_bytes(experiment_validation_payload(
+                        intent, payload["configured_input"], document, digest)))
+                    if preview.timed_out and deadline is not None and time.monotonic() >= deadline:
+                        raise CapabilityDeadlineError("independent validator protocol reached the mission deadline")
+                    if preview.timed_out or preview.truncated or preview.returncode != 0:
+                        raise ValidationError("independent validator protocol execution failed: "
+                            + preview.stderr.decode("utf-8", "replace")[-1200:])
+                    verdict = validate_deterministic_validation(json.loads(preview.stdout), intent, digest)
+                    bind_deterministic_validation(verdict, document, intent)
                     provenance = {"role": "methods.validator-author", "method": "blinded_separate_authoring",
                         "assignment_sha256": identity, "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
                         "response_sha256": hashlib.sha256(response["text"].encode()).hexdigest(), "model": response["model"]}
                     return source, provenance, probe
+                except CapabilityDeadlineError:
+                    retained["status"] = "response_received"
+                    save("independent_validator_validation_pending")
+                    raise
                 except (ValidationError, ValueError, TypeError) as exc:
                     retained.update(status="repair_required", error=str(exc))
                     save("independent_validator_contract_failed")
                     if retained.get("attempts", 0) >= self.max_attempts:
-                        raise ModelWorkBlocked("independent validator technical repair exhausted: " + str(exc)) from exc
+                        blocked = ModelWorkBlocked("independent validator technical repair exhausted: " + str(exc))
+                        blocked.failure_class = "model_contract"
+                        blocked.recovery_mode = "format_repair_then_rerun"
+                        blocked.repair_gate = "independent_validator_contract"
+                        raise blocked from exc
 
         if state["status"] == "blocked" and isinstance(
                 state.get("repair_budget_exhausted"), dict):

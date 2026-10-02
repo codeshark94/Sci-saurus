@@ -216,7 +216,16 @@ The producer returns executor source and experimental intent. A separate
 `methods.validator-author` context writes the validator from the frozen intent,
 configured input and observation schema, without receiving the executor source
 or reported metric values. Its response and source hashes are bound to the
-admitted capability. Runtime provenance and configured test data belong to the controller. Repairs
+admitted capability. The validator author receives the exact nested verdict
+schema. Readiness and protocol execution are checked before program admission:
+malformed validator verdicts return to the validator author, while well-formed
+scientific rejections retain their ordinary program-repair route. Deadline
+interruption preserves the captured response for validation on resume.
+Copied work histories bind their immutable predecessor and request prefix;
+global accounting charges only newly dispatched requests. Historical duplicate
+charges require an owned correction receipt with exact ordered before/after
+mission checkpoints, and the correction is applied once.
+Runtime provenance and configured test data belong to the controller. Repairs
 replace only explicitly updated code or intent fields. Unchanged source is
 retained. Source repairs can use ordered exact-text edits; each match must be
 unique, stale or ambiguous edits fail atomically, and the assembled candidate

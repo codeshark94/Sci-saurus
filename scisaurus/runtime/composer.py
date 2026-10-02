@@ -1213,6 +1213,8 @@ class ComposerRunner:
                     "action": "retire_superseded_work_orders_on_resume",
                     "work_orders": retired_work_orders,
                 })
+            if self._reconcile_foundry_usage_inheritance():
+                self._checkpoint("recovered_foundry_usage_inheritance", force=True)
             if self._sync_foundry_usage():
                 self._checkpoint("recovered_usage", force=True)
             if self._reconcile_duplicate_foundry_settlements():
@@ -1782,19 +1784,100 @@ class ComposerRunner:
         error.usage_is_snapshot = False
         return error
 
+    def _foundry_inherited_usage(self, logical_id, body):
+        inheritance = body.get("usage_inheritance")
+        if inheritance is None:
+            record = self.store.head("command/foundry-usage-inheritance/" + logical_id.rsplit("/", 1)[-1])
+            if record is not None:
+                manifest, _, inheritance = self._read_verified_artifact_json(record["artifact_ref"])
+                target_manifest, _, _ = self._read_verified_artifact_json(inheritance["target_ref"])
+                if (manifest.get("author") != "command.composer" or manifest.get("version") != 1
+                        or target_manifest.get("artifact_id") != logical_id):
+                    raise ValidationError("foundry usage inheritance has no matching immutable correction owner")
+        if inheritance is None:
+            return {}
+        if not isinstance(inheritance, dict):
+            raise ValidationError("foundry usage inheritance requires an immutable source")
+        record, _, source = self._read_verified_artifact_json(inheritance["source_ref"])
+        count = inheritance.get("source_request_count")
+        if (record.get("author") != "command.controller"
+                or not record.get("artifact_ref", "").startswith("artifact:command/foundry-work/")
+                or type(count) is not int or count < 1
+                or len(source.get("requests", [])) != count
+                or body.get("requests", [])[:count] != source["requests"]
+                or source.get("assignment") != body.get("assignment")):
+            raise ValidationError("foundry usage inheritance does not bind the captured request prefix")
+        inherited = source.get("usage", {})
+        if any(type(amount) not in (int, float) or not math.isfinite(amount) or amount < 0
+               or body.get("usage", {}).get(key, 0) < amount for key, amount in inherited.items()):
+            raise ValidationError("foundry inherited usage exceeds its cumulative assignment history")
+        return inherited
+
+    def _reconcile_foundry_usage_inheritance(self):
+        """Refund a copied assignment history only with exact paid checkpoint evidence."""
+        rows = self.control._conn.execute(
+            "SELECT a.artifact_ref FROM artifacts a JOIN "
+            "(SELECT logical_id,MAX(version) version FROM artifacts "
+            "WHERE logical_id LIKE 'command/foundry-usage-inheritance/%' GROUP BY logical_id) h "
+            "ON a.logical_id=h.logical_id AND a.version=h.version")
+        changed = False
+        for row in rows:
+            record, _, proof = self._read_verified_artifact_json(row["artifact_ref"])
+            if (record.get("author") != "command.composer" or record.get("version") != 1
+                    or proof.get("schema_version") != "foundry-usage-inheritance-correction-1"):
+                raise ValidationError("foundry usage correction has no Composer owner")
+            namespace = "foundry-inheritance:" + record["artifact_id"]
+            if namespace in self.stage_usage_totals:
+                continue
+            target_record, _, target = self._read_verified_artifact_json(proof["target_ref"])
+            source_record, _, _ = self._read_verified_artifact_json(proof["source_ref"])
+            inherited = self._foundry_inherited_usage(target_record["artifact_id"], target)
+            if len(target.get("requests", [])) != proof["source_request_count"]:
+                raise ValidationError("foundry correction must bind the original copied request prefix")
+            before_manifest, _, before = self._read_verified_artifact_json(proof["before_checkpoint_ref"])
+            after_manifest, _, after = self._read_verified_artifact_json(proof["after_checkpoint_ref"])
+            if (before_manifest.get("author") != "command.composer"
+                    or after_manifest.get("author") != "command.composer"
+                    or before.get("schema_version") != "composer-checkpoint-1"
+                    or after.get("schema_version") != "composer-checkpoint-1"
+                    or before.get("workflow_id") != self.workflow["id"]
+                    or after.get("workflow_id") != self.workflow["id"]
+                    or target_record.get("author") != "command.controller"
+                    or not (source_record["created_at"] < before_manifest["created_at"]
+                            < target_record["created_at"] < after_manifest["created_at"])):
+                raise ValidationError("foundry correction must bind ordered mission accounting checkpoints")
+            for field in ("usage", "foundry_usage"):
+                if any(after.get(field, {}).get(key, 0) - before.get(field, {}).get(key, 0) != amount
+                       for key, amount in inherited.items() if key in self.usage):
+                    raise ValidationError("foundry correction lacks an exact duplicate payment proof")
+            with self._progress_lock:
+                state = deepcopy(self._accounting_state)
+                for key, amount in inherited.items():
+                    if key not in state["usage"]:
+                        continue
+                    if state["usage"].get(key, 0) < amount or state["foundry_usage"].get(key, 0) < amount:
+                        raise ValidationError("foundry correction exceeds its paid accounting baseline")
+                    state["usage"][key] -= amount
+                    state["foundry_usage"][key] -= amount
+                state["stage_usage_totals"][namespace] = deepcopy(inherited)
+                self._accounting_state = state
+            changed = True
+        return changed
+
     def _sync_foundry_usage(self):
         """Reconcile durable per-request charges with the last usage checkpoint."""
         totals = {}
         rows = self.control._conn.execute(
-            "SELECT a.body_hash FROM artifacts a JOIN "
+            "SELECT a.logical_id,a.body_hash FROM artifacts a JOIN "
             "(SELECT logical_id,MAX(version) version FROM artifacts "
             "WHERE logical_id LIKE 'command/foundry-work/%' GROUP BY logical_id) h "
             "ON a.logical_id=h.logical_id AND a.version=h.version")
         for row in rows:
             body = json.loads(self.store.read_body(row["body_hash"]))
+            inherited = self._foundry_inherited_usage(row["logical_id"], body)
             for key, amount in body.get("usage", {}).items():
                 if key in self.usage and type(amount) in (int, float) and math.isfinite(amount) and amount >= 0:
-                    totals[key] = totals.get(key, 0) + amount
+                    totals[key] = totals.get(key, 0) + amount - inherited.get(key, 0)
         incremental_usage = {}
         for key, total in totals.items():
             delta = total - self.foundry_usage.get(key, 0)
@@ -3694,13 +3777,7 @@ class ComposerRunner:
 
     def _route_unexecuted_experiment_to_survey(self, stage, context, error,
                                                reviewer_evidence=None):
-        """Resolve an admitted pilot's evidence deficit before repairing code.
-
-        A code-capability repair is not actionable when the current same-topic
-        survey explicitly admitted only an exploratory pilot for insufficient
-        evidence. Give Research one source-backed acquisition pass first; the
-        Methods repair remains deferred until the scientific input is usable.
-        """
+        """Route a material source-evidence deficit to the admitted survey."""
         if not self._is_pre_execution_capability_failure(stage, context, error):
             failure_text = error if error is not None else context.get("error")
             is_reproducible_harness_failure = (
@@ -3851,7 +3928,13 @@ class ComposerRunner:
                     item["text"].strip()[:1400] for item in directives
                     if isinstance(item, dict) and isinstance(item.get("text"), str)
                     and item["text"].strip())
+        if isinstance(retained_request, dict):
+            review_items.extend(
+                item["text"].strip()[:1400] for item in retained_request.get("review_directives", [])
+                if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip())
         review_items = list(dict.fromkeys(review_items))[:12]
+        if not review_items and getattr(error, "failure_class", None) != "evidence_input_unavailable":
+            return None
         topic_cycle = identity["topic_cycle"]
         survey_ref = survey_context.get("survey_ref")
         assessment_ref = survey_context.get("assessment_ref")

@@ -9678,6 +9678,25 @@ class ComposerWorkflowTests(unittest.TestCase):
             finally:
                 runner.close()
 
+    def test_technical_failure_does_not_reopen_an_exploratory_survey(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            stage = runner.workflow['stages'][1]
+            identity = {'topic_id': 'topic-1', 'topic_cycle': 0}
+            runner.context['topic'] = {'topic': {'id': 'topic-1', 'research_question': 'Frozen question'}}
+            runner.context['survey'] = {'gap_state': 'insufficient_evidence',
+                'topic_admission': 'exploratory_pilot', 'survey_current': True, 'assessment_current': True}
+            context = {'results_status': 'not_executed'}
+            with patch.object(runner, '_is_pre_execution_capability_failure', return_value=True), \
+                    patch.object(runner, '_request_context_matches_current_topic', return_value=True), \
+                    patch.object(runner, '_topic_stage_for_survey', return_value={'id': 'topic'}), \
+                    patch.object(runner, '_current_topic_identity', return_value=identity):
+                self.assertIsNone(runner._route_unexecuted_experiment_to_survey(
+                    stage, context, 'Validator output violates its response contract.'))
+            self.assertEqual(runner.active_research_requests, [])
+            self.assertEqual(context, {'results_status': 'not_executed'})
+
     def test_unexecuted_exploratory_pilot_repairs_survey_before_methods_code(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -10114,7 +10133,8 @@ class ComposerWorkflowTests(unittest.TestCase):
                     self.assertIsNone(runner._route_unexecuted_experiment_to_survey(
                         stage, context, "Estimator failed."))
                     changed = {**order, "success_condition": "Capture a newly requested control.",
-                               "repair_policy_revision": 0}
+                               "repair_policy_revision": 0, "review_directives": [{"text":
+                                   "The declared control has no source-traceable measurements."}]}
                     runner.active_research_requests = [changed]
                     routed = runner._route_unexecuted_experiment_to_survey(
                         stage, context, "Estimator failed.")
@@ -11059,6 +11079,47 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(resumed.usage["model_calls"], 3)
             self.assertEqual(resumed.usage["input_tokens"], 300)
             self.assertFalse(resumed._sync_foundry_usage())
+
+    def test_foundry_inheritance_correction_is_bound_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            source_body = {'assignment': {'question': 'fixed'}, 'requests': [{'role': 'author', 'status': 'succeeded'}],
+                           'usage': {'model_calls': 1, 'input_tokens': 10, 'output_tokens': 5}}
+            source = runner._publish('command/foundry-work/source', 'note', source_body, 'command.controller')
+            runner._sync_foundry_usage()
+            def checkpoint(name):
+                return runner._publish('command/composer/checkpoints/' + name, 'note', {
+                    'schema_version': 'composer-checkpoint-1', 'workflow_id': runner.workflow['id'],
+                    'usage': deepcopy(runner.usage), 'foundry_usage': deepcopy(runner.foundry_usage)}, 'command.composer')
+            before = checkpoint('before-copy')
+            target = runner._publish('command/foundry-work/target', 'note', source_body, 'command.controller')
+            runner._sync_foundry_usage()
+            after = checkpoint('after-copy')
+            current = deepcopy(source_body)
+            current['requests'].append({'role': 'validator', 'status': 'succeeded'})
+            current['usage']['model_calls'] = 2
+            runner._publish('command/foundry-work/target', 'note', current, 'command.controller')
+            runner._sync_foundry_usage()
+            proof = {'schema_version': 'foundry-usage-inheritance-correction-1',
+                     'source_ref': source['artifact_ref'], 'source_request_count': 1,
+                     'target_ref': target['artifact_ref'], 'before_checkpoint_ref': before['artifact_ref'],
+                     'after_checkpoint_ref': after['artifact_ref']}
+            runner._publish('command/foundry-usage-inheritance/target', 'note', proof, 'command.composer')
+            self.assertTrue(runner._reconcile_foundry_usage_inheritance())
+            self.assertEqual(runner.usage['model_calls'], 2)
+            self.assertEqual(runner.foundry_usage['model_calls'], 2)
+            self.assertFalse(runner._sync_foundry_usage())
+            self.assertFalse(runner._reconcile_foundry_usage_inheritance())
+            inherited = deepcopy(current)
+            inherited['usage_inheritance'] = {'source_ref': runner.store.head(
+                'command/foundry-work/target')['artifact_ref'], 'source_request_count': 2}
+            runner._publish('command/foundry-work/next', 'note', inherited, 'command.controller')
+            self.assertFalse(runner._sync_foundry_usage())
+            self.assertEqual(runner.usage['model_calls'], 2)
+            runner._publish('command/foundry-usage-inheritance/target', 'note', proof, 'command.composer')
+            with self.assertRaises(ValidationError):
+                runner._reconcile_foundry_usage_inheritance()
 
     def test_legacy_survey_resume_reads_immutable_runner_config(self):
         with tempfile.TemporaryDirectory() as path:
