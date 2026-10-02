@@ -5648,6 +5648,27 @@ class TestSurveyRunner(unittest.TestCase):
 
 
 class TestSurveyContracts(unittest.TestCase):
+    def test_map_normalizer_binds_positioned_relationship_evidence_without_digests(self):
+        texts = {'W101': 'The measured rate increased.', 'W102': 'The control rate stayed constant.'}
+        sources = [{'work_id': wid, 'source_ref': 'source-' + wid, 'text': text, 'representation': 'abstract'}
+                   for wid, text in texts.items()]
+        proofs = [{'work_id': row['work_id'], 'source_ref': row['source_ref'], 'quote': row['text'],
+                   'start': 0, 'end': len(row['text'])} for row in sources]
+        entry = {'work_id': 'W101', 'inclusion': 'included', 'reason': 'A measured comparison.',
+                 **{field: {'text': None, 'evidence': []} for field in MAP_FIELDS}}
+        value = {'entries': [entry], 'relationships': [{'source': 'W101', 'target': 'W102',
+            'kind': 'compares', 'claim': {'text': 'The reported rate responses differ.', 'evidence': proofs}}]}
+        normalized = normalize_map_worker_response(value, work_id='W101', all_work_ids=set(texts),
+            sources=sources, windows={})
+        self.assertEqual(len(normalized['relationships']), 1)
+        evidence = normalized['relationships'][0]['claim']['evidence']
+        for original, bound in zip(proofs, evidence):
+            self.assertEqual({key: bound[key] for key in original}, original)
+            self.assertIn('quote_sha256', bound)
+            self.assertNotIn('quote_sha256', original)
+        validate_map(normalized, ['W101'], set(texts),
+                     {row['source_ref']: row for row in sources}, require_spans=True)
+
     def test_operation_completion_is_separate_from_evidence_sufficiency(self):
         from scisaurus.runtime.survey_records import validate_follow_up_result, follow_up_completion_met
         from scisaurus.core.errors import ModelContractError

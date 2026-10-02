@@ -11,7 +11,8 @@ from scisaurus.core.schema import canonical_bytes
 
 
 LEGACY_EVIDENCE_FIELDS = {"work_id", "source_ref", "quote"}
-SPAN_EVIDENCE_FIELDS = {*LEGACY_EVIDENCE_FIELDS, "start", "end", "quote_sha256"}
+LOCATED_EVIDENCE_FIELDS = {*LEGACY_EVIDENCE_FIELDS, "start", "end"}
+SPAN_EVIDENCE_FIELDS = {*LOCATED_EVIDENCE_FIELDS, "quote_sha256"}
 
 
 def contains_legacy(value) -> bool:
@@ -269,6 +270,8 @@ def bind(value, sources: dict, *, windows: dict | None = None) -> dict:
     authoritative payload: when a span-shaped item does not reproduce it, discard
     only the stale locator and re-locate that exact quotation inside the pinned
     source window. A quotation that cannot be located uniquely still fails closed.
+    A positioned quotation without a digest is completed only after its supplied
+    character range and exact text validate inside the pinned source window.
     """
     value = deepcopy(value)
     windows = windows or {}
@@ -277,13 +280,20 @@ def bind(value, sources: dict, *, windows: dict | None = None) -> dict:
     def visit(item, path="$"):
         if isinstance(item, dict):
             fields = set(item)
-            if fields == LEGACY_EVIDENCE_FIELDS or fields == SPAN_EVIDENCE_FIELDS:
+            if fields in (LEGACY_EVIDENCE_FIELDS, LOCATED_EVIDENCE_FIELDS, SPAN_EVIDENCE_FIELDS):
                 source = sources.get(item.get("source_ref"))
                 if source is None or source.get("work_id") != item.get("work_id"):
                     errors.append(f"{path}: evidence identifies an unavailable source or different work")
                     return
                 try:
                     window = windows.get(item["source_ref"])
+                    if fields == LOCATED_EVIDENCE_FIELDS:
+                        try:
+                            item["quote_sha256"] = quote_sha256(item.get("quote"))
+                            validate(item, source, require_span=True, window=window)
+                        except ValidationError as exc:
+                            errors.append(f"{path}: {exc}")
+                        return
                     if fields == SPAN_EVIDENCE_FIELDS:
                         start, end = item.get("start"), item.get("end")
                         text = source.get("text")

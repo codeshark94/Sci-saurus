@@ -47,6 +47,12 @@ Each mapping task receives its own source windows and available abstracts for co
 
 The `literature-survey-3` bundle requires exactly one current passed focused review for every registered work and its outgoing relationships. It pins separate bibliographic identity records and their provider executions when present. The gate binds each actual review prompt to the exact stored entry and relationship bodies. Review source windows must be exact slices of pinned source captures with matching work identity, representation, and length, and every cited span must reproduce its quote and SHA-256 inside that window. A missing work, ambiguous or changed span, omitted relationship check, fabricated context, identity-input drift, or failed focused review blocks acceptance even when the global reviewer passes. Accepted `literature-survey-2` records remain readable; any remapping upgrades legacy quotations before a v3 bundle can be accepted.
 
+A model-supplied quotation with explicit character offsets may omit its digest.
+The binder computes SHA-256 from the exact quotation and validates the supplied
+range, source identity, work identity, and displayed window. It preserves those
+offsets and rejects mismatched or hidden spans rather than relocating them.
+Digest completion does not determine whether the quotation supports a claim.
+
 Survey acceptance also requires all three registered checks exactly once: `coverage-accounting`, `source-fidelity`, and `map-support`. Gap assessment requires `closest-prior-work`, `scope-comparability`, `counterevidence`, and `full-text-support`. Unknown, duplicated, omitted, or malformed checks cannot imply approval. Decisive gap states require every check to pass.
 
 Reviews bind the exact survey and recorded model response from a successful independent task attempt. The deterministic gate checks immutable artifact integrity, governing versions, and authoritative acceptance records. Gap nomination, targeted challenge, and final assessment recheck the current accepted survey immediately before worker dispatch. Survey and assessment commitment recheck current dependencies, capability applicability, and remaining time inside the adoption boundary. A new source, map, work, or other governing version invalidates the old survey's applicability.

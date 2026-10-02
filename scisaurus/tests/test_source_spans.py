@@ -66,6 +66,25 @@ class SourceSpanTests(unittest.TestCase):
                  **locate(source, "exact quotation")}
         self.assertEqual(bind(value, {"source": source}), value)
 
+    def test_bind_completes_a_digest_without_changing_a_supplied_span(self):
+        source = {"work_id": "W1", "text": "repeat then repeat"}
+        value = {"work_id": "W1", "source_ref": "source", "quote": "repeat", "start": 12, "end": 18}
+        bound = bind({"evidence": [value]}, {"source": source})['evidence'][0]
+        self.assertEqual({key: bound[key] for key in value}, value)
+        self.assertNotIn('quote_sha256', value)
+        validate(bound, source, require_span=True)
+        self.assertEqual(bind(bound, {"source": source}), bound)
+
+    def test_positioned_quote_without_digest_rejects_invalid_or_hidden_locators(self):
+        source = {"work_id": "W1", "text": "repeat then repeat"}
+        proof = {"work_id": "W1", "source_ref": "source", "quote": "repeat", "start": 0, "end": 6}
+        for invalid in ({**proof, 'end': 5}, {**proof, 'start': True}, {**proof, 'quote': 'changed'},
+                        {**proof, 'work_id': 'W2'}, {**proof, 'source_ref': 'unavailable'}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
+                bind(invalid, {"source": source})
+        with self.assertRaisesRegex(ValidationError, 'outside'):
+            bind(proof, {"source": source}, windows={'source': {'start': 12, 'end': 18}})
+
     def test_bind_reports_every_invalid_quote_location_for_targeted_repair(self):
         source = {"work_id": "W1", "text": "alpha beta gamma"}
         value = {"first": {"work_id": "W1", "source_ref": "source", "quote": "missing one"},
