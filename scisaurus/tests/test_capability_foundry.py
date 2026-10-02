@@ -22,6 +22,7 @@ from scisaurus.runtime.capability_foundry import (
     SourceDataUnavailable, _is_repeated_repair_failure, _sandbox_failure_signature,
     _program_gate_failure_signature,
     _authored_candidate_sha256, _candidate_bound_value, _source_patch_context,
+    _author_requested_candidate,
     _retained_candidate_failure,
     _repair_scientific_input,
     _author_response_format_failure_signature,
@@ -2553,6 +2554,70 @@ class CapabilityFoundryTests(unittest.TestCase):
             self.assertEqual(final["usage"]["model_calls"], 3)
             self.assertNotEqual(final["usage"].get("input_tokens"), 900)
             self.assertIn("candidate_seed_ref", final)
+
+    def test_new_unrequested_repair_subject_retains_history_but_receives_author_attempt(self):
+        previous = self._payload()
+        previous["experiment_intent"]["unexpected"] = True
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            cache = self._cache(root)
+            cache.put("exhausted-prior-subject", {"status": "blocked", "attempts": 10,
+                "assignment": {"capability_brief": "bounded comparison", "configured_input": {"probe": True}},
+                "last_attempt": previous, "feedback": "remove unexpected field",
+                "repair_subject_attempt_offset": 0, "usage": {"model_calls": 9},
+                "repair_ledger": [{"attempt": 10, "gate": "author_response_contract"}],
+                "requests": [{"role": "research.experiment-author", "status": "succeeded",
+                              "prompt": json.dumps({"candidate_sha256": _authored_candidate_sha256(self._payload())})}]})
+            author = StubClient({"updates": {"experiment_intent": {"unexpected": None}}})
+            foundry = self._foundry(root)
+            foundry.max_attempts = 2
+            states = []
+            result = foundry.generate("bounded comparison", client=author, work_cache=cache,
+                on_progress=lambda phase, state: states.append(state))
+            self.assertEqual(result["status"], "registered")
+            self.assertEqual(author.calls, 1)
+            self.assertEqual(states[-1]["attempts"], 11)
+            self.assertEqual(states[-1]["repair_subject_attempt_offset"], 10)
+            self.assertEqual(states[-1]["repair_subject_attempt_limit"], 12)
+            self.assertEqual(states[-1]["repair_ledger"][0]["attempt"], 10)
+            self.assertEqual(states[-1]["candidate_seed_ref"].split("@")[0],
+                             "artifact:command/foundry-work/exhausted-prior-subject")
+
+    def test_existing_repair_subject_retains_absolute_limit_after_policy_change(self):
+        previous = self._payload()
+        previous["experiment_intent"]["unexpected"] = True
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            cache = self._cache(root)
+            cache.put("exhausted-owned-subject", {"status": "blocked", "attempts": 10,
+                "assignment": {"capability_brief": "bounded comparison", "configured_input": {"probe": True}},
+                "last_attempt": previous, "feedback": "remove unexpected field",
+                "repair_subject_sha256": _authored_candidate_sha256(previous),
+                "repair_subject_attempt_offset": 8, "repair_subject_attempt_limit": 10})
+            author = StubClient({"updates": {"experiment_intent": {"unexpected": None}}})
+            foundry = self._foundry(root)
+            foundry.max_attempts = 4
+            states = []
+            with self.assertRaises(ModelWorkBlocked):
+                foundry.generate("bounded comparison", client=author, work_cache=cache,
+                    on_progress=lambda phase, state: states.append(state))
+            self.assertEqual(author.calls, 0)
+            self.assertEqual(states[-1]["attempts"], 10)
+            self.assertEqual(states[-1]["repair_subject_attempt_limit"], 10)
+
+    def test_repair_subject_attribution_uses_dispatched_request_identity(self):
+        candidate = self._payload()
+        request = {"role": "research.experiment-author", "request_signature": "recorded",
+                   "prompt": json.dumps({"repair_request": {"previous_attempt": candidate}})}
+        for status in ("succeeded", "failed", "result_unknown"):
+            with self.subTest(status=status):
+                self.assertTrue(_author_requested_candidate([{**request, "status": status}], candidate))
+        for status in ("provider_rate_limited", "cooldown_not_dispatched"):
+            with self.subTest(status=status):
+                self.assertFalse(_author_requested_candidate([{**request, "status": status}], candidate))
+        self.assertFalse(_author_requested_candidate([request], {}))
+        invalid = {**request, "prompt": json.dumps({"repair_request": {"previous_attempt": {}}})}
+        self.assertFalse(_author_requested_candidate([invalid], {}))
 
     def test_changed_scientific_repair_input_does_not_seed_prior_candidate(self):
         order = {"kind": "analysis_repair", "objective": "Old contrast",

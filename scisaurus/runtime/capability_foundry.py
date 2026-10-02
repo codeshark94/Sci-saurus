@@ -416,6 +416,28 @@ def _is_repeated_repair_failure(error, failures, failure_signatures,
                 and failure_signature in failure_signatures))
 
 
+def _author_requested_candidate(requests, candidate):
+    """Identify an already dispatched repair against the exact authored source."""
+    fingerprint = _authored_candidate_sha256(candidate)
+    if fingerprint is None:
+        return False
+    for request in requests:
+        if _author_request_signature_from_record(request) is None:
+            continue
+        try:
+            prompt = json.loads(request.get("prompt", ""))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(prompt, dict):
+            continue
+        if _repair_request_matches_candidate(prompt, candidate):
+            return True
+        previous = prompt.get("repair_request", {}).get("previous_attempt") if isinstance(prompt.get("repair_request"), dict) else None
+        if isinstance(previous, dict) and _authored_candidate_sha256(previous) == fingerprint:
+            return True
+    return False
+
+
 def _author_response_format_failure_signature(envelope, finish_reason, route_index=0):
     """Deduplicate malformed responses per route, not across independent models."""
     failure = ("invalid_json" if envelope is None
@@ -2354,6 +2376,19 @@ class CapabilityFoundry:
                                  candidate_seed_ref=prior["cache_ref"])
                     if type(prior.get("attempts")) is int and prior["attempts"] >= 0:
                         state["attempts"] = prior["attempts"]
+                    offset = prior.get("repair_subject_attempt_offset", 0)
+                    offset = offset if type(offset) is int and 0 <= offset <= state["attempts"] else 0
+                    prior_author_requests = [request for _, rows, _ in reusable_prior for request in rows]
+                    subject = _authored_candidate_sha256(candidate)
+                    new_subject = (prior.get("repair_subject_sha256") != subject
+                                   and not _author_requested_candidate(prior_author_requests, candidate))
+                    if new_subject:
+                        offset = state["attempts"]
+                    state["repair_subject_sha256"] = subject
+                    state["repair_subject_attempt_offset"] = offset
+                    prior_limit = prior.get("repair_subject_attempt_limit")
+                    if not new_subject and type(prior_limit) is int and prior_limit >= offset:
+                        state["repair_subject_attempt_limit"] = prior_limit
                     prior_failure = _retained_candidate_failure(prior, candidate)
                     if prior_failure:
                         state["candidate_failure"] = prior_failure
@@ -3700,7 +3735,14 @@ class CapabilityFoundry:
         last_attempt = state.get("last_attempt")
         buffered = ModelResult(**state["last_response"]) if state["status"] == "response_received" else None
         first_attempt = state["attempts"] - (1 if buffered else 0)
-        author_attempt_limit = self.max_attempts + max(0, len(author_route_configs) - 1)
+        subject_offset = state.get("repair_subject_attempt_offset", 0)
+        subject_offset = subject_offset if type(subject_offset) is int and 0 <= subject_offset <= state["attempts"] else 0
+        author_attempt_limit = state.get("repair_subject_attempt_limit")
+        if type(author_attempt_limit) is not int or author_attempt_limit < subject_offset:
+            author_attempt_limit = subject_offset + self.max_attempts + max(0, len(author_route_configs) - 1)
+        if state.get("repair_subject_sha256"):
+            state["repair_subject_attempt_limit"] = author_attempt_limit
+            save("author_repair_subject_retained")
         for attempt in range(first_attempt, author_attempt_limit):
             attempt_feedback = feedback
             format_repair = state.get("format_repair")
