@@ -22969,10 +22969,9 @@ class ComposerRunner:
                 "research_review": deepcopy(error.research_review),
                 "model_diagnostics": deepcopy(error.model_diagnostics),
             }
-            attempt_number = max((value for value in (
-                record.get("attempt_count"), latest.get("attempt_number"),
-                context.get("attempt_number"))
-                if type(value) is int and value >= 0), default=0) + 1
+            attempt_number = latest.get("attempt_number")
+            if type(attempt_number) is not int or attempt_number < 1:
+                continue
             dossier = self._record_failure_recovery(
                 stage, dict(latest), error, error.stage_result,
                 {"reports": []}, None, attempt_number,
@@ -23008,7 +23007,9 @@ class ComposerRunner:
                 reason="current-topic scientific findings superseded format-only retry")
             if retired:
                 self.organization_snapshot = deepcopy(self.departments.snapshot())
+            latest["failure_dossier_ref"] = dossier.get("artifact_ref")
             record.update({
+                "attempt_number": attempt_number,
                 "status": "research_expansion_required",
                 "error": str(error), "failure_class": "experiment_failure",
                 "failure_dossier_ref": repaired.get("failure_dossier_ref"),

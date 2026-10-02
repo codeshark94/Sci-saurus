@@ -2653,6 +2653,44 @@ class ComposerWorkflowTests(unittest.TestCase):
                         rejected_projection = runner._specialist_experiment_projection(stage, {}, bad)
                     self.assertFalse(rejected_projection["failure_evidence"]["current_foundry_failure"]["available"])
                     self.assertNotIn("failure_dossier", rejected_projection["failure_evidence"])
+            resume_work = deepcopy(current_work)
+            resume_work["validation_feedback"]["gate"] = "adversarial_review"
+            resume_work["validation_feedback"]["findings"] = [{"severity": "blocking", "finding": "Selection is not supported.",
+                "evidence": "Recorded selector rejects the full grid.", "required_change": "Reconcile selection against raw rows."}]
+            resume_work["last_failure_gate"] = "adversarial_review"
+            resumed_result = current_result(resume_work)
+            current_ref = resumed_result["repair_feedback"]["foundry_work_ref"]
+            current_manifest = runner.store.get(current_ref)
+            linked_snapshot = {"cache_ref": current_ref, "last_attempt": {**resume_work["last_attempt"],
+                "source_integrity": {name: {"sha256": hashlib.sha256(resume_work["last_attempt"][name + "_source"].encode()).hexdigest()}
+                                     for name in ("executor", "validator")}}, **selected, "topic_id": selected["id"]}
+            resume_projection = {"status": "repairing", "cache_ref": current_ref,
+                "cache_body_sha256": current_manifest["body_hash"], "cache_body_verified": True,
+                "feedback": "Current selection rejected", "validation_feedback": resume_work["validation_feedback"]}
+            latest = {"attempt_id": "interrupted-49", "attempt_number": 49, "state": "unknown",
+                "topic_id": selected["id"], "topic_cycle": 1}
+            runner.tasks.create("current-owner-task", "production", {}, "command.composer")
+            runner.tasks.transition("current-owner-task", "queued", "command.composer")
+            runner.tasks.start_attempt("current-owner-task", latest["attempt_id"],
+                owner="command.composer", lease_ttl_seconds=60, payload={"stage_id": stage["id"]})
+            runner.stage_records[stage["id"]] = {"attempt_count": 49, "attempts": [latest]}
+            runner.context[stage["id"]] = {"attempt_number": 49, "topic_id": selected["id"], "topic_cycle": 1}
+            with patch.object(runner, "_topic_context_for_stage", return_value=("topic", {"topic": selected})), \
+                    patch.object(runner, "_latest_foundry_failure_projection", return_value=resume_projection), \
+                    patch.object(runner, "_failed_foundry_work_for_stage", return_value=linked_snapshot), \
+                    patch.object(runner, "_failure_program_snapshot", return_value=[]):
+                self.assertEqual(len(runner._reconcile_interrupted_foundry_rejection({stage["id"]: stage})), 1)
+                resumed = runner.context[stage["id"]]
+                hydrated = runner._failure_dossier_evidence(resumed["failure_dossier_ref"],
+                    expected_stage_id=stage["id"], expected_attempt_number=49)
+                self.assertTrue(hydrated["available"], hydrated)
+                self.assertEqual(hydrated["foundry_execution_evidence"], evidence)
+                packet = runner._build_capability_repair_packet(stage, {"topic": selected}, resumed, "Current selection rejected")
+                self.assertEqual(packet["foundry_execution_evidence"], evidence)
+                self.assertTrue(packet["exact_candidate_sources"]["validator"]["available"])
+                self.assertEqual(packet["prior_foundry_work"]["cache_ref"], current_ref)
+                self.assertTrue(packet["failure_lineage"]["identity_verified"])
+                self.assertEqual(latest["state"], "unknown")
             for alteration in ("input", "candidate", "source", "object", "mode", "stdin_array", "output_array", "verdict_array"):
                 with self.subTest(alteration=alteration):
                     changed = deepcopy(work)
@@ -5882,6 +5920,10 @@ class ComposerWorkflowTests(unittest.TestCase):
                     "project_dir": str(root / "experiment" / "attempts" / "attempt-510"),
                     "topic_id": "direction_3", "topic_cycle": 819,
                 }
+                runner.tasks.create("interrupted-owner-task", "production", {}, "command.composer")
+                runner.tasks.transition("interrupted-owner-task", "queued", "command.composer")
+                runner.tasks.start_attempt("interrupted-owner-task", latest["attempt_id"],
+                    owner="command.composer", lease_ttl_seconds=60, payload={"stage_id": stage["id"]})
                 runner.stage_records["experiment"] = {
                     "kind": "experiment", "status": "retrying", "attempt_count": 514,
                     "attempts": [unresolved, latest],
@@ -5925,6 +5967,16 @@ class ComposerWorkflowTests(unittest.TestCase):
                 self.assertEqual(context["failure_class"], "experiment_failure")
                 self.assertEqual(context["topic_id"], "direction_3")
                 self.assertEqual(context["topic_cycle"], 819)
+                owned_ref = context["failure_dossier_ref"]
+                manifest, _, owned = runner._read_verified_artifact_json(owned_ref)
+                self.assertEqual(owned["attempt_number"], latest["attempt_number"])
+                self.assertEqual(latest["failure_dossier_ref"], owned_ref)
+                self.assertEqual(runner.stage_records["experiment"]["attempt_count"], 514)
+                self.assertEqual(runner.stage_records["experiment"]["attempt_number"], 514)
+                hydrated = runner._failure_dossier_evidence(owned_ref,
+                    expected_stage_id="experiment", expected_attempt_number=514)
+                self.assertTrue(hydrated["available"], hydrated)
+                self.assertEqual(latest["state"], "unknown")
                 self.assertEqual(
                     {item["attempt_id"] for item in context["unresolved_prior_attempts"]},
                     {unresolved["attempt_id"], latest["attempt_id"]},
