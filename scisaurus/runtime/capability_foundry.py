@@ -201,11 +201,17 @@ REVIEW_SYSTEM = (
     "Correctly computed constant or null results are not defects by themselves. Independent validation "
     "may recalculate declared outcomes from recorded observations; do not require a second full simulation "
     "merely because observations are shared. Inspect the measurement code separately for mathematical defects. "
+    "Require a justified mapping between the model and the research question: distinguish sourced equations "
+    "and coefficients from declared design assumptions, and reject unsupported physical interpretation. "
+    "Check applicable numerical convergence, settling, analytic limits and boundary/censoring conventions. "
+    "Controls, sensitivity and uncertainty must be supported by computed evidence or a justified analytical "
+    "calculation; a label, fixed detection threshold or description of an unperformed analysis is insufficient. "
     "A correctly labelled limited or negative exploratory result may pass. Return only the requested JSON, "
     "with concise evidence and at most three decisive findings; do not write extended derivations."
 )
 PROGRAM_REVIEW_CHECKS = {"method_implementation", "estimator_definedness",
-                         "independent_validation", "claim_support"}
+                         "independent_validation", "claim_support", "model_applicability",
+                         "numerical_validation", "analysis_evidence"}
 
 ATTEMPT_FIELDS = {"executor_source", "validator_source", "experiment_intent"}
 PRODUCER_FIELDS = {"executor_source", "experiment_intent"}
@@ -2174,7 +2180,10 @@ class CapabilityFoundry:
                     if prior.get("assignment") == base_prompt:
                         response = prior.get("last_response")
                         requests = prior.get("requests", [])
-                        last_request = requests[-1] if requests else None
+                        author_requests = [request for request in requests
+                                           if isinstance(request, dict)
+                                           and request.get("role", author_role) == author_role]
+                        last_request = author_requests[-1] if author_requests else None
                         prior_route_index = prior.get("author_route_index", 0)
                         if not isinstance(last_request, dict):
                             last_request = {}
@@ -2197,7 +2206,9 @@ class CapabilityFoundry:
                                 isinstance(response, dict)
                                 and isinstance(response.get("text"), str)
                                 and response["text"]
-                                and response.get("finish_reason") == "length"
+                                and (response.get("finish_reason") == "length"
+                                     or (response.get("finish_reason") == "stop"
+                                         and prior.get("status") == "response_received"))
                                 and isinstance(last_request, dict)
                                 and last_request.get("role", author_role) == author_role
                                 and last_request.get("status") == "succeeded"
@@ -3150,7 +3161,9 @@ class CapabilityFoundry:
                 state, state.get("validation_feedback"))
             identity = hashlib.sha256(canonical_bytes(candidate)).hexdigest()
             reviews = state.setdefault("scientific_reviews", {})
-            retained = reviews.setdefault(identity, {"status": "pending", "responses": []})
+            review_scope = hashlib.sha256(canonical_bytes(sorted(PROGRAM_REVIEW_CHECKS))).hexdigest()
+            retained = reviews.setdefault(identity + ":" + review_scope,
+                                          {"status": "pending", "responses": []})
             responses = retained.setdefault("responses", [retained["result"]] if retained.get("result") else [])
             if retained["status"] in {
                     "calling", "result_unknown", "provider_rate_limited"}:
@@ -3208,7 +3221,8 @@ class CapabilityFoundry:
                 ]
                 save("scientific_review_completed")
                 return {**review, "review_method": "independent_model", "role": "review.methods",
-                        "model": result.model, "candidate_sha256": identity}
+                        "model": result.model, "candidate_sha256": identity,
+                        "prior_blocking_issues": deepcopy_config(prior_blocking_issues)}
 
         def call_reviewer(candidate, document, identity, retained, review_attempt,
                           prior_blocking_issues):
@@ -3227,6 +3241,9 @@ class CapabilityFoundry:
                 "executor_source": candidate["executor_source"],
                 "validator_source": candidate["validator_source"],
                 "observed_data": program_failure_context(document),
+                "raw_observation_sample": document["observations"][:24],
+                "raw_observation_sample_complete": len(document["observations"]) <= 24,
+                "analysis": document.get("analysis", {}),
                 "prior_blocking_issues": prior_blocking_issues,
                 "findings": document["findings"], "limitations": document["limitations"],
                 "output_contract": {"status": "admitted|rejected",
@@ -3310,6 +3327,10 @@ class CapabilityFoundry:
                         if role not in model.get("role_models", {}):
                             review_config = resolve_model_config(model, role="review.methods")
                             model.setdefault("role_models", {})[role] = review_config
+                        alternatives = model.get("role_model_fallbacks", {}).get(
+                            role, model.get("role_model_fallbacks", {}).get("review.methods", []))
+                        if retained.get("error") and alternatives:
+                            model.setdefault("role_models", {})[role] = alternatives[0]
                         config = self._model_config_for_role(role, self.author_max_output_tokens, model_config=model)
                         validator_client = ModelClient(**config)
                     request = {"role": "methods.validator-author", "assignment_sha256": identity,
@@ -3387,6 +3408,12 @@ class CapabilityFoundry:
         if state["status"] == "blocked":
             raise repair_exhausted_error()
         if state["status"] == "succeeded":
+            review = state["outcome"]["admission"].get("adversarial_review", {})
+            current_review = validate_program_review({
+                key: review.get(key) for key in ("status", "checks", "findings")},
+                prior_blocking_issues=review.get("prior_blocking_issues"))
+            if current_review["status"] != "admitted":
+                raise ValidationError("retained capability requires admission under the current scientific review contract")
             descriptor = Path(state["outcome"]["registration"]["descriptor_path"])
             if (not descriptor.is_file() or hashlib.sha256(descriptor.read_bytes()).hexdigest()
                     != state["descriptor_sha256"]):

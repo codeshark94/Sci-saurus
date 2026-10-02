@@ -13202,7 +13202,8 @@ class ComposerRunner:
                         continue
                 try:
                     valid_verdict = validate_program_review({
-                        name: review.get(name) for name in ("status", "checks", "findings")})["status"] == "admitted"
+                        name: review.get(name) for name in ("status", "checks", "findings")},
+                        prior_blocking_issues=review.get("prior_blocking_issues"))["status"] == "admitted"
                 except ValidationError:
                     valid_verdict = False
                 if (not valid_verdict or review.get("role") != "review.methods"

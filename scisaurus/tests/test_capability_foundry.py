@@ -34,7 +34,7 @@ from scisaurus.runtime.capability_foundry import (
     _validate_source_data_manifest, _validate_source_observation_binding,
     _model_route_identity,
     apply_authoring_patch, authoring_patch_prompt, normalize_capability_candidate,
-    program_failure_context, candidate_prompt, PROGRAM_REVIEW_CHECKS,
+    program_failure_context, candidate_prompt, PROGRAM_REVIEW_CHECKS, validate_program_review,
 )
 from unittest.mock import patch
 from scisaurus.runtime.capability_registry import load_registry
@@ -3803,6 +3803,68 @@ if __name__ == "__main__":
 
 
 class IndependentValidatorAuthorshipTests(unittest.TestCase):
+    def test_repaired_approval_retains_prior_issue_contract_on_cached_reuse(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            cache = CapabilityFoundryTests._cache(self, root)
+            payload = CapabilityFoundryTests._payload()
+            class Author:
+                calls = 0
+                def complete(inner, *, system, prompt):
+                    inner.calls += 1
+                    value = payload if inner.calls == 1 else {'updates': {'executor_source': {
+                        'edits': [{'old': 'import json', 'new': 'import json\n'}]}}}
+                    return ModelResult(json.dumps(value), 'producer', {'model_calls': 1}, 0, 'stop')
+            class Reviewer:
+                calls = 0
+                def complete(inner, *, system, prompt):
+                    inner.calls += 1
+                    value = CapabilityFoundryTests._review_payload()
+                    if inner.calls == 1:
+                        value['status'] = 'rejected'
+                        value['checks'][0]['outcome'] = 'failed'
+                        value['findings'] = [{'severity': 'blocking', 'finding': 'source formatting',
+                            'evidence': 'import layout', 'required_change': 'separate import section'}]
+                    value = _add_prior_review_checks(value, prompt)
+                    return ModelResult(json.dumps(value), 'reviewer', {'model_calls': 1}, 0, 'stop')
+            author = Author()
+            reviewer = Reviewer()
+            foundry.reviewer_client = reviewer
+            first = foundry.generate('bounded comparison', client=author, work_cache=cache)
+            second = foundry.generate('bounded comparison', client=author, work_cache=cache)
+            self.assertEqual(first, second)
+            self.assertTrue(first['admission']['adversarial_review']['prior_blocking_issues'])
+            self.assertEqual((author.calls, reviewer.calls), (2, 2))
+
+    def test_contract_change_preserves_complete_producer_and_blind_responses(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            author = StubClient(CapabilityFoundryTests._payload())
+            author.model = 'stub'
+            cache = CapabilityFoundryTests._cache(self, root)
+            def captured_response(phase, state):
+                if phase == 'independent_validator_response':
+                    raise CapabilityDeadlineError('captured response boundary')
+            with self.assertRaises(CapabilityDeadlineError):
+                foundry.generate('bounded comparison', client=author, work_cache=cache,
+                                 on_progress=captured_response)
+            original_key = cache.key
+            def new_contract_key(**kwargs):
+                return hashlib.sha256((original_key(**kwargs) + ':new-contract').encode()).hexdigest()
+            with patch.object(cache, 'key', side_effect=new_contract_key):
+                outcome = foundry.generate('bounded comparison', client=author, work_cache=cache)
+            self.assertEqual(outcome['status'], 'registered')
+            self.assertEqual((author.calls, foundry.validator_client.calls), (1, 1))
+
+    def test_old_arithmetic_review_cannot_omit_substantive_science_checks(self):
+        value = {'status': 'admitted', 'findings': [], 'checks': [
+            {'id': name, 'outcome': 'passed', 'evidence': 'recalculated'} for name in
+            ['method_implementation', 'estimator_definedness', 'independent_validation', 'claim_support']]}
+        with self.assertRaises(ValidationError):
+            validate_program_review(value)
+
     def test_missing_intent_repair_retains_two_field_producer_executor(self):
         with tempfile.TemporaryDirectory() as path:
             foundry = CapabilityFoundryTests._foundry(Path(path))
@@ -3843,6 +3905,16 @@ class IndependentValidatorAuthorshipTests(unittest.TestCase):
                 self.assertEqual(packet['observation_schema'][0]['replicate'], 'int')
                 return original(system=system, prompt=prompt)
             independent.complete = complete
+            reviewer = foundry.reviewer_client
+            original_review = reviewer.complete
+            def review_complete(*, system, prompt):
+                packet = json.loads(prompt)
+                self.assertIn('analysis', packet)
+                self.assertTrue(packet['raw_observation_sample'])
+                self.assertIn('model_applicability', {
+                    check['id'] for check in packet['output_contract']['checks']})
+                return original_review(system=system, prompt=prompt)
+            reviewer.complete = review_complete
             cache = CapabilityFoundryTests._cache(self, Path(path))
             first = foundry.generate('bounded comparison', client=author, work_cache=cache)
             second = foundry.generate('bounded comparison', client=author, work_cache=cache)

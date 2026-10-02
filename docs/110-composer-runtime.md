@@ -234,6 +234,11 @@ the complete executor and validator source against the declared method, observed
 metrics and input variation. Arithmetic agreement alone cannot approve a
 scientifically invalid estimator. Its verdict and usage are retained against the
 exact candidate hash; rejection returns concrete corrections to the author.
+Required review checks separately assess model applicability, numerical validation
+and calculated analysis evidence. The reviewer receives the analysis records and
+a labelled raw-observation sample alongside both sources. A threshold labelled
+as uncertainty or prose describing an unperformed sensitivity analysis does not
+satisfy these checks. Cached reviews are scoped to the required check set.
 Malformed or truncated review responses permit one format repair using a
 configured alternative when available, without echoing unfinished reasoning.
 Valid rejections never trigger model substitution. The repair allowance and
