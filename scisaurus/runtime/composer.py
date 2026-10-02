@@ -14620,7 +14620,7 @@ class ComposerRunner:
         """Replay the immutable owner of a stopped supervisor projection."""
         restored = self._restored_execution_frontier
         if (not isinstance(restored, dict) or restored.get("cycle") != self.continuation_cycles
-                or restored.get("status") not in {"paused", "blocked"}):
+                or restored.get("status") not in STAGE_READY_STATUSES | STAGE_HOLD_STATUSES | {"paused", "blocked"}):
             raise StateError("survey review recovery requires a restored stopped execution frontier")
         row = self.control._conn.execute(
             "SELECT artifact_ref FROM artifacts WHERE body_hash=? ORDER BY created_at DESC LIMIT 1",

@@ -658,6 +658,26 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(second.deadline_epoch, deadline)
             self.assertEqual(current["follow_up_result"], native["follow_up_result"])
 
+    def test_review_revalidation_accepts_immutable_review_candidates_without_a_pause_roundtrip(self):
+        for status in ("candidate_needs_review", "research_expansion_required", "review_rejected", "completed", "running"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as path:
+                runner, stage, native = self._owned_held_survey_review(Path(path))
+                workflow = deepcopy(runner.workflow); before = deepcopy(runner.usage)
+                runner.status = status; runner._checkpoint("review_boundary", force=True); runner.close()
+                runner = ComposerRunner(workflow, resume=True, stop_after_stage="survey"); self.addCleanup(runner.close)
+                with patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient), \
+                     patch.object(runner, "_survey_references_are_current", return_value=True), \
+                     patch.object(runner, "_survey_follow_up_was_replayed", return_value=True):
+                    if status == "running":
+                        with self.assertRaisesRegex(StateError, "restored stopped execution frontier"):
+                            runner.revalidate_stage_review(stage["id"])
+                        self.assertEqual(runner.usage, before)
+                    else:
+                        current = runner.revalidate_stage_review(stage["id"])
+                        self.assertEqual(current["status"], "completed")
+                        self.assertEqual(runner.usage["model_calls"], before["model_calls"] + 1)
+                        self.assertEqual(current["follow_up_result"], native["follow_up_result"])
+
     def test_completed_review_is_retained_when_only_instruction_wording_changes(self):
         with tempfile.TemporaryDirectory() as path:
             runner, stage, _ = self._owned_held_survey_review(Path(path))
