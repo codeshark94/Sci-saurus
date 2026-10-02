@@ -34,11 +34,11 @@ from scisaurus.runtime.capability_foundry import (
     _validate_source_data_manifest, _validate_source_observation_binding,
     _model_route_identity,
     apply_authoring_patch, authoring_patch_prompt, normalize_capability_candidate,
-    program_failure_context, candidate_prompt, PROGRAM_REVIEW_CHECKS, validate_program_review,
+    program_failure_context, program_review_evidence, candidate_prompt, PROGRAM_REVIEW_CHECKS, validate_program_review,
 )
 from unittest.mock import patch
 from scisaurus.runtime.capability_registry import load_registry
-from scisaurus.runtime.experiment import ExperimentRunner
+from scisaurus.runtime.experiment import ExperimentRunner, validate_program_output
 from scisaurus.runtime.experiment_config import ExperimentWorkOrderContractError
 from scisaurus.runtime.models import ModelCallError, ModelResult
 from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
@@ -2694,6 +2694,73 @@ class CapabilityFoundryTests(unittest.TestCase):
             self.assertEqual(author.calls, 1)
             self.assertEqual(foundry.reviewer_client.calls, 1)
             self.assertEqual(cache.entries()[0]["usage"]["model_calls"], 3)
+
+    def test_review_receives_complete_candidate_bound_recalculation_and_observations(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            author = StubClient(self._payload())
+            reviewer = foundry.reviewer_client
+            complete = reviewer.complete
+            packets = []
+            def inspect(**kwargs):
+                packets.append(json.loads(kwargs["prompt"]))
+                return complete(**kwargs)
+            reviewer.complete = inspect
+            cache = self._cache(root)
+            result = foundry.generate("bounded comparison", client=author,
+                                     test_input={"probe": True}, work_cache=cache)
+            packet = packets[0]
+            evidence = packet["execution_evidence"]
+            execution = next(item for item in cache.entries()[0]["sandbox_executions"]
+                             if item["operation"] == "executor_replay")
+            document = validate_program_output(json.loads(
+                cache.store.read_body(execution["stdout_sha256"])),
+                result["candidate"]["experiment_intent"])
+            self.assertEqual(evidence["raw_observations"], document["observations"])
+            self.assertTrue(evidence["raw_observations_complete"])
+            self.assertEqual(evidence["reported_metrics"], document["metrics"])
+            self.assertEqual(evidence["configured_input"], {"probe": True})
+            digest = hashlib.sha256(canonical_bytes(document)).hexdigest()
+            self.assertEqual(evidence["candidate_sha256"], digest)
+            self.assertEqual(evidence["independent_validation"]["candidate_sha256"], digest)
+            self.assertEqual(evidence["independent_validation"]["decision"], "accepted")
+            self.assertEqual(evidence["executor_source_sha256"],
+                hashlib.sha256(packet["executor_source"].encode()).hexdigest())
+            self.assertEqual(evidence["validator_source_sha256"],
+                hashlib.sha256(packet["validator_source"].encode()).hexdigest())
+            changed = deepcopy(evidence["independent_validation"])
+            changed["candidate_sha256"] = "0" * 64
+            with self.assertRaises(ValidationError):
+                program_review_evidence(result["candidate"], document, changed)
+
+    def test_review_cache_without_execution_evidence_is_not_reused_on_resume(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            author = StubClient(self._payload())
+            cache = self._cache(root)
+            def interrupt(phase, state):
+                if phase == "scientific_review_response":
+                    raise KeyboardInterrupt()
+            with self.assertRaises(KeyboardInterrupt):
+                foundry.generate("bounded comparison", client=author,
+                                 work_cache=cache, on_progress=interrupt)
+            entry = cache.entries()[0]
+            key, retained = next(iter(entry["scientific_reviews"].items()))
+            old_scope = hashlib.sha256(canonical_bytes(sorted(PROGRAM_REVIEW_CHECKS))).hexdigest()
+            entry["scientific_reviews"] = {key.split(":")[0] + ":" + old_scope: retained}
+            cache.put(entry["cache_ref"].rsplit("/", 1)[-1].split("@")[0], entry)
+            result = foundry.generate("bounded comparison", client=author, work_cache=cache)
+            self.assertEqual(result["status"], "registered")
+            self.assertEqual(author.calls, 1)
+            self.assertEqual(foundry.reviewer_client.calls, 2)
+
+    def test_review_schema_error_identifies_echoed_input_fields(self):
+        review = self._review_payload() | {"analysis": {}, "assignment": "review"}
+        with self.assertRaisesRegex(ValidationError,
+                r"unexpected=\['analysis', 'assignment'\]"):
+            validate_program_review(review)
 
     def test_late_scientific_verdict_is_retained_but_not_registered(self):
         with tempfile.TemporaryDirectory() as path:

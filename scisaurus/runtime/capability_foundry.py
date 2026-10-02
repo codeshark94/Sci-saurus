@@ -53,6 +53,7 @@ from scisaurus.runtime.program_admission import (
     validate_program_candidate,
 )
 from scisaurus.runtime.program_gates import (ProgramGateRejected, admit_program_candidate,
+                                            program_validator_configured_input,
                                             validate_validator_readiness,
                                             validator_readiness_contract)
 from scisaurus.runtime.program_sandbox import run_sandboxed, sandbox_status
@@ -1841,6 +1842,23 @@ def program_failure_context(document):
                         for item in metrics[:24] if isinstance(item, dict)]}
 
 
+def program_review_evidence(candidate, document, verdict):
+    digest = hashlib.sha256(canonical_bytes(document)).hexdigest()
+    validate_deterministic_validation(verdict, candidate["experiment_intent"], digest)
+    bind_deterministic_validation(verdict, document, candidate["experiment_intent"])
+    return {
+        "schema_version": "program-review-evidence-1",
+        "candidate_sha256": digest,
+        "executor_source_sha256": hashlib.sha256(candidate["executor_source"].encode()).hexdigest(),
+        "validator_source_sha256": hashlib.sha256(candidate["validator_source"].encode()).hexdigest(),
+        "configured_input": deepcopy_config(program_validator_configured_input(candidate)),
+        "raw_observations": deepcopy_config(document["observations"]),
+        "raw_observations_complete": True,
+        "reported_metrics": deepcopy_config(document["metrics"]),
+        "independent_validation": deepcopy_config(verdict),
+    }
+
+
 def validate_program_review(value, *, prior_blocking_issues=None):
     prior_blocking_issues = (
         prior_blocking_issues if isinstance(prior_blocking_issues, list) else [])
@@ -1850,9 +1868,14 @@ def validate_program_review(value, *, prior_blocking_issues=None):
     }
     required_check_ids = PROGRAM_REVIEW_CHECKS | prior_check_ids
     required = PROGRAM_REVIEW_REQUIRED_FIELDS
-    if (not isinstance(value, dict) or not required.issubset(value)
-            or set(value) - PROGRAM_REVIEW_FIELDS):
+    if not isinstance(value, dict):
         raise ValidationError("scientific program review requires status, checks and findings")
+    missing_fields = sorted(required - set(value))
+    unexpected_fields = sorted(set(value) - PROGRAM_REVIEW_FIELDS)
+    if missing_fields or unexpected_fields:
+        raise ValidationError(
+            "scientific program review requires status, checks and findings; "
+            f"missing={missing_fields}; unexpected={unexpected_fields}")
     limitations = value.get("limitations", [])
     if not isinstance(limitations, list) or any(not isinstance(item, str) or not item.strip() for item in limitations):
         raise ValidationError("scientific program review limitations must be nonempty strings")
@@ -3223,7 +3246,13 @@ class CapabilityFoundry:
                 state, state.get("validation_feedback"))
             identity = hashlib.sha256(canonical_bytes(candidate)).hexdigest()
             reviews = state.setdefault("scientific_reviews", {})
-            review_scope = hashlib.sha256(canonical_bytes(sorted(PROGRAM_REVIEW_CHECKS))).hexdigest()
+            execution_evidence = program_review_evidence(candidate, document, verdict)
+            review_scope = hashlib.sha256(canonical_bytes({
+                "checks": sorted(PROGRAM_REVIEW_CHECKS),
+                "execution_evidence": execution_evidence,
+                "response_fields": sorted(PROGRAM_REVIEW_FIELDS),
+                "review_system": REVIEW_SYSTEM,
+            })).hexdigest()
             retained = reviews.setdefault(identity + ":" + review_scope,
                                           {"status": "pending", "responses": []})
             responses = retained.setdefault("responses", [retained["result"]] if retained.get("result") else [])
@@ -3236,7 +3265,7 @@ class CapabilityFoundry:
                 else:
                     result = call_reviewer(
                         candidate, document, identity, retained, review_attempt,
-                        prior_blocking_issues)
+                        prior_blocking_issues, execution_evidence)
                 result = continue_truncated_review_response(
                     result, identity, retained, review_attempt)
                 try:
@@ -3292,7 +3321,7 @@ class CapabilityFoundry:
                         "prior_blocking_issues": deepcopy_config(prior_blocking_issues)}
 
         def call_reviewer(candidate, document, identity, retained, review_attempt,
-                          prior_blocking_issues):
+                          prior_blocking_issues, execution_evidence):
             required_check_ids = sorted(
                 PROGRAM_REVIEW_CHECKS | {
                     item["review_check_id"] for item in prior_blocking_issues
@@ -3307,12 +3336,21 @@ class CapabilityFoundry:
                 "experiment_intent": candidate["experiment_intent"],
                 "executor_source": candidate["executor_source"],
                 "validator_source": candidate["validator_source"],
+                "execution_evidence": execution_evidence,
                 "observed_data": program_failure_context(document),
                 "raw_observation_sample": document["observations"][:24],
                 "raw_observation_sample_complete": len(document["observations"]) <= 24,
                 "analysis": document.get("analysis", {}),
                 "prior_blocking_issues": prior_blocking_issues,
                 "findings": document["findings"], "limitations": document["limitations"],
+                "response_instructions": (
+                    "Return only the output_contract object: status, checks, findings, and optional "
+                    "limitations. Do not echo assignment, analysis, execution_evidence or any other "
+                    "input fields. Use the exact current source and complete raw_observations. "
+                    "The supplied independent_validation is the current executable recalculation, "
+                    "bound by candidate_sha256; it does not establish physical model validity. "
+                    "Reconcile historical failures against this current evidence without requiring "
+                    "a resolved mismatch to remain failed."),
                 "output_contract": {"status": "admitted|rejected",
                     "checks": [{"id": name, "outcome": "passed|failed", "evidence": "exact code or result evidence"}
                                for name in required_check_ids],
