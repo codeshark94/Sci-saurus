@@ -5764,7 +5764,7 @@ class ComposerRunner:
             })
 
     @staticmethod
-    def _survey_checkpoint(project_dir):
+    def _survey_checkpoint(project_dir, *, include_completed=False):
         """Return the durable survey milestone recorded in one workspace."""
         if not isinstance(project_dir, (str, Path)):
             return None
@@ -5784,10 +5784,11 @@ class ComposerRunner:
             return None
         # A current survey without a current assessment is an honest
         # resumable frontier.  A fully assessed survey is a released upstream
-        # dependency and should be left alone when another continuation is
-        # admitted for a downstream scope.
+        # dependency. Reopen it only for an owned producer evidence order;
+        # downstream continuation does not invalidate the literature frontier.
         if payload.get("assessment_current") is True and payload.get("assessment_ref"):
-            if not (payload.get("status") in {"blocked", "paused"}
+            if not (include_completed and payload.get("status") == "completed") and not (
+                    payload.get("status") in {"blocked", "paused"}
                     and payload.get("work_orders") and not payload.get("follow_up_result")):
                 return None
         return payload
@@ -5836,9 +5837,12 @@ class ComposerRunner:
         if not isinstance(stage, dict) or stage.get("kind") != "survey":
             return None
         topic_identity = self._current_topic_identity()
+        revalidation = bool(self._survey_revalidation_scopes(stage))
+        producer_orders = [] if revalidation else self._survey_producer_work_orders(stage)
+        completed_follow_up = any(order.get("kind") == "literature_expansion"
+                                  for order in producer_orders)
         candidates = []
         context = self.context.get(stage.get("id"), {})
-        revalidation = bool(self._survey_revalidation_scopes(stage))
         aggregate_review_repair = (
             isinstance(context, dict)
             and context.get("review_status") == "survey_integrity_repair"
@@ -5855,13 +5859,24 @@ class ComposerRunner:
             ))
         record = self.stage_records.get(stage.get("id"), {})
         attempts = record.get("attempts", []) if isinstance(record, dict) else []
+        preferred_partial = None
         if isinstance(attempts, list):
-            candidates.extend(
+            attempt_candidates = [
                 (attempt.get("project_dir"), attempt.get("topic_id"),
                  attempt.get("topic_cycle"), attempt)
                 for attempt in reversed(attempts)
-                if isinstance(attempt, dict)
-            )
+                if isinstance(attempt, dict)]
+            pending_attempt = (record.get("status") in {"blocked", "running", "retrying"}
+                               and attempt_candidates
+                               and attempt_candidates[0][3].get("state") not in {"succeeded", "completed"})
+            if attempt_candidates and (pending_attempt
+                    or context.get("status") in {"blocked", "paused", "running", "retrying"}):
+                preferred_partial = attempt_candidates[0][0]
+                if isinstance(preferred_partial, str):
+                    preferred_partial = str(Path(preferred_partial).resolve())
+                candidates = attempt_candidates + candidates
+            else:
+                candidates.extend(attempt_candidates)
         candidates.append((stage.get("project_dir"), None, None, None))
         seen = set()
         partials = []
@@ -5886,7 +5901,20 @@ class ComposerRunner:
                 if (type(candidate_topic_cycle) is int
                         and candidate_topic_cycle != topic_identity["topic_cycle"]):
                     continue
-            checkpoint = self._survey_checkpoint(resolved)
+            checkpoint = self._survey_checkpoint(resolved, include_completed=completed_follow_up)
+            completed = (isinstance(checkpoint, dict) and checkpoint.get("status") == "completed"
+                         and checkpoint.get("assessment_current") is True)
+            if completed:
+                durable = self._durable_stage_config(resolved)
+                topic_stage = self._topic_stage_for_survey(stage)
+                expected_question = (self.context.get(topic_stage["id"], {}).get("topic", {}).get("research_question")
+                                     if topic_stage is not None else
+                                     self._read_json_object(stage["config_path"]).get("survey", {}).get("question"))
+                question = durable.get("survey", {}).get("question") if isinstance(durable, dict) else None
+                if (not isinstance(expected_question, str) or question != expected_question
+                        or not self._survey_references_are_current(resolved, checkpoint)):
+                    checkpoint = None
+                    completed = False
             if checkpoint is None and revalidation:
                 output = Path(resolved) / "output/run.json"
                 durable = self._durable_stage_config(resolved)
@@ -5925,6 +5953,8 @@ class ComposerRunner:
                 if bound_checkpoint:
                     if not partial:
                         return Path(resolved)
+                    if resolved == preferred_partial:
+                        return Path(resolved)
                     coverage = checkpoint.get("coverage", {})
                     partials.append(((coverage.get("map_entry_count", 0), coverage.get("verified_full_texts", 0),
                                       coverage.get("unique_works", 0)), Path(resolved)))
@@ -5952,6 +5982,8 @@ class ComposerRunner:
                     })
                 continue
             if not partial:
+                return Path(resolved)
+            if resolved == preferred_partial:
                 return Path(resolved)
             coverage = checkpoint.get("coverage", {})
             partials.append(((coverage.get("map_entry_count", 0),
@@ -23180,6 +23212,17 @@ class ComposerRunner:
                     self._durable_stage_config(project_dir)
                     if project_has_checkpoint else None
                 )
+                producer_orders = self._survey_producer_work_orders(stage)
+                completed_follow_up = (
+                    prior.get("status") == "completed"
+                    and prior.get("survey_current") is True
+                    and prior.get("assessment_current") is True
+                    and any(order.get("kind") == "literature_expansion"
+                            for order in producer_orders)
+                    and isinstance(durable_config, dict)
+                    and durable_config.get("survey", {}).get("question") == config.get("survey", {}).get("question")
+                    and self._survey_references_are_current(project_dir, prior)
+                )
                 # A continuation can be interrupted after the durable survey
                 # store is created but before SurveyRunner writes run.json.
                 # That is still a resumable run, not a new-directory request.
@@ -23190,7 +23233,8 @@ class ComposerRunner:
                     project_has_checkpoint
                     and durable_config is not None
                     and (bool(revalidation_scopes) or not prior_run.is_file()
-                         or prior.get("status") in {"blocked", "paused", "running"})
+                         or prior.get("status") in {"blocked", "paused", "running"}
+                         or completed_follow_up)
                 )
                 if revalidation_scopes and not resumable_checkpoint:
                     raise StateError("survey revalidation requires the retained immutable runner input")
@@ -23206,8 +23250,10 @@ class ComposerRunner:
                     if (isinstance(fallback, dict)
                             and fallback.get("mode") == "crossref_metadata"):
                         provider_fallback = "crossref_metadata"
-                    scopes = revalidation_scopes or [self._survey_resume_scope(
-                        prior, stage_context=self.context.get(stage["id"]))]
+                    scopes = revalidation_scopes or (["follow_up"]
+                        if prior.get("survey_current") is True and prior.get("assessment_current") is True
+                        and producer_orders else [self._survey_resume_scope(
+                            prior, stage_context=self.context.get(stage["id"]))])
                     resume_policy = {
                         # Composer owns autonomous recovery.  A process
                         # interruption cannot observe an in-flight model
@@ -23231,7 +23277,7 @@ class ComposerRunner:
                                   }, "command.composer")
                 delegation = self._stage_model_delegation(stage)
                 result = SurveyRunner(stage["project_dir"], config, on_progress=self._stage_progress(stage),
-                                      work_orders=self._survey_producer_work_orders(stage),
+                                      work_orders=producer_orders,
                                       review_obligations=self._survey_review_obligations(stage),
                                       resume_policy=resume_policy,
                                       provider_fallback=provider_fallback,

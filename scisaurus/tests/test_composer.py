@@ -10519,6 +10519,87 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(runner.usage, usage)
             self.assertTrue(runner._has_pending_admitted_recovery(by_id["experiment"], by_id))
 
+    def test_completed_survey_evidence_follow_up_reuses_exact_namespace_and_config(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path))); self.addCleanup(runner.close)
+            stage = runner.workflow["stages"][0]; project = Path(stage["project_dir"])
+            stored = {"project_id": str(project), "limits": {"wall_clock_seconds": 10},
+                      "survey": {"question": "Exact retained question", "proposed_gap": {
+                          "id": "topic-current", "statement": "Exact retained question"}}}
+            Path(stage["config_path"]).write_bytes(canonical_bytes(stored))
+            control = ControlStore(project); store = ArtifactStore(control); store.init_project(principal_note="Source ledger")
+            original = store.publish_artifact(logical_id="inputs/run-config", artifact_type="note", author="principal",
+                body=canonical_bytes(stored), media_type="application/json")
+            control.close(); (project / "output").mkdir()
+            prior = {"status": "completed", "survey_ref": "artifact:kb/surveys/current@3",
+                     "assessment_ref": "artifact:kb/gap-assessments/current@1", "survey_current": True,
+                     "assessment_current": True, "follow_up_result": {"orders": [{"id": "old", "status": "resolved"}]}}
+            (project / "output/run.json").write_bytes(canonical_bytes(prior))
+            order = {"id": "new-evidence", "kind": "literature_expansion", "owner": "research.intelligence",
+                "target_stage_id": "survey", "objective": "Find the missing source condition.",
+                "why": "The retained survey lacks a source condition.",
+                "success_condition": "The condition is captured or recorded unavailable.", "evidence_needed": "Exact source."}
+            runner.active_research_requests = [order]; runner.reopened_stage_ids = {"survey"}; runner.continuation_cycles = 1
+            runner.context["survey"] = {"project_dir": str(project)}
+            with patch.object(runner, "_survey_references_are_current", return_value=True):
+                self.assertEqual(runner._stage_for_cycle(stage)["project_dir"], str(project))
+                runner.active_research_requests = [{**order, "target_stage_id": "experiment", "kind": "analysis_repair", "owner": "methods.validation"}]
+                self.assertNotEqual(runner._stage_for_cycle(stage)["project_dir"], str(project))
+                runner.active_research_requests = [order]
+                Path(stage["config_path"]).write_bytes(canonical_bytes({**stored, "survey": {"question": "Other question"}}))
+                self.assertNotEqual(runner._stage_for_cycle(stage)["project_dir"], str(project))
+                Path(stage["config_path"]).write_bytes(canonical_bytes(stored))
+            captured = {}
+            class RetainedSurvey:
+                def __init__(self, root, config, **options):
+                    captured.update(root=root, config=deepcopy(config), options=options)
+                def run(self):
+                    return {**prior, "usage": {"model_calls": 0}, "output_path": str(project / "output/run.json")}
+            deadline = runner.deadline_epoch
+            with patch("scisaurus.runtime.survey.SurveyRunner", RetainedSurvey), \
+                    patch.object(runner, "_stage_remaining", return_value=7), \
+                    patch.object(runner, "_survey_references_are_current", return_value=True), \
+                    patch.object(runner, "_stage_model_delegation", return_value=None), \
+                    patch.object(runner, "_gate_free_topic_survey", side_effect=lambda value, **kwargs: value):
+                runner._produce_stage(stage)
+            self.assertEqual(captured["root"], str(project))
+            self.assertEqual(captured["config"], stored)
+            self.assertEqual(captured["options"]["work_orders"], runner._follow_up_projection([order]))
+            self.assertEqual(captured["options"]["resume_policy"]["source_changes"]["reopen_scopes"], ["follow_up"])
+            self.assertEqual(runner.deadline_epoch, deadline)
+            self.assertEqual(runner._durable_stage_config(project), stored)
+            older = (Path(path) / "older-partial").resolve()
+            old_control = ControlStore(older); old_store = ArtifactStore(old_control)
+            old_store.init_project(principal_note="Earlier source ledger")
+            old_store.publish_artifact(logical_id="inputs/run-config", artifact_type="note", author="principal",
+                body=canonical_bytes(stored), media_type="application/json")
+            old_control.close(); (older / "output").mkdir()
+            (older / "output/run.json").write_bytes(canonical_bytes({**prior, "status": "blocked",
+                "assessment_current": False, "assessment_ref": None}))
+            runner.stage_records["survey"] = {"attempts": [{"project_dir": str(older)}]}
+            runner.context["survey"].update(status="completed")
+            with patch.object(runner, "_survey_references_are_current", return_value=True):
+                self.assertEqual(runner._stage_for_cycle(stage)["project_dir"], str(project))
+                runner.stage_records["survey"].update(status="retrying", attempt_number=2)
+                runner.stage_records["survey"]["attempts"][0].update(state="unknown", attempt_number=2)
+                runner.context["survey"].update(attempt_number=1)
+                self.assertEqual(runner._stage_for_cycle(stage)["project_dir"], str(older))
+
+    def test_nested_survey_review_recovery_does_not_project_template_producer_orders(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path))); self.addCleanup(runner.close)
+            stage = runner.workflow["stages"][0]; project = Path(stage["project_dir"]) / "continuations/cycle-3"
+            control = ControlStore(project); store = ArtifactStore(control); store.init_project(principal_note="Retained reviewed sources")
+            store.publish_artifact(logical_id="inputs/run-config", artifact_type="note", author="principal",
+                body=canonical_bytes({"survey": {"question": "Exact question"}}), media_type="application/json")
+            control.close(); (project / "output").mkdir()
+            (project / "output/run.json").write_bytes(canonical_bytes({"status": "completed", "survey_current": True,
+                "assessment_current": True, "survey_ref": "artifact:kb/surveys/current@1", "assessment_ref": "artifact:kb/gap-assessments/current@1"}))
+            runner.context["survey"] = {"project_dir": str(project)}
+            with patch.object(runner, "_survey_revalidation_scopes", return_value=["focused_review"]), \
+                    patch.object(runner, "_survey_producer_work_orders", side_effect=AssertionError("template has no retained recovery ownership")):
+                self.assertEqual(runner._latest_resumable_survey_project(stage), project.resolve())
+
     def test_completed_survey_revalidation_resumes_exact_config_with_owned_scopes(self):
         with tempfile.TemporaryDirectory() as path:
             runner = ComposerRunner(self._workflow(Path(path)))

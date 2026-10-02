@@ -86,6 +86,34 @@ class TestExplorationContract(unittest.TestCase):
     def test_grounded_reference_branch(self):
         self.validate(self.plan)
 
+    def test_planning_evidence_ids_bind_exact_spans_without_transferring_ownership(self):
+        from scisaurus.core.source_spans import index_evidence
+        projected, catalog = index_evidence(self.plan, self.sources)
+        bound = normalize_plan(projected, {"parent-0": "parent"}, self.sources,
+                               parents=self.parents, evidence_catalog=catalog)
+        self.assertEqual(bound, bind(self.plan, self.sources))
+        validate_plan(bound, self.parents, self.sources, max_branches=None)
+        self.assertEqual(bound["branches"][0]["evidence"][0]["quote"], self.source["text"])
+        string_selection = deepcopy(projected)
+        string_selection["branches"][0]["evidence"] = [catalog[0]["evidence_id"]]
+        self.assertEqual(normalize_plan(string_selection, {"parent-0": "parent"}, self.sources,
+            parents=self.parents, evidence_catalog=catalog), bound)
+        foreign = {"work_id": "W3", "text": "A different measured mechanism.", "representation": "abstract"}
+        sources = {**self.sources, "foreign": foreign}
+        _, foreign_catalog = index_evidence({"work_id": "W3", "source_ref": "foreign", "quote": foreign["text"]}, sources)
+        altered = deepcopy(projected); altered["branches"][0]["evidence"] = [{"evidence_id": foreign_catalog[0]["evidence_id"]}]
+        with self.assertRaisesRegex(ModelContractError, "outside.*source scope|ownership"):
+            normalize_plan(altered, {"parent-0": "parent"}, sources, parents=self.parents,
+                           evidence_catalog=catalog + foreign_catalog)
+        for bad_catalog in ([{**catalog[0], "quote": "Invented result."}], catalog + catalog):
+            with self.assertRaises(ModelContractError):
+                normalize_plan(projected, {"parent-0": "parent"}, self.sources,
+                               parents=self.parents, evidence_catalog=bad_catalog)
+        altered["branches"][0]["evidence"] = [{"evidence_id": "unknown"}]
+        with self.assertRaises(ModelContractError):
+            normalize_plan(altered, {"parent-0": "parent"}, self.sources,
+                           parents=self.parents, evidence_catalog=catalog)
+
     def test_normalizer_reports_all_foreign_sources_with_owned_destinations(self):
         proposal = deepcopy(self.plan)
         second = deepcopy(proposal["branches"][0])

@@ -9,7 +9,7 @@ import tempfile
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.errors import ModelContractError, ProviderRateLimitError, StateError, ValidationError
 from scisaurus.core.source_spans import (LEGACY_EVIDENCE_FIELDS, SPAN_EVIDENCE_FIELDS,
-                                         bind, validate as validate_span)
+                                         bind, expand_evidence, index_evidence, validate as validate_span)
 from scisaurus.runtime.survey_config import search_query, work_id
 from scisaurus.runtime.survey_records import MAP_FIELDS, authoritative_source
 
@@ -116,7 +116,7 @@ def _plan_evidence_source(branch, index, proof, parent, sources):
     return source
 
 
-def normalize_plan(value, parent_aliases, sources, *, windows=None, parents=None):
+def normalize_plan(value, parent_aliases, sources, *, windows=None, parents=None, evidence_catalog=None):
     """Bind only exact assigned identifiers and captured evidence spans."""
     try:
         value = bind_plan_parents(value, parent_aliases)
@@ -125,6 +125,7 @@ def normalize_plan(value, parent_aliases, sources, *, windows=None, parents=None
             evidence = branch.get("evidence")
             if not isinstance(evidence, list):
                 raise ModelContractError(f"branch {index} evidence must be a list")
+            evidence = expand_evidence({"evidence": evidence}, evidence_catalog or [], sources, windows=windows)["evidence"]
             for proof in evidence:
                 if not isinstance(proof, dict) or not isinstance(proof.get("source_ref"), str):
                     raise ModelContractError(f"branch {index} evidence requires a string source_ref")
@@ -700,10 +701,12 @@ class LiteratureTree:
             full_text_chars=self.bounds["context_chars"], abstract_chars=self.bounds["context_chars"],
             unverified_chars=self.bounds["context_chars"], evidence=evidence)
         windows = {source["source_ref"]: source["window"] for source in context}
+        assignments, evidence_catalog = index_evidence(assignments, sources)
         branch_limit = None
         remaining, scopes = self._remaining_model_capacity(["research.search-planner", "research.literature-mapper", "methods.work-reviewer"])
         assignment = {"phase": "exploration_plan", "question": self.score["question"],
-            "parents": assignments, "sources": context, "suggestions": suggestions,
+            "parents": assignments, "sources": context, "evidence_catalog": evidence_catalog,
+            "suggestions": suggestions,
             "max_branches": branch_limit, "search_syntax": self._tree_search_syntax(),
             "allowed_operations": {"root": ["search", "work"], "read": ["search", "work", "citing"]},
             "remaining_catalog_capacity": self._tree_catalog_capacity(),
@@ -716,12 +719,16 @@ class LiteratureTree:
             "instructions": "Choose prioritized inquiries that advance the declared research question. "
                 "Return exactly {decision:expand|stop,rationale:string,branches:[{parent_id,question,rationale,"
                 "operation:search|work|citing,query:string|null,work_id:string|null,"
-                "evidence:[{work_id,source_ref,quote}]}]}. Copy parent_id exactly from the assigned parent's id handle. "
+                "evidence:[{evidence_id:ID}]}]}. Copy parent_id exactly from the assigned parent's id handle. "
                 "These handles are local to this assignment; work IDs and acquisition history IDs are not parent handles. "
                 "For a root, choose initial searches or direct canonical OpenAlex work lookups from the scientific intake, with empty evidence. "
                 "For a read, explain what its checked findings suggest investigating next, with exact parent quotations. "
                 "Each branch parent_id must identify the work supplying its evidence: use that parent's allowed_evidence "
                 "and its source_refs in the shared sources table. Each captured source is supplied once. "
+                "Select checked evidence as [{evidence_id:ID}] from evidence_catalog; exact quotations and source "
+                "locators are attached deterministically. Each ID must belong to the assigned parent. "
+                "For new evidence absent from the catalog, supply an exact {work_id,source_ref,quote} object "
+                "copied from the displayed parent source window. "
                 "Source windows retain every checked finding's cited span; copy new quotations only from these displayed windows. "
                 "Another parent's source cannot support a branch attached to this parent. Incoming question and inquiry_rationale "
                 "describe how the work was found; they do not grant evidence ownership. Close irrelevant parents instead of using "
@@ -743,7 +750,8 @@ class LiteratureTree:
         else:
             self._record("kb/exploration-inputs/" + identity, "note", assignment, "research.search-planner",
                          subjects=[self.protocol["artifact_ref"], *[node["review_ref"] for node in parents if node.get("review_ref")]])
-        normalizer = lambda value: normalize_plan(value, parent_aliases, sources, windows=windows, parents=parent_map)
+        normalizer = lambda value: normalize_plan(value, parent_aliases, sources, windows=windows,
+            parents=parent_map, evidence_catalog=assignment.get("evidence_catalog", []))
         validator = lambda value: validate_plan(value, parent_map, sources, max_branches=branch_limit)
         value, execution = self._model_checked("exploration-" + identity, "research.search-planner",
             assignment, validator, normalizer=normalizer, stage="supervision", task_kind="service")

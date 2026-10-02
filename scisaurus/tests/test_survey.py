@@ -1750,7 +1750,7 @@ class TestSurveyRunner(unittest.TestCase):
         changed = self.follow_up_order("Locate the independent instrument calibration measurement.")
         policy = {"additional_seconds": config["limits"]["wall_clock_seconds"],
                   "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
-                  "source_changes": {"mode": "reopen", "reopen_scopes": ["gap_assessment"]}}
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["follow_up"]}}
         second = self.runtime(config, resume_policy=policy, work_orders=[changed])
         refreshed = second.run()
         self.assertEqual(refreshed["status"], "completed", refreshed.get("error"))
