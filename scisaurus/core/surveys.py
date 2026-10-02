@@ -873,7 +873,10 @@ class SurveyGate:
                 for key in ("role", "plan_ref", "execution_ref"))
                 or not isinstance(query.get("request"), dict)):
             raise ValidationError("follow-up search requires its exact retrieval execution and plan")
-        _, plan = self._note(query["plan_ref"])
+        plan_manifest, raw_plan = self._artifact(query["plan_ref"], current=False)
+        if plan_manifest["artifact_type"] != "note":
+            raise ValidationError("follow-up search requires its admitted plan note")
+        plan = self._json(raw_plan, "follow-up search plan")
         request = query["request"]
         if (manifest["artifact_type"] != "query_record"
                 or manifest["author"] != query["role"]

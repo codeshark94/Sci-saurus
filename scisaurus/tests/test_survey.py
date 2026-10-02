@@ -1867,6 +1867,68 @@ class TestSurveyRunner(unittest.TestCase):
         runner.gate = SurveyGate(runner.control, runner.store)
         self.assertEqual(runner._prior_follow_up_completion_reviews(), [])
 
+    def test_retained_completed_review_requires_its_exact_evidence_assignment(self):
+        order = self.follow_up_order()
+        runner = self.runtime(survey_config(self.endpoint, "follow-up-conflicted-completion"), work_orders=[order])
+        result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        runner.control, runner.store = self.open_store()
+        runner.gate = SurveyGate(runner.control, runner.store)
+        report = runner._body(runner.store.get(result["follow_up_result"]["ref"]))
+        review_ref = report["completion_execution_refs"][0]
+        recorded = SurveyGate._recorded_execution
+        for field, value in (("phase", "unrelated_phase"), ("survey_ref", "artifact:foreign/survey@1"),
+                             ("assessment_ref", "artifact:foreign/assessment@1"), ("evidence_context", {}),
+                             ("completion_review_contract", "unknown-contract")):
+            def changed(gate, ref, *args, **kwargs):
+                values = list(recorded(gate, ref, *args, **kwargs))
+                if ref == review_ref:
+                    assignment = json.loads(values[3]["prompt"])
+                    assignment[field] = value
+                    values[3] = {**values[3], "prompt": json.dumps(assignment)}
+                return tuple(values)
+            with self.subTest(field=field), patch.object(SurveyGate, "_recorded_execution", new=changed):
+                with self.assertRaises(StateError):
+                    runner._prior_follow_up_completion_reviews(include_completed=True)
+
+    def test_completed_availability_feedback_and_historical_search_survive_plan_revision(self):
+        order = self.follow_up_order()
+        config = survey_config(self.endpoint, "follow-up-conflicted-completion")
+        first = self.runtime(config, work_orders=[order]).run()
+        self.assertEqual(first["status"], "completed", first["error"])
+        policy = {"additional_seconds": config["limits"]["wall_clock_seconds"],
+                  "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["follow_up"]}}
+        runner = self.runtime(config, work_orders=[order], resume_policy=policy)
+        reviews = runner._prior_follow_up_completion_reviews(include_completed=True)
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews[0]["review"]["outcome"], "met")
+        row = first["follow_up_result"]["orders"][0]
+        self.assertEqual(reviews[0]["disposition"]["evidence"], row["evidence"])
+        self.assertEqual(reviews[0]["disposition"]["limitation"], row["limitation"])
+        query_ref = row["query_refs"][0]
+        query = runner._body(runner.store.get(query_ref))
+        plan = runner.store.get(query["plan_ref"])
+        revised = runner.store.publish_artifact(logical_id=plan["artifact_id"],
+            artifact_type=plan["artifact_type"], author=plan["author"],
+            body=canonical_bytes({**runner._body(plan), "revision_reason": "A later search plan."}),
+            inputs=plan["inputs"])
+        self.assertNotEqual(revised["artifact_ref"], query["plan_ref"])
+        self.assertIn(query_ref, runner._follow_up_query_refs())
+        captured = []
+        original = runner._model_checked
+        def inspect(name, role, assignment, *args, **kwargs):
+            if assignment.get("phase") == "survey_follow_up":
+                captured.append(deepcopy(assignment))
+            return original(name, role, assignment, *args, **kwargs)
+        with patch.object(runner, "_model_checked", side_effect=inspect):
+            second = runner.run()
+        self.assertEqual(second["status"], "completed", second["error"])
+        self.assertEqual(captured[0]["prior_completion_reviews"], reviews)
+        self.assertIn(query_ref, captured[0]["query_refs"])
+        from scisaurus.runtime.composer import ComposerRunner
+        self.assertTrue(ComposerRunner._survey_follow_up_was_replayed(self.root / "run", second, order))
+
     def test_unmet_completion_feedback_reaches_the_disposition_author(self):
         order = {**self.follow_up_order(), "success_condition": "Capture the numeric measurement with units."}
         config = survey_config(self.endpoint, "follow-up-capture-required")

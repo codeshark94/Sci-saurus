@@ -8174,6 +8174,25 @@ class ComposerRunner:
         if not self.active_research_requests:
             return
         if context.get("preserve_work_orders"):
+            fulfilled = [request for request in self._requests_for_stage(stage)
+                         if stage.get("kind") == "survey"
+                         and self._survey_request_was_fulfilled(
+                             context.get("project_dir") or stage["project_dir"], context, request)]
+            if fulfilled:
+                resolved = self.departments.resolve_work_orders(fulfilled,
+                    stage_kind=stage["kind"], stage_id=stage["id"], outcome="completed")
+                closed_ids = {row["request_id"] for row in resolved if row.get("state") == "completed"}
+                closed = {self._research_request_signature(request) for request in fulfilled
+                          if request.get("id") in closed_ids}
+                self.active_research_requests = [request for request in self.active_research_requests
+                    if self._research_request_signature(request) not in closed]
+                for key in ("research_requests", "research_expansion_requests", "deferred_research_requests"):
+                    if isinstance(context.get(key), list):
+                        context[key] = [request for request in context[key]
+                            if self._research_request_signature(request) not in closed]
+                self.department_activity.append({"cycle": self.continuation_cycles,
+                    "action": "resolve_verified_work_orders_with_open_backfill",
+                    "stage_id": stage["id"], "outcome": outcome, "work_orders": deepcopy(resolved)})
             self.department_activity.append({"cycle": self.continuation_cycles,
                 "action": "retain_work_orders_for_backfill", "stage_id": stage["id"], "outcome": outcome,
                 "work_orders": deepcopy(self.active_research_requests)})
@@ -17758,8 +17777,7 @@ class ComposerRunner:
 
     def _survey_request_was_fulfilled(self, project_dir, run, request):
         if self._is_scoped_survey_review_repair(request):
-            return (run.get("status") in {"completed", "accepted"}
-                    and run.get("survey_current") is True
+            return (run.get("survey_current") is True
                     and run.get("assessment_current") is True
                     and self._survey_references_are_current(project_dir, run))
         if "resume_scopes" not in request:

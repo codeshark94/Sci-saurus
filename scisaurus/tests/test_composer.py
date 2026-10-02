@@ -700,6 +700,35 @@ class ComposerWorkflowTests(unittest.TestCase):
             retired = [x for x in result["blockers"] if x.get("recovery") == "superseded_by_current_stage_state"]
             self.assertEqual(len(retired), 3)
 
+    def test_verified_scoped_repair_closes_while_other_survey_work_remains_open(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            stage = runner.workflow["stages"][0]
+            common = {"owner": "research.intelligence", "target_stage_id": "survey",
+                "objective": "Review the retained evidence.", "why": "A scoped check remains.",
+                "success_condition": "The scoped requirement is independently checked.",
+                "evidence_needed": "Immutable evidence."}
+            repair = {**common, "id": "gap-repair", "kind": "recovery", "repair_strategy": "gap_assessment"}
+            unmet = {**common, "id": "capture", "kind": "literature_expansion"}
+            methods = {**common, "id": "methods", "kind": "additional_experiment", "target_stage_id": "experiment"}
+            runner.active_research_requests = [repair, unmet, methods]
+            context = {"status": "review_rejected", "preserve_work_orders": True,
+                "survey_current": True, "assessment_current": True,
+                "survey_ref": "artifact:survey@1", "assessment_ref": "artifact:assessment@1",
+                "research_requests": [repair, unmet]}
+            with patch.object(runner, "_survey_references_are_current", return_value=True), \
+                    patch.object(runner, "_survey_work_order_was_fulfilled", return_value=False):
+                runner._settle_stage_work_orders(stage, context, "review_rejected")
+            self.assertEqual(runner.active_research_requests, [unmet, methods])
+            self.assertEqual(context["research_requests"], [unmet])
+            self.assertEqual(context["status"], "review_rejected")
+            runner.active_research_requests = [repair, unmet, methods]
+            with patch.object(runner, "_survey_references_are_current", return_value=False), \
+                    patch.object(runner, "_survey_work_order_was_fulfilled", return_value=False):
+                runner._settle_stage_work_orders(stage, context, "review_rejected")
+            self.assertEqual(runner.active_research_requests, [repair, unmet, methods])
+
     def test_stage_work_order_settlement_closes_only_owned_accepted_requests(self):
         with tempfile.TemporaryDirectory() as path:
             runner = ComposerRunner(self._workflow(Path(path))); self.addCleanup(runner.close)
