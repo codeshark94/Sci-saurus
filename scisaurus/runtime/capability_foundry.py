@@ -1770,6 +1770,9 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
             [_bounded_repair_text(item, 300) for item in value[:16]]
             if isinstance(value, list) else _bounded_repair_text(value, 1400)
         )
+    for key in ("analysis_contract", "observed_analysis"):
+        if key in format_repair:
+            format_details[key] = deepcopy_config(format_repair[key])
     compact_feedback = _compact_repair_findings(validation_feedback)
     candidate_failure = format_repair.get("candidate_failure")
     candidate_failure = candidate_failure if isinstance(candidate_failure, dict) else {}
@@ -1808,8 +1811,8 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
         "repair_request": {
             "previous_error": previous_error,
             "candidate_failure": deepcopy_config(candidate_failure),
-            "author_response_error": (None if format_repair.get("repair_kind") == "executor_output_contract"
-                                      else format_error),
+            "author_response_error": (None if format_repair.get("repair_kind") in {
+                "executor_output_contract", "analysis_output_contract"} else format_error),
             "repair_scope": repair_scope,
             "observed_failure_context": _compact_repair_context(validation_context),
             "validation_feedback": compact_feedback,
@@ -2577,9 +2580,30 @@ class CapabilityFoundry:
                 isinstance(state.get("last_attempt"), dict)
                 and PRODUCER_FIELDS.issubset(state["last_attempt"])
             )
-            feedback = prior_feedback if prior_feedback is not None and has_repair_base else None
+            output_failure = isinstance(output_contract_error, (
+                ExperimentProgramOutputContractError, AnalysisContractError))
+            feedback = (str(reason) if output_failure else
+                        prior_feedback if prior_feedback is not None and has_repair_base else None)
             state["feedback"] = feedback
-            if isinstance(output_contract_error, ExperimentProgramOutputContractError):
+            if isinstance(output_contract_error, AnalysisContractError):
+                state["format_repair"] = {
+                    "repair_kind": "analysis_output_contract",
+                    "previous_error": str(reason),
+                    "analysis_contract": analysis_output_contract(),
+                    "observed_analysis": deepcopy_config(document.get("analysis")),
+                    "instructions": (
+                        "The executor emitted parseable JSON, but its analysis violates the output contract. "
+                        "Repair the analysis serialization against the current error, observed_analysis, and "
+                        "analysis_contract. Preserve the frozen intent, observations, estimands, and computed "
+                        "values. Do not fabricate interval bounds or replace an unavailable quantity with zero. "
+                        "The complete current candidate will undergo fresh sandbox execution and every gate. "
+                        "Return only the bounded source update envelope requested by output_contract."
+                    ),
+                }
+                state["candidate_failure"] = deepcopy_config(state["format_repair"])
+                state["candidate_failure"].update(error=str(reason), gate="analysis_output_contract")
+                state["candidate_failure_sha256"] = _authored_candidate_sha256(state["last_attempt"])
+            elif isinstance(output_contract_error, ExperimentProgramOutputContractError):
                 state["format_repair"] = {
                     "repair_kind": "executor_output_contract",
                     "previous_error": str(reason)[:1200],
@@ -4173,7 +4197,8 @@ class CapabilityFoundry:
                     failure_signature = _author_response_format_failure_signature(
                         attempt_value, result.finish_reason, author_route_index)
                 elif isinstance(exc, AnalysisContractError):
-                    failure_signature = "analysis_output_contract:analysis"
+                    failure_signature = "analysis_output_contract:" + hashlib.sha256(
+                        str(exc).encode("utf-8")).hexdigest()
                 elif isinstance(exc, ExperimentProgramOutputContractError) or output_contract_failure:
                     failure_signature = "program_output_contract:executor_output"
                 elif isinstance(exc, ExperimentIntentContractError):
@@ -4244,7 +4269,8 @@ class CapabilityFoundry:
                 if repairable_output_format:
                     prepare_author_format_retry(
                         last_error, attempt_feedback,
-                        output_contract_error=(exc if output_contract_failure else None),
+                        output_contract_error=(exc if output_contract_failure or isinstance(
+                            exc, AnalysisContractError) else None),
                     )
                 continue
         state.update(status="blocked", error=(

@@ -3327,6 +3327,50 @@ class CapabilityFoundryTests(unittest.TestCase):
             self.assertEqual(states[-1]["last_failure_class"], "model_contract")
             self.assertEqual(states[-1]["last_failure_gate"], "analysis_output_contract")
 
+    def test_current_analysis_error_drives_successive_contract_repairs(self):
+        payload = self._payload()
+        marker = '    sys.stdout.write(json.dumps(result))'
+        initial = '    result["analysis"] = {"effect_sizes": [{"id": "effect", "description": "Point estimate with unavailable interval", "estimate": 1.0, "lower": None, "upper": None}]}\n'
+        unavailable = initial.replace('"estimate": 1.0', '"status": "not_estimable", "reason": "Interval unavailable", "metric_ids": ["tail_error"], "estimate": 1.0')
+        repaired = unavailable.replace('"estimate": 1.0', '"estimate": None')
+        payload["executor_source"] = MINI_EXECUTOR.replace(marker, initial + marker)
+
+        class PatchingAuthor:
+            calls = 0
+            max_output_tokens = 24000
+
+            def __init__(inner_self):
+                inner_self.prompts = []
+
+            def complete(inner_self, *, system, prompt):
+                inner_self.calls += 1
+                inner_self.prompts.append(json.loads(prompt))
+                if inner_self.calls == 1:
+                    value = payload
+                else:
+                    old, new = (initial, unavailable) if inner_self.calls == 2 else (unavailable, repaired)
+                    value = {"updates": {"executor_source": {"edits": [{"old": old, "new": new}]}}}
+                return ModelResult(json.dumps(value), "stub", {"model_calls": 1, "input_tokens": 5, "output_tokens": 10}, 0.0, "stop")
+
+        with tempfile.TemporaryDirectory() as path:
+            foundry = self._foundry(Path(path))
+            foundry.max_attempts = 3
+            author = PatchingAuthor()
+            outcome = foundry.generate("bounded comparison", client=author)
+        self.assertEqual(outcome["status"], "registered")
+        self.assertEqual(author.calls, 3)
+        first, second = author.prompts[1:]
+        for prompt in (first, second):
+            self.assertEqual(prompt["format_repair"]["repair_kind"], "analysis_output_contract")
+            self.assertIn("not_estimable", prompt["format_repair"]["analysis_contract"]["effect_sizes"])
+            self.assertIsNone(prompt["repair_request"]["author_response_error"])
+            self.assertEqual(prompt["repair_request"]["candidate_failure"]["gate"], "analysis_output_contract")
+        self.assertIn("must be a finite number", first["repair_request"]["previous_error"])
+        self.assertIn("not_estimable numeric fields must be null", second["repair_request"]["previous_error"])
+        self.assertEqual(first["format_repair"]["observed_analysis"]["effect_sizes"][0]["estimate"], 1.0)
+        self.assertEqual(second["format_repair"]["observed_analysis"]["effect_sizes"][0]["status"], "not_estimable")
+        self.assertEqual(outcome["candidate"]["executor_source"], MINI_EXECUTOR.replace(marker, repaired + marker))
+
     def test_stage_seconds_intent_failure_uses_format_repair_without_review_panel(self):
         payload = self._payload()
         payload["experiment_intent"]["stage_seconds"].pop("reassessment")

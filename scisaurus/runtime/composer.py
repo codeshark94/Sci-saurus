@@ -93,7 +93,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-model-response-owned-format-recovery-7")
+    "experiment-current-output-contract-recovery-8")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -25159,6 +25159,31 @@ class ComposerRunner:
                     self._record_topic_rejection_history(rejected)
             else:
                 error = ModelWorkBlocked(error_text or "recoverable stage assignment blocker")
+                saved_context = self.context.get(stage_id)
+                saved_context = saved_context if isinstance(saved_context, dict) else {}
+                attempts = record.get("attempts", [])
+                latest = attempts[-1] if isinstance(attempts, list) and attempts else {}
+                latest = latest if isinstance(latest, dict) else {}
+                current_class = latest.get("failure_class") or record.get("failure_class")
+                if stage.get("kind") == "experiment" and (
+                        current_class == "model_contract"
+                        or current_class is None and saved_context.get("failure_class") == "model_contract"):
+                    attempt_number = latest.get("attempt_number") or record.get("attempt_number") or record.get("attempt_count")
+                    dossier_ref = latest.get("failure_dossier_ref") or record.get("failure_dossier_ref") or saved_context.get("failure_dossier_ref")
+                    if (type(attempt_number) is not int or attempt_number < 1
+                            or saved_context.get("failure_dossier_ref") not in (None, dossier_ref)
+                            or record.get("failure_dossier_ref") not in (None, dossier_ref)):
+                        continue
+                    evidence = self._failure_dossier_evidence(
+                        dossier_ref, expected_stage_id=stage_id,
+                        expected_attempt_number=attempt_number)
+                    if (not isinstance(evidence, dict) or evidence.get("available") is not True
+                            or evidence.get("failure_class") != "model_contract"
+                            or not isinstance(evidence.get("error"), str) or not evidence["error"].strip()):
+                        continue
+                    error = ModelWorkBlocked(evidence["error"])
+                    error.failure_class = "model_contract"
+                    error.recovery_mode = "format_repair_then_rerun"
             if self._admit_scientific_blocker_recovery(
                     stage, error, completed, by_id):
                 record["status"] = "retrying"

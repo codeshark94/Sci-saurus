@@ -14635,6 +14635,83 @@ class ComposerWorkflowTests(unittest.TestCase):
                     {**persisted, 'failure_input_sha256': 'b' * 64}],
                     question='current question', domain='plasma')
 
+    def test_resume_restores_owned_analysis_contract_failure_after_policy_change(self):
+        with tempfile.TemporaryDirectory() as path:
+            workflow = self._workflow(Path(path))
+            runner = ComposerRunner(workflow)
+            self.addCleanup(runner.close)
+            stage = next(item for item in workflow["stages"] if item.get("kind") == "experiment")
+            error = "ModelWorkBlocked: capability foundry did not admit a program: analysis.effect_sizes not_estimable numeric fields must be null"
+            dossier = runner._publish("command/composer/failure-recovery/experiment/attempt-55", "report", {
+                "stage_id": stage["id"], "attempt_number": 55, "input_sha256": "a" * 64,
+                "failure_class": "model_contract", "error": error,
+            }, "command.composer")
+            latest = {"attempt_number": 55, "state": "failed", "failure_class": "model_contract",
+                      "failure_dossier_ref": dossier["artifact_ref"], "error": error}
+            runner.stage_records[stage["id"]] = {"kind": "experiment", "status": "blocked",
+                "failure_class": "model_contract", "attempt_count": 55, "attempts": [latest], "error": error}
+            runner.context[stage["id"]] = {"failure_class": "model_contract", "review_status": "format_recovery_exhausted",
+                "failure_dossier_ref": dossier["artifact_ref"], "error": error,
+                "format_recovery": True, "format_recovery_dispatched": True,
+                "format_recovery_policy_revision": "previous-output-contract-policy",
+                "failure_recovery": {"failure_class": "model_contract", "recovery_mode": "format_repair_then_rerun",
+                                     "input_sha256": "a" * 64}}
+            runner.format_recovery_ledger["previous-policy-signature"] = {"status": "exhausted"}
+            by_id = {item["id"]: item for item in workflow["stages"]}
+            current_signature = runner._format_recovery_signature(stage, error)
+            runner.format_recovery_ledger[current_signature] = {"status": "exhausted"}
+            runner.stage_records[stage["id"]]["error"] = "Unchanged experiment input failed 1 time(s): " + error
+            with patch.object(runner, "_begin_continuation", return_value=True) as begin:
+                self.assertFalse(runner._reopen_blocked_checkpoint(set(), by_id))
+                begin.assert_not_called()
+            runner.format_recovery_ledger.pop(current_signature)
+            with patch.object(runner, "_begin_continuation", return_value=True) as begin:
+                self.assertTrue(runner._reopen_blocked_checkpoint(set(), by_id))
+                begin.assert_called_once()
+            self.assertEqual(runner.context[stage["id"]]["failure_class"], "model_contract")
+            self.assertTrue(any(item.get("recovery_mode") == "format_repair_then_rerun"
+                                for item in runner.context[stage["id"]]["research_requests"]))
+            with patch.object(runner, "_begin_continuation", return_value=True) as begin:
+                self.assertFalse(runner._reopen_blocked_checkpoint(set(), by_id))
+                begin.assert_not_called()
+
+    def test_resume_does_not_reclassify_unowned_contract_failure_as_science(self):
+        with tempfile.TemporaryDirectory() as path:
+            workflow = self._workflow(Path(path))
+            runner = ComposerRunner(workflow)
+            self.addCleanup(runner.close)
+            stage = next(item for item in workflow["stages"] if item.get("kind") == "experiment")
+            error = "capability foundry did not admit a program: analysis.effect_sizes invalid"
+            runner.stage_records[stage["id"]] = {"status": "blocked", "failure_class": "model_contract", "error": error}
+            for ref in (None, "", 42, "artifact:missing@1"):
+                with self.subTest(ref=ref):
+                    runner.context[stage["id"]] = {"failure_class": "model_contract", "failure_dossier_ref": ref}
+                    with patch.object(runner, "_admit_scientific_blocker_recovery") as admit:
+                        self.assertFalse(runner._reopen_blocked_checkpoint(set(), {stage["id"]: stage}))
+                        admit.assert_not_called()
+
+    def test_resume_current_scientific_failure_keeps_ownership_over_stale_contract_context(self):
+        with tempfile.TemporaryDirectory() as path:
+            workflow = self._workflow(Path(path))
+            runner = ComposerRunner(workflow)
+            self.addCleanup(runner.close)
+            stage = next(item for item in workflow["stages"] if item.get("kind") == "experiment")
+            old = runner._publish("command/composer/failure-recovery/experiment/attempt-55", "report", {
+                "stage_id": stage["id"], "attempt_number": 55, "input_sha256": "a" * 64,
+                "failure_class": "model_contract"}, "command.composer")
+            current = runner._publish("command/composer/failure-recovery/experiment/attempt-56", "report", {
+                "stage_id": stage["id"], "attempt_number": 56, "input_sha256": "b" * 64,
+                "failure_class": "experiment_failure"}, "command.composer")
+            runner.stage_records[stage["id"]] = {"status": "blocked", "failure_class": "experiment_failure",
+                "failure_dossier_ref": current["artifact_ref"], "attempts": [
+                    {"attempt_number": 55, "failure_dossier_ref": old["artifact_ref"]},
+                    {"attempt_number": 56, "failure_class": "experiment_failure", "failure_dossier_ref": current["artifact_ref"]}],
+                "error": "capability foundry did not admit a program: duplicate metric id"}
+            runner.context[stage["id"]] = {"failure_class": "model_contract", "failure_dossier_ref": old["artifact_ref"]}
+            with patch.object(runner, "_admit_scientific_blocker_recovery", return_value=False) as admit:
+                self.assertFalse(runner._reopen_blocked_checkpoint(set(), {stage["id"]: stage}))
+                self.assertIsNone(getattr(admit.call_args.args[1], "failure_class", None))
+
     def test_legacy_experiment_author_policy_reopens_once_without_methods_order(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
