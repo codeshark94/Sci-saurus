@@ -17449,6 +17449,44 @@ class ComposerWorkflowTests(unittest.TestCase):
                 self.assertTrue(author.call_args.kwargs["force_regenerate"])
                 self.assertEqual(author.call_args.kwargs["repair_context"]["packet"], packet)
 
+    def test_methods_response_recovery_survives_missing_format_work_order(self):
+        for requests in ([], [{"id": "prior-plan", "kind": "additional_experiment",
+                "owner": "methods.validation", "target_stage_id": "experiment"}]):
+            with self.subTest(requests=requests), tempfile.TemporaryDirectory() as path:
+                runner = ComposerRunner(self._workflow(Path(path)))
+                try:
+                    topic, _, subject, prior, _, _ = self._methods_response_recovery_fixture(runner)
+                    runner.active_research_requests = requests
+                    stage = runner.workflow["stages"][1]
+                    packet = runner._build_capability_repair_packet(stage, {"topic": topic}, prior, prior["error"])
+                    panel = {"schema_version": "capability-repair-panel-6", "packet": packet,
+                        "status": "unavailable", "decision": "defer", "dispatch_usage": {},
+                        "model_failure": {"error": "invalid response", "failure": {"kind": "output_contract"}}}
+                    with patch.object(runner, "_run_capability_repair_panel", return_value=panel) as call, \
+                            patch.object(runner, "_materialize_topic_capability") as author:
+                        with self.assertRaises(ModelWorkBlocked) as failed:
+                            runner._apply_topic_to_experiment_config(stage, {
+                                "experiment": {"revision": 1, "literature_gate": {}}, "supplied_context": "base"})
+                        call.assert_called_once()
+                        author.assert_not_called()
+                        self.assertEqual(failed.exception.repair_subject, subject)
+                    runner.stage_records["experiment"]["attempts"][1]["attempt_number"] = 3
+                    with self.assertRaises(ValidationError):
+                        runner._format_recovery_requires_methods_panel(stage, requests, prior)
+                finally:
+                    runner.close()
+
+    def test_completed_experiment_cannot_reopen_historical_response_failure(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            _, _, _, prior, order, _ = self._methods_response_recovery_fixture(runner)
+            prior.update(status="completed", review_status="accepted", failure_class="model_contract")
+            stage = runner.workflow["stages"][1]
+            self.assertFalse(runner._format_recovery_requires_methods_panel(stage, [], prior))
+            with self.assertRaisesRegex(ValidationError, "completed experiment"):
+                runner._format_recovery_requires_methods_panel(stage, [order], prior)
+
     def test_methods_response_owner_never_resumes_foreign_foundry_assignment(self):
         for diagnostics in (None, {}, {"repair_feedback": {"foundry_work_ref":
                 "artifact:command/foundry-work/stale@1"}}):

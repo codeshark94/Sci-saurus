@@ -93,7 +93,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-response-owner-recovery-10")
+    "experiment-response-owner-recovery-11")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -22567,9 +22567,14 @@ class ComposerRunner:
         orders = [order for order in requests if isinstance(order, dict)
                   and order.get("kind") == "recovery"
                   and order.get("recovery_mode") == "format_repair_then_rerun"]
-        if not orders:
-            return False
         prior_context = prior_context if isinstance(prior_context, dict) else {}
+        if prior_context.get("status") == "completed":
+            if orders:
+                raise ValidationError("response recovery cannot reopen a completed experiment")
+            return False
+        if (not orders and prior_context.get("failure_class") != "model_contract"
+                and prior_context.get("review_status") != "model_contract_repair"):
+            return False
         recovery = prior_context.get("failure_recovery")
         recovery = recovery if isinstance(recovery, dict) else {}
         current_ref = prior_context.get("failure_dossier_ref") or recovery.get("dossier_ref")
@@ -22578,6 +22583,16 @@ class ComposerRunner:
         if isinstance(current_ref, str):
             _, _, current = self._read_verified_artifact_json(current_ref)
         native_owner = isinstance(current, dict) and self._methods_panel_response_failure(current)
+        if native_owner:
+            if (current.get("stage_id") != stage["id"]
+                    or current.get("failure_class") != "model_contract"
+                    or current.get("repair_phase") != "pre_execution_plan_review"):
+                raise ValidationError("Methods response recovery does not bind the current repair panel")
+            evidence = self._failure_dossier_evidence(current_ref, expected_stage_id=stage["id"],
+                expected_attempt_number=current.get("attempt_number"))
+            if (not isinstance(evidence, dict) or evidence.get("available") is not True
+                    or not isinstance(evidence.get("repair_subject_lineage"), dict)):
+                raise ValidationError("Methods response recovery has no verified scientific repair subject")
         for order in orders:
             ref = order.get("failure_dossier_ref")
             if native_owner and ref != current_ref:
@@ -22593,11 +22608,6 @@ class ComposerRunner:
                     or dossier.get("failure_class") != "model_contract"
                     or dossier.get("repair_phase") != "pre_execution_plan_review"):
                 raise ValidationError("Methods response recovery does not bind the current repair panel")
-            evidence = self._failure_dossier_evidence(ref, expected_stage_id=stage["id"],
-                expected_attempt_number=dossier.get("attempt_number"))
-            if (not isinstance(evidence, dict) or evidence.get("available") is not True
-                    or not isinstance(evidence.get("repair_subject_lineage"), dict)):
-                raise ValidationError("Methods response recovery has no verified scientific repair subject")
         return native_owner
 
     def _format_recovery_foundry_assignment(self, requests, *, question, domain):
