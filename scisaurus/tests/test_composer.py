@@ -14460,6 +14460,45 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertNotEqual(runner._research_request_signature(order),
                 runner._research_request_signature({**order, 'foundry_work_ref': other['artifact_ref']}))
 
+    def test_methods_format_recovery_does_not_inherit_prior_foundry_failure(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            stage = next(s for s in runner.workflow['stages'] if s['kind']=='experiment')
+            stale = {'foundry_work_ref': 'artifact:command/foundry-work/prior@1',
+                     'gate': 'author_response_format'}
+            for diagnostics in ({'repair_gate': 'repair_adjudication_response'}, {}):
+                with self.subTest(diagnostics=diagnostics):
+                    context = {'repair_feedback': stale,
+                        'model_diagnostics': {'repair_feedback': stale},
+                        'failure_recovery': {'failure_class': 'model_contract',
+                            'model_diagnostics': diagnostics}}
+                    order = runner._format_contract_recovery_request(stage, context)
+                    self.assertNotIn('foundry_work_ref', order)
+                    self.assertNotIn('failure_gate', order)
+                    self.assertIsNone(runner._format_recovery_foundry_assignment(
+                        [order], question='current question', domain='plasma'))
+            context = {'repair_feedback': stale}
+            order = runner._format_contract_recovery_request(stage, context,
+                dossier={'model_diagnostics': {}})
+            self.assertNotIn('foundry_work_ref', order)
+            dossier = runner._publish('command/failure/native-response', 'note', {
+                'stage_id': stage['id'], 'input_sha256': 'a' * 64,
+                'failure_class': 'model_contract',
+                'model_diagnostics': {'repair_gate': 'repair_adjudication_response'}
+            }, 'command.controller')
+            persisted = {**order, 'foundry_work_ref': stale['foundry_work_ref'],
+                'failure_dossier_ref': dossier['artifact_ref'],
+                'failure_input_sha256': 'a' * 64}
+            self.assertIsNone(runner._format_recovery_foundry_assignment(
+                [persisted], question='current question', domain='plasma'))
+            self.assertEqual(runner.department_activity[-1]['action'],
+                             'reconcile_format_recovery_owner')
+            with self.assertRaisesRegex(ValidationError, 'bind its response failure dossier'):
+                runner._format_recovery_foundry_assignment([
+                    {**persisted, 'failure_input_sha256': 'b' * 64}],
+                    question='current question', domain='plasma')
+
     def test_legacy_experiment_author_policy_reopens_once_without_methods_order(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)

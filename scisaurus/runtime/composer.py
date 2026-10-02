@@ -93,7 +93,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-author-bounded-diff-and-resumable-length-continuation-6")
+    "experiment-model-response-owned-format-recovery-7")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -22437,23 +22437,53 @@ class ComposerRunner:
         }
         if policy_revision:
             request["repair_policy_revision"] = policy_revision
-        for diagnostics in (context, recovery.get("model_diagnostics"), context.get("model_diagnostics")):
-            diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
-            feedback = diagnostics.get("repair_feedback")
-            feedback = feedback if isinstance(feedback, dict) else {}
-            if feedback.get("foundry_work_ref"):
-                request["foundry_work_ref"] = feedback["foundry_work_ref"]
-                request["failure_gate"] = feedback.get("gate")
-                break
+        if isinstance(dossier, dict) and "model_diagnostics" in dossier:
+            diagnostics = dossier["model_diagnostics"]
+        elif "model_diagnostics" in recovery:
+            diagnostics = recovery["model_diagnostics"]
+        elif "model_diagnostics" in context:
+            diagnostics = context["model_diagnostics"]
+        else:
+            diagnostics = context
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        feedback = diagnostics.get("repair_feedback")
+        feedback = feedback if isinstance(feedback, dict) else {}
+        if feedback.get("foundry_work_ref"):
+            request["foundry_work_ref"] = feedback["foundry_work_ref"]
+            request["failure_gate"] = feedback.get("gate")
         return request
 
     def _format_recovery_foundry_assignment(self, requests, *, question, domain):
-        refs = {
-            order["foundry_work_ref"] for order in requests
-            if isinstance(order, dict) and order.get("kind") == "recovery"
-            and order.get("recovery_mode") == "format_repair_then_rerun"
-            and isinstance(order.get("foundry_work_ref"), str)
-        }
+        refs = set()
+        for order in requests:
+            if (not isinstance(order, dict) or order.get("kind") != "recovery"
+                    or order.get("recovery_mode") != "format_repair_then_rerun"):
+                continue
+            ref = order.get("foundry_work_ref")
+            dossier_ref = order.get("failure_dossier_ref")
+            if isinstance(dossier_ref, str):
+                _, _, dossier = self._read_verified_artifact_json(dossier_ref)
+                if (dossier.get("stage_id") != order.get("target_stage_id")
+                        or dossier.get("input_sha256") != order.get("failure_input_sha256")
+                        or dossier.get("failure_class") != "model_contract"):
+                    raise ValidationError("format recovery does not bind its response failure dossier")
+                if "model_diagnostics" in dossier:
+                    diagnostics = dossier["model_diagnostics"]
+                    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+                    feedback = diagnostics.get("repair_feedback")
+                    feedback = feedback if isinstance(feedback, dict) else {}
+                    authoritative_ref = feedback.get("foundry_work_ref")
+                    if ref != authoritative_ref:
+                        self.department_activity.append({
+                            "action": "reconcile_format_recovery_owner",
+                            "stage_id": order.get("target_stage_id"),
+                            "failure_dossier_ref": dossier_ref,
+                            "retired_foundry_work_ref": ref,
+                            "foundry_work_ref": authoritative_ref,
+                        })
+                    ref = authoritative_ref
+            if isinstance(ref, str):
+                refs.add(ref)
         if not refs:
             return None
         if len(refs) != 1:
