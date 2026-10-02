@@ -5568,6 +5568,9 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                            "credential_env": exc.credential_env}
             elif isinstance(exc, ModelCallError):
                 failure = exc.failure_details()
+            elif isinstance(exc, ModelContractError):
+                failure = {"kind": "model_contract", "failure_class": exc.failure_class,
+                           "recovery_mode": exc.recovery_mode}
             elif isinstance(exc, ModelContextBudgetError):
                 failure = {"kind": "context_budget", "failure_class": exc.failure_class,
                            "model": exc.model, "estimated_input_tokens": exc.estimated_input_tokens,

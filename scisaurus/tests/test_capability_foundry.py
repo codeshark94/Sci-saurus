@@ -3843,6 +3843,55 @@ class IndependentValidatorAuthorshipTests(unittest.TestCase):
             self.assertEqual(outcome['status'], 'registered')
             self.assertEqual((producer.calls, foundry.validator_client.calls), (1, 2))
 
+    def test_exhausted_validator_contract_preserves_owner_and_executor(self):
+        from scisaurus.runtime.failure_recovery import classify_failure
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            producer = StubClient(CapabilityFoundryTests._payload())
+            foundry.validator_client = StubClient({'validator_source':
+                MINI_VALIDATOR.replace('"evidence":', '"detail":')})
+            cache = CapabilityFoundryTests._cache(self, root)
+            states = []
+            for _ in range(2):
+                with self.assertRaises(ModelWorkBlocked) as blocked:
+                    foundry.generate('bounded comparison', client=producer,
+                        work_cache=cache, on_progress=lambda phase, state: states.append(state))
+                error = blocked.exception
+                self.assertEqual(error.failure_class, 'model_contract')
+                self.assertEqual(error.recovery_mode, 'format_repair_then_rerun')
+                self.assertEqual(error.repair_gate, 'independent_validator_contract')
+                self.assertEqual(classify_failure('experiment', error), 'model_contract')
+                self.assertEqual(error.repair_ledger[-1]['gate'], 'independent_validator_contract')
+                self.assertEqual(error.repair_ledger[-1]['next_action'], 'format_repair_then_rerun')
+                self.assertEqual((producer.calls, foundry.validator_client.calls), (1, 2))
+            state = states[-1]
+            self.assertEqual(state['last_attempt']['executor_source'], MINI_EXECUTOR)
+            self.assertFalse(state['failed_candidates'])
+            self.assertEqual(state['last_failure_class'], 'model_contract')
+            self.assertEqual(state['last_failure_gate'], 'independent_validator_contract')
+            self.assertFalse(list((root / 'registry').glob('**/*.json')))
+
+    def test_cached_recalculation_rejection_preserves_scientific_gate(self):
+        from scisaurus.runtime.failure_recovery import classify_failure
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            producer = StubClient(CapabilityFoundryTests._payload())
+            source = MINI_VALIDATOR.replace('    reported =', '    p95 += 1\n    reported =')
+            foundry.validator_client = StubClient({'validator_source': source})
+            cache = CapabilityFoundryTests._cache(self, root)
+            states = []
+            for _ in range(2):
+                with self.assertRaises(ModelWorkBlocked) as blocked:
+                    foundry.generate('bounded comparison', client=producer, work_cache=cache,
+                        on_progress=lambda phase, state: states.append(state))
+                self.assertEqual(blocked.exception.failure_class, 'experiment_capability_repair')
+                self.assertEqual(blocked.exception.repair_gate, 'independent_recalculation')
+                self.assertEqual(classify_failure('experiment', blocked.exception), 'experiment_failure')
+            self.assertTrue(states[-1]['failed_candidates'])
+            self.assertFalse(list((root / 'registry').glob('**/*.json')))
+
     def test_repaired_approval_retains_prior_issue_contract_on_cached_reuse(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)

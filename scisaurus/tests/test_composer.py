@@ -1663,8 +1663,15 @@ class ComposerWorkflowTests(unittest.TestCase):
                 failure.failure_class = "model_contract"
                 failure.recovery_mode = "format_repair_then_rerun"
                 failure.repair_gate = "analysis_output_contract"
+                failure.repair_feedback = {"gate": "analysis_output_contract", "feedback": "Invalid schema."}
+                failure.stage_result = {"status": "blocked", "raw_results": {"observations": [1, 2]}}
+                failure.usage = {"model_calls": 3}
+                failure.foundry_usage = {"model_calls": 2}
+                failure.repair_panel_usage = {"model_calls": 1}
+                executions = []
 
                 def fail(*_args, **_kwargs):
+                    executions.append(1)
                     raise failure
 
                 runner._execute_stage = fail
@@ -1676,6 +1683,15 @@ class ComposerWorkflowTests(unittest.TestCase):
                                  "format_repair_then_rerun")
                 self.assertEqual(raised.exception.repair_gate,
                                  "analysis_output_contract")
+                self.assertEqual(raised.exception.usage, failure.usage)
+                with self.assertRaises(ModelWorkBlocked) as cached:
+                    runner._run_stage(runner.workflow["stages"][1])
+                self.assertEqual(executions, [1])
+                for field in ('failure_class', 'recovery_mode', 'repair_gate', 'repair_feedback',
+                              'stage_result', 'capability_repair_panel_completed'):
+                    self.assertEqual(getattr(cached.exception, field), getattr(failure, field))
+                for field in ('usage', 'foundry_usage', 'repair_panel_usage'):
+                    self.assertEqual(getattr(cached.exception, field), {})
             finally:
                 runner.close()
 
@@ -4986,6 +5002,35 @@ class ComposerWorkflowTests(unittest.TestCase):
         self.assertIsNone(rejected)
         self.assertIn("not verified", error)
 
+    def test_repair_plan_admission_preserves_all_selected_actions_and_checks(self):
+        packet = {"topic": {"id": "topic"}, "failure_lineage": {
+            "identity_verified": True, "stage_id": "experiment", "attempt_number": 3,
+            "failure_dossier_ref": "artifact:failure/attempt-3@1", "failure_input_sha256": "a" * 64},
+            "repair_contract": {"check_phase_protocol": "repair-check-phases-1", "must_prove": []}}
+        plan = {"disposition": "repair", "root_cause": {
+            "statement": "Multiple source defects require coordinated repair.",
+            "evidence": [f"Immutable trace {i}" for i in range(9)]},
+            "required_changes": [{"target": f"source-{i}", "instruction": f"Repair observed defect {i}.",
+                "scientific_basis": "Preserve the defined estimand.",
+                "source_refs": [f"source-{j}" for j in range(7)]} for i in range(8)],
+            "acceptance_checks": [{"phase": "execution", "check": f"Reproduce check {i}."} for i in range(17)],
+            "residual_uncertainties": [f"Scoped uncertainty {i}" for i in range(9)]}
+        report = {"status": "succeeded", "response": {"decision": "repair", "raw": {"repair_plan": plan}}}
+        validated, error = ComposerRunner._validated_capability_repair_plan(report, packet)
+        self.assertIsNone(error)
+        for field in ("root_cause", "required_changes", "acceptance_checks", "residual_uncertainties"):
+            self.assertEqual(validated[field], plan[field])
+        projection = ComposerRunner._capability_authoring_repair_projection({
+            "schema_version": "capability-repair-panel-6", "decision": "repair", "repair_plan": validated})
+        self.assertEqual(projection['repair_plan'], validated)
+        for field, value in (("required_changes", [{}]), ("acceptance_checks", [{"phase": "later", "check": "Invalid."}]),
+                             ("residual_uncertainties", [None])):
+            malformed = deepcopy(report)
+            malformed["response"]["raw"]["repair_plan"][field] = value
+            self.assertIsNone(ComposerRunner._validated_capability_repair_plan(malformed, packet)[0])
+        self.assertEqual(ComposerRunner._capability_repair_verdict(validated, {
+            "status": "succeeded", "response": {"decision": "hold", "blocking_findings": ["Unresolved estimand."]}})[0], "hold")
+
     def test_preexecution_verifier_dissent_blocks_capability_admission(self):
         plan = {
             "acceptance_checks": ["recalculate the primary slope independently"],
@@ -5168,9 +5213,9 @@ class ComposerWorkflowTests(unittest.TestCase):
             rejected, error = ComposerRunner._validated_capability_repair_plan(changed, packet)
             self.assertIsNone(rejected)
             self.assertIn("topic identity", error)
-        for field, value in (("required_changes", plan["required_changes"] * 7),
-                             ("root_cause", {**plan["root_cause"], "evidence": ["evidence"] * 9}),
-                             ("residual_uncertainties", ["uncertainty"] * 9),
+        for field, value in (("required_changes", [{"target": "design"}]),
+                             ("root_cause", {**plan["root_cause"], "evidence": [None]}),
+                             ("residual_uncertainties", [None]),
                              ("acceptance_checks", [{"invalid": "check"}])):
             changed = deepcopy(report)
             changed["response"]["raw"]["repair_plan"][field] = value

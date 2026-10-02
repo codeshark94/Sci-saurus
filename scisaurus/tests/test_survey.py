@@ -2938,6 +2938,14 @@ class TestSurveyRunner(unittest.TestCase):
         first = self.runtime(config, work_orders=orders)
         with patch.object(first, "_nominate", side_effect=ModelContractError("nomination response malformed")):
             failed = first.run()
+        self.assertEqual(failed["failure"], {
+            "kind": "model_contract", "failure_class": "model_contract",
+            "recovery_mode": "format_repair_then_rerun"})
+        from scisaurus.runtime.composer import ComposerRunner
+        from scisaurus.runtime.failure_recovery import classify_failure
+        with self.assertRaises(ModelContractError) as blocked:
+            ComposerRunner._raise_stage_failure(failed)
+        self.assertEqual(classify_failure("survey", blocked.exception, failed), "model_contract")
         self.assertTrue(failed["survey_current"])
         self.assertFalse(failed["assessment_current"])
         self.assertIsNone(failed["nomination"])

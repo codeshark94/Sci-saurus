@@ -33,7 +33,7 @@ from types import SimpleNamespace
 
 from scisaurus.core.errors import (
     ConflictError, NotFoundError, ProviderConfigurationError, ProviderRateLimitError, QuotaExceededError, StateError,
-    ValidationError,
+    ModelContractError, ValidationError,
 )
 from scisaurus.core.events import ControlStore
 from scisaurus.core.messages import MessageBus
@@ -213,7 +213,7 @@ EXPERIMENT_RESULT_METADATA_FIELDS = frozenset({
 MAX_EXPERIMENT_RESULT_PACKAGE_BYTES = 16 * 1024 * 1024
 CAPABILITY_REPAIR_SOURCE_CHARS = 64_000
 CAPABILITY_REPAIR_PANEL_SCHEMA_VERSION = "capability-repair-panel-8"
-CAPABILITY_REPAIR_PANEL_PROMPT_REVISION = "repair-plan-owned-evidence-actions-14"
+CAPABILITY_REPAIR_PANEL_PROMPT_REVISION = "repair-plan-owned-evidence-actions-15"
 SURVEY_EVIDENCE_REQUEST_POLICY_REVISION = 2
 CAPABILITY_REPAIR_REVIEW_EVIDENCE_REVISION = "immutable-research-evidence-v2"
 CAPABILITY_REPAIR_UNRESOLVED_SOURCE_FILES = 2
@@ -1382,6 +1382,17 @@ class ComposerRunner:
             if hasattr(source, name):
                 setattr(target, name, deepcopy(getattr(source, name)))
         return target
+
+    @staticmethod
+    def _stage_failure_metadata(error):
+        """Retain failure ownership and evidence across wrappers and cache replay."""
+        return {name: deepcopy(getattr(error, name)) for name in (
+            "failure_class", "recovery_mode", "repair_gate", "repair_attempts",
+            "repair_ledger", "repair_feedback", "model_diagnostics",
+            "capability_repair_panel_completed", "capability_repair_panel_attempted",
+            "repair_subject", "research_argument", "research_review", "research_feedback",
+            "research_response", "research_review_argument_sha256", "stage_result", "failure_scope",
+        ) if getattr(error, name, None) is not None}
 
     def _record_capability_repair_panel_usage(self, stage, panel, *, already_charged=False):
         """Settle a completed Methods invoice before downstream authoring."""
@@ -11708,13 +11719,9 @@ class ComposerRunner:
                 or not evidence
                 or any(not isinstance(item, str) or not item.strip() for item in evidence)):
             return None, "the root cause is missing a concrete evidence link"
-        if len(evidence) > 8:
-            return None, "the repair plan has more than 8 root-cause evidence links"
         changes = plan.get("required_changes")
         if not isinstance(changes, list) or not changes:
             return None, "the repair plan has no selected source or design change"
-        if len(changes) > 6:
-            return None, "the repair plan has more than 6 selected changes"
         normalized_changes = []
         for change in changes:
             if not isinstance(change, dict):
@@ -11726,7 +11733,7 @@ class ComposerRunner:
                 return None, "a selected repair change lacks its target, instruction, or scientific basis"
             if "source_refs" not in change:
                 fields["source_refs"] = []
-            if not isinstance(fields["source_refs"], list) or len(fields["source_refs"]) > 6 or any(
+            if not isinstance(fields["source_refs"], list) or any(
                     not isinstance(item, str) for item in fields["source_refs"]):
                 return None, "a selected repair change has invalid source references"
             normalized_changes.append(deepcopy(fields))
@@ -11771,10 +11778,8 @@ class ComposerRunner:
                 normalized_checks.append(normalized)
         if not normalized_checks:
             return None, "the repair plan has no falsifiable acceptance checks"
-        if len(normalized_checks) > 16:
-            return None, "the bounded repair contract has more than 16 acceptance checks"
         uncertainties = plan.get("residual_uncertainties", [])
-        if (not isinstance(uncertainties, list) or len(uncertainties) > 8
+        if (not isinstance(uncertainties, list)
                 or any(not isinstance(item, str) for item in uncertainties)):
             return None, "the repair plan has invalid residual uncertainties"
         return {
@@ -21360,6 +21365,11 @@ class ComposerRunner:
             if not scientific_recovery and not format_recovery:
                 blocked = ModelWorkBlocked(retained["error"],
                                            failure_class=retained.get("failure_class"))
+                for name, value in retained.get("failure_metadata", {}).items():
+                    setattr(blocked, name, deepcopy(value))
+                blocked.usage = {}
+                blocked.foundry_usage = {}
+                blocked.repair_panel_usage = {}
                 if retained.get("failure_class") == "context_budget":
                     blocked.failure_class = "context_budget"
                     blocked.context_budget = deepcopy(retained.get("context_budget", {}))
@@ -21432,27 +21442,16 @@ class ComposerRunner:
                      or self._retry_policy().get("max_attempts") or 3)
             exhausted = isinstance(exc, ModelWorkBlocked) or failures >= limit
             error = f"Unchanged {stage['id']} input failed {failures} time(s): {type(exc).__name__}: {exc}"
+            failure_metadata = self._stage_failure_metadata(exc)
             cache.put(key, {"status": "blocked" if exhausted else "repairing",
                             "failed_attempts": failures, "error": error,
-                            "failure_class": getattr(exc, "failure_class", None)})
+                            "failure_class": getattr(exc, "failure_class", None),
+                            "failure_metadata": failure_metadata})
             if exhausted:
                 blocked = ModelWorkBlocked(error)
-                for attribute in (
-                        "failure_class", "recovery_mode", "repair_gate",
-                        "repair_attempts", "repair_ledger", "repair_feedback",
-                        "model_diagnostics", "capability_repair_panel_completed",
-                        "capability_repair_panel_attempted", "repair_subject"):
-                    if hasattr(exc, attribute):
-                        setattr(blocked, attribute, deepcopy(getattr(exc, attribute)))
-                for attribute in ("research_argument", "research_review", "research_feedback",
-                                  "research_response", "research_review_argument_sha256"):
-                    value = getattr(exc, attribute, None)
-                    if value is not None:
-                        setattr(blocked, attribute, deepcopy(value))
+                for name, value in failure_metadata.items():
+                    setattr(blocked, name, deepcopy(value))
                 self._copy_error_accounting(exc, blocked)
-                stage_result = getattr(exc, "stage_result", None)
-                if isinstance(stage_result, dict):
-                    blocked.stage_result = deepcopy(stage_result)
                 raise blocked from exc
             raise
         if result.get("status") in STAGE_READY_STATUSES:
@@ -21500,6 +21499,10 @@ class ComposerRunner:
             # not reduce an exhausted model-contract retry to a bare string;
             # the Composer's failure panel needs the observed refs and gate
             # state to issue a useful repair order.
+            error.stage_result = deepcopy(result)
+            error.failure_scope = "stage"
+        elif failure.get("kind") == "model_contract":
+            error = ModelContractError(result.get("error") or "stage model response violates its contract")
             error.stage_result = deepcopy(result)
             error.failure_scope = "stage"
         elif failure.get("kind") == "operational_state":

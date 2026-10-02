@@ -340,6 +340,9 @@ class CapabilityModelBudgetExceeded(ModelWorkBlocked):
 
 def _repair_gate(error):
     """Return the admission gate that produced a repairable failure."""
+    gate = getattr(error, "repair_gate", None)
+    if isinstance(gate, str) and gate:
+        return gate
     feedback = getattr(error, "feedback", None)
     if isinstance(feedback, dict) and isinstance(feedback.get("gate"), str):
         return feedback["gate"]
@@ -2402,7 +2405,7 @@ class CapabilityFoundry:
             error.repair_gate = (
                 ("author_response_format" if format_response_incomplete else
                  failure_gate or "author_response_format") if format_failure else
-                validation_feedback.get("gate") or exhausted.get("gate"))
+                validation_feedback.get("gate") or failure_gate or exhausted.get("gate"))
             error.repair_attempts = exhausted.get("failures", 0)
             error.repair_ledger = deepcopy_config(state.get("repair_ledger", [])[-8:])
             summary = state.get("feedback")
@@ -3962,6 +3965,9 @@ class CapabilityFoundry:
                     else normalized_error)
                 output_contract_failure = isinstance(
                     exc, ExperimentProgramOutputContractError)
+                scoped_contract_failure = (
+                    isinstance(exc, ModelWorkBlocked)
+                    and getattr(exc, "failure_class", None) == "model_contract")
                 format_envelope = (
                     partial_intent_response
                     or (candidate_fingerprint is None
@@ -3975,6 +3981,7 @@ class CapabilityFoundry:
                 state["last_failure_class"] = (
                     "model_contract" if (
                         format_envelope
+                        or scoped_contract_failure
                         or isinstance(exc, ModelContractError)
                         or isinstance(exc, AnalysisContractError)
                         or output_contract_failure
@@ -4020,7 +4027,7 @@ class CapabilityFoundry:
                     _record_program_gate_feedback(state, exc.feedback, attempt_value)
                 if feedback not in failures:
                     failures.append(feedback)
-                if candidate_fingerprint is not None:
+                if candidate_fingerprint is not None and not scoped_contract_failure:
                     state.setdefault("failed_candidates", {})[candidate_fingerprint] = feedback
                     state.setdefault("failed_candidate_failure_classes", {})[
                         candidate_fingerprint] = state["last_failure_class"]
@@ -4054,7 +4061,9 @@ class CapabilityFoundry:
                     "failure_signature": failure_signature,
                     "validation_context": deepcopy_config(state.get("validation_context", {})),
                     "validation_feedback": deepcopy_config(state.get("validation_feedback", {})),
-                    "next_action": "source_level_repair_then_fresh_replay",
+                    "next_action": (getattr(exc, "recovery_mode", None)
+                                    if scoped_contract_failure else
+                                    "source_level_repair_then_fresh_replay"),
                 })
                 state["repair_ledger"] = state["repair_ledger"][-12:]
                 if gate:
