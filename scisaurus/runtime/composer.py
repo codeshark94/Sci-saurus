@@ -26568,6 +26568,47 @@ class ComposerRunner:
                 blocker["superseded_by_dossier_ref"] = corrected_manifest["artifact_ref"]
         return True
 
+    def _retire_native_operational_stops(self, stage, record, run, receipt_ref):
+        """A verified completed producer supersedes its recovered operational stops."""
+        reasons = {"provider_rate_limit", "provider_configuration", "operational_state"}
+        pending = [item for item in self.blockers if isinstance(item, dict)
+                   and item.get("stage_id") == stage["id"] and item.get("stop_reason") in reasons
+                   and item.get("recovery") not in {"cycle_admitted", "superseded_by_current_stage_state"}]
+        if not pending or not isinstance(receipt_ref, str) or run.get("status") != "completed":
+            return False
+        number = record.get("attempt_number")
+        if type(number) is not int or number < 1:
+            return False
+        if not any(attempt.get("attempt_number") == number and attempt.get("state") in {"succeeded", "completed"}
+                   for attempt in record.get("attempts", []) if isinstance(attempt, dict)):
+            return False
+        if (not isinstance(record.get("attempt_id"), str)
+                or self.tasks.get_attempt(record["attempt_id"])["state"] != "succeeded"):
+            return False
+        manifest, _, receipt = self._read_verified_artifact_json(receipt_ref)
+        project = Path(record.get("project_dir") or stage["project_dir"]).resolve()
+        if (manifest.get("author") != "command.composer" or receipt.get("stage_id") != stage["id"]
+                or receipt.get("schema_version") != "native-survey-reconciliation-1"
+                or receipt.get("project_dir") != str(project)
+                or receipt.get("result", {}).get("run_id") != run.get("run_id")):
+            raise StateError("operational recovery requires the exact owned reconciliation")
+        with closing(sqlite3.connect((project / "state/control.sqlite").as_uri() + "?mode=ro", uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            store = ArtifactStore(SimpleNamespace(dir=str(project), _conn=connection))
+            final = store.head("command/results/final")
+            raw = store.read_body(final["body_hash"])
+            if (final["artifact_ref"] != receipt["producer_ref"] or final["body_hash"] != receipt["producer_sha256"]
+                    or hashlib.sha256(raw).hexdigest() != final["body_hash"] or json.loads(raw) != run):
+                raise StateError("operational recovery does not match the completed native producer")
+        changed = False
+        for item in pending:
+            if type(item.get("attempt_number")) is int and item["attempt_number"] > number:
+                continue
+            item.update(recovery="superseded_by_current_stage_state", recovered_by_receipt=receipt_ref)
+            changed = True
+        return changed
+
     def _reconcile_latest_survey_results(self):
         """Consume an owned immutable native receipt without inheriting an older approval."""
         reconciled = []
@@ -26604,6 +26645,8 @@ class ComposerRunner:
                 "work_orders_sha256": hashlib.sha256(canonical_bytes(self._follow_up_projection(self._requests_for_stage(stage)))).hexdigest()}
             if run.get("run_id") == incumbent.get("run_id") and (not incumbent.get("native_reconciliation_ref")
                     or incumbent.get("native_reconciliation_scope") == scope):
+                if self._retire_native_operational_stops(stage, record, run, incumbent.get("native_reconciliation_ref")):
+                    self._checkpoint("resume:retire_completed_native_operational_stops", force=True)
                 continue
             with closing(sqlite3.connect((project / "state/control.sqlite").as_uri() + "?mode=ro", uri=True)) as connection:
                 connection.row_factory = sqlite3.Row
@@ -26659,6 +26702,7 @@ class ComposerRunner:
                     "result": fresh, "inherited_approval": False, "model_calls": 0}, "command.composer")
             fresh["native_reconciliation_ref"] = receipt["artifact_ref"]
             self.context[stage["id"]] = fresh
+            self._retire_native_operational_stops(stage, record, run, receipt["artifact_ref"])
             for key in ("composer_decision", "verifier_artifact_ref", "verifier_outcome", "specialist_assignments"):
                 self.stage_records[stage["id"]].pop(key, None)
             self.stage_records[stage["id"]].update(status=fresh["status"], native_reconciliation_ref=receipt["artifact_ref"],

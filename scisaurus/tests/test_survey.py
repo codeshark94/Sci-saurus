@@ -1961,6 +1961,30 @@ class TestSurveyRunner(unittest.TestCase):
             self.assertTrue(resumed.context["survey"]["release_blocking"])
             self.assertFalse(resumed._stage_releases_dependencies(resumed.stage_records["survey"], stage_kind="survey"))
             self.assertEqual(resumed._reconcile_latest_survey_results(), [])
+        historical = {"stage_id": "survey", "stop_reason": "provider_rate_limit", "reason": "Captured HTTP429"}
+        scientific = {"stage_id": "survey", "stop_reason": "scientific_evidence", "reason": "Input remains missing"}
+        future = {"stage_id": "survey", "stop_reason": "operational_state", "attempt_number": 999, "reason": "Later failure"}
+        resumed.blockers.extend([historical, scientific, future])
+        with patch.object(resumed, "_current_topic_identity", return_value=identity), \
+                patch.object(resumed, "_requests_for_stage", return_value=[id_only_order]), \
+                patch.object(resumed.tasks, "get_attempt", return_value={"state": "failed"}):
+            self.assertEqual(resumed._reconcile_latest_survey_results(), [])
+            self.assertNotIn("recovery", historical)
+        original_export = exported_path.read_bytes()
+        exported_path.write_bytes(canonical_bytes({**native, "usage": {"model_calls": 99999}}))
+        with patch.object(resumed, "_current_topic_identity", return_value=identity), \
+                patch.object(resumed, "_requests_for_stage", return_value=[id_only_order]), \
+                self.assertRaisesRegex(StateError, "completed native producer"):
+            resumed._reconcile_latest_survey_results()
+        exported_path.write_bytes(original_export)
+        self.assertNotIn("recovery", historical)
+        with patch.object(resumed, "_current_topic_identity", return_value=identity), \
+                patch.object(resumed, "_requests_for_stage", return_value=[id_only_order]):
+            self.assertEqual(resumed._reconcile_latest_survey_results(), [])
+        self.assertEqual(historical["recovery"], "superseded_by_current_stage_state")
+        self.assertEqual(historical["reason"], "Captured HTTP429")
+        self.assertNotIn("recovery", scientific)
+        self.assertNotIn("recovery", future)
         resumed.context["topic"] = {"topic": {"research_question": config["survey"]["question"]},
             "specialist_verifier": {"artifact_ref": "artifact:command/new-governing-review@1"}}
         with patch.object(resumed, "_current_topic_identity", return_value=identity), \
