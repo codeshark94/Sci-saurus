@@ -26714,8 +26714,25 @@ class ComposerRunner:
             self._checkpoint("resume:consume_current_native_surveys", force=True)
         return reconciled
 
+    def _stage_has_pending_continuation(self, stage_id):
+        by_id = {stage["id"]: stage for stage in self.workflow["stages"]}
+        return stage_id in self._continuation_targets(self._continuation_requests(), by_id)
+
+    def _stage_boundary_is_settled(self, stage_id):
+        record = self.stage_records.get(stage_id, {})
+        context = self.context.get(stage_id, {})
+        return (record.get("status") in {"completed", "accepted"}
+                and context.get("status", record.get("status")) in {"completed", "accepted"}
+                and record.get("release_blocking") is not True
+                and context.get("release_blocking") is not True
+                and not any(isinstance(item.get("failure_debt"), dict)
+                       and item["failure_debt"].get("release_blocking") is True
+                       for item in (record, context)))
+
     def _pause_at_stage_boundary(self, stage_id):
-        if self.stop_after_stage != stage_id:
+        if self.stop_after_stage != stage_id or not self._stage_boundary_is_settled(stage_id):
+            return False
+        if self._stage_has_pending_continuation(stage_id):
             return False
         self.status = "paused"
         self.blockers.append({"stage_id": "workflow", "boundary_stage_id": stage_id, "reason": "declared operator stage boundary reached",
@@ -26738,9 +26755,16 @@ class ComposerRunner:
                     return self._finish()
             self._reconcile_interrupted_stage_attempts()
             self._reconcile_latest_survey_results()
-            if self.stop_after_stage is not None and self.stage_records.get(self.stop_after_stage, {}).get("status") in {"completed", "candidate_needs_review", "research_expansion_required", "review_rejected"}:
-                if self._pause_at_stage_boundary(self.stop_after_stage):
-                    return self._finish()
+            if self.stop_after_stage is not None and self._pause_at_stage_boundary(self.stop_after_stage):
+                return self._finish()
+            if (self.stop_after_stage is not None
+                    and self.stage_records.get(self.stop_after_stage, {}).get("status") in {
+                        "completed", "accepted", "candidate_needs_review"}
+                    and not self._stage_boundary_is_settled(self.stop_after_stage)
+                    and not self._stage_has_pending_continuation(self.stop_after_stage)):
+                self.status = "candidate_needs_review"
+                self._checkpoint(f"{self.stop_after_stage}:boundary_review_required", force=True)
+                return self._finish()
             self._execution_started = True
             self.status = "running"
             by_id = {stage["id"]: stage for stage in self.workflow["stages"]}
@@ -26982,6 +27006,17 @@ class ComposerRunner:
             # interrupted run from silently treating an old proposal as data.
             held = {stage_id for stage_id, row in self.stage_records.items()
                     if row.get("status") in STAGE_HOLD_STATUSES}
+            if (self.stop_after_stage is not None
+                    and not held and not migration_reopened
+                    and self.stop_after_stage not in self.continuation_pending_stage_ids
+                    and self._stage_has_pending_continuation(self.stop_after_stage)):
+                migration_reopened = self._begin_continuation(completed, by_id)
+                if migration_reopened:
+                    self._checkpoint("continuation:boundary_work_admitted", force=True)
+                else:
+                    self.status = "research_expansion_required"
+                    self._checkpoint("continuation:boundary_work_unavailable", force=True)
+                    return self._finish()
             if held and not migration_reopened and self._begin_continuation(completed, by_id):
                 self._checkpoint("continuation:resume_admitted", force=True)
             elif held and not migration_reopened:
@@ -28283,7 +28318,16 @@ class ComposerRunner:
                             self.stage_records.get(stage_id, {}))
                         if self._pause_at_stage_boundary(stage_id):
                             return self._finish()
-                        if context.get("status") in STAGE_HOLD_STATUSES:
+                        if (self.stop_after_stage == stage_id
+                                and not self._stage_boundary_is_settled(stage_id)
+                                and context.get("status") not in STAGE_HOLD_STATUSES
+                                and not self._stage_has_pending_continuation(stage_id)):
+                            self.status = "candidate_needs_review"
+                            self._checkpoint(f"{stage_id}:boundary_review_required", force=True)
+                            return self._finish()
+                        if (context.get("status") in STAGE_HOLD_STATUSES
+                                or (self.stop_after_stage == stage_id
+                                    and self._stage_has_pending_continuation(stage_id))):
                             # A hold is a control decision, not a successful
                             # dependency.  Start the owning continuation now;
                             # otherwise return the hold without admitting a
@@ -28293,8 +28337,10 @@ class ComposerRunner:
                                 self._checkpoint(f"{stage_id}:continuation_admitted", force=True)
                                 progress = True
                                 break
-                            self.status = context["status"]
-                            self._checkpoint(f"{stage_id}:{context['status']}", force=True)
+                            self.status = (context["status"]
+                                           if context["status"] in STAGE_HOLD_STATUSES
+                                           else "research_expansion_required")
+                            self._checkpoint(f"{stage_id}:{self.status}", force=True)
                             return self._finish()
                         self._checkpoint(
                             f"{stage_id}:release_blocked" if release_blocking

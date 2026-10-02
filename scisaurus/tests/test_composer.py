@@ -287,6 +287,192 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(calls, ["survey", "experiment"])
             self.assertEqual(advanced["status"], "completed")
 
+    def test_stage_boundary_rejects_unsettled_results_and_owned_continuations(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)), stop_after_stage="survey")
+            self.addCleanup(runner.close)
+            for status in ("research_expansion_required", "review_rejected", "candidate_needs_review",
+                           "retrying", "running"):
+                runner.stage_records["survey"] = {"status": status}
+                runner.context["survey"] = {"status": status}
+                self.assertFalse(runner._pause_at_stage_boundary("survey"), status)
+            for field in ({"release_blocking": True}, {"failure_debt": {"release_blocking": True}}):
+                runner.stage_records["survey"] = {"status": "completed", **field}
+                runner.context["survey"] = {"status": "completed"}
+                self.assertFalse(runner._pause_at_stage_boundary("survey"))
+            runner.stage_records["survey"] = {"status": "completed"}
+            runner.context["survey"] = {"status": "completed", "research_requests": [{
+                "id": "source-follow-up", "kind": "literature_expansion", "owner": "research.intelligence",
+                "objective": "Check the missing source condition.", "why": "The recorded condition is incomplete.",
+                "success_condition": "The condition is captured or recorded unavailable.",
+                "evidence_needed": "Exact retained source and capture.", "target_stage_id": "survey"}]}
+            self.assertFalse(runner._pause_at_stage_boundary("survey"))
+            runner.context["survey"]["research_requests"][0].update(
+                kind="analysis_repair", owner="methods.validation", target_stage_id="experiment")
+            self.assertEqual(len(runner._continuation_requests()), 1)
+            self.assertTrue(runner._pause_at_stage_boundary("survey"))
+
+    def test_stop_after_stage_finishes_internal_follow_up_before_pausing(self):
+        for first_status in ("research_expansion_required", "completed"):
+            with self.subTest(first_status=first_status), tempfile.TemporaryDirectory() as path:
+                root = Path(path); workflow = self._workflow(root)
+                workflow["continuation_policy"] = {"mode": "bounded", "max_cycles": 2}
+                runner = ComposerRunner(workflow, stop_after_stage="survey")
+                calls = []
+                def produce(stage, **kwargs):
+                    calls.append(stage["id"])
+                    self.assertEqual(stage["id"], "survey")
+                    output = root / f"survey-{len(calls)}.json"; output.write_text("{}")
+                    result = {"status": "completed", "output_path": str(output),
+                              "project_dir": stage["project_dir"], "stage_id": stage["id"]}
+                    if len(calls) == 1:
+                        result.update(status=first_status, research_requests=[{
+                            "id": "source-follow-up", "kind": "literature_expansion",
+                            "owner": "research.intelligence", "target_stage_id": "survey",
+                            "objective": "Check the missing source condition.",
+                            "why": "The recorded condition is incomplete.",
+                            "success_condition": "The condition is captured or recorded unavailable.",
+                            "evidence_needed": "Exact retained source and capture."}])
+                    if len(calls) > 2:
+                        raise AssertionError("completed follow-up was redispatched")
+                    return result
+                with patch.object(runner, "_run_stage", side_effect=produce), \
+                        patch.object(runner, "_survey_request_was_fulfilled", return_value=True), \
+                        patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient):
+                    result = runner.run()
+                self.assertEqual(calls, ["survey", "survey"])
+                self.assertEqual(result["status"], "paused")
+                self.assertEqual(result["interim_report"]["stop_reason"], "operator_stage_boundary")
+                self.assertEqual(result["stages"]["survey"]["status"], "completed")
+
+    def test_boundary_candidate_cannot_dispatch_downstream_on_fresh_or_resume(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path); workflow = self._workflow(root)
+            workflow["progression_policy"] = "forward_first"
+            runner = ComposerRunner(workflow, stop_after_stage="survey")
+            calls = []
+            def produce(stage, **kwargs):
+                calls.append(stage["id"])
+                output = root / "candidate.json"; output.write_text("{}")
+                return {"status": "candidate_needs_review", "release_blocking": False,
+                        "composer_decision": "advance_with_findings", "output_path": str(output),
+                        "project_dir": stage["project_dir"], "stage_id": stage["id"]}
+            with patch.object(runner, "_run_stage", side_effect=produce), \
+                    patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient):
+                candidate = runner.run()
+            self.assertEqual(calls, ["survey"])
+            self.assertEqual(candidate["status"], "candidate_needs_review")
+            self.assertNotEqual(candidate.get("interim_report", {}).get("stop_reason"), "operator_stage_boundary")
+            resumed = ComposerRunner(workflow, resume=True, stop_after_stage="survey")
+            with patch.object(resumed, "_run_stage", side_effect=AssertionError("candidate cannot cross boundary")):
+                retained = resumed.run()
+            self.assertEqual(retained["status"], "candidate_needs_review")
+            self.assertEqual(retained["usage"], candidate["usage"])
+            self.assertEqual(retained["deadline_at_epoch"], candidate["deadline_at_epoch"])
+
+    def test_boundary_resume_admits_retained_follow_up_and_fences_unavailable_continuation(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path); workflow = self._workflow(root)
+            workflow["continuation_policy"] = {"mode": "bounded", "max_cycles": 2}
+            runner = ComposerRunner(workflow, stop_after_stage="survey")
+            output = root / "survey.json"; output.write_text("{}")
+            result = {"status": "completed", "output_path": str(output),
+                      "project_dir": workflow["stages"][0]["project_dir"], "stage_id": "survey"}
+            order = {"id": "retained-follow-up", "kind": "literature_expansion",
+                     "owner": "research.intelligence", "target_stage_id": "survey",
+                     "objective": "Check the retained source condition.", "why": "A source condition is missing.",
+                     "success_condition": "The condition is captured or recorded unavailable.",
+                     "evidence_needed": "The retained source and exact capture."}
+            with patch.object(runner, "_run_stage", return_value={**result, "research_requests": [order]}), \
+                    patch.object(runner, "_begin_continuation", return_value=False), \
+                    patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient):
+                held = runner.run()
+            self.assertEqual(held["status"], "research_expansion_required")
+            self.assertNotIn("experiment", held["stages"])
+            usage, deadline = held["usage"], held["deadline_at_epoch"]
+            blocked = ComposerRunner(workflow, resume=True, stop_after_stage="survey")
+            with patch.object(blocked, "_begin_continuation", return_value=False), \
+                    patch.object(blocked, "_run_stage", side_effect=AssertionError("unadmitted work must not dispatch")):
+                still_held = blocked.run()
+            self.assertEqual(still_held["status"], "research_expansion_required")
+            self.assertEqual(still_held["usage"], usage)
+            self.assertEqual(still_held["deadline_at_epoch"], deadline)
+            resumed = ComposerRunner(workflow, resume=True, stop_after_stage="survey")
+            calls = []
+            def produce(stage, **kwargs):
+                calls.append(stage["id"])
+                self.assertEqual(stage["id"], "survey")
+                return deepcopy(result)
+            with patch.object(resumed, "_run_stage", side_effect=produce), \
+                    patch.object(resumed, "_survey_request_was_fulfilled", return_value=True), \
+                    patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient):
+                settled = resumed.run()
+            self.assertEqual(calls, ["survey"])
+            self.assertEqual(settled["interim_report"]["stop_reason"], "operator_stage_boundary")
+            self.assertEqual(settled["deadline_at_epoch"], deadline)
+            self.assertNotIn("experiment", settled["stages"])
+
+    def test_boundary_leaves_future_stage_work_for_after_inspection(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path); workflow = self._workflow(root)
+            runner = ComposerRunner(workflow, stop_after_stage="survey")
+            calls = []
+            def produce(stage, **kwargs):
+                calls.append(stage["id"])
+                output = root / "survey.json"; output.write_text("{}")
+                return {"status": "completed", "output_path": str(output),
+                        "project_dir": stage["project_dir"], "stage_id": stage["id"],
+                        "research_requests": [{"id": "future-calculation", "kind": "analysis_repair",
+                            "owner": "methods.validation", "target_stage_id": "experiment",
+                            "objective": "Calculate the new study outputs.", "why": "The calculation belongs to Methods.",
+                            "success_condition": "Calculated study outputs pass independent recalculation.",
+                            "evidence_needed": "The literature inputs and study design."}]}
+            with patch.object(runner, "_run_stage", side_effect=produce), \
+                    patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient):
+                stopped = runner.run()
+            self.assertEqual(calls, ["survey"])
+            self.assertEqual(stopped["interim_report"]["stop_reason"], "operator_stage_boundary")
+            resumed = ComposerRunner(workflow, resume=True, stop_after_stage="survey")
+            with patch.object(resumed, "_run_stage", side_effect=AssertionError("future work awaits inspection")):
+                retained = resumed.run()
+            self.assertEqual(retained["usage"], stopped["usage"])
+            self.assertEqual(retained["continuation_cycles"], 0)
+            self.assertEqual(retained["context"]["survey"]["research_requests"], stopped["context"]["survey"]["research_requests"])
+
+    def test_boundary_resume_preserves_already_admitted_continuation(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path); workflow = self._workflow(root)
+            workflow["continuation_policy"] = {"mode": "bounded", "max_cycles": 2}
+            runner = ComposerRunner(workflow, stop_after_stage="survey")
+            output = root / "survey.json"; output.write_text("{}")
+            result = {"status": "completed", "output_path": str(output),
+                      "project_dir": workflow["stages"][0]["project_dir"], "stage_id": "survey"}
+            runner.context["survey"] = {**result, "research_requests": [{
+                "id": "admitted-follow-up", "kind": "literature_expansion",
+                "owner": "research.intelligence", "target_stage_id": "survey",
+                "objective": "Check the retained source condition.", "why": "A source condition is missing.",
+                "success_condition": "The condition is captured or recorded unavailable.",
+                "evidence_needed": "The retained source and exact capture."}]}
+            runner.stage_records["survey"] = {"status": "completed", "kind": "survey", "attempt_count": 0}
+            by_id = {stage["id"]: stage for stage in workflow["stages"]}
+            self.assertTrue(runner._begin_continuation({"survey"}, by_id))
+            self.assertEqual(runner.continuation_cycles, 1)
+            runner.status = "paused"; runner._checkpoint("continuation:interrupted", force=True); runner.close()
+            resumed = ComposerRunner(workflow, resume=True, stop_after_stage="survey")
+            calls = []
+            def produce(stage, **kwargs):
+                calls.append(stage)
+                self.assertEqual(stage["id"], "survey")
+                return deepcopy(result)
+            with patch.object(resumed, "_run_stage", side_effect=produce), \
+                    patch.object(resumed, "_survey_request_was_fulfilled", return_value=True), \
+                    patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient):
+                settled = resumed.run()
+            self.assertEqual(len(calls), 1)
+            self.assertIn("cycle-1", calls[0]["project_dir"])
+            self.assertEqual(settled["continuation_cycles"], 1)
+            self.assertEqual(settled["interim_report"]["stop_reason"], "operator_stage_boundary")
+
     def test_topic_review_contract_revalidation_reuses_paid_production_and_peers_after_native_resume(self):
         with tempfile.TemporaryDirectory() as path:
             runner, stage, _ = self._owned_held_topic(Path(path))
