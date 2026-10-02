@@ -596,13 +596,21 @@ def validate_feasibility_plan(value, name="feasibility_plan"):
         raise ValidationError(f"{name}.evidence_inputs must contain one to eight items")
     seen_kinds = set()
     for item in evidence_inputs:
-        if not isinstance(item, dict) or set(item) != {"kind", "status", "source"}:
+        if not isinstance(item, dict) or set(item) not in ({"kind", "status", "source"}, {"kind", "status", "source", "artifact_refs"}):
             raise ValidationError(f"{name}.evidence_inputs item has an invalid shape")
         if item["kind"] not in FEASIBILITY_INPUT_KINDS:
             raise ValidationError(f"{name}.evidence_inputs contains an unsupported kind")
         if item["status"] not in FEASIBILITY_INPUT_STATUSES:
             raise ValidationError(f"{name}.evidence_inputs contains an unsupported status")
         _text(item["source"], f"{name}.evidence_inputs source", public=False)
+        if "artifact_refs" in item:
+            from scisaurus.core.schema import parse_ref
+            refs = item["artifact_refs"]
+            if (not isinstance(refs, list) or any(not isinstance(ref, str) for ref in refs)
+                    or len(set(refs)) != len(refs)):
+                raise ValidationError(f"{name}.evidence_inputs artifact_refs must be exact unique references")
+            for ref in refs:
+                parse_ref(ref)
         if len(item["source"]) > 320:
             raise ValidationError(f"{name}.evidence_inputs source is too long")
         if item["kind"] in seen_kinds:
@@ -625,9 +633,9 @@ def validate_feasibility_plan(value, name="feasibility_plan"):
         if not observed_kinds.issubset({"synthetic", "analytical_parameters"}):
             raise ValidationError(
                 f"{name}.evidence_inputs for self_contained may use only synthetic or analytical_parameters inputs")
-        if any(item["status"] != "available" for item in evidence_inputs):
+        if any(item["status"] == "unavailable" for item in evidence_inputs):
             raise ValidationError(
-                f"{name}.evidence_inputs for self_contained must already be available")
+                f"{name}.evidence_inputs for self_contained cannot be declared unavailable")
     elif value["experiment_input"] == "project_artifact":
         if "project_artifact" not in observed_kinds:
             raise ValidationError(
@@ -1371,6 +1379,12 @@ def _repair_feasibility_input_duplicates(package):
             joined = " | ".join(sources)
             source_truncated = len(joined) > 320
             existing["source"] = joined[:317].rstrip() + "..." if source_truncated else joined
+            if "artifact_refs" in existing or "artifact_refs" in item:
+                left, right = existing.get("artifact_refs", []), item.get("artifact_refs", [])
+                if isinstance(left, list) and isinstance(right, list):
+                    existing["artifact_refs"] = left + [ref for ref in right if ref not in left]
+                elif not isinstance(right, list):
+                    existing["artifact_refs"] = right
             statuses = [existing.get("status"), item.get("status")]
             known_statuses = [status for status in statuses if status in FEASIBILITY_STATUS_PRIORITY]
             if known_statuses:
@@ -1612,7 +1626,7 @@ FEASIBILITY_PLAN_PROMPT_CONTRACT = {
     "execution_mode": "foundry, configured_program, or project_runner",
     "experiment_input": "self_contained, project_artifact, or survey_artifact",
     "evidence_inputs": (
-        "one to eight {kind,status,source} objects; kind must be exactly "
+        "one to eight {kind,status,source} objects, optionally with artifact_refs from the verified runtime inventory; an available declaration alone does not prove execution readiness. Use acquirable_before_experiment for planned acquisition. kind must be exactly "
         "synthetic, analytical_parameters, project_artifact, survey_metadata, "
         "survey_full_text, public_dataset, new_measurement, or external_service; "
         "status must be exactly available, acquirable_before_experiment, or "
@@ -3528,12 +3542,6 @@ def validate_topic_feasibility(package, runtime_context):
     if unavailable_statuses:
         failures.append({"check": "evidence_inputs", "unavailable": unavailable_statuses,
                          "reason": "input is declared unavailable"})
-    if foundry_enabled:
-        not_ready = [item["kind"] for item in plan["evidence_inputs"]
-                     if item["status"] != "available"]
-        if not_ready:
-            failures.append({"check": "input_readiness", "not_ready": not_ready,
-                             "reason": "the deterministic foundry cannot acquire inputs during execution"})
     allowed_access = set(feasibility_runtime.get("allowed_data_access") or [])
     if allowed_access and plan["data_access"] not in allowed_access:
         failures.append({"check": "data_access", "observed": plan["data_access"],
@@ -3578,7 +3586,12 @@ def validate_topic_feasibility(package, runtime_context):
         first = failures[0]
         detail = json.dumps(first, ensure_ascii=False, sort_keys=True)
         raise ValidationError("selected topic failed feasibility checks: " + detail)
-    return {"status": "feasible", "unavailable": [],
+    from scisaurus.runtime.scientific_inputs import input_readiness
+    readiness = input_readiness(selected, runtime_context.get("scientific_input_artifacts", []))
+    unresolved_inputs = [item for item in readiness if item["status"] == "unverified"]
+    return {"status": "provisional_for_survey" if unresolved_inputs else "feasible", "unavailable": [],
+            "execution_ready": all(item["status"] == "verified" for item in readiness),
+            "input_readiness": readiness,
             "requirements": deepcopy(requirements), "plan": deepcopy(plan),
             "checks": {
                 "execution_boundary": "passed",
@@ -3586,6 +3599,8 @@ def validate_topic_feasibility(package, runtime_context):
                 "provider_budget": "passed",
                 "compute_budget": "passed",
                 "runtime_dependencies": "passed",
+                "scientific_inputs": "unverified" if unresolved_inputs else "generation_required" if not all(
+                    item["status"] == "verified" for item in readiness) else "verified",
             }}
 
 

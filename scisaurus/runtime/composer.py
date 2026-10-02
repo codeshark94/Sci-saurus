@@ -49,7 +49,7 @@ from scisaurus.runtime.departments import (
     stage_role,
 )
 from scisaurus.runtime.specialists import (
-    VERIFIER_SYSTEM, SpecialistDispatcher,
+    VERIFIER_SYSTEM, STAGE_WORK_KINDS, SpecialistDispatcher,
     specialist_system,
     build_repair_adjudication_prompt, build_repair_evidence_prompt, build_specialist_prompt,
     build_verifier_prompt, redact_sensitive_text, _preserve_response_value, _repair_candidate_program,
@@ -6097,6 +6097,11 @@ class ComposerRunner:
             }
         return None
 
+    def _scientific_input_inventory(self):
+        from scisaurus.runtime.scientific_inputs import input_artifact
+        return [input_artifact(self.store, row["artifact_ref"]) for row in self.control._conn.execute(
+            "SELECT artifact_ref FROM artifacts WHERE logical_id LIKE 'kb/scientific-inputs/%' ORDER BY created_at")]
+
     def _runtime_context(self, model):
         """Expose safe, actionable execution capabilities to topic selection.
 
@@ -6311,6 +6316,11 @@ class ComposerRunner:
         })
         return {
             "operating_system": platform.system(),
+            "scientific_input_artifacts": self._scientific_input_inventory(),
+            "scientific_input_contract": {"namespace": "kb/scientific-inputs/", "schema_version": "scientific-input-1",
+                "fields": ["schema_version", "topic_id", "topic_sha256", "kind", "payload", "source_refs"],
+                "topic_hash_encoding": "SHA256 of canonical JSON of the complete topic object; feasibility_plan.evidence_inputs excludes artifact_refs to avoid circular references.",
+                "availability_rule": "A declared available input remains unverified until its materialized artifact and source hashes are checked. Synthetic inputs require generation. Scientific adequacy still requires independent review."},
             "platform": platform.machine(),
             "python_version": sys.version.split()[0],
             "current_date": time.strftime("%Y-%m-%d", time.gmtime()),
@@ -7178,6 +7188,12 @@ class ComposerRunner:
         for item in self.active_research_requests:
             if not isinstance(item, dict):
                 continue
+            identity = self._current_topic_identity()
+            if item.get("topic_ids") and identity is not None and identity["topic_id"] not in item["topic_ids"]:
+                continue
+            if item.get("work_kind") is not None and item.get("target_stage_id") == stage_id:
+                if item["work_kind"] not in STAGE_WORK_KINDS.get(stage_kind, []):
+                    raise ValidationError("research work kind is not owned by its target stage")
             target_stage_id = item.get("target_stage_id")
             if isinstance(target_stage_id, str):
                 if target_stage_id == stage_id:
@@ -7279,9 +7295,12 @@ class ComposerRunner:
                 continue
             context, plan_ref, ref, digest, response = owned
             normalized = _normalise_verdict(response, current_stage_id=topic_stage["id"],
-                valid_target_stage_ids=contract["downstream_stage_ids"])
+                valid_target_stage_ids=contract["downstream_stage_ids"], obligation_scope=contract["obligation_scope"])
             for obligation in normalized.get("deferred_obligations", []):
                 if obligation["target_stage_id"] != target_stage["id"]:
+                    continue
+                selected_id = context["topic"]["id"]
+                if selected_id not in obligation["topic_ids"]:
                     continue
                 origin = {"verifier_execution_ref": ref, "verifier_execution_sha256": digest,
                     "assignment_plan_ref": plan_ref, "topic_stage_id": topic_stage["id"],
@@ -7291,6 +7310,8 @@ class ComposerRunner:
                 requests.append({"id": "topic-deferred-" + hashlib.sha256(canonical_bytes(origin)).hexdigest()[:32],
                     "kind": kinds[target_stage["kind"]], "owner": STAGE_ROLES[target_stage["kind"]],
                     "source_stage_id": topic_stage["id"], "target_stage_id": target_stage["id"],
+                    "topic_id": selected_id, "topic_cycle": self._current_topic_identity()["topic_cycle"],
+                    "topic_ids": deepcopy(obligation["topic_ids"]), "work_kind": obligation["work_kind"],
                     "target_stage_kind": target_stage["kind"], "objective": obligation["requirement"],
                     "why": "An independent topic review assigns this requirement to its declared downstream owner.",
                     "success_condition": obligation["completion_check"],
@@ -7515,7 +7536,7 @@ class ComposerRunner:
             for key in (
                 "kind", "owner", "objective", "success_condition", "evidence_needed",
                 "source_stage_id", "target_stage_id", "target_stage_kind",
-                "topic_id", "topic_cycle", "source_survey_ref", "source_assessment_ref",
+                "topic_id", "topic_cycle", "topic_ids", "work_kind", "source_survey_ref", "source_assessment_ref",
                 "failure_input_sha256",
                 "recovery_mode", "repair_policy_revision", "resume_scopes", "repair_commands", "acceptance_checks",
                 "review_directives", "experiment_repair_plan", "repair_strategy",
@@ -14035,6 +14056,7 @@ class ComposerRunner:
                 "acceptance_checks", "review_directives", "model_diagnostics",
                 "recovery_mode", "repair_policy_revision",
                 "target_stage_id", "target_stage_kind",
+                "topic_id", "topic_cycle", "topic_ids", "work_kind", "source_stage_id",
                 "repair_priority", "experiment_repair_plan", "repair_strategy",
                 "attempt_lineage") if key in item}),
         } for item in requests]
@@ -17342,6 +17364,12 @@ class ComposerRunner:
 
     @staticmethod
     def _survey_work_order_was_fulfilled(project_dir, run, request):
+        return (ComposerRunner._survey_follow_up_was_replayed(project_dir, run, request)
+                and any(row.get("id") == request.get("id") and row.get("status") in {"resolved", "limited"}
+                        for row in run["follow_up_result"]["orders"]))
+
+    @staticmethod
+    def _survey_follow_up_was_replayed(project_dir, run, request=None):
         from scisaurus.core.source_spans import bind as bind_spans, expand_evidence
         from scisaurus.core.surveys import SurveyGate
         from scisaurus.runtime.models import ModelResult
@@ -17434,16 +17462,14 @@ class ComposerRunner:
                 if (set(checked) != {order["id"] for order in orders}
                         or [checked[order["id"]] for order in orders] != body.get("orders")):
                     return False
-                projected = ComposerRunner._follow_up_projection([request])[0]
+                projected = ComposerRunner._follow_up_projection([request])[0] if request is not None else None
                 return (body.get("schema_version") == "survey-follow-up-result-1"
                         and body.get("survey_ref") == run["survey_ref"]
                         and body.get("assessment_ref") == run["assessment_ref"]
                         and body.get("orders") == result.get("orders")
-                        and any(isinstance(order, dict)
+                        and (request is None or any(isinstance(order, dict)
                                 and ComposerRunner._follow_up_projection([order])[0] == projected for order in orders)
-                        and any(isinstance(row, dict) and row.get("id") == request.get("id")
-                                and row.get("status") in {"resolved", "limited"}
-                                for row in body["orders"]))
+                        ))
         except (sqlite3.Error, IndexError, KeyError, TypeError, ValueError, OSError, NotFoundError, ValidationError, ConflictError):
             return False
 
@@ -19254,6 +19280,12 @@ class ComposerRunner:
             "candidate_methods": deepcopy(topic.get("resource_plan", "")),
             "capability_inventory": deepcopy(stage_result.get("feasibility_check", {})),
         })
+        if isinstance(topic.get("feasibility_plan"), dict):
+            from scisaurus.runtime.scientific_inputs import input_readiness
+            readiness = input_readiness(topic, self._scientific_input_inventory())
+            projected["experiment_feasibility"].update(input_readiness=readiness,
+                execution_ready=all(item["status"] == "verified" for item in readiness))
+            projected["input_readiness"] = readiness
         return projected
 
     def _specialist_experiment_projection(self, stage, descriptor, stage_result=None):
@@ -19288,7 +19320,7 @@ class ComposerRunner:
         selected_branch = selected_branch if isinstance(selected_branch, dict) else {}
         feasibility = topic_context.get("feasibility_check")
         feasibility = feasibility if isinstance(feasibility, dict) else {}
-        feasibility_plan = feasibility.get("plan")
+        feasibility_plan = selected.get("feasibility_plan", feasibility.get("plan"))
         feasibility_plan = feasibility_plan if isinstance(feasibility_plan, dict) else {}
         configured_experiment = descriptor.get("experiment") if isinstance(descriptor, dict) else None
         configured_experiment = configured_experiment if isinstance(configured_experiment, dict) else {}
@@ -19370,6 +19402,14 @@ class ComposerRunner:
             "required_packages": deepcopy(feasibility_plan.get("required_packages", [])),
             "network_access": feasibility_plan.get("network_access"),
         }
+        if isinstance(selected.get("feasibility_plan"), dict):
+            from scisaurus.runtime.scientific_inputs import input_readiness
+            readiness = input_readiness(selected, self._scientific_input_inventory())
+            method_constraints["input_readiness"] = readiness
+            available_assets["required_inputs"] = deepcopy(feasibility_plan.get("evidence_inputs", []))
+            verified_kinds = {item["kind"] for item in readiness if item["status"] == "verified"}
+            available_assets["evidence_inputs"] = [item for item in available_assets["required_inputs"]
+                                                  if item["kind"] in verified_kinds]
         design = {
             key: deepcopy(configured_experiment[key])
             for key in ("study_type", "method", "parameters", "primary_outcomes",
@@ -19688,7 +19728,7 @@ class ComposerRunner:
             "failure_recovery": failure_recovery_projection,
         }
 
-    def _stage_acceptance_contract(self, stage):
+    def _stage_acceptance_contract(self, stage, stage_result=None):
         descendants = set()
         frontier = {stage["id"]}
         while frontier:
@@ -19706,11 +19746,22 @@ class ComposerRunner:
         }
         target = ("bounded admission to literature survey, not final journal maturity or experiment admission"
                   if stage["kind"] == "topic_discovery" else "independent acceptance of the declared " + stage["kind"] + " output")
+        work_kinds = STAGE_WORK_KINDS
+        topic_result = stage_result if stage["kind"] == "topic_discovery" and isinstance(stage_result, dict) else next(
+            (self.context.get(item["id"], {}) for item in self.workflow["stages"] if item["kind"] == "topic_discovery"), {})
+        candidates = topic_result.get("candidates", [])
+        topic_ids = [item["id"] for item in candidates if isinstance(item, dict) and isinstance(item.get("id"), str)]
+        selected_topic = topic_result.get("topic", {})
+        if isinstance(selected_topic.get("id"), str) and selected_topic["id"] not in topic_ids:
+            topic_ids.append(selected_topic["id"])
         return {"current_stage_id": stage["id"],
+            "obligation_scope": {"topic_ids": topic_ids, "stage_work_kinds": {
+                item["id"]: work_kinds[item["kind"]] for item in self.workflow["stages"] if item["id"] in descendants}},
             "scientific_input_recovery": scientific_input_recovery_contract(),
             "downstream_stage_ids": [item["id"] for item in self.workflow["stages"] if item["id"] in descendants],
             "acceptance_target": target, "current_requirements": deepcopy(requirements[stage["kind"]]),
             "downstream_requirements": [{"target_stage_id": item["id"], "stage_kind": item["kind"],
+                "allowed_work_kinds": work_kinds[item["kind"]],
                 "requirements": deepcopy(requirements[item["kind"]])}
                 for item in self.workflow["stages"] if item["id"] in descendants]}
 
@@ -19720,7 +19771,7 @@ class ComposerRunner:
             "objective": self.workflow["objective"],
             "stage_id": stage["id"],
             "stage_kind": stage["kind"],
-            "stage_acceptance_contract": self._stage_acceptance_contract(stage),
+            "stage_acceptance_contract": self._stage_acceptance_contract(stage, stage_result),
             "work_orders": self._follow_up_projection(self._requests_for_stage(stage)),
             "dependencies": deepcopy(self.context),
             "stage_result": self._specialist_stage_result_projection(
@@ -26508,6 +26559,100 @@ class ComposerRunner:
                 blocker["superseded_by_dossier_ref"] = corrected_manifest["artifact_ref"]
         return True
 
+    def _reconcile_latest_survey_results(self):
+        """Consume an owned immutable native receipt without inheriting an older approval."""
+        reconciled = []
+        for stage in self.workflow["stages"]:
+            if stage["kind"] != "survey":
+                continue
+            incumbent = self.context.get(stage["id"], {})
+            record = self.stage_records.get(stage["id"], {})
+            project = Path(record.get("project_dir") or stage["project_dir"]).resolve()
+            if (not isinstance(incumbent.get("run_id"), str)
+                    or record.get("status") in {"running", "retrying"}
+                    or Path(incumbent.get("project_dir") or project).resolve() != project
+                    or not self._request_context_matches_current_topic(stage["id"], incumbent)):
+                continue
+            identity = self._current_topic_identity()
+            if identity is not None and (incumbent.get("topic_id") not in (None, identity["topic_id"])
+                    or incumbent.get("topic_cycle") is not None and (type(incumbent["topic_cycle"]) is not int
+                        or incumbent["topic_cycle"] != identity["topic_cycle"])):
+                continue
+            attempts = record.get("attempts", [])
+            if not any(isinstance(attempt, dict) and attempt.get("state") in {"succeeded", "completed"}
+                       and isinstance(attempt.get("project_dir"), str)
+                       and Path(attempt["project_dir"]).resolve() == project
+                       and (identity is None or (attempt.get("topic_id") == identity["topic_id"]
+                            and attempt.get("topic_cycle") == identity["topic_cycle"])) for attempt in attempts):
+                continue
+            run = self._read_json_object(project / "output/run.json")
+            if (not isinstance(run, dict) or run.get("status") != "completed"
+                    or run.get("run_id") == incumbent.get("run_id")):
+                continue
+            with closing(sqlite3.connect((project / "state/control.sqlite").as_uri() + "?mode=ro", uri=True)) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only=ON")
+                store = ArtifactStore(SimpleNamespace(dir=str(project), _conn=connection))
+                final = store.head("command/results/final")
+                config_record = store.head("inputs/run-config")
+                if final is None or config_record is None:
+                    raise StateError("native survey reconciliation requires immutable final and configuration receipts")
+                raw = store.read_body(final["body_hash"])
+                config_raw = store.read_body(config_record["body_hash"])
+                config = json.loads(config_raw)
+                topic_stage = self._topic_stage_for_survey(stage)
+                topic = self.context.get(topic_stage["id"], {}).get("topic", {}) if topic_stage else {}
+                resume_rows = connection.execute("SELECT manifest_json FROM artifacts WHERE logical_id LIKE 'command/resume-sessions/%' ORDER BY created_at DESC").fetchall()
+                resume = json.loads(resume_rows[0]["manifest_json"]) if resume_rows else None
+                if (hashlib.sha256(raw).hexdigest() != final["body_hash"] or json.loads(raw) != run
+                        or hashlib.sha256(config_raw).hexdigest() != config_record["body_hash"]
+                        or config.get("project_id") != str(project) or run.get("project_id") != str(project)
+                        or (topic and config["survey"]["question"] != topic.get("research_question"))
+                        or resume is None or resume["created_at"] >= final["created_at"]):
+                    raise StateError("native survey receipt does not own the current workspace, topic or resume")
+                resume_raw = store.read_body(resume["body_hash"])
+                resume_body = json.loads(resume_raw)
+                if (hashlib.sha256(resume_raw).hexdigest() != resume["body_hash"]
+                        or resume_body.get("schema_version") != "resume-session-1"
+                        or resume_body.get("config_ref") != config_record["artifact_ref"]
+                        or resume.get("author") != "command.recovery"
+                        or resume_body.get("event_chain_before_resume") != [True, "ok"]
+                        or config_record["artifact_ref"] not in {item["ref"] for item in resume["inputs"]}):
+                    raise StateError("native survey resume does not retain its immutable configuration")
+            if (not self._survey_references_are_current(project, run)
+                    or (run.get("follow_up_result") is not None and not self._survey_follow_up_was_replayed(project, run))):
+                raise StateError("native survey final receipt failed current evidence replay")
+            fresh = {**deepcopy(run), "stage_id": stage["id"], "kind": "survey", "project_dir": str(project),
+                     "output_path": str(project / "output/run.json"),
+                     **({"topic_id": identity["topic_id"], "topic_cycle": identity["topic_cycle"], "topic_lineage": deepcopy(identity)}
+                        if identity is not None else {key: deepcopy(incumbent[key]) for key in ("topic_id", "topic_cycle", "topic_lineage") if key in incumbent})}
+            fresh = self._gate_survey_work_orders(stage, fresh)
+            fresh = self._gate_free_topic_survey(fresh, stage=stage)
+            if not self._survey_attempt_was_accepted(stage["id"], record, fresh):
+                fresh["review_status"] = "current_producer_requires_review"
+                fresh["release_blocking"] = True
+                fresh["composer_decision"] = "review_required"
+                if fresh["status"] in {"completed", "accepted"}:
+                    fresh["status"] = "candidate_needs_review"
+            receipt = self._publish(f"command/composer/native-survey-reconciliations/{stage['id']}/{run['run_id']}",
+                "decision_note", {"schema_version": "native-survey-reconciliation-1", "stage_id": stage["id"],
+                    "project_dir": str(project), "producer_ref": final["artifact_ref"], "producer_sha256": final["body_hash"],
+                    "config_ref": config_record["artifact_ref"], "config_sha256": config_record["body_hash"],
+                    "resume_ref": resume["artifact_ref"], "prior_run_id": incumbent.get("run_id"),
+                    "result": fresh, "inherited_approval": False, "model_calls": 0}, "command.composer")
+            fresh["native_reconciliation_ref"] = receipt["artifact_ref"]
+            self.context[stage["id"]] = fresh
+            for key in ("composer_decision", "verifier_artifact_ref", "verifier_outcome", "specialist_assignments"):
+                self.stage_records[stage["id"]].pop(key, None)
+            self.stage_records[stage["id"]].update(status=fresh["status"], native_reconciliation_ref=receipt["artifact_ref"],
+                release_blocking=fresh.get("release_blocking", False), review_status=fresh.get("review_status"),
+                composer_decision=fresh.get("composer_decision"))
+            (project / "output/composer-gated-run.json").write_bytes(canonical_bytes(fresh))
+            reconciled.append(stage["id"])
+        if reconciled:
+            self._checkpoint("resume:consume_current_native_surveys", force=True)
+        return reconciled
+
     def _pause_at_stage_boundary(self, stage_id):
         if self.stop_after_stage != stage_id:
             return False
@@ -26530,12 +26675,13 @@ class ComposerRunner:
                                           "stop_reason": "operational_state", "review_revalidation_required": True})
                     self._checkpoint("paused:topic_review_revalidation", force=True)
                     return self._finish()
+            self._reconcile_interrupted_stage_attempts()
+            self._reconcile_latest_survey_results()
             if self.stop_after_stage is not None and self.stage_records.get(self.stop_after_stage, {}).get("status") in {"completed", "candidate_needs_review", "research_expansion_required", "review_rejected"}:
                 if self._pause_at_stage_boundary(self.stop_after_stage):
                     return self._finish()
             self._execution_started = True
             self.status = "running"
-            self._reconcile_interrupted_stage_attempts()
             by_id = {stage["id"]: stage for stage in self.workflow["stages"]}
             foundry_rejections = self._reconcile_interrupted_foundry_rejection(by_id)
             if foundry_rejections:

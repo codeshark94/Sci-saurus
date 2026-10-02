@@ -29,7 +29,7 @@ WORK_ORDER_OPTIONAL_FIELDS = frozenset({
     "failure_dossier_ref", "failure_input_sha256", "repair_commands", "acceptance_checks",
     "review_directives", "model_diagnostics", "recovery_mode", "target_stage_id",
     "target_stage_kind", "repair_priority", "experiment_repair_plan", "repair_strategy",
-    "attempt_lineage",
+    "attempt_lineage", "topic_id", "topic_cycle", "topic_ids", "work_kind", "source_stage_id",
 })
 
 

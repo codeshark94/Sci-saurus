@@ -1870,6 +1870,75 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertTrue(disposition["record_evidence"])
         self.assertFalse(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, order))
 
+    def test_composer_resume_consumes_new_native_unresolved_receipt_before_stage_boundary(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        from scisaurus.tests.test_composer import ComposerWorkflowTests, _ComposerTestSpecialistClient
+        config = survey_config(self.endpoint, "follow-up-records-only")
+        config["project_id"] = str((self.root / "run").resolve())
+        order = self.follow_up_order("Check the registered membership of W101.")
+        first = self.runtime(config, work_orders=[order]).run()
+        self.assertEqual(first["status"], "completed", first["error"])
+        root = self.root / "composer-fixture"; root.mkdir()
+        workflow = ComposerWorkflowTests()._workflow(root)
+        workflow["stages"] = workflow["stages"][:1]
+        workflow["stages"][0]["project_dir"] = config["project_id"]
+        workflow["completion"]["required_stage_ids"] = ["survey"]
+        composer = ComposerRunner(workflow, stop_after_stage="survey")
+        self.addCleanup(composer.close)
+        initial = {**first, "stage_id": "survey", "kind": "survey", "project_dir": config["project_id"],
+                   "output_path": str(self.root / "run/output/run.json")}
+        with patch.object(composer, "_run_stage", return_value=initial), \
+                patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient):
+            stopped = composer.run()
+        self.assertEqual(stopped["status"], "paused")
+        native = self.runtime(config, work_orders=[order], resume_policy={"additional_seconds": config["limits"]["wall_clock_seconds"],
+            "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+            "source_changes": {"mode": "reopen", "reopen_scopes": ["follow_up"]}}).run()
+        self.assertEqual(native["status"], "completed", native["error"])
+        self.assertNotEqual(native["run_id"], first["run_id"])
+        self.assertEqual(native["survey_ref"], first["survey_ref"])
+        self.assertEqual(native["assessment_ref"], first["assessment_ref"])
+        self.assertTrue(ComposerRunner._survey_follow_up_was_replayed(self.root / "run", native))
+        resumed = ComposerRunner(workflow, resume=True, stop_after_stage="survey")
+        self.addCleanup(resumed.close)
+        identity = {"topic_id": "selected", "topic_cycle": 0}
+        saved = deepcopy(resumed.context["survey"])
+        resumed.stage_records["survey"].update(topic_id="selected", topic_cycle=0,
+            composer_decision="advance_with_findings", verifier_artifact_ref="artifact:old/verifier@1")
+        for attempt in resumed.stage_records["survey"]["attempts"]:
+            attempt.update(topic_id="selected", topic_cycle=0)
+        with patch.object(resumed, "_current_topic_identity", return_value=identity):
+            for wrong in ({"topic_lineage": {"topic_id": "foreign", "topic_cycle": 0}},
+                          {"topic_lineage": {"topic_id": "selected", "topic_cycle": 1}},
+                          {"topic_id": "foreign"}, {"superseded_topic_id": "selected"}):
+                resumed.context["survey"] = {**saved, **wrong}
+                self.assertEqual(resumed._reconcile_latest_survey_results(), [])
+        resumed.context["survey"] = {**saved, **identity, "topic_lineage": identity}
+        exported_path = self.root / "run/output/run.json"
+        original_export = exported_path.read_bytes()
+        exported_path.write_bytes(canonical_bytes({**native, "run_id": "forged"}))
+        with self.assertRaisesRegex(StateError, "receipt"):
+            resumed._reconcile_latest_survey_results()
+        exported_path.write_bytes(original_export)
+        with patch.object(resumed, "_current_topic_identity", return_value=identity), \
+                patch.object(resumed, "_run_stage", side_effect=AssertionError("boundary must not dispatch")), \
+                patch("scisaurus.runtime.specialists.ModelClient", side_effect=AssertionError("receipt replay must not dispatch")):
+            updated = resumed.run()
+        context = updated["context"]["survey"]
+        self.assertEqual(context["run_id"], native["run_id"])
+        self.assertEqual(context["follow_up_result"], native["follow_up_result"])
+        self.assertEqual(context["status"], "candidate_needs_review")
+        self.assertEqual(context["topic_lineage"], identity)
+        self.assertTrue(context["release_blocking"])
+        self.assertFalse(resumed._stage_releases_dependencies(updated["stages"]["survey"], stage_kind="survey"))
+        self.assertEqual(updated["stages"]["survey"]["composer_decision"], "review_required")
+        self.assertNotIn("verifier_artifact_ref", updated["stages"]["survey"])
+        self.assertEqual(updated["deadline_at_epoch"], stopped["deadline_at_epoch"])
+        self.assertEqual(updated["interim_report"]["stop_reason"], "operator_stage_boundary")
+        self.assertEqual(json.loads((self.root / "run/output/composer-gated-run.json").read_text()), context)
+        self.assertFalse(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", native, order))
+        self.assertEqual(resumed._reconcile_latest_survey_results(), [])
+
     def test_follow_up_inventory_projection_keeps_exact_named_ids_and_discloses_scope(self):
         inventory = {"survey_ref": "artifact:kb/surveys/current@1", "works": [
             {"work_id": "W1", "screening": "uncertain", "sources": [{"representation": "abstract"}]},

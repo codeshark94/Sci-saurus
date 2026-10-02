@@ -151,14 +151,24 @@ VERIFIER_SYSTEM = (
     "An accept response must leave blocking_findings, required_revisions, and any critical_findings "
     "alias empty. Deferred gates and non-blocking repair scope may remain. "
     "Use deferred_obligations for requirements owned by a later declared workflow stage. Each record "
-    "has target_stage_id, requirement, completion_check, and evidence_needed; preserve the exact "
+    "has target_stage_id, topic_ids, work_kind, requirement, completion_check, and evidence_needed; preserve the exact "
     "requirement and falsifiable completion check. evidence_needed is a nonempty string or list of "
     "nonempty strings. Target only the supplied downstream_stage_ids, never the current stage. "
+    "Bind topic_ids to the branches that actually own the requirement. Retained alternative branches "
+    "do not create admission debt for the selected branch. Use only the target's allowed_work_kinds. "
+    "Evidence acquisition belongs to survey; derived values, numerical uncertainty bands and experiment "
+    "design belong to calculation stages. Projection repair belongs to the stage that produced the packet. "
+    "If the owning stage is not configured, retain the requirement as a named deferred gate; never "
+    "redirect it to an available stage. Source silence is not proof that a proposed derivation is impossible. "
     "Assess the declared current-stage acceptance contract independently of producer admission labels. "
     "Cite the supplied evidence and its consequence. Keep the response as concise as the evidence "
     "allows, without omitting material support or applying word-count limits. "
     + RESPONSE_REPAIR_PROVENANCE_RULE
 )
+
+STAGE_WORK_KINDS = {"topic_discovery": ["provenance"], "survey": ["evidence"],
+    "experiment": ["calculation"], "interpretation": ["interpretation"],
+    "argument": ["argument"], "paper": ["manuscript"]}
 
 
 DEFAULT_PROVIDER_CAPACITY = {"ollama": 3, "qwen": 1}
@@ -948,6 +958,8 @@ def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, det
         "required_revisions": ["changes required before this stage can pass"],
         "deferred_gates": ["checks assigned to a later stage, with the stage that owns each check"],
         "deferred_obligations": [{"target_stage_id": "one declared downstream stage ID",
+            "topic_ids": ["the exact candidate branch IDs owning this requirement"],
+            "work_kind": "one of the target stage's allowed_work_kinds",
             "requirement": "complete literal later-stage requirement",
             "completion_check": "complete falsifiable check before that stage can pass",
             "evidence_needed": ["required evidence to perform the check"]}],
@@ -1541,7 +1553,7 @@ def _normalise_report(result):
     }
 
 
-def _normalise_verdict(result, *, current_stage_id=None, valid_target_stage_ids=None):
+def _normalise_verdict(result, *, current_stage_id=None, valid_target_stage_ids=None, obligation_scope=None):
     if not isinstance(result, dict):
         raise ValidationError("verifier response must be a JSON object")
     decision = result.get("decision")
@@ -1564,8 +1576,10 @@ def _normalise_verdict(result, *, current_stage_id=None, valid_target_stage_ids=
             raise ValidationError("valid deferred obligation targets must be stage IDs")
         valid_target_stage_ids = set(valid_target_stage_ids)
     for obligation in obligations:
+        fields = {"target_stage_id", "requirement", "completion_check", "evidence_needed"}
+        scoped = isinstance(obligation, dict) and bool({"topic_ids", "work_kind"} & set(obligation))
         if (not isinstance(obligation, dict)
-                or set(obligation) != {"target_stage_id", "requirement", "completion_check", "evidence_needed"}
+                or set(obligation) != fields | ({"topic_ids", "work_kind"} if scoped else set())
                 or any(not isinstance(obligation.get(key), str) or not obligation[key].strip()
                        for key in ("target_stage_id", "requirement", "completion_check"))):
             raise ValidationError("deferred obligation must contain its complete stage-owned contract")
@@ -1579,6 +1593,22 @@ def _normalise_verdict(result, *, current_stage_id=None, valid_target_stage_ids=
             raise ValidationError("current-stage requirements cannot be deferred to the current stage")
         if valid_target_stage_ids is not None and target not in valid_target_stage_ids:
             raise ValidationError("deferred obligation target is not a declared downstream stage")
+        if obligation_scope is not None:
+            if not scoped:
+                raise ValidationError("deferred obligation requires topic_ids and work_kind")
+            topics = obligation["topic_ids"]
+            if (not isinstance(topics, list) or not topics
+                    or any(not isinstance(item, str) or item not in obligation_scope["topic_ids"] for item in topics)
+                    or len(set(topics)) != len(topics)):
+                raise ValidationError("deferred obligation must name its exact declared topic branches")
+            if obligation["work_kind"] not in obligation_scope["stage_work_kinds"].get(target, []):
+                raise ValidationError("deferred obligation work_kind is not owned by its target stage")
+        elif scoped:
+            if (not isinstance(obligation["topic_ids"], list) or not obligation["topic_ids"]
+                    or any(not isinstance(item, str) or not item.strip() for item in obligation["topic_ids"])
+                    or len(set(obligation["topic_ids"])) != len(obligation["topic_ids"])
+                    or not isinstance(obligation["work_kind"], str) or not obligation["work_kind"].strip()):
+                raise ValidationError("deferred obligation scope must be explicit")
     rationale = _response_text(result.get("rationale", ""))
     blocking_findings = result.get("blocking_findings")
     if not isinstance(blocking_findings, list):
@@ -1620,7 +1650,8 @@ def _verifier_obligation_scope(prompt, assignment):
     if (not isinstance(targets, list)
             or any(not isinstance(value, str) or not value.strip() or value == current for value in targets)):
         raise ValidationError("verifier acceptance contract must declare downstream stage IDs")
-    return {"current_stage_id": current, "valid_target_stage_ids": targets}
+    return {"current_stage_id": current, "valid_target_stage_ids": targets,
+            **({"obligation_scope": declared["obligation_scope"]} if "obligation_scope" in declared else {})}
 
 
 def _response_format_repair_prompt(prompt, error, *, response_kind, output_role,
@@ -1659,8 +1690,9 @@ def _verifier_repair_prompt(prompt, error, previous_text, *, max_input_tokens,
         "repair_scope. The original evidence packet follows. Preserve all material evidence links. "
         "Classify only defects that make this stage's acceptance target unsafe or unsupported as "
         "blocking; distinguish required revisions from checks that belong to a later declared gate. "
-        "Each deferred_obligations record must retain target_stage_id, requirement, completion_check, "
-        "and evidence_needed, owned by a supplied downstream_stage_id rather than the current stage."
+        "Each deferred_obligations record must retain target_stage_id, topic_ids, work_kind, requirement, "
+        "completion_check, and evidence_needed, owned by a supplied downstream_stage_id and its "
+        "allowed work kinds rather than the current stage or another topic branch."
     )
     return _response_format_repair_prompt(prompt, error, response_kind="verifier",
         output_role=output_role, instruction=instruction, system=VERIFIER_SYSTEM,

@@ -1235,6 +1235,25 @@ class SpecialistDispatcherTests(unittest.TestCase):
                     _normalise_verdict({**verdict, "deferred_obligations": [bad]},
                         current_stage_id="question-design", valid_target_stage_ids=["source-audit"])
 
+    def test_deferred_branch_and_work_kind_are_checked_against_the_owned_contract(self):
+        scope = {"topic_ids": ["selected", "retained"],
+                 "stage_work_kinds": {"survey": ["evidence"], "experiment": ["calculation"]}}
+        order = {"target_stage_id": "survey", "topic_ids": ["retained"], "work_kind": "evidence",
+                 "requirement": "Capture the retained branch's source.",
+                 "completion_check": "A cited source is captured.", "evidence_needed": "Source receipt."}
+        def validate(order):
+            return _normalise_verdict({"decision": "accept", "deferred_obligations": [order]},
+                current_stage_id="topic", valid_target_stage_ids=["survey", "experiment"], obligation_scope=scope)
+        self.assertEqual(validate(order)["deferred_obligations"], [order])
+        calculation = {**order, "target_stage_id": "experiment", "work_kind": "calculation"}
+        self.assertEqual(validate(calculation)["deferred_obligations"], [calculation])
+        for invalid in ({**order, "work_kind": "calculation"}, {**order, "work_kind": "provenance"},
+                        {**order, "topic_ids": ["foreign"]}, {**order, "topic_ids": []},
+                        {**order, "topic_ids": ["selected", "selected"]},
+                        {key: value for key, value in order.items() if key not in {"topic_ids", "work_kind"}}):
+            with self.subTest(order=invalid), self.assertRaises(ValidationError):
+                validate(invalid)
+
     def test_typed_deferred_owner_validation_survives_generic_response_retry(self):
         model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1", "model": "fixture",
                  "timeout_seconds": 5, "max_output_tokens": 1000, "context_window_tokens": 16000, "max_input_tokens": 15000}
@@ -1786,7 +1805,7 @@ class SpecialistDispatcherTests(unittest.TestCase):
         assignment = {"assigned_role": "research.adversarial-reviewer", "role_id": "adversarial-reviewer",
                       "model_role": "review.arbiter", "execution_kind": "review",
                       "stage_id": "experiment", "stage_kind": "experiment",
-                      "quota": {"max_calls": 2, "max_input_tokens": 1000,
+                      "quota": {"max_calls": 2, "max_input_tokens": 2000,
                                 "max_output_tokens": 100, "max_output_tokens_per_call": 100,
                                 "max_seconds": 5}, "_prompt": "{}"}
         error = ModelCallError("transient failed response", outcome_known=True, attempts=1, status_code=500)

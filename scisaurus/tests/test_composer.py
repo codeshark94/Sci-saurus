@@ -106,7 +106,7 @@ class ComposerWorkflowTests(unittest.TestCase):
         output = (topic_dir / "topic.json").resolve(); output.write_bytes(canonical_bytes(topic_package()))
         result = {"stage_id": "topic", "kind": "topic_discovery", "status": "completed",
                   "project_dir": str(topic_dir), "output_path": str(output), "usage": {},
-                  "topic": deepcopy(topic_package()["candidates"][1])}
+                  "topic": deepcopy(topic_package()["candidates"][1]), "candidates": deepcopy(topic_package()["candidates"])}
         cache = ModelWorkCache(runner.store, runner._publish)
         cache.put("owned-topic-production", {"status": "succeeded", "result": result,
                     "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest()})
@@ -192,10 +192,15 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertNotIn("admission_state", runner.context["topic"])
             requirement = "Create a source-bound numeric parameter file. " + "Complete literal requirement. " * 150
             deferred = [{"target_stage_id": "survey", "requirement": "Independently check the declared comparator.",
+                         "topic_ids": [runner.context["topic"]["topic"]["id"]], "work_kind": "evidence",
                          "completion_check": "Cited captures establish or refute the comparator.", "evidence_needed": ["Exact captured source spans."]},
                         {"target_stage_id": "experiment", "requirement": requirement,
+                         "topic_ids": [runner.context["topic"]["topic"]["id"]], "work_kind": "calculation",
                          "completion_check": "The file exists and every input traces to a cited source location.",
                          "evidence_needed": ["Versioned parameter file.", "Independent recalculation."]}]
+            deferred.append({"target_stage_id": "survey", "topic_ids": [runner.context["topic"]["candidates"][0]["id"]],
+                "work_kind": "evidence", "requirement": "Capture the alternative branch's sources.",
+                "completion_check": "Its sources are captured.", "evidence_needed": "Alternative source records."})
             verifier = runner.context["topic"]["specialist_verifier"]
             record, _, execution = runner._read_verified_artifact_json(verifier["artifact_ref"])
             response = {"decision": "accept", "rationale": "Searchable bounded question.",
@@ -212,6 +217,8 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(experiment_orders[0]["attempt_lineage"]["deferred_obligation"], deferred[1])
             self.assertEqual(runner._capability_authoring_follow_up_projection(experiment_orders), experiment_orders)
             self.assertEqual(runner._follow_up_projection(experiment_orders)[0]["objective"], requirement)
+            self.assertEqual(runner._follow_up_projection(experiment_orders)[0]["topic_id"], runner.context["topic"]["topic"]["id"])
+            self.assertEqual(runner._follow_up_projection(experiment_orders)[0]["work_kind"], "calculation")
             self.assertEqual(experiment_orders[0]["attempt_lineage"]["verifier_execution_sha256"], updated["body_hash"])
             validate_work_orders(runner._follow_up_projection(experiment_orders))
             self.assertEqual(runner._requests_for_stage(topic), [])
@@ -9506,7 +9513,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                 runner.feedback.append({"action": "continue_research", "research_requests": [legacy]})
                 runner._attempted_request_signatures.add(runner._research_request_signature(legacy))
                 with patch.object(runner, "_survey_work_order_was_fulfilled", side_effect=lambda _p, _r, req:
-                                      runner._follow_up_projection([req]) == runner._follow_up_projection([order])), \
+                                      runner._follow_up_projection([req]) in (runner._follow_up_projection([order]), runner._follow_up_projection([legacy]))), \
                         patch.object(runner, "_current_topic_identity", return_value={"topic_id": "topic-1", "topic_cycle": 0}), \
                         patch.object(runner, "_continuation_requests", return_value=[methods]):
                     frontier = runner._survey_acquisition_frontier_for_topic("survey", "topic-1", 0, order)

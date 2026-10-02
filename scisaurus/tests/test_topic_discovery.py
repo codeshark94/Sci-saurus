@@ -3576,8 +3576,8 @@ class TopicDiscoveryTests(unittest.TestCase):
     def test_duplicate_feasibility_kinds_are_merged_without_losing_sources(self):
         value = package("Choose a feasible research direction")
         plan = foundry_feasibility_plan(evidence_inputs=[
-            {"kind": "synthetic", "status": "available", "source": "generated inputs"},
-            {"kind": "synthetic", "status": "available", "source": "seeded perturbations"},
+            {"kind": "synthetic", "status": "available", "source": "generated inputs", "artifact_refs": ["artifact:kb/input@1"]},
+            {"kind": "synthetic", "status": "available", "source": "seeded perturbations", "artifact_refs": ["artifact:kb/input@1", "artifact:kb/input@2"]},
         ])
         value["candidates"][0]["feasibility_plan"] = plan
         repairs = _repair_feasibility_input_duplicates(value)
@@ -3585,6 +3585,7 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertEqual(len(inputs), 1)
         self.assertIn("generated inputs", inputs[0]["source"])
         self.assertIn("seeded perturbations", inputs[0]["source"])
+        self.assertEqual(inputs[0]["artifact_refs"], ["artifact:kb/input@1", "artifact:kb/input@2"])
         self.assertEqual(repairs[0]["source"], "lossless_duplicate_kind_merge")
         validate_feasibility_plan(value["candidates"][0]["feasibility_plan"])
 
@@ -3760,7 +3761,10 @@ class TopicDiscoveryTests(unittest.TestCase):
             {"experiment_input", "data_access", "estimated_compute_seconds"},
         )
         from scisaurus.runtime.topic_discovery import validate_topic_feasibility
-        self.assertEqual(validate_topic_feasibility(value, context)["status"], "feasible")
+        result = validate_topic_feasibility(value, context)
+        self.assertEqual(result["status"], "provisional_for_survey")
+        self.assertFalse(result["execution_ready"])
+        self.assertEqual(result["input_readiness"][0]["status"], "unverified")
 
     def test_topic_package_normalizes_input_alias_before_strict_feasibility_gate(self):
         value = package("Choose a feasible research direction")
