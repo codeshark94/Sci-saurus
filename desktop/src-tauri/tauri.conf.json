@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Sci-saurus",
+  "version": "0.1.0",
+  "identifier": "science.scisaurus.desktop",
+  "build": {"frontendDist": "../ui", "beforeBuildCommand": "python3 build_backend.py", "beforeDevCommand": "python3 build_backend.py"},
+  "app": {"windows": [], "withGlobalTauri": true, "security": {"csp": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src ipc: http://ipc.localhost"}},
+  "bundle": {"active": true, "targets": ["app"], "externalBin": ["binaries/scisaurus-backend"], "icon": ["icons/icon.png", "icons/icon.icns"], "macOS": {"minimumSystemVersion": "12.0"}}
+}

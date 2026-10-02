@@ -15,6 +15,7 @@
     stageId: new URLSearchParams(window.location.search).get("stage"),
     topicPaperQuery: "",
     literatureQuery: "", literatureEvidence: "all", literatureOffset: 0, literatureRequest: 0,
+    run: null, runBusy: false, runRequest: 0,
   };
   const INVENTORY_PAGE_SIZE = 24;
   const $ = (selector) => document.querySelector(selector);
@@ -79,8 +80,9 @@
   }
 
   function statusPill(value) {
-    const status = text(value, "unknown").replaceAll("_", " ");
-    return `<span class="state-pill state-pill--${statusClass(value)}">${escapeHtml(status)}</span>`;
+    const labels = {candidate_needs_review: "Review pending", research_expansion_required: "Research needed", awaiting_review: "Review pending", review_rejected: "Review rejected", waiting_for_provider: "Provider wait", deadline_reached: "Deadline reached"};
+    const status = labels[value] || text(value, "unknown").replaceAll("_", " ");
+    return `<span class="state-pill state-pill--${statusClass(value)}" title="${escapeHtml(text(value).replaceAll("_", " "))}">${escapeHtml(status)}</span>`;
   }
 
   function stageName(snapshot, id) {
@@ -222,6 +224,8 @@
     url.hash = "research";
     window.history.pushState({}, "", `${url.pathname}${url.search}${url.hash}`);
     state.snapshot = null;
+    state.run = null;
+    renderRunControls();
     state.stageId = null; state.literatureOffset = 0; state.literatureQuery = "";
     state.literatureEvidence = "all";
     $("#literature-search").value = ""; $("#literature-evidence").value = "all";
@@ -229,6 +233,7 @@
     window.scrollTo(0, 0);
     fetchSnapshot();
     fetchProjects();
+    fetchRun();
   }
 
   function renderSidebar(projects) {
@@ -237,7 +242,7 @@
     const items = Array.isArray(projects) ? projects : [];
     const selectedRef = state.view === "project" ? state.projectRef : null;
     list.innerHTML = items.length ? items.map((project) => `<button class="sidebar-project${project.ref === selectedRef ? " is-selected" : ""}" type="button" data-sidebar-project-ref="${escapeHtml(project.ref)}">
-      <span class="sidebar-project-main"><span class="sidebar-project-name">${escapeHtml(text(project.name, project.ref))}</span><span class="sidebar-project-meta">${escapeHtml(text(project.workflow_id, project.ref === "." ? "current mission" : project.ref))}</span></span>
+      <span class="sidebar-project-main"><span class="sidebar-project-name" title="${escapeHtml(text(project.name, project.ref))}">${escapeHtml(text(project.name, project.ref))}</span><span class="sidebar-project-meta" title="${escapeHtml(text(project.workflow_id, project.ref))}">${escapeHtml(text(project.workflow_id, project.ref === "." ? "current mission" : project.ref))}</span></span>
       <span class="sidebar-project-state">${statusPill(project.status)}</span>
     </button>`).join("") : '<div class="sidebar-empty">No projects</div>';
     $$("[data-sidebar-project-ref]").forEach((button) => button.addEventListener("click", () => navigateProject(button.dataset.sidebarProjectRef)));
@@ -304,7 +309,7 @@
     $("#elapsed").textContent = duration(live.elapsed_seconds);
     $("#remaining").textContent = live.remaining_seconds === null || live.remaining_seconds === undefined
       ? "No deadline" : `${duration(live.remaining_seconds)} left`;
-    const processes = snapshot.runtime?.processes || [];
+    const processes = (snapshot.runtime?.processes || []).filter((item) => item.owns_execution === true);
     $("#process-state").textContent = processes.length ? `${processes.map((item) => `PID ${item.pid}`).join(" · ")}` : "not detected";
     $("#connection-status").textContent = "Connected";
     $("#connection-dot").classList.remove("is-error");
@@ -1011,9 +1016,40 @@
       closeProjectDialog();
       navigateProject(button.dataset.projectRef);
     }));
-    const draft = selected?.status === "draft";
-    $("#start-current").disabled = !draft;
-    $("#resume-current").disabled = !selected || draft || selected.initialized !== true;
+  }
+
+  function renderRunControls() {
+    const run = state.run;
+    const names = {ready: "Ready to start", running: "Running", waiting_for_provider: "Waiting for provider", stopping: "Stopping…", stopped: "Stopped", completed: "Complete", deadline_reached: "Deadline reached"};
+    $("#run-status").textContent = state.runBusy ? "Applying command…" : (names[run?.status] || "Checking…");
+    const processes = run?.processes || [];
+    $("#run-detail").textContent = run?.control_error || (processes.length ? `PID ${processes.map((p) => p.pid).join(" · ")}${run.provider_retry_at_epoch ? ` · Retry ${new Date(run.provider_retry_at_epoch * 1000).toLocaleString()}` : ""}` : (run?.initialized ? "Existing checkpoint preserved" : "No run has been started"));
+    for (const action of ["start", "stop", "resume"]) $("#run-" + action).disabled = state.runBusy || run?.["can_" + action] !== true;
+    const scope = $("#run-scope");
+    const options = '<option value="">Workflow complete</option>' + (run?.stages || []).map((stage) => `<option value="${escapeHtml(stage.id)}">${escapeHtml(stage.label)}</option>`).join("");
+    if (scope.dataset.project !== state.projectRef || scope.dataset.options !== options) {
+      scope.innerHTML = options; scope.value = run?.settings?.stop_after_stage || "";
+      scope.dataset.project = state.projectRef; scope.dataset.options = options;
+    }
+    scope.disabled = !run || state.runBusy || processes.length > 0;
+    $("#run-note").textContent = run?.status === "stopping" ? "Waiting for the supervisor to stop its workers and preserve the checkpoint." : "Stopping preserves the checkpoint. Runs continue when this window closes.";
+  }
+
+  async function fetchRun() {
+    if (state.view !== "project") return;
+    const request = ++state.runRequest, project = state.projectRef;
+    try {
+      const response = await fetch(`/api/run?project=${encodeURIComponent(project || ".")}`, {cache: "no-store"});
+      const value = await response.json();
+      if (!response.ok) throw new Error(value.error || `Run status unavailable (${response.status})`);
+      if (request !== state.runRequest || project !== state.projectRef) return;
+      state.run = value;
+      renderRunControls();
+    } catch (error) {
+      if (request !== state.runRequest || project !== state.projectRef) return;
+      state.run = null; renderRunControls(); $("#run-status").textContent = "Unavailable";
+      $("#run-detail").textContent = error.message;
+    }
   }
 
   async function fetchProjects() {
@@ -1042,14 +1078,21 @@
     return value;
   }
 
-  async function runProject(resume) {
+  async function runProject(action) {
+    if (state.runBusy) return;
+    const project = state.projectRef;
+    if (project === null) return;
+    state.runBusy = true; renderRunControls();
     try {
-      const result = await postAction({ action: "start_composer", project: state.projectRef || ".", resume });
-      showToast(result.status === "already_running" ? "This Composer is already running." : `Composer started · PID ${result.pid}`);
-      await fetchProjects();
-      await fetchSnapshot();
+      const payload = {action: action === "stop" ? "stop_composer" : "start_composer", project};
+      if (action !== "stop") { payload.resume = action === "resume"; payload.settings = {development: state.run?.settings?.development ?? true, stop_after_stage: $("#run-scope").value || null}; }
+      const result = await postAction(payload);
+      showToast(result.status === "already_running" ? "This mission is already running." : result.status === "stopping" ? "Stop requested. Preserving the checkpoint…" : result.status === "already_stopped" ? "This mission is already stopped." : `Mission ${action === "resume" ? "resumed" : "started"} · PID ${result.pid}`);
+      await Promise.all([fetchProjects(), fetchRun(), fetchSnapshot()]);
     } catch (error) {
       showToast(error.message);
+    } finally {
+      state.runBusy = false; renderRunControls();
     }
   }
 
@@ -1108,7 +1151,7 @@
   }
 
   async function refreshCurrent() {
-    await Promise.all([fetchWorkspace(), state.view === "project" ? fetchSnapshot() : Promise.resolve()]);
+    await Promise.all([fetchWorkspace(), state.view === "project" ? fetchSnapshot() : Promise.resolve(), fetchRun()]);
   }
 
   function setInspectorRaw(href) {
@@ -1334,8 +1377,7 @@
     $("#project-dialog").addEventListener("click", (event) => {
       if (event.target === $("#project-dialog")) closeProjectDialog();
     });
-    $("#start-current").addEventListener("click", () => runProject(false));
-    $("#resume-current").addEventListener("click", () => runProject(true));
+    for (const action of ["start", "stop", "resume"]) $("#run-" + action).addEventListener("click", () => runProject(action));
     $("#project-form").addEventListener("submit", (event) => {
       event.preventDefault();
       createProject(event.submitter?.dataset.start === "true");
@@ -1392,6 +1434,7 @@
         setView("project", project || ".");
         fetchSnapshot();
         fetchProjects();
+        fetchRun();
       }
     });
     window.addEventListener("hashchange", () => {
@@ -1404,6 +1447,7 @@
   fetchProjects();
   fetchWorkspace();
   if (state.view === "project") fetchSnapshot();
+  fetchRun();
   window.setInterval(refreshCurrent, 5000);
   let resizeTimer;
   window.addEventListener("resize", () => {

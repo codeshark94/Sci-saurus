@@ -4,7 +4,8 @@ Sci-saurus includes a small localhost web console for understanding and
 managing the whole local research workspace and its bounded Composer projects. It reads the durable workflow checkpoints,
 content-addressed artifact store, SQLite control ledger, and project files.
 Snapshot and file inspection stay read-only; the Projects dialog exposes only
-validated project creation and Composer start/resume actions.
+validated project creation. Each selected project exposes supervised Composer
+Start, Stop, and Resume controls above its stage workspace.
 
 ## Start it
 
@@ -133,6 +134,17 @@ missions/<slug>/
 
 `Create project` only writes the validated workflow. `Create & start` creates
 it and launches the allowlisted Composer command. An existing Composer state
-database must be resumed with `Resume current`; a new run cannot silently
-overwrite existing state. The dashboard intentionally has no arbitrary shell
-execution or stop/kill action.
+database must be resumed with `Resume`; a new run cannot silently overwrite
+existing state. `Run until` selects a scheduled stage boundary. Stop sends a
+termination request to the verified supervisor, which stops its worker and
+preserves the checkpoint. Resume keeps the original deadline and acquired
+artifacts. An elapsed mission requires an explicit deadline decision outside
+these controls.
+
+Start and Resume use a local workflow descriptor matching the current immutable
+Composer revision. A missing matching descriptor disables execution while
+retaining read-only inspection and Stop for an identified supervisor. Controls
+adopt existing supervised runs and prevent duplicate starts across dashboard
+instances. Runs launched without a supervisor must be stopped in their terminal.
+
+The [desktop app](130-desktop-app.md) bundles this dashboard and its local backend.

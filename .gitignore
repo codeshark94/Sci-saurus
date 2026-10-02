@@ -11,3 +11,11 @@ projects/*/state/
 .env
 .env.local
 .dsh/
+desktop/node_modules/
+desktop/.venv-build/
+desktop/.build/
+desktop/src-tauri/target/
+desktop/src-tauri/binaries/
+desktop/src-tauri/gen/
+output/playwright/
+.playwright-cli/

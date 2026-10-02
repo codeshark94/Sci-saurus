@@ -5,7 +5,7 @@ function element(id){
   if(!elements.has(id)){
     const attrs=new Map(),classes=new Set();
     elements.set(id,{hidden:false,open:false,close(){this.open=false;},dataset:{},attrs,classes,
-      classList:{toggle(c,on){if(on)classes.add(c);else classes.delete(c);}},
+      classList:{toggle(c,on){if(on)classes.add(c);else classes.delete(c);},remove(c){classes.delete(c);}},
       setAttribute(k,v){attrs.set(k,v);},getAttribute(k){return attrs.get(k);},removeAttribute(k){attrs.delete(k);}});
   }
   return elements.get(id);
@@ -19,7 +19,7 @@ const context={URL,URLSearchParams,console,document:{querySelector:element,getEl
 vm.createContext(context);
 let app=fs.readFileSync(path.join(root,'scisaurus/dashboard/static/app.js'),'utf8');
 const bootstrap=app.indexOf('\n  bindControls();\n  setView');assert(bootstrap>=0);
-app=app.slice(0,bootstrap)+'\nwindow.testApi={renderProjectPage,navigateOperation,selectStage,state};\n})();';
+app=app.slice(0,bootstrap)+'\nwindow.testApi={renderProjectPage,navigateOperation,selectStage,renderHeader,state};\n})();';
 vm.runInContext(app,context);
 const api=context.window.testApi;
 const panes=['mission-metrics','calls','activity','specialists','resources','structure','inventory'];
@@ -45,4 +45,8 @@ assert.equal(stages.filter(e=>e.classes.has('is-active')).length,1);count++;
 location.hash='resources';api.renderProjectPage();assert.deepEqual(visible(),['resources']);count++;
 location.hash='stage-workspace';api.renderProjectPage();assert.deepEqual(visible(),[]);count++;
 assert.equal(scrolls,5);
+api.renderHeader({runtime:{processes:[{pid:123,owns_execution:true},{pid:456,owns_execution:false}]} });
+assert.equal(element('#process-state').textContent,'PID 123');count++;
+api.renderHeader({runtime:{processes:[{pid:456,owns_execution:false}]} });
+assert.equal(element('#process-state').textContent,'not detected');count++;
 console.log(JSON.stringify({status:'passed',cases:count,externalCalls:0}));

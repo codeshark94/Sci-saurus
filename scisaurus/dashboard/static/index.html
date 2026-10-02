@@ -6,12 +6,12 @@
   <meta name="color-scheme" content="dark">
   <title>Sci-saurus · Research Console</title>
   <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/styles.css?v=27">
+    <link rel="stylesheet" href="/assets/styles.css?v=28">
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar" aria-label="Primary navigation">
-      <div class="sidebar-context">SCI-SAURUS / LOCAL CONSOLE</div>
+      <div class="sidebar-context"><img src="/assets/favicon.svg" alt="" width="28" height="28"><span>SCI-SAURUS<br><small>RESEARCH CONSOLE</small></span></div>
 
       <nav class="global-nav" aria-label="Workspace navigation">
         <a class="nav-link is-active" id="workspace-link" href="#workspace"><span class="nav-index">00</span><span>Workspace</span></a>
@@ -114,6 +114,12 @@
       </div>
 
       <div class="content-wrap project-view" id="project-view" hidden>
+        <section class="run-control" aria-label="Mission controls">
+          <div class="run-control-state"><span class="run-control-label">EXECUTION</span><strong id="run-status">Checking…</strong><span id="run-detail">Reading the current process and checkpoint.</span></div>
+          <div class="run-control-settings"><label for="run-scope">Run until</label><select id="run-scope" aria-label="Run until"><option value="">Workflow complete</option></select></div>
+          <div class="run-control-buttons"><button class="button" id="run-start" type="button" disabled>Start</button><button class="button button--quiet" id="run-stop" type="button" disabled>Stop</button><button class="button" id="run-resume" type="button" disabled>Resume</button></div>
+          <div class="run-control-note" id="run-note" role="status" aria-live="polite">Stopping preserves the checkpoint. Runs continue when this window closes.</div>
+        </section>
         <section class="hero section-anchor" id="overview">
           <div class="hero-main">
             <div class="eyebrow">MISSION STATUS <span class="eyebrow-line"></span><span id="hero-source">CHECKPOINT</span></div>
@@ -395,10 +401,6 @@
       <section class="project-manager-section">
         <div class="project-manager-heading"><div class="research-label">WORKSPACE PROJECTS</div><div class="section-caption" id="project-manager-status">—</div></div>
         <div class="project-list" id="project-list"><div class="loading-block">Loading projects…</div></div>
-        <div class="project-manager-actions">
-          <button class="button button--quiet" id="start-current" type="button">Start new run</button>
-          <button class="button button--quiet" id="resume-current" type="button">Resume current</button>
-        </div>
       </section>
       <section class="project-manager-section">
         <div class="research-label">CREATE FROM CURRENT WORKFLOW TEMPLATE</div>
@@ -410,7 +412,7 @@
         </form>
       </section>
     </div>
-    <div class="inspector-footer"><span>Only validated Composer workflows under this workspace can be created or started.</span></div>
+    <div class="inspector-footer"><span>Select a project to use its Start, Stop, and Resume controls.</span></div>
   </dialog>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script src="/assets/output-view.js?v=1" defer></script>

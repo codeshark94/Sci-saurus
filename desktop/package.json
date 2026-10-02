@@ -1,0 +1,11 @@
+{
+  "name": "scisaurus-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "backend": "python3 build_backend.py",
+    "dev": "tauri dev",
+    "build": "tauri build --bundles app"
+  },
+  "devDependencies": {"@tauri-apps/cli": "^2.0.0"}
+}

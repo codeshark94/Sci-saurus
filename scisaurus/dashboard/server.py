@@ -11,17 +11,21 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from copy import deepcopy
+from contextlib import closing, contextmanager
+import fcntl
 import json
 import mimetypes
 import os
 from pathlib import Path
 import platform
 import re
+import signal
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from threading import Lock, Thread
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
@@ -334,6 +338,7 @@ class DashboardSnapshot:
             raise ValueError(f"dashboard project directory does not exist: {self.root}")
         if self.root == Path("/"):
             raise ValueError("dashboard refuses to inspect the filesystem root")
+        self.workflow_control_error = None
         self.workflow_path, self.workflow = self._load_workflow()
         self.roots = self._discover_roots()
 
@@ -348,6 +353,32 @@ class DashboardSnapshot:
                 continue
             value = _read_json(candidate)
             if isinstance(value, dict) and isinstance(value.get("stages"), list):
+                project_id = value.get("project_id")
+                if isinstance(project_id, str):
+                    project = Path(project_id).expanduser().resolve()
+                    database = project / "state/control.sqlite"
+                    if database.is_file():
+                        with closing(sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)) as conn:
+                            row = conn.execute("SELECT body_hash FROM artifacts WHERE logical_id = ? ORDER BY version DESC LIMIT 1",
+                                               ("command/composer/workflow",)).fetchone()
+                        if row:
+                            body = (project / "objects/sha256" / row[0]).read_bytes()
+                            if sha256_hex(body) != row[0]:
+                                raise ValueError("current workflow artifact hash does not match its body")
+                            current = json.loads(body)
+                            from scisaurus.runtime.composer import validate_workflow
+                            paths = sorted({candidate, *candidate.parent.glob("workflow*.json")})
+                            for path in paths:
+                                descriptor = _read_json(path)
+                                if not isinstance(descriptor, dict):
+                                    continue
+                                try:
+                                    if validate_workflow(descriptor) == current:
+                                        return path.resolve(), current
+                                except ValidationError:
+                                    continue
+                            self.workflow_control_error = "No local workflow descriptor matches the current immutable Composer revision."
+                            return candidate.resolve(), current
                 return candidate.resolve(), value
         return None, {}
 
@@ -2950,7 +2981,7 @@ class DashboardSnapshot:
 
 
 class DashboardService:
-    def __init__(self, project_dir):
+    def __init__(self, project_dir, *, repository=None, runtime_python=None):
         self.project_dir = Path(project_dir).expanduser().resolve()
         if not self.project_dir.is_dir():
             raise ValueError(f"dashboard project directory does not exist: {self.project_dir}")
@@ -2958,6 +2989,8 @@ class DashboardService:
             raise ValueError("dashboard refuses to manage the filesystem root")
         self._owned_processes = {}
         self._action_lock = Lock()
+        self.repository = Path(repository or Path(__file__).resolve().parents[2]).resolve()
+        self.runtime_python = str(runtime_python or sys.executable)
 
     def _resolve_project(self, project_ref=None):
         if project_ref in (None, "", "."):
@@ -2972,11 +3005,13 @@ class DashboardService:
             raise FileNotFoundError("project is outside the dashboard workspace or does not exist")
         return candidate
 
-    def _workflow(self, project_dir):
+    def _workflow(self, project_dir, *, for_execution=False):
         snapshot = DashboardSnapshot(project_dir)
         if snapshot.workflow_path is None:
             raise ValueError("project has no Composer workflow.json")
-        workflow = _read_json(snapshot.workflow_path)
+        if for_execution and snapshot.workflow_control_error:
+            raise ValueError(snapshot.workflow_control_error)
+        workflow = snapshot.workflow
         if not isinstance(workflow, dict):
             raise ValueError("project workflow.json is not a JSON object")
         return snapshot.workflow_path, workflow
@@ -3010,7 +3045,7 @@ class DashboardService:
             })
         return summaries
 
-    def _project_record(self, candidate):
+    def _project_record(self, candidate, process_inventory=None):
         workflow_path, workflow = self._workflow(candidate)
         ref = "." if candidate == self.project_dir else candidate.relative_to(self.project_dir).as_posix()
         project_id = workflow.get("project_id")
@@ -3019,7 +3054,7 @@ class DashboardService:
         state_path = project_root / "state" / "control.sqlite" if project_root else None
         progress = _read_json(progress_path) if progress_path and progress_path.is_file() else {}
         progress = progress if isinstance(progress, dict) else {}
-        running_processes = self._composer_processes(workflow_path)
+        running_processes = self._composer_processes(workflow_path, process_inventory)
         progress_status = _display_status(progress.get("status"))
         status = "running" if running_processes else ("draft" if not progress else progress_status)
         if status == "running" and not running_processes:
@@ -3108,10 +3143,11 @@ class DashboardService:
 
     def projects(self):
         candidates = self._project_candidates()
+        processes = self._composer_inventory()
         projects = []
         for candidate in candidates[:MAX_PROJECTS]:
             try:
-                projects.append(self._project_record(candidate))
+                projects.append(self._project_record(candidate, processes))
             except (OSError, ValueError):
                 continue
         # Put live work and the most recently updated checkpoint first.  This
@@ -3131,7 +3167,7 @@ class DashboardService:
                          for status in ("running", "stale", "draft", "completed", "failed", "blocked", "cancelled")}
         active_runs = [item for item in projects if item.get("status") == "running"]
         active_stages = sum(1 for item in active_runs if item.get("current_stage"))
-        repository = Path(__file__).resolve().parents[2]
+        repository = self.repository
         recent_projects = sorted(
             (item for item in projects if item.get("last_updated")),
             key=lambda item: item["last_updated"], reverse=True,
@@ -3160,28 +3196,94 @@ class DashboardService:
             "active_runs": active_runs,
             "recent_projects": recent_projects,
             "bounded": listing.get("bounded", False),
-            "controls": {"local_actions": ["create_project", "start_composer"]},
+            "controls": {"local_actions": ["create_project", "start_composer", "stop_composer"]},
         }
 
     @staticmethod
-    def _composer_processes(workflow_path):
-        try:
-            result = subprocess.run(
-                ["ps", "-axo", "pid=,command="], check=False,
-                capture_output=True, text=True, timeout=0.7,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return []
+    def _composer_inventory():
+        result = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,ppid=,lstart=,command="], check=True,
+            capture_output=True, text=True, timeout=2,
+        )
         processes = []
         for line in result.stdout.splitlines():
-            match = re.match(r"\s*(\d+)\s+(.*)", line)
-            if not match:
+            fields = line.split(None, 7)
+            if len(fields) != 8 or not fields[0].isdigit():
                 continue
-            command = match.group(2)
-            if not _composer_owns_workflow(command, workflow_path):
+            command = fields[7]
+            runner = _runner_command(command)
+            if not runner or runner["verb"] != "run-composer":
                 continue
-            processes.append({"pid": int(match.group(1)), "command": _short(command, 240)})
+            processes.append({"pid": int(fields[0]), "parent_pid": int(fields[1]),
+                              "started": " ".join(fields[2:7]), "command": command,
+                              "supervised": bool(re.search(r"(?:^|\s)--watch(?=\s|$)", command))})
         return processes
+
+    @staticmethod
+    def _composer_processes(workflow_path, inventory=None):
+        if inventory is None:
+            inventory = DashboardService._composer_inventory()
+        return [item for item in inventory if _composer_owns_workflow(item["command"], workflow_path)]
+
+    @contextmanager
+    def _run_lock(self, project_id):
+        output = project_id / "output"
+        output.mkdir(parents=True, exist_ok=True)
+        with self._action_lock, (output / "run-control.lock").open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield output
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _save_run_control(output, value):
+        temporary = output / "run-control.json.tmp"
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+        temporary.replace(output / "run-control.json")
+
+    def run_status(self, project_ref=None):
+        project_dir = self._resolve_project(project_ref)
+        workflow_path, workflow = self._workflow(project_dir)
+        project_id = Path(workflow["project_id"]).expanduser().resolve()
+        if not project_id.is_relative_to(project_dir):
+            raise ValueError("workflow project_id must stay inside its managed project")
+        output = project_id / "output"
+        progress = _read_json(output / "progress.json") or {}
+        control = _read_json(output / "run-control.json") or {}
+        if control.get("workflow_path") != str(workflow_path.resolve()):
+            control = {}
+        processes = self._composer_processes(workflow_path)
+        initialized = (project_id / "state/control.sqlite").is_file()
+        now = time.time()
+        deadline = progress.get("deadline_at_epoch")
+        expired = isinstance(deadline, (float, int)) and not isinstance(deadline, bool) and deadline <= now
+        completed = progress.get("status") == "completed"
+        stopping = control.get("stop_requested") is True and any(
+            item["pid"] == control.get("pid") and item["started"] == control.get("started")
+            for item in processes)
+        supervisor = _read_json(output / "supervisor-state.json") or {}
+        cooldowns = [item for item in progress.get("active_blockers", [])
+                     if isinstance(item, dict) and item.get("reason") == "provider_cooldown"
+                     and isinstance(item.get("retry_after_epoch"), (int, float))
+                     and item["retry_after_epoch"] > now]
+        retry_at = max((item["retry_after_epoch"] for item in cooldowns), default=None)
+        if processes:
+            status = "stopping" if stopping else (
+                "waiting_for_provider" if retry_at and supervisor.get("action") == "waiting_to_resume" else "running")
+        else:
+            status = "completed" if completed else ("deadline_reached" if expired else ("stopped" if initialized else "ready"))
+        settings = control.get("settings", {"development": True, "stop_after_stage": None})
+        control_error = DashboardSnapshot(project_dir).workflow_control_error
+        return {"project": project_ref or ".", "status": status, "processes": processes,
+                "initialized": initialized, "checkpoint_status": progress.get("status"),
+                "phase": progress.get("phase"), "deadline_at_epoch": deadline,
+                "provider_retry_at_epoch": retry_at, "settings": settings, "control_error": control_error,
+                "stages": [{"id": item["id"], "label": STAGE_LABELS.get(item["id"], item["id"])}
+                           for item in workflow.get("stages", [])],
+                "can_start": not processes and not initialized and not control_error,
+                "can_resume": not processes and initialized and not expired and not completed and not control_error,
+                "can_stop": bool(processes) and not stopping and all(item["supervised"] for item in processes)}
 
     def _validate_composer_workflow(self, workflow_path, workflow, project_dir):
         from scisaurus.runtime.composer import validate_workflow
@@ -3193,11 +3295,11 @@ class DashboardService:
             raise ValueError("workflow must stay inside its managed project")
         return validated, project_id
 
-    def start_composer(self, project_ref=None, *, resume=False):
+    def start_composer(self, project_ref=None, *, resume=False, settings=None):
         project_dir = self._resolve_project(project_ref)
-        workflow_path, workflow = self._workflow(project_dir)
+        workflow_path, workflow = self._workflow(project_dir, for_execution=True)
         workflow, project_id = self._validate_composer_workflow(workflow_path, workflow, project_dir)
-        with self._action_lock:
+        with self._run_lock(project_id) as output:
             existing = self._composer_processes(workflow_path)
             if existing:
                 return {"status": "already_running", "project": project_dir.name,
@@ -3207,9 +3309,28 @@ class DashboardService:
                 raise ValueError("resume requires an initialized Composer project")
             if not resume and state_path.is_file():
                 raise ValueError("project already has Composer state; choose Resume")
-            repository = Path(__file__).resolve().parents[2]
-            command = [sys.executable, "-m", "scisaurus.cli", "run-composer",
-                       "--workflow", str(workflow_path)]
+            if resume:
+                status = self.run_status(project_ref)
+                if not status["can_resume"]:
+                    raise ValueError("this checkpoint is complete or its original deadline has elapsed")
+            if settings is None:
+                settings = self.run_status(project_ref)["settings"]
+            if not isinstance(settings, dict) or set(settings) - {"development", "stop_after_stage"}:
+                raise ValueError("unsupported run settings")
+            development = settings.get("development", True)
+            stop_stage = settings.get("stop_after_stage")
+            if type(development) is not bool:
+                raise ValueError("development must be a boolean")
+            if stop_stage is not None and stop_stage not in {item["id"] for item in workflow["stages"]}:
+                raise ValueError("stop stage must belong to the selected workflow")
+            settings = {"development": development, "stop_after_stage": stop_stage}
+            repository = self.repository
+            command = [self.runtime_python, "-u", "-m", "scisaurus.cli", "run-composer",
+                       "--workflow", str(workflow_path), "--watch"]
+            if development:
+                command.append("--development")
+            if stop_stage:
+                command.extend(["--stop-after-stage", stop_stage])
             from scisaurus.runtime.composer import default_runtime_environment_files
             for env_file in default_runtime_environment_files(repository):
                 command.extend(["--env-file", env_file])
@@ -3223,9 +3344,60 @@ class DashboardService:
                     stderr=subprocess.STDOUT, start_new_session=True,
                 )
             self._owned_processes[str(workflow_path)] = process
+            Thread(target=process.wait, daemon=True).start()
+            try:
+                time.sleep(0.15)
+                if process.poll() is not None:
+                    raise ValueError(f"Composer exited during startup; inspect {log_path}")
+                identity = next((item for item in self._composer_processes(workflow_path)
+                                 if item["pid"] == process.pid), None)
+                if identity is None:
+                    raise ValueError(f"Composer startup identity could not be verified; inspect {log_path}")
+                self._save_run_control(output, {"workflow_path": str(workflow_path.resolve()),
+                                       "pid": process.pid, "started": identity["started"],
+                                       "stop_requested": False, "settings": settings})
+            except BaseException:
+                if process.poll() is None:
+                    process.terminate()
+                process.wait(timeout=20)
+                self._owned_processes.pop(str(workflow_path), None)
+                raise
             return {"status": "started", "project": project_dir.name,
                     "workflow_path": str(workflow_path), "pid": process.pid,
                     "resume": resume, "command": command, "log_path": str(log_path)}
+
+    def stop_composer(self, project_ref=None):
+        project_dir = self._resolve_project(project_ref)
+        workflow_path, workflow = self._workflow(project_dir)
+        project_id = Path(workflow["project_id"]).expanduser().resolve()
+        if not project_id.is_relative_to(project_dir) or not workflow_path.resolve().is_relative_to(project_dir):
+            raise ValueError("workflow ownership must stay inside its managed project")
+        with self._run_lock(project_id) as output:
+            processes = self._composer_processes(workflow_path)
+            if not processes:
+                return {"status": "already_stopped", "project": project_ref or "."}
+            if len(processes) != 1:
+                raise ValueError("multiple Composer supervisors own this workflow; reconcile their ownership before stopping")
+            owner = processes[0]
+            if not owner["supervised"]:
+                raise ValueError("this run has no checkpoint supervisor; stop it from its original terminal")
+            control = _read_json(output / "run-control.json") or {}
+            settings = control.get("settings") if control.get("workflow_path") == str(workflow_path.resolve()) else None
+            if settings is None:
+                stage = re.search(r"(?:^|\s)--stop-after-stage(?:=|\s+)(\S+)", owner["command"])
+                settings = {"development": bool(re.search(r"(?:^|\s)--development(?=\s|$)", owner["command"])),
+                            "stop_after_stage": stage[1] if stage else None}
+            current = next((item for item in self._composer_processes(workflow_path)
+                            if item["pid"] == owner["pid"]), None)
+            if current is None:
+                return {"status": "already_stopped", "project": project_ref or "."}
+            if current != owner:
+                raise ValueError("Composer process identity changed before stop")
+            os.kill(owner["pid"], signal.SIGTERM)
+            self._save_run_control(output, {"workflow_path": str(workflow_path.resolve()),
+                                   "pid": owner["pid"], "started": owner["started"],
+                                   "stop_requested": True, "settings": settings})
+            return {"status": "stopping", "project": project_ref or ".", "pid": owner["pid"]}
 
     @staticmethod
     def _rewrite_template_paths(value, template_dir, target_dir):
@@ -3509,7 +3681,10 @@ class DashboardService:
         if action == "create_project":
             return self.create_project(payload)
         if action == "start_composer":
-            return self.start_composer(payload.get("project", "."), resume=payload.get("resume") is True)
+            return self.start_composer(payload.get("project", "."), resume=payload.get("resume") is True,
+                                       settings=payload.get("settings"))
+        if action == "stop_composer":
+            return self.stop_composer(payload.get("project", "."))
         raise ValueError("unsupported dashboard action")
 
     def file_payload(self, file_ref, project_ref=None):
@@ -3559,6 +3734,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return self._json_response(self.server.service.workspace())
             if parsed.path == "/api/projects":
                 return self._json_response(self.server.service.projects())
+            if parsed.path == "/api/run":
+                return self._json_response(self.server.service.run_status(query.get("project", [None])[0]))
             if parsed.path in {"/api/literature", "/api/literature/detail"}:
                 options = {"q": query.get("q", [""])[0], "evidence": query.get("evidence", ["all"])[0],
                            "offset": int(query.get("offset", ["0"])[0]), "limit": int(query.get("limit", ["25"])[0])}
@@ -3586,7 +3763,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         except FileNotFoundError as exc:
             self._error(404, str(exc))
-        except (ValueError, OSError, sqlite3.Error) as exc:
+        except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError, ValidationError) as exc:
             self._error(400, str(exc))
 
     def do_POST(self):  # noqa: N802 - stdlib handler API
@@ -3595,6 +3772,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._error(404, "route not found")
         if self.client_address[0] not in {"127.0.0.1", "::1", "localhost"}:
             return self._error(403, "dashboard actions are limited to a local client")
+        host = self.headers.get("Host", "")
+        allowed_hosts = {f"{name}:{self.server.server_port}" for name in
+                         ("127.0.0.1", "localhost", f"[{self.server.server_address[0]}]", self.server.server_address[0])}
+        if host not in allowed_hosts:
+            return self._error(403, "dashboard action Host does not match this server")
+        origin = self.headers.get("Origin")
+        if origin and origin != f"http://{host}":
+            return self._error(403, "dashboard actions require the same origin")
+        if self.headers.get_content_type() != "application/json":
+            return self._error(415, "dashboard actions require application/json")
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -3609,7 +3796,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         except FileExistsError as exc:
             self._error(409, str(exc))
-        except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
+        except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError, ValidationError) as exc:
             self._error(400, str(exc))
 
     def _static(self, relative):

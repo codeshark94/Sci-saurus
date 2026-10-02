@@ -280,7 +280,8 @@ before using live providers.
 | [Agent / department / stage flow](docs/16-agent-department-flow.md) | Routing, assignments, handoffs, and scoped continuation |
 | [Composer runtime](docs/110-composer-runtime.md) | End-to-end stage admission, review, reallocation, and resume |
 | [Critical review articles](docs/115-review-articles.md) | Journal/theme scouting, review benchmarks, original synthesis, and rendered peer review |
-| [Local dashboard](docs/120-local-dashboard.md) | Workspace overview, project drill-down, research progress, bounded project creation, and Composer start/resume |
+| [Local dashboard](docs/120-local-dashboard.md) | Workspace overview, research progress, project creation, and supervised Start/Stop/Resume |
+| [Desktop app](docs/130-desktop-app.md) | Tauri app, bundled local backend, repository selection, and execution controls |
 | [Literature survey](docs/75-literature-survey-score.md) | Search, source spans, citation maps, and gap assessment |
 | [Experiment runtime](docs/90-experiment-runtime.md) | Frozen studies, replay, recalculation, and result packages |
 | [Completion runtime](docs/80-completion-runtime.md) | Paper release candidates, evaluation, and delivery boundaries |
