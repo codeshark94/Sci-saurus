@@ -233,6 +233,8 @@ def main(argv=None) -> int:
     p_composer.add_argument(
         "--stop-after-stage", help="pause after the named workflow stage settles for inspection")
     p_composer.add_argument("--resume", action="store_true", help="resume the matching composer project")
+    p_composer.add_argument("--extend-workflow", action="store_true",
+                            help="admit an append-only workflow revision at a stopped stage boundary (requires --resume)")
     p_composer.add_argument(
         "--extend-deadline-seconds", type=float,
         help="extend the existing Composer mission wall before resuming (requires --resume)")
@@ -311,12 +313,14 @@ def main(argv=None) -> int:
                         workflow, initial_resume=args.resume,
                         initial_additional_seconds=args.extend_deadline_seconds,
                         poll_seconds=args.watch_interval, on_progress=on_progress,
-                        stop_after_stage=args.stop_after_stage)
+                        stop_after_stage=args.stop_after_stage,
+                        extend_workflow=args.extend_workflow)
                 else:
                     result = ComposerRunner(workflow, resume=args.resume,
                                             additional_seconds=args.extend_deadline_seconds,
                                             on_progress=on_progress,
-                                            stop_after_stage=args.stop_after_stage).run()
+                                            stop_after_stage=args.stop_after_stage,
+                                            extend_workflow=args.extend_workflow).run()
             except (OSError, ValueError, ValidationError) as exc:
                 print(f"composer workflow rejected: {exc}", file=sys.stderr)
                 return 2

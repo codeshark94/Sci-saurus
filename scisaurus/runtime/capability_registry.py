@@ -18,6 +18,20 @@ import uuid
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
+
+
+def _validate_validator_authorship(admission, source):
+    proof = admission.get("validator_authorship")
+    if proof is None:
+        return
+    if (not isinstance(proof, dict)
+            or proof.get("role") != "methods.validator-author"
+            or proof.get("method") != "blinded_separate_authoring"
+            or proof.get("source_sha256") != hashlib.sha256(source.encode()).hexdigest()
+            or any(not isinstance(proof.get(key), str) or len(proof[key]) != 64
+                   or any(char not in "0123456789abcdef" for char in proof[key])
+                   for key in ("assignment_sha256", "response_sha256"))):
+        raise ValidationError("validator authorship does not bind the registered source and request")
 from scisaurus.runtime.experiment_config import validate_experiment_config
 
 REGISTRY_SCHEMA = "experiment-capability-registry-1"
@@ -284,6 +298,7 @@ def _verify_entry(root, entry):
     candidate = _load_json(candidate_path, "candidate")
     admission = _load_json(admission_path, "admission")
     validate_program_candidate(candidate)
+    _validate_validator_authorship(admission, candidate["validator_source"])
     if (_digest(candidate) != entry["candidate_record_sha256"]
             or admission.get("schema_version") != ADMISSION_SCHEMA
             or _digest(admission) != entry["admission_sha256"]
@@ -358,6 +373,7 @@ def register_capability(root, candidate, admission, *, runtime_python, repo_root
     validate_program_candidate(candidate)
     if not isinstance(admission, dict) or admission.get("schema_version") != ADMISSION_SCHEMA:
         raise ValidationError("capability registration requires an admission record")
+    _validate_validator_authorship(admission, candidate["validator_source"])
     if (admission.get("study_id") != candidate["study_id"]
             or admission.get("revision") != candidate["revision"]):
         raise ValidationError("admission record does not match the candidate identity")

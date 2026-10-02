@@ -5519,6 +5519,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                 context["capability_id"] = "current-capability"
                 context["study_id"] = "current-capability"
                 context["metrics"] = [{"id": "metric", "value": 0.5}]
+                context["execution_refs"] = ["artifact:methods/execution@1"]
                 original_project_dir = context["project_dir"]
                 context["project_dir"] = str(root / "experiment" / "attempt-3")
                 self.assertEqual([], runner._reconcile_mixed_experiment_response_failure(
@@ -16040,7 +16041,7 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(materialize.call_args.kwargs["stage_seconds"], stage_seconds)
             self.assertEqual(projected["experiment"]["id"], "generated_frontier")
             entry = {"id": "generated_frontier", "revision": 1,
-                     "path": str(descriptor_path), "candidate_record_sha256": "a" * 64}
+                     "path": str(descriptor_path), "candidate_record_sha256": "a" * 64, "validator_sha256": "b" * 64}
             admission_path = root / "admission.json"
             admission_path.write_text(json.dumps({"adversarial_review": {"status": "admitted", "findings": []}}))
             with patch("scisaurus.runtime.capability_registry.load_registry", return_value={"capabilities": [entry]}), \
@@ -16057,7 +16058,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                         patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate", return_value=generated) as upgrade:
                     runner._materialize_topic_capability(result)
                 upgrade.assert_called_once()
-            admission_path.write_text(json.dumps({"adversarial_review": valid_review}))
+            admission_path.write_text(json.dumps({"adversarial_review": valid_review, "validator_authorship": {"role": "methods.validator-author", "method": "blinded_separate_authoring", "source_sha256": "b" * 64}}))
             with patch("scisaurus.runtime.capability_registry.load_registry", return_value={"capabilities": [entry]}), \
                     patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate") as regenerate_existing:
                 checked = runner._materialize_topic_capability(result)
@@ -16078,7 +16079,8 @@ class ComposerWorkflowTests(unittest.TestCase):
             brief = json.loads(fresh.call_args.args[0])
             self.assertEqual(brief["repair_evidence_frontier"], runner._capability_evidence_projection(frontier))
             admission_path.write_text(json.dumps({"adversarial_review": valid_review,
-                "repair_provenance": {"repair_evidence_frontier": binding}}))
+                "repair_provenance": {"repair_evidence_frontier": binding},
+                "validator_authorship": {"role": "methods.validator-author", "method": "blinded_separate_authoring", "source_sha256": "b" * 64}}))
             with patch.object(runner, "_require_capability_evidence_before_authoring", return_value=frontier), \
                     patch("scisaurus.runtime.capability_registry.load_registry", return_value={"capabilities": [entry]}), \
                     patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate") as reuse:
@@ -16089,7 +16091,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                 with self.assertRaisesRegex(ModelWorkBlocked, "evidence remains held"):
                     runner._materialize_topic_capability(result, stage_id="experiment")
             registry.assert_not_called()
-            admission_path.write_text(json.dumps({"adversarial_review": valid_review}))
+            admission_path.write_text(json.dumps({"adversarial_review": valid_review, "validator_authorship": {"role": "methods.validator-author", "method": "blinded_separate_authoring", "source_sha256": "b" * 64}}))
             lazy_result = json.loads(json.dumps(result))
             lazy_result.pop("generated_capability")
             lazy_result["topic"].pop("experiment_capability_id", None)
@@ -16125,7 +16127,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                 "results_package": {
                     "schema_version": "results-package-1",
                     "id": "generated_frontier",
-                    "metrics": [{"id": "observed_metric", "value": 1.0}],
+                    "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "observed_metric", "value": 1.0}],
                 },
             }
             runner.stage_records["experiment"] = {
@@ -16161,7 +16163,7 @@ class ComposerWorkflowTests(unittest.TestCase):
             "study_id": "old_capability",
             "results_package": {
                 "id": "old_capability",
-                "metrics": [{"id": "old_metric", "value": 1.0}],
+                "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "old_metric", "value": 1.0}],
             },
         }
         self.assertFalse(
@@ -16175,7 +16177,7 @@ class ComposerWorkflowTests(unittest.TestCase):
             "results_package": {
                 "capability_id": "old_capability",
                 "id": "study-current",
-                "metrics": [{"id": "metric", "value": 1.0}],
+                "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "metric", "value": 1.0}],
             },
         }, "current_capability"))
         self.assertFalse(ComposerRunner._has_executed_experiment_result({
@@ -16183,7 +16185,7 @@ class ComposerWorkflowTests(unittest.TestCase):
             "study_id": "study-current",
             "results_package": {
                 "id": "study-old",
-                "metrics": [{"id": "metric", "value": 1.0}],
+                "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "metric", "value": 1.0}],
             },
         }, "current_capability"))
         self.assertTrue(ComposerRunner._has_executed_experiment_result({
@@ -16191,25 +16193,25 @@ class ComposerWorkflowTests(unittest.TestCase):
             "study_id": "capability_b_study",
             "results_package": {
                 "id": "capability_b_study",
-                "metrics": [{"id": "metric", "value": 1.0}],
+                "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "metric", "value": 1.0}],
             },
         }, "cap-b"))
         self.assertFalse(ComposerRunner._has_executed_experiment_result({
             "capability_id": "cap-current",
             "results_package": {
                 "capability_id": "cap-stale",
-                "metrics": [{"id": "metric", "value": 1.0}],
+                "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "metric", "value": 1.0}],
             },
         }))
         self.assertFalse(ComposerRunner._has_executed_experiment_result({
             "results_package": {
-                "metrics": [{"id": "metric", "value": 1.0}],
+                "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "metric", "value": 1.0}],
             },
         }, "capability-without-result-identity"))
         self.assertFalse(ComposerRunner._has_executed_experiment_result({
             "raw_results": {"raw_measurement": 0.0},
         }, "capability-without-result-identity"))
-        self.assertTrue(ComposerRunner._has_executed_experiment_result({
+        self.assertFalse(ComposerRunner._has_executed_experiment_result({
             "raw_results": {"raw_measurement": 0.0},
         }))
 
@@ -16224,14 +16226,14 @@ class ComposerWorkflowTests(unittest.TestCase):
             package_path.write_text(json.dumps({
                 "id": "capability-a",
                 "capability_id": "capability-a",
-                "metrics": [{"id": "ordering_score", "value": 0.42}],
+                "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "ordering_score", "value": 0.42}],
             }))
             context = {
                 "kind": "experiment", "project_dir": str(prior_dir),
                 "capability_id": "capability-a", "study_id": "capability-a",
                 "results_package": "output/results-package.json",
                 "failure_recovery": {"requires_capability_repair": True},
-                "metrics": [{"id": "ordering_score", "value": 0.42}],
+                "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "ordering_score", "value": 0.42}],
             }
             self.assertTrue(ComposerRunner._has_executed_experiment_result(
                 context, "capability-a"))
@@ -16283,7 +16285,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                 "study_id": "study-b",
                 "results_package": {
                     "id": "study-b",
-                    "metrics": [{"id": "metric", "value": 1.0}],
+                    "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "metric", "value": 1.0}],
                 },
             }))
             workflow["stages"][2]["reuse_completed"] = True
@@ -16313,7 +16315,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                     "study_id": "study-b",
                     "results_package": {
                         "id": "study-b",
-                        "metrics": [{"id": "metric", "value": 1.0}],
+                        "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "metric", "value": 1.0}],
                     },
                 }
                 self.assertFalse(runner._bind_reused_experiment_capability(
@@ -16324,7 +16326,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                     "study_id": "study-old",
                     "results_package": {
                         "id": "study-old",
-                        "metrics": [{"id": "metric", "value": 1.0}],
+                        "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "metric", "value": 1.0}],
                     },
                 }
                 self.assertFalse(runner._bind_reused_experiment_capability(
@@ -16333,7 +16335,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                 missing_study = {
                     "capability_id": "cap-b",
                     "results_package": {
-                        "metrics": [{"id": "metric", "value": 1.0}],
+                        "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "metric", "value": 1.0}],
                     },
                 }
                 self.assertFalse(runner._bind_reused_experiment_capability(
@@ -16357,9 +16359,9 @@ class ComposerWorkflowTests(unittest.TestCase):
                 "timestamp": "2026-09-25T00:00:00Z",
             }]}},
             {"metrics": []},
-            {"execution_refs": ["artifact:execution@1"]},
+            {"execution_refs": ["artifact:methods/execution@1"]},
             {
-                "execution_refs": ["artifact:execution@1"],
+                "execution_refs": ["artifact:methods/execution@1"],
                 "deterministic_validation_ref": "artifact:validation@1",
                 "assessment_ref": "artifact:assessment@1",
                 "model_review_refs": ["artifact:review@1"],
@@ -16374,11 +16376,11 @@ class ComposerWorkflowTests(unittest.TestCase):
             }},
             {"results_package": {
                 "id": "capability-a",
-                "metrics": [{"id": "", "value": 0.5}],
+                "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "", "value": 0.5}],
             }},
             {"results_package": {
                 "id": "capability-a",
-                "metrics": [{"id": "bad metric", "value": 0.5}],
+                "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "bad metric", "value": 0.5}],
             }},
         ]
         for context in metadata_only_contexts:
@@ -16389,13 +16391,13 @@ class ComposerWorkflowTests(unittest.TestCase):
 
         self.assertTrue(ComposerRunner._has_executed_experiment_result({
             "study_id": "capability-a",
-            "execution_refs": ["artifact:execution@1"],
+            "execution_refs": ["artifact:methods/execution@1"],
             "raw_results": {"observations": [{"replicate": 1, "helicity": 0.0}]},
         }, "capability-a"))
         self.assertTrue(ComposerRunner._has_executed_experiment_result({
             "results_package": {
                 "id": "capability-a",
-                "metrics": [{"id": "helicity", "value": 0.0}],
+                "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "helicity", "value": 0.0}],
             },
         }, "capability-a"))
 
@@ -17460,7 +17462,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                 package_path.parent.mkdir(parents=True)
                 package_path.write_text(json.dumps({
                     "id": "study-a", "capability_id": "capability-a",
-                    "metrics": [{"id": "metric", "value": 1.0}],
+                    "provenance": {"execution_refs": ["artifact:methods/execution@1"]}, "metrics": [{"id": "metric", "value": 1.0}],
                 }))
                 runner.context["experiment"] = {
                     "kind": "experiment", "status": "research_expansion_required",
@@ -20989,3 +20991,76 @@ class ComposerWorkflowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkflowExtensionTests(unittest.TestCase):
+    def test_append_only_extension_preserves_owned_checkpoint_and_deadline(self):
+        with tempfile.TemporaryDirectory() as path:
+            full = ComposerWorkflowTests._workflow(self, Path(path))
+            old = deepcopy(full)
+            old['stages'] = old['stages'][:1]
+            old['completion']['required_stage_ids'] = ['survey']
+            runner = ComposerRunner(old)
+            runner.status = 'paused'
+            runner.stage_records['survey'] = {'kind': 'survey', 'status': 'completed'}
+            runner.context['survey'] = {'status': 'completed', 'survey_ref': 'artifact:research/survey/test@1'}
+            runner._checkpoint('survey:operator_stage_boundary', force=True)
+            before = runner.deadline_epoch
+            prior_ref = runner.store.head('command/composer/workflow')['artifact_ref']
+            runner.close()
+            full['revision'] = 2
+            with self.assertRaises(ValidationError):
+                ComposerRunner(full, resume=True)
+            resumed = ComposerRunner(full, resume=True, extend_workflow=True)
+            try:
+                self.assertEqual(resumed.deadline_epoch, before)
+                self.assertEqual(resumed.context['survey']['survey_ref'], 'artifact:research/survey/test@1')
+                head = resumed.store.head('inputs/composer-run')
+                admission = json.loads(resumed.store.read_body(head['body_hash']))
+                self.assertEqual(admission['workflow_extension']['previous_workflow_ref'], prior_ref)
+                self.assertEqual(admission['workflow_extension']['appended_stage_ids'], ['experiment'])
+                self.assertTrue(admission['workflow_extension']['checkpoint_sha256'])
+            finally:
+                resumed.close()
+            again = ComposerRunner(full, resume=True)
+            self.assertEqual(again.deadline_epoch, before)
+            again.close()
+
+    def test_extension_rejects_changes_to_existing_mission(self):
+        with tempfile.TemporaryDirectory() as path:
+            full = ComposerWorkflowTests._workflow(self, Path(path))
+            old = deepcopy(full)
+            old['stages'] = old['stages'][:1]
+            old['completion']['required_stage_ids'] = ['survey']
+            full['revision'] = 2
+            self.assertTrue(ComposerRunner._is_stage_extension(old, full))
+            changes = [lambda v: v['time_policy'].update(hard_seconds=60),
+                       lambda v: v.update(revision=3),
+                       lambda v: v.update(exploration_seed=5),
+                       lambda v: v['stages'][0].update(estimate_seconds=2),
+                       lambda v: v['completion'].update(required_stage_ids=['experiment']),
+                       lambda v: v['completion'].update(release_requires_human=False),
+                       lambda v: v['stages'][1].update(project_dir=v['stages'][0]['project_dir'] + '/child'),
+                       lambda v: v['stages'][1].update(depends_on=[])]
+            for change in changes:
+                changed = deepcopy(full)
+                change(changed)
+                with self.subTest(value=changed):
+                    self.assertFalse(ComposerRunner._is_stage_extension(old, changed))
+
+    def test_future_routing_changes_preserve_current_acceptance_scope(self):
+        contract = {'current_stage_id': 'survey', 'current_requirements': ['captured sources'],
+                    'scientific_input_recovery': {'schema': 1},
+                    'obligation_scope': {'topic_ids': ['current'], 'stage_work_kinds': {}},
+                    'downstream_stage_ids': [], 'downstream_requirements': []}
+        extended = deepcopy(contract)
+        extended['downstream_stage_ids'] = ['experiment']
+        extended['downstream_requirements'] = ['validated outcomes']
+        extended['obligation_scope']['stage_work_kinds'] = {'experiment': ['additional_experiment']}
+        self.assertEqual(ComposerRunner._current_acceptance_scope(contract), ComposerRunner._current_acceptance_scope(extended))
+        extended['current_requirements'].append('new evidence')
+        self.assertNotEqual(ComposerRunner._current_acceptance_scope(contract), ComposerRunner._current_acceptance_scope(extended))
+
+    def test_design_parameters_do_not_count_as_observations(self):
+        self.assertFalse(ComposerRunner._has_executed_experiment_result({
+            'capability_id': 'current', 'raw_results': {'parameters': {'mass_ratio': 1836}, 'observations': []}}, 'current'))

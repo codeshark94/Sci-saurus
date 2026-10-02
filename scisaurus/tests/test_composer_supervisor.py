@@ -475,7 +475,7 @@ class ComposerSupervisorTests(unittest.TestCase):
             snapshot = supervisor._live_snapshot()
             self.assertTrue(supervisor._scheduled_retry_wait(snapshot))
 
-    def test_provider_429_stops_supervisor_before_pending_requests_or_fallback(self):
+    def test_transient_provider_429_resumes_from_checkpoint_after_cooldown(self):
         with tempfile.TemporaryDirectory() as path:
             supervisor = ComposerSupervisor({"id": "provider-rate-limit-stop-test", "project_id": str(Path(path) / "project")})
             base = {"status": "paused", "remaining_seconds": 3600,
@@ -486,7 +486,7 @@ class ComposerSupervisorTests(unittest.TestCase):
                 {"reason": "provider_cooldown", "rate_limit": {"provider": "openalex", "status_code": 429}},
             ):
                 with self.subTest(blocker=blocker):
-                    self.assertFalse(supervisor._should_resume({**base, "active_blockers": [blocker]}))
+                    self.assertTrue(supervisor._should_resume({**base, "active_blockers": [blocker]}))
                     self.assertTrue(supervisor._should_resume({**base, "active_blockers": [], "blockers": [blocker]}))
             self.assertFalse(supervisor._should_resume({**base, "stop_reason": "provider_rate_limit", "active_blockers": []}))
 
@@ -501,7 +501,7 @@ class ComposerSupervisorTests(unittest.TestCase):
             self.assertFalse(supervisor._should_resume({**base, "stop_reason": "operational_state"}))
             self.assertTrue(supervisor._should_resume({**base, "active_blockers": [], "blockers": [blocker]}))
 
-    def test_model_429_stops_supervisor_without_replaying_the_mission(self):
+    def test_model_quota_requires_a_reset_time_before_automatic_resume(self):
         with tempfile.TemporaryDirectory() as path:
             supervisor = ComposerSupervisor({
                 "id": "model-rate-limit-stop-test",
@@ -530,7 +530,7 @@ class ComposerSupervisorTests(unittest.TestCase):
                     "retry_after_seconds": 3600,
                 }],
             }
-            self.assertFalse(supervisor._should_resume(expired_cooldown))
+            self.assertTrue(supervisor._should_resume(expired_cooldown))
 
             active_cooldown = {
                 **limited,
@@ -539,7 +539,7 @@ class ComposerSupervisorTests(unittest.TestCase):
                     "retry_after_epoch": time.time() + 3600,
                 }],
             }
-            self.assertFalse(supervisor._should_resume(active_cooldown))
+            self.assertTrue(supervisor._should_resume(active_cooldown))
 
             resolved_historical = {
                 **limited,
@@ -666,6 +666,7 @@ class ComposerSupervisorTests(unittest.TestCase):
         self.assertFalse(supervisor._should_resume(malformed))
 
         executed = json.loads(json.dumps(result))
+        executed["context"]["experiment"]["execution_refs"] = ["artifact:methods/execution@1"]
         executed["context"]["experiment"]["metrics"] = [{
             "id": "slope_difference", "value": -0.2,
         }]
@@ -679,6 +680,7 @@ class ComposerSupervisorTests(unittest.TestCase):
             package.parent.mkdir(parents=True)
             package.write_text(json.dumps({
                 "capability_id": "cap-b", "study_id": "study-b",
+                "provenance": {"execution_refs": ["artifact:methods/execution@1"]},
                 "observations": [{"value": 0.7}],
             }))
             workflow = {
@@ -1309,3 +1311,28 @@ class ComposerSupervisorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TransientProviderRecoveryTests(unittest.TestCase):
+    def test_rate_limit_does_not_override_terminal_operator_or_runtime_stops(self):
+        supervisor = ComposerSupervisor({'project_id': '/unused'})
+        base = {'status': 'paused', 'remaining_seconds': 300,
+                'active_blockers': [{'reason': 'provider_cooldown', 'rate_limit': {'status_code': 429, 'provider_error_kind': 'rate_limited'}}]}
+        self.assertTrue(supervisor._should_resume(base))
+        for reason in ('operator_stage_boundary', 'operational_state', 'workflow_validation', 'hard_deadline', 'provider_configuration'):
+            with self.subTest(reason=reason):
+                self.assertFalse(supervisor._should_resume({**base, 'stop_reason': reason}))
+
+    def test_nested_retry_after_respects_the_finite_mission_wall(self):
+        supervisor = ComposerSupervisor({'project_id': '/unused'}, poll_seconds=0)
+        value = {'status': 'paused', 'remaining_seconds': 12,
+                 'active_blockers': [{'reason': 'provider_cooldown', 'rate_limit': {'status_code': 429, 'retry_after_seconds': 30}}]}
+        clock = [0.0]
+        sleeps = []
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+        with patch.object(supervisor, '_write_state'), patch('scisaurus.runtime.composer_supervisor.time.monotonic', side_effect=lambda: clock[0]), patch('scisaurus.runtime.composer_supervisor.time.sleep', side_effect=sleep):
+            self.assertTrue(supervisor._wait_before_resume(value))
+        self.assertEqual(sum(sleeps), 12)
+        self.assertTrue(all(interval <= 5 for interval in sleeps))

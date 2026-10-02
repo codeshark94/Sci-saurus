@@ -844,7 +844,7 @@ class CapabilityFoundryTests(unittest.TestCase):
         full_generation = _author_format_repair_instructions(
             "length-limited experiment-author response was not a valid JSON object prefix")
         self.assertIn("complete authoring assignment", full_generation)
-        self.assertIn("experiment_intent, executor_source, and validator_source", full_generation)
+        self.assertIn("only experiment_intent and executor_source", full_generation)
         self.assertIn("Do not return edits", full_generation)
         self.assertIn("bounded patch contract", _author_format_repair_instructions(
             "program author response was incomplete (finish_reason=length)",
@@ -887,7 +887,7 @@ class CapabilityFoundryTests(unittest.TestCase):
         self.assertIn("complete authoring assignment",
                       repair_prompt["format_repair"]["instructions"])
         self.assertEqual(
-            repair_prompt["author_response_contract_version"], "experiment-author-json-v2")
+            repair_prompt["author_response_contract_version"], "experiment-author-json-v3")
 
     def test_unknown_author_continuation_is_not_replayed_and_full_generation_recovers(self):
         with tempfile.TemporaryDirectory() as path:
@@ -1207,7 +1207,8 @@ class CapabilityFoundryTests(unittest.TestCase):
             registry_root=root / "registry", repo_root=ROOT,
             requirements_file=ROOT / "requirements-experiment.txt",
             runtime_packages=[("pip", version("pip"))], max_attempts=2,
-            reviewer_client=StubClient(CapabilityFoundryTests._review_payload()))
+            reviewer_client=StubClient(CapabilityFoundryTests._review_payload()),
+            validator_client=StubClient({"validator_source": MINI_VALIDATOR}))
 
     def test_runtime_pin_mismatch_stops_before_authoring(self):
         with tempfile.TemporaryDirectory() as path:
@@ -1791,7 +1792,7 @@ class CapabilityFoundryTests(unittest.TestCase):
             progress = []
             outcome = foundry.generate(
                 "bounded comparison", client=author,
-                model_call_budget=3,
+                model_call_budget=4,
                 on_progress=lambda phase, state: progress.append((phase, state)))
 
         self.assertEqual(outcome["status"], "registered")
@@ -1834,7 +1835,7 @@ class CapabilityFoundryTests(unittest.TestCase):
             author = MultiContinuationAuthor()
             progress = []
             outcome = foundry.generate(
-                "bounded comparison", client=author, model_call_budget=11,
+                "bounded comparison", client=author, model_call_budget=12,
                 on_progress=lambda phase, state: progress.append((phase, state)))
 
         self.assertEqual(outcome["status"], "registered")
@@ -2007,18 +2008,19 @@ class CapabilityFoundryTests(unittest.TestCase):
                 with self.assertRaisesRegex(ModelWorkBlocked, "finite JSON scalar"):
                     foundry.generate("bounded comparison", client=client)
                 self.assertEqual(client.calls, 2)
-                self.assertEqual(execute.call_count, 2)
+                self.assertEqual(execute.call_count, 1)
 
-    def test_validator_launch_failure_is_detected_before_any_experiment_execution(self):
+    def test_independent_validator_launch_failure_blocks_registration(self):
         payload = self._payload()
         payload["validator_source"] = 'import sys\nsys.stdout.write("not json")\n'
         with tempfile.TemporaryDirectory() as path:
             foundry = self._foundry(Path(path))
             foundry.max_attempts = 1
+            foundry.validator_client = StubClient({"validator_source": payload["validator_source"]})
             with patch.object(foundry, "_execute", wraps=foundry._execute) as execute:
                 with self.assertRaisesRegex(ModelWorkBlocked, "validator readiness did not return a JSON"):
                     foundry.generate("bounded comparison", client=StubClient(payload))
-                self.assertEqual(execute.call_count, 1)
+                self.assertEqual(execute.call_count, 2)
                 self.assertEqual(execute.call_args.args[0], payload["validator_source"])
 
     def test_foundry_and_live_executor_receive_the_same_quality_contract(self):
@@ -2111,7 +2113,9 @@ class CapabilityFoundryTests(unittest.TestCase):
         self.assertNotIn(drifted, normalized["validator_source"])
         self.assertEqual(len(repairs), 1)
         with tempfile.TemporaryDirectory() as path:
-            outcome = self._foundry(Path(path)).generate(
+            foundry = self._foundry(Path(path))
+            foundry.validator_client = StubClient({"validator_source": MINI_VALIDATOR.replace("tail_error", "max_dvpdp_window")})
+            outcome = foundry.generate(
                 "bounded comparison", client=StubClient(payload))
             self.assertEqual(outcome["status"], "registered")
             self.assertEqual(
@@ -2156,11 +2160,11 @@ class CapabilityFoundryTests(unittest.TestCase):
         self.assertIn("do not manufacture an onset", constraints)
         self.assertIn("run_count is only a minimum total-row check", constraints)
         self.assertIn("Derive max_observations from the complete planned row count", constraints)
-        self.assertIn("every check outcome is", prompt["output_contract"]["validator_source"])
+        self.assertIn("every check outcome is", prompt["independent_validation_contract"])
         self.assertIn("Metric agreement alone does not override a failed check",
-                      prompt["output_contract"]["validator_source"])
+                      prompt["independent_validation_contract"])
         self.assertIn("'configured_input','experiment','candidate'",
-                      prompt["output_contract"]["validator_source"])
+                      prompt["independent_validation_contract"])
         self.assertIn("request['experiment']", " ".join(prompt["constraints"]))
 
     def test_candidate_contract_separates_input_recovery_from_paper_access(self):
@@ -2346,14 +2350,14 @@ class CapabilityFoundryTests(unittest.TestCase):
 
     def test_exact_source_repair_passes_the_full_program_gates(self):
         payload = self._payload()
-        payload["validator_source"] = MINI_VALIDATOR.replace('"__main__"', '"main__"')
+        payload["executor_source"] = MINI_EXECUTOR.replace('"__main__"', '"main__"')
         client = StubClient(payload)
         original = client.complete
         def complete(*, system, prompt):
             if client.calls == 0:
                 return original(system=system, prompt=prompt)
             client.calls += 1
-            return ModelResult(json.dumps({"updates": {"validator_source": {"edits": [
+            return ModelResult(json.dumps({"updates": {"executor_source": {"edits": [
                 {"old": 'if __name__ == "main__":', "new": 'if __name__ == "__main__":'},
             ]}}}), "stub", {"model_calls": 1}, 0, "stop")
         client.complete = complete
@@ -2365,7 +2369,7 @@ class CapabilityFoundryTests(unittest.TestCase):
 
     def test_rejected_source_edit_feedback_reaches_next_repair_and_recovers(self):
         payload = self._payload()
-        payload["validator_source"] = MINI_VALIDATOR.replace('"__main__"', '"main__"')
+        payload["executor_source"] = MINI_EXECUTOR.replace('"__main__"', '"main__"')
         prompts = []
 
         class RepairSequenceClient:
@@ -2378,13 +2382,13 @@ class CapabilityFoundryTests(unittest.TestCase):
                     return ModelResult(json.dumps(payload), "stub",
                                        {"model_calls": 1}, 0.0, "stop")
                 if inner_self.calls == 2:
-                    return ModelResult(json.dumps({"updates": {"validator_source": {"edits": [
+                    return ModelResult(json.dumps({"updates": {"executor_source": {"edits": [
                         {"old": "not present in current source",
                          "new": 'if __name__ == "__main__":'},
                     ]}}}), "stub", {"model_calls": 1}, 0.0, "stop")
                 self.assertIn("observed 0 occurrences", prompt)
                 self.assertIn("requested_old_prefix='not present in current source'", prompt)
-                return ModelResult(json.dumps({"updates": {"validator_source": {"edits": [
+                return ModelResult(json.dumps({"updates": {"executor_source": {"edits": [
                     {"old": 'if __name__ == "main__":',
                      "new": 'if __name__ == "__main__":'},
                 ]}}}), "stub", {"model_calls": 1}, 0.0, "stop")
@@ -2536,7 +2540,7 @@ class CapabilityFoundryTests(unittest.TestCase):
             self.assertEqual(final["repair_gate_counts"]["author_response_contract"], 1)
             self.assertEqual(final["repair_ledger"][0]["attempt"], 2)
             self.assertEqual(result["candidate"]["test_vector"]["input"]["configured_input"], new_input)
-            self.assertEqual(final["usage"]["model_calls"], 2)
+            self.assertEqual(final["usage"]["model_calls"], 3)
             self.assertNotEqual(final["usage"].get("input_tokens"), 900)
             self.assertIn("candidate_seed_ref", final)
 
@@ -2582,7 +2586,7 @@ class CapabilityFoundryTests(unittest.TestCase):
             outcome = self._foundry(root).generate("bounded comparison", client=client, work_cache=cache)
             self.assertEqual(outcome["status"], "registered")
             self.assertEqual(client.calls, 0)
-            self.assertEqual(cache.entries()[0]["usage"], {"model_calls": 1})
+            self.assertEqual(cache.entries()[0]["usage"], {"model_calls": 2})
 
     def test_changed_contract_replays_exact_edit_against_its_original_base(self):
         for recorded_base in (False, True):
@@ -2613,7 +2617,7 @@ class CapabilityFoundryTests(unittest.TestCase):
                 self.assertEqual(outcome["status"], "registered")
                 self.assertEqual(outcome["candidate"]["validator_source"], MINI_VALIDATOR)
                 self.assertEqual(author.calls, 0)
-                self.assertEqual(cache.entries()[0]["usage"]["model_calls"], 1)
+                self.assertEqual(cache.entries()[0]["usage"]["model_calls"], 2)
 
     def test_check_only_review_rejection_preserves_the_failed_evidence(self):
         review = self._review_payload()
@@ -2671,7 +2675,7 @@ class CapabilityFoundryTests(unittest.TestCase):
                     foundry.generate("bounded comparison", client=author, work_cache=cache)
             self.assertEqual(author.calls, 2)
             self.assertEqual(foundry.reviewer_client.calls, 1)
-            self.assertEqual(cache.entries()[0]["usage"]["model_calls"], 3)
+            self.assertEqual(cache.entries()[0]["usage"]["model_calls"], 4)
             self.assertFalse((root / "registry/capabilities/index.json").exists())
 
     def test_review_retains_raw_response_and_usage_across_interruption(self):
@@ -2689,7 +2693,7 @@ class CapabilityFoundryTests(unittest.TestCase):
             self.assertEqual(result["status"], "registered")
             self.assertEqual(author.calls, 1)
             self.assertEqual(foundry.reviewer_client.calls, 1)
-            self.assertEqual(cache.entries()[0]["usage"]["model_calls"], 2)
+            self.assertEqual(cache.entries()[0]["usage"]["model_calls"], 3)
 
     def test_late_scientific_verdict_is_retained_but_not_registered(self):
         with tempfile.TemporaryDirectory() as path:
@@ -2759,7 +2763,7 @@ class CapabilityFoundryTests(unittest.TestCase):
                 self.assertEqual(factory.call_args.kwargs["model"], "second-reviewer")
             self.assertEqual(outcome["status"], "registered")
             self.assertEqual((author.calls, first.calls, second.calls), (1, 1, 1))
-            self.assertEqual(cache.entries()[0]["usage"]["model_calls"], 3)
+            self.assertEqual(cache.entries()[0]["usage"]["model_calls"], 4)
 
     def test_complete_review_json_is_accepted_when_finish_reason_is_length(self):
         with tempfile.TemporaryDirectory() as path:
@@ -3796,3 +3800,122 @@ class CapabilityFoundryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IndependentValidatorAuthorshipTests(unittest.TestCase):
+    def test_missing_intent_repair_retains_two_field_producer_executor(self):
+        with tempfile.TemporaryDirectory() as path:
+            foundry = CapabilityFoundryTests._foundry(Path(path))
+            payload = CapabilityFoundryTests._payload()
+            class Author:
+                calls = 0
+                def complete(inner, *, system, prompt):
+                    inner.calls += 1
+                    if inner.calls == 1:
+                        return ModelResult(json.dumps({'executor_source': payload['executor_source']}),
+                            'producer', {'model_calls': 1}, 0, 'stop')
+                    packet = json.loads(prompt)
+                    self.assertNotIn('validator_source', packet['output_contract']['updates'])
+                    return ModelResult(json.dumps({'updates': {
+                        'experiment_intent': payload['experiment_intent']}}),
+                        'producer', {'model_calls': 1}, 0, 'stop')
+            author = Author()
+            outcome = foundry.generate('bounded comparison', client=author)
+            self.assertEqual(outcome['status'], 'registered')
+            self.assertEqual(outcome['candidate']['executor_source'], payload['executor_source'])
+            self.assertEqual((author.calls, foundry.validator_client.calls), (2, 1))
+
+    def test_blind_author_receives_contract_without_producer_source_or_results(self):
+        with tempfile.TemporaryDirectory() as path:
+            foundry = CapabilityFoundryTests._foundry(Path(path))
+            payload = CapabilityFoundryTests._payload()
+            payload.pop('validator_source')
+            author = StubClient(payload)
+            independent = foundry.validator_client
+            original = independent.complete
+            def complete(*, system, prompt):
+                packet = json.loads(prompt)
+                self.assertEqual(packet['assignment'], 'author_independent_validator')
+                self.assertNotIn('executor_source', packet)
+                self.assertNotIn('validator_source', packet)
+                self.assertNotIn('metrics', packet)
+                self.assertNotIn('findings', packet)
+                self.assertEqual(packet['observation_schema'][0]['replicate'], 'int')
+                return original(system=system, prompt=prompt)
+            independent.complete = complete
+            cache = CapabilityFoundryTests._cache(self, Path(path))
+            first = foundry.generate('bounded comparison', client=author, work_cache=cache)
+            second = foundry.generate('bounded comparison', client=author, work_cache=cache)
+            self.assertEqual(first, second)
+            self.assertEqual((author.calls, independent.calls, foundry.reviewer_client.calls), (1, 1, 1))
+            self.assertEqual(first['candidate']['validator_source'], MINI_VALIDATOR)
+            proof = first['admission']['validator_authorship']
+            self.assertEqual(proof['source_sha256'], hashlib.sha256(MINI_VALIDATOR.encode()).hexdigest())
+            self.assertEqual(cache.entries()[0]['usage']['model_calls'], 3)
+
+    def test_429_preserves_validator_repair_allowance_and_producer_response(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            author = StubClient(CapabilityFoundryTests._payload())
+            cache = CapabilityFoundryTests._cache(self, root)
+            class Independent:
+                calls = 0
+                def complete(inner, *, system, prompt):
+                    inner.calls += 1
+                    if inner.calls == 1:
+                        raise ModelCallError('cooldown', status_code=429, outcome_known=True, attempts=1, retry_after_seconds=0)
+                    if inner.calls == 2:
+                        return ModelResult('{', 'independent', {'model_calls': 1}, 0, 'stop')
+                    self.assertIn('validator_repair', json.loads(prompt))
+                    return ModelResult(json.dumps({'validator_source': MINI_VALIDATOR}), 'independent', {'model_calls': 1}, 0, 'stop')
+            independent = Independent()
+            foundry.validator_client = independent
+            with self.assertRaises(ModelCallError):
+                foundry.generate('bounded comparison', client=author, work_cache=cache)
+            outcome = foundry.generate('bounded comparison', client=author, work_cache=cache)
+            self.assertEqual(outcome['status'], 'registered')
+            self.assertEqual((author.calls, independent.calls), (1, 3))
+            self.assertEqual(cache.entries()[0]['usage']['model_calls'], 5)
+
+    def test_unknown_validator_dispatch_never_reauthors_the_producer(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            author = StubClient(CapabilityFoundryTests._payload())
+            cache = CapabilityFoundryTests._cache(self, root)
+            class Unknown:
+                calls = 0
+                def complete(inner, *, system, prompt):
+                    inner.calls += 1
+                    raise ModelCallError('unknown validator outcome', outcome_known=False, attempts=1)
+            independent = Unknown()
+            foundry.validator_client = independent
+            with self.assertRaises(ModelCallError):
+                foundry.generate('bounded comparison', client=author, work_cache=cache)
+            with self.assertRaisesRegex(ModelWorkBlocked, 'unresolved dispatched request'):
+                foundry.generate('bounded comparison', client=author, work_cache=cache)
+            self.assertEqual((author.calls, independent.calls), (1, 1))
+            self.assertEqual(cache.entries()[0]['requests'][-1]['status'], 'result_unknown')
+
+    def test_two_field_producer_response_repairs_its_executor_without_a_validator_draft(self):
+        with tempfile.TemporaryDirectory() as path:
+            foundry = CapabilityFoundryTests._foundry(Path(path))
+            payload = CapabilityFoundryTests._payload()
+            payload.pop('validator_source')
+            payload['executor_source'] = MINI_EXECUTOR.replace('"__main__"', '"main__"')
+            class Author:
+                calls = 0
+                def complete(inner, *, system, prompt):
+                    inner.calls += 1
+                    if inner.calls == 1:
+                        return ModelResult(json.dumps(payload), 'producer', {'model_calls': 1}, 0, 'stop')
+                    packet = json.loads(prompt)
+                    self.assertNotIn('validator_source', packet['output_contract']['updates'])
+                    return ModelResult(json.dumps({'updates': {'executor_source': {'edits': [{
+                        'old': 'if __name__ == "main__":', 'new': 'if __name__ == "__main__":'}]}}}),
+                        'producer', {'model_calls': 1}, 0, 'stop')
+            author = Author()
+            outcome = foundry.generate('bounded comparison', client=author)
+            self.assertEqual(outcome['status'], 'registered')
+            self.assertEqual((author.calls, foundry.validator_client.calls), (2, 1))

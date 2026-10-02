@@ -45,7 +45,7 @@ DEFAULT_WATCHDOG_SECONDS = 300.0
 
 
 def _composer_child_entry(workflow, resume, result_pipe,
-                          additional_seconds=None, runner_type=ComposerRunner, stop_after_stage=None):
+                          additional_seconds=None, runner_type=ComposerRunner, stop_after_stage=None, extend_workflow=False):
     """Run one Composer attempt in a killable process.
 
     The parent owns supervision.  A provider or a library call that ignores
@@ -62,6 +62,8 @@ def _composer_child_entry(workflow, resume, result_pipe,
 
     try:
         runner_options = {"resume": resume, "on_progress": lambda state: publish({"kind": "progress", "state": state})}
+        if extend_workflow:
+            runner_options["extend_workflow"] = True
         if stop_after_stage is not None:
             runner_options["stop_after_stage"] = stop_after_stage
         if additional_seconds is not None:
@@ -172,6 +174,19 @@ def _research_request_fingerprint(request):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _provider_retry_delay(blocker, now_epoch):
+    if not isinstance(blocker, dict):
+        return None
+    rate_limit = blocker.get("rate_limit", {})
+    containers = (blocker, rate_limit) if isinstance(rate_limit, dict) else (blocker,)
+    for key in ("retry_after_epoch", "retry_after_seconds"):
+        for container in containers:
+            value = _finite_number(container.get(key))
+            if value is not None:
+                return max(0.0, value - now_epoch if key == "retry_after_epoch" else value)
+    return None
+
+
 def _remaining(result):
     value = result.get("remaining_seconds") if isinstance(result, dict) else None
     value = _finite_number(value)
@@ -197,7 +212,7 @@ def _stop_reason(result):
 
 
 def _has_active_provider_rate_limit(result):
-    """Keep an active provider 429 paused until an explicit operator resume."""
+    """Distinguish active provider backpressure from historical failures."""
     if not isinstance(result, dict):
         return False
     blockers = (result.get("active_blockers") if "active_blockers" in result
@@ -273,11 +288,13 @@ class ComposerSupervisor:
     """Keep a Composer process alive across recoverable child exits."""
 
     def __init__(self, workflow, *, initial_resume=False, initial_additional_seconds=None,
-                 poll_seconds=5.0, stop_after_stage=None,
+                 poll_seconds=5.0, stop_after_stage=None, extend_workflow=False,
                  on_progress=None, process_watchdog=True,
                  watchdog_seconds=DEFAULT_WATCHDOG_SECONDS):
         if not isinstance(workflow, dict):
             raise ValidationError("supervisor workflow must be an object")
+        if extend_workflow and not initial_resume:
+            raise ValidationError("workflow extension requires explicit resume")
         if type(poll_seconds) not in (int, float) or poll_seconds < 0:
             raise ValidationError("supervisor poll_seconds must be nonnegative")
         if type(watchdog_seconds) not in (int, float) or watchdog_seconds < 30:
@@ -295,6 +312,7 @@ class ComposerSupervisor:
                                             if isinstance(stage, dict)}):
             raise ValidationError("stop_after_stage must name a declared workflow stage")
         self.stop_after_stage = stop_after_stage
+        self.extend_workflow = extend_workflow
         self.workflow = deepcopy(workflow)
         self.initial_resume = bool(initial_resume)
         self.initial_additional_seconds = (
@@ -677,12 +695,7 @@ class ComposerSupervisor:
         for blocker in blockers:
             if not isinstance(blocker, dict):
                 continue
-            retry_epoch = _finite_number(blocker.get("retry_after_epoch"))
-            if retry_epoch is not None:
-                delay = max(0.0, retry_epoch - now_epoch)
-            else:
-                retry_seconds = _finite_number(blocker.get("retry_after_seconds"))
-                delay = max(0.0, retry_seconds) if retry_seconds is not None else 0.0
+            delay = _provider_retry_delay(blocker, now_epoch) or 0.0
             if delay <= 0:
                 continue
             if blocker.get("stage_id") not in fallback_stages or not is_openalex_cooldown(blocker):
@@ -725,14 +738,7 @@ class ComposerSupervisor:
         for blocker in blockers:
             if not isinstance(blocker, dict):
                 continue
-            retry_epoch = _finite_number(blocker.get("retry_after_epoch"))
-            if retry_epoch is not None:
-                value = max(0.0, retry_epoch - now_epoch)
-            else:
-                retry_seconds = _finite_number(blocker.get("retry_after_seconds"))
-                if retry_seconds is None:
-                    continue
-                value = max(0.0, retry_seconds)
+            value = _provider_retry_delay(blocker, now_epoch) or 0.0
             if value > 0:
                 retry_after = max(retry_after or 0.0, value)
         if retry_after is not None:
@@ -749,8 +755,6 @@ class ComposerSupervisor:
     def _should_resume(self, result):
         if not isinstance(result, dict):
             return True
-        if _has_active_provider_rate_limit(result):
-            return False
         active_blockers = result.get("active_blockers")
         if not isinstance(active_blockers, list):
             active_blockers = result.get("blockers", [])
@@ -762,6 +766,20 @@ class ComposerSupervisor:
             # Retrying a runtime defect without a source fix consumes provider
             # calls while preserving the same failed execution path.
             return False
+        if _has_active_provider_rate_limit(result):
+            if (_remaining(result) <= 0 or result.get("status") in TERMINAL_STATUSES
+                    or _stop_reason(result) in STOP_REASONS - {"provider_rate_limit"}):
+                return False
+            for blocker in active_blockers if isinstance(active_blockers, list) else []:
+                if not isinstance(blocker, dict):
+                    continue
+                rate_limit = blocker.get("rate_limit", {})
+                if not isinstance(rate_limit, dict):
+                    continue
+                if (rate_limit.get("provider_error_kind") == "quota_exhausted"
+                        and _provider_retry_delay(blocker, time.time()) is None):
+                    return False
+            return True
         status = result.get("status")
         if _remaining(result) <= 0:
             return False
@@ -873,6 +891,8 @@ class ComposerSupervisor:
             self._write_state(child_status="starting", action="dispatch", result=None)
             try:
                 runner_options = {"resume": resume, "on_progress": self.on_progress}
+                if self.extend_workflow:
+                    runner_options["extend_workflow"] = True
                 if self.stop_after_stage is not None:
                     runner_options["stop_after_stage"] = self.stop_after_stage
                 if additional_seconds is not None:
@@ -1040,7 +1060,7 @@ class ComposerSupervisor:
                 authorized_deadline = prior_deadline + additional_seconds
         child = context.Process(
             target=_composer_child_entry,
-            args=(self.workflow, resume, child_pipe, additional_seconds, ComposerRunner, self.stop_after_stage),
+            args=(self.workflow, resume, child_pipe, additional_seconds, ComposerRunner, self.stop_after_stage, self.extend_workflow),
             name=f"scisaurus-composer-{self.workflow.get('id', 'run')}",
         )
         try:
@@ -1169,6 +1189,8 @@ class ComposerSupervisor:
     def _run_one_in_process(self, resume, *, additional_seconds=None):
         try:
             runner_options = {"resume": resume, "on_progress": self.on_progress}
+            if self.extend_workflow:
+                runner_options["extend_workflow"] = True
             if self.stop_after_stage is not None:
                 runner_options["stop_after_stage"] = self.stop_after_stage
             if additional_seconds is not None:
@@ -1237,14 +1259,14 @@ class ComposerSupervisor:
 
 
 def supervise_composer(workflow, *, initial_resume=False, initial_additional_seconds=None,
-                       poll_seconds=5.0, stop_after_stage=None,
+                       poll_seconds=5.0, stop_after_stage=None, extend_workflow=False,
                        on_progress=None, process_watchdog=True,
                        watchdog_seconds=DEFAULT_WATCHDOG_SECONDS):
     """Convenience entry point used by the CLI and the local launch script."""
     return ComposerSupervisor(
         workflow, initial_resume=initial_resume,
         initial_additional_seconds=initial_additional_seconds,
-        poll_seconds=poll_seconds, stop_after_stage=stop_after_stage,
+        poll_seconds=poll_seconds, stop_after_stage=stop_after_stage, extend_workflow=extend_workflow,
         on_progress=on_progress, process_watchdog=process_watchdog,
         watchdog_seconds=watchdog_seconds,
     ).run()

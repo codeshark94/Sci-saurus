@@ -252,22 +252,13 @@ def _contains_numeric_experiment_measurement(value):
 
 def _has_numeric_experiment_observations(value):
     if isinstance(value, list):
-        return any(_has_numeric_experiment_observations(item) for item in value)
+        return any(isinstance(item, dict) and any(
+            not _is_experiment_result_metadata_field(key)
+            and _contains_numeric_experiment_measurement(content)
+            for key, content in item.items()) for item in value)
     if not isinstance(value, dict):
         return False
-    observations = value.get("observations")
-    if isinstance(observations, list) and any(
-            isinstance(item, dict)
-            and any(not _is_experiment_result_metadata_field(key)
-                    and _contains_numeric_experiment_measurement(content)
-                    for key, content in item.items())
-            for item in observations):
-        return True
-    # A bare observation row is also accepted by older runner envelopes.
-    return any(
-        not _is_experiment_result_metadata_field(key)
-        and _contains_numeric_experiment_measurement(item)
-        for key, item in value.items())
+    return _has_numeric_experiment_observations(value.get("observations"))
 
 
 def _has_numeric_experiment_metrics(value):
@@ -928,20 +919,22 @@ class ComposerRunner:
 
 
     def __init__(self, workflow, *, resume=False, clock=time.monotonic, on_progress=None,
-                 additional_seconds=None, stop_after_stage=None):
+                 additional_seconds=None, stop_after_stage=None, extend_workflow=False):
         self.control = None
         self._runtime_environment_before = None
         self._runtime_environment_after = None
         try:
             self._initialize_composer(workflow, resume=resume, clock=clock,
                                       on_progress=on_progress, additional_seconds=additional_seconds,
-                                      stop_after_stage=stop_after_stage)
+                                      stop_after_stage=stop_after_stage, extend_workflow=extend_workflow)
         except BaseException:
             self.close()
             raise
 
-    def _initialize_composer(self, workflow, *, resume, clock, on_progress, additional_seconds, stop_after_stage):
+    def _initialize_composer(self, workflow, *, resume, clock, on_progress, additional_seconds, stop_after_stage, extend_workflow):
         self.workflow = deepcopy(validate_workflow(workflow))
+        if extend_workflow and not resume:
+            raise ValidationError("workflow extension requires resume")
         if stop_after_stage is not None and (not isinstance(stop_after_stage, str)
                 or stop_after_stage not in {stage["id"] for stage in self.workflow["stages"]}):
             raise ValidationError("stop_after_stage must name a declared workflow stage")
@@ -954,10 +947,16 @@ class ComposerRunner:
             self._runtime_environment_after = dict(os.environ)
         if additional_seconds is not None and not resume:
             raise ValidationError("additional_seconds is only valid when resuming a Composer project")
+        if additional_seconds is not None and (type(additional_seconds) not in (int, float)
+                or not math.isfinite(additional_seconds) or additional_seconds <= 0):
+            raise ValidationError("additional_seconds must be finite and positive")
         self.root = Path(self.workflow["project_id"]).resolve()
         # project_id is the stable identity; the workflow's project directory
         # is derived from it so a config cannot redirect the control ledger.
         self.root.mkdir(parents=True, exist_ok=True)
+        existing = (self.root / "state" / "control.sqlite").exists()
+        if resume and existing:
+            self._preflight_resume_workflow(extend_workflow)
         self.topic_history_path = self._resolve_topic_history_path()
         self.topic_history_scope = self._topic_history_scope_key()
         self._migrate_legacy_topic_history()
@@ -1095,17 +1094,45 @@ class ComposerRunner:
             if head is None:
                 raise ValidationError("composer resume workflow does not match the original immutable workflow")
             stored_workflow = json.loads(self.store.read_body(head["body_hash"]))
+            workflow_extension = None
             if stored_workflow != self.workflow:
-                if not self._is_continuation_policy_relaxation(
+                if extend_workflow and self._is_stage_extension(stored_workflow, self.workflow):
+                    workflow_extension = {
+                        "previous_workflow_ref": head["artifact_ref"],
+                        "previous_revision": stored_workflow["revision"],
+                        "appended_stage_ids": [item["id"] for item in self.workflow["stages"][len(stored_workflow["stages"]):]],
+                    }
+                elif self._is_continuation_policy_relaxation(
                         stored_workflow, self.workflow):
+                    workflow_policy_update = {
+                        "previous_workflow_ref": head["artifact_ref"],
+                        "previous_policy": deepcopy(stored_workflow.get("continuation_policy")),
+                        "current_policy": deepcopy(self.workflow.get("continuation_policy")),
+                    }
+                else:
                     raise ValidationError(
                         "composer resume workflow does not match the original immutable workflow")
-                workflow_policy_update = {
-                    "previous_workflow_ref": head["artifact_ref"],
-                    "previous_policy": deepcopy(stored_workflow.get("continuation_policy")),
-                    "current_policy": deepcopy(self.workflow.get("continuation_policy")),
-                }
             self._restore()
+            if workflow_extension is not None:
+                try:
+                    checkpoint, body = self._stopped_execution_checkpoint()
+                except StateError as exc:
+                    raise ValidationError(str(exc)) from exc
+                if (body.get("active_stage_ids") or body.get("active_work_order_ids")
+                        or any(item.get("status") in {"running", "retrying"}
+                               for item in body.get("stages", {}).values())):
+                    raise ValidationError("workflow extension requires idle stopped stages")
+                workflow_extension.update(checkpoint_ref=checkpoint["artifact_ref"],
+                                          checkpoint_sha256=checkpoint["body_hash"])
+                self._workflow_record = self._publish(
+                    "command/composer/workflow", "note", self.workflow, "command.composer",
+                    subjects=[head["artifact_ref"], checkpoint["artifact_ref"]])
+                self._publish("inputs/composer-run", "note", {
+                    "schema_version": "composer-run-input-1", "workflow_ref": self._workflow_record["artifact_ref"],
+                    "run_id": self.run_id, "resume": True, "exploration_seed": self.exploration_seed,
+                    "agenda_policy": self._agenda_policy(), "workflow_extension": workflow_extension,
+                }, "command.composer", subjects=[head["artifact_ref"], self._workflow_record["artifact_ref"], checkpoint["artifact_ref"]])
+                self._checkpoint("resume:workflow_extended", force=True)
             if workflow_policy_update is not None:
                 self._workflow_record = self._publish(
                     "command/composer/workflow", "note", self.workflow,
@@ -1212,6 +1239,81 @@ class ComposerRunner:
             else:
                 os.environ.pop(key, None)
         self._runtime_environment_after = None
+
+    def _preflight_resume_workflow(self, extend_workflow):
+        """Reject amendments before reconciling any durable owner state."""
+        with closing(sqlite3.connect((self.root / "state/control.sqlite").as_uri() + "?mode=ro", uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            store = ArtifactStore(SimpleNamespace(dir=str(self.root), _conn=connection))
+            head = store.head("command/composer/workflow")
+            if head is None:
+                raise ValidationError("composer resume has no immutable workflow")
+            raw = store.read_body(head["body_hash"])
+            if hashlib.sha256(raw).hexdigest() != head["body_hash"] or head.get("author") != "command.composer":
+                raise StateError("composer workflow has no verified immutable owner")
+            stored = json.loads(raw)
+            if stored == self.workflow or self._is_continuation_policy_relaxation(stored, self.workflow):
+                return
+            if not extend_workflow or not self._is_stage_extension(stored, self.workflow):
+                raise ValidationError("composer resume workflow does not match the original immutable workflow")
+            records = connection.execute(
+                "SELECT manifest_json FROM artifacts WHERE logical_id='command/composer/run' "
+                "OR logical_id LIKE 'command/composer/checkpoints/%' ORDER BY created_at DESC LIMIT 16").fetchall()
+            checkpoints = []
+            for row in records:
+                manifest = json.loads(row["manifest_json"])
+                raw = store.read_body(manifest["body_hash"])
+                body = json.loads(raw)
+                if (hashlib.sha256(raw).hexdigest() != manifest["body_hash"]
+                        or manifest.get("author") != "command.composer"
+                        or body.get("workflow_id") != self.workflow["id"]):
+                    raise StateError("workflow extension has an invalid immutable checkpoint owner")
+                checkpoints.append(body)
+            if not checkpoints:
+                raise ValidationError("workflow extension requires a stopped checkpoint")
+            progress = self._read_json_object(self.root / "output/progress.json")
+            if (not isinstance(progress, dict) or progress not in checkpoints
+                    or progress.get("status") not in STAGE_READY_STATUSES | STAGE_HOLD_STATUSES | {"paused", "blocked"}
+                    or connection.execute("SELECT 1 FROM tasks WHERE state IN ('running','awaiting_review') LIMIT 1").fetchone() is not None):
+                raise ValidationError("workflow extension requires an immutable idle progress owner")
+            latest = max(checkpoints, key=lambda item: item.get("state_revision", 0))
+            if (latest.get("status") not in STAGE_READY_STATUSES | STAGE_HOLD_STATUSES | {"paused", "blocked"}
+                    or latest.get("active_stage_ids") or latest.get("active_work_order_ids")
+                    or any(item.get("status") in {"running", "retrying"} for item in latest.get("stages", {}).values())):
+                raise ValidationError("workflow extension requires idle stopped stages")
+
+    @staticmethod
+    def _is_stage_extension(previous, requested):
+        """Append downstream stages without replacing any mission contract."""
+        if not isinstance(previous, dict) or not isinstance(requested, dict):
+            return False
+        old, new = previous.get("stages", []), requested.get("stages", [])
+        if not old or len(new) <= len(old) or new[:len(old)] != old:
+            return False
+        if requested.get("revision") != previous.get("revision", 0) + 1:
+            return False
+        excluded = {"revision", "stages", "completion"}
+        if ({key: value for key, value in previous.items() if key not in excluded}
+                != {key: value for key, value in requested.items() if key not in excluded}):
+            return False
+        before, after = previous["completion"], requested["completion"]
+        appended = new[len(old):]
+        old_ids = {item["id"] for item in old}
+        known = set(old_ids)
+        directories = [Path(item["project_dir"]).resolve() for item in old]
+        for stage in appended:
+            directory = Path(stage["project_dir"]).resolve()
+            if (not set(stage["depends_on"]).intersection(known)
+                    or any(directory == root or directory.is_relative_to(root)
+                           or root.is_relative_to(directory) for root in directories)):
+                return False
+            directories.append(directory)
+            known.add(stage["id"])
+        return (before["release_requires_human"] == after["release_requires_human"]
+                and set(before["required_stage_ids"]) <= set(after["required_stage_ids"])
+                and set(after["required_stage_ids"]) - set(before["required_stage_ids"])
+                    == {item["id"] for item in appended})
 
     @staticmethod
     def _is_continuation_policy_relaxation(previous, requested):
@@ -2755,6 +2857,22 @@ class ComposerRunner:
 
         package = _read_experiment_result_payload(
             identity_context.get("results_package"), base_dir=result_root)
+        provenance = identity_context.get("provenance", {})
+        execution_refs = identity_context.get("execution_refs", []) or (
+            provenance.get("execution_refs", []) if isinstance(provenance, dict) else [])
+        if not execution_refs and isinstance(package, dict):
+            provenance = package.get("provenance", {})
+            execution_refs = provenance.get("execution_refs", []) if isinstance(provenance, dict) else []
+        if not isinstance(execution_refs, list) or not execution_refs:
+            return False
+        try:
+            if any(not isinstance(ref, str) or not ref.startswith("artifact:")
+                   for ref in execution_refs):
+                return False
+            for ref in execution_refs:
+                parse_ref(ref)
+        except ValidationError:
+            return False
         observed = (observed
                     or _has_numeric_experiment_observations(
                         package.get("observations") if isinstance(package, dict) else None)
@@ -7395,7 +7513,8 @@ class ComposerRunner:
             raise StateError("stage review revalidation has no exact owned verifier input")
         report = execution.get("report", {})
         response = report.get("response", {})
-        if (initial_contract == self._stage_acceptance_contract(stage, context)
+        if (self._current_acceptance_scope(initial_contract)
+                == self._current_acceptance_scope(self._stage_acceptance_contract(stage, context))
                 and record.get("status") in {"completed", "accepted"}
                 and context.get("status") in {"completed", "accepted"}
                 and report.get("status") == "succeeded" and response.get("decision") == "accept"
@@ -7449,6 +7568,19 @@ class ComposerRunner:
         return {**producer, "peer_reports": deepcopy(peers),
                 "prior_verifier_execution_ref": ref, "prior_verifier_execution_sha256": digest,
                 "prior_assignment_plan_ref": plan_ref}
+
+    @staticmethod
+    def _current_acceptance_scope(contract):
+        """Future obligation routing cannot revoke an accepted current-stage result."""
+        if not isinstance(contract, dict):
+            return contract
+        scope = {key: deepcopy(value) for key, value in contract.items()
+                 if key not in {"downstream_stage_ids", "downstream_requirements"}}
+        obligations = scope.get("obligation_scope")
+        if isinstance(obligations, dict):
+            scope["obligation_scope"] = {key: value for key, value in obligations.items()
+                if key not in {"stage_work_kinds", "deferred_gate_work_kinds"}}
+        return scope
 
     def _survey_review_revalidation_producer(self, stage, context, execution):
         project = Path(context["project_dir"]).resolve()
@@ -13019,6 +13151,7 @@ class ComposerRunner:
         existing = None
         superseded = None
         prior_capability = deepcopy(result.get("generated_capability"))
+        executable_work_orders = project_executable_work_orders(continuation_requests)
         for entry in reversed(load_registry(registry_root).get("capabilities", [])):
             try:
                 path = Path(entry["path"])
@@ -13028,7 +13161,23 @@ class ComposerRunner:
                 continue
             if (experiment.get("research_question") == question
                     and experiment.get("domain") == domain):
+                if superseded is None or experiment["revision"] > superseded["revision"]:
+                    superseded = {"id": experiment["id"], "revision": experiment["revision"]}
+                registered_input = experiment.get("execution", {}).get("input", {})
+                if (not isinstance(registered_input, dict)
+                        or registered_input.get("source_data_manifest") != source_data_manifest
+                        or registered_input.get("work_orders", []) != executable_work_orders
+                        or (continuation_revision is not None and experiment.get("revision", 0) < continuation_revision)
+                        or (quality_contract is not None and experiment.get("quality_contract") != quality_contract)
+                        or (stage_seconds is not None and experiment.get("stage_seconds") != stage_seconds)):
+                    continue
                 admission = json.loads((path.parent / "admission.json").read_text())
+                authorship = admission.get("validator_authorship", {})
+                if (authorship.get("method") != "blinded_separate_authoring"
+                        or authorship.get("role") != "methods.validator-author"
+                        or not entry.get("validator_sha256")
+                        or authorship.get("source_sha256") != entry["validator_sha256"]):
+                    continue
                 review = admission.get("adversarial_review") or {}
                 repair = admission.get("repair_provenance") or {}
                 if (evidence_binding is not None
@@ -13550,7 +13699,8 @@ class ComposerRunner:
             # requirements in supplied_context (and the downstream review
             # ledger) where they can constrain interpretation without
             # mutating the executable capability.
-        selected_experiment["revision"] = int(current.get("revision", selected_experiment.get("revision", 1)))
+        if not isinstance(generated, dict):
+            selected_experiment["revision"] = int(current.get("revision", selected_experiment.get("revision", 1)))
         # A design-driven capability executes a bounded declarative design that
         # the topic stage proposed.  The program, estimators and data-process
         # families stay pinned; only the declared design and the scientific

@@ -167,11 +167,11 @@ def _validate_source_observation_binding(document, configured_input):
 
 SYSTEM = (
     "You are the program-authoring specialist for an autonomous research laboratory. "
-    "You write ONE deterministic, seeded experiment program and ONE independently authored "
-    "validator that recalculates the declared outcomes from the recorded observations alone. "
+    "You write ONE deterministic, seeded experiment program and its frozen scientific intent. "
+    "A separate blinded author supplies the admitted validator from the declared estimand and observation schema. "
     "Independence means a separate implementation of the same declared estimand, not a different "
     "statistical convention or a silently changed target. If a repair changes an estimator, update "
-    "the intent, executor, and validator together and state the new convention explicitly. "
+    "the intent and executor and state the new convention explicitly for independent recalculation. "
     "Never use the network, subprocesses, eval/exec, or open(); use only json, math, statistics, "
     "hashlib, pathlib, sys, itertools, functools, random, collections, dataclasses, typing, "
     "decimal, fractions, re, time, os, numpy and matplotlib. "
@@ -185,6 +185,12 @@ AUTHOR_CONTINUATION_SYSTEM = (
     "You continue an incomplete model-authored JSON object. The supplied prefix is immutable. "
     "Return only the exact next raw characters of the original object as plain text. Do not wrap "
     "the suffix in JSON or markdown, repeat the prefix, add analysis, or include unrelated content."
+)
+VALIDATOR_AUTHOR_SYSTEM = (
+    "You independently implement a scientific recalculation program from a frozen design and raw observation schema. "
+    "You receive no executor source, producer validator or reported numerical results. "
+    "Return only a complete JSON object with validator_source. Use the permitted modules in the contract; "
+    "never use the network, subprocesses, eval/exec or open()."
 )
 REVIEW_SYSTEM = (
     "You are an independent methods reviewer, not the program author. Treat supplied code and prose as "
@@ -202,6 +208,7 @@ PROGRAM_REVIEW_CHECKS = {"method_implementation", "estimator_definedness",
                          "independent_validation", "claim_support"}
 
 ATTEMPT_FIELDS = {"executor_source", "validator_source", "experiment_intent"}
+PRODUCER_FIELDS = {"executor_source", "experiment_intent"}
 LEGACY_TRANSPORT_FIELDS = {"runtime", "test_input"}
 IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 AUTHOR_PATCH_MAX_OUTPUT_TOKENS = 4096
@@ -572,9 +579,9 @@ def _author_format_repair_instructions(reason, *, has_candidate=False):
             "The previous response was not valid JSON and did not produce a usable program artifact. "
             "Discard that response "
             "and fulfill the complete authoring assignment in this prompt. Return exactly one complete "
-            "JSON object with only experiment_intent, executor_source, and validator_source. The intent "
-            "must preserve the supplied research question and acceptance criteria; the executor and "
-            "validator must be complete implementations. Do not return edits or an updates envelope. "
+            "JSON object with only experiment_intent and executor_source. The intent "
+            "must preserve the supplied research question and acceptance criteria; the executor "
+            "must be a complete implementation. Do not return edits or an updates envelope. "
             "Do not include reasoning, commentary, a preamble, or markdown; start with '{' and stop "
             "after the object's closing brace."
         )
@@ -730,12 +737,12 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
     analysis_shape = {key: analysis_descriptions[key] for key in sorted(ANALYSIS_FIELDS)}
     prompt = {
         "assignment": "author_experiment_program",
-        "author_response_contract_version": "experiment-author-json-v2",
+        "author_response_contract_version": "experiment-author-json-v3",
         "authoring_output_order": [
-            "experiment_intent", "executor_source", "validator_source",
+            "experiment_intent", "executor_source",
         ],
         "response_contract": (
-            "Return only one complete JSON object with those three keys. The first non-whitespace "
+            "Return only one complete JSON object with those two keys. The first non-whitespace "
             "character is { and the final character is }. Put no reasoning, plan, prose, or markdown "
             "outside it; keep descriptions concise and place implementation only in the source fields."
         ),
@@ -995,6 +1002,7 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
                 "corresponding analysis list; leave an unrequired kind empty rather than fabricate it. "
                 "analysis.raw_data must identify the actual raw observations emitted.",
             ])
+    prompt["independent_validation_contract"] = prompt["output_contract"].pop("validator_source")
     return prompt
 
 
@@ -1316,9 +1324,9 @@ def _retain_prior_blocking_issues(state, *values):
 
 
 def _authored_candidate_sha256(candidate):
-    if not isinstance(candidate, dict) or not ATTEMPT_FIELDS.issubset(candidate):
+    if not isinstance(candidate, dict) or not PRODUCER_FIELDS.issubset(candidate):
         return None
-    authored = {key: candidate[key] for key in sorted(ATTEMPT_FIELDS)}
+    authored = {key: candidate[key] for key in sorted(ATTEMPT_FIELDS) if key in candidate}
     return hashlib.sha256(canonical_bytes(authored)).hexdigest()
 
 
@@ -1341,6 +1349,8 @@ def _repair_request_matches_candidate(prompt, candidate):
     if not isinstance(contexts, dict):
         return False
     for key in ("executor_source", "validator_source"):
+        if key not in candidate:
+            continue
         source = candidate.get(key)
         context = contexts.get(key)
         if (not isinstance(source, str) or not isinstance(context, dict)
@@ -1701,6 +1711,7 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
             "duplicate declarations may be removed; never return full source"),
         "experiment_intent": "optional JSON merge patch containing only changed fields",
     }}
+    output_contract["updates"].pop("validator_source")
     format_details = {}
     for key in ("repair_kind", "previous_error", "required_fields", "observed_fields",
                 "missing_fields", "unexpected_fields", "instructions"):
@@ -1743,7 +1754,7 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
             "experiment_intent": candidate.get("experiment_intent", {}),
             "source_context": {
                 key: _source_patch_context(candidate[key])
-                for key in ("executor_source", "validator_source")
+                for key in ("executor_source", "validator_source") if key in candidate
             },
         },
         "repair_request": {
@@ -1915,7 +1926,7 @@ def validate_program_review(value, *, prior_blocking_issues=None):
 class CapabilityFoundry:
     def __init__(self, model_config, *, runtime_python, workspace_root, registry_root, repo_root,
                  requirements_file, runtime_packages, max_attempts=4, timeout_seconds=900.0,
-                 model_timeout_seconds=None, reviewer_client=None,
+                 model_timeout_seconds=None, reviewer_client=None, validator_client=None,
                  author_max_output_tokens=24000, reviewer_max_output_tokens=12000):
         self.model_config = deepcopy_config(model_config)
         self.runtime_python = Path(runtime_python)
@@ -1931,6 +1942,7 @@ class CapabilityFoundry:
         self.reviewer_max_output_tokens = reviewer_max_output_tokens
         self.deadline = None
         self.reviewer_client = reviewer_client
+        self.validator_client = validator_client
         if type(max_attempts) is not int or not 1 <= max_attempts <= 12:
             raise ValidationError("foundry max_attempts must be an integer between 1 and 12")
         if (type(timeout_seconds) not in (int, float)
@@ -1952,9 +1964,9 @@ class CapabilityFoundry:
                 "capability foundry requires the deny-by-default sandbox-exec boundary")
         self.workspace_root.mkdir(parents=True, exist_ok=True)
 
-    def _model_config_for_role(self, role, output_limit):
+    def _model_config_for_role(self, role, output_limit, *, model_config=None):
         """Allocate a route's context ceiling to the requested output budget."""
-        config = resolve_model_config(self.model_config, role=role)
+        config = resolve_model_config(self.model_config if model_config is None else model_config, role=role)
         self._reserve_output_capacity(config, output_limit, role=role)
         timeout_bounds = []
         if self.model_timeout_seconds is not None:
@@ -2136,7 +2148,7 @@ class CapabilityFoundry:
                     candidate = (prior.get("outcome", {}).get("candidate")
                                  if prior.get("status") == "succeeded" else prior.get("last_attempt"))
                     if (not (requests or prior.get("assignment"))
-                            or not isinstance(candidate, dict) or not ATTEMPT_FIELDS.issubset(candidate)):
+                            or not isinstance(candidate, dict) or not PRODUCER_FIELDS.issubset(candidate)):
                         return None
                     try:
                         original = prior.get("assignment") or json.loads(requests[0]["prompt"])
@@ -2227,7 +2239,7 @@ class CapabilityFoundry:
                         prior.get("blocking_issue_ledger"),
                         prior.get("validation_feedback"),
                     )
-                    candidate = {name: candidate[name] for name in ATTEMPT_FIELDS}
+                    candidate = {name: candidate[name] for name in ATTEMPT_FIELDS if name in candidate}
                     prior_feedback = _candidate_bound_value(
                         prior, candidate, "validation_feedback",
                         "validation_feedback_candidate_sha256")
@@ -2358,7 +2370,7 @@ class CapabilityFoundry:
             active_scientific_repair = (
                 bool(blocking_issues)
                 and isinstance(retained_candidate, dict)
-                and ATTEMPT_FIELDS.issubset(retained_candidate)
+                and PRODUCER_FIELDS.issubset(retained_candidate)
             )
             format_failure = (
                 isinstance(state.get("format_repair"), dict)
@@ -2440,7 +2452,7 @@ class CapabilityFoundry:
             switched = switch_author_route(reason)
             has_repair_base = (
                 isinstance(state.get("last_attempt"), dict)
-                and ATTEMPT_FIELDS.issubset(state["last_attempt"])
+                and PRODUCER_FIELDS.issubset(state["last_attempt"])
             )
             feedback = prior_feedback if prior_feedback is not None and has_repair_base else None
             state["feedback"] = feedback
@@ -2643,7 +2655,7 @@ class CapabilityFoundry:
                 if type(observed_calls) is not int:
                     observed_calls = 0
                 continuation_limit = continuation_count + max(
-                    0, model_call_budget - observed_calls - 1)
+                    0, model_call_budget - observed_calls - 2)
 
             for continuation_index in range(continuation_count, continuation_limit):
                 try:
@@ -2667,8 +2679,8 @@ class CapabilityFoundry:
                     observed_calls = state.get("usage", {}).get("model_calls", 0)
                     if type(observed_calls) is not int:
                         observed_calls = 0
-                    # Keep the experiment's independent program reviewer funded.
-                    if observed_calls + 2 > model_call_budget:
+                    # Reserve both independent validator authoring and program review.
+                    if observed_calls + 3 > model_call_budget:
                         break
 
                 continuation_marker, current_prefix_digest, prompt = (
@@ -3270,6 +3282,85 @@ class CapabilityFoundry:
             save("scientific_review_response")
             return result
 
+        def author_independent_validator(intent, payload, document):
+            schema = [{key: type(value).__name__ for key, value in row.items()}
+                      for row in document["observations"][:3]]
+            assignment = {
+                "assignment": "author_independent_validator",
+                "experiment_intent": intent,
+                "configured_input": payload["configured_input"],
+                "observation_schema": schema,
+                "contract": base_prompt["independent_validation_contract"],
+                "response_contract": {"validator_source": "complete Python source"},
+                "instructions": "Implement recalculation from raw observations and the frozen estimand. Never trust candidate metric values as recalculated values. Check every declared primary outcome, raw-data consistency, frozen limitations and finite values. No executor source or producer validator is available. Use only the declared runtime packages and permitted modules. Return only the complete JSON object.",
+                "runtime": runtime,
+                "permitted_modules": ["json", "math", "statistics", "hashlib", "pathlib", "sys", "itertools", "functools", "random", "collections", "dataclasses", "typing", "decimal", "fractions", "re", "time", "os", "numpy", "matplotlib"],
+            }
+            identity = hashlib.sha256(canonical_bytes(assignment)).hexdigest()
+            retained = state.setdefault("validator_authorship", {}).setdefault(identity, {"status": "pending"})
+            while True:
+                if retained.get("status") in {"calling", "result_unknown"}:
+                    raise ModelWorkBlocked("independent validator authoring has an unresolved dispatched request")
+                if retained.get("status") != "response_received":
+                    ensure_model_call_budget()
+                    validator_client = self.validator_client
+                    if validator_client is None:
+                        model = deepcopy_config(self.model_config)
+                        role = "methods.validator-author"
+                        if role not in model.get("role_models", {}):
+                            review_config = resolve_model_config(model, role="review.methods")
+                            model.setdefault("role_models", {})[role] = review_config
+                        config = self._model_config_for_role(role, self.author_max_output_tokens, model_config=model)
+                        validator_client = ModelClient(**config)
+                    request = {"role": "methods.validator-author", "assignment_sha256": identity,
+                        "status": "started", "prompt": json.dumps({**assignment, **({"validator_repair": {"prior_source": retained.get("source"), "prior_response": retained.get("response"), "diagnostic": retained["error"]}} if retained.get("error") else {})}, sort_keys=True), "usage": {"model_calls": 1}}
+                    state["requests"].append(request)
+                    state["usage"]["model_calls"] = state["usage"].get("model_calls", 0) + 1
+                    attempts_before = retained.get("attempts", 0)
+                    retained["attempts"] = attempts_before + 1
+                    retained["status"] = "calling"
+                    save("independent_validator_authoring")
+                    try:
+                        response = validator_client.complete(system=VALIDATOR_AUTHOR_SYSTEM, prompt=request["prompt"])
+                    except ModelCallError as exc:
+                        if record_provider_rate_limit(request, exc, phase="validator_author_rate_limited", retry_state=retained):
+                            retained["attempts"] = attempts_before
+                            save("validator_author_cooldown")
+                            raise
+                        retained["status"] = "result_unknown"
+                        request.update(status="result_unknown", error=str(exc))
+                        save("validator_author_unknown")
+                        raise
+                    except BaseException as exc:
+                        retained["status"] = "result_unknown"
+                        request.update(status="result_unknown", error=str(exc))
+                        save("validator_author_unknown")
+                        raise
+                    record_result(request, response)
+                    retained.update(status="response_received", response=asdict(response), assignment=assignment)
+                    save("independent_validator_response")
+                try:
+                    response = retained["response"]
+                    if response["finish_reason"] != "stop":
+                        raise ValidationError("independent validator author response is incomplete")
+                    value = parse_complete_json_object(response["text"], "independent validator author", model_envelope=False)
+                    if set(value) != {"validator_source"} or not isinstance(value["validator_source"], str):
+                        raise ValidationError("independent validator author must return exactly validator_source")
+                    source = value["validator_source"]
+                    scan_program_source(source, "independent program validator")
+                    retained["source"] = source
+                    probe = self._execute(source, canonical_bytes({"readiness_probe": True}))
+                    validate_validator_readiness(probe)
+                    provenance = {"role": "methods.validator-author", "method": "blinded_separate_authoring",
+                        "assignment_sha256": identity, "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                        "response_sha256": hashlib.sha256(response["text"].encode()).hexdigest(), "model": response["model"]}
+                    return source, provenance, probe
+                except (ValidationError, ValueError, TypeError) as exc:
+                    retained.update(status="repair_required", error=str(exc))
+                    save("independent_validator_contract_failed")
+                    if retained.get("attempts", 0) >= self.max_attempts:
+                        raise ModelWorkBlocked("independent validator technical repair exhausted: " + str(exc)) from exc
+
         if state["status"] == "blocked" and isinstance(
                 state.get("repair_budget_exhausted"), dict):
             ledger = state.get("repair_ledger", [])
@@ -3288,7 +3379,7 @@ class CapabilityFoundry:
                     and type(state.get("attempts")) is int
                     and state["attempts"] < self.max_attempts
                     and isinstance(state.get("last_attempt"), dict)
-                    and ATTEMPT_FIELDS.issubset(state["last_attempt"])):
+                    and PRODUCER_FIELDS.issubset(state["last_attempt"])):
                 state["legacy_repair_budget_exhausted"] = deepcopy_config(
                     state.pop("repair_budget_exhausted"))
                 state.update(status="repairing", error=None)
@@ -3327,7 +3418,7 @@ class CapabilityFoundry:
                 error = state["author_response_continuation"]["error"]
                 has_candidate = (
                     isinstance(state.get("last_attempt"), dict)
-                    and ATTEMPT_FIELDS.issubset(state["last_attempt"])
+                    and PRODUCER_FIELDS.issubset(state["last_attempt"])
                 )
                 state["format_repair"] = {
                     "previous_error": error,
@@ -3351,7 +3442,7 @@ class CapabilityFoundry:
             continuation.update(status="format_repair_required", error=error_text)
             has_candidate = (
                 isinstance(state.get("last_attempt"), dict)
-                and ATTEMPT_FIELDS.issubset(state["last_attempt"])
+                and PRODUCER_FIELDS.issubset(state["last_attempt"])
             )
             state["format_repair"] = {
                 "previous_error": error_text,
@@ -3366,6 +3457,7 @@ class CapabilityFoundry:
             save("author_response_continuation_unknown_format_recovery")
         last_request = state.get("requests", [])[-1] if state.get("requests") else {}
         if (last_request.get("status") == "result_unknown"
+                and last_request.get("role", "research.experiment-author") == "research.experiment-author"
                 and last_request.get("operation") != "continue_truncated_response"):
             error_text = (
                 "experiment-author response outcome is unknown; the original request is retained "
@@ -3384,7 +3476,7 @@ class CapabilityFoundry:
             format_repair = state.get("format_repair")
             has_repair_candidate = (
                 isinstance(last_attempt, dict)
-                and ATTEMPT_FIELDS.issubset(last_attempt)
+                and PRODUCER_FIELDS.issubset(last_attempt)
             )
             bounded_patch_retry = (
                 has_repair_candidate
@@ -3444,7 +3536,7 @@ class CapabilityFoundry:
                     "instructions": "Fix only the reported failure. Never call open(), eval(), exec(), "
                                     "compile(), input() or __import__(); use Path.write_bytes for files.",
                 }
-                if isinstance(last_attempt, dict) and ATTEMPT_FIELDS.issubset(last_attempt):
+                if isinstance(last_attempt, dict) and PRODUCER_FIELDS.issubset(last_attempt):
                     prompt_value["output_contract"] = {"updates": {
                         "executor_source": (
                             "optional exact edits {'edits':[{'old':'unique text','new':'replacement'}]} or "
@@ -3460,6 +3552,7 @@ class CapabilityFoundry:
                             f"{AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS} duplicates; no complete replacement"),
                         "experiment_intent": "optional JSON merge patch: include only changed fields; null deletes an object field; arrays replace whole arrays",
                     }}
+                    prompt_value["output_contract"]["updates"].pop("validator_source")
                     prompt_value["repair_request"]["instructions"] += (
                         " Return only {updates:{...}}. Omit unchanged fields and source code. "
                         "Do not include derivations, rationale, or a replacement program; reserve "
@@ -3484,7 +3577,7 @@ class CapabilityFoundry:
                 result, buffered = buffered, None
             else:
                 if (isinstance(last_attempt, dict)
-                        and ATTEMPT_FIELDS.issubset(last_attempt)
+                        and PRODUCER_FIELDS.issubset(last_attempt)
                         and type(getattr(client, "max_output_tokens", None)) is int):
                     output_limit = self.author_max_output_tokens
                     if feedback is not None or isinstance(format_repair, dict):
@@ -3655,10 +3748,10 @@ class CapabilityFoundry:
                 state.pop("format_repair", None)
                 if "updates" in attempt_value:
                     attempt_value = apply_authoring_patch(state.get("response_base", last_attempt), attempt_value)
-                if (not ATTEMPT_FIELDS.issubset(attempt_value)
+                if (not PRODUCER_FIELDS.issubset(attempt_value)
                         or set(attempt_value) - (ATTEMPT_FIELDS | LEGACY_TRANSPORT_FIELDS)):
                     raise ValidationError(
-                        f"program author must return exactly {sorted(ATTEMPT_FIELDS)}; "
+                        f"program author must return exactly {sorted(PRODUCER_FIELDS)}; "
                         f"observed keys: {sorted(attempt_value)}")
                 # Runtime provenance and test input are host-owned, including
                 # when replaying legacy five-field author responses.
@@ -3704,17 +3797,13 @@ class CapabilityFoundry:
                         "kind": "capability_identifier",
                         "repairs": identifier_repairs,
                     })
-                executor, validator = attempt_value["executor_source"], attempt_value["validator_source"]
+                executor = attempt_value["executor_source"]
                 validate_experiment_intent(attempt_value["experiment_intent"])
                 scan_program_source(executor, "program executor")
-                scan_program_source(validator, "program validator")
                 candidate_fingerprint = hashlib.sha256(canonical_bytes(attempt_value)).hexdigest()
                 failed_candidates = state.setdefault("failed_candidates", {})
                 if candidate_fingerprint in failed_candidates:
                     raise ValidationError(failed_candidates[candidate_fingerprint])
-                save("validator_readiness")
-                validator_probe = self._execute(validator, canonical_bytes({"readiness_probe": True}))
-                validate_validator_readiness(validator_probe)
                 payload_value = self._payload(attempt_value["experiment_intent"],
                                               attempt_value["test_input"])
                 payload = canonical_bytes(payload_value)
@@ -3738,6 +3827,9 @@ class CapabilityFoundry:
                     payload_value["configured_input"].get("work_orders", []))
                 _validate_source_observation_binding(
                     document, payload_value["configured_input"])
+                validator, validator_authorship, validator_probe = author_independent_validator(
+                    attempt_value["experiment_intent"], payload_value, document)
+                attempt_value["validator_source"] = validator
                 digest = hashlib.sha256(canonical_bytes(document)).hexdigest()
                 candidate_value = {
                     "schema_version": "method-program-candidate-1",
@@ -3765,6 +3857,7 @@ class CapabilityFoundry:
                     # program look admitted.
                     admission["repair_provenance"] = deepcopy_config(
                         repair_provenance)
+                admission["validator_authorship"] = validator_authorship
                 if deadline is not None and time.monotonic() >= deadline:
                     raise CapabilityDeadlineError("capability admission reached its mission deadline")
                 registration = register_capability(
@@ -3795,21 +3888,19 @@ class CapabilityFoundry:
                     raise CapabilityDeadlineError("capability validation reached its mission deadline") from exc
                 partial_intent_response = (
                     isinstance(attempt_value, dict)
-                    and set(attempt_value) - LEGACY_TRANSPORT_FIELDS
-                    in ({"executor_source", "validator_source"},
-                        {"executor_source", "validator_source", "experiment_intent"})
+                    and not (set(attempt_value) - (ATTEMPT_FIELDS | LEGACY_TRANSPORT_FIELDS))
                     and isinstance(attempt_value.get("executor_source"), str)
-                    and isinstance(attempt_value.get("validator_source"), str)
                     and not isinstance(attempt_value.get("experiment_intent"), dict)
                 )
                 if partial_intent_response:
                     response_base = {
                         "experiment_intent": {},
                         "executor_source": attempt_value["executor_source"],
-                        "validator_source": attempt_value["validator_source"],
                         "runtime": runtime,
                         "test_input": configured_input,
                     }
+                    if isinstance(attempt_value.get("validator_source"), str):
+                        response_base["validator_source"] = attempt_value["validator_source"]
                     attempt_value = deepcopy_config(response_base)
                     state["response_base"] = deepcopy_config(response_base)
                 normalized_error = _normalize_program_validation_error(exc)
@@ -3823,7 +3914,7 @@ class CapabilityFoundry:
                     partial_intent_response
                     or (candidate_fingerprint is None
                         and (attempt_value is None
-                             or not ATTEMPT_FIELDS.issubset(attempt_value)))
+                             or not PRODUCER_FIELDS.issubset(attempt_value)))
                 )
                 repairable_output_format = (
                     format_envelope or isinstance(exc, (
@@ -3887,11 +3978,11 @@ class CapabilityFoundry:
                     state["validation_context"] = program_failure_context(document)
                     state["validation_context_candidate_sha256"] = (
                         _authored_candidate_sha256(attempt_value))
-                if isinstance(attempt_value, dict) and ATTEMPT_FIELDS.issubset(attempt_value):
+                if isinstance(attempt_value, dict) and PRODUCER_FIELDS.issubset(attempt_value):
                     # Keep only authored fields in the repair base. Invalid
                     # envelopes must not destroy a previously complete source
                     # or make an uneditable extra field survive every patch.
-                    last_attempt = {name: attempt_value[name] for name in ATTEMPT_FIELDS}
+                    last_attempt = {name: attempt_value[name] for name in ATTEMPT_FIELDS if name in attempt_value}
                     last_attempt.update(runtime=runtime, test_input=configured_input)
                 state.update(status="blocked" if repeated else "repairing", feedback=feedback,
                     last_attempt=last_attempt,

@@ -957,11 +957,13 @@ class ExperimentRunner(ExecutionRuntime):
         if not decision["allowed"]:
             raise ValidationError(f"time admission deferred experiment execution: {decision['reason']}")
         started = time.monotonic()
-        result, ref = self.operations.run(self.bindings["execution"], {"input": self._program_input()}, self._call,
+        payload = self._program_input()
+        result, ref = self.operations.run(self.bindings["execution"], {"input": payload}, self._call,
             operator="methods.experiment-operator")
         self.time_policy.observe("production", time.monotonic() - started)
         candidate = validate_program_output(result["document"], self.experiment, self.work_orders)
         self.execution_refs.append(ref)
+        self._executed_configured_input = deepcopy(payload["configured_input"])
         return candidate
 
     def _workspace_assets(self, candidate):
@@ -1002,7 +1004,7 @@ class ExperimentRunner(ExecutionRuntime):
         if not decision["allowed"]:
             raise ValidationError(f"time admission deferred deterministic validation: {decision['reason']}")
         payload = experiment_validation_payload(
-            self.experiment, self.experiment["validation"]["input"],
+            self.experiment, self._executed_configured_input,
             candidate, candidate_sha256)
         started = time.monotonic()
         result, execution_ref = self.operations.run(self.bindings["validation"], {"input": payload}, self._call,

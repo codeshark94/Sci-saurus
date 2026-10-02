@@ -1223,3 +1223,37 @@ class ExperimentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FrozenExecutionInputTests(unittest.TestCase):
+    setUp = ExperimentTests.setUp
+    tearDown = ExperimentTests.tearDown
+    def test_validator_receives_the_exact_dispatched_input_after_controller_changes(self):
+        from copy import deepcopy
+        from unittest.mock import Mock
+        intent = validate_experiment_config(ExperimentTests.config(self))['experiment']
+        runner = object.__new__(ExperimentRunner)
+        runner.experiment = intent
+        runner.experiment['execution']['input'] = {'design': {'seed': 13}}
+        runner.experiment['validation']['input'] = {'obsolete': True}
+        runner.work_orders = [{'id': 'current_order'}]
+        runner.bindings = {'execution': 'producer', 'validation': 'calculator'}
+        runner.time_policy = Mock()
+        runner.time_policy.admit.return_value = {'allowed': True}
+        runner.operations = Mock()
+        runner.operations.run.return_value = ({'document': {}}, 'artifact:execution@1')
+        runner._call = Mock()
+        runner._publish = Mock(return_value={'artifact_ref': 'artifact:validation@1'})
+        runner.execution_refs = []
+        runner.asset_records = []
+        with patch('scisaurus.runtime.experiment.validate_program_output', return_value={}):
+            runner._execute_once()
+        dispatched = deepcopy(runner.operations.run.call_args.args[1]['input'])
+        runner.work_orders = [{'id': 'later_order'}]
+        runner.experiment['execution']['input']['design']['seed'] = 17
+        with patch('scisaurus.runtime.experiment.validate_deterministic_validation', return_value={'decision': 'accepted'}), patch('scisaurus.runtime.experiment.bind_deterministic_validation'):
+            runner._deterministic_validate({}, 'a' * 64)
+        validated = runner.operations.run.call_args.args[1]['input']
+        self.assertEqual(dispatched['configured_input'], validated['configured_input'])
+        self.assertEqual(validated['configured_input']['design']['seed'], 13)
+        self.assertEqual(validated['configured_input']['work_orders'], [{'id': 'current_order'}])

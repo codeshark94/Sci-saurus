@@ -88,7 +88,7 @@ failure dossier + source/trace evidence
         ↓
 Methods diagnosis and root-cause synthesis
         ↓
-edit executor and validator together
+repair executor and independently author its validator
         ↓
 fresh sandbox + raw observations + deterministic replay
         ↓
@@ -121,7 +121,7 @@ check. The default experiment order is:
 
 ```text
 inspect result + source → independently recalculate estimands
-        → edit executor/validator source → fresh replay + independent review
+        → repair executor + separately author validator → fresh replay + independent review
 ```
 
 The Composer stores that order as a scoped departmental work order and reopens
@@ -212,8 +212,11 @@ switching model names within that account does not bypass the cooldown.
 Generated experiment capabilities use the same durable work ledger. Every
 authoring request reserves a conservative call before dispatch, records the raw
 response and reported usage immediately, then runs the sandbox admission checks.
-The author returns executor source, validator source and experimental intent;
-runtime provenance and configured test data belong to the controller. Repairs
+The producer returns executor source and experimental intent. A separate
+`methods.validator-author` context writes the validator from the frozen intent,
+configured input and observation schema, without receiving the executor source
+or reported metric values. Its response and source hashes are bound to the
+admitted capability. Runtime provenance and configured test data belong to the controller. Repairs
 replace only explicitly updated code or intent fields. Unchanged source is
 retained. Source repairs can use ordered exact-text edits; each match must be
 unique, stale or ambiguous edits fail atomically, and the assembled candidate
@@ -235,7 +238,7 @@ Malformed or truncated review responses permit one format repair using a
 configured alternative when available, without echoing unfinished reasoning.
 Valid rejections never trigger model substitution. The repair allowance and
 all calls remain charged across restarts. Validator launchability is checked
-before the numerical experiment, and a late verdict cannot register a capability.
+after the initial executor sandbox and before admission replay, and a late verdict cannot register a capability.
 Legacy capabilities without this independent review are re-admitted as new
 immutable revisions before Composer can reuse them.
 A first-pass pilot is classified as exploratory before program authoring, not
@@ -663,12 +666,22 @@ request IDs and routing metadata remain in the Composer ledger.
 ```bash
 python3 -m scisaurus.cli run-composer --workflow composer-workflow.json
 python3 -m scisaurus.cli run-composer --workflow composer-workflow.json --resume
+# Append downstream stages to a settled workflow checkpoint
+python3 -m scisaurus.cli run-composer --workflow extended-workflow.json \
+  --resume --extend-workflow
 # Continue the same mission after a hard stop, adding only the time you intend
 python3 -m scisaurus.cli run-composer --workflow composer-workflow.json \
   --resume --extend-deadline-seconds 36000
 # Inspect a stopped run without opening the full ledger
 python3 -m scisaurus.cli composer-interim-report /path/to/composer-project
 ```
+
+`--extend-workflow` admits an append-only workflow revision at a settled
+checkpoint. Existing stages, mission inputs and time policy must remain exact;
+new stages use distinct project directories and connect to existing dependencies.
+The extension records the prior workflow and checkpoint hashes. It preserves
+completed stage evidence and the original mission deadline. Changes to future
+downstream routing do not invalidate acceptance of unchanged completed work.
 
 `time_policy.first_result_seconds`, `target_seconds`, and
 `hard_seconds` are explicit workflow fields; a ten-hour run is represented by
