@@ -3429,6 +3429,8 @@ class CapabilityFoundry:
                     record_result(request, response)
                     retained.update(status="response_received", response=asdict(response), assignment=assignment)
                     save("independent_validator_response")
+                source = None
+                provenance = None
                 try:
                     response = retained["response"]
                     if response["finish_reason"] != "stop":
@@ -3439,6 +3441,9 @@ class CapabilityFoundry:
                     source = value["validator_source"]
                     scan_program_source(source, "independent program validator")
                     retained["source"] = source
+                    provenance = {"role": "methods.validator-author", "method": "blinded_separate_authoring",
+                        "assignment_sha256": identity, "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                        "response_sha256": hashlib.sha256(response["text"].encode()).hexdigest(), "model": response["model"]}
                     probe = execute_recorded(source, canonical_bytes(
                         validator_readiness_contract()["stdin"]), "validator_readiness")
                     if probe.timed_out and deadline is not None and time.monotonic() >= deadline:
@@ -3454,9 +3459,6 @@ class CapabilityFoundry:
                             + preview.stderr.decode("utf-8", "replace")[-1200:])
                     verdict = validate_deterministic_validation(json.loads(preview.stdout), intent, digest)
                     bind_deterministic_validation(verdict, document, intent)
-                    provenance = {"role": "methods.validator-author", "method": "blinded_separate_authoring",
-                        "assignment_sha256": identity, "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
-                        "response_sha256": hashlib.sha256(response["text"].encode()).hexdigest(), "model": response["model"]}
                     return source, provenance, probe
                 except CapabilityDeadlineError:
                     retained["status"] = "response_received"
@@ -3470,6 +3472,9 @@ class CapabilityFoundry:
                         blocked.failure_class = "model_contract"
                         blocked.recovery_mode = "format_repair_then_rerun"
                         blocked.repair_gate = "independent_validator_contract"
+                        if source is not None and provenance is not None:
+                            blocked.validator_failure = {"source": source,
+                                "provenance": provenance, "status": "rejected", "diagnostic": str(exc)}
                         raise blocked from exc
 
         if state["status"] == "blocked" and isinstance(
@@ -3944,6 +3949,8 @@ class CapabilityFoundry:
                     payload_value["configured_input"].get("work_orders", []))
                 _validate_source_observation_binding(
                     document, payload_value["configured_input"])
+                attempt_value.pop("validator_source", None)
+                state.pop("validator_failure", None)
                 validator, validator_authorship, validator_probe = author_independent_validator(
                     attempt_value["experiment_intent"], payload_value, document)
                 attempt_value["validator_source"] = validator
@@ -4028,6 +4035,10 @@ class CapabilityFoundry:
                     else normalized_error)
                 output_contract_failure = isinstance(
                     exc, ExperimentProgramOutputContractError)
+                validator_failure = getattr(exc, "validator_failure", None)
+                if isinstance(validator_failure, dict) and isinstance(attempt_value, dict):
+                    attempt_value["validator_source"] = validator_failure["source"]
+                    state["validator_failure"] = deepcopy_config(validator_failure)
                 scoped_contract_failure = (
                     isinstance(exc, ModelWorkBlocked)
                     and getattr(exc, "failure_class", None) == "model_contract")

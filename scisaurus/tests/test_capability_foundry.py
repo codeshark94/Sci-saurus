@@ -3964,6 +3964,33 @@ class IndependentValidatorAuthorshipTests(unittest.TestCase):
             self.assertFalse(state['failed_candidates'])
             self.assertEqual(state['last_failure_class'], 'model_contract')
             self.assertEqual(state['last_failure_gate'], 'independent_validator_contract')
+            failed_source = MINI_VALIDATOR.replace('"evidence":', '"detail":')
+            self.assertEqual(state['last_attempt']['validator_source'], failed_source)
+            self.assertEqual(state['validator_failure']['status'], 'rejected')
+            self.assertEqual(state['validator_failure']['provenance']['source_sha256'],
+                             hashlib.sha256(failed_source.encode()).hexdigest())
+            self.assertEqual(state['validator_failure']['provenance']['role'], 'methods.validator-author')
+            self.assertFalse(list((root / 'registry').glob('**/*.json')))
+
+    def test_malformed_current_validator_response_does_not_expose_stale_source(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            producer = StubClient(CapabilityFoundryTests._payload())
+            bad_source = MINI_VALIDATOR.replace('"evidence":', '"detail":')
+            class Independent:
+                calls = 0
+                def complete(inner, *, system, prompt):
+                    inner.calls += 1
+                    value = {'validator_source': bad_source} if inner.calls == 1 else {'invalid': True}
+                    return ModelResult(json.dumps(value), 'independent', {'model_calls': 1}, 0, 'stop')
+            foundry.validator_client = Independent()
+            states = []
+            with self.assertRaises(ModelWorkBlocked):
+                foundry.generate('bounded comparison', client=producer,
+                    on_progress=lambda phase, state: states.append(state))
+            self.assertNotIn('validator_source', states[-1]['last_attempt'])
+            self.assertNotIn('validator_failure', states[-1])
             self.assertFalse(list((root / 'registry').glob('**/*.json')))
 
     def test_cached_recalculation_rejection_preserves_scientific_gate(self):

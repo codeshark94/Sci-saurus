@@ -652,6 +652,66 @@ class SpecialistDispatcherTests(unittest.TestCase):
         self.assertNotEqual(dispatched_call.kwargs["system"], SPECIALIST_SYSTEM)
         self.assertEqual(report["response"]["raw"]["repair_plan"], repair_plan)
 
+    def test_repair_adjudication_format_error_is_repaired_before_scientific_review(self):
+        model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+                 "model": "fixture", "timeout_seconds": 5, "max_output_tokens": 2048,
+                 "context_window_tokens": 65536, "max_input_tokens": 60000}
+        packet = {"failure_dossier_ref": "artifact:failure@1", "scientific_evidence": "unchanged"}
+        assignment = {"assigned_role": "methods.methodologist", "role_id": "methodologist",
+                      "model_role": "methods.methodologist", "execution_kind": "model",
+                      "stage_id": "experiment-repair-panel", "stage_kind": "experiment",
+                      "quota": {"max_calls": 2, "max_input_tokens": 60000,
+                                "max_output_tokens": 4096, "max_seconds": 10},
+                      "_response_contract": "repair_adjudication", "_prompt": json.dumps(packet)}
+        response = {"decision": "repair", "summary": "Inspect the estimand.", "findings": [],
+                    "evidence_gaps": [], "requested_actions": [], "repair_plan": {
+                        "disposition": "repair", "root_cause": {"statement": "unchanged", "evidence": []},
+                        "required_changes": [], "acceptance_checks": [{"phase": "plan",
+                            "check": "Inspect the declared estimand.", "is_falsifiable": True,
+                            "phase_owner": "methods.methodologist"}]}}
+        original = json.dumps(response)
+        calls = []
+        def reply(*, system, prompt, **kwargs):
+            calls.append(json.loads(prompt))
+            if len(calls) > 1:
+                self.assertEqual(calls[-1]["evidence_packet"], packet)
+                self.assertEqual(calls[-1]["response_format_repair"]["diagnostic"]["kind"], "output_contract")
+                response["repair_plan"]["acceptance_checks"][0] = {
+                    "phase": "plan", "check": "Inspect the declared estimand."}
+            return ModelResult(json.dumps(response), "fixture", {"model_calls": 1, "output_tokens": 100}, .01, "stop", 1)
+        with patch("scisaurus.runtime.specialists.ModelClient") as client:
+            client.return_value.complete.side_effect = reply
+            report = SpecialistDispatcher(model, max_parallel=1, deadline=time.monotonic() + 10).dispatch(
+                [assignment], {})[0]
+        self.assertEqual(report["status"], "succeeded", report.get("error"))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(report["validation_retries"], 1)
+        self.assertEqual(report["retry_history"][0]["response_text"], original)
+        self.assertEqual(report["retry_history"][0]["response_sha256"], hashlib.sha256(original.encode()).hexdigest())
+        self.assertEqual(report["response"]["raw"]["repair_plan"], response["repair_plan"])
+
+    def test_exhausted_repair_adjudication_format_is_an_output_contract_failure(self):
+        model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
+                 "model": "fixture", "timeout_seconds": 5, "max_output_tokens": 2048}
+        response = {"decision": "repair", "summary": "Inspect.", "findings": [],
+                    "evidence_gaps": [], "requested_actions": [], "repair_plan": {
+                        "disposition": "repair", "root_cause": {"statement": "unchanged", "evidence": []},
+                        "required_changes": [], "acceptance_checks": [{"phase": "execution",
+                            "check": "Replay.", "extra": "ambiguous"}]}}
+        assignment = {"assigned_role": "methods.methodologist", "model_role": "methods.methodologist",
+                      "execution_kind": "model", "stage_id": "panel", "stage_kind": "experiment",
+                      "quota": {"max_calls": 2, "max_output_tokens": 4096, "max_seconds": 10},
+                      "_response_contract": "repair_adjudication", "_prompt": "{}"}
+        with patch("scisaurus.runtime.specialists.ModelClient") as client:
+            client.return_value.complete.return_value = ModelResult(json.dumps(response), "fixture",
+                {"model_calls": 1, "output_tokens": 100}, .01, "stop", 1)
+            report = SpecialistDispatcher(model, max_parallel=1, deadline=time.monotonic() + 10).dispatch(
+                [assignment], {})[0]
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["failure"]["kind"], "output_contract")
+        self.assertNotIn("response", report)
+        self.assertEqual(json.loads(report["partial_response"]), response)
+
     def test_review_response_contracts_preserve_complete_evidence_without_word_ceilings(self):
         self.assertIn("at most three", SPECIALIST_SYSTEM)
         self.assertIn("a longer item is preferable to omitting material support", SPECIALIST_SYSTEM)

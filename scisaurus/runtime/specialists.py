@@ -102,6 +102,9 @@ REPAIR_EVIDENCE_SYSTEM = (
 REPAIR_ADJUDICATION_SYSTEM = (
     "You are the Methods lead adjudicating a bounded scientific repair before code execution. "
     "Treat the supplied source, validation feedback, and independent reviewer reports as evidence; "
+    "When foundry_execution_evidence is available, concatenate each output source_chunks in order "
+    "to read its JSON. Compare raw observations, frozen estimands and validator output before "
+    "attributing a rejection to the executor or validator. These are failed-attempt evidence, not admitted claims. "
     "do not invent code defects, data, sources, or checks. Preserve the admitted research question. "
     "A prior pre-execution verifier hold is an admission gate: revise the required changes to "
     "resolve each blocking finding and required revision, or rebut it with supplied evidence. "
@@ -245,7 +248,7 @@ def _safe_value(value, *, depth=0):
                 continue
             if str(key) in {"candidate_program", "prior_plan_review", "repair_evidence_request",
                             "repair_evidence_note", "repair_adjudication", "repair_contract",
-                            "prior_evidence_review", "evidence_experiment_intent"}:
+                            "prior_evidence_review", "evidence_experiment_intent", "foundry_execution_evidence"}:
                 output[key] = _preserve_response_value(item)
                 continue
             output[key] = _safe_value(item, depth=depth + 1)
@@ -291,7 +294,7 @@ def _bounded_value(value, *, depth=0, max_depth=5, max_keys=64, max_items=24,
         for key, item in value.items():
             if str(key) in {"candidate_program", "prior_plan_review", "repair_evidence_request",
                             "repair_evidence_note", "repair_adjudication", "repair_contract",
-                            "prior_evidence_review", "evidence_experiment_intent"}:
+                            "prior_evidence_review", "evidence_experiment_intent", "foundry_execution_evidence"}:
                 output[key] = _preserve_response_value(item)
                 continue
             if index >= max_keys:
@@ -636,6 +639,7 @@ def _verifier_repair_packet(value, *, detail="full"):
         if key in value and not isinstance(value[key], (dict, list))
     }
     output["candidate_program"] = _repair_candidate_program(value)
+    output["foundry_execution_evidence"] = _preserve_response_value(value.get("foundry_execution_evidence", {}))
     output["failure_lineage"] = _bounded_value(
         value.get("failure_lineage", {}), max_depth=2,
         max_keys=12, max_items=8, max_text=400)
@@ -1440,6 +1444,7 @@ def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports
             "topic": _bounded_value(repair_packet.get("topic", {}), max_depth=3,
                                     max_keys=16, max_items=6, max_text=1000),
             "repair_contract": _preserve_response_value(repair_packet.get("repair_contract", {})),
+            "foundry_execution_evidence": _preserve_response_value(repair_packet.get("foundry_execution_evidence", {})),
             "plan_review_failure": _bounded_value(
                 repair_packet.get("plan_review_failure", {}), max_depth=3,
                 max_keys=12, max_items=8, max_text=1400),
@@ -1611,6 +1616,53 @@ def _response_items(value):
     if not isinstance(value, list):
         return []
     return [_response_text(item) for item in value]
+
+
+def _validate_repair_adjudication_response(result):
+    """Validate response transport before scientific admission consumes the plan."""
+    keys = {"decision", "summary", "findings", "evidence_gaps", "requested_actions", "repair_plan"}
+    if (set(result) != keys or not isinstance(result.get("summary"), str)
+            or any(not isinstance(result.get(key), list)
+                   or any(not isinstance(item, str) for item in result[key])
+                   for key in ("findings", "evidence_gaps", "requested_actions"))):
+        raise ValidationError("repair-adjudication response must satisfy its complete declared contract")
+    decision = result.get("decision")
+    plan = result.get("repair_plan")
+    if decision == "hold":
+        if plan is not None:
+            raise ValidationError("a held repair adjudication must have repair_plan null")
+        return
+    if decision != "repair" or not isinstance(plan, dict) or plan.get("disposition") != "repair":
+        raise ValidationError("repair adjudication requires decision repair and an object with disposition repair")
+    cause = plan.get("root_cause")
+    if (not isinstance(cause, dict) or not isinstance(cause.get("statement"), str)
+            or not isinstance(cause.get("evidence"), list)
+            or any(not isinstance(item, str) for item in cause["evidence"])):
+        raise ValidationError("repair_plan.root_cause requires statement text and an evidence string list")
+    changes = plan.get("required_changes")
+    if not isinstance(changes, list):
+        raise ValidationError("repair_plan.required_changes must be a list")
+    for index, change in enumerate(changes):
+        if (not isinstance(change, dict)
+                or any(not isinstance(change.get(key), str) for key in ("target", "instruction", "scientific_basis"))
+                or not isinstance(change.get("source_refs", []), list)
+                or any(not isinstance(item, str) for item in change.get("source_refs", []))):
+            raise ValidationError(f"repair_plan.required_changes[{index}] requires target, instruction, scientific_basis text and source_refs strings")
+    uncertainties = plan.get("residual_uncertainties", [])
+    if not isinstance(uncertainties, list) or any(not isinstance(item, str) for item in uncertainties):
+        raise ValidationError("repair_plan.residual_uncertainties must be a string list")
+    checks = plan.get("acceptance_checks", [])
+    if not isinstance(checks, list):
+        raise ValidationError("repair_plan.acceptance_checks must be a list")
+    if any(key in plan for key in ("plan_acceptance_checks", "execution_acceptance_checks", "deferred_gates")):
+        raise ValidationError("repair checks belong only in repair_plan.acceptance_checks")
+    for index, check in enumerate(checks):
+        if (not isinstance(check, dict) or set(check) != {"phase", "check"}
+                or check.get("phase") not in ("plan", "execution")
+                or not isinstance(check.get("check"), str) or not check["check"].strip()):
+            raise ValidationError(
+                f"repair_plan.acceptance_checks[{index}] must contain exactly phase and check; "
+                "phase must be plan or execution and check must be a nonempty string")
 
 
 def _normalise_report(result):
@@ -2472,6 +2524,8 @@ class SpecialistDispatcher:
                     raise ValidationError(
                         f"specialist response did not finish normally: {result.finish_reason}")
                 parsed = result.json_object()
+                if response_contract == "repair_adjudication" and not verifier:
+                    _validate_repair_adjudication_response(parsed)
                 normalized = _normalise_verdict(parsed, **_verifier_obligation_scope(prompt, assignment)) \
                     if verifier else _normalise_report(parsed)
                 if response_contract == "repair_evidence" and not verifier:
@@ -2641,6 +2695,8 @@ class SpecialistDispatcher:
                         schema_repair_used = True
                     retry_history.append({
                         "kind": "length_continuation" if continuing else "validation",
+                        "response_text": result.text,
+                        "response_sha256": hashlib.sha256(result.text.encode("utf-8")).hexdigest(),
                         "attempt": validation_retries, "route_id": route["route_id"],
                         "provider_pool": route["pool"], "error": str(exc)[:1000],
                         "request_attempts": result.request_attempts,
@@ -2667,6 +2723,7 @@ class SpecialistDispatcher:
                     "model_role": model_role,
                     "route_id": route["route_id"] if route else None,
                     "provider_pool": route["pool"] if route else None,
+                    "failure": {"kind": "output_contract", "outcome_known": True},
                     "error": f"{type(exc).__name__}: {exc}",
                     "partial_response": previous_text if previous_text else None,
                     "elapsed_seconds": time.monotonic() - started,

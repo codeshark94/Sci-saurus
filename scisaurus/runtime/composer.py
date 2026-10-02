@@ -9550,6 +9550,7 @@ class ComposerRunner:
                     last_attempt.get("experiment_intent"), max_depth=4, max_keys=24,
                     max_items=8, max_text=1600),
             },
+            "foundry_execution_evidence": deepcopy(packet.get("foundry_execution_evidence", {})),
             "observed_result": ComposerRunner._capability_repair_projection(
                 packet.get("observed_result"), max_depth=4, max_keys=24, max_items=8, max_text=1600),
             "failure_observed_result": ComposerRunner._capability_repair_projection(
@@ -9797,6 +9798,108 @@ class ComposerRunner:
             "diagnostic_hypotheses": records("diagnostic_hypotheses", "root_causes"),
             "proposed_changes": records("proposed_changes", "required_changes"),
         }
+
+    def _foundry_execution_evidence(self, work):
+        """Hydrate failed execution evidence only from hash-bound sandbox records."""
+        from scisaurus.runtime.capability_registry import experiment_program_payload, experiment_validation_payload
+        unavailable = {"available": False, "admissible_as_verified_claims": False}
+        attempt = work.get("last_attempt") if isinstance(work, dict) else None
+        records = work.get("sandbox_executions") if isinstance(work, dict) else None
+        if not isinstance(attempt, dict) or not isinstance(records, list):
+            return unavailable | {"reason": "No recorded sandbox execution is available."}
+        def read_object(digest):
+            if (not isinstance(digest, str) or len(digest) != 64
+                    or any(char not in "0123456789abcdef" for char in digest)):
+                raise ValidationError("Sandbox evidence has an invalid object digest")
+            body = self.store.read_body(digest)
+            if hashlib.sha256(body).hexdigest() != digest:
+                raise ValidationError("Sandbox evidence object does not match its digest")
+            return body
+        def successful(record):
+            return (isinstance(record, dict) and record.get("mode") == "sandbox-exec"
+                    and record.get("returncode") == 0
+                    and record.get("timed_out") is False and record.get("truncated") is False)
+        try:
+            if any(not isinstance(attempt.get(name + "_source"), str) for name in ("executor", "validator")):
+                raise ValidationError("Failed candidate source pair is unavailable")
+            source_hashes = {name: hashlib.sha256(attempt[name + "_source"].encode()).hexdigest()
+                             for name in ("executor", "validator")}
+            executor = next(record for record in reversed(records)
+                            if successful(record) and record.get("operation") in ("executor_preview", "executor_replay")
+                            and record.get("program_sha256") == source_hashes["executor"])
+            if read_object(executor["program_sha256"]).decode() != attempt["executor_source"]:
+                raise ValidationError("Recorded executor differs from the failed candidate source")
+            stdin = json.loads(read_object(executor["stdin_sha256"]))
+            intent = attempt["experiment_intent"]
+            configured = attempt["test_input"]
+            if not isinstance(intent, dict) or not isinstance(stdin, dict):
+                raise ValidationError("Recorded executor input and frozen intent must be objects")
+            if canonical_bytes(stdin) != canonical_bytes(experiment_program_payload(intent, configured)):
+                raise ValidationError("Recorded executor input differs from the frozen candidate input")
+            document = json.loads(read_object(executor["stdout_sha256"]))
+            if not isinstance(document, dict):
+                raise ValidationError("Recorded executor output must be an object")
+            if document.get("study_id") != intent.get("id") or document.get("revision") != intent.get("revision"):
+                raise ValidationError("Recorded executor output differs from the frozen study identity")
+            observations = document.get("observations")
+            if not isinstance(observations, list) or any(not isinstance(row, dict) for row in observations):
+                raise ValidationError("Recorded executor observations are not a row collection")
+            candidate_hash = hashlib.sha256(canonical_bytes(document)).hexdigest()
+            validator = None
+            verdict = None
+            for record in reversed(records):
+                if (not successful(record) or record.get("operation") not in ("validator_preview", "validator_recalculation")
+                        or record.get("program_sha256") != source_hashes["validator"]):
+                    continue
+                payload = json.loads(read_object(record["stdin_sha256"]))
+                if not isinstance(payload, dict):
+                    raise ValidationError("Recorded validator input must be an object")
+                if payload.get("candidate_sha256") != candidate_hash:
+                    continue
+                if canonical_bytes(payload) != canonical_bytes(experiment_validation_payload(
+                        intent, configured, document, candidate_hash)):
+                    raise ValidationError("Recorded validator input does not bind the exact executor result")
+                if read_object(record["program_sha256"]).decode() != attempt["validator_source"]:
+                    raise ValidationError("Recorded validator differs from the failed validator source")
+                verdict = json.loads(read_object(record["stdout_sha256"]))
+                if not isinstance(verdict, dict):
+                    raise ValidationError("Recorded validator output must be an object")
+                if verdict.get("candidate_sha256") != candidate_hash or verdict.get("study_id") != intent.get("id"):
+                    raise ValidationError("Recorded validator verdict does not bind the exact candidate")
+                validator = record
+                break
+            if validator is None:
+                raise ValidationError("No current-source validator output is bound to the executor result")
+            def encoded_document(value):
+                text = redact_sensitive_text(canonical_bytes(value).decode())
+                limit = 16 * 7000
+                complete = len(text) <= limit
+                return {"complete": complete, "characters": len(text),
+                        "source_chunks": [text[offset:offset + 7000]
+                                          for offset in range(0, min(len(text), limit), 7000)],
+                        "omission_reason": None if complete else "The serialized evidence exceeds the repair transport size."}
+            columns = {}
+            for name in sorted({key for row in observations for key in row}):
+                values = [row[name] for row in observations if name in row]
+                distinct = {canonical_bytes(value) for value in values}
+                summary = {"present_rows": len(values), "distinct_values": len(distinct)}
+                numeric = [value for value in values if type(value) in (int, float)]
+                if numeric and len(numeric) == len(values):
+                    summary.update(minimum=min(numeric), maximum=max(numeric))
+                columns[name] = summary
+            identity = {"candidate_sha256": candidate_hash, "sources": source_hashes,
+                        "executor": {key: executor.get(key) for key in (
+                            "operation", "mode", "stdin_sha256", "stdout_sha256", "stderr_sha256")},
+                        "validator": {key: validator.get(key) for key in (
+                            "operation", "mode", "stdin_sha256", "stdout_sha256", "stderr_sha256")}}
+            return {"available": True, "admissible_as_verified_claims": False,
+                    "identity": identity, "observation_count": len(observations),
+                    "observation_columns": columns,
+                    "executor_output": encoded_document({key: value for key, value in document.items() if key != "assets"}),
+                    "executor_output_omitted_fields": ["assets"] if "assets" in document else [],
+                    "validator_output": encoded_document(verdict)}
+        except (StopIteration, NotFoundError, KeyError, OSError, TypeError, ValueError, ValidationError) as exc:
+            return unavailable | {"reason": str(exc) or "No matching current-source execution is available."}
 
     def _latest_foundry_failure_projection(self, question, domain):
         """Find the latest failed authoring state for this exact scientific intent."""
@@ -11574,6 +11677,7 @@ class ComposerRunner:
             "execution_link_verified",
         ) if name in source}
             for source in unresolved_attempt_sources if isinstance(source, dict)]
+        packet["foundry_execution_evidence"] = deepcopy((verified_dossier or {}).get("foundry_execution_evidence", {}))
         packet["experiment_intent"] = deepcopy(intent)
         packet["survey_evidence_refs"] = deepcopy(survey_refs)
         packet["prior_measurements"] = deepcopy(prior_measurements)
@@ -11605,6 +11709,7 @@ class ComposerRunner:
                 "scientific_sha256": prior_attempt_result.get("scientific_sha256"),
                 "validation_decision": prior_attempt_result.get("validation_decision"),
             },
+            "foundry_execution_identity": packet["foundry_execution_evidence"],
             "prior_measurements": prior_measurements,
             "review_evidence": prior_reports,
             "repair_plan": self._normalize_research_request_value(
@@ -11618,8 +11723,10 @@ class ComposerRunner:
             "unresolved_execution_evidence": unresolved_identity,
             "unresolved_execution_sources": unresolved_source_identity,
         })).hexdigest()
+        execution_evidence = packet.pop("foundry_execution_evidence", {})
         packet = self._capability_repair_projection(
             packet, max_depth=9, max_text=CAPABILITY_REPAIR_SOURCE_CHARS)
+        packet["foundry_execution_evidence"] = execution_evidence
         semantic_packet = deepcopy(packet)
         semantic_packet["repair_prompt_revision"] = CAPABILITY_REPAIR_PANEL_PROMPT_REVISION
         semantic_packet.pop("continuation_cycle", None)
@@ -12216,6 +12323,7 @@ class ComposerRunner:
         survey_refs = survey_refs if isinstance(survey_refs, dict) else {}
         evidence = {
             "contract_revision": CAPABILITY_REPAIR_REVIEW_EVIDENCE_REVISION,
+            "foundry_execution_evidence": packet.get("foundry_execution_evidence"),
             "topic": {key: topic.get(key) for key in (
                 "id", "title", "domain", "research_question", "scope",
                 "comparison", "measurement", "disconfirmation_test", "resource_plan",
@@ -13058,7 +13166,7 @@ class ComposerRunner:
             return next((report for report in reports if isinstance(report, dict)
                          and report.get("status") != "succeeded"
                          and isinstance(report.get("failure"), dict)
-                         and report["failure"].get("kind") == "model_call"), None)
+                         and report["failure"].get("kind") in {"model_call", "output_contract"}), None)
         reviewer_failure = model_failure_report(reviewer_bundle.get("reports", []))
         if reviewer_failure is not None:
             plan_validation_error = str(reviewer_failure.get("error") or "required Methods role is unavailable")
@@ -13839,9 +13947,15 @@ class ComposerRunner:
                 self._checkpoint(f"{stage['id']}:capability_repair_usage_charged", force=True)
             model_failure = repair_context.get("model_failure")
             if isinstance(model_failure, dict):
-                fenced = ModelCallError.from_failure(
-                    model_failure.get("error") or "Methods panel model request unavailable",
-                    {**model_failure["failure"], "usage": {}})
+                if model_failure.get("failure", {}).get("kind") == "output_contract":
+                    fenced = ModelWorkBlocked(model_failure.get("error") or "Methods repair response contract failed")
+                    fenced.failure_class = "model_contract"
+                    fenced.recovery_mode = "format_repair_then_rerun"
+                    fenced.repair_gate = "repair_adjudication_response"
+                else:
+                    fenced = ModelCallError.from_failure(
+                        model_failure.get("error") or "Methods panel model request unavailable",
+                        {**model_failure["failure"], "usage": {}})
                 fenced.capability_repair_panel_attempted = True
                 reviewed_packet = repair_context.get("packet")
                 if (isinstance(reviewed_packet, dict)
@@ -22039,6 +22153,8 @@ class ComposerRunner:
         evidence = {
             "artifact_ref": artifact_ref,
             "artifact_body_sha256": dossier_body_hash,
+            "foundry_execution_evidence": self._foundry_execution_evidence(foundry_cache)
+            if foundry_cache_identity_verified else {"available": False, "reason": "Foundry identity is unverified."},
             "available": True,
             "stage_id": dossier_stage_id,
             "attempt_number": dossier_attempt_number,
@@ -22122,7 +22238,7 @@ class ComposerRunner:
                             for name, item in source_files.items())):
                     raise ValidationError("Methods repair subject conflicts with newly produced candidate evidence")
             for key in ("experiment_intent", "candidate_input_sha256", "validation_context_sha256",
-                        "topic_identity", "source_integrity", "source_files",
+                        "topic_identity", "source_integrity", "source_files", "foundry_execution_evidence",
                         "runtime", "test_input", "program_snapshot", "prior_foundry_feedback",
                         "foundry_work_artifact_ref", "foundry_work_body_sha256",
                         "foundry_work_body_verified", "foundry_work_identity_verified",
@@ -22134,8 +22250,11 @@ class ComposerRunner:
             evidence["scientific_failure_error"] = origin.get("scientific_failure_error", origin.get("error"))
             evidence["scientific_observed_result"] = deepcopy(
                 origin.get("scientific_observed_result", origin.get("observed_result")))
-        return self._capability_repair_projection(
+        execution_evidence = evidence.pop("foundry_execution_evidence", {})
+        projected = self._capability_repair_projection(
             evidence, max_depth=7, max_keys=40, max_items=12, max_text=20_000)
+        projected["foundry_execution_evidence"] = execution_evidence
+        return projected
 
     def _experiment_ancestor_stage_id(self, stage):
         """Find the experiment scope that can produce evidence for a later repair."""

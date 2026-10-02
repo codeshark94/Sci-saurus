@@ -2490,6 +2490,96 @@ class ComposerWorkflowTests(unittest.TestCase):
             finally:
                 runner.close()
 
+    def test_failed_foundry_execution_evidence_binds_complete_raw_rows_and_rejection(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            from scisaurus.tests.test_program_admission import INTENT
+            from scisaurus.runtime.capability_registry import experiment_program_payload, experiment_validation_payload
+            intent = {**deepcopy(INTENT), "id": "study", "revision": 2}
+            configured = {"grid": [1, 2, 3]}
+            document = {"study_id": "study", "revision": 2,
+                        "observations": [{"condition": "cell-" + str(i), "x": i} for i in range(480)],
+                        "metrics": [], "assets": [{"data": "excluded"}]}
+            candidate_hash = hashlib.sha256(canonical_bytes(document)).hexdigest()
+            verdict = {"study_id": "study", "candidate_sha256": candidate_hash,
+                       "decision": "rejected", "checks": [{"id": "selection", "outcome": "failed"}]}
+            def publish(value):
+                body = value.encode() if isinstance(value, str) else canonical_bytes(value)
+                return runner.store.publish_object(body, "application/json")
+            work = {"last_attempt": {"executor_source": "executor", "validator_source": "validator",
+                                      "experiment_intent": intent, "test_input": configured},
+                    "sandbox_executions": [
+                        {"operation": "executor_preview", "mode": "sandbox-exec", "returncode": 0,
+                         "timed_out": False, "truncated": False, "program_sha256": publish("executor"),
+                         "stdin_sha256": publish(experiment_program_payload(intent, configured)),
+                         "stdout_sha256": publish(document)},
+                        {"operation": "validator_recalculation", "mode": "sandbox-exec", "returncode": 0,
+                         "timed_out": False, "truncated": False, "program_sha256": publish("validator"),
+                         "stdin_sha256": publish(experiment_validation_payload(intent, configured, document, candidate_hash)),
+                         "stdout_sha256": publish(verdict)}]}
+            evidence = runner._foundry_execution_evidence(work)
+            self.assertTrue(evidence["available"], evidence)
+            self.assertFalse(evidence["admissible_as_verified_claims"])
+            self.assertEqual(evidence["observation_count"], 480)
+            self.assertEqual(evidence["observation_columns"]["condition"]["distinct_values"], 480)
+            raw = json.loads("".join(evidence["executor_output"]["source_chunks"]))
+            self.assertEqual(raw["observations"], document["observations"])
+            self.assertNotIn("assets", raw)
+            self.assertTrue(evidence["executor_output"]["complete"])
+            self.assertEqual(json.loads("".join(evidence["validator_output"]["source_chunks"])), verdict)
+            manifest = runner.store.publish_artifact(logical_id="command/foundry-work/recorded-fixture",
+                artifact_type="note", media_type="application/json", body=canonical_bytes(work),
+                author="command.controller")
+            snapshot = {"cache_ref": manifest["artifact_ref"], "last_attempt": {
+                **work["last_attempt"], "source_integrity": {
+                    name: {"sha256": hashlib.sha256(work["last_attempt"][name + "_source"].encode()).hexdigest()}
+                    for name in ("executor", "validator")}}}
+            dossier = runner.store.publish_artifact(logical_id="command/failure/recorded-fixture",
+                artifact_type="note", media_type="application/json", body=canonical_bytes({
+                    "stage_id": "experiment", "attempt_number": 1, "foundry_work_snapshot": snapshot,
+                    "observed_result": {"status": "blocked"}}), author="command.controller")
+            runner.stage_records["experiment"] = {"attempts": [{"attempt_number": 1,
+                "failure_dossier_ref": dossier["artifact_ref"]}]}
+            hydrated = runner._failure_dossier_evidence(dossier["artifact_ref"],
+                expected_stage_id="experiment", expected_attempt_number=1)
+            self.assertEqual(hydrated["foundry_execution_evidence"], evidence)
+            packet = {"foundry_execution_evidence": evidence}
+            from scisaurus.runtime.specialists import build_specialist_prompt, build_repair_adjudication_prompt, _verifier_repair_packet
+            role_prompt = json.loads(build_specialist_prompt({"role_id": "analysis-reviewer",
+                "assigned_role": "methods.analysis-reviewer", "input_projection": {}},
+                {"repair_panel": True, "capability_repair_packet": packet}))
+            self.assertEqual(role_prompt["projected_input"]["capability_repair_packet"]["foundry_execution_evidence"], evidence)
+            lead_prompt = json.loads(build_repair_adjudication_prompt({}, packet, []))
+            self.assertEqual(lead_prompt["repair_adjudication_packet"]["foundry_execution_evidence"], evidence)
+            self.assertEqual(_verifier_repair_packet(packet)["foundry_execution_evidence"], evidence)
+            self.assertNotEqual(runner._capability_repair_review_input_sha256(packet),
+                                runner._capability_repair_review_input_sha256({}))
+            authored = runner._capability_authoring_repair_projection({"packet": packet})
+            self.assertEqual(authored["foundry_execution_evidence"], evidence)
+            for alteration in ("input", "candidate", "source", "object", "mode", "stdin_array", "output_array", "verdict_array"):
+                with self.subTest(alteration=alteration):
+                    changed = deepcopy(work)
+                    if alteration == "input":
+                        changed["last_attempt"]["test_input"] = {}
+                    elif alteration == "candidate":
+                        payload = {"experiment": intent, "configured_input": configured,
+                                   "candidate": document, "candidate_sha256": "0" * 64}
+                        changed["sandbox_executions"][1]["stdin_sha256"] = publish(payload)
+                    elif alteration == "source":
+                        changed["last_attempt"]["validator_source"] = "another validator"
+                    elif alteration == "mode":
+                        changed["sandbox_executions"][0]["mode"] = "unsandboxed"
+                    elif alteration == "stdin_array":
+                        changed["sandbox_executions"][0]["stdin_sha256"] = publish([])
+                    elif alteration == "output_array":
+                        changed["sandbox_executions"][0]["stdout_sha256"] = publish([])
+                    elif alteration == "verdict_array":
+                        changed["sandbox_executions"][1]["stdout_sha256"] = publish([])
+                    else:
+                        changed["sandbox_executions"][0]["stdout_sha256"] = "0" * 64
+                    self.assertFalse(runner._foundry_execution_evidence(changed)["available"])
+
     def test_foundry_failure_lookup_scans_past_unrelated_history(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -4911,7 +5001,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                                         "source_refs": [],
                                     }],
                                     "acceptance_checks": [
-                                        "Recalculate the result independently from raw observations.",
+                                        {"phase": "execution", "check": "Recalculate the result independently from raw observations."},
                                     ],
                                 }
                         return ModelResult(
@@ -16954,6 +17044,14 @@ class ComposerWorkflowTests(unittest.TestCase):
                 self.assertEqual(raised.exception.usage, panel_usage)
                 self.assertEqual(runner._record_failed_stage_usage(raised.exception), panel_usage)
                 self.assertEqual(runner.usage["model_calls"], panel_usage["model_calls"])
+                panel["model_failure"] = {"error": "invalid repair response",
+                                          "failure": {"kind": "output_contract", "outcome_known": True}}
+                with patch.object(runner, "_run_capability_repair_panel", return_value=panel):
+                    with self.assertRaises(ModelWorkBlocked) as malformed:
+                        runner._apply_topic_to_experiment_config(workflow["stages"][1],
+                            {"experiment": {"revision": 1, "literature_gate": {}}, "supplied_context": "base"})
+                self.assertEqual(malformed.exception.failure_class, "model_contract")
+                self.assertEqual(malformed.exception.repair_gate, "repair_adjudication_response")
                 panel["model_failure"] = {"error": "provider quota exhausted",
                                           "failure": {"kind": "model_call", "status_code": 429,
                                                       "retry_after_seconds": 900,
@@ -18215,7 +18313,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                                 "source_refs": ["W2162644906"],
                             }],
                             "acceptance_checks": [
-                                "A fresh independent calculation reproduces both branch slopes.",
+                                {"phase": "execution", "check": "A fresh independent calculation reproduces both branch slopes."},
                             ],
                             "dissent_resolution": [], "residual_uncertainties": [],
                         }
