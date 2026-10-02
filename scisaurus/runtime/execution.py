@@ -31,7 +31,7 @@ from scisaurus.runtime.execution_policy import execution_policy, enforce_model_c
 from scisaurus.runtime.models import (
     DEFAULT_MODEL_RATE_LIMIT_COOLDOWN_SECONDS,
     ModelCallError, ModelBudgetExceededError, ModelClient, ModelResult, effective_model_timeout,
-    model_call_budget_available, merge_model_config,
+    model_call_budget_available, merge_model_config, model_route_candidates,
     is_local_qwen_route, json_object_continuation_error, model_context_error, model_provider_quota_scope,
     MODEL_CALL_BUDGET_FIELDS, MODEL_BUDGET_SCOPE_FIELDS, MODEL_CONTINUATION_INSTRUCTION, role_routes_for, resolve_model_config,
     validate_model_budget_scope,
@@ -881,21 +881,36 @@ class ExecutionRuntime:
     def _provider_url(value):
         return value.rstrip("/") if isinstance(value, str) else value
 
-    def _base_model_config(self, spec):
-        """Resolve a task client, filling fixture-style partial clients from the run config."""
+    def _task_model_config(self, spec, *, routing=False):
+        """Fill partial clients while retaining the task's route configuration."""
         params = spec["params"]
-        client = params.get("_routing_client") or params.get("client")
+        client = (params.get("_routing_client") or params.get("client")) if routing else params.get("client")
         if not isinstance(client, dict):
             raise ValidationError("model operation requires a client object")
-        role = params.get("role") or spec["actor"]
         selected = self._delegated_model_config(client)
         # Generic execution tests and a few adapters pass only per-call
         # overrides. Real model tasks pass the complete run model config.
         if "base_url" not in selected or "model" not in selected:
             inherited = self._delegated_model_config(self.config.get("model") or {})
             selected = merge_model_config(inherited, selected)
-        return merge_model_config(resolve_model_config(selected, role=role),
+        return merge_model_config(selected,
                                   {"model_call_budget_scopes": self.model_call_budget_scopes})
+
+    def _base_model_config(self, spec):
+        role = spec["params"].get("role") or spec["actor"]
+        return resolve_model_config(self._task_model_config(spec), role=role)
+
+    def _implicit_model_config(self, spec):
+        """Preserve primary preference among ordinary context-fitting routes."""
+        role = spec["params"].get("role") or spec["actor"]
+        errors = []
+        for candidate in model_route_candidates(self._task_model_config(spec, routing=True), role=role):
+            error = self._model_context_error(spec, candidate)
+            if error is None:
+                return candidate
+            errors.append(error)
+        return _ProviderContextBlock(
+            "no configured provider route fits the model context budget: " + "; ".join(errors))
 
     def _route_model_config(self, spec, route):
         effective = self._base_model_config(spec)
@@ -1086,7 +1101,7 @@ class ExecutionRuntime:
         """Select one route with pool capacity and a fitting context budget."""
         if spec["kind"] == "model" and self.model_rate_limit_fence is not None:
             return _NO_PROVIDER_CAPACITY
-        if spec["kind"] != "model" or not self.provider_pools:
+        if spec["kind"] != "model":
             return None
         override = spec.get("_provider_route_override")
         if isinstance(override, dict):
@@ -1173,14 +1188,16 @@ class ExecutionRuntime:
                 return _ProviderContextBlock("configured model call budget is exhausted")
             return _NO_PROVIDER_CAPACITY
 
-        effective = self._base_model_config(spec)
+        effective = self._implicit_model_config(spec)
+        if isinstance(effective, _ProviderContextBlock):
+            return effective
         base_url = self._provider_url(effective.get("base_url"))
         matches = [name for name, pool in self.provider_pools.items()
                    if base_url in {self._provider_url(url) for url in pool["base_urls"]}]
         if len(matches) > 1:
             raise ValidationError(f"model base_url matches multiple provider pools: {matches}")
         if not matches:
-            return None
+            return {"id": "default:unpooled", "pool": None, "_effective": effective}
         pool_name = matches[0]
         quota_scope = model_provider_quota_scope(effective)
         cooldown_until, fallback_allowed = self._provider_cooldown_state(quota_scope)
@@ -1215,7 +1232,10 @@ class ExecutionRuntime:
         now = time.monotonic()
         route_configs = [self._route_model_config(spec, route) for route in routes]
         if not route_configs:
-            route_configs = [self._base_model_config(spec)]
+            effective = self._implicit_model_config(spec)
+            if isinstance(effective, _ProviderContextBlock):
+                return []
+            route_configs = [effective]
         delays = []
         for index, route_config in enumerate(route_configs):
             if routes:

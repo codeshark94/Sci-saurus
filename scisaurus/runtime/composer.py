@@ -2531,7 +2531,7 @@ class ComposerRunner:
                 and result["failure"].get("kind") == "operational_state")
 
     @staticmethod
-    def _forward_failure_class(error):
+    def _forward_failure_class(error, *, stage_kind=None):
         """Classify a failed attempt without turning every defect into a stop."""
         if ComposerRunner._is_operational_stage_failure(error):
             return "operational_recovery"
@@ -2545,6 +2545,8 @@ class ComposerRunner:
             return "unknown_external_outcome"
         if isinstance(error, KeyboardInterrupt):
             return "process_interruption"
+        if classify_failure(stage_kind, error, getattr(error, "stage_result", None)) == "resource_fence":
+            return "resource_fence"
         text = str(error or "").casefold()
         if any(token in text for token in (
                 "deadline", "quota", "cooldown", "result_unknown",
@@ -4025,7 +4027,7 @@ class ComposerRunner:
         if self._is_pre_execution_capability_failure(
                 stage, self.context.get(stage.get("id")), error):
             return False
-        failure_class = self._forward_failure_class(error)
+        failure_class = self._forward_failure_class(error, stage_kind=stage.get("kind"))
         return failure_class not in {"resource_fence", "operational_recovery", "unknown_external_outcome",
                                      "process_interruption"}
 
@@ -4203,7 +4205,7 @@ class ComposerRunner:
             # result. Keep the failure scoped so the Composer can pivot the
             # executable direction instead of parking behind a release gate.
             return None
-        failure_class = self._forward_failure_class(error)
+        failure_class = self._forward_failure_class(error, stage_kind=stage.get("kind"))
         if failure_class in {"resource_fence", "operational_recovery", "unknown_external_outcome",
                              "process_interruption"} and not force_advance:
             return None

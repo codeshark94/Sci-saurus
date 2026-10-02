@@ -11053,6 +11053,39 @@ class ComposerWorkflowTests(unittest.TestCase):
                     self.assertFalse(attempt["repair_order_issued"])
                     self.assertEqual(runner.format_recovery_ledger, {})
 
+    def test_context_admission_failure_cannot_create_scientific_backfill(self):
+        with tempfile.TemporaryDirectory() as path:
+            workflow = self._workflow(Path(path))
+            workflow["progression_policy"] = "forward_first"
+            workflow["retry_policy"] = {"mode": "bounded", "max_attempts": 1, "backoff_seconds": 0}
+            runner = ComposerRunner(workflow)
+            self.addCleanup(runner.close)
+            calls = []
+            error = ValidationError(
+                "model dispatch failed: model context budget exceeded for primary: "
+                "conservative input estimate 248358 tokens exceeds 245760 input tokens")
+            self.assertEqual(runner._forward_failure_class(error), "resource_fence")
+            self.assertFalse(runner._composer_can_advance_after_admission(workflow["stages"][0], error))
+            executor_error = ValidationError(
+                "executor failed in the sandbox (status=-9, timeout=False, truncated=True)")
+            self.assertEqual(classify_failure("experiment", executor_error), "experiment_failure")
+            self.assertNotEqual(runner._forward_failure_class(
+                executor_error, stage_kind="experiment"), "resource_fence")
+
+            def reject(stage, **kwargs):
+                calls.append(stage["id"])
+                raise error
+
+            runner._run_stage = reject
+            result = runner.run()
+            self.assertEqual(calls, ["survey"])
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["continuation_cycles"], 0)
+            self.assertFalse(runner._continuation_requests())
+            self.assertEqual(runner.format_recovery_ledger, {})
+            self.assertFalse(any(item.get("kind") == "literature_expansion"
+                                 for item in result.get("active_research_requests", [])))
+
     def test_operational_stage_failure_requires_owned_recovery_without_retry_or_science(self):
         with tempfile.TemporaryDirectory() as path:
             workflow = self._workflow(Path(path))

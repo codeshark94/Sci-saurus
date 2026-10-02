@@ -1483,6 +1483,94 @@ class TestExecutionRuntime(unittest.TestCase):
         self.assertEqual(runtime.control._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 0)
         self.assertEqual(runtime.provider_active, {"ollama": 0})
 
+    def test_implicit_fallback_context_selection_reaches_worker(self):
+        for pooled in (True, False):
+            with self.subTest(pooled=pooled):
+                value = config()
+                value["model"].update(
+                    base_url="http://127.0.0.1:1/v1", protocol="openai_compatible",
+                    model="primary", context_window_tokens=3000, max_input_tokens=300)
+                value["model"]["role_model_fallbacks"] = {
+                    "strategy.worker": [{
+                        "base_url": "http://127.0.0.1:2/v1", "protocol": "openai_compatible",
+                        "model": "fallback", "context_window_tokens": 9000,
+                        "max_input_tokens": 6000,
+                    }]
+                }
+                value["limits"]["provider_pools"] = {
+                    "primary": {"max_concurrent": 1, "base_urls": ["http://127.0.0.1:1/v1"]},
+                    **({"fallback": {"max_concurrent": 1, "base_urls": ["http://127.0.0.1:2/v1"]}}
+                       if pooled else {}),
+                }
+                runtime = ExecutionRuntime(self.root / f"implicit-context-{pooled}", validate_config(value),
+                                           worker_target=execution_worker)
+                self.runtimes.append(runtime)
+                spec = self.spec(f"implicit-context-{pooled}", payload="x" * 2000)
+                spec["params"]["client"] = value["model"]
+                outcomes = runtime._call_batch([spec], max_parallel=1)
+                self.assertTrue(outcomes[spec["task_id"]]["ok"], outcomes)
+                record = json.loads(outcomes[spec["task_id"]]["result"]["text"])
+                self.assertEqual(record["model"], "fallback")
+                self.assertEqual(record["provider_pool"], "fallback" if pooled else None)
+                self.assertEqual(runtime.provider_active, {key: 0 for key in value["limits"]["provider_pools"]})
+                self.assertEqual(runtime.control._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 1)
+
+    def test_implicit_context_selection_preserves_primary_preference_and_cooldown_scope(self):
+        value = config()
+        value["model"].update(
+            base_url="http://127.0.0.1:1/v1", protocol="openai_compatible",
+            model="primary", context_window_tokens=9000, max_input_tokens=6000)
+        value["model"]["role_model_fallbacks"] = {
+            "strategy.worker": [{
+                "base_url": "http://127.0.0.1:2/v1", "protocol": "openai_compatible",
+                "model": "fallback", "context_window_tokens": 9000, "max_input_tokens": 6000,
+            }]
+        }
+        value["limits"]["provider_pools"] = {
+            "primary": {"max_concurrent": 1, "base_urls": ["http://127.0.0.1:1/v1"]},
+            "fallback": {"max_concurrent": 1, "base_urls": ["http://127.0.0.1:2/v1"]},
+        }
+        runtime = ExecutionRuntime(self.root / "implicit-context-preference", validate_config(value),
+                                   worker_target=execution_worker)
+        self.runtimes.append(runtime)
+        spec = self.spec("implicit-context-preference", payload="x" * 2000)
+        spec["params"]["client"] = value["model"]
+        runtime.provider_active["primary"] = 1
+        self.assertIs(runtime._provider_route(spec), _NO_PROVIDER_CAPACITY)
+        runtime.provider_active["primary"] = 0
+        self.assertEqual(runtime._provider_route(spec)["_effective"]["model"], "primary")
+        spec["params"]["client"] = dict(value["model"], max_input_tokens=300)
+        selected = runtime._provider_route(spec)["_effective"]
+        self.assertEqual(selected["model"], "fallback")
+        scope = model_provider_quota_scope(selected)
+        runtime._loaded_provider_cooldown_scopes.add(scope)
+        runtime.provider_cooldowns[scope] = time.monotonic() + 30
+        self.assertIs(runtime._provider_route(spec), _NO_PROVIDER_CAPACITY)
+        self.assertGreater(runtime._pending_cooldowns(spec)[0], 0)
+
+    def test_implicit_context_overflow_preserves_all_routes_and_charges_no_attempt(self):
+        value = config()
+        value["model"].update(
+            base_url="http://127.0.0.1:1/v1", protocol="openai_compatible",
+            model="primary", context_window_tokens=3000, max_input_tokens=300)
+        value["model"]["role_model_fallbacks"] = {
+            "strategy.worker": [{"model": "fallback", "max_input_tokens": 400}]
+        }
+        value["limits"]["provider_pools"] = {
+            "primary": {"max_concurrent": 1, "base_urls": ["http://127.0.0.1:1/v1"]},
+        }
+        runtime = ExecutionRuntime(self.root / "implicit-context-overflow", validate_config(value),
+                                   worker_target=execution_worker)
+        self.runtimes.append(runtime)
+        spec = self.spec("implicit-context-overflow", payload="x" * 2000)
+        spec["params"]["client"] = value["model"]
+        outcome = runtime._call_batch([spec])[spec["task_id"]]
+        self.assertFalse(outcome["ok"])
+        self.assertIn("primary", outcome["error"])
+        self.assertIn("fallback", outcome["error"])
+        self.assertTrue(outcome["outcome_known"])
+        self.assertEqual(runtime.control._conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 0)
+
     @unittest.skipUnless(os.name == "posix", "process-group cleanup uses POSIX process sessions")
     def test_interrupt_keeps_unknown_cost_releases_undispatched_review_and_stops_descendants(self):
         paths = [self.root / f"pid-{i}.json" for i in range(2)]
