@@ -1890,6 +1890,9 @@ class TestSurveyRunner(unittest.TestCase):
             runner._resolve_follow_up()
         self.assertLessEqual(estimate_input_tokens(SYSTEM, json.dumps(captured[0], ensure_ascii=False)), 56000)
         self.assertEqual(captured[0]["work_orders"], [self.follow_up_order()])
+        self.assertEqual(captured[0]["response_contract"]["required_order_fields"],
+                         ["id", "status", "rationale", "evidence", "query_refs", "limitation", "next_action", "completion"])
+        self.assertIn("no paper must itself declare", captured[0]["instructions"])
         self.assertEqual(runner.source_docs, original)
 
     def test_record_follow_up_is_consumed_only_with_recalculated_pinned_inventory(self):

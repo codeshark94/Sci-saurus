@@ -820,6 +820,12 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         assignment = {
             "phase": "survey_follow_up", "question": self.score["question"],
             "completion_contract": FOLLOW_UP_COMPLETION_CONTRACT,
+            "response_contract": {
+                "envelope": {"orders": "one disposition for the assigned order"},
+                "required_order_fields": ["id", "status", "rationale", "evidence", "query_refs",
+                                          "limitation", "next_action", "completion"],
+                "completion": {"outcome": ["met", "unmet"], "rationale": "exact acceptance evaluation"},
+            },
             "survey_ref": self.survey_ref, "assessment_ref": self.assessment_ref,
             "assessment": {key: self._body(self.store.get(self.assessment_ref)).get(key)
                            for key in ("state", "rationale", "checks")},
@@ -836,7 +842,12 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "completion evaluates that exact success condition separately from scientific evidence status. "
                 "Honor its alternatives and scope: if it explicitly permits recording an input as unavailable, "
                 "a source-backed availability record can meet that operation while the scientific input remains "
-                "unresolved. If it requires capturing a value or executing a measurement, unavailable evidence "
+                "unresolved. An unavailable outcome is a scoped ledger finding recorded by this disposition "
+                "from the retained acquisition failures, source availability, inventory and bounded searches. "
+                "Identify each missing requested input explicitly in limitation and completion.rationale; "
+                "no paper must itself declare that an uncaptured value is unavailable. This record describes "
+                "what the survey could obtain, not global nonexistence of a value or relation. "
+                "If it requires capturing a value or executing a measurement, unavailable evidence "
                 "does not meet it. Explain each requested deliverable and any permitted unavailable outcome in "
                 "completion.rationale. Do not replace the stated acceptance rule with a stricter requirement "
                 "or treat completion as evidence of novelty, experimental readiness or a resolved research question. "
@@ -1554,7 +1565,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             if isinstance(previous, dict) and isinstance(previous.get("orders"), list):
                 repair["previous_dispositions"] = [
                     {key: deepcopy(row[key]) for key in (
-                        "id", "status", "rationale", "query_refs", "limitation", "next_action") if key in row}
+                        "id", "status", "rationale", "query_refs", "limitation", "next_action", "completion") if key in row}
                     for row in previous["orders"] if isinstance(row, dict)]
             repair.pop("previous_response_excerpt", None)
             repair["previous_response_omitted"] = True
