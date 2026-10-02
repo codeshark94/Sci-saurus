@@ -862,7 +862,19 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         for record in rows:
             manifest, raw_report = self.gate._artifact(record["artifact_ref"], current=False)
             report = json.loads(raw_report)
-            if report.get("follow_up_ref") != self.follow_up_ref:
+            historical_ref = report.get("follow_up_ref")
+            if not isinstance(historical_ref, str):
+                continue
+            packet, raw_packet = self.gate._artifact(historical_ref, current=False)
+            packet_body = json.loads(raw_packet)
+            if (packet.get("author") != "command.controller" or packet["artifact_type"] != "note"
+                    or packet_body.get("schema_version") != "survey-follow-up-1"
+                    or not isinstance(packet_body.get("work_orders"), list)
+                    or historical_ref not in {item["ref"] for item in manifest["inputs"]}):
+                raise StateError("follow-up completion feedback lacks its exact historical work packet")
+            matching_orders = {order["id"]: order for order in self.work_orders
+                               if order in packet_body["work_orders"]}
+            if not matching_orders:
                 continue
             completion_refs = report.get("completion_execution_refs")
             if completion_refs is None:
@@ -878,7 +890,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 if not isinstance(row, dict) or not isinstance(row.get("completion"), dict):
                     raise StateError("follow-up completion feedback requires explicit disposition and review objects")
                 key = (row.get("id"), row["completion"].get("outcome"))
-                if key not in pending:
+                if key not in pending or row.get("id") not in matching_orders:
                     continue
                 review_ref = completion_refs[index]
                 _, _, reviewed, params = self.gate._recorded_execution(
@@ -898,7 +910,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                         or writer_assignment.get("phase") != "survey_follow_up"
                         or any(writer_assignment.get(key) != report.get(key)
                                for key in ("survey_ref", "assessment_ref"))
-                        or writer_assignment.get("follow_up_ref") != self.follow_up_ref
+                        or writer_assignment.get("follow_up_ref") != historical_ref
+                        or writer_assignment.get("work_orders") != [matching_orders[row["id"]]]
                         or len(written_rows) != 1 or written_rows[0].get("id") != row["id"]
                         or follow_up_completion_basis(written_rows[0]) != follow_up_completion_basis(row)
                         or review_assignment.get("disposition_execution_ref") != writer_ref):
@@ -922,15 +935,15 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                                for key in ("survey_ref", "assessment_ref"))
                         or (review_contract == FOLLOW_UP_COMPLETION_REVIEW_CONTRACT
                             and review_assignment.get("evidence_context") != follow_up_completion_context(writer_assignment))
-                        or review_assignment.get("follow_up_ref") != self.follow_up_ref
-                        or review_assignment.get("work_orders") != [next(
-                            order for order in self.work_orders if order["id"] == row["id"])]
+                        or review_assignment.get("follow_up_ref") != historical_ref
+                        or review_assignment.get("work_orders") != [matching_orders[row["id"]]]
                         or prior_basis != expected_basis
                         or completion != row.get("completion")):
                     raise StateError("follow-up completion feedback differs from its recorded independent review")
                 pending.remove(key)
                 if row.get("completion", {}).get("outcome") in outcomes:
-                    feedback.append({"report_ref": record["artifact_ref"], "order_id": row["id"],
+                    feedback.append({"report_ref": record["artifact_ref"], "follow_up_ref": historical_ref,
+                        "order_id": row["id"],
                         "disposition": follow_up_completion_basis(written_rows[0]),
                         "review": deepcopy(row["completion"]),
                         "review_execution_ref": review_ref})
@@ -1002,6 +1015,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             scoped["instructions"] += (
                 " Address the exact deficiencies in any prior_completion_reviews against the current captured "
                 "evidence. These records include prior accepted availability dispositions as well as failed reviews. "
+                "Earlier packet query references in these historical records document past work; do not list "
+                "them as current query_refs unless they also appear in this assignment's allowed query_refs. "
                 "Preserve their valid itemized findings, quotations and search evidence where the current sources "
                 "still support them; explain any evidence-based revision. A prior completion establishes only "
                 "that operation's acceptance, and must not be promoted to empirical support or novelty. "

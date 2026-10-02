@@ -1867,6 +1867,27 @@ class TestSurveyRunner(unittest.TestCase):
         runner.gate = SurveyGate(runner.control, runner.store)
         self.assertEqual(runner._prior_follow_up_completion_reviews(), [])
 
+    def test_completed_order_history_survives_unrelated_packet_changes(self):
+        order = self.follow_up_order()
+        config = survey_config(self.endpoint, "follow-up-conflicted-completion")
+        first = self.runtime(config, work_orders=[order]).run()
+        self.assertEqual(first["status"], "completed", first["error"])
+        extra = {**order, "id": "different-order", "objective": "Review a separate requirement."}
+        policy = {"additional_seconds": config["limits"]["wall_clock_seconds"],
+                  "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["follow_up"]}}
+        runner = self.runtime(config, work_orders=[order, extra], resume_policy=policy)
+        self.assertNotEqual(runner.follow_up_ref, first["follow_up_ref"])
+        reviews = runner._prior_follow_up_completion_reviews(include_completed=True)
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews[0]["order_id"], order["id"])
+        self.assertEqual(reviews[0]["follow_up_ref"], first["follow_up_ref"])
+        self.assertEqual(reviews[0]["review"]["outcome"], "met")
+        self.assertTrue(reviews[0]["disposition"]["query_refs"])
+        self.assertEqual(runner._follow_up_query_refs(), [])
+        runner.work_orders = [{**order, "success_condition": "Capture a new measurement."}, extra]
+        self.assertEqual(runner._prior_follow_up_completion_reviews(include_completed=True), [])
+
     def test_retained_completed_review_requires_its_exact_evidence_assignment(self):
         order = self.follow_up_order()
         runner = self.runtime(survey_config(self.endpoint, "follow-up-conflicted-completion"), work_orders=[order])
