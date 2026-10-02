@@ -17007,6 +17007,7 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(packet["repair_subject_lineage"], subject)
             self.assertEqual(packet["failure"]["error"], "normalizer is zero")
             self.assertEqual(packet["plan_review_failure"]["error"], "plan review hold")
+            self.assertEqual(packet["plan_review_failure"]["temporal_scope"], "historical_prior_plan_review")
             projected = runner._capability_authoring_repair_projection({"packet": packet})
             self.assertEqual(projected["repair_subject_lineage"], subject)
             self.assertEqual(projected["failed_program"]["executor_source"], sources["executor"])

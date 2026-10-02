@@ -1068,6 +1068,51 @@ class SpecialistDispatcherTests(unittest.TestCase):
                       payload["verifier_contract"]["repair_panel_rule"])
         self.assertIn(SCIENTIFIC_REPAIR_ACCEPTANCE_RULE, REPAIR_ADJUDICATION_SYSTEM)
 
+    def test_current_plan_review_scopes_historical_verdict_without_losing_requirements(self):
+        plan = {"disposition": "repair", "required_changes": [
+            {"target": "estimand", "instruction": "Declare one estimator."}],
+            "acceptance_checks": [{"phase": "execution", "check": "Recalculate the declared estimator."}]}
+        prior_plan = {"disposition": "repair", "required_changes": ["ambiguous estimator"]}
+        prior = {"prior_plan": prior_plan, "lead_review": {"summary": "Historical prose." * 2000},
+            "verifier_review": {"decision": "hold", "rationale": "Old judgment." * 2000,
+                "blocking_findings": ["Declare one estimator."], "required_revisions": ["Bind its recalculation."],
+                "artifact_ref": "artifact:prior-verifier@1"}, "source_scope_matches": True,
+            "evidence_dependencies": [{"ref": "artifact:prior-evidence@1"}]}
+        chief = {"repair_adjudication": plan, "prior_plan_review": prior}
+        packet = {"repair_panel": True, "repair_verification_scope": "pre_execution_plan",
+            "capability_repair_packet": {"plan_review_failure": {
+                "error": "old plan hold", "source_authority": "The current plan review failed"}}}
+        for limit in (32000, 8000):
+            prompt = build_verifier_prompt({"id": "repair", "kind": "experiment"}, packet, [], chief,
+                                          max_input_tokens=limit)
+            value = json.loads(prompt)
+            self.assertEqual(value['chief_result']['repair_adjudication'], plan)
+            self.assertEqual(value['verifier_contract']['review_subject']['sha256'],
+                             hashlib.sha256(canonical_bytes(plan)).hexdigest())
+            history = value['chief_result']['prior_plan_review']
+            self.assertEqual(history['prior_plan_sha256'], hashlib.sha256(canonical_bytes(prior_plan)).hexdigest())
+            self.assertEqual(history['requirements_to_reassess'], {
+                'blocking_findings': ['Declare one estimator.'], 'required_revisions': ['Bind its recalculation.']})
+            self.assertEqual(history['evidence_dependencies'], prior['evidence_dependencies'])
+            for field in ('prior_plan', 'lead_review', 'verifier_review', 'decision'):
+                self.assertNotIn(field, history)
+            failure = value['capability_repair_packet']['plan_review_failure']
+            self.assertEqual(failure['temporal_scope'], 'historical_prior_plan_review')
+            self.assertNotIn('current plan review failed', failure['source_authority'])
+            repaired = json.loads(_verifier_repair_prompt(prompt, 'schema error', '{}',
+                max_input_tokens=limit))
+            self.assertEqual(repaired['evidence_packet'], value)
+        self.assertEqual(chief['prior_plan_review'], prior)
+        from scisaurus.runtime.specialists import _historical_plan_requirements
+        for review in ({'blocking_findings': ['Current required design.'], 'required_revisions': ['Revise the comparator.']},
+                       {**prior, 'blocking_findings': ['Current required design.'],
+                        'required_revisions': ['Revise the comparator.']}):
+            history = _historical_plan_requirements(review)
+            self.assertIn('Current required design.', history['requirements_to_reassess']['blocking_findings'])
+            self.assertIn('Revise the comparator.', history['requirements_to_reassess']['required_revisions'])
+            if 'verifier_review' in review:
+                self.assertIn('Declare one estimator.', history['requirements_to_reassess']['blocking_findings'])
+
     def test_repair_verifier_retains_the_leads_source_evidence_at_every_detail(self):
         from scisaurus.runtime.specialists import (
             _verifier_repair_packet, build_repair_adjudication_prompt,

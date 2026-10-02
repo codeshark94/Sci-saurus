@@ -643,6 +643,10 @@ def _verifier_repair_packet(value, *, detail="full"):
         output["plan_review_failure"] = _bounded_value(
             value["plan_review_failure"], max_depth=3,
             max_keys=12, max_items=8, max_text=1400)
+        output["plan_review_failure"].update({
+            "temporal_scope": "historical_prior_plan_review",
+            "source_authority": "This records a previous plan rejection, not a verdict on the current proposed plan.",
+        })
     if isinstance(value.get("topic"), dict):
         output["topic"] = _verifier_topic(
             value["topic"], max_items=item_limit, text_limit=text_limit)
@@ -869,6 +873,37 @@ def _verifier_survey_evidence(result):
     return evidence
 
 
+def _historical_plan_requirements(review):
+    """Carry prior obligations without presenting an old verdict as current."""
+    verifier = review.get("verifier_review")
+    verifier = verifier if isinstance(verifier, dict) else {}
+    response = verifier.get("response")
+    response = response if isinstance(response, dict) else verifier
+    prior_plan = review.get("prior_plan")
+    requirements = {}
+    for source in (response, review):
+        for key in ("blocking_findings", "critical_findings", "required_revisions"):
+            if key not in source:
+                continue
+            values = source[key]
+            values = values if isinstance(values, list) else [values]
+            retained = requirements.setdefault(key, [])
+            for value in values:
+                value = _preserve_response_value(value)
+                if value not in retained:
+                    retained.append(value)
+    return {
+        "temporal_scope": "historical_prior_plan_review",
+        "prior_plan_sha256": (hashlib.sha256(canonical_bytes(prior_plan)).hexdigest()
+                              if isinstance(prior_plan, dict) else None),
+        "verifier_artifact_ref": verifier.get("artifact_ref"),
+        "requirements_to_reassess": requirements,
+        **{key: _preserve_response_value(review[key]) for key in (
+            "source_scope_matches", "pending_origin_actions", "evidence_dependencies", "evidence_dependency")
+            if key in review},
+    }
+
+
 def _verifier_chief_result(result, *, detail="full"):
     """Expose claim/evidence fields while dropping execution and provenance bulk."""
     if not isinstance(result, dict):
@@ -917,7 +952,9 @@ def _verifier_chief_result(result, *, detail="full"):
             canonical_bytes(output["repair_adjudication"])).hexdigest()
     for key in ("repair_evidence_request", "repair_evidence_note", "prior_plan_review"):
         if isinstance(result.get(key), dict):
-            output[key] = _preserve_response_value(result[key])
+            output[key] = (_historical_plan_requirements(result[key])
+                           if key == "prior_plan_review" and isinstance(adjudication, dict)
+                           else _preserve_response_value(result[key]))
     if "frontier_seed_plan" in result:
         output["recent_papers_scope"] = (
             "recent_papers is a balanced discovery sample across frontier seeds; "
@@ -1067,9 +1104,21 @@ def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, det
                 and isinstance(chief_result.get("repair_adjudication"), dict)):
             body["verifier_contract"].update({
                 "acceptance_target": "the scoped methods repair plan before source authoring or execution",
+                "review_subject": {
+                    "path": "chief_result.repair_adjudication",
+                    "sha256": body["chief_result"]["repair_adjudication_sha256"],
+                    "phase": "proposed_design_before_source_authoring",
+                },
                 "repair_panel_rule": (
                     SCIENTIFIC_REPAIR_ACCEPTANCE_RULE + " "
                     "Review the methodologist's reconciled plan, not an experiment that has not yet run. "
+                    "The review_subject identifies the current proposed plan. Prior-plan verdicts and "
+                    "baseline source defects are historical evidence, not a verdict on this plan. "
+                    "For each retained requirement, compare the current required_changes and acceptance_checks; "
+                    "cite the current plan field and its actual instruction before calling it absent or invalid. "
+                    "Do not repeat an addressed prior finding as a required revision. Assess planned amendments "
+                    "as design specifications; rereading amended executable source, tests, and raw results "
+                    "belongs to execution checks. A proposed amendment is not a claim that it already ran. "
                     "Accept only if its root cause is evidenced, its source/design changes are specific, "
                     "the question and lineage are preserved, and its checks can falsify the repair. "
                     "Report a prose attribution discrepancy as non-blocking when the selected digest and "

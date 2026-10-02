@@ -213,7 +213,7 @@ EXPERIMENT_RESULT_METADATA_FIELDS = frozenset({
 MAX_EXPERIMENT_RESULT_PACKAGE_BYTES = 16 * 1024 * 1024
 CAPABILITY_REPAIR_SOURCE_CHARS = 64_000
 CAPABILITY_REPAIR_PANEL_SCHEMA_VERSION = "capability-repair-panel-8"
-CAPABILITY_REPAIR_PANEL_PROMPT_REVISION = "repair-plan-owned-evidence-actions-15"
+CAPABILITY_REPAIR_PANEL_PROMPT_REVISION = "repair-plan-owned-evidence-actions-16"
 SURVEY_EVIDENCE_REQUEST_POLICY_REVISION = 2
 CAPABILITY_REPAIR_REVIEW_EVIDENCE_REVISION = "immutable-research-evidence-v2"
 CAPABILITY_REPAIR_UNRESOLVED_SOURCE_FILES = 2
@@ -11466,7 +11466,8 @@ class ComposerRunner:
             packet["plan_review_failure"] = {
                 "error": verified_dossier.get("error"),
                 "failure_lineage": deepcopy(failure_lineage),
-                "source_authority": "The current plan review failed; the candidate evidence belongs to repair_subject_lineage.",
+                "temporal_scope": "historical_prior_plan_review",
+                "source_authority": "This dossier records a previous plan rejection, not the verdict on a revised plan. Candidate evidence belongs to repair_subject_lineage.",
             }
         intent = foundry_failure.get("last_attempt")
         intent = intent.get("experiment_intent") if isinstance(intent, dict) else None
@@ -12694,7 +12695,7 @@ class ComposerRunner:
                     "lead_review": deepcopy(retained_lead),
                     "verifier_review": deepcopy(retained.get("verifier")),
                     "source_scope_matches": retained_review_digest == current_review_digest,
-                    "instruction": "Preserve the recorded HOLD and its exact actions; reassess changed-source findings against the current bound candidate.",
+                    "instruction": "The recorded verdict applies to the prior plan. Preserve its exact requirements and evidence, then assess whether the revised plan addresses them. An unresolved requirement remains blocking; an addressed requirement is not a current defect merely because the prior verdict was HOLD.",
                 }
         repair_evidence = self._run_pending_capability_evidence(stage, descriptor, packet)
         if repair_evidence is not None:
