@@ -228,6 +228,13 @@ def _validate_censored_event_observations(observations):
                     "and do not use it as an observed event")
 
 
+def normalize_program_output(value):
+    """Apply the shared transport normalization before binding a candidate digest."""
+    if "analysis" in value:
+        value["analysis"] = validate_analysis(value["analysis"])
+    return value
+
+
 def validate_program_output(value, experiment, work_orders=None):
     work_orders = validate_work_orders(work_orders)
     output_fields = set(PROGRAM_OUTPUT_FIELDS)
@@ -349,8 +356,7 @@ def validate_program_output(value, experiment, work_orders=None):
                    if asset["media_type"] in requirement["media_types"]]
         if len(matches) < requirement["min_count"]:
             raise ValidationError("experiment output omits a required asset")
-    if "analysis" in value:
-        value["analysis"] = validate_analysis(value["analysis"])
+    normalize_program_output(value)
     # The executable result is admitted on reproducibility and independent
     # recalculation first.  A quality contract is a substantive publication
     # floor, not a pre-execution response-format gate: an author may omit the
@@ -456,10 +462,17 @@ def bind_deterministic_validation(value, candidate, experiment):
             "deterministic validation must bind exactly the declared primary outcomes")
     for item in recalculations:
         metric_id = item["metric_id"]
-        if metric_id not in reported \
-                or canonical_bytes(item["reported_value"]) != canonical_bytes(reported[metric_id]):
+        echoed = item["reported_value"]
+        original = reported.get(metric_id)
+        same_value = ((echoed is None and original is None)
+                      or (type(echoed) in (int, float) and type(original) in (int, float)
+                          and (type(echoed) is int or math.isfinite(echoed))
+                          and (type(original) is int or math.isfinite(original))
+                          and echoed == original))
+        if metric_id not in reported or not same_value:
             raise ValidationError(
-                "deterministic validation changed a reported primary metric")
+                "deterministic validation changed a reported primary metric: "
+                f"metric_id={metric_id}, expected={original!r}, observed={echoed!r}")
     return value
 
 

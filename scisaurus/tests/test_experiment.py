@@ -17,7 +17,7 @@ from scisaurus.runtime.experiment import (ExperimentProgramOutputContractError, 
                                           reconcile_model_review_disposition,
                                           _review_repair_directives,
                                           _scoped_review_assessment,
-                                          validate_assessment, validate_deterministic_validation,
+                                          bind_deterministic_validation, validate_assessment, validate_deterministic_validation,
                                           validate_model_review, validate_program_output)
 from scisaurus.runtime.experiment_config import validate_experiment_config
 from scisaurus.runtime.models import ModelCallError
@@ -148,6 +148,22 @@ def disputed_claim_fixture_worker(kind, params, channel):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_validator_echo_binds_numeric_value_without_json_number_spelling(self):
+        experiment = {"primary_outcomes": [{"id": "count"}]}
+        for original, echoed in ((0, 0.0), (0.0, 0), (1, 1.0), (-0.0, 0), (None, None), (10**400, 10**400)):
+            with self.subTest(original=original, echoed=echoed):
+                candidate = {"metrics": [{"id": "count", "value": original}]}
+                verdict = {"metric_recalculations": [{"metric_id": "count", "reported_value": echoed}]}
+                self.assertIs(bind_deterministic_validation(verdict, candidate, experiment), verdict)
+        for original, echoed in ((0, 1), (1, True), (False, 0), (None, 0),
+                                  (0, None), (1, "1"), (2**53 + 1, float(2**53 + 1)),
+                                  (float("inf"), float("inf")), (float("nan"), float("nan"))):
+            with self.subTest(original=original, echoed=echoed):
+                candidate = {"metrics": [{"id": "count", "value": original}]}
+                verdict = {"metric_recalculations": [{"metric_id": "count", "reported_value": echoed}]}
+                with self.assertRaisesRegex(ValidationError, "metric_id=count"):
+                    bind_deterministic_validation(verdict, candidate, experiment)
+
     def test_runner_budget_failure_preserves_typed_fence_into_composer(self):
         from scisaurus.runtime.models import ModelBudgetExceededError
         from scisaurus.runtime.composer import ComposerRunner

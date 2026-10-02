@@ -2500,8 +2500,12 @@ class ComposerWorkflowTests(unittest.TestCase):
             configured = {"grid": [1, 2, 3]}
             document = {"study_id": "study", "revision": 2,
                         "observations": [{"condition": "cell-" + str(i), "x": i} for i in range(480)],
-                        "metrics": [], "assets": [{"data": "excluded"}]}
-            candidate_hash = hashlib.sha256(canonical_bytes(document)).hexdigest()
+                        "metrics": [], "assets": [{"data": "excluded"}],
+                        "analysis": {"comparisons": ["Compare the declared conditions."]}}
+            from scisaurus.runtime.experiment import normalize_program_output
+            candidate = normalize_program_output(deepcopy(document))
+            self.assertNotEqual(candidate["analysis"], document["analysis"])
+            candidate_hash = hashlib.sha256(canonical_bytes(candidate)).hexdigest()
             verdict = {"study_id": "study", "candidate_sha256": candidate_hash,
                        "decision": "rejected", "checks": [{"id": "selection", "outcome": "failed"}]}
             def publish(value):
@@ -2516,7 +2520,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                          "stdout_sha256": publish(document)},
                         {"operation": "validator_recalculation", "mode": "sandbox-exec", "returncode": 0,
                          "timed_out": False, "truncated": False, "program_sha256": publish("validator"),
-                         "stdin_sha256": publish(experiment_validation_payload(intent, configured, document, candidate_hash)),
+                         "stdin_sha256": publish(experiment_validation_payload(intent, configured, candidate, candidate_hash)),
                          "stdout_sha256": publish(verdict)}]}
             evidence = runner._foundry_execution_evidence(work)
             self.assertTrue(evidence["available"], evidence)

@@ -9802,6 +9802,7 @@ class ComposerRunner:
     def _foundry_execution_evidence(self, work):
         """Hydrate failed execution evidence only from hash-bound sandbox records."""
         from scisaurus.runtime.capability_registry import experiment_program_payload, experiment_validation_payload
+        from scisaurus.runtime.experiment import normalize_program_output
         unavailable = {"available": False, "admissible_as_verified_claims": False}
         attempt = work.get("last_attempt") if isinstance(work, dict) else None
         records = work.get("sandbox_executions") if isinstance(work, dict) else None
@@ -9844,7 +9845,8 @@ class ComposerRunner:
             observations = document.get("observations")
             if not isinstance(observations, list) or any(not isinstance(row, dict) for row in observations):
                 raise ValidationError("Recorded executor observations are not a row collection")
-            candidate_hash = hashlib.sha256(canonical_bytes(document)).hexdigest()
+            candidate = normalize_program_output(deepcopy(document))
+            candidate_hash = hashlib.sha256(canonical_bytes(candidate)).hexdigest()
             validator = None
             verdict = None
             for record in reversed(records):
@@ -9857,7 +9859,7 @@ class ComposerRunner:
                 if payload.get("candidate_sha256") != candidate_hash:
                     continue
                 if canonical_bytes(payload) != canonical_bytes(experiment_validation_payload(
-                        intent, configured, document, candidate_hash)):
+                        intent, configured, candidate, candidate_hash)):
                     raise ValidationError("Recorded validator input does not bind the exact executor result")
                 if read_object(record["program_sha256"]).decode() != attempt["validator_source"]:
                     raise ValidationError("Recorded validator differs from the failed validator source")
@@ -9887,7 +9889,10 @@ class ComposerRunner:
                 if numeric and len(numeric) == len(values):
                     summary.update(minimum=min(numeric), maximum=max(numeric))
                 columns[name] = summary
-            identity = {"candidate_sha256": candidate_hash, "sources": source_hashes,
+            identity = {"candidate_sha256": candidate_hash,
+                        "raw_document_sha256": hashlib.sha256(canonical_bytes(document)).hexdigest(),
+                        "candidate_normalization": "shared_program_output_normalization",
+                        "sources": source_hashes,
                         "executor": {key: executor.get(key) for key in (
                             "operation", "mode", "stdin_sha256", "stdout_sha256", "stderr_sha256")},
                         "validator": {key: validator.get(key) for key in (
