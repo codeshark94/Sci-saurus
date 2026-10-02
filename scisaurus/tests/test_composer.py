@@ -549,6 +549,19 @@ class ComposerWorkflowTests(unittest.TestCase):
             **runner._stage_assignment_fields(plan, finished))
         return runner, stage, run
 
+    def test_active_producer_resumes_before_previous_review_revalidation(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner, stage, run = self._owned_held_survey_review(Path(path))
+            output = Path(runner.context[stage['id']]['output_path'])
+            output.write_bytes(canonical_bytes({**run, 'status': 'running', 'run_id': 'new-producer'}))
+            for status in ('running', 'retrying'):
+                with self.subTest(status=status):
+                    runner.stage_records[stage['id']]['status'] = status
+                    self.assertIsNone(runner._stage_review_revalidation_input(stage))
+            runner.stage_records[stage['id']]['status'] = 'candidate_needs_review'
+            with self.assertRaisesRegex(StateError, 'exact current completed producer'):
+                runner._stage_review_revalidation_input(stage)
+
     def test_survey_review_revalidation_resumes_only_paid_review_and_settles_boundary(self):
         with tempfile.TemporaryDirectory() as path:
             runner, stage, native = self._owned_held_survey_review(Path(path))

@@ -7572,6 +7572,13 @@ class ComposerRunner:
 
     def _stage_review_revalidation_input(self, stage):
         """Replay owned production and peer evidence for a changed verifier contract."""
+        record = self.stage_records.get(stage["id"], {})
+        if record.get("status") in {"running", "retrying"}:
+            task = self.tasks.get(record["task_id"]) if record.get("task_id") else {}
+            admission_ref = record.get("review_revalidation_admission_ref")
+            if (task.get("kind") != "review" or not isinstance(admission_ref, str)
+                    or task.get("payload", {}).get("admission_ref") != admission_ref):
+                return None
         context = self.context.get(stage["id"], {})
         verifier = context.get("specialist_verifier") or {}
         ref = verifier.get("artifact_ref")
