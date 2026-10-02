@@ -38,7 +38,7 @@ from scisaurus.runtime.operation_adapters import get_adapter
 from scisaurus.runtime.scores import exact, identifier
 from scisaurus.runtime.survey_config import validate_survey_config, search_query
 from scisaurus.runtime.survey_records import (
-    MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, CRITIQUE_DISPOSITIONS, normalize_check_envelope,
+    FOLLOW_UP_COMPLETION_CONTRACT, MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, CRITIQUE_DISPOSITIONS, normalize_check_envelope,
     BODY_SECTION_MARKERS, authoritative_source, has_section_heading as _has_section_heading,
     normalize_gap_assessment_envelope, validate_map,
     validate_survey_review, validate_assessment, validate_work_review, survey_review_response_contract,
@@ -741,12 +741,14 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "survey_ref": self.survey_ref, **self.nomination},
                 "research.gap-proposer", subjects=[self.survey_ref])
 
-    def _validate_follow_up_result(self, value, *, sources=None, work_orders=None, record_inventory=None):
+    def _validate_follow_up_result(self, value, *, sources=None, work_orders=None, record_inventory=None,
+                                   require_completion=False):
         from scisaurus.runtime.survey_records import validate_follow_up_result
         displayed = self._assessment_source_context() if sources is None else sources
         windows = {source["source_ref"]: source["window"] for source in displayed}
         validate_follow_up_result(value, self.work_orders if work_orders is None else work_orders, self.source_docs,
-                                  self._follow_up_query_refs(), windows=windows, record_inventory=record_inventory)
+                                  self._follow_up_query_refs(), windows=windows, record_inventory=record_inventory,
+                                  require_completion=require_completion)
         _, survey = self.gate._note(self.survey_ref)
         works = {}
         for ref in survey["work_refs"]:
@@ -817,6 +819,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         sources = self._assessment_source_context()
         assignment = {
             "phase": "survey_follow_up", "question": self.score["question"],
+            "completion_contract": FOLLOW_UP_COMPLETION_CONTRACT,
             "survey_ref": self.survey_ref, "assessment_ref": self.assessment_ref,
             "assessment": {key: self._body(self.store.get(self.assessment_ref)).get(key)
                            for key in ("state", "rationale", "checks")},
@@ -827,8 +830,16 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                          for ref, row in zip(self.query_refs, self.search_log)
                          if ref in self._follow_up_query_refs()],
             "instructions": (
-                "Return {orders:[{id,status,rationale,evidence:[{work_id,source_ref,quote}],query_refs,limitation,next_action}]}. "
+                "Return {orders:[{id,status,rationale,evidence:[{work_id,source_ref,quote}],query_refs,limitation,next_action,"
+                "completion:{outcome:met|unmet,rationale:string}}]}. "
                 "Account for each assigned order exactly once against its success condition. "
+                "completion evaluates that exact success condition separately from scientific evidence status. "
+                "Honor its alternatives and scope: if it explicitly permits recording an input as unavailable, "
+                "a source-backed availability record can meet that operation while the scientific input remains "
+                "unresolved. If it requires capturing a value or executing a measurement, unavailable evidence "
+                "does not meet it. Explain each requested deliverable and any permitted unavailable outcome in "
+                "completion.rationale. Do not replace the stated acceptance rule with a stricter requirement "
+                "or treat completion as evidence of novelty, experimental readiness or a resolved research question. "
                 "resolved requires captured quotations supporting fulfillment; limited requires a bounded recorded "
                 "search, an explicit remaining evidence limitation, "
                 "and a justified next scientific action. Optional record_evidence is a list of exact work_ref "
@@ -843,7 +854,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "record or an absent map entry. These records establish current survey membership, not "
                 "what an earlier topic projection contained or a scientific claim from an unread source. "
                 "An insufficient gap assessment never establishes novelty or fulfills a measurement request by itself. "
-                "Return all seven fields for the single assigned order, including empty evidence/query_refs lists "
+                "Return all eight fields for the single assigned order, including empty evidence/query_refs lists "
                 "and an empty limitation string when appropriate. Keep rationale and next_action concise.")}
         limit = self._map_input_limit("methods.evidence-verifier")
         orders, executions = [], []
@@ -863,7 +874,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             value, execution = self._model_checked(
                 f"follow-up-disposition-{identity}", "methods.evidence-verifier", scoped,
                 lambda value: self._validate_follow_up_result(value, sources=displayed, work_orders=[order],
-                                                             record_inventory=scoped["survey_inventory"]),
+                                                             record_inventory=scoped["survey_inventory"],
+                                                             require_completion=True),
                 normalizer=self._normalize_follow_up_result, normalizer_uses_assignment=True,
                 stage="supervision", task_kind="review")
             orders.extend(value["orders"])

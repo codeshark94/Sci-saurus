@@ -252,12 +252,20 @@ def simulated_survey_worker(kind, params, channel):
             "evidence": [], "query_refs": assignment["query_refs"],
             "limitation": "The configured sources lack the requested measurement.",
             "next_action": "Keep the measurement claim provisional and narrow the study.",
+            "completion": {"outcome": "met", "rationale": "The bounded negative search is recorded as allowed."},
         } for order in assignment["work_orders"]]}
+        if mode == "follow-up-capture-required":
+            for row in value["orders"]:
+                row["completion"] = {"outcome": "unmet", "rationale": "The required numeric capture is absent."}
+        if mode == "follow-up-missing-completion":
+            for row in value["orders"]:
+                row.pop("completion")
         if mode in {"follow-up-records", "follow-up-records-only"}:
             for row in value["orders"]:
                 if mode == "follow-up-records-only":
                     row["query_refs"] = []
                     row["status"] = "unresolved"
+                    row["completion"] = {"outcome": "unmet", "rationale": "The required earlier projection remains absent."}
                 row["record_evidence"] = [assignment["survey_inventory"]["works"][0]["work_ref"]]
                 row["rationale"] = "Current catalog membership is established by the pinned record."
                 row["limitation"] = "The earlier upstream projection is not captured."
@@ -1739,6 +1747,51 @@ class TestSurveyRunner(unittest.TestCase):
                 SurveyGate(control, store).require_successful_follow_up_search(
                     forged_summary["artifact_ref"], {"query_refs": [forged_summary["artifact_ref"]]},
                     result["follow_up_ref"])
+
+    def test_capture_required_follow_up_does_not_close_on_unavailable_evidence(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        order = {**self.follow_up_order(), "success_condition": "Capture the numeric measurement with units."}
+        runner = self.runtime(survey_config(self.endpoint, "follow-up-capture-required"), work_orders=[order])
+        result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertTrue(ComposerRunner._survey_follow_up_was_replayed(self.root / "run", result, order))
+        self.assertEqual(result["follow_up_result"]["orders"][0]["completion"]["outcome"], "unmet")
+        self.assertFalse(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, order))
+
+    def test_modern_disposition_replay_rejects_missing_completion(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        order = self.follow_up_order()
+        runner = self.runtime(survey_config(self.endpoint, "follow-up-missing-completion"), work_orders=[order])
+        original = runner._validate_follow_up_result
+        def legacy_validation(value, **kwargs):
+            kwargs["require_completion"] = False
+            return original(value, **kwargs)
+        with patch.object(runner, "_validate_follow_up_result", side_effect=legacy_validation):
+            result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertNotIn("completion", result["follow_up_result"]["orders"][0])
+        self.assertFalse(ComposerRunner._survey_follow_up_was_replayed(self.root / "run", result, order))
+        self.assertFalse(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, order))
+
+    def test_legacy_disposition_replay_preserves_prior_status_semantics(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        order = self.follow_up_order()
+        runner = self.runtime(survey_config(self.endpoint, "follow-up-missing-completion"), work_orders=[order])
+        original_validate = runner._validate_follow_up_result
+        original_assignment = runner._follow_up_assignment
+        def legacy_validation(value, **kwargs):
+            kwargs["require_completion"] = False
+            return original_validate(value, **kwargs)
+        def legacy_assignment(assignment):
+            value = original_assignment(assignment)
+            value.pop("completion_contract", None)
+            return value
+        with patch.object(runner, "_validate_follow_up_result", side_effect=legacy_validation), \
+             patch.object(runner, "_follow_up_assignment", side_effect=legacy_assignment):
+            result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertTrue(ComposerRunner._survey_follow_up_was_replayed(self.root / "run", result, order))
+        self.assertTrue(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, order))
 
     def test_follow_up_resume_keeps_completed_analysis_with_unchanged_claims(self):
         config = survey_config(self.endpoint)
@@ -5506,6 +5559,38 @@ class TestSurveyRunner(unittest.TestCase):
 
 
 class TestSurveyContracts(unittest.TestCase):
+    def test_operation_completion_is_separate_from_evidence_sufficiency(self):
+        from scisaurus.runtime.survey_records import validate_follow_up_result, follow_up_completion_met
+        from scisaurus.core.errors import ModelContractError
+        order = {"id": "inputs", "success_condition": "Capture the value or record it as unavailable."}
+        row = {"id": "inputs", "status": "unresolved", "rationale": "No captured measurement.",
+               "evidence": [], "query_refs": ["query-1"], "limitation": "The measurement is unavailable.",
+               "next_action": "Design a measurement.",
+               "completion": {"outcome": "met", "rationale": "The permitted unavailable outcome is recorded."}}
+        def validate(item, *, required=True):
+            return validate_follow_up_result({"orders": [item]}, [order], {}, ["query-1"],
+                                             windows={}, require_completion=required)
+        validate(row)
+        self.assertTrue(follow_up_completion_met(row, require_resolved=True))
+        self.assertEqual(row["status"], "unresolved")
+        unmet = {**row, "status": "limited", "completion": {
+            "outcome": "unmet", "rationale": "A capture-required measurement is still missing."}}
+        validate(unmet)
+        self.assertFalse(follow_up_completion_met(unmet))
+        legacy = {key: value for key, value in unmet.items() if key != "completion"}
+        validate(legacy, required=False)
+        self.assertTrue(follow_up_completion_met(legacy))
+        self.assertFalse(follow_up_completion_met(legacy, require_resolved=True))
+        with self.assertRaises(ModelContractError):
+            validate(legacy)
+        for outcome in ([], {}, None, True, "unknown", ""):
+            with self.subTest(outcome=outcome), self.assertRaises(ModelContractError):
+                validate({**row, "completion": {"outcome": outcome, "rationale": "Invalid outcome."}})
+        for changes in ({"query_refs": []}, {"limitation": ""}, {"query_refs": ["foreign-query"]},
+                        {"completion": {"outcome": "met", "rationale": ""}}):
+            with self.subTest(changes=changes), self.assertRaises(ModelContractError):
+                validate({**row, **changes})
+
     def test_nomination_identifier_normalization_preserves_the_hypothesis(self):
         statement = "A bounded model comparison remains unresolved."
         for label in ("Gap With Spaces", "field_0to1T", "x" * 100, "123"):

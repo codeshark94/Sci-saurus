@@ -12,6 +12,8 @@ from scisaurus.core.source_spans import validate as validate_source_span
 from scisaurus.core.schema import canonical_bytes
 
 
+FOLLOW_UP_COMPLETION_CONTRACT = "survey-operation-completion-1"
+
 MAP_FIELDS = ("problem", "approach", "finding", "limitations")
 SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
 GAP_CHECKS = ("closest-prior-work", "scope-comparability", "counterevidence", "full-text-support")
@@ -645,7 +647,16 @@ def project_follow_up_inventory(inventory, order):
             "projection_scope": "named_records" if named else "catalog", "works": named or inventory["works"]}
 
 
-def validate_follow_up_result(value, work_orders, sources, query_refs, *, windows, record_inventory=None):
+def follow_up_completion_met(row, *, require_resolved=False):
+    """Operation acceptance is independent of the remaining scientific evidence."""
+    completion = row.get("completion")
+    if isinstance(completion, dict):
+        return completion.get("outcome") == "met"
+    return row.get("status") == "resolved" if require_resolved else row.get("status") in {"resolved", "limited"}
+
+
+def validate_follow_up_result(value, work_orders, sources, query_refs, *, windows, record_inventory=None,
+                              require_completion=False):
     def response_exact(value, fields, name):
         try:
             exact(value, fields, name)
@@ -665,7 +676,8 @@ def validate_follow_up_result(value, work_orders, sources, query_refs, *, window
     expected, seen = {order["id"] for order in work_orders}, set()
     for row in rows:
         response_exact(row, {"id", "status", "rationale", "evidence", "query_refs", "limitation", "next_action"}
-                       | ({"record_evidence"} if "record_evidence" in row else set()),
+                       | ({"record_evidence"} if "record_evidence" in row else set())
+                       | ({"completion"} if require_completion or "completion" in row else set()),
               "survey follow-up disposition")
         response_text(row["id"], "survey follow-up order ID")
         response_text(row["status"], "survey follow-up status")
@@ -704,6 +716,18 @@ def validate_follow_up_result(value, work_orders, sources, query_refs, *, window
         if row["status"] == "limited" and (not row["query_refs"] or not row["limitation"].strip()):
             raise ModelContractError("limited survey follow-up requires targeted searches and an explicit limitation; "
                                      "record-only provenance must remain unresolved")
+        if "completion" in row:
+            completion = row["completion"]
+            response_exact(completion, {"outcome", "rationale"}, "survey follow-up completion")
+            response_text(completion["outcome"], "survey follow-up completion outcome")
+            if completion["outcome"] not in {"met", "unmet"}:
+                raise ModelContractError("survey follow-up completion outcome must be met or unmet")
+            response_text(completion["rationale"], "survey follow-up completion rationale")
+            if completion["outcome"] == "met":
+                if not (row["evidence"] or record_refs or row["query_refs"]):
+                    raise ModelContractError("completed survey work requires recorded source, inventory or search provenance")
+                if row["status"] != "resolved" and not row["limitation"].strip():
+                    raise ModelContractError("completed work with unresolved evidence must retain an explicit limitation")
 
 
 def statement(value, sources, *, work_id=None, require_spans=False):

@@ -172,6 +172,16 @@ class ComposerWorkflowTests(unittest.TestCase):
                 self.assertFalse(runner._topic_review_obligation_is_closed(source, limited, request))
                 resolved = {**completed, "follow_up_result": {"orders": [{"id": request["id"], "status": "resolved"}]}}
                 self.assertEqual(runner._gate_free_topic_survey(resolved, stage=source), resolved)
+                unavailable = {**completed, "gap_state": "insufficient_evidence", "follow_up_result": {"orders": [{
+                    "id": request["id"], "status": "unresolved", "completion": {
+                        "outcome": "met", "rationale": "The explicitly allowed unavailability was recorded."}}]}}
+                self.assertTrue(runner._topic_review_obligation_is_closed(source, unavailable, request))
+                self.assertEqual(unavailable["gap_state"], "insufficient_evidence")
+                missing = deepcopy(resolved)
+                missing["follow_up_result"]["orders"][0]["completion"] = {
+                    "outcome": "unmet", "rationale": "Required numeric input is missing."}
+                self.assertFalse(runner._topic_review_obligation_is_closed(source, missing, request))
+
             runner.context["survey"] = limited
             with self.assertRaisesRegex(ModelWorkBlocked, "topic review obligations"):
                 runner._require_capability_evidence_before_authoring(experiment, runner.context["topic"], {})

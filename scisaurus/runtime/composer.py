@@ -7356,13 +7356,14 @@ class ComposerRunner:
         return requests
 
     def _topic_review_obligation_is_closed(self, stage, result, obligation, *, require_independent=False):
-        """A limited search is retained evidence, not closure of an admission debt."""
+        """Replay exact operation acceptance independently of evidence sufficiency."""
+        from scisaurus.runtime.survey_records import follow_up_completion_met
         rows = (result.get("follow_up_result") or {}).get("orders", [])
         project = self.stage_records.get(stage["id"], {}).get("project_dir") or result.get("project_dir") or stage["project_dir"]
         record = self.stage_records.get(stage["id"], {})
         return ((not require_independent or self._survey_attempt_was_accepted(stage["id"], record, result))
                 and any(isinstance(row, dict) and row.get("id") == obligation["id"]
-                    and row.get("status") == "resolved" for row in rows)
+                    and follow_up_completion_met(row, require_resolved=True) for row in rows)
                 and self._survey_work_order_was_fulfilled(project, result, obligation))
 
     def _topic_review_revalidation_input(self, stage):
@@ -17405,8 +17406,9 @@ class ComposerRunner:
 
     @staticmethod
     def _survey_work_order_was_fulfilled(project_dir, run, request):
+        from scisaurus.runtime.survey_records import follow_up_completion_met
         return (ComposerRunner._survey_follow_up_was_replayed(project_dir, run, request)
-                and any(row.get("id") == request.get("id") and row.get("status") in {"resolved", "limited"}
+                and any(row.get("id") == request.get("id") and follow_up_completion_met(row)
                         for row in run["follow_up_result"]["orders"]))
 
     @staticmethod
@@ -17415,8 +17417,8 @@ class ComposerRunner:
         from scisaurus.core.surveys import SurveyGate
         from scisaurus.runtime.models import ModelResult
         from scisaurus.runtime.survey import acquisition_succeeded
-        from scisaurus.runtime.survey_records import (follow_up_inventory, project_follow_up_inventory,
-                                                      validate_follow_up_result)
+        from scisaurus.runtime.survey_records import (FOLLOW_UP_COMPLETION_CONTRACT, follow_up_inventory,
+                                                      project_follow_up_inventory, validate_follow_up_result)
         result = run.get("follow_up_result")
         if (not isinstance(result, dict) or not isinstance(result.get("ref"), str)
                 or any(not isinstance(run.get(key), str) for key in ("survey_ref", "assessment_ref"))):
@@ -17460,6 +17462,9 @@ class ComposerRunner:
                     execution, _, execution_body, model_params = gate._recorded_execution(
                         execution_ref, "methods.evidence-verifier", operation="model", task_kinds={"review"})
                     assignment = json.loads(model_params["prompt"])
+                    completion_contract = assignment.get("completion_contract")
+                    if completion_contract not in (None, FOLLOW_UP_COMPLETION_CONTRACT):
+                        return False
                     assigned = assignment.get("work_orders")
                     if (execution.get("author") != "methods.evidence-verifier"
                             or execution_ref not in {item["ref"] for item in record["inputs"]}
@@ -17492,7 +17497,8 @@ class ComposerRunner:
                                 follow_up_inventory(store, run["survey_ref"]), assigned[0])):
                             return False
                     validate_follow_up_result(response, assigned, sources, query_refs, windows=windows,
-                                              record_inventory=record_inventory)
+                                              record_inventory=record_inventory,
+                                              require_completion=completion_contract == FOLLOW_UP_COMPLETION_CONTRACT)
                     for row in response["orders"]:
                         if row["id"] in checked:
                             return False
