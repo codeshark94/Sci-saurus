@@ -4198,6 +4198,13 @@ class IndependentValidatorAuthorshipTests(unittest.TestCase):
                 self.assertNotIn('metrics', packet)
                 self.assertNotIn('findings', packet)
                 self.assertEqual(packet['observation_schema'][0]['replicate'], 'int')
+                expected = candidate_prompt("schema", [], {})['executor_output_exact_shapes']
+                self.assertEqual(packet['candidate_output_exact_shapes'], expected)
+                metrics = packet['candidate_output_exact_shapes']['metrics']
+                self.assertIsInstance(metrics, list)
+                self.assertEqual(set(metrics[0]), {'id', 'value', 'unit', 'conditions', 'source', 'presentation'})
+                self.assertIn("only for reported_value", packet['instructions'])
+                self.assertNotIn('recalculated_value', json.dumps(packet['candidate_output_exact_shapes']))
                 return original(system=system, prompt=prompt)
             independent.complete = complete
             reviewer = foundry.reviewer_client
