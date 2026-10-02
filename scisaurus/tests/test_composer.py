@@ -9015,9 +9015,9 @@ class ComposerWorkflowTests(unittest.TestCase):
                     self.assertNotIn("topic_pivot", runner.context["topic"])
                     self.assertIn("topic_pivot", runner.context["topic"]["deferred_topic_state"])
                     self.assertIn("topic", completed)
-                    self.assertNotIn("survey", completed)
+                    self.assertIn("survey", completed)
                     survey_context = runner.context["survey"]
-                    self.assertEqual(survey_context["status"], "pending")
+                    self.assertEqual(survey_context["status"], "completed")
                     self.assertEqual(survey_context["topic_lineage"], {
                         "topic_id": topic_id, "topic_cycle": topic_cycle,
                     })
@@ -9028,25 +9028,21 @@ class ComposerWorkflowTests(unittest.TestCase):
                     self.assertEqual(survey_record["assessment_ref"],
                                      assessment_manifest["artifact_ref"])
                     request = runner.active_research_requests[0]
-                    self.assertEqual(request["kind"], "literature_expansion")
-                    self.assertEqual(request["owner"], "research.intelligence")
-                    self.assertEqual(request["target_stage_id"], "survey")
+                    self.assertEqual(request["kind"], "additional_experiment")
+                    self.assertEqual(request["owner"], "methods.validation")
+                    self.assertEqual(request["target_stage_id"], "experiment")
                     self.assertEqual(request["topic_id"], topic_id)
                     self.assertEqual(request["topic_cycle"], topic_cycle)
-                    self.assertEqual(request["source_survey_ref"],
-                                     survey_manifest["artifact_ref"])
-                    self.assertEqual(request["source_assessment_ref"],
-                                     assessment_manifest["artifact_ref"])
                     self.assertEqual(
                         runner.context["experiment"]["failure_recovery"]["recovery_mode"],
-                        "survey_evidence_before_experiment_repair")
+                        "experiment_diagnose_patch_execute_recalculate")
                     self.assertEqual(runner.reopened_stage_ids,
-                                     {"survey", "experiment", "interpretation", "argument", "paper"})
+                                     {"experiment", "interpretation", "argument", "paper"})
                     self.assertEqual(runner.context["paper"]["topic_lineage"], {
                         "topic_id": topic_id, "topic_cycle": topic_cycle,
                     })
                     self.assertTrue(any(
-                        item.get("action") == "restore_verified_frontier_and_acquire_survey_evidence"
+                        item.get("action") == "restore_verified_frontier_and_repair_experiment"
                         for item in runner.department_activity
                     ))
 
@@ -9705,10 +9701,136 @@ class ComposerWorkflowTests(unittest.TestCase):
                     patch.object(runner, '_request_context_matches_current_topic', return_value=True), \
                     patch.object(runner, '_topic_stage_for_survey', return_value={'id': 'topic'}), \
                     patch.object(runner, '_current_topic_identity', return_value=identity):
-                self.assertIsNone(runner._route_unexecuted_experiment_to_survey(
-                    stage, context, 'Validator output violates its response contract.'))
+                for finding in ['Validator output violates its response contract.',
+                                'Specify window-center attribution in the frozen estimand.',
+                                'An executor and validator must use the same configured input.']:
+                    self.assertIsNone(runner._route_unexecuted_experiment_to_survey(
+                        stage, context, finding, reviewer_evidence=[finding]))
             self.assertEqual(runner.active_research_requests, [])
             self.assertEqual(context, {'results_status': 'not_executed'})
+
+    def test_misclassified_source_route_restores_methods_and_preserves_owned_evidence(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            stage = runner.workflow['stages'][1]
+            error = 'Replacement capability withheld: Methods requires a revised frozen estimand.'
+            dossier = runner._publish('command/composer/failure-recovery/experiment/attempt-3', 'note', {
+                'stage_id': 'experiment', 'stage_kind': 'experiment', 'failure_class': 'experiment_failure',
+                'attempt_number': 3, 'input_sha256': 'a' * 64, 'error': error,
+            }, 'command.composer')
+            auto = {'id': 'source-route', 'kind': 'literature_expansion', 'owner': 'research.intelligence',
+                    'source_stage_id': 'survey', 'target_stage_id': 'survey', 'target_stage_kind': 'survey',
+                    'topic_id': 'topic-1', 'topic_cycle': 0,
+                    'recovery_mode': 'survey_evidence_before_experiment_repair', 'repair_policy_revision': 1,
+                    'objective': 'Acquire source data.', 'why': 'Prior automatic classification.',
+                    'success_condition': 'Source rows or a bounded negative result.', 'evidence_needed': 'Source rows.'}
+            unrelated = {'id': 'survey-review-repair', 'kind': 'recovery', 'owner': 'research.intelligence',
+                         'target_stage_id': 'survey', 'target_stage_kind': 'survey',
+                         'objective': 'Repair the retained review.', 'why': 'A malformed review response.',
+                         'success_condition': 'The scoped review succeeds.', 'evidence_needed': 'Retained sources.'}
+            panel = {'decision': 'hold', 'reports': [], 'dispatch_usage': {'model_calls': 8},
+                     'usage_invoice_ref': 'artifact:invoice@1',
+                     'verifier': {'required_revisions': ['Bind window-center in the frozen definition.'],
+                                  'blocking_findings': ['The declared estimand is ambiguous.']}}
+            runner.context['experiment'] = {
+                'stage_id': 'experiment', 'kind': 'experiment', 'error': error,
+                'results_status': 'not_executed', 'failure_dossier_ref': dossier['artifact_ref'],
+                'failure_recovery': {'dossier_ref': dossier['artifact_ref'], 'failure_class': 'experiment_failure',
+                    'attempt_number': 3, 'input_sha256': 'a' * 64,
+                    'recovery_mode': 'survey_evidence_before_experiment_repair'},
+                'survey_evidence_expansion_history': [{'request_id': auto['id'], 'topic_id': 'topic-1', 'topic_cycle': 0}],
+                'deferred_experiment_repair': {'capability_repair_panel': deepcopy(panel)},
+                'research_requests': [auto],
+            }
+            runner.context['survey'] = {'research_requests': [auto, unrelated]}
+            runner.active_research_requests = [auto, unrelated]
+            runner.stage_records['experiment'] = {'attempts': [{'attempt_id': 'unknown-1',
+                'attempt_number': 1, 'state': 'unknown', 'project_dir': str(Path(path) / 'missing')}]}
+            runner.context['topic'] = {'topic': {'id': 'topic-1'}}
+            self.enterContext(patch.object(runner, '_current_topic_identity',
+                return_value={'topic_id': 'topic-1', 'topic_cycle': 0}))
+            deadline = runner.deadline_epoch
+            by_id = {item['id']: item for item in runner.workflow['stages']}
+            baseline_context = deepcopy(runner.context)
+            baseline_active = deepcopy(runner.active_research_requests)
+            for boundary in ('foreign_cycle', 'other_experiment', 'executed', 'existing_methods'):
+                runner.context = deepcopy(baseline_context)
+                runner.active_research_requests = deepcopy(baseline_active)
+                if boundary == 'foreign_cycle':
+                    for order in runner.active_research_requests:
+                        if order['id'] == auto['id']:
+                            order['topic_cycle'] = 1
+                    runner.context['experiment']['research_requests'] = []
+                    runner.context['survey']['research_requests'][0]['topic_cycle'] = 1
+                    self.assertEqual(runner._reconcile_experiment_survey_evidence_routes(by_id), [])
+                    self.assertEqual(len(runner.active_research_requests), 2)
+                elif boundary == 'other_experiment':
+                    by_id['experiment-other'] = {**stage, 'id': 'experiment-other'}
+                    runner.context['experiment-other'] = {
+                        'survey_evidence_expansion_history': deepcopy(
+                            baseline_context['experiment']['survey_evidence_expansion_history'])}
+                    self.assertEqual(runner._reconcile_experiment_survey_evidence_routes(by_id), [])
+                    self.assertEqual(runner.active_research_requests, baseline_active)
+                    by_id.pop('experiment-other')
+                elif boundary == 'executed':
+                    runner.context['experiment']['results_status'] = 'succeeded'
+                    before = deepcopy(runner.context)
+                    self.assertEqual(runner._reconcile_experiment_survey_evidence_routes(by_id), [])
+                    self.assertEqual(runner.context, before)
+                else:
+                    current = runner._autonomous_experiment_repair_request(stage,
+                        runner.context['experiment'], error, 0)
+                    runner.active_research_requests.append(deepcopy(current))
+                    count = runner.context['experiment']['capability_repair_attempts']
+                    runner._reconcile_experiment_survey_evidence_routes(by_id)
+                    methods = [item for item in runner.active_research_requests
+                        if item['kind'] == 'additional_experiment']
+                    self.assertEqual(methods, [current])
+                    self.assertEqual(runner.context['experiment']['capability_repair_attempts'], count)
+            runner.context = deepcopy(baseline_context)
+            runner.active_research_requests = deepcopy(baseline_active)
+            runner._attempted_request_signatures.clear()
+            repaired = runner._reconcile_experiment_survey_evidence_routes(by_id)
+            self.assertEqual(repaired[0]['action'], 'restore_methods_repair_after_source_route_misclassification')
+            methods = next(item for item in runner.active_research_requests if item['kind'] == 'additional_experiment')
+            self.assertEqual(methods['target_stage_id'], 'experiment')
+            self.assertEqual(runner.context['experiment']['capability_repair_panel'], panel)
+            self.assertEqual(runner.context['survey']['research_requests'], [unrelated])
+            self.assertIn(unrelated, runner.active_research_requests)
+            self.assertNotIn(auto, runner.active_research_requests)
+            self.assertIn(runner._research_request_signature(auto), runner._attempted_request_signatures)
+            self.assertEqual(runner.stage_records['experiment']['attempts'][0]['state'], 'unknown')
+            self.assertEqual(runner.deadline_epoch, deadline)
+            self.assertEqual(runner._reconcile_experiment_survey_evidence_routes(by_id), [])
+
+    def test_durable_source_routing_requires_the_exact_owned_failure_dossier(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            stage = runner.workflow['stages'][1]
+            dossier = runner._publish('command/composer/failure-recovery/experiment/attempt-3', 'note', {
+                'stage_id': 'experiment', 'stage_kind': 'experiment', 'failure_class': 'evidence_input_unavailable',
+                'attempt_number': 3, 'input_sha256': 'a' * 64, 'error': 'Required source rows are absent.',
+            }, 'command.composer')
+            context = {'error': 'Required source rows are absent.', 'failure_dossier_ref': dossier['artifact_ref'],
+                       'failure_recovery': {'dossier_ref': dossier['artifact_ref'],
+                           'failure_class': 'evidence_input_unavailable', 'input_sha256': 'a' * 64, 'attempt_number': 3}}
+            self.assertEqual(runner._current_experiment_failure_class(stage, context), 'evidence_input_unavailable')
+            for key, value in [('attempt_number', 4), ('input_sha256', 'b' * 64), ('failure_class', 'experiment_failure')]:
+                changed = deepcopy(context); changed['failure_recovery'][key] = value
+                self.assertIsNone(runner._current_experiment_failure_class(stage, changed))
+            long_error = 'x' * 5000
+            long_dossier = runner._publish('command/composer/failure-recovery/experiment/attempt-4', 'note', {
+                'stage_id': 'experiment', 'stage_kind': 'experiment', 'failure_class': 'experiment_failure',
+                'attempt_number': 4, 'input_sha256': 'b' * 64, 'error': long_error,
+            }, 'command.composer')
+            long_context = {'error': long_error[:4096], 'failure_dossier_ref': long_dossier['artifact_ref'],
+                'failure_recovery': {'dossier_ref': long_dossier['artifact_ref'],
+                    'failure_class': 'experiment_failure', 'input_sha256': 'b' * 64, 'attempt_number': 4}}
+            self.assertEqual(runner._current_experiment_failure_class(stage, long_context), 'experiment_failure')
+            changed = deepcopy(context); changed['error'] = 'A different failure.'
+            self.assertIsNone(runner._current_experiment_failure_class(stage, changed))
 
     def test_unexecuted_exploratory_pilot_repairs_survey_before_methods_code(self):
         with tempfile.TemporaryDirectory() as path:
@@ -9799,8 +9921,7 @@ class ComposerWorkflowTests(unittest.TestCase):
 
                 request = runner._autonomous_experiment_repair_request(
                     stage, context,
-                    "Unchanged experiment input failed: capability foundry did not admit a program: "
-                    "work order requires its routing, objective, success and evidence fields",
+                    SourceDataUnavailable("Required source rows are absent."),
                     4)
 
                 self.assertEqual(request["kind"], "literature_expansion")
@@ -9916,6 +10037,14 @@ class ComposerWorkflowTests(unittest.TestCase):
                     "experiment_repair_plan": {"review_evidence": [
                         "The survey packet lacks comparable down-sweep measurements."]},
                 }
+                failure = runner._publish('command/composer/failure-recovery/experiment/attempt-3', 'note', {
+                    'stage_id': 'experiment', 'stage_kind': 'experiment', 'failure_class': 'evidence_input_unavailable',
+                    'attempt_number': 3, 'input_sha256': 'a' * 64, 'error': 'The experiment was not admitted.',
+                }, 'command.composer')
+                runner.context['experiment']['failure_dossier_ref'] = failure['artifact_ref']
+                runner.context['experiment']['failure_recovery'].update({
+                    'dossier_ref': failure['artifact_ref'], 'failure_class': 'evidence_input_unavailable',
+                    'input_sha256': 'a' * 64, 'attempt_number': 3})
                 runner.active_research_requests = [old_order]
                 runner._attempted_request_signatures.add(
                     ComposerRunner._research_request_signature({
@@ -10127,7 +10256,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                         patch.object(runner, "_current_topic_identity", return_value=identity), \
                         patch.object(runner, "_survey_acquisition_frontier_for_topic", return_value=frontier), \
                         patch.object(runner, "_survey_work_order_was_fulfilled", return_value=True):
-                    self.assertIsNone(runner._route_unexecuted_experiment_to_survey(stage, context, "Estimator failed."))
+                    self.assertIsNone(runner._route_unexecuted_experiment_to_survey(stage, context, SourceDataUnavailable("Required source rows are absent.")))
                 older = {**order, "success_condition": "Acquire a different measurement."}
                 runner.active_research_requests = []
                 runner.context["survey"]["research_requests"] = [older]
@@ -10144,13 +10273,13 @@ class ComposerWorkflowTests(unittest.TestCase):
                         patch.object(runner, "_survey_acquisition_frontier_for_topic", side_effect=exact_frontier), \
                         patch.object(runner, "_survey_work_order_was_fulfilled", return_value=True):
                     self.assertIsNone(runner._route_unexecuted_experiment_to_survey(
-                        stage, context, "Estimator failed."))
+                        stage, context, SourceDataUnavailable("Required source rows are absent.")))
                     changed = {**order, "success_condition": "Capture a newly requested control.",
                                "repair_policy_revision": 0, "review_directives": [{"text":
                                    "The declared control has no source-traceable measurements."}]}
                     runner.active_research_requests = [changed]
                     routed = runner._route_unexecuted_experiment_to_survey(
-                        stage, context, "Estimator failed.")
+                        stage, context, SourceDataUnavailable("Required source rows are absent."))
                     self.assertEqual(routed, changed)
             finally:
                 runner.close()

@@ -214,7 +214,7 @@ MAX_EXPERIMENT_RESULT_PACKAGE_BYTES = 16 * 1024 * 1024
 CAPABILITY_REPAIR_SOURCE_CHARS = 64_000
 CAPABILITY_REPAIR_PANEL_SCHEMA_VERSION = "capability-repair-panel-8"
 CAPABILITY_REPAIR_PANEL_PROMPT_REVISION = "repair-plan-owned-evidence-actions-14"
-SURVEY_EVIDENCE_REQUEST_POLICY_REVISION = 1
+SURVEY_EVIDENCE_REQUEST_POLICY_REVISION = 2
 CAPABILITY_REPAIR_REVIEW_EVIDENCE_REVISION = "immutable-research-evidence-v2"
 CAPABILITY_REPAIR_UNRESOLVED_SOURCE_FILES = 2
 CAPABILITY_REPAIR_PLAN_SCHEMA_VERSIONS = frozenset({
@@ -3415,6 +3415,20 @@ class ComposerRunner:
             "artifact_evidence_sha256": reconciliation["artifact_evidence"]["sha256"],
         }
 
+    @staticmethod
+    def _restore_deferred_experiment_repair(context):
+        deferred_repair = context.get("deferred_experiment_repair")
+        if isinstance(deferred_repair, dict):
+            context = deepcopy(context)
+            for key in (
+                    "experiment_repair_plan", "capability_repair_panel",
+                    "specialist_reports", "specialist_verifier",
+                    "deferred_preexecution_review"):
+                if not context.get(key) and deferred_repair.get(key) is not None:
+                    context[key] = deepcopy(deferred_repair[key])
+            context.pop("deferred_experiment_repair", None)
+        return context
+
     def _autonomous_experiment_repair_request(self, stage, context, error,
                                                repair_attempts):
         """Create a concrete code-and-evidence repair order for one lineage.
@@ -3427,16 +3441,7 @@ class ComposerRunner:
         if not isinstance(stage, dict) or stage.get("kind") != "experiment":
             return None
         context = context if isinstance(context, dict) else {}
-        deferred_repair = context.get("deferred_experiment_repair")
-        if isinstance(deferred_repair, dict):
-            context = deepcopy(context)
-            for key in (
-                    "experiment_repair_plan", "capability_repair_panel",
-                    "specialist_reports", "specialist_verifier",
-                    "deferred_preexecution_review"):
-                if not context.get(key) and deferred_repair.get(key) is not None:
-                    context[key] = deepcopy(deferred_repair[key])
-            context.pop("deferred_experiment_repair", None)
+        context = self._restore_deferred_experiment_repair(context)
         recovery = context.get("failure_recovery")
         recovery = recovery if isinstance(recovery, dict) else {}
         history = context.get("experiment_repair_history")
@@ -3775,9 +3780,37 @@ class ComposerRunner:
         self.context[stage["id"]] = context
         return request
 
+    def _current_experiment_failure_class(self, stage, context, error=None):
+        """Recover routing authority from a live typed failure or its exact dossier."""
+        typed = getattr(error, "failure_class", None)
+        if isinstance(typed, str):
+            return typed
+        recovery = context.get("failure_recovery") if isinstance(context, dict) else None
+        if not isinstance(recovery, dict):
+            return None
+        ref = recovery.get("dossier_ref")
+        if not isinstance(ref, str) or context.get("failure_dossier_ref", ref) != ref:
+            return None
+        try:
+            manifest, _, dossier = self._read_verified_artifact_json(ref)
+            if (manifest.get("author") != "command.composer"
+                    or dossier.get("stage_id") != stage.get("id")
+                    or dossier.get("stage_kind") != "experiment"
+                    or dossier.get("failure_class") != recovery.get("failure_class")
+                    or dossier.get("input_sha256") != recovery.get("input_sha256")
+                    or dossier.get("attempt_number") != recovery.get("attempt_number")
+                    or not isinstance(dossier.get("error"), str)
+                    or dossier["error"][:4096] != context.get("error")):
+                return None
+            return dossier.get("failure_class")
+        except (KeyError, TypeError, ValueError, OSError, NotFoundError, ValidationError):
+            return None
+
     def _route_unexecuted_experiment_to_survey(self, stage, context, error,
                                                reviewer_evidence=None):
         """Route a material source-evidence deficit to the admitted survey."""
+        if self._current_experiment_failure_class(stage, context, error) != "evidence_input_unavailable":
+            return None
         if not self._is_pre_execution_capability_failure(stage, context, error):
             failure_text = error if error is not None else context.get("error")
             is_reproducible_harness_failure = (
@@ -3933,8 +3966,6 @@ class ComposerRunner:
                 item["text"].strip()[:1400] for item in retained_request.get("review_directives", [])
                 if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip())
         review_items = list(dict.fromkeys(review_items))[:12]
-        if not review_items and getattr(error, "failure_class", None) != "evidence_input_unavailable":
-            return None
         topic_cycle = identity["topic_cycle"]
         survey_ref = survey_context.get("survey_ref")
         assessment_ref = survey_context.get("assessment_ref")
@@ -4116,13 +4147,116 @@ class ComposerRunner:
         return request
 
     def _reconcile_experiment_survey_evidence_routes(self, by_id):
-        """Replace stale Methods orders when a resumed pilot lacks survey evidence."""
+        """Restore routing from the current failure without discarding paid evidence."""
         reconciled = []
         for stage_id, stage in by_id.items():
             if not isinstance(stage, dict) or stage.get("kind") != "experiment":
                 continue
             context = self.context.get(stage_id)
             if not isinstance(context, dict):
+                continue
+            failure_class = self._current_experiment_failure_class(stage, context)
+            if failure_class is not None and failure_class != "evidence_input_unavailable":
+                if (context.get("results_status") not in {None, "not_executed"}
+                        or self._has_executed_experiment_result(
+                            context, self._stage_experiment_capability_id(stage),
+                            project_dir=self._current_experiment_result_project_dir(stage))):
+                    continue
+                identity = self._current_topic_identity()
+                if not isinstance(identity, dict):
+                    continue
+                history = context.get("survey_evidence_expansion_history", [])
+                history = history if isinstance(history, list) else []
+                routes = [item for item in history if isinstance(item, dict)
+                          and item.get("topic_id") == identity.get("topic_id")
+                          and item.get("topic_cycle") == identity.get("topic_cycle")]
+                survey_ids = set()
+                pending = list(stage.get("depends_on", []))
+                visited = set()
+                while pending:
+                    parent_id = pending.pop()
+                    if parent_id in visited:
+                        continue
+                    visited.add(parent_id)
+                    parent = by_id.get(parent_id, {})
+                    if parent.get("kind") == "survey":
+                        survey_ids.add(parent_id)
+                    pending.extend(parent.get("depends_on", []))
+                candidates = [*self.active_research_requests]
+                for value in self.context.values():
+                    if isinstance(value, dict):
+                        for key in ("research_requests", "research_expansion_requests", "deferred_research_requests"):
+                            if isinstance(value.get(key), list):
+                                candidates.extend(value[key])
+                misrouted = [item for item in candidates if isinstance(item, dict)
+                             and item.get("recovery_mode") == "survey_evidence_before_experiment_repair"
+                             and item.get("repair_policy_revision") == 1
+                             and item.get("target_stage_id") in survey_ids
+                             and item.get("source_stage_id") in survey_ids | {stage_id}
+                             and any(all(item.get(key) == route.get(key) for key in (
+                                 "topic_id", "topic_cycle", "source_survey_ref", "source_assessment_ref"))
+                                 and item.get("id") == route.get("request_id") for route in routes)]
+                other_owned_routes = set()
+                for other_id, other_stage in by_id.items():
+                    if other_id == stage_id or other_stage.get("kind") != "experiment":
+                        continue
+                    other_context = self.context.get(other_id, {})
+                    other_history = other_context.get("survey_evidence_expansion_history", [])
+                    if not isinstance(other_history, list):
+                        continue
+                    for item in misrouted:
+                        if any(isinstance(route, dict)
+                               and route.get("request_id") == item.get("id")
+                               and all(route.get(key) == item.get(key) for key in (
+                                   "topic_id", "topic_cycle", "source_survey_ref", "source_assessment_ref"))
+                               for route in other_history):
+                            other_owned_routes.add(self._research_request_signature(item))
+                misrouted = [item for item in misrouted
+                             if self._research_request_signature(item) not in other_owned_routes]
+                signatures = {self._research_request_signature(item) for item in misrouted}
+                if signatures:
+                    self._attempted_request_signatures.update(signatures)
+                    self.active_research_requests = [item for item in self.active_research_requests
+                        if self._research_request_signature(item) not in signatures]
+                    for value in self.context.values():
+                        if not isinstance(value, dict):
+                            continue
+                        for key in ("research_requests", "research_expansion_requests", "deferred_research_requests"):
+                            if isinstance(value.get(key), list):
+                                value[key] = [item for item in value[key]
+                                    if self._research_request_signature(item) not in signatures]
+                    context.setdefault("superseded_research_requests", []).extend(
+                        {**deepcopy(item), "superseded_reason": "current owned failure does not require source acquisition"}
+                        for item in {self._research_request_signature(item): item for item in misrouted}.values())
+                    recovery = context["failure_recovery"]
+                    request = next((item for item in self.active_research_requests
+                        if isinstance(item, dict)
+                        and item.get("target_stage_id") == stage_id
+                        and item.get("recovery_mode") == "experiment_diagnose_patch_execute_recalculate"
+                        and item.get("failure_dossier_ref") == recovery.get("dossier_ref")
+                        and item.get("failure_input_sha256") == recovery.get("input_sha256")), None)
+                    if request is not None:
+                        context = self._restore_deferred_experiment_repair(context)
+                        context["failure_recovery"].update({
+                            "recovery_mode": "experiment_diagnose_patch_execute_recalculate",
+                            "requires_capability_repair": True,
+                        })
+                        self.context[stage_id] = context
+                    if request is None:
+                        request = self._autonomous_experiment_repair_request(
+                            stage, context, context.get("error"), self._pre_execution_repair_count(stage))
+                        if isinstance(request, dict):
+                            self.active_research_requests.append(deepcopy(request))
+                    if isinstance(request, dict):
+                        self.continuation_pending_stage_ids.add(stage_id)
+                    reconciled.append({
+                        "cycle": self.continuation_cycles,
+                        "action": "restore_methods_repair_after_source_route_misclassification",
+                        "stage_id": stage_id, "failure_class": failure_class,
+                        "retired_request_ids": sorted({item["id"] for item in misrouted}),
+                        "methods_request_id": request.get("id") if isinstance(request, dict) else None,
+                        "model_calls": 0,
+                    })
                 continue
             review_evidence = []
             plan = context.get("experiment_repair_plan")
