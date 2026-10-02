@@ -275,7 +275,7 @@ def validate_results_package(value, *, base_dir=None):
     _core(value, asset_version=asset_version, base_dir=base_dir)
     if schema in {"results-package-2", "results-package-3"}:
         if "analysis" in value:
-            validate_analysis(value["analysis"])
+            validate_analysis(value["analysis"], metric_ids={item["id"] for item in value["metrics"]})
         if "quality_contract" in value:
             validate_quality_contract(value["quality_contract"], study_type=value["study_type"])
             # The package validator checks the declared contract and the

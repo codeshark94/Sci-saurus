@@ -231,7 +231,9 @@ def _validate_censored_event_observations(observations):
 def normalize_program_output(value):
     """Apply the shared transport normalization before binding a candidate digest."""
     if "analysis" in value:
-        value["analysis"] = validate_analysis(value["analysis"])
+        value["analysis"] = validate_analysis(
+            value["analysis"], metric_ids={item["id"] for item in value.get("metrics", [])
+                                        if isinstance(item, dict) and "id" in item})
     return value
 
 

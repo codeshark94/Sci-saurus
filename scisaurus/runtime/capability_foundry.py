@@ -1016,6 +1016,13 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
                 "For a bootstrap interval, store machine-readable estimate, lower, and upper values "
                 "on the same analysis.uncertainty record; include the resampling method, unit, and "
                 "replicate count in its description or additional evidence fields.",
+                "For an analysis quantity that cannot be estimated, emit status=not_estimable, "
+                "a nonempty reason, and unique metric_ids naming the emitted metrics concerned. "
+                "Its mean or estimate must be null, and any lower/upper must both be null. "
+                "A finite metric point estimate can coexist with unavailable interval evidence; "
+                "keep that point estimate in metrics. Never substitute zero for unavailable analysis. "
+                "This representation preserves uncertainty debt for scientific and quality review; "
+                "it does not establish censoring, validate an estimator, or satisfy a quantitative floor.",
                 "For every required analysis kind, include a nonempty, result-grounded entry in its "
                 "corresponding analysis list; leave an unrequired kind empty rather than fabricate it. "
                 "analysis.raw_data must identify the actual raw observations emitted.",

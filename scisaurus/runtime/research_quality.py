@@ -53,28 +53,45 @@ def _analysis_strings(value, name):
     return result
 
 
-def _validate_uncertainty_numbers(record):
-    """Validate optional machine-readable estimates carried with uncertainty evidence."""
-    for field in {"mean", "estimate", "lower", "upper"} & record.keys():
-        value = record[field]
-        if (type(value) not in (int, float)
-                or (type(value) is float and not math.isfinite(value))):
-            raise ValidationError(
-                f"analysis.uncertainty.{field} must be a finite number")
+def _validate_quantitative_evidence(record, name, *, metric_ids=None):
+    """Distinguish unavailable analysis quantities from finite computed estimates."""
+    numeric_fields = {"mean", "estimate", "lower", "upper"} & record.keys()
+    unavailable = record.get("status") == "not_estimable"
+    if unavailable:
+        _text(record.get("reason"), f"{name}.reason")
+        references = record.get("metric_ids")
+        if (not isinstance(references, list) or not references
+                or any(not isinstance(item, str) for item in references)):
+            raise ValidationError(f"{name}.metric_ids must name emitted metrics")
+        for reference in references:
+            _identifier(reference, f"{name}.metric_ids")
+        if len(references) != len(set(references)):
+            raise ValidationError(f"{name}.metric_ids must be unique")
+        if metric_ids is not None and set(references) - set(metric_ids):
+            raise ValidationError(f"{name}.metric_ids reference unknown emitted metrics")
+        if not {"mean", "estimate"} & numeric_fields:
+            raise ValidationError(f"{name} not_estimable requires a null mean or estimate")
+        if any(record[field] is not None for field in numeric_fields):
+            raise ValidationError(f"{name} not_estimable numeric fields must be null")
+    else:
+        for field in numeric_fields:
+            value = record[field]
+            if (type(value) not in (int, float)
+                    or (type(value) is float and not math.isfinite(value))):
+                raise ValidationError(
+                    f"{name}.{field} must be a finite number; unavailable quantities require "
+                    "status=not_estimable, reason, metric_ids, and null numeric fields")
     has_lower = "lower" in record
     has_upper = "upper" in record
     if has_lower != has_upper:
-        raise ValidationError(
-            "analysis.uncertainty interval requires both lower and upper")
+        raise ValidationError(f"{name} interval requires both lower and upper")
     if has_lower and not ({"mean", "estimate"} & record.keys()):
-        raise ValidationError(
-            "analysis.uncertainty interval requires a machine-readable mean or estimate")
-    if has_lower and record["lower"] > record["upper"]:
-        raise ValidationError(
-            "analysis.uncertainty lower bound must not exceed upper bound")
+        raise ValidationError(f"{name} interval requires a machine-readable mean or estimate")
+    if has_lower and not unavailable and record["lower"] > record["upper"]:
+        raise ValidationError(f"{name} lower bound must not exceed upper bound")
 
 
-def _analysis_evidence(value, name, *, records=True):
+def _analysis_evidence(value, name, *, records=True, metric_ids=None):
     """Preserve concise evidence entries while enforcing a shared record shape."""
     if not isinstance(value, list):
         raise ValidationError(f"{name} must be a list")
@@ -94,8 +111,8 @@ def _analysis_evidence(value, name, *, records=True):
             _identifier(item["id"], f"{name} evidence id")
             _text(item["description"], f"{name} evidence description")
             normalized = deepcopy(item)
-            if name == "analysis.uncertainty":
-                _validate_uncertainty_numbers(normalized)
+            if name in {"analysis.uncertainty", "analysis.effect_sizes", "analysis.sensitivity", "analysis.ablation"}:
+                _validate_quantitative_evidence(normalized, name, metric_ids=metric_ids)
             identity = canonical_bytes(normalized)
             if normalized["id"] in identifiers:
                 raise ValidationError(f"{name} evidence IDs must be unique")
@@ -122,16 +139,22 @@ def analysis_output_contract():
         "uncertainty": (
             "list of nonempty strings or {id,description} records; additional JSON evidence fields are preserved. "
             "For a numeric estimate or interval, include finite machine-readable mean or estimate, lower, and upper "
-            "values in the same evidence record; lower must not exceed upper"
+            "values in the same evidence record; lower must not exceed upper. "
+            "Unavailable quantities use status=not_estimable, nonempty reason, unique metric_ids "
+            "naming emitted metrics, and null mean or estimate; any lower/upper must both be null. "
+            "These records preserve unresolved evidence and do not satisfy a quantitative analysis floor"
         ),
         "effect_sizes": (
-            "list of nonempty strings or {id,description} records; additional JSON evidence fields are preserved"
+            "list of nonempty strings or {id,description} records; additional JSON evidence fields are preserved. "
+            "Any mean/estimate/lower/upper follow the uncertainty numeric or not_estimable contract"
         ),
         "sensitivity": (
-            "list of nonempty strings or {id,description} records; additional JSON evidence fields are preserved"
+            "list of nonempty strings or {id,description} records; additional JSON evidence fields are preserved. "
+            "Any mean/estimate/lower/upper follow the uncertainty numeric or not_estimable contract"
         ),
         "ablation": (
-            "list of nonempty strings or {id,description} records; additional JSON evidence fields are preserved"
+            "list of nonempty strings or {id,description} records; additional JSON evidence fields are preserved. "
+            "Any mean/estimate/lower/upper follow the uncertainty numeric or not_estimable contract"
         ),
         "raw_data": (
             "list of nonempty strings or {id,description} records identifying emitted observations"
@@ -247,7 +270,7 @@ def build_research_design(experiment):
     return design
 
 
-def validate_analysis(value):
+def validate_analysis(value, *, metric_ids=None):
     """Validate the program's reader-facing analysis summary."""
     if not isinstance(value, dict):
         raise AnalysisContractError("analysis must be an object")
@@ -265,7 +288,7 @@ def validate_analysis(value):
         value["conditions"] = _analysis_strings(value["conditions"], "analysis.conditions")
         for key in ("controls", "uncertainty", "effect_sizes", "sensitivity",
                     "ablation", "raw_data"):
-            value[key] = _analysis_evidence(value[key], f"analysis.{key}")
+            value[key] = _analysis_evidence(value[key], f"analysis.{key}", metric_ids=metric_ids)
         seeds = value["independent_seeds"]
         if (not isinstance(seeds, list)
                 or any(type(seed) is not int or seed < 0 for seed in seeds)):
@@ -320,8 +343,13 @@ def check_analysis_contract(analysis, contract, *, figure_count=0):
     }
     for requirement in contract["required_analyses"]:
         field = analysis_by_requirement[requirement]
-        if not analysis[field]:
-            deficits.append({"field": requirement, "observed": 0, "required": 1})
+        available = [item for item in analysis[field]
+                     if not (isinstance(item, dict) and item.get("status") == "not_estimable")]
+        if not available:
+            deficit = {"field": requirement, "observed": 0, "required": 1}
+            if analysis[field]:
+                deficit["unresolved_evidence_ids"] = [item["id"] for item in analysis[field]]
+            deficits.append(deficit)
     return deficits
 
 

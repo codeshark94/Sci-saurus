@@ -110,6 +110,107 @@ class ResearchQualityTests(unittest.TestCase):
                 with self.assertRaises(ValidationError):
                     validate_analysis(analysis)
 
+    def _unavailable(self):
+        return {"id": "crossing_uncertainty", "description": "No interval is identifiable.",
+                "status": "not_estimable", "reason": "Local estimator has no variation.",
+                "metric_ids": ["crossing"], "estimate": None, "lower": None, "upper": None}
+
+    def test_unavailable_quantitative_records_are_preserved_and_normalization_is_stable(self):
+        for field in ("uncertainty", "effect_sizes", "sensitivity", "ablation"):
+            with self.subTest(field=field):
+                record = self._unavailable()
+                analysis = self._analysis()
+                analysis[field] = [record]
+                normalized = validate_analysis(analysis, metric_ids={"crossing"})
+                self.assertEqual(normalized[field], [record])
+                self.assertEqual(validate_analysis(normalized, metric_ids={"crossing"}), normalized)
+                self.assertEqual(analysis[field], [record])
+
+    def test_unavailable_records_require_explicit_status_reason_and_binding(self):
+        mutations = [lambda r: r.pop("status"), lambda r: r.update(status="undefined"),
+                     lambda r: r.pop("reason"), lambda r: r.update(reason=" "),
+                     lambda r: r.pop("metric_ids"), lambda r: r.update(metric_ids=[]),
+                     lambda r: r.update(metric_ids=["crossing", "crossing"]),
+                     lambda r: r.update(metric_ids=["unknown"]),
+                     lambda r: r.update(metric_ids=[True]),
+                     lambda r: r.pop("estimate"), lambda r: r.pop("upper")]
+        for field in ("uncertainty", "effect_sizes", "sensitivity", "ablation"):
+            for mutate in mutations:
+                with self.subTest(field=field, mutate=mutate):
+                    record = self._unavailable()
+                    mutate(record)
+                    analysis = self._analysis()
+                    analysis[field] = [record]
+                    with self.assertRaises(ValidationError):
+                        validate_analysis(analysis, metric_ids={"crossing"})
+
+    def test_unavailable_record_cannot_carry_numeric_placeholders(self):
+        for field in ("uncertainty", "effect_sizes", "sensitivity", "ablation"):
+            for value in (0, -1, 0.0, True, "0", float("nan"), float("inf")):
+                for numeric_field in ("estimate", "lower", "upper", "mean"):
+                    with self.subTest(field=field, value=value, numeric_field=numeric_field):
+                        record = self._unavailable()
+                        record[numeric_field] = value
+                        analysis = self._analysis()
+                        analysis[field] = [record]
+                        with self.assertRaises(ValidationError):
+                            validate_analysis(analysis, metric_ids={"crossing"})
+
+    def test_finite_quantitative_records_keep_zero_negative_and_zero_containing_intervals(self):
+        for field in ("uncertainty", "effect_sizes", "sensitivity", "ablation"):
+            for estimate in (0, -0.5, 0.5):
+                with self.subTest(field=field, estimate=estimate):
+                    record = {"id": "interval", "description": "Computed interval.",
+                              "estimate": estimate, "lower": -1, "upper": 1}
+                    analysis = self._analysis()
+                    analysis[field] = [record]
+                    self.assertEqual(validate_analysis(analysis)[field], [record])
+
+    def test_shared_quantitative_contract_rejects_invalid_numeric_fields(self):
+        for field in ("uncertainty", "effect_sizes", "sensitivity", "ablation"):
+            for value in (None, True, "0.2", float("nan"), float("inf")):
+                with self.subTest(field=field, value=value):
+                    analysis = self._analysis()
+                    analysis[field] = [{"id": "interval", "description": "Computed interval.",
+                                        "estimate": value, "lower": -1, "upper": 1}]
+                    with self.assertRaises(ValidationError):
+                        validate_analysis(analysis)
+
+    def test_unavailable_uncertainty_is_quality_debt_until_quantified_evidence_exists(self):
+        analysis = self._analysis()
+        analysis["uncertainty"] = [self._unavailable()]
+        package = {"quality_contract": default_research_quality_contract(), "analysis": analysis,
+                   "assets": [{"id": f"figure_{i}", "role": "figure"} for i in range(3)]}
+        decision = evaluate_result_package_quality(package)
+        self.assertEqual(decision["decision"], "research_expansion_required")
+        self.assertEqual(decision["deficits"], [{"field": "uncertainty", "observed": 0,
+                          "required": 1, "unresolved_evidence_ids": ["crossing_uncertainty"]}])
+        analysis["uncertainty"].append({"id": "exponent_interval", "description": "Bootstrap.",
+                                        "estimate": 0, "lower": -0.1, "upper": 0.1})
+        self.assertEqual(evaluate_result_package_quality(package)["decision"], "proceed")
+        self.assertIsNone(analysis["uncertainty"][0]["estimate"])
+
+    def test_program_normalization_binds_unavailable_analysis_to_actual_metrics(self):
+        from scisaurus.runtime.experiment import normalize_program_output
+        from copy import deepcopy
+        analysis = self._analysis()
+        analysis["uncertainty"] = [self._unavailable()]
+        output = {"analysis": analysis, "metrics": [{"id": "crossing", "value": None},
+                                                    {"id": "exponent", "value": 0.2}]}
+        normalized = normalize_program_output(deepcopy(output))
+        self.assertEqual(normalized["analysis"]["uncertainty"], [self._unavailable()])
+        self.assertEqual(normalize_program_output(deepcopy(normalized)), normalized)
+        output["analysis"]["uncertainty"][0]["metric_ids"] = ["absent"]
+        with self.assertRaisesRegex(ValidationError, "unknown emitted metrics"):
+            normalize_program_output(output)
+
+    def test_finite_primary_estimate_can_have_unavailable_uncertainty(self):
+        from scisaurus.runtime.experiment import normalize_program_output
+        analysis = self._analysis()
+        analysis["uncertainty"] = [self._unavailable()]
+        output = {"analysis": analysis, "metrics": [{"id": "crossing", "value": 150.0}]}
+        self.assertIsNone(normalize_program_output(output)["analysis"]["uncertainty"][0]["estimate"])
+
     def test_metric_specific_analysis_keys_remain_rejected(self):
         analysis = self._analysis()
         analysis["bootstrap_slope_difference"] = {

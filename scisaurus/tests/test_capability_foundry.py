@@ -2226,6 +2226,16 @@ class CapabilityFoundryTests(unittest.TestCase):
             "machine-readable estimate, lower, and upper" in item
             for item in prompt["constraints"]))
 
+    def test_authoring_contract_exposes_non_estimable_analysis_without_fake_numbers(self):
+        prompt = candidate_prompt("bounded comparison", [], {"probe": True},
+                                  required_intent={"quality_contract": default_research_quality_contract()})
+        constraints = " ".join(prompt["constraints"])
+        self.assertIn("status=not_estimable", constraints)
+        self.assertIn("metric_ids naming the emitted metrics", constraints)
+        self.assertIn("does not establish censoring", constraints)
+        for field in ("uncertainty", "effect_sizes", "sensitivity", "ablation"):
+            self.assertIn("not_estimable", prompt["executor_output_exact_shapes"]["analysis"][field])
+
     def test_exact_source_edits_preserve_unchanged_code_and_input(self):
         previous = self._payload()
         revised = apply_authoring_patch(previous, {"updates": {"executor_source": {"edits": [
