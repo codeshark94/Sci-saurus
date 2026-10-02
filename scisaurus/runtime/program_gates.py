@@ -76,12 +76,24 @@ def _parse_json_output(result, name):
                               "verify the entry point and stdin handling") from exc
 
 
+def validator_readiness_contract():
+    return {
+        "stdin": {"readiness_probe": True},
+        "stdout": {"status": "ready"},
+        "transport": "The probe is the entire stdin JSON object, not a configured_input field.",
+    }
+
+
 def validate_validator_readiness(result):
     if getattr(result, "mode", None) != "sandbox-exec":
         raise ValidationError("validator readiness requires the deny-by-default sandbox-exec boundary")
     record = _parse_json_output(result, "program validator readiness")
-    if record != {"status": "ready"}:
-        raise ValidationError("program validator readiness must return exactly {'status': 'ready'}")
+    contract = validator_readiness_contract()
+    if record != contract["stdout"]:
+        raise ValidationError(
+            "program validator readiness must return exactly {'status': 'ready'}; "
+            f"stdin is the entire JSON object {contract['stdin']!r}, not configured_input; "
+            f"observed stdout: {json.dumps(record, ensure_ascii=False)[:800]}")
     return record
 
 

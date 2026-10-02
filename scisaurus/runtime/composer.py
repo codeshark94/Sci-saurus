@@ -213,7 +213,7 @@ EXPERIMENT_RESULT_METADATA_FIELDS = frozenset({
 MAX_EXPERIMENT_RESULT_PACKAGE_BYTES = 16 * 1024 * 1024
 CAPABILITY_REPAIR_SOURCE_CHARS = 64_000
 CAPABILITY_REPAIR_PANEL_SCHEMA_VERSION = "capability-repair-panel-8"
-CAPABILITY_REPAIR_PANEL_PROMPT_REVISION = "repair-plan-owned-evidence-actions-16"
+CAPABILITY_REPAIR_PANEL_PROMPT_REVISION = "repair-plan-owned-evidence-actions-17"
 SURVEY_EVIDENCE_REQUEST_POLICY_REVISION = 2
 CAPABILITY_REPAIR_REVIEW_EVIDENCE_REVISION = "immutable-research-evidence-v2"
 CAPABILITY_REPAIR_UNRESOLVED_SOURCE_FILES = 2
@@ -5630,6 +5630,7 @@ class ComposerRunner:
                             "repair_commands", "acceptance_checks", "review_directives",
                             "model_diagnostics", "recovery_mode", "target_stage_id",
                             "target_stage_kind", "repair_priority", "repair_policy_revision",
+                            "foundry_work_ref", "failure_gate",
                             "recovery_generation", "resume_scopes",
                             "source_survey_ref", "source_assessment_ref",
                             "experiment_repair_plan",
@@ -8037,11 +8038,12 @@ class ComposerRunner:
                 "topic_id", "topic_cycle", "topic_ids", "work_kind", "source_survey_ref", "source_assessment_ref",
                 "failure_input_sha256",
                 "recovery_mode", "repair_policy_revision", "resume_scopes", "repair_commands", "acceptance_checks",
+                "foundry_work_ref", "failure_gate",
                 "review_directives", "experiment_repair_plan", "repair_strategy",
             )
             if key in request
         }
-        for key in ("source_survey_ref", "source_assessment_ref"):
+        for key in ("source_survey_ref", "source_assessment_ref", "foundry_work_ref"):
             if key in request:
                 stable[key] = deepcopy(request[key])
         return hashlib.sha256(canonical_bytes(stable)).hexdigest()
@@ -9646,6 +9648,7 @@ class ComposerRunner:
                     "kind", "objective", "why", "success_condition", "evidence_needed",
                     "failure_dossier_ref", "failure_input_sha256", "recovery_mode",
                     "repair_policy_revision",
+                    "foundry_work_ref", "failure_gate",
                     "target_stage_id", "target_stage_kind", "repair_priority",
                     "experiment_repair_plan", "repair_strategy", "attempt_lineage",
                 ) if key in item
@@ -11360,6 +11363,7 @@ class ComposerRunner:
             "input_sha256": failure_input_sha256,
             "identity_verified": verified_dossier is not None,
         }
+        from scisaurus.runtime.capability_foundry import validator_output_contract
         packet = {
             "schema_version": "capability-repair-packet-1",
             "stage_id": stage.get("id"),
@@ -11435,6 +11439,8 @@ class ComposerRunner:
             },
             "repair_contract": {
                 "check_phase_protocol": "repair-check-phases-1",
+                "executable_validator_output": validator_output_contract(),
+                "protocol_ownership": "executable_validator_output governs the generated validator. Specialist and verifier response decision vocabularies govern only their own model reports; they must never replace the executable protocol.",
                 "must_preserve": [
                     "the admitted topic domain", "the exact research question",
                     "the admitted primary outcome and comparison, unless a scientifically justified "
@@ -13644,9 +13650,20 @@ class ComposerRunner:
                 if evidence_binding is not None:
                     repair_provenance = {**(repair_provenance or {}),
                                          "repair_evidence_frontier": evidence_binding}
+                author_brief = json.dumps(brief, ensure_ascii=False, sort_keys=True)
+                frozen_work_ref, frozen_work = self._format_recovery_foundry_assignment(
+                    continuation_requests, question=question, domain=domain) or (None, None)
+                if frozen_work is not None:
+                    assignment = frozen_work["assignment"]
+                    author_brief = assignment["capability_brief"]
+                    foundry_input = deepcopy(assignment["configured_input"])
+                    required_intent = deepcopy(
+                        (frozen_work.get("last_attempt") or {}).get("experiment_intent")
+                        or assignment.get("required_intent_fields") or {})
+                    repair_provenance = deepcopy(frozen_work.get("repair_provenance"))
                 outcome = foundry.generate(
-                    json.dumps(brief, ensure_ascii=False, sort_keys=True),
-                    test_input=foundry_input or None,
+                    author_brief,
+                    test_input=(foundry_input if frozen_work is not None else foundry_input or None),
                     required_intent=required_intent,
                     work_cache=ModelWorkCache(self.store, self._publish, namespace="command/foundry-work"),
                     on_progress=lambda phase, state: self._foundry_progress(stage_id or selected["id"], phase, state),
@@ -13655,6 +13672,7 @@ class ComposerRunner:
                         if stage_id is not None else self._remaining()),
                     model_call_budget=model_call_budget,
                     repair_provenance=repair_provenance,
+                    resume_work_ref=frozen_work_ref,
                 )
             except Exception as exc:
                 self._sync_foundry_usage()
@@ -14605,6 +14623,7 @@ class ComposerRunner:
                 "failure_dossier_ref", "failure_input_sha256", "repair_commands",
                 "acceptance_checks", "review_directives", "model_diagnostics",
                 "recovery_mode", "repair_policy_revision",
+                "foundry_work_ref", "failure_gate",
                 "target_stage_id", "target_stage_kind",
                 "topic_id", "topic_cycle", "topic_ids", "work_kind", "source_stage_id",
                 "repair_priority", "experiment_repair_plan", "repair_strategy",
@@ -22248,13 +22267,16 @@ class ComposerRunner:
             )
         elif stage.get("kind") == "experiment":
             objective = (
-                "Retry only the experiment program-author response under the revised output policy: "
+                "Repair only the failed experiment model response, preserving its recorded failure gate "
+                "and owning role. Retain the executor, frozen intent, configured input, raw observations "
+                "and completed validator/review work. A validator or review response failure does not "
+                "authorize a new scientific design or a replacement executor. For program-author errors, "
                 "use the configured author output-token ceiling for an initial candidate; for a repair, "
                 "return one compact schema-valid JSON object containing only bounded exact source edits. "
                 "Do not regenerate the full program or repeat an identical request. Use only the primary "
-                "or non-premium format fallback. The prior program "
-                "was never admitted or executed, so do not issue a scientific experiment/code-repair "
-                "order or claim new observations."
+                "or non-premium format fallback. Distinguish observed sandbox execution from scientific "
+                "admission and release; do not claim an unobserved execution or discard observed results; "
+                "do not issue a scientific experiment/code-repair order for a response-format failure."
             )
         request_digest = digest[:16]
         if policy_revision:
@@ -22290,7 +22312,41 @@ class ComposerRunner:
         }
         if policy_revision:
             request["repair_policy_revision"] = policy_revision
+        for diagnostics in (context, recovery.get("model_diagnostics"), context.get("model_diagnostics")):
+            diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+            feedback = diagnostics.get("repair_feedback")
+            feedback = feedback if isinstance(feedback, dict) else {}
+            if feedback.get("foundry_work_ref"):
+                request["foundry_work_ref"] = feedback["foundry_work_ref"]
+                request["failure_gate"] = feedback.get("gate")
+                break
         return request
+
+    def _format_recovery_foundry_assignment(self, requests, *, question, domain):
+        refs = {
+            order["foundry_work_ref"] for order in requests
+            if isinstance(order, dict) and order.get("kind") == "recovery"
+            and order.get("recovery_mode") == "format_repair_then_rerun"
+            and isinstance(order.get("foundry_work_ref"), str)
+        }
+        if not refs:
+            return None
+        if len(refs) != 1:
+            raise ValidationError("format recovery has conflicting frozen foundry assignments")
+        ref = next(iter(refs))
+        if not ref.startswith("artifact:command/foundry-work/"):
+            raise ValidationError("format recovery requires an immutable foundry work reference")
+        _, _, work = self._read_verified_artifact_json(ref)
+        assignment = work.get("assignment") or {}
+        candidate_intent = (work.get("last_attempt") or {}).get("experiment_intent") or {}
+        intent = candidate_intent or assignment.get("required_intent_fields") or {}
+        if (work.get("status") not in {"blocked", "repairing", "response_received"}
+                or work.get("last_failure_class") != "model_contract"
+                or intent.get("research_question") != question or intent.get("domain") != domain
+                or not isinstance(assignment.get("capability_brief"), str)
+                or not isinstance(assignment.get("configured_input"), dict)):
+            raise ValidationError("format recovery foundry work does not match its failed scientific assignment")
+        return ref, work
 
     @staticmethod
     def _format_recovery_policy_revision(stage):

@@ -14319,6 +14319,45 @@ class ComposerWorkflowTests(unittest.TestCase):
             finally:
                 runner.close()
 
+    def test_format_recovery_binds_the_immutable_failed_foundry_assignment(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            stage = next(s for s in runner.workflow['stages'] if s['kind']=='experiment')
+            work = {'status': 'blocked', 'last_failure_class': 'model_contract',
+                'assignment': {'capability_brief': '{"topic": "frozen"}',
+                    'configured_input': {'parameters': {'mass_ratio': [100, 200]}}},
+                'last_attempt': {'experiment_intent': {'research_question': 'frozen question',
+                    'domain': 'plasma', 'parameters': {'dt': .001}},
+                    'executor_source': 'original source'},
+                'repair_provenance': {'kind': 'independent_repair'}}
+            record = runner._publish('command/foundry-work/frozen', 'note', work, 'command.controller')
+            context = {'failure_recovery': {'model_diagnostics': {'repair_feedback': {
+                'foundry_work_ref': record['artifact_ref'], 'gate': 'review_response_format'}}}}
+            order = runner._format_contract_recovery_request(stage, context)
+            self.assertEqual(order['foundry_work_ref'], record['artifact_ref'])
+            self.assertEqual(order['failure_gate'], 'review_response_format')
+            projected = runner._follow_up_projection([order])[0]
+            self.assertEqual(projected['foundry_work_ref'], record['artifact_ref'])
+            self.assertEqual(projected['failure_gate'], 'review_response_format')
+            self.assertEqual(runner._format_recovery_foundry_assignment([order],
+                question='frozen question', domain='plasma'), (record['artifact_ref'], work))
+            with self.assertRaises(ValidationError):
+                runner._format_recovery_foundry_assignment([order],
+                    question='foreign question', domain='plasma')
+            succeeded = deepcopy(work); succeeded['status']='succeeded'
+            other = runner._publish('command/foundry-work/other', 'note', succeeded, 'command.controller')
+            with self.assertRaises(ValidationError):
+                runner._format_recovery_foundry_assignment([
+                    {**order, 'foundry_work_ref': other['artifact_ref']}],
+                    question='frozen question', domain='plasma')
+            with self.assertRaises(ValidationError):
+                runner._format_recovery_foundry_assignment([order,
+                    {**order, 'foundry_work_ref': other['artifact_ref']}],
+                    question='frozen question', domain='plasma')
+            self.assertNotEqual(runner._research_request_signature(order),
+                runner._research_request_signature({**order, 'foundry_work_ref': other['artifact_ref']}))
+
     def test_legacy_experiment_author_policy_reopens_once_without_methods_order(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -14391,6 +14430,9 @@ class ComposerWorkflowTests(unittest.TestCase):
                 self.assertIn("repeat an identical request", request["objective"])
                 self.assertIn("do not issue a scientific experiment/code-repair order",
                               request["objective"])
+                self.assertIn("owning role", request["objective"])
+                self.assertIn("completed validator/review work", request["objective"])
+                self.assertNotIn("was never admitted or executed", request["objective"])
                 legacy_signature_request = deepcopy(request)
                 legacy_signature_request["source_stage_id"] = stage["id"]
                 legacy_signature_request.pop("repair_policy_revision")
@@ -17008,6 +17050,8 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(packet["failure"]["error"], "normalizer is zero")
             self.assertEqual(packet["plan_review_failure"]["error"], "plan review hold")
             self.assertEqual(packet["plan_review_failure"]["temporal_scope"], "historical_prior_plan_review")
+            from scisaurus.runtime.capability_foundry import validator_output_contract
+            self.assertEqual(packet["repair_contract"]["executable_validator_output"], validator_output_contract())
             projected = runner._capability_authoring_repair_projection({"packet": packet})
             self.assertEqual(projected["repair_subject_lineage"], subject)
             self.assertEqual(projected["failed_program"]["executor_source"], sources["executor"])

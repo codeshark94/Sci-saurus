@@ -1082,6 +1082,11 @@ class SpecialistDispatcherTests(unittest.TestCase):
         packet = {"repair_panel": True, "repair_verification_scope": "pre_execution_plan",
             "capability_repair_packet": {"plan_review_failure": {
                 "error": "old plan hold", "source_authority": "The current plan review failed"}}}
+        from scisaurus.runtime.capability_foundry import candidate_prompt, validator_output_contract
+        contract = validator_output_contract()
+        self.assertEqual(candidate_prompt('comparison', [], {})['validator_output_exact_shapes'], contract)
+        packet['capability_repair_packet']['repair_contract'] = {
+            'executable_validator_output': contract, 'protocol_ownership': 'Program protocol, not model-report protocol.'}
         for limit in (32000, 8000):
             prompt = build_verifier_prompt({"id": "repair", "kind": "experiment"}, packet, [], chief,
                                           max_input_tokens=limit)
@@ -1097,6 +1102,9 @@ class SpecialistDispatcherTests(unittest.TestCase):
             for field in ('prior_plan', 'lead_review', 'verifier_review', 'decision'):
                 self.assertNotIn(field, history)
             failure = value['capability_repair_packet']['plan_review_failure']
+            self.assertEqual(value['capability_repair_packet']['repair_contract']['executable_validator_output'], contract)
+            self.assertEqual(contract['decision'], 'accepted|rejected')
+            self.assertEqual(set(contract['checks'][0]), {'id', 'outcome', 'evidence'})
             self.assertEqual(failure['temporal_scope'], 'historical_prior_plan_review')
             self.assertNotIn('current plan review failed', failure['source_authority'])
             repaired = json.loads(_verifier_repair_prompt(prompt, 'schema error', '{}',

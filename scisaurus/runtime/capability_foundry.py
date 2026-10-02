@@ -53,7 +53,8 @@ from scisaurus.runtime.program_admission import (
     validate_program_candidate,
 )
 from scisaurus.runtime.program_gates import (ProgramGateRejected, admit_program_candidate,
-                                            validate_validator_readiness)
+                                            validate_validator_readiness,
+                                            validator_readiness_contract)
 from scisaurus.runtime.program_sandbox import run_sandboxed, sandbox_status
 from scisaurus.runtime.research_quality import (
     ANALYSIS_FIELDS, AnalysisContractError, analysis_output_contract,
@@ -212,6 +213,8 @@ REVIEW_SYSTEM = (
 PROGRAM_REVIEW_CHECKS = {"method_implementation", "estimator_definedness",
                          "independent_validation", "claim_support", "model_applicability",
                          "numerical_validation", "analysis_evidence"}
+PROGRAM_REVIEW_REQUIRED_FIELDS = {"status", "checks", "findings"}
+PROGRAM_REVIEW_FIELDS = PROGRAM_REVIEW_REQUIRED_FIELDS | {"limitations"}
 
 ATTEMPT_FIELDS = {"executor_source", "validator_source", "experiment_intent"}
 PRODUCER_FIELDS = {"executor_source", "experiment_intent"}
@@ -731,6 +734,21 @@ def validate_foundry_config(value):
     return deepcopy_config(value)
 
 
+def validator_output_contract():
+    """The executable validator protocol shared by authoring and repair review."""
+    return {
+        "schema_version": "experiment-validation-1", "study_id": "exact candidate study_id",
+        "candidate_sha256": "exact request candidate_sha256", "decision": "accepted|rejected",
+        "checks": [{"id": "unique_identifier", "outcome": "passed|failed",
+                    "evidence": "nonempty description of the observed check"}],
+        "metric_recalculations": [{"metric_id": "exact primary outcome id",
+            "reported_value": "exact candidate metric value, or null for an explicitly censored/undefined estimand",
+            "recalculated_value": "finite value independently recomputed from observations, or matching null",
+            "tolerance": "nonnegative finite number", "matches": "boolean; matching nulls are reproducible censoring"}],
+        "limitations": ["bounded limitations of this recalculation"],
+    }
+
+
 def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, runtime_version=None):
     work_orders = test_input.get("work_orders", []) if isinstance(test_input, dict) else []
     if not isinstance(work_orders, list):
@@ -837,17 +855,7 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
                         "role": "figure", "media_type": "image/png",
                         "caption": "nonempty scientific caption"}],
         },
-        "validator_output_exact_shapes": {
-            "schema_version": "experiment-validation-1", "study_id": "exact candidate study_id",
-            "candidate_sha256": "exact request candidate_sha256", "decision": "accepted|rejected",
-            "checks": [{"id": "unique_identifier", "outcome": "passed|failed",
-                        "evidence": "nonempty description of the observed check"}],
-            "metric_recalculations": [{"metric_id": "exact primary outcome id",
-                "reported_value": "exact candidate metric value, or null for an explicitly censored/undefined estimand",
-                "recalculated_value": "finite value independently recomputed from observations, or matching null",
-                "tolerance": "nonnegative finite number", "matches": "boolean; matching nulls are reproducible censoring"}],
-            "limitations": ["bounded limitations of this recalculation"],
-        },
+        "validator_output_exact_shapes": validator_output_contract(),
         "experiment_intent_example": {
             "id": "skewed_tail_comparison", "revision": 1, "study_type": "methods_validation",
             "domain": "robust statistics", "research_question": "Does estimator A lower tail error than B?",
@@ -1841,9 +1849,9 @@ def validate_program_review(value, *, prior_blocking_issues=None):
         if isinstance(item, dict) and isinstance(item.get("review_check_id"), str)
     }
     required_check_ids = PROGRAM_REVIEW_CHECKS | prior_check_ids
-    required = {"status", "checks", "findings"}
+    required = PROGRAM_REVIEW_REQUIRED_FIELDS
     if (not isinstance(value, dict) or not required.issubset(value)
-            or set(value) - (required | {"limitations"})):
+            or set(value) - PROGRAM_REVIEW_FIELDS):
         raise ValidationError("scientific program review requires status, checks and findings")
     limitations = value.get("limitations", [])
     if not isinstance(limitations, list) or any(not isinstance(item, str) or not item.strip() for item in limitations):
@@ -2064,7 +2072,9 @@ class CapabilityFoundry:
 
     def generate(self, brief, *, test_input=None, required_intent=None, client=None,
                  work_cache=None, on_progress=None, deadline=None,
-                 model_call_budget=None, repair_provenance=None):
+                 model_call_budget=None, repair_provenance=None, resume_work_ref=None):
+        if resume_work_ref is not None and work_cache is None:
+            raise ValidationError("foundry format resume requires its durable work cache")
         if model_call_budget is not None and (
                 type(model_call_budget) is not int or model_call_budget < 1):
             raise ValidationError("foundry model_call_budget must be a positive integer when supplied")
@@ -2132,7 +2142,8 @@ class CapabilityFoundry:
         state = {"status": "pending", "attempts": 0, "usage": {}, "requests": [],
                  "author_request_signatures": [],
                  "repair_gate_counts": {}, "repair_ledger": [],
-                 "assignment": base_prompt}
+                 "assignment": base_prompt,
+                 "repair_provenance": deepcopy_config(repair_provenance)}
         if work_cache is not None:
             contract = hashlib.sha256()
             for name in ("capability_foundry.py", "capability_registry.py", "experiment.py",
@@ -2142,7 +2153,8 @@ class CapabilityFoundry:
             key = work_cache.key(scope="experiment-capability", role="research.experiment-author",
                 system=SYSTEM, prompt={"assignment": base_prompt,
                     "validation_contract": contract.hexdigest(),
-                    "repair_provenance": repair_provenance},
+                    "repair_provenance": repair_provenance,
+                    **({"resume_work_ref": resume_work_ref} if resume_work_ref is not None else {})},
                 model={name: value for name, value in self.model_config.items() if name != "timeout_seconds"})
             state = work_cache.get(key) or state
             state.pop("cache_ref", None)
@@ -2179,7 +2191,17 @@ class CapabilityFoundry:
 
                 reusable_prior = []
                 resumable_response = None
-                for prior in work_cache.entries():
+                if resume_work_ref is None:
+                    prior_entries = work_cache.entries()
+                else:
+                    if not resume_work_ref.startswith(f"artifact:{work_cache.namespace}/"):
+                        raise ValidationError("foundry format resume references a foreign work namespace")
+                    manifest = work_cache.store.get(resume_work_ref)
+                    body = work_cache.store.read_body(manifest["body_hash"])
+                    if hashlib.sha256(body).hexdigest() != manifest["body_hash"]:
+                        raise ValidationError("foundry resume work body differs from its immutable digest")
+                    prior_entries = [{**json.loads(body), "cache_ref": resume_work_ref}]
+                for prior in prior_entries:
                     if prior.get("assignment") == base_prompt:
                         response = prior.get("last_response")
                         requests = prior.get("requests", [])
@@ -2321,6 +2343,8 @@ class CapabilityFoundry:
                             continue
                         if checked["status"] == "rejected":
                             state.setdefault("scientific_reviews", {})[identity] = deepcopy_config(review)
+                elif resume_work_ref is not None:
+                    raise ValidationError("referenced foundry work cannot resume the frozen scientific assignment")
 
         author_route_index = state.get("author_route_index", 0)
         if type(author_route_index) is not int or author_route_index < 0:
@@ -2336,6 +2360,25 @@ class CapabilityFoundry:
                 work_cache.put(key, state)
             if on_progress is not None:
                 on_progress(phase, deepcopy_config(state))
+
+        def execute_recorded(source, payload, operation):
+            result = self._execute(source, payload)
+            if work_cache is not None:
+                store = work_cache.store
+                record = {
+                    "operation": operation,
+                    "program_sha256": store.publish_object(source.encode("utf-8"), "text/x-python"),
+                    "stdin_sha256": store.publish_object(payload, "application/json"),
+                    "stdout_sha256": store.publish_object(result.stdout, "application/octet-stream"),
+                    "stderr_sha256": store.publish_object(result.stderr, "application/octet-stream"),
+                    "returncode": result.returncode,
+                    "timed_out": result.timed_out,
+                    "truncated": result.truncated,
+                    "mode": result.mode,
+                }
+                state.setdefault("sandbox_executions", []).append(record)
+                save("sandbox_execution_recorded")
+            return result
 
         def repair_exhausted_error():
             """Keep a rejected scientific review authoritative over a later bad response."""
@@ -2441,6 +2484,10 @@ class CapabilityFoundry:
                 "candidate_sha256": current_candidate_sha256,
                 "candidate_failure": _retained_candidate_failure(state, retained_candidate),
             })
+            if work_cache is not None:
+                retained_work = work_cache.get(key)
+                if retained_work is not None:
+                    error.repair_feedback["foundry_work_ref"] = retained_work["cache_ref"]
             error.model_diagnostics = {
                 "author_responses": deepcopy_config(
                     state.get("model_diagnostics", [])[-8:]),
@@ -2946,6 +2993,14 @@ class CapabilityFoundry:
                 # A prose or markdown prefix is not a valid place to resume raw
                 # JSON. Use the bounded schema repair path without echoing it.
                 return result
+            first_field = re.match(r'^\s*\{\s*("(?:[^"\\]|\\.)*")\s*:', result.text)
+            if first_field:
+                try:
+                    first_key = json.loads(first_field.group(1))
+                except ValueError:
+                    return result
+                if first_key not in PROGRAM_REVIEW_FIELDS:
+                    return result
             try:
                 parse_complete_json_object(
                     result.text, "independent program review", model_envelope=False)
@@ -3207,7 +3262,12 @@ class CapabilityFoundry:
                         raise blocked from exc
                     if review_attempt == 0:
                         continue
-                    raise ModelWorkBlocked(f"independent program review response is invalid: {exc}") from exc
+                    blocked = ModelWorkBlocked(
+                        f"independent program review response is invalid: {exc}")
+                    blocked.failure_class = "model_contract"
+                    blocked.recovery_mode = "format_repair_then_rerun"
+                    blocked.repair_gate = "review_response_format"
+                    raise blocked from exc
                 retained["status"] = "completed"
                 state["blocking_issue_ledger"] = _reconcile_prior_blocking_issues(
                     prior_blocking_issues, review)
@@ -3316,6 +3376,7 @@ class CapabilityFoundry:
                 "observation_schema": schema,
                 "contract": base_prompt["independent_validation_contract"],
                 "validator_output_exact_shapes": base_prompt["validator_output_exact_shapes"],
+                "readiness_handshake": validator_readiness_contract(),
                 "response_contract": {"validator_source": "complete Python source"},
                 "instructions": "Implement recalculation from raw observations and the frozen estimand. Never trust candidate metric values as recalculated values. Check every declared primary outcome, raw-data consistency, frozen limitations and finite values. No executor source or producer validator is available. Use only the declared runtime packages and permitted modules. Return only the complete JSON object.",
                 "runtime": runtime,
@@ -3378,13 +3439,14 @@ class CapabilityFoundry:
                     source = value["validator_source"]
                     scan_program_source(source, "independent program validator")
                     retained["source"] = source
-                    probe = self._execute(source, canonical_bytes({"readiness_probe": True}))
+                    probe = execute_recorded(source, canonical_bytes(
+                        validator_readiness_contract()["stdin"]), "validator_readiness")
                     if probe.timed_out and deadline is not None and time.monotonic() >= deadline:
                         raise CapabilityDeadlineError("independent validator readiness reached the mission deadline")
                     validate_validator_readiness(probe)
                     digest = hashlib.sha256(canonical_bytes(document)).hexdigest()
-                    preview = self._execute(source, canonical_bytes(experiment_validation_payload(
-                        intent, payload["configured_input"], document, digest)))
+                    preview = execute_recorded(source, canonical_bytes(experiment_validation_payload(
+                        intent, payload["configured_input"], document, digest)), "validator_preview")
                     if preview.timed_out and deadline is not None and time.monotonic() >= deadline:
                         raise CapabilityDeadlineError("independent validator protocol reached the mission deadline")
                     if preview.timed_out or preview.truncated or preview.returncode != 0:
@@ -3863,7 +3925,7 @@ class CapabilityFoundry:
                                               attempt_value["test_input"])
                 payload = canonical_bytes(payload_value)
                 save("sandbox_execution")
-                first = self._execute(executor, payload)
+                first = execute_recorded(executor, payload, "executor_preview")
                 if first.timed_out and deadline is not None and time.monotonic() >= deadline:
                     raise CapabilityDeadlineError("capability sandbox reached its mission deadline")
                 if first.timed_out or first.truncated or first.returncode != 0:
@@ -3899,9 +3961,10 @@ class CapabilityFoundry:
                 save("sandbox_validation")
                 admission = admit_program_candidate(
                     candidate_value,
-                    execute=lambda data, src=executor: self._execute(src, data),
-                    validate=lambda data, src=validator: self._execute(
-                        src, self._validator_input(data, attempt_value["experiment_intent"])),
+                    execute=lambda data, src=executor: execute_recorded(src, data, "executor_replay"),
+                    validate=lambda data, src=validator: execute_recorded(
+                        src, self._validator_input(data, attempt_value["experiment_intent"]),
+                        "validator_recalculation"),
                     readiness=lambda: validator_probe,
                     review=review_program)
                 if isinstance(repair_provenance, dict):

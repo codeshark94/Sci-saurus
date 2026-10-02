@@ -2823,6 +2823,61 @@ class CapabilityFoundryTests(unittest.TestCase):
         self.assertEqual((author.calls, reviewer.calls), (1, 2))
         self.assertEqual(reviewer.output_format, "json")
 
+    def test_truncated_evidence_echo_repairs_verdict_without_suffix_continuation(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            author = StubClient(self._payload())
+            outer = self
+            class Reviewer:
+                calls = 0
+                def complete(inner, *, system, prompt):
+                    inner.calls += 1
+                    packet = json.loads(prompt)
+                    outer.assertEqual(packet['assignment'], 'independent_scientific_program_review')
+                    if inner.calls == 1:
+                        return ModelResult('{"sta\\q":',
+                                           'reviewer', {'model_calls': 1}, 0, 'length')
+                    outer.assertIn('format_repair', packet)
+                    return ModelResult(json.dumps(outer._review_payload()),
+                                       'reviewer', {'model_calls': 1}, 0, 'stop')
+            foundry.reviewer_client = reviewer = Reviewer()
+            outcome = foundry.generate('bounded comparison', client=author,
+                                       work_cache=self._cache(root))
+            self.assertEqual(outcome['status'], 'registered')
+            self.assertEqual((author.calls, reviewer.calls), (1, 2))
+
+    def test_format_recovery_revalidates_frozen_executor_without_author_call(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            cache = self._cache(root)
+            author = StubClient(self._payload())
+            foundry.reviewer_client = StubClient({'invalid': True})
+            with self.assertRaises(ModelWorkBlocked) as failure:
+                foundry.generate('bounded comparison', client=author, work_cache=cache)
+            ref = failure.exception.repair_feedback['foundry_work_ref']
+            record = cache.store.get(ref)
+            frozen = json.loads(cache.store.read_body(record['body_hash']))
+            competing = deepcopy(frozen)
+            competing['last_attempt']['executor_source'] += '\n# distinct program\n'
+            competing['last_response']['text'] = json.dumps({
+                **self._payload(), 'executor_source': competing['last_attempt']['executor_source']})
+            competing.pop('response_base', None)
+            cache.put('distinct-work', competing)
+            foundry.reviewer_client = StubClient(self._review_payload())
+            next_author = StubClient({'invalid': True})
+            result = foundry.generate(frozen['assignment']['capability_brief'],
+                test_input=frozen['assignment']['configured_input'],
+                required_intent=frozen['last_attempt']['experiment_intent'],
+                client=next_author, work_cache=cache, resume_work_ref=ref)
+            self.assertEqual(result['status'], 'registered')
+            self.assertEqual(next_author.calls, 0)
+            self.assertEqual(result['candidate']['executor_source'],
+                             frozen['last_attempt']['executor_source'])
+            self.assertEqual(result['candidate']['experiment_intent'],
+                             frozen['last_attempt']['experiment_intent'])
+
     def test_unknown_review_continuation_is_not_replayed_after_resume(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -2865,11 +2920,46 @@ class CapabilityFoundryTests(unittest.TestCase):
             author = StubClient(self._payload())
             cache = self._cache(root)
             for _ in range(2):
-                with self.assertRaisesRegex(ModelWorkBlocked, "review response is invalid"):
+                with self.assertRaisesRegex(ModelWorkBlocked, "review response is invalid") as blocked:
                     foundry.generate("bounded comparison", client=author, work_cache=cache)
+                self.assertEqual(blocked.exception.failure_class, "model_contract")
+                self.assertEqual(blocked.exception.repair_gate, "review_response_format")
+                self.assertEqual(blocked.exception.recovery_mode, "format_repair_then_rerun")
             self.assertEqual(author.calls, 1)
             self.assertEqual(foundry.reviewer_client.calls, 2)
             self.assertFalse((root / "registry/capabilities/index.json").exists())
+            self.assertFalse(cache.entries()[0]["failed_candidates"])
+
+    def test_failed_review_retains_complete_sandbox_execution_objects(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            foundry.reviewer_client = StubClient({'invalid': True})
+            cache = self._cache(root)
+            with self.assertRaises(ModelWorkBlocked):
+                foundry.generate('bounded comparison', client=StubClient(self._payload()),
+                                 work_cache=cache)
+            runs = cache.entries()[0]['sandbox_executions']
+            self.assertEqual([r['operation'] for r in runs], [
+                'executor_preview', 'validator_readiness', 'validator_preview',
+                'executor_replay', 'executor_replay', 'executor_replay',
+                'validator_recalculation'])
+            store = cache.store
+            for run in runs:
+                for key in ('program_sha256', 'stdin_sha256', 'stdout_sha256', 'stderr_sha256'):
+                    body = store.read_body(run[key])
+                    self.assertEqual(hashlib.sha256(body).hexdigest(), run[key])
+                self.assertEqual(run['returncode'], 0)
+                self.assertEqual(run['mode'], 'sandbox-exec')
+                self.assertFalse(run['truncated'])
+                self.assertFalse(run['timed_out'])
+            raw = json.loads(store.read_body(runs[0]['stdout_sha256']))
+            validator_input = json.loads(store.read_body(runs[-1]['stdin_sha256']))
+            self.assertEqual(validator_input['candidate'], raw)
+            self.assertEqual(json.loads(store.read_body(runs[-1]['stdout_sha256']))['decision'],
+                             'accepted')
+            self.assertEqual({r['stdout_sha256'] for r in runs if r['operation']=='executor_replay'},
+                             {runs[0]['stdout_sha256']})
 
     def test_unhashable_review_fields_raise_validation_errors(self):
         from scisaurus.runtime.capability_foundry import validate_program_review
@@ -3830,6 +3920,10 @@ class IndependentValidatorAuthorshipTests(unittest.TestCase):
                 def complete(inner, *, system, prompt):
                     inner.calls += 1
                     packet = json.loads(prompt)
+                    self.assertEqual(packet['readiness_handshake']['stdin'],
+                                     {'readiness_probe': True})
+                    self.assertEqual(packet['readiness_handshake']['stdout'],
+                                     {'status': 'ready'})
                     self.assertEqual(set(packet['validator_output_exact_shapes']['checks'][0]),
                                      {'id', 'outcome', 'evidence'})
                     if inner.calls > 1:

@@ -777,6 +777,9 @@ def _verifier_repair_packet(value, *, detail="full"):
         }
         if "check_phase_protocol" in contract:
             output["repair_contract"]["check_phase_protocol"] = contract["check_phase_protocol"]
+        for key in ("executable_validator_output", "protocol_ownership"):
+            if key in contract:
+                output["repair_contract"][key] = _preserve_response_value(contract[key])
     for key in ("diagnostic_hypotheses", "proposed_changes", "root_causes",
                 "required_changes", "acceptance_checks", "repair_commands"):
         if isinstance(value.get(key), list):
@@ -1119,6 +1122,11 @@ def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, det
                     "Do not repeat an addressed prior finding as a required revision. Assess planned amendments "
                     "as design specifications; rereading amended executable source, tests, and raw results "
                     "belongs to execution checks. A proposed amendment is not a claim that it already ran. "
+                    "Use repair_contract.executable_validator_output for the program validator's schema, "
+                    "never your own model-report vocabulary. Judge whether the estimand, operator, and "
+                    "conditions are unambiguous; literal replacement field wording and executable source "
+                    "edits are the subsequent author's work, not additional plan-admission requirements "
+                    "when the proposed mathematical definition and protocol are already explicit. "
                     "Accept only if its root cause is evidenced, its source/design changes are specific, "
                     "the question and lineage are preserved, and its checks can falsify the repair. "
                     "Report a prose attribution discrepancy as non-blocking when the selected digest and "
