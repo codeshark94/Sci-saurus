@@ -1657,6 +1657,29 @@ def _compact_repair_context(value):
     return result
 
 
+def validator_methods_repair(brief, provenance):
+    """Bind separately authored validation to the admitted Methods repair plan."""
+    if isinstance(brief, str):
+        try:
+            brief = json.loads(brief)
+        except ValueError:
+            return None
+    context = brief.get("capability_repair") if isinstance(brief, dict) else None
+    plan = context.get("repair_plan") if isinstance(context, dict) else None
+    if plan is None:
+        return None
+    digest = hashlib.sha256(canonical_bytes(plan)).hexdigest()
+    if (not isinstance(plan, dict) or not isinstance(provenance, dict)
+            or provenance.get("kind") != "independent_repair"
+            or provenance.get("origin") != "composer_model_panel"
+            or provenance.get("repair_plan_sha256") != digest
+            or not provenance.get("panel_input_sha256")):
+        raise ValidationError("independent validator repair requires an admitted, fingerprint-bound Methods plan")
+    return {"repair_plan_sha256": digest,
+            "panel_input_sha256": provenance["panel_input_sha256"],
+            "panel_verdict_artifact_ref": provenance.get("panel_verdict_artifact_ref")}
+
+
 def authoring_patch_prompt(*, brief, required_intent, configured_input,
                            candidate, feedback, validation_context,
                            validation_feedback, format_repair):
@@ -2105,6 +2128,7 @@ class CapabilityFoundry:
         validate_work_orders(
             configured_input.get("work_orders")
             if isinstance(configured_input, dict) else None)
+        validator_repair_review = validator_methods_repair(brief, repair_provenance)
         requires_source_data = _requires_source_data_manifest(brief)
         source_manifest = (configured_input.get("source_data_manifest")
                            if isinstance(configured_input, dict) else None)
@@ -3412,6 +3436,7 @@ class CapabilityFoundry:
                 "experiment_intent": intent,
                 "configured_input": payload["configured_input"],
                 "observation_schema": schema,
+                "raw_observation_sample": deepcopy_config(document["observations"][:3]),
                 "contract": base_prompt["independent_validation_contract"],
                 "validator_output_exact_shapes": base_prompt["validator_output_exact_shapes"],
                 "readiness_handshake": validator_readiness_contract(),
@@ -3420,6 +3445,15 @@ class CapabilityFoundry:
                 "runtime": runtime,
                 "permitted_modules": ["json", "math", "statistics", "hashlib", "pathlib", "sys", "itertools", "functools", "random", "collections", "dataclasses", "typing", "decimal", "fractions", "re", "time", "os", "numpy", "matplotlib"],
             }
+            if validator_repair_review is not None:
+                assignment["methods_repair_review"] = validator_repair_review
+                assignment["instructions"] += (
+                    " A Methods repair has been admitted, but its implementation instructions and "
+                    "producer results remain blinded. Independently derive parameter mapping, "
+                    "observation indexing and estimand conventions from the current frozen intent "
+                    "and recorded row sample. Never alter a tolerance or acceptance check just to "
+                    "agree with the producer. No executor implementation is supplied and "
+                    "producer-authored validator patches are not admissible.")
             identity = hashlib.sha256(canonical_bytes(assignment)).hexdigest()
             retained = state.setdefault("validator_authorship", {}).setdefault(identity, {"status": "pending"})
             while True:
@@ -3989,9 +4023,13 @@ class CapabilityFoundry:
                     document, payload_value["configured_input"])
                 attempt_value.pop("validator_source", None)
                 state.pop("validator_failure", None)
+                state["last_attempt"] = deepcopy_config(attempt_value)
+                save("executor_observations_recorded")
                 validator, validator_authorship, validator_probe = author_independent_validator(
                     attempt_value["experiment_intent"], payload_value, document)
                 attempt_value["validator_source"] = validator
+                state["last_attempt"] = deepcopy_config(attempt_value)
+                save("independent_validator_bound")
                 digest = hashlib.sha256(canonical_bytes(document)).hexdigest()
                 candidate_value = {
                     "schema_version": "method-program-candidate-1",
@@ -4155,7 +4193,12 @@ class CapabilityFoundry:
                     # or make an uneditable extra field survive every patch.
                     last_attempt = {name: attempt_value[name] for name in ATTEMPT_FIELDS if name in attempt_value}
                     last_attempt.update(runtime=runtime, test_input=configured_input)
-                state.update(status="blocked" if repeated else "repairing", feedback=feedback,
+                needs_adjudication = (isinstance(exc, ProgramGateRejected)
+                                      and _repair_gate(exc) == "independent_recalculation")
+                if needs_adjudication:
+                    state.pop("format_repair", None)
+                    state["repair_owner"] = "methods_adjudication"
+                state.update(status="blocked" if repeated or needs_adjudication else "repairing", feedback=feedback,
                     last_attempt=last_attempt,
                     error=f"capability foundry did not admit a program: {feedback}")
                 gate = ("author_response_format" if partial_intent_response
@@ -4173,7 +4216,8 @@ class CapabilityFoundry:
                     "failure_signature": failure_signature,
                     "validation_context": deepcopy_config(state.get("validation_context", {})),
                     "validation_feedback": deepcopy_config(state.get("validation_feedback", {})),
-                    "next_action": (getattr(exc, "recovery_mode", None)
+                    "next_action": ("methods_adjudication_before_source_repair" if needs_adjudication
+                                    else getattr(exc, "recovery_mode", None)
                                     if scoped_contract_failure else
                                     "source_level_repair_then_fresh_replay"),
                 })
@@ -4182,7 +4226,7 @@ class CapabilityFoundry:
                     counts = state["repair_gate_counts"]
                     counts[gate] = counts.get(gate, 0) + 1
                 save("validation_failed")
-                if repeated:
+                if repeated or needs_adjudication:
                     raise repair_exhausted_error() from exc
                 if repairable_output_format:
                     prepare_author_format_retry(

@@ -3469,26 +3469,8 @@ class CapabilityFoundryTests(unittest.TestCase):
         self.assertNotEqual(_program_gate_failure_signature(first),
                             _program_gate_failure_signature(materially_different_result))
 
-    def test_repeated_independent_gate_result_stops_after_one_material_source_patch(self):
+    def test_independent_gate_disagreement_requires_adjudication_before_source_patch(self):
         from scisaurus.runtime.program_gates import ProgramGateRejected
-
-        payload = self._payload()
-
-        class SourceRevisionAuthor:
-            calls = 0
-
-            def complete(inner_self, *, system, prompt):
-                inner_self.calls += 1
-                if inner_self.calls == 1:
-                    response = payload
-                else:
-                    response = {"updates": {"executor_source": {"edits": [{
-                        "old": "def main():",
-                        "new": "# material source revision\ndef main():",
-                    }]}}}
-                return ModelResult(json.dumps(response), "stub",
-                                   {"model_calls": 1, "input_tokens": 4, "output_tokens": 8},
-                                   0.0, "stop")
 
         rejected = ProgramGateRejected(
             "independent recalculation did not accept the candidate",
@@ -3503,19 +3485,19 @@ class CapabilityFoundryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as path:
             foundry = self._foundry(Path(path))
             foundry.max_attempts = 8
-            author = SourceRevisionAuthor()
+            author = StubClient(self._payload())
             with patch("scisaurus.runtime.capability_foundry.admit_program_candidate",
                        side_effect=rejected):
                 with self.assertRaises(ModelWorkBlocked) as blocked:
                     foundry.generate("bounded comparison", client=author)
 
         ledger = blocked.exception.repair_ledger
-        self.assertEqual(author.calls, 2)
-        self.assertEqual(len(ledger), 2)
-        self.assertEqual(ledger[0]["failure_signature"], ledger[1]["failure_signature"])
-        self.assertNotEqual(ledger[0]["candidate_sha256"], ledger[1]["candidate_sha256"])
-        self.assertTrue(ledger[1]["failure_signature"].startswith(
+        self.assertEqual(author.calls, 1)
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(ledger[0]["next_action"], "methods_adjudication_before_source_repair")
+        self.assertTrue(ledger[0]["failure_signature"].startswith(
             "program_gate:independent_recalculation:"))
+        self.assertEqual(blocked.exception.failure_class, "experiment_capability_repair")
 
     def test_truncated_patch_preserves_scientific_review_without_reclassifying_it_as_a_review_failure(self):
         payload = self._payload()
@@ -4268,3 +4250,118 @@ class IndependentValidatorAuthorshipTests(unittest.TestCase):
             outcome = foundry.generate('bounded comparison', client=author)
             self.assertEqual(outcome['status'], 'registered')
             self.assertEqual((author.calls, foundry.validator_client.calls), (2, 1))
+
+
+class RecalculationOwnershipTests(unittest.TestCase):
+    def test_valid_rejection_hands_ownership_to_methods_before_producer_retry(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            producer = StubClient(CapabilityFoundryTests._payload())
+            bad_validator = MINI_VALIDATOR.replace('    reported =', '    p95 += 1\n    reported =')
+            foundry.validator_client = StubClient({'validator_source': bad_validator})
+            cache = CapabilityFoundryTests._cache(self, root)
+            states = []
+            for _ in range(2):
+                with self.assertRaises(ModelWorkBlocked) as raised:
+                    foundry.generate('bounded comparison', client=producer, work_cache=cache,
+                                     on_progress=lambda phase, state: states.append(state))
+                self.assertEqual(raised.exception.failure_class, 'experiment_capability_repair')
+                self.assertEqual(raised.exception.repair_gate, 'independent_recalculation')
+            self.assertEqual(producer.calls, 1)
+            self.assertEqual(foundry.validator_client.calls, 1)
+            self.assertEqual(foundry.reviewer_client.calls, 0)
+            self.assertEqual(states[-1]['repair_owner'], 'methods_adjudication')
+            self.assertEqual(states[-1]['repair_ledger'][-1]['next_action'],
+                             'methods_adjudication_before_source_repair')
+            self.assertEqual(states[-1]['last_attempt']['executor_source'], MINI_EXECUTOR)
+            self.assertEqual(states[-1]['last_attempt']['validator_source'], bad_validator)
+            self.assertFalse(list((root / 'registry').glob('**/*.json')))
+
+    @staticmethod
+    def _methods_review():
+        plan = {'disposition': 'repair', 'root_cause': {'statement': 'Clarify the frozen estimand.',
+                'evidence': ['The independent source uses a different convention.']},
+                'required_changes': [{'target': 'validator', 'instruction': 'Use the declared convention.',
+                                     'scientific_basis': 'Frozen primary outcome definition.', 'source_refs': []}]}
+        brief = {'capability_repair': {'repair_plan': plan}}
+        provenance = {'kind': 'independent_repair', 'origin': 'composer_model_panel',
+                      'repair_plan_sha256': hashlib.sha256(canonical_bytes(plan)).hexdigest(),
+                      'panel_input_sha256': 'a' * 64,
+                      'panel_verdict_artifact_ref': 'artifact:methods/verifier@1'}
+        return brief, provenance
+
+    def test_validator_author_receives_bound_methods_plan_and_raw_conventions(self):
+        brief, provenance = self._methods_review()
+        brief['capability_repair']['repair_plan']['root_cause']['evidence'].append(MINI_EXECUTOR)
+        brief['capability_repair']['repair_plan']['required_changes'][0]['instruction'] += ' reported_metric=987654.321'
+        provenance['repair_plan_sha256'] = hashlib.sha256(canonical_bytes(brief['capability_repair']['repair_plan'])).hexdigest()
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            validator = foundry.validator_client
+            complete = validator.complete
+            prompts = []
+            def inspect(**kwargs):
+                prompts.append(json.loads(kwargs['prompt']))
+                return complete(**kwargs)
+            validator.complete = inspect
+            outcome = foundry.generate(json.dumps(brief), client=StubClient(CapabilityFoundryTests._payload()),
+                                       repair_provenance=provenance)
+            self.assertEqual(outcome['status'], 'registered')
+            assignment = prompts[0]
+            self.assertNotIn('repair_plan', assignment['methods_repair_review'])
+            self.assertNotIn('reported_metric=987654.321', json.dumps(assignment))
+            self.assertEqual(assignment['methods_repair_review']['repair_plan_sha256'], provenance['repair_plan_sha256'])
+            self.assertTrue(assignment['raw_observation_sample'])
+            self.assertNotIn('executor_source', assignment)
+            self.assertNotIn(MINI_EXECUTOR, json.dumps(assignment))
+            self.assertNotIn('metrics', assignment)
+            changed = deepcopy(brief)
+            changed['capability_repair']['repair_plan']['required_changes'][0]['instruction'] = 'Clarify indexing.'
+            from scisaurus.runtime.capability_foundry import validator_methods_repair
+            updated_provenance = {**provenance, 'repair_plan_sha256': hashlib.sha256(canonical_bytes(changed['capability_repair']['repair_plan'])).hexdigest()}
+            revised = deepcopy(assignment)
+            revised['methods_repair_review'] = validator_methods_repair(changed, updated_provenance)
+            self.assertNotEqual(hashlib.sha256(canonical_bytes(assignment)).hexdigest(),
+                                hashlib.sha256(canonical_bytes(revised)).hexdigest())
+
+    def test_unadmitted_or_tampered_methods_plan_is_rejected_before_dispatch(self):
+        brief, provenance = self._methods_review()
+        for mutation in ['digest', 'input', 'origin']:
+            damaged = deepcopy(provenance)
+            damaged[{'digest': 'repair_plan_sha256', 'input': 'panel_input_sha256', 'origin': 'origin'}[mutation]] = None
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as path:
+                producer = StubClient(CapabilityFoundryTests._payload())
+                foundry = CapabilityFoundryTests._foundry(Path(path))
+                with self.assertRaisesRegex(ValidationError, 'fingerprint-bound Methods plan'):
+                    foundry.generate(brief, client=producer, repair_provenance=damaged)
+                self.assertEqual(producer.calls, 0)
+                self.assertEqual(foundry.validator_client.calls, 0)
+
+    def test_validator_budget_boundary_preserves_current_executor_without_old_verdict(self):
+        with tempfile.TemporaryDirectory() as path:
+            foundry = CapabilityFoundryTests._foundry(Path(path))
+            states = []
+            with self.assertRaises(CapabilityModelBudgetExceeded):
+                foundry.generate('bounded comparison', client=StubClient(CapabilityFoundryTests._payload()),
+                                 model_call_budget=1,
+                                 on_progress=lambda phase, state: states.append((phase, state)))
+            latest = states[-1][1]
+            self.assertEqual(latest['last_attempt']['executor_source'], MINI_EXECUTOR)
+            self.assertEqual(latest['last_attempt']['experiment_intent'], INTENT)
+            self.assertEqual(latest['last_attempt']['test_input'], {'probe': True})
+            self.assertNotIn('validator_source', latest['last_attempt'])
+            self.assertEqual(foundry.validator_client.calls, 0)
+            self.assertIn('executor_observations_recorded', [phase for phase, _ in states])
+
+
+    def test_legacy_admitted_plan_retains_missing_verdict_reference_without_invention(self):
+        from scisaurus.runtime.capability_foundry import validator_methods_repair
+        from scisaurus.runtime.composer import ComposerRunner
+        brief, _ = self._methods_review()
+        context = {**brief['capability_repair'], 'input_sha256': 'a' * 64, 'ledger': None}
+        provenance = ComposerRunner._capability_repair_provenance(context)
+        binding = validator_methods_repair(brief, provenance)
+        self.assertIsNone(binding['panel_verdict_artifact_ref'])
+        self.assertEqual(binding['repair_plan_sha256'], provenance['repair_plan_sha256'])

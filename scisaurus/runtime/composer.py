@@ -9798,6 +9798,8 @@ class ComposerRunner:
             "panel_stage_id": ledger.get("panel_stage_id"),
             "panel_input_sha256": repair_context.get("input_sha256"),
             "panel_verdict_artifact_ref": ledger.get("verifier_artifact_ref"),
+            **({"repair_plan_sha256": hashlib.sha256(canonical_bytes(repair_context["repair_plan"])).hexdigest()}
+               if isinstance(repair_context.get("repair_plan"), dict) else {}),
             "diagnostic_hypotheses": records("diagnostic_hypotheses", "root_causes"),
             "proposed_changes": records("proposed_changes", "required_changes"),
         }
