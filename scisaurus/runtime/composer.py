@@ -17418,7 +17418,9 @@ class ComposerRunner:
         from scisaurus.runtime.models import ModelResult
         from scisaurus.runtime.survey import acquisition_succeeded
         from scisaurus.runtime.survey_records import (FOLLOW_UP_COMPLETION_CONTRACT, FOLLOW_UP_COMPLETION_REVIEW_CONTRACT,
-                    follow_up_inventory, project_follow_up_inventory, validate_follow_up_result, validate_follow_up_completion)
+                    FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT,
+                    follow_up_inventory, project_follow_up_inventory, validate_follow_up_result, validate_follow_up_completion,
+                    follow_up_completion_basis)
         result = run.get("follow_up_result")
         if (not isinstance(result, dict) or not isinstance(result.get("ref"), str)
                 or any(not isinstance(run.get(key), str) for key in ("survey_ref", "assessment_ref"))):
@@ -17506,7 +17508,8 @@ class ComposerRunner:
                                               record_inventory=record_inventory,
                                               require_completion=completion_contract == FOLLOW_UP_COMPLETION_CONTRACT)
                     completion_review_contract = assignment.get("completion_review_contract")
-                    if completion_review_contract not in (None, FOLLOW_UP_COMPLETION_REVIEW_CONTRACT):
+                    if completion_review_contract not in (None, FOLLOW_UP_COMPLETION_REVIEW_CONTRACT,
+                                                          FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT):
                         return False
                     if completion_review_contract is not None:
                         if completion_refs is None or len(assigned) != 1 or len(response["orders"]) != 1:
@@ -17524,7 +17527,9 @@ class ComposerRunner:
                                 or completion_assignment.get("survey_ref") != run["survey_ref"]
                                 or completion_assignment.get("assessment_ref") != run["assessment_ref"]
                                 or completion_assignment.get("disposition_execution_ref") != execution_ref
-                                or completion_assignment.get("disposition") != response["orders"][0]
+                                or completion_assignment.get("disposition") != (
+                                    response["orders"][0] if completion_review_contract == FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT
+                                    else follow_up_completion_basis(response["orders"][0]))
                                 or completion_body.get("finish_reason", "stop") not in {"stop", "length"}):
                             return False
                         completion = ModelResult(text=completion_body["text"], model="retained", usage={},

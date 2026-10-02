@@ -1779,9 +1779,11 @@ class TestSurveyRunner(unittest.TestCase):
             self.assertTrue(ComposerRunner._survey_follow_up_was_replayed(self.root / "run", result, order))
         assignment = assignments[0]
         self.assertNotIn("scientific_input_recovery", assignment)
-        self.assertEqual(assignment["disposition"]["completion"]["outcome"], "unmet")
-        self.assertEqual({k:v for k,v in assignment["disposition"].items() if k != "completion"},
-                         {k:v for k,v in row.items() if k != "completion"})
+        self.assertNotIn("completion", assignment["disposition"])
+        self.assertNotIn("rationale", assignment["disposition"])
+        self.assertNotIn("next_action", assignment["disposition"])
+        from scisaurus.runtime.survey_records import follow_up_completion_basis
+        self.assertEqual(assignment["disposition"], follow_up_completion_basis(row))
         self.assertEqual(assignment["work_orders"], [order])
         for changed in ({"completion_execution_refs": []}, {"completion_execution_refs": [body["execution_ref"]]},
                         {"completion_execution_refs": None},
@@ -1807,6 +1809,19 @@ class TestSurveyRunner(unittest.TestCase):
                 return tuple(values)
             with self.subTest(field=field), patch.object(SurveyGate, "_recorded_execution", new=altered):
                 self.assertFalse(ComposerRunner._survey_follow_up_was_replayed(self.root / "run", result, order))
+
+    def test_prior_completion_review_contract_replays_its_full_pinned_disposition(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        from scisaurus.runtime.survey_records import FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT
+        order = self.follow_up_order()
+        runner = self.runtime(survey_config(self.endpoint, "follow-up-conflicted-completion"), work_orders=[order])
+        with patch("scisaurus.runtime.survey.FOLLOW_UP_COMPLETION_REVIEW_CONTRACT",
+                   FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT), \
+             patch("scisaurus.runtime.survey.follow_up_completion_basis", side_effect=deepcopy):
+            result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertTrue(ComposerRunner._survey_follow_up_was_replayed(self.root / "run", result, order))
+        self.assertTrue(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, order))
 
     def test_capture_required_follow_up_does_not_close_on_unavailable_evidence(self):
         from scisaurus.runtime.composer import ComposerRunner

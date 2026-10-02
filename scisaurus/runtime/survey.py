@@ -39,6 +39,7 @@ from scisaurus.runtime.scores import exact, identifier
 from scisaurus.runtime.survey_config import validate_survey_config, search_query
 from scisaurus.runtime.survey_records import (
     FOLLOW_UP_COMPLETION_CONTRACT, FOLLOW_UP_COMPLETION_REVIEW_CONTRACT, validate_follow_up_completion,
+    follow_up_completion_basis,
     MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, CRITIQUE_DISPOSITIONS, normalize_check_envelope,
     BODY_SECTION_MARKERS, authoritative_source, has_section_heading as _has_section_heading,
     normalize_gap_assessment_envelope, validate_map,
@@ -821,7 +822,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "phase": "survey_operation_completion", "completion_review_contract": FOLLOW_UP_COMPLETION_REVIEW_CONTRACT,
             "work_orders": [order], "follow_up_ref": self.follow_up_ref,
             "survey_ref": self.survey_ref, "assessment_ref": self.assessment_ref,
-            "disposition_execution_ref": execution_ref, "disposition": deepcopy(disposition),
+            "disposition_execution_ref": execution_ref, "disposition": follow_up_completion_basis(disposition),
             "instructions": (
                 "Return only {outcome:met|unmet,rationale:string}. Independently evaluate the assigned order's "
                 "exact success_condition against the validated disposition, not the producer's completion verdict. "
