@@ -9343,6 +9343,9 @@ class ComposerRunner:
         if isinstance(value, dict):
             output = {}
             for index, (key, item) in enumerate(value.items()):
+                if str(key) == "foundry_execution_evidence":
+                    output[str(key)] = _preserve_response_value(item)
+                    continue
                 if index >= max_keys:
                     output["[truncated_keys]"] = True
                     break
@@ -9874,12 +9877,10 @@ class ComposerRunner:
                 raise ValidationError("No current-source validator output is bound to the executor result")
             def encoded_document(value):
                 text = redact_sensitive_text(canonical_bytes(value).decode())
-                limit = 16 * 7000
-                complete = len(text) <= limit
-                return {"complete": complete, "characters": len(text),
+                return {"complete": True, "characters": len(text),
                         "source_chunks": [text[offset:offset + 7000]
-                                          for offset in range(0, min(len(text), limit), 7000)],
-                        "omission_reason": None if complete else "The serialized evidence exceeds the repair transport size."}
+                                          for offset in range(0, len(text), 7000)],
+                        "omission_reason": None}
             columns = {}
             for name in sorted({key for row in observations for key in row}):
                 values = [row[name] for row in observations if name in row]

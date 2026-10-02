@@ -2499,7 +2499,9 @@ class ComposerWorkflowTests(unittest.TestCase):
             intent = {**deepcopy(INTENT), "id": "study", "revision": 2}
             configured = {"grid": [1, 2, 3]}
             document = {"study_id": "study", "revision": 2,
-                        "observations": [{"condition": "cell-" + str(i), "x": i} for i in range(480)],
+                        "observations": [{"condition": "cell-" + str(i), "x": i,
+                            "measurement_context": "Declared observation metadata. " * 10}
+                            for i in range(480)],
                         "metrics": [], "assets": [{"data": "excluded"}],
                         "analysis": {"comparisons": ["Compare the declared conditions."]}}
             from scisaurus.runtime.experiment import normalize_program_output
@@ -2531,6 +2533,8 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(raw["observations"], document["observations"])
             self.assertNotIn("assets", raw)
             self.assertTrue(evidence["executor_output"]["complete"])
+            self.assertGreater(evidence["executor_output"]["characters"], 16 * 7000)
+            self.assertGreater(len(evidence["executor_output"]["source_chunks"]), 16)
             self.assertEqual(json.loads("".join(evidence["validator_output"]["source_chunks"])), verdict)
             manifest = runner.store.publish_artifact(logical_id="command/foundry-work/recorded-fixture",
                 artifact_type="note", media_type="application/json", body=canonical_bytes(work),
@@ -2548,6 +2552,10 @@ class ComposerWorkflowTests(unittest.TestCase):
             hydrated = runner._failure_dossier_evidence(dossier["artifact_ref"],
                 expected_stage_id="experiment", expected_attempt_number=1)
             self.assertEqual(hydrated["foundry_execution_evidence"], evidence)
+            projected = runner._capability_repair_projection(
+                {"failure_dossier": hydrated}, max_depth=9, max_keys=48,
+                max_items=12, max_text=20_000)
+            self.assertEqual(projected["failure_dossier"]["foundry_execution_evidence"], evidence)
             packet = {"foundry_execution_evidence": evidence}
             from scisaurus.runtime.specialists import build_specialist_prompt, build_repair_adjudication_prompt, _verifier_repair_packet
             role_prompt = json.loads(build_specialist_prompt({"role_id": "analysis-reviewer",
