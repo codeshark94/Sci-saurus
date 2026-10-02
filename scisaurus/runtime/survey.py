@@ -38,8 +38,9 @@ from scisaurus.runtime.operation_adapters import get_adapter
 from scisaurus.runtime.scores import exact, identifier
 from scisaurus.runtime.survey_config import validate_survey_config, search_query
 from scisaurus.runtime.survey_records import (
-    FOLLOW_UP_COMPLETION_CONTRACT, FOLLOW_UP_COMPLETION_REVIEW_CONTRACT, validate_follow_up_completion,
-    follow_up_completion_basis,
+    FOLLOW_UP_COMPLETION_CONTRACT, FOLLOW_UP_COMPLETION_REVIEW_CONTRACT,
+    FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT, validate_follow_up_completion,
+    follow_up_completion_basis, follow_up_completion_context, replay_follow_up_response,
     MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, CRITIQUE_DISPOSITIONS, normalize_check_envelope,
     BODY_SECTION_MARKERS, authoritative_source, has_section_heading as _has_section_heading,
     normalize_gap_assessment_envelope, validate_map,
@@ -818,14 +819,22 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
 
     def _review_follow_up_completion(self, order, disposition, execution_ref):
         """Assess operation acceptance against an immutable scientific disposition."""
+        _, _, _, params = self.gate._recorded_execution(
+            execution_ref, "methods.evidence-verifier", operation="model", task_kinds={"review"})
+        evidence_assignment = json.loads(params["prompt"])
         assignment = {
             "phase": "survey_operation_completion", "completion_review_contract": FOLLOW_UP_COMPLETION_REVIEW_CONTRACT,
             "work_orders": [order], "follow_up_ref": self.follow_up_ref,
             "survey_ref": self.survey_ref, "assessment_ref": self.assessment_ref,
-            "disposition_execution_ref": execution_ref, "disposition": follow_up_completion_basis(disposition),
+            "disposition_execution_ref": execution_ref,
+            "disposition": follow_up_completion_basis(disposition, contract=FOLLOW_UP_COMPLETION_REVIEW_CONTRACT),
+            "evidence_context": follow_up_completion_context(evidence_assignment),
             "instructions": (
                 "Return only {outcome:met|unmet,rationale:string}. Independently evaluate the assigned order's "
-                "exact success_condition against the validated disposition, not the producer's completion verdict. "
+                "exact success_condition against the validated disposition and its captured evidence_context, "
+                "not the producer's completion verdict. Rationale and next_action are scientific deliverables to "
+                "evaluate, not an acceptance verdict. Check their claims against the captured sources, inventory "
+                "and bounded search records. Distinguish a declared scientific decision from a suggestion to decide later. "
                 "The objective describes desired scientific inputs; success_condition controls operation acceptance. "
                 "Explain how each requested deliverable meets or fails that condition. Honor its explicit alternatives. "
                 "If it permits recording unavailable inputs, the disposition's itemized, scoped availability record "
@@ -837,6 +846,72 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         identity = hashlib.sha256(canonical_bytes({"order": order, "execution_ref": execution_ref})).hexdigest()
         return self._model_checked(f"follow-up-acceptance-{identity}", "methods.evidence-verifier", assignment,
                                    validate_follow_up_completion, stage="supervision", task_kind="review")
+
+    def _prior_follow_up_completion_reviews(self):
+        """Return exact failed acceptance feedback to the disposition's author."""
+        rows = self.control._conn.execute(
+            "SELECT artifact_ref FROM artifacts WHERE logical_id LIKE ? ORDER BY created_at DESC",
+            ("command/survey-follow-up-results/%",)).fetchall()
+        pending, feedback = {order["id"] for order in self.work_orders}, []
+        for record in rows:
+            manifest = self.store.get(record["artifact_ref"])
+            report = self._body(manifest)
+            if report.get("follow_up_ref") != self.follow_up_ref:
+                continue
+            completion_refs = report.get("completion_execution_refs")
+            if completion_refs is None:
+                continue
+            execution_refs = report.get("execution_refs", [report.get("execution_ref")])
+            if (manifest.get("author") != "methods.evidence-verifier"
+                    or not isinstance(completion_refs, list) or not isinstance(execution_refs, list)
+                    or len(completion_refs) != len(report.get("orders", []))
+                    or len(execution_refs) != len(completion_refs)):
+                raise StateError("follow-up completion feedback lacks its independent review provenance")
+            for index, row in enumerate(report.get("orders", [])):
+                if row.get("id") not in pending:
+                    continue
+                review_ref = completion_refs[index]
+                _, _, reviewed, params = self.gate._recorded_execution(
+                    review_ref, "methods.evidence-verifier", operation="model", task_kinds={"review"})
+                review_assignment = json.loads(params["prompt"])
+                writer_ref = execution_refs[index]
+                _, _, written, writer_params = self.gate._recorded_execution(
+                    writer_ref, "methods.evidence-verifier", operation="model", task_kinds={"review"})
+                writer_assignment = json.loads(writer_params["prompt"])
+                captured_sources = {source["source_ref"]: self._body(self.store.get(source["source_ref"]))
+                                    for source in writer_assignment["sources"]}
+                written_rows = replay_follow_up_response(written, writer_assignment, captured_sources)["orders"]
+                if (writer_ref not in {item["ref"] for item in manifest["inputs"]}
+                        or writer_assignment.get("follow_up_ref") != self.follow_up_ref
+                        or len(written_rows) != 1 or written_rows[0].get("id") != row["id"]
+                        or follow_up_completion_basis(written_rows[0]) != follow_up_completion_basis(row)
+                        or review_assignment.get("disposition_execution_ref") != writer_ref):
+                    raise StateError("follow-up completion feedback differs from its recorded scientific disposition")
+                completion = ModelResult(text=reviewed["text"], model="retained", usage={}, elapsed_seconds=0,
+                    finish_reason=reviewed.get("finish_reason", "stop")).json_object(allow_missing_closers=True)
+                validate_follow_up_completion(completion)
+                review_contract = review_assignment.get("completion_review_contract")
+                prior_basis = review_assignment.get("disposition")
+                expected_basis = follow_up_completion_basis(row, contract=review_contract)
+                if review_contract == FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT:
+                    prior_basis = follow_up_completion_basis(prior_basis)
+                    expected_basis = follow_up_completion_basis(row)
+                if (review_ref not in {item["ref"] for item in manifest["inputs"]}
+                        or review_assignment.get("follow_up_ref") != self.follow_up_ref
+                        or review_assignment.get("work_orders") != [next(
+                            order for order in self.work_orders if order["id"] == row["id"])]
+                        or prior_basis != expected_basis
+                        or completion != row.get("completion")):
+                    raise StateError("follow-up completion feedback differs from its recorded independent review")
+                pending.remove(row["id"])
+                if row.get("completion", {}).get("outcome") == "unmet":
+                    feedback.append({"report_ref": record["artifact_ref"], "order_id": row["id"],
+                        "disposition": follow_up_completion_basis(written_rows[0]),
+                        "review": deepcopy(row["completion"]),
+                        "review_execution_ref": review_ref})
+            if not pending:
+                break
+        return feedback
 
     def _resolve_follow_up(self):
         if not self.work_orders:
@@ -897,6 +972,13 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         orders, executions, completion_executions = [], [], []
         for order in self.work_orders:
             scoped = self._follow_up_assignment({**assignment, "work_orders": [order]})
+            scoped["prior_completion_reviews"] = [review for review in self._prior_follow_up_completion_reviews()
+                                                   if review["order_id"] == order["id"]]
+            scoped["instructions"] += (
+                " Address the exact deficiencies in any prior_completion_reviews against the current captured "
+                "evidence. Preserve valid findings and unresolved science; do not repeat the same disposition "
+                "without addressing its independent review. A requested scientific decision must be explicitly "
+                "stated and supported rather than deferred as a future action.")
             scoped["survey_inventory"] = self._project_follow_up_inventory(
                 assignment["survey_inventory"], order)
             for chars in (12000, 6000, 3000, 1000, 300):

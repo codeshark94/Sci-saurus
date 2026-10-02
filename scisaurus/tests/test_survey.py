@@ -250,6 +250,13 @@ def simulated_survey_worker(kind, params, channel):
         disposition = assignment["disposition"]
         value = {"outcome": "unmet" if mode in {"follow-up-capture-required", "follow-up-records-only"} else "met",
                  "rationale": "The exact operation's permitted availability record is present."}
+        if mode == "follow-up-decision-required":
+            context = assignment.get("evidence_context", {})
+            complete = ("prediction" in disposition.get("next_action", "")
+                        and bool(disposition.get("rationale")) and bool(context.get("searches"))
+                        and bool(context.get("survey_inventory", {}).get("works")))
+            value = {"outcome": "met" if complete else "unmet",
+                     "rationale": "Check the declared scientific decision and captured bounded search."}
     elif phase == "survey_follow_up":
         value = {"orders": [{
             "id": order["id"], "status": "limited", "rationale": "The bounded evidence does not resolve this measurement.",
@@ -261,6 +268,10 @@ def simulated_survey_worker(kind, params, channel):
         if mode in {"follow-up-capture-required", "follow-up-conflicted-completion"}:
             for row in value["orders"]:
                 row["completion"] = {"outcome": "unmet", "rationale": "The required numeric capture is absent."}
+        if mode == "follow-up-decision-required":
+            for row in value["orders"]:
+                row["next_action"] = "Proceed as a prediction study; empirical confirmation remains unsupported."
+                row["completion"] = {"outcome": "unmet", "rationale": "No measured result is established."}
         if mode == "follow-up-missing-completion":
             for row in value["orders"]:
                 row.pop("completion")
@@ -872,6 +883,12 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertTrue(assignment["evidence_catalog"])
         self.assertTrue(all("text" not in source for source in assignment["sources"]))
         self.assertNotIn("previous_response", assignment["validation_feedback"])
+        _, _, _, review_params = SurveyGate(control, store)._recorded_execution(
+            report["completion_execution_refs"][1], "methods.evidence-verifier", operation="model",
+            task_kinds={"review"})
+        review_assignment = json.loads(review_params["prompt"])
+        self.assertEqual(review_assignment["evidence_context"]["evidence_catalog"],
+                         assignment["evidence_catalog"])
         for order in orders:
             self.assertTrue(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", completed, order))
 
@@ -1780,11 +1797,18 @@ class TestSurveyRunner(unittest.TestCase):
         assignment = assignments[0]
         self.assertNotIn("scientific_input_recovery", assignment)
         self.assertNotIn("completion", assignment["disposition"])
-        self.assertNotIn("rationale", assignment["disposition"])
-        self.assertNotIn("next_action", assignment["disposition"])
+        self.assertEqual(assignment["disposition"]["rationale"], row["rationale"])
+        self.assertEqual(assignment["disposition"]["next_action"], row["next_action"])
         from scisaurus.runtime.survey_records import follow_up_completion_basis
         self.assertEqual(assignment["disposition"], follow_up_completion_basis(row))
         self.assertEqual(assignment["work_orders"], [order])
+        disposition_execution = store.get(body["execution_ref"])
+        context_ref = disposition_execution["inputs"][0]["ref"]
+        context = json.loads(store.read_body(store.get(context_ref)["body_hash"]))
+        disposition_assignment = json.loads(context["prompt"])
+        from scisaurus.runtime.survey_records import follow_up_completion_context
+        self.assertEqual(assignment["evidence_context"], follow_up_completion_context(disposition_assignment))
+        self.assertTrue(assignment["evidence_context"]["searches"])
         for changed in ({"completion_execution_refs": []}, {"completion_execution_refs": [body["execution_ref"]]},
                         {"completion_execution_refs": None},
                         {"orders": [{**row, "completion": {"outcome": "unmet", "rationale": "Operator rewrite."}}]}):
@@ -1799,7 +1823,10 @@ class TestSurveyRunner(unittest.TestCase):
         for field, value in (("disposition_execution_ref", "artifact:foreign/execution@1"),
                              ("work_orders", [{**order, "success_condition": "Different acceptance."}]),
                              ("survey_ref", "artifact:foreign/survey@1"),
-                             ("disposition", {**assignment["disposition"], "limitation": ""})):
+                             ("disposition", {**assignment["disposition"], "limitation": ""}),
+                             ("evidence_context", {**assignment["evidence_context"], "searches": []}),
+                             ("evidence_context", {**assignment["evidence_context"], "sources": []}),
+                             ("evidence_context", {**assignment["evidence_context"], "survey_inventory": {}})):
             def altered(gate, ref, *args, **kwargs):
                 values = list(recorded(gate, ref, *args, **kwargs))
                 if ref == completion_ref:
@@ -1816,11 +1843,79 @@ class TestSurveyRunner(unittest.TestCase):
         order = self.follow_up_order()
         runner = self.runtime(survey_config(self.endpoint, "follow-up-conflicted-completion"), work_orders=[order])
         with patch("scisaurus.runtime.survey.FOLLOW_UP_COMPLETION_REVIEW_CONTRACT",
-                   FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT), \
-             patch("scisaurus.runtime.survey.follow_up_completion_basis", side_effect=deepcopy):
+                   FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT):
             result = runner.run()
         self.assertEqual(result["status"], "completed", result["error"])
         self.assertTrue(ComposerRunner._survey_follow_up_was_replayed(self.root / "run", result, order))
+        self.assertTrue(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, order))
+        runner.control, runner.store = self.open_store()
+        runner.gate = SurveyGate(runner.control, runner.store)
+        self.assertEqual(runner._prior_follow_up_completion_reviews(), [])
+
+    def test_prior_evidence_only_completion_review_remains_replayable(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        from scisaurus.runtime.survey_records import FOLLOW_UP_COMPLETION_REVIEW_EVIDENCE_CONTRACT
+        order = self.follow_up_order()
+        runner = self.runtime(survey_config(self.endpoint, "follow-up-conflicted-completion"), work_orders=[order])
+        with patch("scisaurus.runtime.survey.FOLLOW_UP_COMPLETION_REVIEW_CONTRACT",
+                   FOLLOW_UP_COMPLETION_REVIEW_EVIDENCE_CONTRACT):
+            result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertTrue(ComposerRunner._survey_follow_up_was_replayed(self.root / "run", result, order))
+        self.assertTrue(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, order))
+        runner.control, runner.store = self.open_store()
+        runner.gate = SurveyGate(runner.control, runner.store)
+        self.assertEqual(runner._prior_follow_up_completion_reviews(), [])
+
+    def test_unmet_completion_feedback_reaches_the_disposition_author(self):
+        order = {**self.follow_up_order(), "success_condition": "Capture the numeric measurement with units."}
+        config = survey_config(self.endpoint, "follow-up-capture-required")
+        first = self.runtime(config, work_orders=[order]).run()
+        self.assertEqual(first["status"], "completed", first["error"])
+        policy = {"additional_seconds": config["limits"]["wall_clock_seconds"],
+                  "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["gap_assessment"]}}
+        runner = self.runtime(config, work_orders=[order], resume_policy=policy)
+        reviews = runner._prior_follow_up_completion_reviews()
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews[0]["order_id"], order["id"])
+        self.assertEqual(reviews[0]["review"]["outcome"], "unmet")
+        self.assertNotIn("completion", reviews[0]["disposition"])
+        self.assertEqual(reviews[0]["disposition"]["next_action"],
+                         first["follow_up_result"]["orders"][0]["next_action"])
+        self.assertTrue(reviews[0]["review_execution_ref"].startswith("artifact:command/executions/"))
+        captured = []
+        original = runner._model_checked
+        def inspect(name, role, assignment, *args, **kwargs):
+            if assignment.get("phase") == "survey_follow_up":
+                captured.append(deepcopy(assignment))
+            return original(name, role, assignment, *args, **kwargs)
+        with patch.object(runner, "_model_checked", side_effect=inspect):
+            second = runner.run()
+        self.assertEqual(second["status"], "completed", second["error"])
+        self.assertEqual(captured[0]["prior_completion_reviews"], reviews)
+        runner.control, runner.store = self.open_store()
+        runner.gate = SurveyGate(runner.control, runner.store)
+        report = runner.store.get(second["follow_up_result"]["ref"])
+        forged = runner._body(report)
+        forged["orders"][0]["completion"]["rationale"] = "Unrecorded review content."
+        runner.store.publish_artifact(logical_id="command/survey-follow-up-results/forged",
+            artifact_type="report", author="methods.evidence-verifier", body=canonical_bytes(forged),
+            inputs=report["inputs"])
+        with self.assertRaisesRegex(StateError, "recorded independent review"):
+            runner._prior_follow_up_completion_reviews()
+
+    def test_completion_review_sees_scientific_decision_and_negative_search_provenance(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        order = {**self.follow_up_order(), "success_condition":
+                 "Document a bounded negative search, then explicitly reframe as a prediction study."}
+        runner = self.runtime(survey_config(self.endpoint, "follow-up-decision-required"), work_orders=[order])
+        result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        row = result["follow_up_result"]["orders"][0]
+        self.assertEqual(row["status"], "limited")
+        self.assertEqual(row["completion"]["outcome"], "met")
+        self.assertTrue(row["limitation"])
         self.assertTrue(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", result, order))
 
     def test_capture_required_follow_up_does_not_close_on_unavailable_evidence(self):
@@ -5648,6 +5743,16 @@ class TestSurveyRunner(unittest.TestCase):
 
 
 class TestSurveyContracts(unittest.TestCase):
+    def test_completion_context_retains_repaired_evidence_catalog(self):
+        from scisaurus.runtime.survey_records import follow_up_completion_context
+        assignment = {key: [] for key in ("sources", "query_refs", "searches")}
+        assignment.update(question="Retained question", assessment={}, survey_inventory={},
+                          evidence_catalog=[{"evidence_id": "ev-1", "quote": "Exact captured quote"}])
+        context = follow_up_completion_context(assignment)
+        self.assertEqual(context["evidence_catalog"], assignment["evidence_catalog"])
+        context["evidence_catalog"][0]["quote"] = "Different quote"
+        self.assertEqual(assignment["evidence_catalog"][0]["quote"], "Exact captured quote")
+
     def test_map_normalizer_binds_positioned_relationship_evidence_without_digests(self):
         texts = {'W101': 'The measured rate increased.', 'W102': 'The control rate stayed constant.'}
         sources = [{'work_id': wid, 'source_ref': 'source-' + wid, 'text': text, 'representation': 'abstract'}

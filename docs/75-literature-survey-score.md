@@ -53,6 +53,15 @@ range, source identity, work identity, and displayed window. It preserves those
 offsets and rejects mismatched or hidden spans rather than relocating them.
 Digest completion does not determine whether the quotation supports a claim.
 
+Follow-up operation acceptance preserves the disposition's scientific rationale
+and next action while excluding its proposed completion verdict. The independent
+review also receives the exact source windows, inventory, assessment, and bounded
+search records supplied to the disposition author. Replay verifies that evidence
+packet against the original recorded assignment. Earlier acceptance contracts
+remain replayable under their original projections. An unmet independent review
+is returned to the author with its recorded execution and unchanged scientific
+disposition; a new acceptance decision still requires an independent review.
+
 Survey acceptance also requires all three registered checks exactly once: `coverage-accounting`, `source-fidelity`, and `map-support`. Gap assessment requires `closest-prior-work`, `scope-comparability`, `counterevidence`, and `full-text-support`. Unknown, duplicated, omitted, or malformed checks cannot imply approval. Decisive gap states require every check to pass.
 
 Reviews bind the exact survey and recorded model response from a successful independent task attempt. The deterministic gate checks immutable artifact integrity, governing versions, and authoritative acceptance records. Gap nomination, targeted challenge, and final assessment recheck the current accepted survey immediately before worker dispatch. Survey and assessment commitment recheck current dependencies, capability applicability, and remaining time inside the adoption boundary. A new source, map, work, or other governing version invalidates the old survey's applicability.

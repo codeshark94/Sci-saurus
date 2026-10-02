@@ -13,7 +13,8 @@ from scisaurus.core.schema import canonical_bytes
 
 
 FOLLOW_UP_COMPLETION_CONTRACT = "survey-operation-completion-1"
-FOLLOW_UP_COMPLETION_REVIEW_CONTRACT = "survey-operation-acceptance-2"
+FOLLOW_UP_COMPLETION_REVIEW_CONTRACT = "survey-operation-acceptance-3"
+FOLLOW_UP_COMPLETION_REVIEW_EVIDENCE_CONTRACT = "survey-operation-acceptance-2"
 FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT = "survey-operation-acceptance-1"
 
 MAP_FIELDS = ("problem", "approach", "finding", "limitations")
@@ -657,10 +658,34 @@ def follow_up_completion_met(row, *, require_resolved=False):
     return row.get("status") == "resolved" if require_resolved else row.get("status") in {"resolved", "limited"}
 
 
-def follow_up_completion_basis(disposition):
-    """Project validated evidence and availability without the producer's verdict."""
-    return {key: deepcopy(disposition[key]) for key in (
-        "id", "status", "evidence", "query_refs", "limitation", "record_evidence") if key in disposition}
+def follow_up_completion_basis(disposition, *, contract=FOLLOW_UP_COMPLETION_REVIEW_CONTRACT):
+    """Preserve scientific deliverables without the producer's acceptance verdict."""
+    if contract == FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT:
+        return deepcopy(disposition)
+    if contract == FOLLOW_UP_COMPLETION_REVIEW_EVIDENCE_CONTRACT:
+        return {key: deepcopy(disposition[key]) for key in (
+            "id", "status", "evidence", "query_refs", "limitation", "record_evidence") if key in disposition}
+    return {key: deepcopy(value) for key, value in disposition.items() if key != "completion"}
+
+
+def follow_up_completion_context(assignment):
+    """Bind the acceptance review to the disposition's captured evidence packet."""
+    context = {key: deepcopy(assignment[key]) for key in (
+        "question", "assessment", "survey_inventory", "sources", "query_refs", "searches")}
+    if "evidence_catalog" in assignment:
+        context["evidence_catalog"] = deepcopy(assignment["evidence_catalog"])
+    return context
+
+
+def replay_follow_up_response(execution, assignment, sources):
+    """Reconstruct a recorded disposition against its original visible sources."""
+    from scisaurus.core.source_spans import bind, expand_evidence
+    from scisaurus.runtime.models import ModelResult
+    windows = {source["source_ref"]: source["window"] for source in assignment["sources"]}
+    response = ModelResult(text=execution["text"], model="retained", usage={}, elapsed_seconds=0,
+        finish_reason=execution.get("finish_reason", "stop")).json_object(allow_missing_closers=True)
+    return bind(expand_evidence(response, assignment.get("evidence_catalog", []), sources,
+                               windows=windows), sources, windows=windows)
 
 
 def validate_follow_up_completion(value):

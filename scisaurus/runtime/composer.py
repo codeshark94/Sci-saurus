@@ -17762,14 +17762,13 @@ class ComposerRunner:
 
     @staticmethod
     def _survey_follow_up_was_replayed(project_dir, run, request=None):
-        from scisaurus.core.source_spans import bind as bind_spans, expand_evidence
         from scisaurus.core.surveys import SurveyGate
         from scisaurus.runtime.models import ModelResult
         from scisaurus.runtime.survey import acquisition_succeeded
         from scisaurus.runtime.survey_records import (FOLLOW_UP_COMPLETION_CONTRACT, FOLLOW_UP_COMPLETION_REVIEW_CONTRACT,
-                    FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT,
+                    FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT, FOLLOW_UP_COMPLETION_REVIEW_EVIDENCE_CONTRACT,
                     follow_up_inventory, project_follow_up_inventory, validate_follow_up_result, validate_follow_up_completion,
-                    follow_up_completion_basis)
+                    follow_up_completion_basis, follow_up_completion_context, replay_follow_up_response)
         result = run.get("follow_up_result")
         if (not isinstance(result, dict) or not isinstance(result.get("ref"), str)
                 or any(not isinstance(run.get(key), str) for key in ("survey_ref", "assessment_ref"))):
@@ -17843,11 +17842,7 @@ class ComposerRunner:
                             query_refs.append(ref)
                     if execution_body.get("finish_reason", "stop") not in {"stop", "length"}:
                         return False
-                    response = ModelResult(text=execution_body["text"], model="retained", usage={},
-                                           elapsed_seconds=0, finish_reason=execution_body.get("finish_reason", "stop")).json_object(
-                                               allow_missing_closers=True)
-                    response = expand_evidence(response, assignment.get("evidence_catalog", []), sources, windows=windows)
-                    response = bind_spans(response, sources, windows=windows)
+                    response = replay_follow_up_response(execution_body, assignment, sources)
                     record_inventory = assignment.get("survey_inventory")
                     if any(row.get("record_evidence") for row in response.get("orders", [])):
                         if (len(assigned) != 1 or record_inventory != project_follow_up_inventory(
@@ -17858,7 +17853,8 @@ class ComposerRunner:
                                               require_completion=completion_contract == FOLLOW_UP_COMPLETION_CONTRACT)
                     completion_review_contract = assignment.get("completion_review_contract")
                     if completion_review_contract not in (None, FOLLOW_UP_COMPLETION_REVIEW_CONTRACT,
-                                                          FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT):
+                                                          FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT,
+                                                          FOLLOW_UP_COMPLETION_REVIEW_EVIDENCE_CONTRACT):
                         return False
                     if completion_review_contract is not None:
                         if completion_refs is None or len(assigned) != 1 or len(response["orders"]) != 1:
@@ -17876,9 +17872,10 @@ class ComposerRunner:
                                 or completion_assignment.get("survey_ref") != run["survey_ref"]
                                 or completion_assignment.get("assessment_ref") != run["assessment_ref"]
                                 or completion_assignment.get("disposition_execution_ref") != execution_ref
-                                or completion_assignment.get("disposition") != (
-                                    response["orders"][0] if completion_review_contract == FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT
-                                    else follow_up_completion_basis(response["orders"][0]))
+                                or completion_assignment.get("disposition") != follow_up_completion_basis(
+                                    response["orders"][0], contract=completion_review_contract)
+                                or (completion_review_contract == FOLLOW_UP_COMPLETION_REVIEW_CONTRACT
+                                    and completion_assignment.get("evidence_context") != follow_up_completion_context(assignment))
                                 or completion_body.get("finish_reason", "stop") not in {"stop", "length"}):
                             return False
                         completion = ModelResult(text=completion_body["text"], model="retained", usage={},
