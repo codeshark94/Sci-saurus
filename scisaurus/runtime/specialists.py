@@ -150,7 +150,12 @@ VERIFIER_SYSTEM = (
     "Use hold when a blocking finding or required revision remains; accept only when neither does. "
     "An accept response must leave blocking_findings, required_revisions, and any critical_findings "
     "alias empty. Deferred gates and non-blocking repair scope may remain. "
-    "Use deferred_obligations for requirements owned by a later declared workflow stage. Each record "
+    "Emit deferred_obligations only for still-outstanding requirements owned by a later declared workflow stage. "
+    "Incoming obligations describe work to assess, not records to copy into the outgoing verdict. "
+    "A current-stage requirement whose exact acceptance condition is met stays closed; preserve its "
+    "unresolved scientific limitations without deferring the same requirement back to its owner. "
+    "An unmet current-stage requirement belongs in required_revisions and decision=hold. "
+    "When downstream_stage_ids is empty, deferred_obligations must be empty. Each record "
     "has target_stage_id, topic_ids, work_kind, requirement, completion_check, and evidence_needed; preserve the exact "
     "requirement and falsifiable completion check. evidence_needed is a nonempty string or list of "
     "nonempty strings. Target only the supplied downstream_stage_ids, never the current stage. "
@@ -1010,6 +1015,16 @@ def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, det
                                               or value == stage.get("id") for value in targets)):
             raise ValidationError("stage acceptance contract must declare downstream stage IDs")
         contract["stage_acceptance_contract"] = _preserve_response_value(declared_contract)
+        contract["deferred_obligation_ownership"] = {
+            "current_stage_id": stage["id"], "allowed_target_stage_ids": deepcopy(targets),
+            "emission_rule": (
+                "Emit only outstanding requirements owned by these downstream stages. "
+                "Do not copy incoming or completed current-stage requirements into outgoing deferrals. "
+                "Current-stage defects are required_revisions; completed operations retain scientific limits "
+                "without reopening the satisfied requirement. No allowed targets means an empty list."),
+        }
+        if not targets:
+            contract["deferred_obligations"] = []
         if isinstance(declared_contract.get("acceptance_target"), str) and declared_contract["acceptance_target"].strip():
             contract["acceptance_target"] = declared_contract["acceptance_target"]
     body = {
@@ -1717,7 +1732,10 @@ def _verifier_repair_prompt(prompt, error, previous_text, *, max_input_tokens,
         "blocking; distinguish required revisions from checks that belong to a later declared gate. "
         "Each deferred_obligations record must retain target_stage_id, topic_ids, work_kind, requirement, "
         "completion_check, and evidence_needed, owned by a supplied downstream_stage_id and its "
-        "allowed work kinds rather than the current stage or another topic branch. deferred_gates uses the same "
+        "allowed work kinds rather than the current stage or another topic branch. If downstream_stage_ids is "
+        "empty, deferred_obligations must be empty. Do not copy an incoming requirement already met by its "
+        "exact operation receipt into outgoing deferrals. Preserve remaining scientific limits; "
+        "unmet current-stage requirements belong in required_revisions, not self-deferrals. deferred_gates uses the same "
         "typed requirement contract with target_stage_kind from deferred_gate_work_kinds for an unconfigured "
         "future owner; no strings or serialized objects are permitted in scoped gates."
     )

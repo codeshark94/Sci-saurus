@@ -1271,6 +1271,28 @@ class SpecialistDispatcherTests(unittest.TestCase):
             with self.subTest(gate=invalid), self.assertRaises(ValidationError):
                 validate(invalid)
 
+    def test_verifier_deferral_schema_is_derived_from_declared_stage_owners(self):
+        stage = {"id": "source-audit", "kind": "survey"}
+        for targets in ([], ["calculation"]):
+            declared = {"current_stage_id": stage["id"], "downstream_stage_ids": targets,
+                        "acceptance_target": "Bounded captured source audit."}
+            packet = {"stage_acceptance_contract": declared}
+            prompt = json.loads(build_verifier_prompt(stage, packet, [], {"status": "completed"}))
+            contract = prompt["verifier_contract"]
+            self.assertEqual(contract["deferred_obligation_ownership"]["allowed_target_stage_ids"], targets)
+            self.assertEqual(contract["deferred_obligation_ownership"]["current_stage_id"], stage["id"])
+            self.assertEqual(contract["stage_acceptance_contract"], declared)
+            if not targets:
+                self.assertEqual(contract["deferred_obligations"], [])
+            else:
+                self.assertTrue(contract["deferred_obligations"])
+            incoming = {"target_stage_id": stage["id"], "requirement": "Capture values or record unavailable.",
+                        "completion_check": "Each value has evidence or a scoped unavailable record.",
+                        "evidence_needed": "Captured sources and search records."}
+            with self.assertRaisesRegex(ValidationError, "current-stage requirements"):
+                _normalise_verdict({"decision": "accept", "deferred_obligations": [incoming]},
+                    current_stage_id=stage["id"], valid_target_stage_ids=targets)
+
     def test_typed_deferred_owner_validation_survives_generic_response_retry(self):
         model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1", "model": "fixture",
                  "timeout_seconds": 5, "max_output_tokens": 1000, "context_window_tokens": 16000, "max_input_tokens": 15000}

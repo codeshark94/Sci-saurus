@@ -7367,6 +7367,9 @@ class ComposerRunner:
                 and self._survey_work_order_was_fulfilled(project, result, obligation))
 
     def _topic_review_revalidation_input(self, stage):
+        return self._stage_review_revalidation_input(stage)
+
+    def _stage_review_revalidation_input(self, stage):
         """Replay owned production and peer evidence for a changed verifier contract."""
         context = self.context.get(stage["id"], {})
         verifier = context.get("specialist_verifier") or {}
@@ -7383,43 +7386,59 @@ class ComposerRunner:
         record = self.stage_records.get(stage["id"], {})
         plan_ref = verifier.get("assignment_plan_ref") or record.get("assignment_plan_ref")
         if (execution.get("schema_version") != "specialist-verifier-execution-1"
-                or execution.get("stage_kind") != "topic_discovery"
-                or execution.get("chief_result", {}).get("topic") != context.get("topic")
+                or execution.get("stage_id") != stage["id"]
+                or execution.get("stage_kind") != stage["kind"]
+                or (stage["kind"] == "topic_discovery"
+                    and execution.get("chief_result", {}).get("topic") != context.get("topic"))
                 or not isinstance(plan_ref, str)
                 or self._stage_specialist_payment_proof(stage, plan_ref, ref) is None):
-            raise StateError("topic review revalidation has no exact owned verifier input")
-        output = Path(context["output_path"]).resolve()
-        output_hash = hashlib.sha256(output.read_bytes()).hexdigest()
-        candidates = []
-        cache = ModelWorkCache(self.store, self._publish)
-        for cached in cache.entries():
-            result = cached.get("result") or {}
-            if (cached.get("status") != "succeeded" or result.get("stage_id") != stage["id"]
-                    or result.get("kind") != "topic_discovery" or result.get("status") != "completed"
-                    or result.get("output_path") != str(output)
-                    or cached.get("output_sha256") != output_hash
-                    or result.get("topic") != context.get("topic")):
-                continue
-            producer_record, producer_digest, _ = self._read_verified_artifact_json(cached["cache_ref"])
-            if producer_record.get("author") != "command.controller":
-                raise StateError("topic review revalidation producer cache is not controller owned")
-            candidates.append((cached, producer_digest))
-        if not candidates or any(item[0]["result"] != candidates[0][0]["result"] for item in candidates):
-            raise StateError("topic review revalidation has no unique immutable completed producer")
-        cached, producer_digest = candidates[0]
+            raise StateError("stage review revalidation has no exact owned verifier input")
+        report = execution.get("report", {})
+        response = report.get("response", {})
+        if (initial_contract == self._stage_acceptance_contract(stage, context)
+                and record.get("status") in {"completed", "accepted"}
+                and context.get("status") in {"completed", "accepted"}
+                and report.get("status") == "succeeded" and response.get("decision") == "accept"
+                and not any(response.get(key) for key in ("blocking_findings", "required_revisions", "critical_findings"))):
+            return None
+        if stage["kind"] == "survey":
+            producer = self._survey_review_revalidation_producer(stage, context, execution)
+        else:
+            output = Path(context["output_path"]).resolve()
+            output_hash = hashlib.sha256(output.read_bytes()).hexdigest()
+            candidates = []
+            cache = ModelWorkCache(self.store, self._publish)
+            for cached in cache.entries():
+                result = cached.get("result") or {}
+                if (cached.get("status") != "succeeded" or result.get("stage_id") != stage["id"]
+                        or result.get("kind") != "topic_discovery" or result.get("status") != "completed"
+                        or result.get("output_path") != str(output)
+                        or cached.get("output_sha256") != output_hash
+                        or result.get("topic") != context.get("topic")):
+                    continue
+                producer_record, producer_digest, _ = self._read_verified_artifact_json(cached["cache_ref"])
+                if producer_record.get("author") != "command.controller":
+                    raise StateError("topic review revalidation producer cache is not controller owned")
+                candidates.append((cached, producer_digest))
+            if not candidates or any(item[0]["result"] != candidates[0][0]["result"] for item in candidates):
+                raise StateError("topic review revalidation has no unique immutable completed producer")
+            cached, producer_digest = candidates[0]
+            producer = {"producer_ref": cached["cache_ref"], "producer_sha256": producer_digest,
+                        "output_path": str(output), "output_sha256": output_hash,
+                        "result": deepcopy(cached["result"])}
         peers = deepcopy(execution.get("specialist_reports"))
         if not isinstance(peers, list) or not peers:
-            raise StateError("topic review revalidation has no retained independent peer reports")
+            raise StateError("stage review revalidation has no retained independent peer reports")
         for peer in peers:
             peer_ref = peer.get("artifact_ref")
             peer_plan_ref = peer.get("input_scope", {}).get("assignment_plan_ref", plan_ref)
             if not isinstance(peer_ref, str) or self._stage_specialist_payment_proof(stage, peer_plan_ref, peer_ref) is None:
-                raise StateError("topic review revalidation peer is not assignment owned")
+                raise StateError("stage review revalidation peer is not assignment owned")
             _, _, peer_execution = self._read_verified_artifact_json(peer_ref)
             retained = peer_execution.get("report", {})
             if (peer_execution.get("schema_version") != "specialist-execution-1"
                     or any(peer.get(key) != retained.get(key) for key in ("status", "role_id", "assigned_role", "response", "usage"))):
-                raise StateError("topic review revalidation changes retained peer evidence")
+                raise StateError("stage review revalidation changes retained peer evidence")
             assignment = next(item for item in self.departments._assignment_task_rows(
                 stage_id=stage["id"], attempt_number=peer_execution["attempt_number"])
                 if item["task_id"] == peer_execution["task_id"])
@@ -7427,22 +7446,68 @@ class ComposerRunner:
                                    "assignment_phase": assignment.get("assignment_phase"),
                                    "assignment_plan_ref": peer_plan_ref,
                                    "execution_ref": peer_ref, "contract_state": "retained_original"}
-        return {"producer_cache_ref": cached["cache_ref"], "producer_cache_sha256": producer_digest,
-                "output_path": str(output), "output_sha256": output_hash,
-                "result": deepcopy(cached["result"]), "peer_reports": deepcopy(peers),
+        return {**producer, "peer_reports": deepcopy(peers),
                 "prior_verifier_execution_ref": ref, "prior_verifier_execution_sha256": digest,
                 "prior_assignment_plan_ref": plan_ref}
 
+    def _survey_review_revalidation_producer(self, stage, context, execution):
+        project = Path(context["project_dir"]).resolve()
+        output = project / "output/run.json"
+        run = self._read_json_object(output)
+        reviewed = execution.get("chief_result", {})
+        if (not isinstance(run, dict) or run.get("status") != "completed"
+                or reviewed.get("status") not in {"completed", "accepted"}
+                or run.get("project_id") != str(project)
+                or not self._request_context_matches_current_topic(stage["id"], context)
+                or any(reviewed.get(key) != value for key, value in run.items() if key != "usage")
+                or any(context.get(key) != run.get(key) for key in (
+                    "run_id", "survey_ref", "assessment_ref", "follow_up_ref", "follow_up_result"))):
+            raise StateError("survey review revalidation requires the exact current completed producer")
+        with closing(sqlite3.connect((project / "state/control.sqlite").as_uri() + "?mode=ro", uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            store = ArtifactStore(SimpleNamespace(dir=str(project), _conn=connection))
+            final = store.head("command/results/final")
+            config_record = store.head("inputs/run-config")
+            if (final is None or config_record is None or final.get("author") != "command.controller"
+                    or config_record.get("author") != "principal"):
+                raise StateError("survey review revalidation requires immutable production and configuration")
+            raw = store.read_body(final["body_hash"])
+            config_raw = store.read_body(config_record["body_hash"])
+            config = json.loads(config_raw)
+            topic_stage = self._topic_stage_for_survey(stage)
+            topic = self.context.get(topic_stage["id"], {}).get("topic", {}) if topic_stage else {}
+            if (hashlib.sha256(raw).hexdigest() != final["body_hash"] or json.loads(raw) != run
+                    or hashlib.sha256(config_raw).hexdigest() != config_record["body_hash"]
+                    or config.get("project_id") != str(project)
+                    or (topic and config["survey"]["question"] != topic.get("research_question"))):
+                raise StateError("survey review revalidation production is not owned by the current topic")
+        if (not self._survey_references_are_current(project, run)
+                or (run.get("follow_up_result") is not None and not self._survey_follow_up_was_replayed(project, run))):
+            raise StateError("survey review revalidation evidence replay failed")
+        return {"producer_ref": final["artifact_ref"], "producer_sha256": final["body_hash"],
+                "producer_project_dir": str(project), "config_ref": config_record["artifact_ref"],
+                "config_sha256": config_record["body_hash"], "output_path": str(output),
+                "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(), "result": deepcopy(reviewed)}
+
     def revalidate_topic_review(self, stage_id):
-        """Re-review exact paid topic production when the verifier contract changes."""
         stage = next((item for item in self.workflow["stages"] if item["id"] == stage_id), None)
         if stage is None or stage.get("kind") != "topic_discovery":
             raise StateError("review revalidation requires a topic stage")
-        retained = self._topic_review_revalidation_input(stage)
+        return self.revalidate_stage_review(stage_id)
+
+    def revalidate_stage_review(self, stage_id):
+        """Re-review exact paid production without repeating acquisition or peer calls."""
+        stage = next((item for item in self.workflow["stages"] if item["id"] == stage_id), None)
+        if stage is None or stage.get("kind") not in {"topic_discovery", "survey"}:
+            raise StateError("review revalidation requires a stage with replayable production")
+        retained = self._stage_review_revalidation_input(stage)
         if retained is None:
             return None
+        stage = deepcopy(stage)
+        stage["project_dir"] = retained["result"]["project_dir"]
         if self._execution_started:
-            raise StateError("topic review revalidation must precede workflow execution")
+            raise StateError("stage review revalidation must precede workflow execution")
         _, stopped = self._stopped_execution_checkpoint()
         for producer in self.workflow["stages"]:
             record = stopped.get("stages", {}).get(producer["id"], {})
@@ -7453,7 +7518,7 @@ class ComposerRunner:
             if (self._producer_checkpoint_evidence(project, progress) is None
                     or progress.get("phase") not in {"calls_settled", "paused"}
                     or progress.get("active_tasks") or progress.get("active_operations")):
-                raise StateError("topic review revalidation requires idle captured downstream production")
+                raise StateError("stage review revalidation requires idle captured downstream production")
         self.context[stage_id]["specialist_verifier"]["assignment_plan_ref"] = retained["prior_assignment_plan_ref"]
         self._reconcile_interrupted_stage_attempts()
         remaining = min(float(stage["deadline_seconds"]), self._remaining())
@@ -7464,25 +7529,25 @@ class ComposerRunner:
         number = max(prior.get("attempt_count", 0), prior.get("attempt_number", 0)) + 1
         identity = hashlib.sha256(canonical_bytes({"input": retained,
             "verifier_system": VERIFIER_SYSTEM, "cycle": self.continuation_cycles})).hexdigest()
-        admission = self._publish(f"command/composer/topic-review-revalidations/{identity}", "decision_note", {
-            "schema_version": "topic-review-revalidation-1", "stage_id": stage_id,
+        admission = self._publish(f"command/composer/stage-review-revalidations/{identity}", "decision_note", {
+            "schema_version": "stage-review-revalidation-1", "stage_id": stage_id,
             "cycle": self.continuation_cycles, "producer": retained,
             "verifier_system_sha256": hashlib.sha256(VERIFIER_SYSTEM.encode()).hexdigest(),
-        }, "command.composer", subjects=[retained["producer_cache_ref"], retained["prior_verifier_execution_ref"],
+        }, "command.composer", subjects=[retained["producer_ref"], retained["prior_verifier_execution_ref"],
             *[peer["artifact_ref"] for peer in retained["peer_reports"]]])
-        task_id = "topic-review-revalidation-" + identity[:24] + "-" + str(number)
+        task_id = "stage-review-revalidation-" + identity[:24] + "-" + str(number)
         task = self.tasks.create(task_id, "review", {"stage_id": stage_id, "admission_ref": admission["artifact_ref"]}, "command.composer")
         if task["state"] not in {"proposed", "queued"}:
-            raise StateError("topic review revalidation requires reconciliation of its existing attempt")
+            raise StateError("stage review revalidation requires reconciliation of its existing attempt")
         if task["state"] == "proposed":
             self.tasks.transition(task_id, "queued", "command.composer")
         attempt_id = task_id + "-" + uuid.uuid4().hex
         self.tasks.start_attempt(task_id, attempt_id, owner="command.composer", lease_ttl_seconds=remaining,
-            payload={"stage_id": stage_id, "kind": "topic_discovery", "attempt_number": number,
+            payload={"stage_id": stage_id, "kind": stage["kind"], "attempt_number": number,
                      "model_budget_cycle": self.continuation_cycles if stage_id in self.reopened_stage_ids else 0,
                      "project_dir": stage["project_dir"], "admission_ref": admission["artifact_ref"],
                      "attempt_deadline_at_epoch": attempt_deadline})
-        plan = self.departments.begin_stage(stage_id, "topic_discovery", attempt_number=number,
+        plan = self.departments.begin_stage(stage_id, stage["kind"], attempt_number=number,
             input_ref={"kind": "composer_stage_task", "ref": task_id, "digest": identity},
             deadline_seconds=remaining, active_role_ids=[])
         self.stage_records[stage_id] = {**prior, "status": "running", "task_id": task_id,
@@ -7498,15 +7563,15 @@ class ComposerRunner:
             report = self._run_specialist_verifier(stage, plan, descriptor, bundle, chief, stage_result=chief)
             if not isinstance(report, dict) or report.get("status") != "succeeded":
                 if isinstance(report, dict) and isinstance(report.get("failure"), dict):
-                    raise ModelCallError.from_failure(report.get("error") or "topic verifier request failed", report["failure"])
-                raise ModelWorkBlocked("topic review revalidation did not produce a complete independent decision")
+                    raise ModelCallError.from_failure(report.get("error") or "stage verifier request failed", report["failure"])
+                raise ModelWorkBlocked("stage review revalidation did not produce a complete independent decision")
             response = report.get("response", {})
             if (response.get("decision") not in {"accept", "hold"}
                     or (response["decision"] == "accept" and any(response.get(key) for key in ("blocking_findings", "required_revisions", "critical_findings")))):
-                raise ModelWorkBlocked("topic review revalidation has contradictory admission obligations", failure_class="model_contract")
+                raise ModelWorkBlocked("stage review revalidation has contradictory admission obligations", failure_class="model_contract")
         except Exception as error:
             usage = self._specialist_usage([report]) if "report" in locals() and isinstance(report, dict) else deepcopy(getattr(error, "usage", {}))
-            failed = self.departments.finish_stage(stage_id, "topic_discovery", attempt_number=number,
+            failed = self.departments.finish_stage(stage_id, stage["kind"], attempt_number=number,
                 outcome="failed", output_ref=chief["output_path"], usage=usage, error=str(error),
                 verifier_result=report if "report" in locals() and isinstance(report, dict) else None)
             self.tasks.finish_attempt(attempt_id, "failed", usage=usage)
@@ -7518,12 +7583,19 @@ class ComposerRunner:
             raise
         response = report.get("response", {})
         outcome = "completed" if response.get("decision") == "accept" else "candidate_needs_review"
-        finished = self.departments.finish_stage(stage_id, "topic_discovery", attempt_number=number,
+        finished = self.departments.finish_stage(stage_id, stage["kind"], attempt_number=number,
             outcome=outcome, output_ref=chief["output_path"], usage=report.get("usage", {}), verifier_result=report)
         self.tasks.finish_attempt(attempt_id, "succeeded", usage=report.get("usage", {}))
         self.tasks.transition(task_id, "awaiting_review", "command.composer")
         self.tasks.transition(task_id, "completed", "command.composer")
-        context = deepcopy(self.context[stage_id])
+        context = deepcopy(retained["result"] if stage["kind"] == "survey" else self.context[stage_id])
+        if stage["kind"] == "survey":
+            context["specialist_reports"] = deepcopy(self.context[stage_id].get("specialist_reports", []))
+            for key in ("topic_id", "topic_cycle", "topic_lineage", "native_reconciliation_ref", "native_reconciliation_scope"):
+                if key in self.context[stage_id]:
+                    context[key] = deepcopy(self.context[stage_id][key])
+            if outcome != "completed":
+                context.update(release_blocking=True, review_status="current_producer_requires_review")
         context.update(status=outcome, specialist_verifier=deepcopy(report),
             review_revalidation={"admission_ref": admission["artifact_ref"], "producer_calls_replayed": 0,
                                 "peer_calls_replayed": 0, "prior_verifier_execution_ref": retained["prior_verifier_execution_ref"]})
@@ -7535,6 +7607,20 @@ class ComposerRunner:
         self.stage_records[stage_id].update(status=outcome, **self._stage_assignment_fields(plan, finished))
         self.stage_records[stage_id]["usage"] = deepcopy(report.get("usage", {}))
         self.stage_records[stage_id].pop("error", None)
+        if stage["kind"] == "survey":
+            for key in ("composer_decision", "evidence_state", "backfill_required", "release_status", "release_blocking", "failure_debt", "review_status"):
+                self.stage_records[stage_id].pop(key, None)
+                if key in context:
+                    self.stage_records[stage_id][key] = deepcopy(context[key])
+            (Path(context["project_dir"]) / "output/composer-gated-run.json").write_bytes(canonical_bytes(context))
+        retired = [item for item in self.blockers if item.get("stage_id") == stage_id
+                   and item.get("stop_reason") == "operational_state"
+                   and item.get("review_revalidation_required") is True]
+        if retired:
+            self.blockers = [item for item in self.blockers if item not in retired]
+            self.department_activity.append({"action": "resolve_stage_review_revalidation_blockers",
+                "stage_id": stage_id, "admission_ref": admission["artifact_ref"],
+                "verifier_execution_ref": report["artifact_ref"], "prior_blockers": deepcopy(retired)})
         self._archive_stage_attempt(self.stage_records[stage_id], cycle=self.continuation_cycles,
                                     default_project_dir=stage["project_dir"])
         self._checkpoint(f"{stage_id}:review_revalidation_completed", force=True)
@@ -26839,15 +26925,15 @@ class ComposerRunner:
     def run(self):
         try:
             for stage in self.workflow["stages"]:
-                if stage.get("kind") != "topic_discovery" or self._topic_review_revalidation_input(stage) is None:
+                if stage.get("kind") not in {"topic_discovery", "survey"} or self._stage_review_revalidation_input(stage) is None:
                     continue
                 try:
-                    self.revalidate_topic_review(stage["id"])
+                    self.revalidate_stage_review(stage["id"])
                 except Exception as error:
                     self.status = "paused"
                     self.blockers.append({"stage_id": stage["id"], "reason": f"{type(error).__name__}: {error}",
                                           "stop_reason": "operational_state", "review_revalidation_required": True})
-                    self._checkpoint("paused:topic_review_revalidation", force=True)
+                    self._checkpoint("paused:stage_review_revalidation", force=True)
                     return self._finish()
             self._reconcile_interrupted_stage_attempts()
             self._reconcile_latest_survey_results()
