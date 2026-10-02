@@ -2487,16 +2487,19 @@ class CapabilityFoundry:
                 and isinstance(retained_candidate, dict)
                 and PRODUCER_FIELDS.issubset(retained_candidate)
             )
+            # Diagnostics accumulate across candidate revisions; an explicit
+            # current gate owns the exception even when an older response failed.
             format_failure = (
+                failure_class == "model_contract"
+                if isinstance(failure_class, str) and failure_class else
                 isinstance(state.get("format_repair"), dict)
-                or failure_class == "model_contract"
                 or latest.get("outcome") in {"incomplete_response", "inadmissible_finish_reason"}
             )
             error.failure_class = (
                 "model_contract" if format_failure else "experiment_capability_repair")
             error.recovery_mode = (
                 "format_repair_then_rerun" if format_failure else "repair_then_rerun")
-            format_response_incomplete = latest.get("outcome") in {
+            format_response_incomplete = format_failure and latest.get("outcome") in {
                 "incomplete_response", "inadmissible_finish_reason",
             }
             error.repair_gate = (
@@ -2507,10 +2510,11 @@ class CapabilityFoundry:
             error.repair_ledger = deepcopy_config(state.get("repair_ledger", [])[-8:])
             summary = state.get("feedback")
             if active_scientific_repair:
-                summary = (
-                    "Blocking scientific review remains unresolved after the attempted "
-                    "program-patch response was incomplete."
-                )
+                if format_response_incomplete:
+                    summary = (
+                        "Blocking scientific review remains unresolved after the attempted "
+                        "program-patch response was incomplete."
+                    )
                 error.research_review = {
                     "status": "rejected",
                     "checks": failed_checks,
@@ -3932,6 +3936,7 @@ class CapabilityFoundry:
                 if feedback not in failures:
                     failures.append(feedback)
                 state.update(status="blocked" if repeated else "repairing", feedback=feedback,
+                    last_failure_class="model_contract", last_failure_gate="author_response_format",
                     error=f"capability foundry did not admit a program: {feedback}")
                 save("validation_failed")
                 if repeated:

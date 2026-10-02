@@ -3509,6 +3509,32 @@ class CapabilityFoundryTests(unittest.TestCase):
             "program_gate:independent_recalculation:"))
         self.assertEqual(blocked.exception.failure_class, "experiment_capability_repair")
 
+    def test_current_scientific_gate_owns_exception_over_historical_response_diagnostic(self):
+        from scisaurus.runtime.program_gates import ProgramGateRejected
+        rejected = ProgramGateRejected("Current recalculation rejected", {
+            "decision": "rejected", "checks": [{"id": "selection", "outcome": "failed", "evidence": "Current rows disagree."}],
+        }, gate="independent_recalculation")
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            cache = self._cache(root)
+            author = StubClient(self._payload())
+            with patch("scisaurus.runtime.capability_foundry.admit_program_candidate", side_effect=rejected):
+                with self.assertRaises(ModelWorkBlocked):
+                    foundry.generate("bounded comparison", client=author, work_cache=cache)
+            state = cache.entries()[0]
+            key = state.pop("cache_ref").split("/")[-1].split("@")[0]
+            state["model_diagnostics"] = [{"outcome": "incomplete_response", "error": "Old length failure"}]
+            cache.put(key, state)
+            with self.assertRaises(ModelWorkBlocked) as blocked:
+                foundry.generate("bounded comparison", client=author, work_cache=cache)
+            self.assertEqual(author.calls, 1)
+            self.assertEqual(blocked.exception.failure_class, "experiment_capability_repair")
+            self.assertEqual(blocked.exception.repair_gate, "independent_recalculation")
+            self.assertEqual(blocked.exception.recovery_mode, "repair_then_rerun")
+            self.assertNotIn("incomplete", blocked.exception.repair_feedback["feedback"])
+            self.assertEqual(blocked.exception.repair_feedback["foundry_work_ref"], cache.entries()[0]["cache_ref"])
+
     def test_truncated_patch_preserves_scientific_review_without_reclassifying_it_as_a_review_failure(self):
         payload = self._payload()
         rejected_review = {

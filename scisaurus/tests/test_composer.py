@@ -2569,6 +2569,90 @@ class ComposerWorkflowTests(unittest.TestCase):
                                 runner._capability_repair_review_input_sha256({}))
             authored = runner._capability_authoring_repair_projection({"packet": packet})
             self.assertEqual(authored["foundry_execution_evidence"], evidence)
+            # The ordinary exception path must hydrate its own immutable work,
+            # even when a prior format failure and Methods plan remain in context.
+            from scisaurus.runtime.capability_foundry import _authored_candidate_sha256
+            from scisaurus.runtime.model_work import ModelWorkBlocked
+            stage = next(item for item in runner.workflow["stages"] if item["kind"] == "experiment")
+            selected = {"id": "study", "research_question": "Does A affect B?", "domain": "physics"}
+            current_work = {**deepcopy(work), "status": "blocked",
+                "assignment": {"required_intent_fields": selected},
+                "error": "Current selection rejected", "feedback": "Current selection rejected",
+                "last_failure_class": "experiment_capability_repair",
+                "last_failure_gate": "independent_recalculation",
+                "validation_feedback": {"gate": "independent_recalculation", "decision": "rejected"},
+                "validation_context": {"observation_count": 480}}
+            current_work["last_attempt"]["runtime"] = {"python": "3.14"}
+            authored_hash = _authored_candidate_sha256(current_work["last_attempt"])
+            for name in ("validation_feedback", "validation_context"):
+                current_work[name + "_candidate_sha256"] = authored_hash
+            def current_result(value, logical_id="command/foundry-work/current-fixture"):
+                ref = runner.store.publish_artifact(logical_id=logical_id, artifact_type="note",
+                    author="command.controller", media_type="application/json", body=canonical_bytes(value))["artifact_ref"]
+                error = ModelWorkBlocked("Current selection rejected")
+                error.failure_class = "experiment_capability_repair"
+                error.repair_feedback = {"foundry_work_ref": ref, "candidate_sha256": authored_hash,
+                    "gate": "independent_recalculation", "validation_feedback": current_work["validation_feedback"],
+                    "validation_context": current_work["validation_context"]}
+                return runner._failure_stage_result(stage, error)
+            result = current_result(current_work)
+            runner.context[stage["id"]] = {"failure_dossier_ref": dossier["artifact_ref"],
+                "error": "Old author JSON failure", "failure_recovery": {
+                    "failure_class": "model_contract", "error": "Old author JSON failure", "attempt_number": 1},
+                "experiment_repair_plan": {"instruction": "Old repair instruction"},
+                "capability_repair_panel": {"decision": "repair", "root_causes": ["Old cause"]}}
+            with patch.object(runner, "_topic_context_for_stage", return_value=("topic", {"topic": selected})):
+                projection = runner._specialist_experiment_projection(stage, {}, result)
+            current = projection["failure_evidence"]["current_foundry_failure"]
+            self.assertTrue(current["available"], current)
+            self.assertEqual(current["foundry_execution_evidence"], evidence)
+            self.assertEqual(current["configured_input"], configured)
+            self.assertEqual(current["runtime"], {"python": "3.14"})
+            self.assertEqual("".join(current["source_files"]["validator"]["source_chunks"]), "validator")
+            self.assertNotIn("failure_dossier", projection["failure_evidence"])
+            self.assertEqual(projection["failure_evidence"]["historical_failure_evidence"]["temporal_scope"],
+                             "historical_prior_attempts_only")
+            self.assertEqual(projection["failure_recovery"]["temporal_scope"], "historical_prior_attempt_only")
+            prompt = json.loads(build_specialist_prompt({"role_id": "methodologist",
+                "input_projection": ["failure_evidence"]}, projection))
+            self.assertEqual(prompt["projected_input"]["failure_evidence"]["current_foundry_failure"], current)
+            for alteration in ("namespace", "unversioned", "topic", "status", "candidate_binding",
+                               "feedback_binding", "context_binding", "source", "input", "feedback", "class", "gate"):
+                with self.subTest(current_alteration=alteration):
+                    changed = deepcopy(current_work)
+                    if alteration == "topic":
+                        changed["assignment"]["required_intent_fields"]["domain"] = "other"
+                    elif alteration == "status":
+                        changed["status"] = "succeeded"
+                    elif alteration == "candidate_binding":
+                        changed["last_attempt"]["validator_source"] = "other source"
+                    elif alteration in {"feedback_binding", "context_binding"}:
+                        name = "validation_feedback" if alteration == "feedback_binding" else "validation_context"
+                        changed[name + "_candidate_sha256"] = "0" * 64
+                    elif alteration == "source":
+                        changed["sandbox_executions"][1]["program_sha256"] = publish("other source")
+                    elif alteration == "input":
+                        changed["last_attempt"]["test_input"] = {}
+                    elif alteration == "feedback":
+                        changed["validation_feedback"] = {"decision": "accepted"}
+                    elif alteration == "class":
+                        changed["last_failure_class"] = "model_contract"
+                    elif alteration == "gate":
+                        changed["last_failure_gate"] = "other"
+                    bad = current_result(changed, "command/other/fixture" if alteration == "namespace"
+                                         else "command/foundry-work/current-fixture")
+                    if alteration == "unversioned":
+                        bad["repair_feedback"]["foundry_work_ref"] = bad["repair_feedback"]["foundry_work_ref"].split("@")[0]
+                    if alteration in {"feedback_binding", "context_binding"}:
+                        name = "validation_feedback" if alteration == "feedback_binding" else "validation_context"
+                        bad["repair_feedback"][name] = {}
+                    rejected = runner._current_foundry_failure_evidence(bad, selected)
+                    self.assertFalse(rejected["available"], rejected)
+                    self.assertNotIn("foundry_execution_evidence", rejected)
+                    with patch.object(runner, "_topic_context_for_stage", return_value=("topic", {"topic": selected})):
+                        rejected_projection = runner._specialist_experiment_projection(stage, {}, bad)
+                    self.assertFalse(rejected_projection["failure_evidence"]["current_foundry_failure"]["available"])
+                    self.assertNotIn("failure_dossier", rejected_projection["failure_evidence"])
             for alteration in ("input", "candidate", "source", "object", "mode", "stdin_array", "output_array", "verdict_array"):
                 with self.subTest(alteration=alteration):
                     changed = deepcopy(work)

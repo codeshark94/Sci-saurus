@@ -9343,7 +9343,7 @@ class ComposerRunner:
         if isinstance(value, dict):
             output = {}
             for index, (key, item) in enumerate(value.items()):
-                if str(key) == "foundry_execution_evidence":
+                if str(key) in {"foundry_execution_evidence", "current_foundry_failure"}:
                     output[str(key)] = _preserve_response_value(item)
                     continue
                 if index >= max_keys:
@@ -9804,6 +9804,55 @@ class ComposerRunner:
             "proposed_changes": records("proposed_changes", "required_changes"),
         }
 
+    @staticmethod
+    def _repair_source_evidence(source, *, source_origin, expected_sha256):
+        """Render only complete, integrity-bound source for repair reviewers."""
+        source_entry = {
+            "available": False,
+            "source_origin": source_origin,
+            "expected_sha256": expected_sha256,
+            "matches_expected": None,
+            "integrity_verified": False,
+            "source_truncated": False,
+            "source_chunks": [],
+        }
+        if isinstance(source, str):
+            source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
+            source_truncated = len(source) > CAPABILITY_REPAIR_SOURCE_CHARS
+            matches_expected = (
+                source_sha256 == expected_sha256
+                if isinstance(expected_sha256, str) else None
+            )
+            source_entry.update({
+                "source_sha256": source_sha256,
+                "source_characters": len(source),
+                "matches_expected": matches_expected,
+                "integrity_verified": matches_expected is True,
+                "source_truncated": source_truncated,
+            })
+            if matches_expected is False:
+                source_entry["omission_reason"] = (
+                    "Stored source does not match the immutable source-integrity digest."
+                )
+            elif source_truncated:
+                source_entry["omission_reason"] = (
+                    "Stored source exceeds the bounded repair-prompt source size."
+                )
+            else:
+                safe_source = redact_sensitive_text(source)
+                source_entry.update({
+                    "available": True,
+                    "prompt_source_sha256": hashlib.sha256(
+                        safe_source.encode("utf-8")).hexdigest(),
+                    "prompt_source_characters": len(safe_source),
+                    "redaction_applied": safe_source != source,
+                    "source_chunks": [
+                        safe_source[offset:offset + 7000]
+                        for offset in range(0, len(safe_source), 7000)
+                    ],
+                })
+        return source_entry
+
     def _foundry_execution_evidence(self, work):
         """Hydrate failed execution evidence only from hash-bound sandbox records."""
         from scisaurus.runtime.capability_registry import experiment_program_payload, experiment_validation_payload
@@ -9908,6 +9957,72 @@ class ComposerRunner:
                     "validator_output": encoded_document(verdict)}
         except (StopIteration, NotFoundError, KeyError, OSError, TypeError, ValueError, ValidationError) as exc:
             return unavailable | {"reason": str(exc) or "No matching current-source execution is available."}
+
+    def _current_foundry_failure_evidence(self, result, selected):
+        """Resolve a current exception's exact work reference without history lookup."""
+        from scisaurus.runtime.capability_foundry import _authored_candidate_sha256, _candidate_bound_value
+        feedback = result.get("repair_feedback")
+        feedback = feedback if isinstance(feedback, dict) else {}
+        ref = feedback.get("foundry_work_ref")
+        if ref is None:
+            return None
+        unavailable = {"available": False, "artifact_ref": ref,
+                       "admissible_as_verified_claims": False}
+        try:
+            if not isinstance(ref, str) or not re.fullmatch(
+                    r"artifact:command/foundry-work/[^@]+@[1-9][0-9]*", ref):
+                raise ValidationError("Current Foundry evidence requires an immutable work reference")
+            manifest, body_hash, work = self._read_verified_artifact_json(ref)
+            if (manifest.get("artifact_ref") != ref
+                    or not manifest.get("artifact_id", "").startswith("command/foundry-work/")):
+                raise ValidationError("Current Foundry evidence has a different artifact identity")
+            required = work.get("assignment", {}).get("required_intent_fields", {})
+            if not isinstance(required, dict) or any(
+                    required.get(key) != selected.get(key)
+                    for key in ("research_question", "domain")):
+                raise ValidationError("Current Foundry evidence belongs to a different research topic")
+            if work.get("status") != "blocked":
+                raise ValidationError("Current Foundry evidence is not a blocked attempt")
+            attempt = work.get("last_attempt")
+            fingerprint = _authored_candidate_sha256(attempt)
+            if fingerprint is None or feedback.get("candidate_sha256") != fingerprint:
+                raise ValidationError("Current failure does not bind the authored candidate")
+            for name in ("validation_feedback", "validation_context"):
+                value = work.get(name)
+                if value and (not isinstance(value, dict)
+                              or work.get(name + "_candidate_sha256") != fingerprint):
+                    raise ValidationError("Current Foundry feedback is not bound to its authored candidate")
+            bound_feedback = _candidate_bound_value(work, attempt, "validation_feedback",
+                                                   "validation_feedback_candidate_sha256")
+            bound_context = _candidate_bound_value(work, attempt, "validation_context",
+                                                  "validation_context_candidate_sha256")
+            if (canonical_bytes(feedback.get("validation_feedback", {})) != canonical_bytes(bound_feedback)
+                    or canonical_bytes(feedback.get("validation_context", {})) != canonical_bytes(bound_context)
+                    or feedback.get("gate") != work.get("last_failure_gate")
+                    or result.get("failure_class") != work.get("last_failure_class")):
+                raise ValidationError("Current failure classification or feedback differs from its work artifact")
+            execution = self._foundry_execution_evidence(work)
+            if not execution.get("available"):
+                raise ValidationError(execution.get("reason", "Current execution evidence is unavailable"))
+            source_files = {
+                name: self._repair_source_evidence(
+                    attempt.get(name + "_source"), source_origin="foundry_work_cache",
+                    expected_sha256=execution["identity"]["sources"][name])
+                for name in ("executor", "validator")
+            }
+            return {"available": True, "admissible_as_verified_claims": False,
+                    "artifact_ref": ref, "artifact_body_sha256": body_hash,
+                    "failure_class": work.get("last_failure_class"),
+                    "failure_gate": work.get("last_failure_gate"), "error": work.get("error"),
+                    "authored_candidate_sha256": fingerprint,
+                    "experiment_intent": deepcopy(attempt.get("experiment_intent")),
+                    "runtime": deepcopy(attempt.get("runtime")),
+                    "configured_input": deepcopy(attempt.get("test_input")),
+                    "validation_context": deepcopy(bound_context),
+                    "validation_feedback": deepcopy(bound_feedback),
+                    "source_files": source_files, "foundry_execution_evidence": execution}
+        except (NotFoundError, KeyError, AttributeError, OSError, TypeError, ValueError, ValidationError) as exc:
+            return unavailable | {"reason": str(exc)}
 
     def _latest_foundry_failure_projection(self, question, domain):
         """Find the latest failed authoring state for this exact scientific intent."""
@@ -20374,7 +20489,26 @@ class ComposerRunner:
                     "current_result_status": result_status,
                     "current_execution_refs": execution_refs,
                 })
+        current_foundry_failure = self._current_foundry_failure_evidence(result, selected)
+        if current_foundry_failure is not None and not has_observed_results:
+            historical = {key: value for key, value in (failure_evidence or {}).items()
+                          if key in {"failure_dossier_ref", "failure_dossier", "failure_input_sha256",
+                                     "review_directives", "repair_plan", "latest_methods_panel"}}
+            historical.update({
+                "temporal_scope": "historical_prior_attempts_only",
+                "error": prior_stage_context.get("error"),
+                "failure_class": failure_recovery.get("failure_class")
+                if isinstance(failure_recovery, dict) else None,
+            })
+            failure_evidence = {
+                "failure_class": result.get("failure_class"),
+                "error": current_failure_message,
+                "current_foundry_failure": current_foundry_failure,
+                "historical_failure_evidence": historical,
+            }
         failure_recovery_projection = deepcopy(failure_recovery)
+        if current_foundry_failure is not None and isinstance(failure_recovery_projection, dict):
+            failure_recovery_projection["temporal_scope"] = "historical_prior_attempt_only"
         if has_observed_results and isinstance(failure_recovery_projection, dict):
             failure_recovery_projection.update({
                 "temporal_scope": "historical_prior_attempt_only",
@@ -20448,6 +20582,10 @@ class ComposerRunner:
                     ),
                 }
                 if has_observed_results else
+                {"state": "current_foundry_failure", "artifact_ref": current_foundry_failure.get("artifact_ref"),
+                 "source_files": deepcopy(current_foundry_failure.get("source_files", {})),
+                 "admissible_as_verified_claims": False}
+                if current_foundry_failure is not None else
                 {"state": "failure_snapshot", "files": program_snapshot,
                  "failure_dossier_ref": prior_stage_context.get("failure_dossier_ref")}
                 if program_snapshot or failure_recovery else
@@ -22044,50 +22182,8 @@ class ComposerRunner:
                 "executor" if source_name == "executor_source" else "validator")
             record = record if isinstance(record, dict) else {}
             expected_sha256 = record.get("sha256")
-            source_entry = {
-                "available": False,
-                "source_origin": source_origin,
-                "expected_sha256": expected_sha256,
-                "matches_expected": None,
-                "integrity_verified": False,
-                "source_truncated": False,
-                "source_chunks": [],
-            }
-            if isinstance(source, str):
-                source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
-                source_truncated = len(source) > CAPABILITY_REPAIR_SOURCE_CHARS
-                matches_expected = (
-                    source_sha256 == expected_sha256
-                    if isinstance(expected_sha256, str) else None
-                )
-                source_entry.update({
-                    "source_sha256": source_sha256,
-                    "source_characters": len(source),
-                    "matches_expected": matches_expected,
-                    "integrity_verified": matches_expected is True,
-                    "source_truncated": source_truncated,
-                })
-                if matches_expected is False:
-                    source_entry["omission_reason"] = (
-                        "Stored source does not match the immutable source-integrity digest."
-                    )
-                elif source_truncated:
-                    source_entry["omission_reason"] = (
-                        "Stored source exceeds the bounded repair-prompt source size."
-                    )
-                else:
-                    safe_source = redact_sensitive_text(source)
-                    source_entry.update({
-                        "available": True,
-                        "prompt_source_sha256": hashlib.sha256(
-                            safe_source.encode("utf-8")).hexdigest(),
-                        "prompt_source_characters": len(safe_source),
-                        "redaction_applied": safe_source != source,
-                        "source_chunks": [
-                            safe_source[offset:offset + 7000]
-                            for offset in range(0, len(safe_source), 7000)
-                        ],
-                    })
+            source_entry = self._repair_source_evidence(
+                source, source_origin=source_origin, expected_sha256=expected_sha256)
             source_files[source_name.removesuffix("_source")] = source_entry
 
         observed = dossier.get("observed_result")
