@@ -287,7 +287,12 @@ class LiteratureTree:
                     or tree.get("protocol_ref") != self.protocol["artifact_ref"]):
                 raise ValidationError("retained exploration tree does not match the declared survey")
             self.exploration_tree = tree
-            if tree.get("follow_up_ref") != self.follow_up_ref:
+            retained_discovery = (
+                getattr(self, "follow_up_discovery_current", False)
+                and self.resume_session is not None
+                and not {"retrieval", "production"}.intersection(self.resume_session["reopened_scopes"])
+            )
+            if tree.get("follow_up_ref") != self.follow_up_ref and not retained_discovery:
                 root = {"kind": "root", "question": self.score["question"],
                         "protocol_ref": self.protocol["artifact_ref"], "follow_up_ref": self.follow_up_ref}
                 for node in tree["nodes"]:

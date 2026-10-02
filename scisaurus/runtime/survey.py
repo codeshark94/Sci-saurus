@@ -1460,9 +1460,9 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         if nomination:
             self.nomination_record, self.nomination = nomination, {
                 key: self._body(nomination)[key] for key in ("id", "statement")}
+        self.follow_up_discovery_current = self._retained_follow_up_discovery()
         if self.store.head("kb/exploration-tree") is not None:
             self._tree_load()
-        self.follow_up_discovery_current = self._retained_follow_up_discovery()
         self._refresh_countersearch_state()
         if self.survey_ref and "gap_assessment" not in scopes:
             accepted = self.store.accepted("kb/gap-assessments/current")
@@ -1487,8 +1487,30 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             if review.get("survey_ref") != accepted["artifact_ref"]:
                 return False
             _, _, prompt, _ = self.gate._model_review_execution(review["execution_ref"], "methods.survey-reviewer")
-            return (prompt.get("follow_up_ref") == self.follow_up_ref
-                    and prompt.get("work_orders") == self.work_orders)
+            manifest, raw = self.gate._artifact(accepted["artifact_ref"], current=False)
+            survey = self.gate._json(raw, accepted["artifact_ref"])
+            _, map_raw = self.gate._artifact(survey["map_ref"], current=False)
+            if (manifest.get("score_ref") != self.score_ref
+                    or survey.get("score_ref") != self.score_ref
+                    or self.gate._json(map_raw, survey["map_ref"]).get("question") != self.score["question"]
+                    or prompt.get("question") != self.score["question"]):
+                return False
+            if (prompt.get("follow_up_ref") == self.follow_up_ref
+                    and prompt.get("work_orders") == self.work_orders):
+                return True
+            # Retiring an order does not invalidate acquisition for unchanged
+            # surviving orders. This retains discovery only; current survey,
+            # counter-search, and disposition gates still apply independently.
+            retained_orders = prompt.get("work_orders")
+            if not isinstance(retained_orders, list) or not retained_orders:
+                return False
+            _, follow_up_raw = self.gate._artifact(prompt["follow_up_ref"], current=False)
+            retained_packet = self.gate._json(follow_up_raw, prompt["follow_up_ref"])
+            if retained_packet.get("work_orders") != retained_orders:
+                return False
+            retained_bodies = {canonical_bytes(order) for order in retained_orders}
+            return bool(self.work_orders) and all(
+                canonical_bytes(order) in retained_bodies for order in self.work_orders)
         except (KeyError, TypeError, ValueError, ValidationError, StateError):
             return False
 

@@ -2874,6 +2874,72 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertFalse(changed.counter_queries_complete)
         changed.control.close()
 
+    def test_retired_follow_up_order_retains_discovery_without_replaying_search(self):
+        config = survey_config(self.endpoint)
+        orders = [self.follow_up_order(), {**self.follow_up_order(), "id": "evidence-2"}]
+        first = self.runtime(config, work_orders=orders)
+        with patch.object(first, "_assess", side_effect=KeyboardInterrupt("before assessment")):
+            failed = first.run()
+        self.assertTrue(failed["survey_current"], failed.get("error"))
+        policy = {"additional_seconds": config["limits"]["wall_clock_seconds"],
+                  "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["gap_assessment"]}}
+        second = self.runtime(config, resume_policy=policy, work_orders=[orders[1]])
+        retained_map = second.map_record["artifact_ref"]
+        self.assertTrue(second.follow_up_discovery_current)
+        self.assertFalse(second.counter_queries_complete)
+        self.assertIsNone(second.counter_plan_record)
+        with patch.object(second, "_prepare_follow_up", side_effect=AssertionError("discovery repeated")), \
+             patch.object(second, "_explore", side_effect=AssertionError("discovery repeated")), \
+             patch.object(second, "_initial_plans", side_effect=AssertionError("discovery searches repeated")), \
+             patch.object(second, "_search", wraps=second._search) as search:
+            completed = second.run()
+        self.assertEqual(completed["status"], "completed", completed.get("error"))
+        self.assertEqual(second.map_record["artifact_ref"], retained_map)
+        self.assertTrue(search.call_args_list)
+        self.assertTrue(all(call.kwargs.get("admission") == "challenge" for call in search.call_args_list))
+        self.assertEqual([order["id"] for order in completed["work_orders"]], [orders[1]["id"]])
+
+    def test_changed_follow_up_body_cannot_inherit_discovery_by_id(self):
+        config = survey_config(self.endpoint)
+        orders = [self.follow_up_order(), {**self.follow_up_order(), "id": "evidence-2"}]
+        first = self.runtime(config, work_orders=orders)
+        with patch.object(first, "_nominate", side_effect=ModelContractError("nomination response malformed")):
+            first.run()
+        policy = {"additional_seconds": config["limits"]["wall_clock_seconds"],
+                  "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["gap_assessment"]}}
+        for order in [{**orders[1], "success_condition": "A different evidence requirement"},
+                      {**orders[1], "id": "evidence-3"}]:
+            with self.subTest(order=order):
+                resumed = self.runtime(config, resume_policy=policy, work_orders=[order])
+                self.assertFalse(resumed.follow_up_discovery_current)
+                resumed.control.close()
+
+    def test_narrowed_order_discovery_does_not_restore_stale_survey_acceptance(self):
+        config = survey_config(self.endpoint)
+        config["survey"]["proposed_gap"] = None
+        orders = [self.follow_up_order(), {**self.follow_up_order(), "id": "evidence-2"}]
+        first = self.runtime(config, work_orders=orders)
+        with patch.object(first, "_nominate", side_effect=ModelContractError("nomination response malformed")):
+            first.run()
+        policy = {"additional_seconds": config["limits"]["wall_clock_seconds"],
+                  "unknown_outcomes": {"mode": "charge_and_retry", "usage_per_attempt": {"model_calls": 1}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["integrated_review"]}}
+        editor = self.runtime(config, resume_policy=policy, work_orders=[orders[1]])
+        entry = editor.analysis_records["W101"]
+        editor._publish(entry["artifact_id"], "note", editor._body(entry), "research.literature-mapper")
+        editor.control.close()
+        resumed = self.runtime(config, resume_policy=policy, work_orders=[orders[1]])
+        self.assertIsNone(resumed.survey_ref)
+        self.assertTrue(resumed.follow_up_discovery_current)
+        with patch.object(resumed, "_prepare_follow_up", side_effect=AssertionError("discovery repeated")), \
+             patch.object(resumed, "_explore", side_effect=AssertionError("discovery repeated")):
+            completed = resumed.run()
+        self.assertEqual(completed["status"], "completed", completed.get("error"))
+        self.assertTrue(completed["survey_current"])
+        self.assertTrue(completed["assessment_current"])
+
     def test_stale_accepted_map_retains_discovery_and_reopens_review_with_tree(self):
         config = survey_config(self.endpoint)
         config["survey"]["proposed_gap"] = None
