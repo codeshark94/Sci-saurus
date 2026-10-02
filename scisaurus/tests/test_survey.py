@@ -1938,6 +1938,42 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(json.loads((self.root / "run/output/composer-gated-run.json").read_text()), context)
         self.assertFalse(ComposerRunner._survey_work_order_was_fulfilled(self.root / "run", native, order))
         self.assertEqual(resumed._reconcile_latest_survey_results(), [])
+        resumed = ComposerRunner(workflow, resume=True, stop_after_stage="survey")
+        self.addCleanup(resumed.close)
+        prior_receipt = context["native_reconciliation_ref"]
+        changed_order = {**order, "id": "new-source-review", "kind": "literature_expansion",
+            "owner": "research.intelligence", "target_stage_id": "survey"}
+        with patch.object(resumed, "_current_topic_identity", return_value=identity), \
+                patch.object(resumed, "_requests_for_stage", return_value=[changed_order]):
+            self.assertEqual(resumed._reconcile_latest_survey_results(), ["survey"])
+            refreshed = resumed.context["survey"]
+            self.assertEqual(refreshed["run_id"], native["run_id"])
+            self.assertEqual(refreshed["survey_ref"], native["survey_ref"])
+            self.assertNotEqual(refreshed["native_reconciliation_ref"], prior_receipt)
+            self.assertEqual(refreshed["research_requests"], [changed_order])
+            self.assertEqual(resumed._reconcile_latest_survey_results(), [])
+        id_only_order = {**changed_order, "id": "replacement-source-review"}
+        with patch.object(resumed, "_current_topic_identity", return_value=identity), \
+                patch.object(resumed, "_requests_for_stage", return_value=[id_only_order]), \
+                patch.object(resumed, "_survey_attempt_was_accepted", return_value=True):
+            self.assertEqual(resumed._reconcile_latest_survey_results(), ["survey"])
+            self.assertEqual(resumed.context["survey"]["research_requests"], [id_only_order])
+            self.assertTrue(resumed.context["survey"]["release_blocking"])
+            self.assertFalse(resumed._stage_releases_dependencies(resumed.stage_records["survey"], stage_kind="survey"))
+            self.assertEqual(resumed._reconcile_latest_survey_results(), [])
+        resumed.context["topic"] = {"topic": {"research_question": config["survey"]["question"]},
+            "specialist_verifier": {"artifact_ref": "artifact:command/new-governing-review@1"}}
+        with patch.object(resumed, "_current_topic_identity", return_value=identity), \
+                patch.object(resumed, "_topic_stage_for_survey", return_value={"id": "topic"}), \
+                patch.object(resumed, "_requests_for_stage", return_value=[id_only_order]), \
+                patch.object(resumed, "_survey_request_was_fulfilled", return_value=True), \
+                patch.object(resumed, "_survey_attempt_was_accepted", return_value=True), \
+                patch.object(resumed, "_gate_free_topic_survey", side_effect=lambda value, **kw: value):
+            self.assertEqual(resumed._reconcile_latest_survey_results(), ["survey"])
+            self.assertEqual(resumed.context["survey"]["status"], "candidate_needs_review")
+            self.assertTrue(resumed.context["survey"]["release_blocking"])
+            self.assertFalse(resumed._stage_releases_dependencies(resumed.stage_records["survey"], stage_kind="survey"))
+            self.assertEqual(resumed._reconcile_latest_survey_results(), [])
 
     def test_follow_up_inventory_projection_keeps_exact_named_ids_and_discloses_scope(self):
         inventory = {"survey_ref": "artifact:kb/surveys/current@1", "works": [

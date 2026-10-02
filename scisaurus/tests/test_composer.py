@@ -132,7 +132,11 @@ class ComposerWorkflowTests(unittest.TestCase):
                         "deferred_gates": ["Recalculate the later experiment outputs."]}
                     return ModelResult(text=json.dumps(body), model="test", usage={"model_calls": 1, "input_tokens": 1, "output_tokens": 1}, elapsed_seconds=.001, finish_reason="stop")
                 return super().complete(system=system, prompt=prompt, images=images)
+        acceptance_contract = runner._stage_acceptance_contract
+        def legacy_acceptance_contract(*args, **kwargs):
+            return {key: value for key, value in acceptance_contract(*args, **kwargs).items() if key != "obligation_scope"}
         with patch("scisaurus.runtime.specialists.ModelClient", HeldClient), \
+             patch.object(runner, "_stage_acceptance_contract", side_effect=legacy_acceptance_contract), \
              patch("scisaurus.runtime.composer.VERIFIER_SYSTEM", "legacy-verifier-contract"), \
              patch("scisaurus.runtime.specialists.VERIFIER_SYSTEM", "legacy-verifier-contract"):
             bundle = runner._publish_specialist_reports(stage, plan,
@@ -312,6 +316,36 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(new_execution["chief_result"]["topic"], current["topic"])
             self.assertEqual(current["review_revalidation"]["producer_calls_replayed"], 0)
             self.assertIsNone(resumed._topic_review_obligation(resumed.workflow["stages"][1]))
+
+    def test_repeated_topic_review_revalidation_preserves_original_peer_payment_plan(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner, stage, _ = self._owned_held_topic(Path(path))
+            workflow = deepcopy(runner.workflow)
+            runner.status = "paused"; runner._checkpoint("paused", force=True); runner.close()
+            runner = ComposerRunner(workflow, resume=True); self.addCleanup(runner.close)
+            peers = deepcopy(runner.context["topic"]["specialist_reports"])
+            before = deepcopy(runner.usage)
+            with patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient):
+                first = runner.revalidate_topic_review("topic")
+                self.assertIsNone(runner.revalidate_topic_review("topic"))
+                contract = runner._stage_acceptance_contract
+                def changed_contract(*args, **kwargs):
+                    value = contract(*args, **kwargs)
+                    value["current_requirements"] = [*value["current_requirements"], "Verify exact deferred ownership."]
+                    return value
+                with patch.object(runner, "_stage_acceptance_contract", side_effect=changed_contract):
+                    second = runner.revalidate_topic_review("topic")
+                    self.assertIsNone(runner.revalidate_topic_review("topic"))
+            self.assertNotEqual(first["specialist_verifier"]["artifact_ref"], second["specialist_verifier"]["artifact_ref"])
+            self.assertEqual(runner.usage["model_calls"], before["model_calls"] + 2)
+            self.assertEqual(second["specialist_reports"], peers)
+            execution = runner._read_verified_artifact_json(second["specialist_verifier"]["artifact_ref"])[2]
+            for peer in execution["specialist_reports"]:
+                original = runner._read_verified_artifact_json(peer["artifact_ref"])[2]
+                plan = runner._read_verified_artifact_json(peer["input_scope"]["assignment_plan_ref"])[2]
+                self.assertEqual(plan["attempt_number"], original["attempt_number"])
+            self.assertEqual(second["review_revalidation"]["producer_calls_replayed"], 0)
+            self.assertEqual(second["review_revalidation"]["peer_calls_replayed"], 0)
 
     def test_topic_review_revalidation_preserves_known_failed_cost_and_routes_fresh_hold_on_native_run(self):
         with tempfile.TemporaryDirectory() as path:

@@ -1254,6 +1254,23 @@ class SpecialistDispatcherTests(unittest.TestCase):
             with self.subTest(order=invalid), self.assertRaises(ValidationError):
                 validate(invalid)
 
+    def test_unconfigured_future_gates_cannot_bypass_branch_or_work_ownership(self):
+        scope = {"topic_ids": ["selected"], "stage_work_kinds": {"survey": ["evidence"]},
+                 "deferred_gate_work_kinds": {"experiment": ["calculation"]}}
+        gate = {"target_stage_kind": "experiment", "topic_ids": ["selected"], "work_kind": "calculation",
+                "requirement": "Propagate the uncertainty band and define the evaluation grid.",
+                "completion_check": "The numerical bounds trace to checked inputs and independent recalculation.",
+                "evidence_needed": ["Source-bound parameter file", "Independent recalculation"]}
+        def validate(value):
+            return _normalise_verdict({"decision": "accept", "deferred_gates": [value]},
+                current_stage_id="topic", valid_target_stage_ids=["survey"], obligation_scope=scope)
+        self.assertEqual(validate(gate)["deferred_gates"], [gate])
+        for invalid in (json.dumps(gate), "Calculate the band in survey", {**gate, "target_stage_kind": "survey"},
+                        {**gate, "target_stage_id": "survey"}, {**gate, "work_kind": "evidence"},
+                        {**gate, "topic_ids": ["foreign"]}):
+            with self.subTest(gate=invalid), self.assertRaises(ValidationError):
+                validate(invalid)
+
     def test_typed_deferred_owner_validation_survives_generic_response_retry(self):
         model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1", "model": "fixture",
                  "timeout_seconds": 5, "max_output_tokens": 1000, "context_window_tokens": 16000, "max_input_tokens": 15000}

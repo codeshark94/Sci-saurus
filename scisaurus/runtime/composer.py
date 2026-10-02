@@ -7294,6 +7294,8 @@ class ComposerRunner:
             if owned is None:
                 continue
             context, plan_ref, ref, digest, response = owned
+            if not response.get("deferred_obligations"):
+                continue
             normalized = _normalise_verdict(response, current_stage_id=topic_stage["id"],
                 valid_target_stage_ids=contract["downstream_stage_ids"], obligation_scope=contract["obligation_scope"])
             for obligation in normalized.get("deferred_obligations", []):
@@ -7337,7 +7339,11 @@ class ComposerRunner:
         if not isinstance(ref, str):
             return None
         manifest, digest, execution = self._read_verified_artifact_json(ref)
-        if execution.get("initial_review_input", {}).get("system") == VERIFIER_SYSTEM:
+        initial = execution.get("initial_review_input", {})
+        initial_packet = json.loads(initial.get("prompt", "{}"))
+        initial_contract = initial_packet.get("verifier_contract", {}).get("stage_acceptance_contract")
+        if (initial.get("system") == VERIFIER_SYSTEM
+                and initial_contract == self._stage_acceptance_contract(stage, context)):
             return None
         record = self.stage_records.get(stage["id"], {})
         plan_ref = verifier.get("assignment_plan_ref") or record.get("assignment_plan_ref")
@@ -7371,7 +7377,8 @@ class ComposerRunner:
             raise StateError("topic review revalidation has no retained independent peer reports")
         for peer in peers:
             peer_ref = peer.get("artifact_ref")
-            if not isinstance(peer_ref, str) or self._stage_specialist_payment_proof(stage, plan_ref, peer_ref) is None:
+            peer_plan_ref = peer.get("input_scope", {}).get("assignment_plan_ref", plan_ref)
+            if not isinstance(peer_ref, str) or self._stage_specialist_payment_proof(stage, peer_plan_ref, peer_ref) is None:
                 raise StateError("topic review revalidation peer is not assignment owned")
             _, _, peer_execution = self._read_verified_artifact_json(peer_ref)
             retained = peer_execution.get("report", {})
@@ -7383,7 +7390,7 @@ class ComposerRunner:
                 if item["task_id"] == peer_execution["task_id"])
             peer["input_scope"] = {"declared_fields": deepcopy(assignment.get("input_projection", [])),
                                    "assignment_phase": assignment.get("assignment_phase"),
-                                   "assignment_plan_ref": plan_ref,
+                                   "assignment_plan_ref": peer_plan_ref,
                                    "execution_ref": peer_ref, "contract_state": "retained_original"}
         return {"producer_cache_ref": cached["cache_ref"], "producer_cache_sha256": producer_digest,
                 "output_path": str(output), "output_sha256": output_hash,
@@ -19756,7 +19763,9 @@ class ComposerRunner:
             topic_ids.append(selected_topic["id"])
         return {"current_stage_id": stage["id"],
             "obligation_scope": {"topic_ids": topic_ids, "stage_work_kinds": {
-                item["id"]: work_kinds[item["kind"]] for item in self.workflow["stages"] if item["id"] in descendants}},
+                item["id"]: work_kinds[item["kind"]] for item in self.workflow["stages"] if item["id"] in descendants},
+                "deferred_gate_work_kinds": {kind: work_kinds[kind] for kind in list(work_kinds)[list(work_kinds).index(stage["kind"])+1:]
+                    if kind not in {item["kind"] for item in self.workflow["stages"]}}},
             "scientific_input_recovery": scientific_input_recovery_contract(),
             "downstream_stage_ids": [item["id"] for item in self.workflow["stages"] if item["id"] in descendants],
             "acceptance_target": target, "current_requirements": deepcopy(requirements[stage["kind"]]),
@@ -26586,8 +26595,15 @@ class ComposerRunner:
                             and attempt.get("topic_cycle") == identity["topic_cycle"])) for attempt in attempts):
                 continue
             run = self._read_json_object(project / "output/run.json")
-            if (not isinstance(run, dict) or run.get("status") != "completed"
-                    or run.get("run_id") == incumbent.get("run_id")):
+            if not isinstance(run, dict) or run.get("status") != "completed":
+                continue
+            topic_stage = self._topic_stage_for_survey(stage)
+            governing_review = (self.context.get(topic_stage["id"], {}).get("specialist_verifier", {}).get("artifact_ref")
+                                if topic_stage else None)
+            scope = {"governing_topic_review_ref": governing_review,
+                "work_orders_sha256": hashlib.sha256(canonical_bytes(self._follow_up_projection(self._requests_for_stage(stage)))).hexdigest()}
+            if run.get("run_id") == incumbent.get("run_id") and (not incumbent.get("native_reconciliation_ref")
+                    or incumbent.get("native_reconciliation_scope") == scope):
                 continue
             with closing(sqlite3.connect((project / "state/control.sqlite").as_uri() + "?mode=ro", uri=True)) as connection:
                 connection.row_factory = sqlite3.Row
@@ -26623,12 +26639,13 @@ class ComposerRunner:
                     or (run.get("follow_up_result") is not None and not self._survey_follow_up_was_replayed(project, run))):
                 raise StateError("native survey final receipt failed current evidence replay")
             fresh = {**deepcopy(run), "stage_id": stage["id"], "kind": "survey", "project_dir": str(project),
-                     "output_path": str(project / "output/run.json"),
+                     "output_path": str(project / "output/run.json"), "native_reconciliation_scope": deepcopy(scope),
                      **({"topic_id": identity["topic_id"], "topic_cycle": identity["topic_cycle"], "topic_lineage": deepcopy(identity)}
                         if identity is not None else {key: deepcopy(incumbent[key]) for key in ("topic_id", "topic_cycle", "topic_lineage") if key in incumbent})}
             fresh = self._gate_survey_work_orders(stage, fresh)
             fresh = self._gate_free_topic_survey(fresh, stage=stage)
-            if not self._survey_attempt_was_accepted(stage["id"], record, fresh):
+            if (incumbent.get("native_reconciliation_scope") != scope
+                    or not self._survey_attempt_was_accepted(stage["id"], record, fresh)):
                 fresh["review_status"] = "current_producer_requires_review"
                 fresh["release_blocking"] = True
                 fresh["composer_decision"] = "review_required"
@@ -26638,7 +26655,7 @@ class ComposerRunner:
                 "decision_note", {"schema_version": "native-survey-reconciliation-1", "stage_id": stage["id"],
                     "project_dir": str(project), "producer_ref": final["artifact_ref"], "producer_sha256": final["body_hash"],
                     "config_ref": config_record["artifact_ref"], "config_sha256": config_record["body_hash"],
-                    "resume_ref": resume["artifact_ref"], "prior_run_id": incumbent.get("run_id"),
+                    "resume_ref": resume["artifact_ref"], "prior_run_id": incumbent.get("run_id"), "governing_scope": deepcopy(scope),
                     "result": fresh, "inherited_approval": False, "model_calls": 0}, "command.composer")
             fresh["native_reconciliation_ref"] = receipt["artifact_ref"]
             self.context[stage["id"]] = fresh
