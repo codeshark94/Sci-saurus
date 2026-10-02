@@ -658,6 +658,35 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(second.deadline_epoch, deadline)
             self.assertEqual(current["follow_up_result"], native["follow_up_result"])
 
+    def test_resumed_boundary_retires_historical_control_stops_without_repeating_review(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner, stage, native = self._owned_held_survey_review(Path(path))
+            workflow = deepcopy(runner.workflow)
+            runner.status = "paused"; runner._checkpoint("paused", force=True); runner.close()
+            runner = ComposerRunner(workflow, resume=True, stop_after_stage="survey")
+            with patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient), \
+                 patch.object(runner, "_survey_references_are_current", return_value=True), \
+                 patch.object(runner, "_survey_follow_up_was_replayed", return_value=True):
+                current = runner.revalidate_stage_review(stage["id"])
+            verifier = current["specialist_verifier"]["artifact_ref"]
+            boundary = {"stage_id": "workflow", "boundary_stage_id": "survey", "stop_reason": "operator_stage_boundary",
+                        "reason": "declared operator stage boundary reached"}
+            interrupted = {"stage_id": "workflow", "stop_reason": "process_interrupted", "reason": "KeyboardInterrupt"}
+            scientific = {"stage_id": "survey", "reason": "An explicitly scoped scientific limit remains."}
+            runner.blockers.extend([deepcopy(boundary), deepcopy(boundary), interrupted, scientific])
+            runner.status = "paused"; runner._checkpoint("survey:operator_stage_boundary", force=True); before = deepcopy(runner.usage); runner.close()
+            runner = ComposerRunner(workflow, resume=True, stop_after_stage="survey")
+            with patch("scisaurus.runtime.specialists.ModelClient", side_effect=AssertionError("accepted review must not repeat")), \
+                 patch.object(runner, "_run_stage", side_effect=AssertionError("acquisition must not repeat")):
+                result = runner.run()
+            self.assertEqual(result["active_blockers"], [boundary])
+            self.assertEqual(result["usage"], before)
+            self.assertEqual(result["context"]["survey"]["specialist_verifier"]["artifact_ref"], verifier)
+            self.assertEqual(result["context"]["survey"]["follow_up_result"], native["follow_up_result"])
+            self.assertIn(scientific, result["blockers"])
+            retired = [x for x in result["blockers"] if x.get("recovery") == "superseded_by_current_stage_state"]
+            self.assertEqual(len(retired), 3)
+
     def test_review_revalidation_accepts_immutable_review_candidates_without_a_pause_roundtrip(self):
         for status in ("candidate_needs_review", "research_expansion_required", "review_rejected", "completed", "running"):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as path:

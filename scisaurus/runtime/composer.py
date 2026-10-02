@@ -26911,19 +26911,37 @@ class ComposerRunner:
                        and item["failure_debt"].get("release_blocking") is True
                        for item in (record, context)))
 
+    def _retire_restored_workflow_stops(self):
+        """Retain prior control stops as history when a restored execution is resumed."""
+        if self._restored_execution_frontier is None:
+            return
+        retired = []
+        for item in self.blockers:
+            if (isinstance(item, dict) and item.get("stage_id") == "workflow"
+                    and item.get("stop_reason") in {"operator_stage_boundary", "process_interrupted"}
+                    and item.get("recovery") != "superseded_by_current_stage_state"):
+                retired.append(deepcopy(item))
+                item.update(recovery="superseded_by_current_stage_state", recovered_by_run_id=self.run_id)
+        if retired:
+            self.department_activity.append({"action": "retire_restored_workflow_stops", "run_id": self.run_id,
+                "restored_frontier": deepcopy(self._restored_execution_frontier), "prior_stops": retired})
+
     def _pause_at_stage_boundary(self, stage_id):
         if self.stop_after_stage != stage_id or not self._stage_boundary_is_settled(stage_id):
             return False
         if self._stage_has_pending_continuation(stage_id):
             return False
         self.status = "paused"
-        self.blockers.append({"stage_id": "workflow", "boundary_stage_id": stage_id, "reason": "declared operator stage boundary reached",
-                              "stop_reason": "operator_stage_boundary"})
+        boundary = {"stage_id": "workflow", "boundary_stage_id": stage_id,
+                    "reason": "declared operator stage boundary reached", "stop_reason": "operator_stage_boundary"}
+        if boundary not in self.blockers:
+            self.blockers.append(boundary)
         self._checkpoint(f"{stage_id}:operator_stage_boundary", force=True)
         return True
 
     def run(self):
         try:
+            self._retire_restored_workflow_stops()
             for stage in self.workflow["stages"]:
                 if stage.get("kind") not in {"topic_discovery", "survey"} or self._stage_review_revalidation_input(stage) is None:
                     continue
