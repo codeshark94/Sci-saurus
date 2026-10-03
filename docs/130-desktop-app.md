@@ -35,7 +35,9 @@ process before enabling actions. Stop ends the supervised worker tree and
 preserves its checkpoint. Resume retains acquired evidence and the original
 mission deadline. Existing state is never overwritten by Start.
 
-Closing the desktop app closes its UI backend. Research supervisors run in
+The window close button hides the window while keeping the app and its backend
+running. Selecting the Dock icon or opening the app again restores the window.
+Quit (Command-Q) exits the app and closes its UI backend. Research supervisors run in
 separate sessions and continue until stopped explicitly or their workflow ends.
 Reopening the app discovers those supervisors. A parent pipe also closes the
 backend if the desktop host exits unexpectedly.

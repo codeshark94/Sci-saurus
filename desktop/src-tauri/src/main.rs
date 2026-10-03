@@ -322,6 +322,14 @@ async fn choose_repository(
     .map_err(|e| e.to_string())?
 }
 
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        if let Err(error) = window.show().and_then(|_| window.set_focus()) {
+            eprintln!("Unable to show the main window: {error}");
+        }
+    }
+}
+
 fn main() {
     let host = Host::default();
     let quit_host = host.clone();
@@ -340,15 +348,20 @@ fn main() {
             });
         })
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            show_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(host.clone())
         .invoke_handler(tauri::generate_handler![connect_saved, choose_repository])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                if let Err(error) = window.hide() {
+                    eprintln!("Unable to hide the main window: {error}");
+                }
+            }
+        })
         .setup(move |app| {
             let menu = tauri::menu::Menu::default(app.handle())?;
             let choose = tauri::menu::MenuItem::with_id(
@@ -434,7 +447,11 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("Desktop host initialization failed")
-        .run(move |_, event| {
+        .run(move |app, event| {
+            #[cfg(target_os = "macos")]
+            if matches!(event, tauri::RunEvent::Reopen { .. }) {
+                show_main_window(app);
+            }
             if matches!(event, tauri::RunEvent::Exit) {
                 if let Ok(mut backend) = quit_host.0.lock() {
                     if let Some(mut child) = backend.child.take() {
