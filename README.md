@@ -2,9 +2,9 @@
 
 # 🦖 Sci-saurus
 
-### A bounded, auditable research organization for turning compute into verified progress.
+**A human-directed, evidence-first research workflow.**
 
-Autonomous within mission bounds · evidence-first · resumable · provider-aware
+Bounded missions · Independent checks · Resumable work · Explicit release authority
 
 [![CI](https://github.com/codeshark94/Sci-saurus/actions/workflows/tests.yml/badge.svg)](https://github.com/codeshark94/Sci-saurus/actions/workflows/tests.yml)
 ![Python 3.14](https://img.shields.io/badge/python-3.14-3776AB?logo=python&logoColor=white)
@@ -12,224 +12,84 @@ Autonomous within mission bounds · evidence-first · resumable · provider-awar
 
 </div>
 
-> Sci-saurus is not a chatbot that pretends to be a scientist. It is a
-> Principal-directed control plane that turns goals into bounded work,
-> evidence, artifacts, independent checks, and explicit next decisions.
-
-## At a glance
-
-Sci-saurus coordinates a project-scoped organization of on-demand specialists.
-The Principal sets the objective, authority, trade-offs, and release boundary.
-Once a mission is admitted, the Composer plans and supervises work;
-departments investigate, construct, challenge, verify, revise, and choose the
-next scoped recovery action without asking a person to invent a pivot. The
-Archivist preserves the trail.
-
-The paper mission has hard evidence dependencies, but it is not a one-way
-assembly line. The Composer keeps a live research frontier and can reopen the
-smallest affected scope:
-
-```text
-candidate portfolio → literature probe ↔ topic refinement
-                              ↓
-                    experiment ↔ added evidence
-                              ↓
-             interpretation ↔ discriminating test
-                              ↓
-                  argument ↔ claim repair
-                              ↓
-                    paper ↔ adversarial review
-```
-
-When several dependency-ready activities exist, an adaptive agenda favors
-evidence-producing work, active work orders, and actions that unlock useful
-downstream work. Seeded exploration breaks close ties. Every choice and
-alternative is checkpointed; final release authority remains with the Principal.
-A failed adaptive attempt yields back to the global agenda with a persisted
-not-before boundary, so another ready evidence action can run during backoff.
-Hard dependencies may correctly leave a single initial frontier; the flow
-becomes non-linear through retained candidate branches and evidence-triggered
-reopenings rather than by bypassing those dependencies.
-
-Autonomous missions can use `progression_policy: forward_first`: after a
-bounded attempt budget, an evidence-bearing mechanical or scientific blocker
-can become a clearly marked `candidate_needs_review` node with a failure-debt
-artifact and a deferred backfill order. A generated capability that never
-executed is not eligible for that provisional handoff: Composer opens the
-experiment repair loop, changes the design axis after an exhausted source-
-repair lease, and reruns the code and validator in a fresh namespace. The
-graph can continue to downstream work only with an observed, explicitly
-unverified candidate, then return to its debt. In this policy the Composer, not
-the deterministic harness, authorizes dependency release; the candidate remains
-visibly unverified and cannot be treated as accepted evidence or an external
-release. Provider quotas, cooldowns, unknown calls, and the hard mission
-deadline still stop safely.
-
-The same runtime can also produce bounded reports, guides, JSON artifacts, and
-Python source units. A scientific result is never inferred from a model response
-or a successful process exit alone.
-
-For free-topic missions, topic discovery is materialized as a provisional
-research program: all candidate branches are retained with supportive,
-null/boundary, and ambiguous outcome rules plus a declared kill condition. The
-argument stage then writes an evidence-bound defense ledger that separates
-observations, inferences, provisional explanations, limitations, and future
-tests. Missing evidence remains a research request; it cannot be repaired by
-confident prose.
-
-Executable failures follow the same control loop. When an experiment capability
-is rejected before execution, or an observed result produces a methods hold,
-Composer activates a bounded Methods repair panel. The methodologist,
-statistical reviewer, reproducibility reviewer, analysis reviewer, and an
-independent adversary inspect the failure packet; their root causes, required
-changes, and falsifiable acceptance checks become the next capability-authoring
-brief. The new program must pass independent recalculation and admission gates
-before it can run. A repair is therefore authored by the project runtime from
-the recorded evidence, not supplied as a hardcoded experiment patch.
-
-For any scientific stage failure, the runtime first writes a failure dossier and
-issues a concrete repair order. Experiment orders inspect the result and both
-programs, independently recalculate the estimand, edit the source-level
-mechanism, and run a fresh replay/review. Provider, quota, deadline, and
-unknown-call failures remain resource recovery events rather than scientific
-retries.
-
-Malformed or truncated model output is tracked separately as `model_contract`:
-the same stage gets one compact, schema-only repair through its configured
-fallback route. It cannot create a topic pivot or consume a scientific repair
-cycle. Only an evidence-bearing scientific failure can issue an additional
-experiment or source-level program repair order.
-
-Licensed under the [MIT License](LICENSE).
+Sci-saurus coordinates project-scoped specialists to turn a Principal's goal
+into bounded work, inspectable evidence, reviewed artifacts, and explicit next
+decisions. The Principal sets the objective, authority, trade-offs, and release
+boundary. The Composer plans and supervises the work; departments form around
+the active task; the Archivist preserves its provenance and history.
 
 ## How the organization works
 
-```mermaid
-flowchart LR
-    P[Principal<br/>objective + authority] --> C[Composer / Command<br/>plan · allocate · supervise]
-    C --> R[Research<br/>questions + evidence]
-    C --> M[Methods<br/>experiments + controls]
-    C --> S[Strategy<br/>interpretation + argument]
-    C --> E[Editorial<br/>manuscript + release proposal]
-    O[Operations<br/>APIs · tools · environment] -. supports .-> R
-    O -. supports .-> M
-    O -. supports .-> E
-    V[Independent checks<br/>review · replay · verification] -. verdicts and holds .-> C
+Authority, coordination, specialist work, operations, and independent checks
+have separate responsibilities. Specialists are activated for scoped tasks;
+the default roster does not mean a fixed set of model processes is running.
 
-    classDef control fill:#e8edf5,stroke:#52657a,color:#17212b
-    classDef department fill:#f5f6f8,stroke:#68727d,color:#17212b
-    classDef support fill:#fafafa,stroke:#9aa3ad,color:#17212b
-    class C control
-    class R,M,S,E department
-    class P,O,V support
-```
+![Sci-saurus accountability map: Principal, Composer, on-demand departments, Operations, and independent checks](docs/diagrams/organization-map.svg)
 
-The accountability map above is not an execution itinerary. Runtime selection
-is shown separately:
+Solid arrows show direction and work assignment. Dashed paths show operational
+support and independent review feedback.
 
-```mermaid
-flowchart TB
-    C[Composer / Command] --> F{Adaptive agenda<br/>score the ready frontier}
-    F --> A[Admit one safe scoped action<br/>after dependency · quota · deadline checks]
+## How a mission progresses
 
-    subgraph G[Default paper mission]
-        direction TB
-        T[Topic<br/>explore · compare · refine]
-        S[Survey<br/>search · acquire · verify]
-        M[Experiment<br/>freeze · run · replay]
-        I[Interpretation<br/>explain · test alternatives]
-        R[Argument<br/>link claims to evidence]
-        P[Paper<br/>compose · review · propose release]
-        T -->|provisional direction| S
-        S -->|eligible evidence| M
-        M --> I --> R --> P
-    end
+![Sci-saurus research workflow: adaptive agenda, dependency-gated stages, scoped repairs, and replanning](docs/diagrams/research-workflow.svg)
 
-    A -->|fresh free-topic mission| T
-    S -.-> Q
-    M -.-> Q
-    I -.-> Q
-    R -.-> Q
-    P -.-> Q
-    Q[Scoped repair work order<br/>gap · control · test · claim finding] -.-> F
+The default paper mission is shown above. Topic discovery is used for
+free-topic missions; a project with supplied research can start at Survey or
+Experiment when its evidence dependencies allow it. The stage graph is not a
+mandatory one-pass itinerary: Composer admits one safe, dependency-ready action
+at a time and can reopen the smallest affected scope when new evidence exposes
+a gap.
 
-    classDef control fill:#e8edf5,stroke:#52657a,color:#17212b
-    classDef feedback fill:#f5f6f8,stroke:#68727d,color:#17212b
-    class C,F,A control
-    class T,S,M,I,R,P stage
-    class Q feedback
-    style G fill:#fbfcfd,stroke:#d0d5dd,color:#17212b
-```
+Free-topic missions retain candidate branches with supportive, null/boundary,
+and ambiguous outcome rules plus a kill condition. The argument stage builds an
+evidence-bound defense ledger that separates observations, inferences,
+provisional explanations, limitations, and future tests.
 
-Solid arrows are scientific dependencies. Dotted arrows return a finding to
-the Composer for scoped repair and re-planning; they are not direct bypasses.
-For a fresh free-topic mission the first admission is Topic, while later
-admissions can target any currently dependency-ready stage. A run may revisit
-an earlier stage or pursue a parallel-ready repair without pretending that a
-later stage is already accepted.
+## Runtime capabilities
 
-| Boundary | Responsibility |
+| Area | What the runtime provides |
 |---|---|
-| **Principal** | Sets the destination, prohibitions, priorities, and release authority |
-| **Composer / Command** | Admits stages, allocates bounded capacity, routes repair, and controls resume |
-| **Research** | Finds questions, sources, identities, evidence, and literature gaps |
-| **Methods** | Freezes methods, runs controls and replay, recalculates results, and checks reproducibility |
-| **Strategy** | Interprets results, tests alternatives, and links claims to evidence |
-| **Editorial** | Structures, edits, renders, and assembles the release candidate |
-| **Operations** | Makes declared APIs, programs, MCP services, and environments work when needed |
-| **Archivist** | Keeps immutable artifacts, provenance, event history, and release records |
+| **Mission control** | Durable project state, event history, leases, checkpoints, adaptive ranking of dependency-ready work, and resumable decisions |
+| **Evidence and artifacts** | Immutable, content-addressed versions; provenance; scoped edits; literature identities; exact source references and spans |
+| **Literature workflow** | OpenAlex discovery, bounded HTML/XML and open-access PDF capture, identity reconciliation, citation maps, counter-search, and gap assessment |
+| **Scientific execution** | Frozen methods and seeds, raw observations, deterministic replay, independent recalculation, and reviewed result packages |
+| **Recovery** | Failure dossiers, typed work orders, bounded capability repair, and reopening of affected downstream dependencies |
+| **Paper delivery** | Claim/evidence index, bibliography, figures, LaTeX source, rendered PDF, and a release proposal with provenance |
+| **Tools and environments** | Allowlisted programs, APIs, and MCP services with readiness checks and drift-aware bindings |
 
-Departments are accountability boundaries, not permanent model processes. The
-default organization exposes an eligible bounded roster; a stage activates only
-the specialists it needs and gives each one a scoped task, artifact namespace,
-quota, and verifier.
+## Evidence and operating boundaries
 
-## Default specialist pools
+- **The Principal owns the mandate and release boundary.** Live provider access
+  and dispatch remain inactive until the operator configures an authorized
+  endpoint and enables `live_dispatch_allowed`.
+- **Claims stay tied to evidence.** Literature support uses exact references
+  and stable source spans; metadata alone is not scientific evidence.
+- **A process exit is not a scientific result.** Experiments require the
+  declared checks, replay, recalculation, and review. Replay establishes
+  repeatability for the pinned execution, not truth or novelty.
+- **Provisional work stays visible.** Under `forward_first`, an observed
+  candidate may continue as `candidate_needs_review` with its failure debt
+  recorded. It remains unverified and cannot satisfy final release gates. A
+  generated capability that has never executed cannot be forwarded as a
+  result; it enters the experiment repair loop.
+- **Failures keep their meaning.** Scientific holds create evidence-bound
+  repair orders. Provider cooldowns, exhausted quotas, unknown calls, and
+  deadlines remain operational blocks. Malformed model output receives a
+  separate schema repair and cannot create a scientific pivot.
+- **The organization can report honest partial progress.** A missing source,
+  unresolved alternative, failed check, or blocked dependency remains explicit
+  in the checkpoint rather than being replaced with confident prose.
 
-| Department | Example on-demand appointments | Independent challenge |
-|---|---|---|
-| **Research** | frontier scout · search strategist · academic scout · source acquirer · citation mapper · cataloger · fact verifier · topic-maturity reviewer | `research.adversarial-reviewer` |
-| **Methods** | methodologist · statistical reviewer · reproducibility reviewer · analysis reviewer · control designer | `methods.adversarial-reviewer` |
-| **Strategy** | mechanism interpreter · planner · narrative architect · evidence linker · section writer | `strategy.adversarial-reviewer` |
-| **Editorial** | writer · structural editor · format editor · consistency QA · journal editor | `editorial.human-scientist-reviewer` |
-| **Operations** | tool/environment engineer · execution operator · operational verifier · runtime auditor | `operations.operational-adversary` |
+## Quick start
 
-The full roster, role contracts, input projections, stage routes, quotas, and
-custom-chief migration rules live in [Project Organization](docs/15-project-organization.md)
-and [Agent, Department, and Stage Flow](docs/16-agent-department-flow.md).
-
-## What is implemented
-
-| Capability | Runtime boundary |
-|---|---|
-| **Durable control plane** | SQLite state, event hash chain, leases, fencing, idempotent effects, and task/attempt lifecycle |
-| **Immutable artifacts** | Content-addressed versions, provenance, adoption checks, scoped edit grants, and change sets |
-| **Independent review** | Field-level critiques, rebuttals, adjudication, verification closure, and adversarial gates |
-| **Bounded specialist execution** | Role contracts, temporary assignments, per-stage quotas, artifact namespaces, chief synthesis, and independent verdicts |
-| **Literature survey** | OpenAlex discovery, verified HTML/XML and bounded open-access PDF text capture (Poppler), identity reconciliation, exact source spans, citation maps, counter-search, and gap assessment |
-| **Topic feasibility admission** | Machine-checked execution mode, input provenance/readiness, data boundary, dependencies, network access, API/model estimates, and experiment deadline before a topic enters the survey |
-| **Scientific experiments** | Frozen methods and seeds, deterministic replay, independent recalculation, raw observations, figures, and result-package review |
-| **Model-led capability repair** | Upper-methods repair panel, bounded redesign brief, fresh capability authoring, provenance, independent admission, and scoped rerun |
-| **Paper pipeline** | Frozen storyline, claim/evidence index, bibliography, figures, LaTeX, rendered PDF, and release manifest |
-| **Research program and defense ledger** | Candidate branches with conditional paper outcomes, retained alternatives, posture-separated argumentation, and reviewer-visible weak points |
-| **Resume and time policy** | Checkpoints, deadline-aware replanning, unknown-call reconciliation, retained failures, and scoped repair |
-| **Adaptive research agenda** | Dependency-ready work ranked by information value, active work orders, downstream unlocks, and reproducible seeded exploration |
-| **Tool acquisition** | Allowlisted programs, APIs, and MCP services with readiness probes and drift-aware bindings |
-
-“Implemented” means the bounded runtime contract is present and regression
-tested. It does not mean that a run has discovered a novel result, passed expert
-peer review, or been submitted to a journal.
-
-## Run it
-
-Install the repository runtime and run the acceptance suite:
+Install the repository runtime and run its acceptance suite:
 
 ```bash
 sh scripts/setup-runtime.sh
 python3 -m unittest discover -s scisaurus/tests -t . -v
 ```
 
-Initialize and verify a project:
+Initialize a project, publish an artifact, and verify its record:
 
 ```bash
 python3 -m scisaurus.cli init /tmp/my-project
@@ -237,8 +97,7 @@ python3 -m scisaurus.cli publish /tmp/my-project strategy/notes/demo brief.md --
 python3 -m scisaurus.cli verify /tmp/my-project
 ```
 
-Prepare a bounded surface, then edit the generated configuration to add the
-authorized model endpoint and set `live_dispatch_allowed` to `true`:
+## Prepare and run a workflow
 
 | Goal | Prepare | Run |
 |---|---|---|
@@ -249,51 +108,27 @@ authorized model endpoint and set `live_dispatch_allowed` to `true`:
 | Composer mission | `./run` | `./run` |
 | Local workspace console | `./dashboard [WORKSPACE]` | `./dashboard` |
 
-The templates are intentionally inert until the operator supplies the
-authorized connection and dispatch permission. See the detailed runtime guide
-before using live providers.
+Generated configurations are inert until the operator supplies the authorized
+connection and dispatch permission. Read the matching runtime guide before
+using live providers.
 
-## Guardrails that matter
-
-- **Human authority is explicit.** The Principal owns mission scope and final release.
-- **Scientific recovery is autonomous.** A hold, rejected direction, or missing typed repair order produces a cycle-specific work order, changes the strategy, and reopens only the affected closure. Experiment failures run through diagnosis, source edits to executor and validator, fresh replay, independent recalculation, and adversarial review; an exhausted source-repair lease changes the experiment design axis instead of forwarding an unexecuted result. Human input is not the normal next step.
-- **Only real fences stop autonomous progress.** Topic intake retries share one bounded intake envelope, and every deliberate continuation pivot receives its own bounded envelope. Provider/account limits, API policy, worker capacity, and the mission deadline remain independently reserved and recorded; a historical pivot cannot exhaust the budget of a newly admitted direction.
-- **Resource fences are not scientific decisions.** A resettable provider/API cooldown is waited out and retried automatically in autonomous mode; exhausted quotas, worker capacity, and the mission deadline remain hard resource boundaries recorded in the checkpoint, never scientific conclusions.
-- **Failure is not success.** A timeout, provider block, malformed response, or rejected review remains visible and scoped.
-- **Evidence is claim-level.** Literature claims require exact source references and stable spans; metadata is not scientific evidence.
-- **Experiments are bounded.** A deterministic replay proves reproducibility of the pinned execution, not mathematical truth or real-world novelty.
-- **Topic feasibility is explicit.** A prose feasibility note is never enough: experiment-backed topic admission checks the actual execution boundary, every input, dependency availability, network use, provider/model work, compute estimate, and disconfirmation-oriented study shape. The current deterministic project boundary admits only self-contained closed-world inputs, zero experiment-side API/model calls, and the foundry timeout; topic intake has its own bounded intake/continuation envelopes.
-- **OpenAlex topic intake fails closed.** Provider cooldown state is persisted; 429s stop fresh query variants until the recorded provider boundary, while bounded retries honor provider cooldown metadata. Crossref identity metadata cannot substitute for the citation graph used for topic discovery.
-- **OpenAlex budget state is shared.** Composer migrates legacy topic/survey state into one credential-scoped ledger under `local-private/provider-state/`, reserves a small remaining-credit margin, and reuses normalized topic pages from the shared cache. A fresh continuation cannot reset the provider budget by changing stage or project directories.
-- **Specialists are on demand.** A 34-role roster does not mean 34 model processes are running.
-- **Forward progress is explicit.** A provisional candidate is never silently promoted: its artifact, failure class, unresolved debt, and backfill order remain visible in the checkpoint and assignment ledger.
-- **LangGraph is optional, not the control plane.** The native Composer, TaskManager, and ArtifactStore own lifecycle and provenance; adapters can be used per department where useful.
-
-## Documentation map
+## Documentation
 
 | Start here | Covers |
 |---|---|
-| [Concept SSOT](docs/00-SSOT.md) | Authority, terminology, and governing decisions |
-| [System concept](docs/05-system-concept.md) | Mission, activity graph, and anytime progress |
-| [Architecture](docs/20-architecture-v0.md) | Control plane, evidence, storage, and gates |
-| [Project organization](docs/15-project-organization.md) | Rosters, contracts, custom organizations, and Operations Cell |
-| [Agent / department / stage flow](docs/16-agent-department-flow.md) | Routing, assignments, handoffs, and scoped continuation |
-| [Composer runtime](docs/110-composer-runtime.md) | End-to-end stage admission, review, reallocation, and resume |
-| [Critical review articles](docs/115-review-articles.md) | Journal/theme scouting, review benchmarks, original synthesis, and rendered peer review |
-| [Local dashboard](docs/120-local-dashboard.md) | Workspace overview, research progress, project creation, and supervised Start/Stop/Resume |
-| [Desktop app](docs/130-desktop-app.md) | Tauri app, bundled local backend, repository selection, and execution controls |
-| [Literature survey](docs/75-literature-survey-score.md) | Search, source spans, citation maps, and gap assessment |
-| [Experiment runtime](docs/90-experiment-runtime.md) | Frozen studies, replay, recalculation, and result packages |
-| [Completion runtime](docs/80-completion-runtime.md) | Paper release candidates, evaluation, and delivery boundaries |
-| [Roadmap](docs/30-roadmap.md) | Remaining phases and acceptance scenarios |
+| [Concept SSOT](docs/00-SSOT.md) · [System concept](docs/05-system-concept.md) · [Architecture](docs/20-architecture-v0.md) | Authority, terminology, activity model, control plane, evidence, and gates |
+| [Project organization](docs/15-project-organization.md) · [Agent / department / stage flow](docs/16-agent-department-flow.md) · [Composer runtime](docs/110-composer-runtime.md) | Roles, routing, assignments, admission, repair, and resume |
+| [Literature survey](docs/75-literature-survey-score.md) · [Experiment runtime](docs/90-experiment-runtime.md) · [Research argument](docs/100-research-argument-runtime.md) | Source review, experiments, interpretation, and claim construction |
+| [Completion runtime](docs/80-completion-runtime.md) · [Critical review articles](docs/115-review-articles.md) | Manuscript assembly, evaluation, rendered review, and delivery boundaries |
+| [Local dashboard](docs/120-local-dashboard.md) · [Desktop app](docs/130-desktop-app.md) · [Roadmap](docs/30-roadmap.md) | Workspace operation, desktop controls, and remaining work |
 
 ## Current status
 
 The durable P1 control plane, project organization, bounded specialist routing,
 literature workflow, experiment runtime, manuscript pipeline, and resume paths
-are implemented and regression tested. The remaining scientific claims are
-deliberately open: expert-held-out evaluation, repeated complete live missions,
-measured quality-versus-compute comparisons, and any external publication.
+are implemented and regression tested. Expert-held-out evaluation, repeated
+complete live missions, measured quality-versus-compute comparisons, and any
+external publication remain open. Runtime capability is not evidence of a
+scientific result.
 
-For the normative contract, start with the [Concept SSOT](docs/00-SSOT.md). For
-the operational model, start with [Composer runtime](docs/110-composer-runtime.md).
+Licensed under the [MIT License](LICENSE).

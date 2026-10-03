@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="560" viewBox="0 0 1280 560" role="img" aria-labelledby="title description">
+  <title id="title">Sci-saurus organization and decision flow</title>
+  <desc id="description">The Principal gives mission intent to Composer, which assigns work to on-demand departments. Operations supports the departments. Independent checks review evidence and return verdicts to Composer.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0 10 5 0 10Z" fill="#56616b"/>
+    </marker>
+    <marker id="arrow-muted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0 10 5 0 10Z" fill="#7b858e"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #222b33; }
+      .title { font-size: 16px; font-weight: 650; }
+      .copy { font-size: 12.5px; fill: #48535d; }
+      .small { font-size: 11px; fill: #606a73; }
+      .label { font-size: 11px; fill: #59636d; }
+      .node { fill: #ffffff; stroke: #65717b; stroke-width: 1.35; }
+      .subnode { fill: #ffffff; stroke: #a7b0b8; stroke-width: 1.1; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="560" fill="#ffffff"/>
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M290 202H400" stroke="#56616b" stroke-width="1.6" marker-end="url(#arrow)"/>
+    <path d="M670 202H790" stroke="#56616b" stroke-width="1.6" marker-end="url(#arrow)"/>
+    <path d="M1050 390V315" stroke="#7b858e" stroke-width="1.5" stroke-dasharray="4 5" marker-end="url(#arrow-muted)"/>
+    <path d="M790 315H750V435H670" stroke="#7b858e" stroke-width="1.5" stroke-dasharray="4 5" marker-end="url(#arrow-muted)"/>
+    <path d="M530 390V255" stroke="#7b858e" stroke-width="1.5" stroke-dasharray="4 5" marker-end="url(#arrow-muted)"/>
+  </g>
+
+  <text class="label" x="312" y="188">mission intent</text>
+  <text class="label" x="685" y="188">scoped assignments</text>
+
+  <rect class="node" x="60" y="150" width="230" height="105" rx="3"/>
+  <text class="title" x="78" y="180">Principal</text>
+  <text class="copy" x="78" y="205">Sets objective, boundaries,</text>
+  <text class="copy" x="78" y="224">and release authority</text>
+
+  <rect class="node" x="400" y="150" width="270" height="105" rx="3"/>
+  <text class="title" x="418" y="180">Composer / Command</text>
+  <text class="copy" x="418" y="205">Plans, allocates, supervises,</text>
+  <text class="copy" x="418" y="224">and records resume state</text>
+
+  <rect x="790" y="95" width="430" height="220" rx="3" fill="#fafbfc" stroke="#65717b" stroke-width="1.35"/>
+  <text class="title" x="810" y="124">Departments (on demand)</text>
+
+  <rect class="subnode" x="810" y="143" width="190" height="62" rx="2"/>
+  <text class="title" x="824" y="168">Research</text>
+  <text class="small" x="824" y="188">Questions · sources · evidence</text>
+
+  <rect class="subnode" x="1020" y="143" width="180" height="62" rx="2"/>
+  <text class="title" x="1034" y="168">Methods</text>
+  <text class="small" x="1034" y="188">Studies · controls · replay</text>
+
+  <rect class="subnode" x="810" y="225" width="190" height="62" rx="2"/>
+  <text class="title" x="824" y="250">Strategy</text>
+  <text class="small" x="824" y="270">Interpretation · argument</text>
+
+  <rect class="subnode" x="1020" y="225" width="180" height="62" rx="2"/>
+  <text class="title" x="1034" y="250">Editorial</text>
+  <text class="small" x="1034" y="270">Manuscript · release proposal</text>
+
+  <rect class="node" x="390" y="390" width="280" height="90" rx="3"/>
+  <text class="title" x="408" y="418">Independent checks</text>
+  <text class="copy" x="408" y="442">Review · replay · verification</text>
+  <text class="small" x="408" y="462">Verdicts return to Composer</text>
+
+  <rect class="node" x="910" y="390" width="280" height="90" rx="3"/>
+  <text class="title" x="928" y="418">Operations</text>
+  <text class="copy" x="928" y="442">APIs · programs · environments</text>
+  <text class="small" x="928" y="462">Supports department work</text>
+
+  <path d="M60 522H100" stroke="#56616b" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text class="small" x="112" y="526">Authority and work assignment</text>
+  <path d="M360 522H400" stroke="#7b858e" stroke-width="1.5" stroke-dasharray="4 5" marker-end="url(#arrow-muted)"/>
+  <text class="small" x="412" y="526">Support and independent feedback</text>
+</svg>
