@@ -1,7 +1,8 @@
 # Desktop app
 
-Sci-saurus uses Tauri to host the research console and a bundled Python HTTP
-backend on an ephemeral loopback port. The app is built for macOS desktop.
+Sci-saurus uses Tauri to host the research console and a bundled Python backend.
+The app is built for macOS desktop. Its `scisaurus://` resources are served through
+an app protocol and a private Unix socket; the app does not open a TCP web port.
 
 ## Build and open
 
@@ -46,6 +47,9 @@ repository's `.venv/bin/python`, from that repository, using its current harness
 and normal environment files. Research data, credentials, immutable artifacts,
 and checkpoints remain in the repository; they are not copied into the app.
 
-The backend binds only to `127.0.0.1`. Mutation requests require a local client,
-the correct Host, same-origin browser requests, and JSON content. There is no
+The backend socket and its temporary directory are accessible only to the current
+user. Tauri forwards resource and API requests over this socket. Mutation requests
+require JSON content; any supplied Origin must match the app origin. There is no
 arbitrary command interface.
+The separate `./dashboard` command remains an explicit browser development tool;
+the desktop app does not launch it.

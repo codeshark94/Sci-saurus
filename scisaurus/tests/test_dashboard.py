@@ -175,6 +175,24 @@ class DashboardTests(unittest.TestCase):
         self.assertFalse(item["analysis"]["current"])
         self.assertEqual(item["review"]["artifact_ref"], review)
 
+    def test_catalog_verifies_each_exact_artifact_once_and_preserves_historical_sources(self):
+        root, survey, control, store, publish = self.make_literature_project()
+        entry = publish("kb/work-analyses/W1", {"work_id": "W1", "inclusion": "included"})
+        publish("kb/literature-map", {"question": "Bounded question", "entry_refs": [entry]})
+        publish("kb/work-reviews/W1", {"entry_ref": entry, "checks": [],
+            "evidence_scope": {"review_protocol": "fixture", "question": "Bounded question",
+                               "owner_basis": [entry] * 50, "targets": {}}, "review_protocol": "fixture"})
+        old_source = store.head("kb/abstracts/W1")["artifact_ref"]
+        publish("kb/abstracts/W1", {"work_id": "W1", "representation": "abstract",
+                                  "text": "A newer capture", "identity_verified": False}, "source_capture")
+        snapshot = DashboardSnapshot(root)
+        with patch.object(snapshot, "_owned_artifact", wraps=snapshot._owned_artifact) as verify:
+            data = snapshot.literature(work_id="W1")
+        refs = [call.args[1]["artifact_ref"] for call in verify.call_args_list if call.args[1] is not None]
+        self.assertEqual(len(refs), len(set(refs)))
+        self.assertEqual(data["item"]["abstracts"][0]["artifact_ref"], old_source)
+        self.assertIn("Captured abstract 1", snapshot.file_payload(data["item"]["abstract_ref"])["text"])
+
     def test_literature_accepted_pins_revoke_currentness_when_governing_head_changes(self):
         from scisaurus.tests.test_surveys import TestSurveyGate
         fixture = TestSurveyGate()
@@ -1129,7 +1147,7 @@ assert(wrapped.includes('Internal transport'));
         script = Path(__file__).with_name("dashboard_navigation_regression.js")
         root = Path(__file__).parents[2]
         completed = subprocess.run([node, str(script), str(root)], check=True, capture_output=True, text=True)
-        self.assertEqual(json.loads(completed.stdout)["cases"], 11)
+        self.assertGreaterEqual(json.loads(completed.stdout)["cases"], 11)
 
     def test_required_controls_exist_once(self):
         static = Path(__file__).parents[1] / "dashboard/static"

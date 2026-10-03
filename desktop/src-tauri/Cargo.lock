@@ -2914,6 +2914,7 @@ dependencies = [
 name = "scisaurus-desktop"
 version = "0.1.0"
 dependencies = [
+ "httparse",
  "libc",
  "serde",
  "serde_json",

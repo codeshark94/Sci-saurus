@@ -14,12 +14,13 @@ const links=['calls','specialists','resources','inventory'].map(id=>{const e=ele
 const stages=['topic','survey'].map(id=>{const e=element('stage-'+id);e.dataset.stageId=id;return e;});
 const location=new URL('http://localhost/?project=.&stage=survey#calls');
 let scrolls=0;
-const context={URL,URLSearchParams,console,document:{querySelector:element,getElementById:id=>element('#'+id),querySelectorAll:selector=>selector.includes('stage-navigation')?stages:links},
+const requests=[];
+const context={URL,URLSearchParams,AbortController,console,fetch:(url,options)=>new Promise(resolve=>requests.push({url,options,resolve})),document:{querySelector:element,getElementById:id=>element('#'+id),querySelectorAll:selector=>selector.includes('stage-navigation')?stages:selector.includes('sidebar-project')?[]:links},
   window:{location,history:{pushState(_,__,url){location.href=new URL(url,location).href;}},scrollTo(){scrolls++;}}};
 vm.createContext(context);
 let app=fs.readFileSync(path.join(root,'scisaurus/dashboard/static/app.js'),'utf8');
 const bootstrap=app.indexOf('\n  bindControls();\n  setView');assert(bootstrap>=0);
-app=app.slice(0,bootstrap)+'\nwindow.testApi={renderProjectPage,navigateOperation,selectStage,renderHeader,state};\n})();';
+app=app.slice(0,bootstrap)+'\nwindow.testApi={renderProjectPage,navigateOperation,selectStage,renderHeader,setView,fetchSnapshot,state};\n})();';
 vm.runInContext(app,context);
 const api=context.window.testApi;
 const panes=['mission-metrics','calls','activity','specialists','resources','structure','inventory'];
@@ -49,4 +50,17 @@ api.renderHeader({runtime:{processes:[{pid:123,owns_execution:true},{pid:456,own
 assert.equal(element('#process-state').textContent,'PID 123');count++;
 api.renderHeader({runtime:{processes:[{pid:456,owns_execution:false}]} });
 assert.equal(element('#process-state').textContent,'not detected');count++;
-console.log(JSON.stringify({status:'passed',cases:count,externalCalls:0}));
+api.setView('project','A');
+assert(element('#sidebar-project-list').hidden);assert(element('#sidebar-project-label').hidden);count++;
+api.setView('workspace');
+assert(!element('#sidebar-project-list').hidden);assert(!element('#sidebar-project-label').hidden);count++;
+(async()=>{
+  api.state.view='project';api.state.projectRef='A';
+  const first=api.fetchSnapshot();await api.fetchSnapshot();assert.equal(requests.length,1);count++;
+  api.state.projectRef='B';const second=api.fetchSnapshot();
+  assert.equal(requests.length,2);assert(requests[0].options.signal.aborted);count++;
+  api.state.view='workspace';
+  requests.forEach(request=>request.resolve({ok:true,json:async()=>({})}));await Promise.all([first,second]);
+  assert.equal(api.state.snapshot,null);count++;
+  console.log(JSON.stringify({status:'passed',cases:count,externalCalls:0}));
+})().catch(error=>{console.error(error);process.exitCode=1;});

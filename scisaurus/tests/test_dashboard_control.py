@@ -1,8 +1,10 @@
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import signal
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -15,7 +17,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.dashboard.server import DashboardServer, DashboardService, DashboardSnapshot
+from scisaurus.dashboard.server import DashboardServer, DashboardUnixServer, DashboardService, DashboardSnapshot
 from scisaurus.runtime.composer import validate_workflow
 
 
@@ -204,6 +206,38 @@ class DashboardControlTests(unittest.TestCase):
         request = Request(url, data=b'{"action":"stop_composer"}', headers={"Content-Type": "application/json"})
         with urlopen(request, timeout=2) as response:
             self.assertEqual(json.loads(response.read())["status"], "already_stopped")
+
+    def test_private_socket_serves_resources_and_rejects_other_origins(self):
+        path = self.root / "backend.sock"
+        server = DashboardUnixServer(str(path), self.service)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.assertEqual(server.socket.family, socket.AF_UNIX)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+        def request(method, route, *, origin=None, content_type="application/json"):
+            body = b'{"action":"stop_composer"}' if method == "POST" else b""
+            headers = f"Host: localhost\r\nContent-Type: {content_type}\r\nContent-Length: {len(body)}\r\n"
+            if origin:
+                headers += f"Origin: {origin}\r\n"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+                stream.settimeout(3)
+                stream.connect(str(path))
+                stream.sendall(f"{method} {route} HTTP/1.0\r\n{headers}\r\n".encode() + body)
+                reply = http.client.HTTPResponse(stream)
+                reply.begin()
+                return reply.status, reply.read()
+
+        status, body = request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Mission controls", body)
+        self.assertEqual(request("POST", "/api/actions", origin="http://localhost")[0], 403)
+        status, body = request("POST", "/api/actions", origin="scisaurus://localhost")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["status"], "already_stopped")
+        self.assertEqual(request("POST", "/api/actions")[0], 200)
+        self.assertEqual(request("POST", "/api/actions", origin="scisaurus://localhost", content_type="text/plain")[0], 415)
 
     def test_settings_are_allowlisted_and_project_is_confined(self):
         for settings in ({"shell": "anything"}, {"development": "yes"}, {"stop_after_stage": "missing"}):

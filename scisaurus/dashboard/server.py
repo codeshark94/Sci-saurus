@@ -20,6 +20,7 @@ from pathlib import Path
 import platform
 import re
 import signal
+import socket
 import shutil
 import sqlite3
 import subprocess
@@ -28,9 +29,10 @@ import tempfile
 import time
 from threading import Lock, Thread
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from scisaurus.core.schema import SCHEMA_VERSION, GENESIS_HASH, canonical_bytes, sha256_hex
+from scisaurus.core.schema import SCHEMA_VERSION, GENESIS_HASH, canonical_bytes, sha256_hex, parse_ref
 from scisaurus.core.errors import ValidationError
 
 
@@ -658,6 +660,7 @@ class DashboardSnapshot:
         try:
             conn = self._db_connection(self.roots[root_key] / "state/control.sqlite")
             try:
+                conn.execute("BEGIN")
                 # Latest records are selected per logical identity. Activity limits must
                 # never determine whether a retained scientific source is visible.
                 rows = conn.execute("SELECT a.* FROM artifacts a JOIN "
@@ -669,16 +672,42 @@ class DashboardSnapshot:
                     summary.update(status="unavailable", notices=["Literature index exceeds its bounded read limit."])
                     return summary, []
                 latest = {row["logical_id"]: row for row in rows}
+                head_versions = dict(conn.execute("SELECT logical_id,MAX(version) FROM artifacts GROUP BY logical_id"))
+                exact_records = {}
+                owned_records = {}
+                def owned(row):
+                    if row is None:
+                        return None
+                    identity = (row["logical_id"], row["version"])
+                    if identity not in owned_records:
+                        owned_records[identity] = self._owned_artifact(root_key, row)
+                    return owned_records[identity]
                 records = {}
                 def record(logical):
                     if logical not in records:
-                        records[logical] = self._owned_artifact(root_key, latest.get(logical))
+                        records[logical] = owned(latest.get(logical))
                     return records[logical]
                 def exact(ref):
                     if not isinstance(ref, str):
                         return None
-                    row = conn.execute("SELECT * FROM artifacts WHERE artifact_ref=?", (ref,)).fetchone()
-                    return self._owned_artifact(root_key, row)
+                    if ref not in exact_records:
+                        try:
+                            namespace, name, version = parse_ref(ref)
+                        except ValidationError:
+                            return None
+                        logical = f"{namespace}/{name}"
+                        row = latest.get(logical)
+                        if row is None or row["version"] != version:
+                            row = conn.execute("SELECT * FROM artifacts WHERE logical_id=? AND version=?",
+                                               (logical, version)).fetchone()
+                        exact_records[ref] = owned(row) if row and row["artifact_ref"] == ref else None
+                    return exact_records[ref]
+                def current_record(ref):
+                    result = exact(ref)
+                    if result is None:
+                        return None
+                    namespace, name, version = parse_ref(ref)
+                    return result if head_versions.get(f"{namespace}/{name}") == version else None
                 register = record("kb/work-register")
                 body = register.get("body", {}) if register else {}
                 if not register or register.get("integrity") != "verified":
@@ -766,9 +795,7 @@ class DashboardSnapshot:
                             and scope.get("question") == map_body.get("question")
                             and scope.get("review_protocol") == review_body.get("review_protocol"))
                         for basis_ref in basis if review_current else []:
-                            pinned_row = conn.execute("SELECT a.* FROM artifacts a WHERE a.artifact_ref=? AND a.version="
-                                "(SELECT MAX(h.version) FROM artifacts h WHERE h.logical_id=a.logical_id)", (basis_ref,)).fetchone()
-                            pinned_record = self._owned_artifact(root_key, pinned_row)
+                            pinned_record = current_record(basis_ref)
                             review_current = review_current and bool(pinned_record and pinned_record.get("integrity") == "verified")
                     checks = review_body.get("checks", [])
                     checks = checks if isinstance(checks, list) else []
@@ -805,7 +832,7 @@ class DashboardSnapshot:
                     if not head or not accepted:
                         return head, False
                     row = conn.execute("SELECT * FROM artifacts WHERE logical_id=? AND version=?", (logical, accepted[0])).fetchone()
-                    admitted = self._owned_artifact(root_key, row)
+                    admitted = owned(row)
                     if not admitted or admitted.get("integrity") != "verified":
                         return admitted, None
                     if head["artifact_ref"] != admitted["artifact_ref"]:
@@ -833,9 +860,7 @@ class DashboardSnapshot:
                         pins = [{"ref": ref} for ref in dependencies]
                     current = pinned
                     for pin in pins:
-                        row = conn.execute("SELECT a.* FROM artifacts a WHERE a.artifact_ref=? AND a.version="
-                            "(SELECT MAX(h.version) FROM artifacts h WHERE h.logical_id=a.logical_id)", (pin["ref"],)).fetchone()
-                        pinned_record = self._owned_artifact(root_key, row)
+                        pinned_record = current_record(pin["ref"])
                         if (not pinned_record or pinned_record.get("integrity") != "verified"
                                 or ("body_hash" in pin and pin["body_hash"] != pinned_record["body_sha256"])):
                             current = False
@@ -3770,15 +3795,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         if parsed.path != "/api/actions":
             return self._error(404, "route not found")
-        if self.client_address[0] not in {"127.0.0.1", "::1", "localhost"}:
+        private_transport = self.server.address_family == socket.AF_UNIX
+        if not private_transport and self.client_address[0] not in {"127.0.0.1", "::1", "localhost"}:
             return self._error(403, "dashboard actions are limited to a local client")
         host = self.headers.get("Host", "")
-        allowed_hosts = {f"{name}:{self.server.server_port}" for name in
+        allowed_hosts = {"localhost"} if private_transport else {f"{name}:{self.server.server_port}" for name in
                          ("127.0.0.1", "localhost", f"[{self.server.server_address[0]}]", self.server.server_address[0])}
         if host not in allowed_hosts:
             return self._error(403, "dashboard action Host does not match this server")
         origin = self.headers.get("Origin")
-        if origin and origin != f"http://{host}":
+        expected_origin = "scisaurus://localhost" if private_transport else f"http://{host}"
+        if origin and origin != expected_origin:
             return self._error(403, "dashboard actions require the same origin")
         if self.headers.get_content_type() != "application/json":
             return self._error(415, "dashboard actions require application/json")
@@ -3824,6 +3851,16 @@ class DashboardServer(ThreadingHTTPServer):
     def __init__(self, address, service):
         self.service = service
         super().__init__(address, DashboardHandler)
+
+
+class DashboardUnixServer(DashboardServer):
+    address_family = socket.AF_UNIX
+
+    def server_bind(self):
+        TCPServer.server_bind(self)
+        os.chmod(self.server_address, 0o600)
+        self.server_name = "localhost"
+        self.server_port = None
 
 
 def run_dashboard(project_dir, *, host="127.0.0.1", port=0, open_browser=False):

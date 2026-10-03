@@ -186,6 +186,8 @@
     $("#workspace-view").hidden = !workspace;
     $("#project-view").hidden = workspace;
     $("#project-nav").hidden = workspace;
+    $("#sidebar-project-label").hidden = !workspace;
+    $("#sidebar-project-list").hidden = !workspace;
     $("#workspace-link").classList.toggle("is-active", workspace);
     if (workspace) {
       $("#breadcrumb-context").textContent = "WORKSPACE";
@@ -1117,18 +1119,30 @@
     }
   }
 
+  let snapshotController = null;
+  let snapshotRequestProject = null;
   async function fetchSnapshot() {
     if (state.view !== "project") return fetchWorkspace();
+    const project = state.projectRef;
+    if (snapshotController && snapshotRequestProject === project) return;
+    if (snapshotController) snapshotController.abort();
+    const controller = new AbortController();
+    snapshotController = controller;
+    snapshotRequestProject = project;
     try {
-      const response = await fetch(`/api/snapshot?ts=${Date.now()}${projectQuery()}`, { cache: "no-store" });
+      const response = await fetch(`/api/snapshot?ts=${Date.now()}${projectQuery()}`, { cache: "no-store", signal: controller.signal });
       if (!response.ok) throw new Error(`snapshot request failed (${response.status})`);
-      render(await response.json());
+      const data = await response.json();
+      if (state.view === "project" && state.projectRef === project && snapshotController === controller) render(data);
     } catch (error) {
+      if (controller.signal.aborted || state.view !== "project" || state.projectRef !== project) return;
       $("#connection-status").textContent = "Unavailable";
       $("#connection-dot").classList.add("is-error");
       $("#last-updated").textContent = "Waiting for the local server";
       if (state.snapshot) showToast(error.message);
       else $("#objective").textContent = `Unable to read the project snapshot: ${error.message}`;
+    } finally {
+      if (snapshotController === controller) snapshotController = null;
     }
   }
 

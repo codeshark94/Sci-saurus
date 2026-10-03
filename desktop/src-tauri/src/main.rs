@@ -1,10 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::{
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{mpsc, Arc, Mutex},
@@ -44,6 +45,7 @@ struct Workspace {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Connection {
     url: String,
+    socket_path: String,
     repository: String,
     workspace: String,
 }
@@ -56,6 +58,79 @@ struct Backend {
 
 #[derive(Clone, Default)]
 struct Host(Arc<Mutex<Backend>>);
+
+fn backend_request(
+    host: &Host,
+    request: tauri::http::Request<Vec<u8>>,
+) -> Result<tauri::http::Response<Vec<u8>>, String> {
+    if request.uri().host() != Some("localhost") {
+        return Err("Unknown desktop resource origin".into());
+    }
+    let socket_path = host
+        .0
+        .lock()
+        .map_err(|e| e.to_string())?
+        .connection
+        .as_ref()
+        .ok_or("Backend is not connected")?
+        .socket_path
+        .clone();
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| e.to_string())?;
+    write!(
+        stream,
+        "{} {} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n",
+        request.method(),
+        request
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/"),
+        request.body().len()
+    )
+    .map_err(|e| e.to_string())?;
+    for name in ["content-type", "origin"] {
+        if let Some(value) = request.headers().get(name) {
+            write!(
+                stream,
+                "{name}: {}\r\n",
+                value.to_str().map_err(|e| e.to_string())?
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    stream.write_all(b"\r\n").map_err(|e| e.to_string())?;
+    stream
+        .write_all(request.body())
+        .map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    let mut headers = vec![httparse::EMPTY_HEADER; 16];
+    loop {
+        let mut parsed = httparse::Response::new(&mut headers);
+        match parsed.parse(&bytes) {
+            Err(httparse::Error::TooManyHeaders) => {
+                headers.resize(headers.len() * 2, httparse::EMPTY_HEADER);
+            }
+            Ok(httparse::Status::Complete(offset)) => {
+                let mut response = tauri::http::Response::builder()
+                    .status(parsed.code.ok_or("Missing backend response status")?);
+                for header in parsed.headers {
+                    response = response.header(header.name, header.value);
+                }
+                return response
+                    .body(bytes[offset..].to_vec())
+                    .map_err(|e| e.to_string());
+            }
+            result => return Err(format!("Invalid backend response: {result:?}")),
+        }
+    }
+}
 
 fn config_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
@@ -251,6 +326,19 @@ fn main() {
     let host = Host::default();
     let quit_host = host.clone();
     tauri::Builder::default()
+        .register_asynchronous_uri_scheme_protocol("scisaurus", |context, request, responder| {
+            let host = context.app_handle().state::<Host>().inner().clone();
+            std::thread::spawn(move || {
+                let response = backend_request(&host, request).unwrap_or_else(|error| {
+                    tauri::http::Response::builder()
+                        .status(502)
+                        .header("Content-Type", "text/plain; charset=utf-8")
+                        .body(error.into_bytes())
+                        .unwrap()
+                });
+                responder.respond(response);
+            });
+        })
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
@@ -299,10 +387,9 @@ fn main() {
                         .lock()
                         .ok()
                         .and_then(|backend| backend.connection.as_ref().map(|c| c.url.clone()));
-                    if allowed
-                        .as_ref()
-                        .and_then(|s| tauri::Url::parse(s).ok())
-                        .is_some_and(|local| local.origin() == url.origin())
+                    if url.scheme() == "scisaurus"
+                        && url.host_str() == Some("localhost")
+                        && allowed.is_some()
                     {
                         return true;
                     }

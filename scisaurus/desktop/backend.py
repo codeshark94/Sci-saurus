@@ -7,9 +7,10 @@ import os
 from pathlib import Path
 import signal
 import sys
+import tempfile
 from threading import Thread
 
-from scisaurus.dashboard.server import DashboardServer, DashboardService
+from scisaurus.dashboard.server import DashboardUnixServer, DashboardService
 
 
 def main(argv=None):
@@ -26,9 +27,11 @@ def main(argv=None):
     if not workspace.is_dir() or not workspace.is_relative_to(repository):
         raise ValueError("The research workspace must be a directory inside the repository.")
     service = DashboardService(workspace, repository=repository, runtime_python=python)
-    server = DashboardServer(("127.0.0.1", 0), service)
-    url = f"http://127.0.0.1:{server.server_port}/"
-    print(json.dumps({"url": url, "repository": str(repository), "workspace": str(workspace)}), flush=True)
+    transport = tempfile.TemporaryDirectory(prefix="scisaurus-")
+    socket_path = str(Path(transport.name) / "backend.sock")
+    server = DashboardUnixServer(socket_path, service)
+    print(json.dumps({"url": "scisaurus://localhost/", "socket_path": socket_path,
+                      "repository": str(repository), "workspace": str(workspace)}), flush=True)
 
     def terminate(*_):
         raise KeyboardInterrupt
@@ -46,6 +49,7 @@ def main(argv=None):
         pass
     finally:
         server.server_close()
+        transport.cleanup()
     return 0
 
 
