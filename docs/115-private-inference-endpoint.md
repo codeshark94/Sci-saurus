@@ -69,6 +69,15 @@ request receipts record the resolved protocol and reasoning setting, rather
 than relying on the provider default. These records exclude authentication
 fields. Figure review and scientific admission remain independently required.
 
+The generation limit includes thinking as well as final content. Native
+`done_reason: "length"` with empty final content is a truncated generation,
+not a successful JSON response or a transport failure. Preserve its usage
+and route it through response-contract recovery. Development execution uses
+the selected route's generation ceiling and context admission; operational
+execution additionally enforces per-call and cumulative role cost ceilings.
+The scientific high-thinking routes reserve up to 32,768 generated tokens;
+this is a maximum, not a required generation length.
+
 - Stage descriptors can reference a shared role table with
   `"model": {"config_path": "/absolute/path/model.json"}`. This file supplies
   provider selection, role assignments, routes, and fallbacks. Call-level

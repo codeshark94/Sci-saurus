@@ -2250,7 +2250,7 @@ class SpecialistDispatcher:
                             quota["max_input_tokens"])
                     output_per_call = quota.get(
                         "max_output_tokens_per_call", quota.get("max_output_tokens"))
-                    if type(output_per_call) is int:
+                    if enforce_model_cost_limits() and type(output_per_call) is int:
                         effective["max_output_tokens"] = min(
                             effective.get("max_output_tokens") or output_per_call,
                             output_per_call)
@@ -2499,7 +2499,7 @@ class SpecialistDispatcher:
             result = None
             request_input = None
             response_received = False
-            remaining_output_budget = output_budget - output_budget_used if enforce_costs else output_per_call
+            remaining_output_budget = output_budget - output_budget_used if enforce_costs else math.inf
             if remaining_output_budget <= 0:
                 report = {
                     **(last_model_failure or {}),
@@ -2573,8 +2573,9 @@ class SpecialistDispatcher:
                 route_output_limit = config.get("max_output_tokens")
                 if type(route_output_limit) is not int or route_output_limit < 1:
                     route_output_limit = output_per_call
-                config["max_output_tokens"] = min(
+                config["max_output_tokens"] = (min(
                     route_output_limit, output_per_call, remaining_output_budget)
+                    if enforce_costs else route_output_limit)
                 if isinstance(quota.get("max_input_tokens"), int):
                     configured = config.get("max_input_tokens")
                     config["max_input_tokens"] = min(configured, quota["max_input_tokens"]) \

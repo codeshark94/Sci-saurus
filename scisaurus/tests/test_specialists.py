@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
@@ -1824,6 +1825,29 @@ class SpecialistDispatcherTests(unittest.TestCase):
         self.assertEqual(report["partial_response"], "I will continue reasoning.")
         self.assertTrue(all("continuation_text" not in item["input"]
                             for item in report["request_inputs"]))
+
+    def test_selected_reasoning_output_cap_respects_execution_policy(self):
+        model = {'protocol': 'ollama', 'base_url': 'http://127.0.0.1:1',
+                 'model': 'fixture', 'timeout_seconds': 5.0, 'max_output_tokens': 32768,
+                 'context_window_tokens': 262144, 'max_input_tokens': 229376,
+                 'reasoning_effort': 'high'}
+        assignment = {'assigned_role': 'methods.methodologist', 'role_id': 'methodologist',
+                      'model_role': 'methods.methodologist', 'execution_kind': 'model',
+                      'stage_id': 'repair', 'quota': {'max_calls': 1, 'max_input_tokens': 245760,
+                      'max_output_tokens': 24576, 'max_output_tokens_per_call': 8192,
+                      'max_seconds': 5}, '_prompt': '{}'}
+        for policy, expected in (('operational', 8192), ('development', 32768)):
+            with self.subTest(policy=policy), patch.dict('os.environ', {
+                    'SCISAURUS_EXECUTION_POLICY': policy}), patch(
+                    'scisaurus.runtime.specialists.ModelClient') as client:
+                client.return_value.complete.return_value = ModelResult(
+                    '{"decision":"repair","summary":"checked"}', 'fixture',
+                    {'model_calls': 1, 'output_tokens': 100}, .01, 'stop')
+                report = SpecialistDispatcher(model, max_parallel=1,
+                    deadline=time.monotonic() + 10).dispatch([deepcopy(assignment)], {})[0]
+                self.assertEqual(report['status'], 'succeeded', report)
+                self.assertEqual(client.call_args.kwargs['max_output_tokens'], expected)
+                self.assertEqual(report['request_inputs'][0]['generation_config']['max_output_tokens'], expected)
 
     def test_development_continues_past_cumulative_call_and_output_limits(self):
         model = {

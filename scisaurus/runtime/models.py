@@ -2127,7 +2127,7 @@ class ModelClient:
                              (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens"))
                              if source in data.get("usage", {})}
                 usage.update(_cache_usage(data))
-                if not isinstance(text, str) or not text.strip():
+                if not isinstance(text, str) or (not text.strip() and reason != "length"):
                     raise ValueError("empty text")
                 if any(type(value) is not int or value < 0 for value in usage.values()):
                     raise ValueError("invalid usage")

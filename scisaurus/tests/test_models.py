@@ -1088,6 +1088,21 @@ class TestModelClient(unittest.TestCase):
                 self.assertEqual(result.json_object(), {'ok': True})
                 self.assertEqual(result.usage['output_tokens'], 40)
 
+    def test_thinking_only_length_response_preserves_truncation_and_usage(self):
+        self.response = {'model': 'served-model', 'message': {
+            'content': '', 'thinking': 'Internal model trace.'},
+            'done': True, 'done_reason': 'length', 'prompt_eval_count': 20, 'eval_count': 64}
+        result = self.client('ollama', reasoning_effort='high',
+                             output_format='json_object').complete(system='Return JSON.', prompt='Inspect.')
+        self.assertEqual(result.text, '')
+        self.assertEqual(result.finish_reason, 'length')
+        self.assertEqual(result.usage['output_tokens'], 64)
+        with self.assertRaises(ValidationError):
+            result.json_object()
+        self.response['done_reason'] = 'stop'
+        with self.assertRaises(ModelCallError):
+            self.client('ollama', reasoning_effort='high').complete(system='Return JSON.', prompt='Inspect.')
+
     def test_json_output_mode_accepts_an_exact_json_markdown_fence(self):
         self.response = {'choices': [{'message': {'content': '```json\n{"ok":true}\n```'}, 'finish_reason': 'stop'}]}
         result = self.client('openai_compatible', output_format='json_object').complete(system='Return JSON.', prompt='Inspect.')
