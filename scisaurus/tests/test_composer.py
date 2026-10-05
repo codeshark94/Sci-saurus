@@ -16808,6 +16808,9 @@ class ComposerWorkflowTests(unittest.TestCase):
                 "id": "fallback", "config_path": str(descriptor_path.resolve())}]
             validate_workflow(workflow)
             runner = ComposerRunner(workflow)
+            software_assessment = patch.object(runner, "_assess_scientific_software", return_value=None)
+            software_assessment.start()
+            self.addCleanup(software_assessment.stop)
             empirical_result = {
                 "status": "completed",
                 "topic": {
@@ -16913,6 +16916,14 @@ class ComposerWorkflowTests(unittest.TestCase):
                 checked = runner._materialize_topic_capability(result)
             regenerate_existing.assert_not_called()
             self.assertTrue(checked["generated_capability"]["reused"])
+            assessment = {"artifact_ref":"artifact:software-assessment@1", "review":{"decision":"accept"},
+                "evidence":{"selection":{"strategy":"custom_model"},"selected_operations":[]}}
+            with patch.object(runner,"_assess_scientific_software",return_value=assessment), \
+                    patch("scisaurus.runtime.capability_registry.load_registry",return_value={"capabilities":[entry]}), \
+                    patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate",return_value=generated) as new_inputs:
+                runner._materialize_topic_capability(result,stage_id="experiment")
+            new_inputs.assert_called_once()
+            self.assertEqual(new_inputs.call_args.kwargs["test_input"]["scientific_software"],runner._scientific_software_projection(assessment))
             frontier_record = runner._publish("command/capability-repair-evidence-frontiers/native", "note",
                 {"schema_version": "capability-repair-evidence-frontier-1", "status": "accepted"}, "command.composer")
             frontier = {"artifact_ref": frontier_record["artifact_ref"], "status": "accepted", "dispatch_usage": {}}

@@ -2130,13 +2130,21 @@ class ComposerRunner:
         author and its independent admission review without exceeding the stage
         envelope.
         """
+        capacity = self._experiment_model_call_capacity(stage, repair_panel_usage=repair_panel_usage)
+        if capacity is None:
+            return (AUTONOMOUS_FOUNDRY_MODEL_CALL_LIMIT
+                    if enforce_model_cost_limits() and self.workflow.get("capability_foundry_config_path") else None)
+        return min(AUTONOMOUS_FOUNDRY_MODEL_CALL_LIMIT, capacity)
+
+    def _experiment_model_call_capacity(self, stage, *, repair_panel_usage=None):
+        """Remaining stage capacity, independent of a program-authoring ceiling."""
         if not self.workflow.get("capability_foundry_config_path"):
             return None
         if not enforce_model_cost_limits():
             return None
         quota = stage.get("quota") if isinstance(stage, dict) else None
         if not isinstance(quota, dict) or type(quota.get("max_model_calls")) is not int:
-            return AUTONOMOUS_FOUNDRY_MODEL_CALL_LIMIT
+            return None
         prior = self._stage_usage(stage["id"]).get("model_calls", 0)
         panel_required = self._capability_repair_panel_required(stage)
         if repair_panel_usage is None:
@@ -2153,7 +2161,7 @@ class ComposerRunner:
             repair_panel_reserve = panel_calls
         available = quota["max_model_calls"] - prior \
             - FOUNDRY_VERIFIER_MODEL_CALL_RESERVE - repair_panel_reserve
-        return max(0, min(AUTONOMOUS_FOUNDRY_MODEL_CALL_LIMIT, available))
+        return max(0, available)
 
     def _capability_repair_panel_model_call_reserve(self, stage):
         """Reserve the configured Methods and verifier call ceilings, not a stale constant."""
@@ -12864,7 +12872,8 @@ class ComposerRunner:
             input_ref["ref"] = self._publish(f"command/capability-repair-budget/{binding_sha}",
                                             "note", binding, "command.composer")["artifact_ref"]
         assignment = self.departments.begin_stage(panel_id, "experiment", attempt_number=attempt,
-            input_ref=input_ref, deadline_seconds=evidence_stage["deadline_seconds"], active_role_ids=["methodologist"])
+            input_ref=input_ref, deadline_seconds=evidence_stage["deadline_seconds"], active_role_ids=["methodologist"],
+            quotas={"methodologist": self._software_producer_quota(stage)})
         producer = next(item for item in assignment["assignments"] if item.get("assignment_phase") == "specialist")
         producer = {**deepcopy(producer), "_response_contract": "repair_evidence"}
         try:
@@ -13009,6 +13018,163 @@ class ComposerRunner:
         for dependency in projected.get("dependencies", []):
             dependency.pop("dispatch_usage", None)
         return _preserve_response_value(projected)
+
+    @staticmethod
+    def _scientific_software_projection(assessment):
+        if assessment is None:
+            return None
+        evidence = deepcopy(assessment["evidence"])
+        selected = evidence["selected_operations"]
+        for row in selected:
+            if row["action"]["operation"] == "acquire":
+                result = row["result"]
+                if "files" in result:
+                    result["files_sha256"] = hashlib.sha256(canonical_bytes(result.pop("files"))).hexdigest()
+                result.pop("steps", None)
+        return {"assessment_ref": assessment["artifact_ref"], "selection": evidence["selection"],
+                "operations": _preserve_response_value(selected),
+                "review": deepcopy(assessment["review"]),
+                "execution_contract": "Reuse the exact acquired software computations as source-bound inputs. Do not replace the package mechanism with copied or invented equations. New scientific parameters require a new controller-recorded software computation, not relabelled old outputs. Ordinary experiment replay, independent recalculation and scientific review remain required."}
+
+    def _software_producer_quota(self, stage):
+        quota = deepcopy(self.departments._resolve_assignment("methods", "methodologist")["quota"])
+        allowance = self._experiment_model_call_capacity(stage, repair_panel_usage={})
+        quota["max_calls"] = None
+        if allowance is not None:
+            verifier_calls = self.departments._resolve_assignment("methods", "adversary")["quota"]["max_calls"]
+            if verifier_calls is None:
+                raise ValidationError("a finite software stage call quota requires a finite reviewer reservation")
+            available = allowance - verifier_calls
+            if available <= 0:
+                from scisaurus.runtime.capability_foundry import CapabilityModelBudgetExceeded
+                raise CapabilityModelBudgetExceeded("No stage call capacity remains for software operations and review", limit=allowance, observed=verifier_calls, usage={})
+            quota["max_calls"] = available
+        return quota
+
+    def _assess_scientific_software(self, stage, descriptor, topic_result, *, computation_scope=None):
+        """Admit software fitness and executed upstream computations before authoring."""
+        from scisaurus.runtime.software_workbench import REVISION, SoftwareWorkbench, selection_contract
+        topic = deepcopy(topic_result["topic"])
+        topic.pop("experiment_capability_id", None)
+        identity = {"revision": REVISION, "topic": topic,
+                    "prior_work": deepcopy(topic_result.get("candidate_prior_work", [])),
+                    "source_challenge": deepcopy(topic_result.get("source_challenge")),
+                    "computation_scope": deepcopy(computation_scope or {})}
+        digest = hashlib.sha256(canonical_bytes(identity)).hexdigest()
+        logical = f"command/scientific-software-assessments/{digest}"
+        previous = self.store.head(logical + "/receipt")
+        if previous:
+            _, _, retained = self._read_verified_artifact_json(previous["artifact_ref"])
+            _, _, producer = self._read_verified_artifact_json(retained["producer_execution_ref"])
+            _, _, reviewer = self._read_verified_artifact_json(retained["verifier_execution_ref"])
+            if (retained.get("identity") != identity or retained.get("status") != "accepted"
+                    or producer.get("report", {}).get("response", {}).get("software_selection") != retained.get("selection")
+                    or reviewer.get("report", {}).get("response") != retained.get("review")
+                    or reviewer.get("chief_result", {}).get("software_assessment") != retained.get("evidence")):
+                raise ValidationError("scientific software assessment lost its exact producer/reviewer binding")
+            workbench = SoftwareWorkbench(self.root / "scientific-software", deadline=time.monotonic() + self._stage_remaining(stage))
+            if retained["selection"]["strategy"] == "reuse":
+                workbench._environment(retained["selection"]["environment_ref"])
+            return {**retained, "artifact_ref": previous["artifact_ref"], "dispatch_usage": {}}
+        request = {"schema_version": "scientific-software-assessment-request-1", **identity,
+                   "source_ref_catalog": [], "scientific_scope": "operational reproduction and scientific fitness for the admitted question; experiment admission remains separate"}
+        def collect(value):
+            if isinstance(value, dict):
+                for item in value.values():
+                    collect(item)
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, str) and value.startswith(("artifact:", "https://")):
+                request["source_ref_catalog"].append(value)
+        collect(topic_result)
+        collect(identity["computation_scope"])
+        collect(self.context)
+        request["source_ref_catalog"] = sorted(set(request["source_ref_catalog"]))
+        request_record = self._publish(logical + "/request", "note", request, "command.composer")
+        panel_id = self._capability_repair_panel_stage_id(stage["id"], digest, self.continuation_cycles, 1, purpose="software")
+        attempt = self._next_capability_repair_assignment_attempt(panel_id)
+        evidence_stage = {**deepcopy(stage), "id": panel_id, "_model_budget_owner_stage_id": stage["id"],
+                          "deadline_seconds": self._stage_remaining(stage)}
+        producer_quota = self._software_producer_quota(stage)
+        input_ref = {"kind": "scientific_software_assessment", "stage_id": stage["id"], "digest": digest, "ref": request_record["artifact_ref"]}
+        owner = None
+        if isinstance(stage.get("quota"), dict):
+            owner = {"scope": self._stage_model_config(stage, {})["model_call_budget_scopes"][0],
+                     "attempt_id": self.stage_records.get(stage["id"], {}).get("attempt_id"),
+                     "cycle": self.continuation_cycles if stage["id"] in self.reopened_stage_ids else 0}
+            binding = {"schema_version": "capability-repair-budget-owner-1", "panel_stage_id": panel_id,
+                       "assignment_attempt_number": attempt, "model_budget_owner": owner,
+                       "evidence_request_ref": request_record["artifact_ref"]}
+            binding_sha = hashlib.sha256(canonical_bytes(binding)).hexdigest()
+            input_ref["ref"] = self._publish(f"command/capability-repair-budget/{binding_sha}",
+                                            "note", binding, "command.composer")["artifact_ref"]
+        assignment = self.departments.begin_stage(panel_id, "experiment", attempt_number=attempt,
+            input_ref=input_ref,
+            deadline_seconds=evidence_stage["deadline_seconds"], active_role_ids=["methodologist"], quotas={"methodologist": producer_quota})
+        producer = next(item for item in assignment["assignments"] if item.get("assignment_phase") == "specialist")
+        producer = {**deepcopy(producer), "_response_contract": "software_selection", "_prompt": json.dumps({
+            "assignment": {key: producer.get(key) for key in ("assigned_role", "stage_id", "task_id")},
+            "software_assessment_request": request, "output_contract": selection_contract()}, ensure_ascii=False, sort_keys=True)}
+        stage_result = {"software_assessment_request": request, "repair_verification_scope": "scientific_software_fitness"}
+        bundle = self._run_specialist_pool(evidence_stage, {**deepcopy(assignment), "assignments": [producer]}, descriptor,
+            stage_result=stage_result, cache_input_digest=hashlib.sha256(producer["_prompt"].encode()).hexdigest())
+        bundle = self._publish_specialist_reports(evidence_stage, assignment, bundle)
+        produced = bundle.get("by_role", {}).get("methodologist", {})
+        response = produced.get("response", {})
+        selection = response.get("software_selection")
+        tools = produced.get("software_tool_results", [])
+        selected_refs = ([selection.get("environment_ref"), selection.get("example_ref"), *selection.get("computation_refs", [])]
+                         if isinstance(selection, dict) else [])
+        from scisaurus.runtime.software_workbench import project_receipt
+        evidence = {"request_ref": request_record["artifact_ref"], "request": deepcopy(request), "selection": deepcopy(selection),
+                    "selected_operations": [project_receipt(row) for row in tools if row.get("receipt_ref") in selected_refs],
+                    "discovery_and_diagnostics": [project_receipt(row) for row in tools if row.get("receipt_ref") not in selected_refs],
+                    "producer_execution_ref": produced.get("artifact_ref")}
+        chief = {"software_assessment": evidence}
+        verifier = None
+        if produced.get("status") == "succeeded" and response.get("decision") == "pass":
+            try:
+                verifier = self._run_specialist_verifier(evidence_stage, assignment, descriptor, bundle, chief, stage_result=stage_result)
+            except ValidationError as exc:
+                verifier = {"status": "failed", "error_type": type(exc).__name__, "error": str(exc),
+                            "usage": deepcopy(getattr(exc, "usage", {}))}
+        verdict = verifier.get("response", {}) if isinstance(verifier, dict) else {}
+        accepted = (produced.get("status") == "succeeded" and response.get("decision") == "pass"
+                    and isinstance(verifier, dict) and verifier.get("status") == "succeeded"
+                    and verdict.get("decision") == "accept" and not verdict.get("blocking_findings")
+                    and not verdict.get("critical_findings") and not verdict.get("required_revisions"))
+        usage = self._specialist_usage([*bundle.get("reports", []), *([verifier] if isinstance(verifier, dict) else [])])
+        finished = self.departments.finish_stage(panel_id, "experiment", attempt_number=attempt,
+            outcome="completed" if accepted else "blocked", output_ref=produced.get("artifact_ref"), usage=usage,
+            error=None if accepted else "scientific software fitness or prerequisites remain unresolved",
+            specialist_results=bundle.get("by_role", {}), verifier_result=verifier)
+        invoice = {"input_sha256": digest, "usage": usage, "ledger": {"panel_stage_id": panel_id,
+                   "assignment_attempt_number": attempt, "assignment_plan_ref": assignment["plan_ref"],
+                   "chief_synthesis_ref": finished.get("chief_synthesis_ref"), "verifier_artifact_ref": finished.get("verifier_artifact_ref")},
+                   **({"model_budget_owner": owner} if owner else {})}
+        self._record_capability_repair_panel_usage(stage, invoice)
+        receipt = {"schema_version": "scientific-software-assessment-1", "status": "accepted" if accepted else "blocked",
+                   "identity": identity, "selection": selection, "evidence": evidence, "review": verdict,
+                   "producer_execution_ref": produced.get("artifact_ref"),
+                   "verifier_execution_ref": verifier.get("artifact_ref") if isinstance(verifier, dict) else None,
+                   "ledger": invoice["ledger"], "usage_invoice_ref": invoice["usage_invoice_ref"]}
+        record = self._publish(logical + ("/receipt" if accepted else "/failure"), "note", receipt, "command.composer")
+        self.context.setdefault(stage["id"], {})["scientific_software_assessment"] = {**receipt, "artifact_ref": record["artifact_ref"]}
+        self._checkpoint(f"{stage['id']}:scientific_software_assessment", force=True)
+        if not accepted:
+            failure = next((row for row in [produced, verifier] if isinstance(row, dict) and isinstance(row.get("failure"), dict)), None)
+            if failure and failure.get("error_type") == "ModelCallError":
+                error = ModelCallError.from_failure(failure.get("error") or "software assessment unavailable", {**failure["failure"], "usage": {}})
+            else:
+                error = ModelWorkBlocked("scientific software assessment requires Methods recovery; generated implementation is not admitted")
+            error.usage = usage
+            error.repair_panel_usage = usage
+            error.stage_result = {"kind": "experiment", "status": "blocked", "error": str(error),
+                                  "scientific_software_assessment": {**receipt, "artifact_ref": record["artifact_ref"]}}
+            error.capability_failure_evidence = deepcopy(error.stage_result["scientific_software_assessment"])
+            raise error
+        return {**receipt, "artifact_ref": record["artifact_ref"], "dispatch_usage": usage}
 
     def _run_capability_repair_panel(self, stage, descriptor, topic_result,
                                      prior_context, error):
@@ -13739,6 +13905,7 @@ class ComposerRunner:
 
         foundry_stage = next((item for item in self.workflow["stages"] if item["id"] == stage_id), None)
         evidence_frontier = None
+        software_assessment = None
         if foundry_stage is not None and foundry_stage["kind"] == "experiment":
             descriptor = json.loads(Path(foundry_stage["config_path"]).read_text())
             evidence_frontier = self._require_capability_evidence_before_authoring(foundry_stage, result, descriptor)
@@ -13749,6 +13916,11 @@ class ComposerRunner:
                 error.usage = deepcopy(evidence_frontier["dispatch_usage"])
                 error.repair_panel_usage = deepcopy(evidence_frontier["dispatch_usage"])
                 raise error
+            if self._format_recovery_foundry_assignment(continuation_requests, question=question, domain=domain) is None:
+                software_assessment = self._assess_scientific_software(foundry_stage, descriptor, result,
+                    computation_scope={"source_data_manifest": deepcopy(source_data_manifest),
+                                       "work_orders": project_executable_work_orders(continuation_requests),
+                                       "study_type": study_type, "quality_contract": deepcopy(quality_contract)})
 
         registry_root = Path(configured["registry_root"])
         evidence_binding = ({
@@ -13772,6 +13944,7 @@ class ComposerRunner:
                     superseded = {"id": experiment["id"], "revision": experiment["revision"]}
                 registered_input = experiment.get("execution", {}).get("input", {})
                 if (not isinstance(registered_input, dict)
+                        or registered_input.get("scientific_software") != self._scientific_software_projection(software_assessment)
                         or registered_input.get("source_data_manifest") != source_data_manifest
                         or registered_input.get("work_orders", []) != executable_work_orders
                         or (continuation_revision is not None and experiment.get("revision", 0) < continuation_revision)
@@ -13871,6 +14044,8 @@ class ComposerRunner:
                 model_timeout_seconds=configured_model_timeout,
             )
             foundry_input = {}
+            if software_assessment is not None:
+                foundry_input["scientific_software"] = self._scientific_software_projection(software_assessment)
             executable_work_orders = project_executable_work_orders(
                 continuation_requests)
             if executable_work_orders:
@@ -13885,6 +14060,7 @@ class ComposerRunner:
                     "research_form", "evidence_mode", "comparison_type",
                     "feasibility_plan")},
                 "repair_evidence_frontier": evidence_projection,
+                "scientific_software": self._scientific_software_projection(software_assessment) if software_assessment else None,
                 "repair_evidence_frontier_sha256": hashlib.sha256(canonical_bytes(evidence_projection)).hexdigest()
                     if evidence_projection is not None else None,
                 "evidence_policy": {
@@ -20909,6 +21085,12 @@ class ComposerRunner:
 
         for assignment in assignments:
             prompt = assignment.get("_prompt") or build_specialist_prompt(assignment, packet)
+            if assignment.get("_software_tools") is True:
+                from scisaurus.runtime.software_workbench import tool_contract
+                envelope = json.loads(prompt)
+                envelope["scientific_software_tools"] = tool_contract()
+                prompt = json.dumps(envelope, ensure_ascii=False, sort_keys=True)
+                assignment = {**assignment, "_prompt": prompt}
             key = cache.key(scope=f"specialist:{assignment['stage_id']}:{verifier}",
                 role=assignment.get("assigned_role"), system=specialist_system(assignment, verifier=verifier),
                 prompt=prompt, model=dispatcher.model_config)
@@ -20983,6 +21165,10 @@ class ComposerRunner:
                        if isinstance(item, dict) and item.get("assignment_phase") == "specialist"]
         if not assignments:
             return {"reports": [], "by_role": {}, "usage": {}, "model_enabled": False}
+        if stage.get("kind") == "experiment":
+            assignments = [{**item, "_software_tools": True} if item.get("role_id") == "methodologist"
+                           and item.get("_response_contract") in {"repair_evidence", "software_selection"}
+                           else item for item in assignments]
         limits = descriptor.get("limits") if isinstance(descriptor, dict) else {}
         max_parallel = limits.get("concurrent_calls") if isinstance(limits, dict) else None
         if type(max_parallel) is not int or max_parallel < 1:
@@ -21052,6 +21238,7 @@ class ComposerRunner:
             dispatcher = SpecialistDispatcher(
                 model, provider_pools=self._specialist_provider_pools(descriptor),
                 max_parallel=min(max_parallel, len(pending_assignments)), deadline=deadline,
+                software_workspace=str(self.root / "scientific-software"),
                 on_progress=lambda event: self._specialist_progress(stage["id"], {
                     **event, "assignment_attempt_number": assignment_number,
                 }, assignment=stage_assignment),
@@ -21193,13 +21380,17 @@ class ComposerRunner:
         return bundle, verifier, stage_result
 
     @staticmethod
-    def _capability_repair_panel_stage_id(stage_id, science_digest, cycle, attempt):
+    def _capability_repair_panel_stage_id(stage_id, science_digest, cycle, attempt, *, purpose=None):
         """Keep one durable Methods assignment lineage for unchanged evidence."""
         base = re.sub(r"[^a-z0-9-]+", "-", str(stage_id).casefold()).strip("-")
         if isinstance(science_digest, str) and re.fullmatch(r"[0-9a-f]{64}", science_digest):
             suffix = f"-repair-panel-{science_digest[:12]}"
         else:
             suffix = f"-repair-panel-{cycle}-{attempt}"
+        if purpose is not None:
+            if purpose != "software":
+                raise ValidationError("unsupported Methods panel purpose")
+            suffix += "-software"
         return f"{(base or 'experiment')[:64 - len(suffix)]}{suffix}"
 
     @staticmethod

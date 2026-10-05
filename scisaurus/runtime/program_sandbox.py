@@ -106,12 +106,20 @@ def _sandbox_read_paths(command, workspace):
     roots = {
         Path(workspace).resolve(),
         Path("/opt/homebrew"),
+        Path("/bin"), Path("/usr/bin"), Path("/usr/lib"),
+        Path("/Library/Developer/CommandLineTools"),
     }
     # A virtual environment keeps its interpreter and site-packages under one
     # prefix. Never infer a broader user-home root from an arbitrary command.
     if configured.parent.name == "bin" and (configured.parent.parent / "pyvenv.cfg").is_file():
         roots.add(configured.parent.parent.resolve())
     files = {configured.resolve(), executable}
+    for selected in ("/private/var/select/sh", "/var/select/sh", "/private/var/select/developer_dir", "/var/select/developer_dir"):
+        selector = Path(selected)
+        if selector.exists():
+            files.update({selector, selector.resolve()})
+            if selector.resolve().is_dir():
+                roots.add(selector.resolve())
     files.update(_macho_dependency_paths(executable))
     for argument in command[1:]:
         candidate = Path(argument)
@@ -120,10 +128,15 @@ def _sandbox_read_paths(command, workspace):
     return sorted(str(path) for path in roots if path.exists()), sorted(str(path) for path in files)
 
 
-def sandbox_profile(workspace, command, *, allow_network=False):
+def sandbox_profile(workspace, command, *, allow_network=False, read_only_paths=()):
     """Return a deny-by-default Seatbelt profile for one throwaway workspace."""
     workspace = str(Path(workspace).resolve())
     read_roots, read_files = _sandbox_read_paths(command, workspace)
+    for value in read_only_paths:
+        path = Path(value)
+        if not path.is_absolute() or not path.is_dir():
+            raise ValidationError("sandbox dependency read roots must be existing absolute directories")
+        read_roots.append(str(path.resolve()))
     metadata_paths = set()
     for value in [*read_roots, *read_files]:
         path = Path(value)
@@ -180,7 +193,7 @@ def _limits(cpu_seconds, address_space_bytes, file_size_bytes):
 def run_sandboxed(command, *, workspace, input_bytes=b"", timeout_seconds=300.0,
                   max_bytes=5_000_000, cpu_seconds=DEFAULT_CPU_SECONDS,
                   address_space_bytes=DEFAULT_ADDRESS_SPACE,
-                  file_size_bytes=DEFAULT_FILE_SIZE, allow_network=False, env=None):
+                  file_size_bytes=DEFAULT_FILE_SIZE, allow_network=False, env=None, read_only_paths=()):
     """Run one pinned program under the sandbox and return bounded output."""
     if not isinstance(command, list) or not command or any(not isinstance(item, str) or not item for item in command):
         raise ValidationError("sandbox command must be a nonempty argument list")
@@ -197,11 +210,18 @@ def run_sandboxed(command, *, workspace, input_bytes=b"", timeout_seconds=300.0,
     process_env["TMPDIR"] = str(workspace)
     if env:
         process_env.update({key: value for key, value in env.items() if key in SAFE_ENV_KEYS})
+        # Package installers may resolve dependencies from an explicitly
+        # provisioned private R library, never from the caller's environment.
+        if "R_LIBS_USER" in env:
+            library = Path(env["R_LIBS_USER"]).resolve()
+            if not library.is_relative_to(workspace.resolve()):
+                raise ValidationError("R dependency library must belong to the sandbox workspace")
+            process_env["R_LIBS_USER"] = str(library)
     process_env["MPLCONFIGDIR"] = str(workspace / ".matplotlib")
     mode = "sandbox-exec"
     if SANDBOX_EXEC:
         command = [SANDBOX_EXEC, "-p", sandbox_profile(
-            workspace, command, allow_network=allow_network), *command]
+            workspace, command, allow_network=allow_network, read_only_paths=read_only_paths), *command]
     else:
         mode = "rlimits-only"
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

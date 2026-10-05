@@ -181,8 +181,8 @@ def _positive_number(value, name):
 
 def _validate_role_quota(value, name="role quota"):
     _exact(value, ROLE_QUOTA_FIELDS, name)
-    if type(value["max_calls"]) is not int or not 1 <= value["max_calls"] <= 16:
-        raise ValidationError(f"{name} max_calls must be between one and sixteen")
+    if value["max_calls"] is not None and (type(value["max_calls"]) is not int or value["max_calls"] < 1):
+        raise ValidationError(f"{name} max_calls must be a positive integer or null")
     for field in ("max_input_tokens", "max_output_tokens", "max_output_tokens_per_call"):
         if type(value[field]) is not int or value[field] < 1:
             raise ValidationError(f"{name} {field} must be a positive integer")
@@ -231,6 +231,8 @@ def _upgrade_role_quota(value, schema_version):
     _exact(value, LEGACY_ROLE_QUOTA_FIELDS, "agent role quota")
     quota = deepcopy(value)
     if schema_version in {LEGACY_SCHEMA_VERSION, V2_SCHEMA_VERSION}:
+        if quota.get("max_calls") is None:
+            raise ValidationError("legacy role quota requires a finite call ceiling")
         if quota in _V2_DEFAULT_ROLE_QUOTAS:
             return _default_role_quota(max_seconds=quota["max_seconds"])
         per_call = quota["max_output_tokens"]

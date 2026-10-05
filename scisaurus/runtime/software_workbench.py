@@ -1,0 +1,599 @@
+"""Receipt-bound scientific software discovery, provisioning and execution.
+
+Repository contents are untrusted inputs. Network acquisition never executes
+them; installation and agent-authored probes run in a required sandbox with
+project-private dependencies and no network or inherited credentials.
+"""
+from __future__ import annotations
+
+from copy import deepcopy
+import hashlib
+import io
+import json
+import math
+import platform
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import sys
+import tarfile
+import threading
+import time
+from urllib.error import HTTPError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
+
+from scisaurus.core.errors import ValidationError
+from scisaurus.core.schema import canonical_bytes
+from scisaurus.runtime.program_sandbox import run_sandboxed, sandbox_status
+from scisaurus.runtime.programs import _parse_object
+
+REVISION = "scientific-software-tools-1"
+_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+_SHA = re.compile(r"[0-9a-f]{40}\Z")
+_PIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*==[A-Za-z0-9][A-Za-z0-9_.+!-]*\Z")
+
+
+def tool_contract():
+    return {
+        "revision": REVISION,
+        "response": {"tool_action": {"operation": "check_environment | search | inspect | list_files | read | acquire | run", "arguments": {}}},
+        "actions": {
+            "check_environment": {},
+            "search": {"query": "repository search derived from the question or cited software", "page": 1},
+            "inspect": {"repository": "owner/name", "revision": "upstream branch, tag or commit"},
+            "read": {"inspection_ref": "software:sha256:...", "path": "repository-relative documentation or code path"},
+            "list_files": {"inspection_ref": "software:sha256:...", "directory": "repository-relative directory"},
+            "acquire": {"inspection_ref": "software:sha256:...", "runtime": "python | r | native",
+                        "license_ref": "software:sha256:...", "requirements": ["exact Python distribution==version"], "dependencies": [], "package_path": ".",
+                        "build": {"system": "cmake | make | configure", "options": [], "executable": "install/bin/engine"}},
+            "run": {"environment_ref": "software:sha256:...", "source": "complete Python or R program",
+                    "input": {}, "purpose": "upstream_example | scientific_computation",
+                    "documentation_refs": ["software:sha256:..."], "expected": None},
+        },
+        "rules": [
+            "Return either one tool_action or the assignment's final response, never both.",
+            "Prefer established software that addresses the declared mechanism; assess species, units, calibration and scope.",
+            "Inspect the actual license and dependencies, read the upstream example, acquire a pinned revision, then reproduce that example.",
+            "build is supplied only for native software; executable is relative to the acquired environment. Native runs use a Python adapter and may invoke the pinned engine_path in the read-only environment; all child processes share the same sandbox.",
+            "Run programs consume one JSON object on stdin and emit one JSON object on stdout. R programs may use base R for JSON literals or a pinned JSON dependency.",
+            "expected is null or {value: <upstream JSON object>, absolute_tolerance: <nonnegative number>, relative_tolerance: <nonnegative number>}. Tolerances must follow documented precision; a match checks reproduction, not scientific fitness.",
+            "A successful installation is not scientific admission. Distinguish upstream examples, new computations and stored upstream results.",
+            "Use actual tool errors to correct dependencies or program calls, or reject the candidate and search another. Never substitute invented equations for unavailable software.",
+            "Source citations use the returned receipt_ref. Failed and unknown operations remain failures; repeating an identical action provides no new evidence.",
+            "Unsupported runtimes or system dependencies must be reported explicitly. No global package installs, shell commands, source builds with network, or credential access are available.",
+        ],
+    }
+
+
+def _sha(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def project_receipt(receipt):
+    """Expose scientific evidence without repeating dependency file inventories."""
+    projected = deepcopy(receipt)
+    result = projected.get("result")
+    if receipt.get("outcome") != "ok" or not isinstance(result, dict):
+        return projected
+    if receipt["action"]["operation"] == "acquire":
+        result["files_sha256"] = _sha(canonical_bytes(result.pop("files")))
+        result["file_inventory_scope"] = "full inventory retained in the content-addressed acquisition receipt"
+    if receipt["action"]["operation"] == "inspect":
+        files = result.pop("files")
+        result["file_index_sha256"] = _sha(canonical_bytes(files))
+        result["files"] = [row for row in files if "/" not in row["path"]]
+        result["file_listing_scope"] = "repository root; use list_files for a source subdirectory"
+    return projected
+
+
+def _fields(value, required, optional=()):
+    if not isinstance(value, dict) or set(value) - set(required) - set(optional) or set(required) - set(value):
+        raise ValidationError(f"software action requires {sorted(required)}; optional {sorted(optional)}")
+
+
+def _relative(value):
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ValidationError("repository path must be a relative POSIX path")
+    path = PurePosixPath(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValidationError("repository path leaves its source tree")
+    return str(path)
+
+
+def _tree(root):
+    """Hash every installed executable input, including interpreter bytecode."""
+    result = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if relative == "environment.json":
+            continue
+        if path.is_symlink():
+            result[relative] = {"symlink": str(path.readlink())}
+        elif path.is_file():
+            result[relative] = {"sha256": _sha(path.read_bytes()), "mode": path.stat().st_mode & 0o777}
+    return result
+
+
+def _runtime_identity():
+    runtimes = {"python": sys.executable, **{name: shutil.which(name) for name in ("R", "Rscript", "cc", "c++", "gfortran", "make", "cmake", "pkg-config")}}
+    result = {}
+    for name, value in runtimes.items():
+        path = Path(value).resolve() if value else None
+        if path and path.is_file():
+            info = path.stat()
+            result[name] = {"path": str(path), "size": info.st_size, "mtime_ns": info.st_mtime_ns, "mode": info.st_mode & 0o777}
+        else:
+            result[name] = None
+    return result
+
+
+class SoftwareWorkbench:
+    def __init__(self, root, *, deadline, fetch=None, runner=None):
+        self.root = Path(root).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.deadline = deadline
+        self.fetch = fetch or self._fetch
+        self.runner = runner or run_sandboxed
+        self.lock = threading.RLock()
+
+    def _remaining(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValidationError("scientific software operation exceeded the stage deadline")
+        return remaining
+
+    def _fetch(self, url, *, archive=False):
+        # URLs are constructed exclusively from the GitHub API/codeload roots.
+        limit = 128 * 1024 * 1024 if archive else 8 * 1024 * 1024
+        request = Request(url, headers={"User-Agent": "Sci-saurus", "Accept": "application/vnd.github+json"})
+        with urlopen(request, timeout=min(60, self._remaining())) as response:
+            if not response.url.startswith(("https://api.github.com/", "https://codeload.github.com/")):
+                raise ValidationError("software acquisition redirected outside its public repository provider")
+            data = response.read(limit + 1)
+        if len(data) > limit:
+            raise ValidationError("software source exceeds the acquisition byte limit")
+        return data
+
+    def _api(self, suffix):
+        return json.loads(self.fetch("https://api.github.com/" + suffix))
+
+    def _receipt(self, ref, operation=None):
+        if not isinstance(ref, str) or not re.fullmatch(r"software:sha256:[0-9a-f]{64}", ref):
+            raise ValidationError("software reference is not a content-addressed receipt")
+        path = self.root / "receipts" / (ref.split(":")[-1] + ".json")
+        body = path.read_bytes()
+        if _sha(body) != ref.split(":")[-1]:
+            raise ValidationError("software receipt hash changed")
+        receipt = json.loads(body)
+        if receipt.get("outcome") != "ok" or (operation and receipt["action"]["operation"] != operation):
+            raise ValidationError("software dependency is not a successful operation of the required kind")
+        return receipt
+
+    def execute(self, action):
+        _fields(action, {"operation", "arguments"})
+        if not isinstance(action["operation"], str) or not isinstance(action["arguments"], dict):
+            raise ValidationError("software action requires an operation name and argument object")
+        identity = {"revision": REVISION, "action": action}
+        if action["operation"] == "acquire":
+            identity["runtime_identity"] = _runtime_identity()
+        key = _sha(canonical_bytes(identity))
+        with self.lock:
+            self._remaining()
+            actions = self.root / "actions"
+            actions.mkdir(exist_ok=True)
+            index = actions / (key + ".json")
+            if index.exists() and action["operation"] != "check_environment":
+                retained = json.loads(index.read_text())
+                if retained.get("status") == "started":
+                    return {"outcome": "result_unknown", "action": deepcopy(action),
+                            "error": "interrupted software operation requires reconciliation before redispatch", "reused": True}
+                ref = retained["receipt_ref"]
+                data = (self.root / "receipts" / (ref.split(":")[-1] + ".json")).read_bytes()
+                if _sha(data) != ref.split(":")[-1]:
+                    raise ValidationError("retained software receipt hash changed")
+                result = json.loads(data)
+                if result.get("retry_not_before_epoch", 0) <= time.time() and "retry_not_before_epoch" in result:
+                    pass
+                else:
+                    if result.get("outcome") == "ok" and action["operation"] == "acquire":
+                        self._environment(ref)
+                    if result.get("outcome") == "ok" and action["operation"] == "run":
+                        self._environment(action["arguments"]["environment_ref"])
+                    return {**result, "receipt_ref": ref, "reused": True}
+            index.write_bytes(canonical_bytes({"status": "started", "action": action}))
+            result = {"revision": REVISION, "action": deepcopy(action), "started_epoch": time.time(),
+                      "runtime_identity": identity.get("runtime_identity")}
+            try:
+                handler = {"check_environment": self._check_environment, "search": self._search, "inspect": self._inspect, "list_files": self._list_files, "read": self._read,
+                           "acquire": self._acquire, "run": self._run}.get(action["operation"])
+                if handler is None:
+                    raise ValidationError("unsupported scientific software operation")
+                result.update(outcome="ok", result=handler(action["arguments"], key))
+            except HTTPError as exc:
+                result.update(outcome="failed", error_type=type(exc).__name__, error=f"HTTP {exc.code}")
+                if exc.code in {403, 429, 503}:
+                    delay = exc.headers.get("Retry-After")
+                    reset = exc.headers.get("X-RateLimit-Reset")
+                    if delay and delay.isdecimal():
+                        result["retry_not_before_epoch"] = time.time() + int(delay)
+                    elif reset and reset.isdecimal():
+                        result["retry_not_before_epoch"] = float(reset)
+            except (OSError, ValueError, ValidationError, tarfile.TarError) as exc:
+                result.update(outcome="failed", error_type=type(exc).__name__, error=str(exc))
+                if isinstance(exc, SoftwareExecutionError):
+                    result["execution"] = exc.execution
+            result["finished_epoch"] = time.time()
+            data = canonical_bytes(result)
+            digest = _sha(data)
+            receipts = self.root / "receipts"
+            receipts.mkdir(exist_ok=True)
+            (receipts / (digest + ".json")).write_bytes(data)
+            ref = "software:sha256:" + digest
+            temporary = index.with_suffix(".tmp")
+            temporary.write_bytes(canonical_bytes({"status": "finished", "receipt_ref": ref}))
+            temporary.replace(index)
+            return {**result, "receipt_ref": ref, "reused": False}
+
+    def _check_environment(self, args, key):
+        _fields(args, set())
+        import tempfile
+        with tempfile.TemporaryDirectory(dir=self.root, prefix="environment-check-") as directory:
+            root = Path(directory)
+            script = root / "check.py"
+            script.write_text('import json,sys,platform; from pathlib import Path; Path("write-check").write_text("ok"); print(json.dumps({"version":sys.version,"executable":sys.executable,"architecture":platform.machine(),"workspace_writable":True}))')
+            python = self._sandbox([sys.executable, "-I", str(script)], root)
+            rscript = shutil.which("Rscript")
+            r = None
+            if rscript:
+                source = root / "check.R"
+                source.write_text('cat(R.version.string, "\\n"); cat(R.version$arch, "\\n"); cat(.libPaths(), sep="\\n")')
+                r = self._sandbox([rscript, "--vanilla", str(source)], root)
+            tools = {name: shutil.which(name) for name in ("R", "Rscript", "cc", "c++", "gfortran", "make", "cmake", "ninja", "pkg-config", "mpiexec", "nvidia-smi", "docker", "git")}
+            return {"platform": platform.system(), "architecture": platform.machine(), "sandbox": sandbox_status(),
+                    "python": python, "r": r, "system_tools": tools,
+                    "workspace": str(self.root), "free_bytes": shutil.disk_usage(self.root).free,
+                    "private_environments": True, "global_installation_allowed": False,
+                    "readiness": "runtimes_probed_dependencies_not_yet_assessed"}
+
+    def _search(self, args, _key):
+        _fields(args, {"query"}, {"page"})
+        if not isinstance(args["query"], str) or not args["query"].strip():
+            raise ValidationError("software search needs a nonempty scientific query")
+        page = args.get("page", 1)
+        if type(page) is not int or page < 1:
+            raise ValidationError("software search page must be a positive integer")
+        value = self._api("search/repositories?" + urlencode({"q": args["query"], "per_page": 100, "page": page}))
+        return {"query": args["query"], "page": page, "total_count": value["total_count"],
+                "incomplete_results": value.get("incomplete_results", False),
+                "repositories": [{key: row.get(key) for key in ("full_name", "html_url", "description", "license", "stargazers_count", "archived", "updated_at")}
+                                 for row in value["items"]], "next_page": page + 1 if page * 100 < value["total_count"] else None}
+
+    def _inspect(self, args, _key):
+        _fields(args, {"repository", "revision"})
+        repository, revision = args["repository"], args["revision"]
+        if not isinstance(repository, str) or not _REPOSITORY.fullmatch(repository):
+            raise ValidationError("software repository must be owner/name")
+        if not isinstance(revision, str) or not revision:
+            raise ValidationError("software inspection requires an upstream revision")
+        metadata = self._api("repos/" + repository)
+        commit = self._api(f"repos/{repository}/commits/" + quote(revision, safe=""))["sha"]
+        if not _SHA.fullmatch(commit):
+            raise ValidationError("repository provider did not resolve an exact commit")
+        tree = self._api(f"repos/{repository}/git/trees/{commit}?recursive=1")
+        return {"repository": repository, "commit": commit, "metadata": {key: metadata.get(key) for key in (
+                    "html_url", "description", "license", "archived", "stargazers_count")},
+                "files": [{key: row.get(key) for key in ("path", "type", "size", "sha")}
+                          for row in tree["tree"]], "tree_complete": tree.get("truncated") is not True}
+
+    def _list_files(self, args, _key):
+        _fields(args, {"inspection_ref", "directory"})
+        inspected = self._receipt(args["inspection_ref"], "inspect")["result"]
+        directory = _relative(args["directory"])
+        return {"inspection_ref": args["inspection_ref"], "directory": directory,
+                "tree_complete": inspected["tree_complete"],
+                "files": [row for row in inspected["files"] if str(PurePosixPath(row["path"]).parent) == directory]}
+
+    def _read(self, args, _key):
+        _fields(args, {"inspection_ref", "path"})
+        inspected = self._receipt(args["inspection_ref"], "inspect")["result"]
+        path = _relative(args["path"])
+        document = self._api(f"repos/{inspected['repository']}/contents/{quote(path, safe='/')}?ref={inspected['commit']}")
+        if not isinstance(document, dict) or document.get("type") != "file" or document.get("encoding") != "base64":
+            raise ValidationError("repository read requires a complete file, not a directory or omitted large content")
+        import base64
+        data = base64.b64decode(document["content"])
+        return {"inspection_ref": args["inspection_ref"], "path": path,
+                "sha256": _sha(data), "content": data.decode("utf-8"), "complete": True}
+
+    def _sandbox(self, command, workspace, *, stdin=b"", env=None, read_only_paths=()):
+        if sandbox_status()["mode"] != "sandbox-exec":
+            raise ValidationError("scientific software installation and execution require the deny-by-default sandbox")
+        result = self.runner(command, workspace=str(workspace), input_bytes=stdin,
+                             timeout_seconds=self._remaining(), allow_network=False,
+                             env={"PATH": "/opt/homebrew/bin:/usr/bin:/bin", **(env or {})}, read_only_paths=read_only_paths)
+        record = {"command": command, "returncode": result.returncode, "stdout": result.stdout.decode("utf-8", errors="replace"),
+                  "stderr": result.stderr.decode("utf-8", errors="replace"), "timed_out": result.timed_out,
+                  "truncated": result.truncated, "sandbox_mode": result.mode, "stdin_sha256": _sha(stdin)}
+        if result.returncode != 0 or result.timed_out or result.truncated or result.mode != "sandbox-exec":
+            raise SoftwareExecutionError(record)
+        return record
+
+    def _acquire(self, args, key):
+        _fields(args, {"inspection_ref", "license_ref", "runtime", "requirements", "dependencies", "package_path"}, {"build"})
+        inspected = self._receipt(args["inspection_ref"], "inspect")["result"]
+        license_document = self._receipt(args["license_ref"], "read")["result"]
+        if license_document["inspection_ref"] != args["inspection_ref"] or not license_document["content"].strip():
+            raise ValidationError("software license must be read from the exact chosen source revision")
+        if args["runtime"] not in {"python", "r", "native"}:
+            raise ValidationError("software runtime is unsupported; choose another candidate or request a runtime adapter")
+        if args["runtime"] != "native" and "build" in args:
+            raise ValidationError("build options are only valid for a native software runtime")
+        if (not isinstance(args["requirements"], list) or any(not isinstance(pin, str) or not _PIN.fullmatch(pin) for pin in args["requirements"])
+                or not isinstance(args["dependencies"], list)):
+            raise ValidationError("software acquisition requires exact dependency pins and receipt references")
+        archive = self.fetch(f"https://codeload.github.com/{inspected['repository']}/tar.gz/{inspected['commit']}", archive=True)
+        root = self.root / "environments" / key
+        root.mkdir(parents=True, exist_ok=False)
+        source = root / "source"
+        source.mkdir()
+        (root / "source.tar.gz").write_bytes(archive)
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as stream:
+            members = stream.getmembers()
+            total = 0
+            for member in members:
+                relative = PurePosixPath(member.name)
+                if relative.is_absolute() or ".." in relative.parts or not relative.parts or not (member.isfile() or member.isdir()):
+                    raise ValidationError("source archive contains an unsafe or unsupported member")
+                total += member.size
+                if total > 512 * 1024 * 1024:
+                    raise ValidationError("expanded source exceeds the acquisition byte limit")
+                target = source.joinpath(*relative.parts[1:])
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                elif len(relative.parts) > 1:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(stream.extractfile(member).read())
+                    target.chmod(member.mode & 0o755)
+        package = source / _relative(args["package_path"])
+        if not package.is_dir():
+            raise ValidationError("chosen software package path is absent")
+        dependencies = [self._environment(ref) for ref in args["dependencies"]]
+        steps = []
+        if args["runtime"] == "python":
+            if dependencies:
+                raise ValidationError("Python dependencies must be exact distribution pins, not foreign environments")
+            steps.append(self._sandbox([sys.executable, "-m", "venv", str(root / "venv")], root))
+            executable = str(root / "venv/bin/python")
+            wheels = root / "wheels"
+            wheels.mkdir()
+            if args["requirements"]:
+                # Only the trusted pip downloader has network access. Wheel code
+                # is never imported here; all install/build hooks run offline.
+                import subprocess
+                fetched = subprocess.run([executable, "-m", "pip", "--isolated", "download", "--index-url", "https://pypi.org/simple",
+                    "--only-binary=:all:", "--dest", str(wheels), *args["requirements"]],
+                    capture_output=True, timeout=self._remaining(), env={"PATH": "/usr/bin:/bin", "HOME": str(root), "PIP_CONFIG_FILE": "/dev/null"})
+                download = {"returncode": fetched.returncode, "stdout": fetched.stdout.decode(errors="replace"), "stderr": fetched.stderr.decode(errors="replace")}
+                if fetched.returncode != 0:
+                    raise SoftwareExecutionError(download)
+                steps.append(download)
+                steps.append(self._sandbox([executable, "-m", "pip", "--isolated", "install", "--no-index", "--find-links", str(wheels), *args["requirements"]], root))
+            steps.append(self._sandbox([executable, "-m", "pip", "--isolated", "wheel", "--no-index", "--no-deps", "--no-build-isolation", "--wheel-dir", str(root / "built"), str(package)], root))
+            built = list((root / "built").glob("*.whl"))
+            if len(built) != 1:
+                raise ValidationError("software build did not produce exactly one package wheel")
+            steps.append(self._sandbox([executable, "-m", "pip", "--isolated", "install", "--no-index", "--no-deps", str(built[0])], root))
+            inventory = self._sandbox([executable, "-m", "pip", "--isolated", "list", "--format=json"], root)
+            steps.append(inventory)
+            packages = json.loads(inventory["stdout"])
+        elif args["runtime"] == "r":
+            if args["requirements"]:
+                raise ValidationError("R dependencies require separately inspected and acquired source receipts")
+            executable = shutil.which("Rscript")
+            r = shutil.which("R")
+            if not executable or not r:
+                raise ValidationError("R runtime is unavailable on the host; no global installer was run")
+            library = root / "library"
+            library.mkdir()
+            for dependency in dependencies:
+                if dependency["runtime"] != "r":
+                    raise ValidationError("R dependency receipt refers to another runtime")
+                for item in (Path(dependency["environment_path"]) / "library").iterdir():
+                    destination = library / item.name
+                    if destination.exists():
+                        raise ValidationError("R dependency environments contain conflicting package names")
+                    shutil.copytree(item, destination)
+            steps.append(self._sandbox([r, "CMD", "INSTALL", "--library=" + str(library), str(package)], root,
+                                       env={"R_LIBS_USER": str(library)}))
+            script = root / "inventory.R"
+            script.write_text('cat(R.version.string, "\\n"); write.table(installed.packages(lib.loc=c(' + json.dumps(str(library)) + ',.Library))[,c("Package","Version")], row.names=FALSE, sep="\\t")')
+            inventory = self._sandbox([executable, "--vanilla", str(script)], root)
+            steps.append(inventory)
+            packages = inventory["stdout"]
+        else:
+            if args["requirements"]:
+                raise ValidationError("native dependencies require separately acquired environment receipts")
+            build = args.get("build")
+            _fields(build, {"system", "options", "executable"})
+            if not isinstance(build["options"], list) or any(not isinstance(option, str) or not option for option in build["options"]):
+                raise ValidationError("native build options must be an explicit argument list")
+            install = root / "install"
+            install.mkdir()
+            dep_paths = []
+            for dependency in dependencies:
+                if dependency["runtime"] != "native":
+                    raise ValidationError("native build dependency belongs to another runtime")
+                dep_paths.append(dependency["environment_path"])
+            read_roots = tuple(dict.fromkeys(path for dependency in dependencies
+                                            for path in self._dependency_roots(dependency)))
+            if build["system"] == "cmake":
+                cmake = shutil.which("cmake")
+                if not cmake:
+                    raise ValidationError("CMake is unavailable; no global installer was run")
+                if any(not re.fullmatch(r"-D[A-Za-z_][A-Za-z0-9_]*=[^\n\r]+", option)
+                       or option.startswith(("-DCMAKE_INSTALL_PREFIX=", "-DCMAKE_PREFIX_PATH=")) for option in build["options"]):
+                    raise ValidationError("CMake options require -Dname=value without overriding managed paths")
+                steps.append(self._sandbox([cmake, "-S", str(package), "-B", str(root / "build"),
+                    "-DCMAKE_INSTALL_PREFIX=" + str(install), "-DCMAKE_PREFIX_PATH=" + ";".join(str(Path(path) / "install") for path in dep_paths), *build["options"]], root, read_only_paths=read_roots))
+                steps.append(self._sandbox([cmake, "--build", str(root / "build")], root, read_only_paths=read_roots))
+                if _relative(build["executable"]).startswith("install/"):
+                    steps.append(self._sandbox([cmake, "--install", str(root / "build")], root, read_only_paths=read_roots))
+            elif build["system"] in {"make", "configure"}:
+                make = shutil.which("make")
+                if not make:
+                    raise ValidationError("Make is unavailable; no global installer was run")
+                if build["system"] == "configure":
+                    if any(not option.startswith("--") or option.startswith("--prefix") for option in build["options"]):
+                        raise ValidationError("configure options cannot override the private install prefix")
+                    steps.append(self._sandbox(["/bin/sh", str(package / "configure"), "--prefix=" + str(install), *build["options"]], package, read_only_paths=(str(root), *read_roots)))
+                    options = []
+                else:
+                    if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=[^\n\r]+", option)
+                           or option.startswith(("PREFIX=", "DESTDIR=")) for option in build["options"]):
+                        raise ValidationError("Make options require name=value without overriding managed install paths")
+                    options = build["options"]
+                steps.append(self._sandbox([make, "-C", str(package), "PREFIX=" + str(install), *options], root, read_only_paths=read_roots))
+                # Projects without an install target may select their build-tree executable.
+                if _relative(build["executable"]).startswith("install/"):
+                    steps.append(self._sandbox([make, "-C", str(package), "install", "PREFIX=" + str(install), *options], root, read_only_paths=read_roots))
+            else:
+                raise ValidationError("unsupported native build system")
+            engine = root / _relative(build["executable"])
+            if not engine.is_file() or engine.is_symlink():
+                raise ValidationError("native build did not produce the selected executable")
+            executable = sys.executable
+            packages = {"build": build, "engine_path": str(engine), "engine_sha256": _sha(engine.read_bytes()),
+                        "dependencies": args["dependencies"]}
+        manifest = {"runtime": args["runtime"], "executable": executable, "executable_sha256": _sha(Path(executable).resolve().read_bytes()),
+                    "inspection_ref": args["inspection_ref"], "repository": inspected["repository"], "commit": inspected["commit"],
+                    "license_ref": args["license_ref"],
+                    "source_archive_sha256": _sha(archive), "environment_path": str(root), "packages": packages,
+                    "dependencies": args["dependencies"], "steps": steps, "files": _tree(root)}
+        (root / "environment.json").write_bytes(canonical_bytes(manifest))
+        return manifest
+
+    def _environment(self, ref):
+        result = self._receipt(ref, "acquire")["result"]
+        root = Path(result["environment_path"])
+        if not root.is_relative_to(self.root / "environments") or root.is_symlink():
+            raise ValidationError("software environment escaped its project workspace")
+        if json.loads((root / "environment.json").read_bytes()) != result or _tree(root) != result["files"]:
+            raise ValidationError("pinned scientific software environment changed")
+        if _sha(Path(result["executable"]).resolve().read_bytes()) != result["executable_sha256"]:
+            raise ValidationError("scientific software interpreter changed")
+        for dependency_ref in result["dependencies"]:
+            self._environment(dependency_ref)
+        return result
+
+    def _dependency_roots(self, environment):
+        roots = [environment["environment_path"]]
+        for ref in environment["dependencies"]:
+            roots.extend(self._dependency_roots(self._environment(ref)))
+        return tuple(dict.fromkeys(roots))
+
+    def _run(self, args, key):
+        _fields(args, {"environment_ref", "source", "input", "purpose", "documentation_refs", "expected"})
+        environment = self._environment(args["environment_ref"])
+        if not isinstance(args["source"], str) or not args["source"].strip() or not isinstance(args["input"], dict):
+            raise ValidationError("software run requires complete source and JSON object input")
+        if args["purpose"] not in {"upstream_example", "scientific_computation"}:
+            raise ValidationError("software run must declare example reproduction or scientific computation")
+        if not isinstance(args["documentation_refs"], list) or not args["documentation_refs"]:
+            raise ValidationError("software run requires acquired documentation references")
+        for ref in args["documentation_refs"]:
+            read = self._receipt(ref, "read")["result"]
+            if read["inspection_ref"] != environment["inspection_ref"]:
+                raise ValidationError("software documentation belongs to another source revision")
+        if args["expected"] is not None and not isinstance(args["expected"], dict):
+            raise ValidationError("expected upstream output must be a JSON object or null")
+        root = self.root / "runs" / key
+        root.mkdir(parents=True, exist_ok=False)
+        source = root / ("program.R" if environment["runtime"] == "r" else "program.py")
+        text = args["source"]
+        if environment["runtime"] == "r":
+            text = ".libPaths(c(" + json.dumps(str(Path(environment["environment_path"]) / "library")) + ", .Library));\n" + text
+        source.write_text(text)
+        command = [environment["executable"], *(["--vanilla"] if environment["runtime"] == "r" else ["-I"]), str(source)]
+        execution = self._sandbox(command, root, stdin=canonical_bytes(args["input"]),
+                                  read_only_paths=self._dependency_roots(environment))
+        try:
+            output = _parse_object(execution["stdout"].encode())
+            expected_matches = _matches_expected(output, args["expected"]) if args["expected"] is not None else None
+        except (ValueError, ValidationError) as exc:
+            raise SoftwareExecutionError({**execution, "output_error": str(exc)}) from exc
+        self._environment(args["environment_ref"])
+        return {"environment_ref": args["environment_ref"], "source_sha256": _sha(text.encode()), "source": text,
+                "input": args["input"], "input_sha256": _sha(canonical_bytes(args["input"])),
+                "purpose": args["purpose"], "documentation_refs": args["documentation_refs"], "execution": execution,
+                "output": output, "stdout_sha256": _sha(execution["stdout"].encode()),
+                "expected": args["expected"], "expected_matches": expected_matches,
+                "scientific_admission": "not_assessed"}
+
+
+class SoftwareExecutionError(ValidationError):
+    def __init__(self, execution):
+        self.execution = execution
+        super().__init__("scientific software execution failed: " + json.dumps(execution, ensure_ascii=False))
+
+
+def _matches_expected(output, expected):
+    _fields(expected, {"value", "absolute_tolerance", "relative_tolerance"})
+    if not isinstance(expected["value"], dict) or any(type(expected[key]) not in (int, float) or not math.isfinite(expected[key]) or expected[key] < 0
+                                                        for key in ("absolute_tolerance", "relative_tolerance")):
+        raise ValidationError("upstream expected output needs finite nonnegative tolerances")
+    def equal(actual, reference):
+        if type(actual) in (int, float) and type(reference) in (int, float):
+            return math.isfinite(actual) and math.isfinite(reference) and math.isclose(actual, reference, abs_tol=expected["absolute_tolerance"], rel_tol=expected["relative_tolerance"])
+        if type(actual) is not type(reference):
+            return False
+        if isinstance(reference, dict):
+            return actual.keys() == reference.keys() and all(equal(actual[key], reference[key]) for key in reference)
+        if isinstance(reference, list):
+            return len(actual) == len(reference) and all(equal(a, b) for a, b in zip(actual, reference))
+        return actual == reference
+    return equal(output, expected["value"])
+
+
+def selection_contract():
+    return {"decision": "pass | hold", "summary": "...", "findings": [], "evidence_gaps": [],
+            "requested_actions": [], "software_selection": {
+                "strategy": "reuse | custom_model | unavailable", "rationale": "source-bound scientific fit assessment",
+                "environment_ref": None, "example_ref": None, "computation_refs": [],
+                "scientific_source_refs": [], "limitations": []}}
+
+
+def validate_selection(response, workbench, results):
+    _fields(response, {"decision", "summary", "findings", "evidence_gaps", "requested_actions", "software_selection"})
+    selection = response["software_selection"]
+    _fields(selection, {"strategy", "rationale", "environment_ref", "example_ref", "computation_refs", "scientific_source_refs", "limitations"})
+    if response["decision"] not in {"pass", "hold"} or selection["strategy"] not in {"reuse", "custom_model", "unavailable"}:
+        raise ValidationError("scientific software selection has an unsupported decision")
+    if not isinstance(selection["rationale"], str) or not selection["rationale"].strip():
+        raise ValidationError("scientific software selection needs an explicit fit rationale")
+    for key in ("computation_refs", "scientific_source_refs", "limitations"):
+        if not isinstance(selection[key], list) or any(not isinstance(ref, str) or not ref for ref in selection[key]):
+            raise ValidationError("scientific software selection requires explicit reference and limitation lists")
+    available = {row.get("receipt_ref") for row in results if row.get("outcome") == "ok"}
+    if response["decision"] == "pass" and not any(row.get("outcome") == "ok" and row["action"]["operation"] == "check_environment" for row in results):
+        raise ValidationError("scientific software assessment has not checked the actual execution environment")
+    if selection["strategy"] == "reuse":
+        refs = [selection["environment_ref"], selection["example_ref"], *selection["computation_refs"]]
+        if not selection["computation_refs"] or any(ref not in available for ref in refs):
+            raise ValidationError("software reuse lacks this assessment's actual environment, example and computations")
+        workbench._environment(selection["environment_ref"])
+        example = workbench._receipt(selection["example_ref"], "run")["result"]
+        if (example["purpose"] != "upstream_example" or example["expected_matches"] is not True
+                or example["environment_ref"] != selection["environment_ref"]):
+            raise ValidationError("software reuse has no matching reproduced upstream example")
+        for ref in selection["computation_refs"]:
+            computation = workbench._receipt(ref, "run")["result"]
+            if computation["purpose"] != "scientific_computation" or computation["environment_ref"] != selection["environment_ref"]:
+                raise ValidationError("selected software computation has another environment or purpose")
+    elif selection["environment_ref"] is not None or selection["example_ref"] is not None or selection["computation_refs"]:
+        raise ValidationError("non-reuse selection must not claim an executed software capability")
+    if selection["strategy"] == "custom_model":
+        if not selection["scientific_source_refs"] or not any(row.get("outcome") == "ok" and row["action"]["operation"] == "search" for row in results):
+            raise ValidationError("custom modelling requires actual software discovery and source-bound justification")
+    if selection["strategy"] == "unavailable" and response["decision"] != "hold":
+        raise ValidationError("unavailable scientific software cannot admit implementation")
