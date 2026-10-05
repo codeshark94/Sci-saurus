@@ -1735,11 +1735,21 @@ def _response_items(value):
 def _validate_repair_adjudication_response(result):
     """Validate response transport before scientific admission consumes the plan."""
     keys = {"decision", "summary", "findings", "evidence_gaps", "requested_actions", "repair_plan"}
-    if (set(result) != keys or not isinstance(result.get("summary"), str)
-            or any(not isinstance(result.get(key), list)
-                   or any(not isinstance(item, str) for item in result[key])
-                   for key in ("findings", "evidence_gaps", "requested_actions"))):
-        raise ValidationError("repair-adjudication response must satisfy its complete declared contract")
+    if not isinstance(result, dict):
+        raise ValidationError("repair-adjudication response must be a JSON object")
+    diagnostics = []
+    if keys - set(result):
+        diagnostics.append("missing fields: " + ", ".join(sorted(keys - set(result))))
+    if set(result) - keys:
+        diagnostics.append("unexpected fields: " + ", ".join(sorted(set(result) - keys)))
+    if "summary" in result and not isinstance(result["summary"], str):
+        diagnostics.append("summary must be a string")
+    for key in ("findings", "evidence_gaps", "requested_actions"):
+        if key in result and (not isinstance(result[key], list)
+                              or any(not isinstance(item, str) for item in result[key])):
+            diagnostics.append(key + " must be a string list")
+    if diagnostics:
+        raise ValidationError("repair-adjudication response contract: " + "; ".join(diagnostics))
     decision = result.get("decision")
     plan = result.get("repair_plan")
     if decision == "hold":

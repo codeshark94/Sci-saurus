@@ -94,7 +94,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-current-response-order-lifecycle-16")
+    "experiment-current-response-order-lifecycle-17")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -7448,6 +7448,25 @@ class ComposerRunner:
         self.department_activity.append({"cycle": self.continuation_cycles,
             "action": "retire_superseded_response_recovery_orders", "work_orders": list(retired.values())})
         return list(retired.values())
+
+    def _reconcile_pending_stage_holds(self, by_id):
+        """Project an unadmitted current work request before retry dispatch."""
+        requests = self._continuation_requests()
+        pending = []
+        for stage_id, stage in by_id.items():
+            context = self.context.get(stage_id, {})
+            record = self.stage_records.get(stage_id, {})
+            if (record.get("status") not in {"blocked", "retrying"}
+                    or context.get("status") not in STAGE_HOLD_STATUSES
+                    or self._requests_for_stage(stage)
+                    or self._has_pending_admitted_recovery(stage, by_id)):
+                continue
+            if not any(stage_id in self._continuation_targets([request], by_id)
+                       for request in requests):
+                continue
+            record["status"] = context["status"]
+            pending.append(stage_id)
+        return pending
 
     def _scope_active_research_requests(self, requests):
         """Drop legacy work orders that predate the currently selected topic."""
@@ -28139,6 +28158,9 @@ class ComposerRunner:
             # resume, repair/review holds are reconciled before the scheduler
             # can admit any downstream consumer; this also prevents an
             # interrupted run from silently treating an old proposal as data.
+            pending_holds = self._reconcile_pending_stage_holds(by_id)
+            if pending_holds:
+                self._checkpoint("resume:pending_work_order_holds_reconciled", force=True)
             held = {stage_id for stage_id, row in self.stage_records.items()
                     if row.get("status") in STAGE_HOLD_STATUSES}
             if (self.stop_after_stage is not None

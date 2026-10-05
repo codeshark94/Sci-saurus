@@ -17,6 +17,21 @@ from scisaurus.tests.test_capability_foundry import StubClient, MINI_VALIDATOR, 
 
 
 class FoundryRecoveryContractTests(unittest.TestCase):
+    def test_methods_response_diagnostic_identifies_exact_contract_defects(self):
+        from scisaurus.core.errors import ValidationError
+        from scisaurus.runtime.specialists import _validate_repair_adjudication_response
+        valid = {'decision': 'hold', 'summary': 'Evidence is unresolved.', 'findings': [],
+                 'evidence_gaps': [], 'requested_actions': [], 'repair_plan': None}
+        _validate_repair_adjudication_response(valid)
+        invalid = {**valid, 'analysis': {}, 'summary': None, 'findings': [False]}
+        del invalid['requested_actions']
+        with self.assertRaises(ValidationError) as caught:
+            _validate_repair_adjudication_response(invalid)
+        message = str(caught.exception)
+        for diagnostic in ('missing fields: requested_actions', 'unexpected fields: analysis',
+                           'summary must be a string', 'findings must be a string list'):
+            self.assertIn(diagnostic, message)
+
     def test_response_repair_lifecycle_retires_only_verified_older_owners(self):
         cases = ('older', 'same', 'newer', 'wrong_input', 'foreign_stage',
                  'missing', 'unbound', 'unadmitted', 'scientific', 'scientific_kind')
@@ -43,8 +58,11 @@ class FoundryRecoveryContractTests(unittest.TestCase):
                     runner.active_research_requests = [order, unrelated]
                     if case != 'unadmitted':
                         runner.feedback.append({'action': 'continue_research', 'research_requests': [order]})
-                    runner.context[stage['id']] = {'failure_dossier_ref': current_ref, 'research_requests': [order]}
-                    runner.stage_records[stage['id']] = {'attempts': [
+                    current_request = {'id': 'current-scientific-order', 'kind': 'additional_experiment',
+                                       'target_stage_id': stage['id'], 'failure_dossier_ref': current_ref}
+                    runner.context[stage['id']] = {'status': 'research_expansion_required',
+                        'failure_dossier_ref': current_ref, 'research_requests': [order, current_request]}
+                    runner.stage_records[stage['id']] = {'status': 'retrying', 'attempts': [
                         {'attempt_number': old_number, 'failure_dossier_ref': old_ref},
                         {'attempt_number': old_number if case == 'same' else 11,
                          'failure_dossier_ref': current_ref}]}
@@ -54,8 +72,46 @@ class FoundryRecoveryContractTests(unittest.TestCase):
                     self.assertEqual(bool(retired), case == 'older')
                     self.assertEqual(len(runner.active_research_requests), 1 if case == 'older' else 2)
                     self.assertIn(unrelated, runner.active_research_requests)
-                    self.assertEqual(len(runner.context[stage['id']]['research_requests']), 0 if case == 'older' else 1)
+                    self.assertEqual(len(runner.context[stage['id']]['research_requests']), 1 if case == 'older' else 2)
+                    self.assertIn(current_request, runner.context[stage['id']]['research_requests'])
+                    self.assertEqual(runner.stage_records[stage['id']]['status'], 'retrying')
                     self.assertEqual(len(runner.stage_records[stage['id']]['attempts']), 0 if case == 'unbound' else 2)
+                finally:
+                    runner.close()
+
+    def test_unowned_hold_admits_current_work_before_reusing_paid_stage_scope(self):
+        for status in ('blocked', 'retrying'):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as path:
+                runner = ComposerRunner(composer_fixtures.ComposerWorkflowTests()._workflow(Path(path)))
+                try:
+                    stage = runner.workflow['stages'][1]
+                    request = {'id': 'current-methods-order', 'kind': 'additional_experiment',
+                        'owner': 'methods.validation', 'objective': 'Resolve the current failure.',
+                        'why': 'The current work failed.', 'success_condition': 'Independent validation.',
+                        'evidence_needed': 'Current execution receipts.', 'target_stage_id': stage['id']}
+                    runner.context[stage['id']] = {'status': 'research_expansion_required',
+                                                   'research_requests': [request]}
+                    runner.stage_records[stage['id']] = {'status': status, 'attempts': []}
+                    runner.stage_usage_totals['stage:' + stage['id']] = {'model_calls': 24}
+                    before = deepcopy(runner.stage_usage_totals)
+                    by_id = {s['id']: s for s in runner.workflow['stages']}
+                    self.assertEqual(runner._reconcile_pending_stage_holds(by_id), [stage['id']])
+                    self.assertEqual(runner.stage_records[stage['id']]['status'], 'research_expansion_required')
+                    self.assertTrue(runner._begin_continuation(set(), by_id))
+                    self.assertEqual(runner.continuation_cycles, 1)
+                    self.assertEqual(runner.active_research_requests[0]['id'], request['id'])
+                    self.assertEqual(runner.stage_usage_totals, before)
+                    self.assertEqual(runner._reconcile_pending_stage_holds(by_id), [])
+                    runner.active_research_requests[0]['source_stage_id'] = 'survey'
+                    runner.feedback.append({'action': 'continue_research',
+                                            'research_requests': deepcopy(runner.active_research_requests)})
+                    runner.stage_records[stage['id']]['status'] = 'retrying'
+                    self.assertEqual(runner._reconcile_pending_stage_holds(by_id), [])
+                    runner.feedback = []
+                    runner.active_research_requests = [{'id': 'foreign-response', 'kind': 'recovery',
+                        'target_stage_id': stage['id'], 'recovery_mode': 'format_repair_then_rerun',
+                        'failure_dossier_ref': 'artifact:foreign@1'}]
+                    self.assertEqual(runner._reconcile_pending_stage_holds(by_id), [])
                 finally:
                     runner.close()
 
