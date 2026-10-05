@@ -350,7 +350,7 @@
     const stage = selectedStage(snapshot);
     if (!stage) return;
     state.stageId = stage.id;
-    $("#stage-navigation").innerHTML = stages.map((item,index) => `<button type="button" class="stage-nav-item${item.id === stage.id ? " is-active" : ""}" data-stage-id="${escapeHtml(item.id)}"><span class="nav-index">${String(index + 1).padStart(2, "0")}</span><span>${escapeHtml(stageLabel(item))}</span><span class="stage-nav-mark ${item.status === "completed" ? "is-complete" : ""}" aria-label="${escapeHtml(STAGE_STATUS[item.status] || text(item.status))}"></span></button>`).join("");
+    $("#stage-navigation").innerHTML = stages.map((item,index) => `<button type="button" class="stage-nav-item${item.id === stage.id ? " is-active" : ""}" data-stage-id="${escapeHtml(item.id)}"><span class="nav-index">${String(index + 1).padStart(2, "0")}</span><span>${escapeHtml(stageLabel(item))}</span><span class="stage-nav-mark ${item.status === "completed" ? "is-complete" : ""}" role="img" aria-label="${escapeHtml(STAGE_STATUS[item.status] || text(item.status))}">${item.status === "completed" ? '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m3 8 3 3 7-7"/></svg>' : ""}</span></button>`).join("");
     $$('[data-stage-id]').forEach((button) => button.addEventListener("click", () => selectStage(button.dataset.stageId)));
     $("#stage-heading").textContent = stageLabel(stage);
     $("#stage-caption").textContent = stage.kind === "topic_discovery" && stage.status === "completed" ? "Candidate selected" : STAGE_STATUS[stage.status] || text(stage.status);

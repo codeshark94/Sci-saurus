@@ -94,7 +94,7 @@ a { color: inherit; text-decoration: none; }
 .nav-link.is-active { box-shadow: inset 2px 0 var(--accent); }
 .nav-index { color: var(--faint); font: 10px/1 "SFMono-Regular", Consolas, monospace; }
 .nav-link.is-active .nav-index { color: var(--accent-strong); }
-.sidebar-project-list { display: grid; flex: 1 1 100px; min-height: 100px; gap: 4px; overflow: auto; }
+.sidebar-project-list { display: grid; align-content: start; flex: 1 1 100px; min-height: 100px; gap: 4px; overflow: auto; }
 .sidebar-project { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; align-content: start; gap: 7px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; padding: 10px 9px; text-align: left; }
 .sidebar-project:hover, .sidebar-project.is-selected { border-color: var(--line); background: var(--surface-raised); color: var(--text); }
 .sidebar-project-main { display: grid; min-width: 0; gap: 3px; }
@@ -618,8 +618,9 @@ h2 { font-size: 17px; line-height: 1.2; }
 .stage-nav-item { display:flex; align-items:center; gap:10px; min-height:36px; width:100%; padding:8px 10px; border:1px solid transparent; border-radius:6px; background:transparent; color:var(--muted); text-align:left; cursor:pointer; }
 .stage-nav-item.is-active { border-color:var(--line-strong); background:var(--surface-raised); color:var(--text); }
 .stage-nav-item:hover { background:var(--surface-hover); }
-.stage-nav-mark { width:5px; height:5px; flex:none; margin-left:auto; border-radius:50%; background:var(--line-strong); }
-.stage-nav-mark.is-complete { background:#9bbbab; }
+.stage-nav-mark { display:grid; place-items:center; width:14px; height:14px; flex:none; margin-left:auto; }
+.stage-nav-mark:not(.is-complete)::before { content:""; width:5px; height:5px; border-radius:50%; background:var(--line-strong); }
+.stage-nav-mark.is-complete { color:#9bbbab; }
 .stage-workspace { padding:22px 0 24px; scroll-margin-top:74px; }
 .stage-result-summary { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-bottom:22px; }
 .stage-summary-card { min-width:0; border:1px solid var(--line); border-radius:var(--radius); background:var(--surface); padding:16px; }
