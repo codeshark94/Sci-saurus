@@ -45,7 +45,7 @@ from scisaurus.runtime.models import (
     ModelCallError, ModelClient, ModelContextBudgetError, ModelResult, effective_model_timeout,
     resolve_model_config, load_model_config, model_route_candidates, role_config_for,
 )
-from scisaurus.runtime.model_work import ModelWorkBlocked
+from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkProvenanceError
 from scisaurus.runtime.specialists import (
     _preserve_response_value, REPAIR_CHECK_PHASE_RULE,
     research_question_alignment, RESEARCH_QUESTION_ALIGNMENT_RULE,
@@ -2236,6 +2236,13 @@ class CapabilityFoundry:
                     **({"resume_work_ref": resume_work_ref} if resume_work_ref is not None else {})},
                 model={name: value for name, value in self.model_config.items() if name != "timeout_seconds"})
             state = work_cache.get(key) or state
+            if state.get("inherited_request_history_reconciliation") is not None:
+                state = work_cache.recovery_entry(state)
+                state["usage_inheritance"] = {
+                    "source_ref": state.pop("cache_ref"),
+                    "source_request_count": len(state.get("requests", [])),
+                }
+            work_cache.inherited_usage(state)
             state.pop("cache_ref", None)
             if not isinstance(state.get("author_request_signatures"), list):
                 state["author_request_signatures"] = []
@@ -2281,6 +2288,8 @@ class CapabilityFoundry:
                         raise ValidationError("foundry resume work body differs from its immutable digest")
                     prior_entries = [{**json.loads(body), "cache_ref": resume_work_ref}]
                 for prior in prior_entries:
+                    prior = work_cache.recovery_entry(prior)
+                    work_cache.inherited_usage(prior)
                     if prior.get("assignment") == base_prompt:
                         response = prior.get("last_response")
                         requests = prior.get("requests", [])
@@ -2465,10 +2474,33 @@ class CapabilityFoundry:
                 client = ModelClient(**author_route_configs[author_route_index])
 
         def save(phase):
-            if work_cache is not None:
-                work_cache.put(key, state)
-            if on_progress is not None:
-                on_progress(phase, deepcopy_config(state))
+            try:
+                if work_cache is not None:
+                    work_cache.inherited_usage(state)
+                    work_cache.put(key, state)
+                if on_progress is not None:
+                    on_progress(phase, deepcopy_config(state))
+            except (ModelWorkProvenanceError, CapabilityDeadlineError,
+                    CapabilityModelBudgetExceeded, ModelContextBudgetError):
+                raise
+            except ValidationError as exc:
+                raise ModelWorkProvenanceError(
+                    f"Foundry checkpoint publication failed: {exc}") from exc
+
+        def reconcile_unknown_dispatch(request, error):
+            inheritance = state.get("usage_inheritance")
+            count = inheritance.get("source_request_count", 0) if isinstance(inheritance, dict) else 0
+            index = next((index for index, item in enumerate(state.get("requests", []))
+                          if item is request), None)
+            if index is not None and index < count:
+                receipt = {"source_ref": inheritance["source_ref"], "request_index": index,
+                           "request_sha256": hashlib.sha256(canonical_bytes(request)).hexdigest(),
+                           "status": "result_unknown", "error": error}
+                receipts = state.setdefault("request_outcome_reconciliations", [])
+                if receipt not in receipts:
+                    receipts.append(receipt)
+            else:
+                request.update(status="result_unknown", error=error)
 
         def execute_recorded(source, payload, operation):
             result = self._execute(source, payload)
@@ -3245,11 +3277,12 @@ class CapabilityFoundry:
                 if (model_call_budget is not None
                         and (type(calls) is not int
                              or calls + 2 > model_call_budget)):
-                    continuation.update(status="exhausted", partial_response=partial)
+                    continuation.update(status="pending", partial_response=partial)
                     retained.update(status="response_received", result=asdict(result))
-                    save("scientific_review_continuation_budget_exhausted")
-                    return ModelResult(
-                        partial, result.model, usage, elapsed, "length", request_attempts)
+                    save("scientific_review_continuation_budget_pending")
+                    raise CapabilityModelBudgetExceeded(
+                        "review continuation requires available call capacity", limit=model_call_budget,
+                        observed=calls, usage=state.get("usage", {}))
 
                 marker, current_prefix_digest, prompt = _review_continuation_prompt(partial)
                 model = getattr(reviewer, "model", reviewer.__class__.__name__)
@@ -3428,7 +3461,7 @@ class CapabilityFoundry:
                     for request in reversed(state.get("requests", [])):
                         if request.get("role") == "review.methods" and request.get("candidate_sha256") == identity:
                             if request.get("status") == "started":
-                                request.update(status="result_unknown", error="process exited before review result was recorded")
+                                reconcile_unknown_dispatch(request, "process exited before review result was recorded")
                             break
                     retained["error"] = "review response outcome is unknown; recovery requires a distinct configured route"
                 retained["status"] = "repairing"
@@ -3450,7 +3483,7 @@ class CapabilityFoundry:
                         result.json_object(allow_missing_closers=True),
                         prior_blocking_issues=prior_blocking_issues)
                 except (CapabilityDeadlineError, CapabilityModelBudgetExceeded,
-                        ModelContextBudgetError, ModelWorkBlocked):
+                        ModelContextBudgetError, ModelWorkBlocked, ModelWorkProvenanceError):
                     raise
                 except ValidationError as exc:
                     retained.update(status="repairing", error=str(exc))
@@ -3717,8 +3750,7 @@ class CapabilityFoundry:
                                 and request.get("assignment_sha256") == identity):
                             interrupted_request = request
                             if request.get("status") == "started":
-                                request.update(status="result_unknown",
-                                    error="process exited before the validator result was recorded")
+                                reconcile_unknown_dispatch(request, "process exited before the validator result was recorded")
                             break
                     if self.validator_client is not None:
                         raise ModelWorkBlocked("independent validator authoring has an unresolved dispatched request")
@@ -3883,8 +3915,7 @@ class CapabilityFoundry:
         feedback = state.get("feedback")
         if state["status"] == "calling":
             last_request = state.get("requests", [])[-1] if state.get("requests") else {}
-            last_request.update(status="result_unknown",
-                error="process exited before the provider result was recorded")
+            reconcile_unknown_dispatch(last_request, "process exited before the provider result was recorded")
             continuation = state.get("author_response_continuation")
             if last_request.get("operation") == "continue_truncated_response":
                 if isinstance(continuation, dict):
@@ -4381,7 +4412,7 @@ class CapabilityFoundry:
                 # reinterpret it as a candidate defect and spend another
                 # repair call before the pivot/recovery path sees it.
                 raise
-            except IndependentValidatorContractError:
+            except (IndependentValidatorContractError, ModelWorkProvenanceError):
                 raise
             except ModelWorkBlocked as exc:
                 if getattr(exc, "failure_class", None) != "model_contract":

@@ -57,7 +57,8 @@ from scisaurus.runtime.specialists import (
     research_question_alignment, validate_decision_alignment, RESEARCH_QUESTION_ALIGNMENT_RULE,
 )
 from scisaurus.runtime.execution_policy import MODEL_COST_LIMITS, enforce_model_cost_limits, execution_policy
-from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
+from scisaurus.runtime.model_work import (ModelWorkBlocked, ModelWorkCache, ModelWorkProvenanceError,
+    validate_foundry_usage_inheritance, reconcile_inherited_request_outcomes)
 from scisaurus.runtime.evidence import scientific_input_recovery_contract
 from scisaurus.runtime.experiment_config import (
     EXPERIMENT_WORK_ORDER_KINDS, project_executable_work_orders,
@@ -1810,21 +1811,9 @@ class ComposerRunner:
         if inheritance is None:
             return {}
         if not isinstance(inheritance, dict):
-            raise ValidationError("foundry usage inheritance requires an immutable source")
+            raise ModelWorkProvenanceError("foundry usage inheritance requires an immutable source")
         record, _, source = self._read_verified_artifact_json(inheritance["source_ref"])
-        count = inheritance.get("source_request_count")
-        if (record.get("author") != "command.controller"
-                or not record.get("artifact_ref", "").startswith("artifact:command/foundry-work/")
-                or type(count) is not int or count < 1
-                or len(source.get("requests", [])) != count
-                or body.get("requests", [])[:count] != source["requests"]
-                or source.get("assignment") != body.get("assignment")):
-            raise ValidationError("foundry usage inheritance does not bind the captured request prefix")
-        inherited = source.get("usage", {})
-        if any(type(amount) not in (int, float) or not math.isfinite(amount) or amount < 0
-               or body.get("usage", {}).get(key, 0) < amount for key, amount in inherited.items()):
-            raise ValidationError("foundry inherited usage exceeds its cumulative assignment history")
-        return inherited
+        return validate_foundry_usage_inheritance({**body, "usage_inheritance": inheritance}, record, source)
 
     def _reconcile_foundry_usage_inheritance(self):
         """Refund a copied assignment history only with exact paid checkpoint evidence."""
@@ -1881,13 +1870,25 @@ class ComposerRunner:
         """Reconcile durable per-request charges with the last usage checkpoint."""
         totals = {}
         rows = self.control._conn.execute(
-            "SELECT a.logical_id,a.body_hash FROM artifacts a JOIN "
+            "SELECT a.logical_id,a.body_hash,a.artifact_ref FROM artifacts a JOIN "
             "(SELECT logical_id,MAX(version) version FROM artifacts "
             "WHERE logical_id LIKE 'command/foundry-work/%' GROUP BY logical_id) h "
             "ON a.logical_id=h.logical_id AND a.version=h.version")
-        for row in rows:
+        for row in list(rows):
             body = json.loads(self.store.read_body(row["body_hash"]))
-            inherited = self._foundry_inherited_usage(row["logical_id"], body)
+            try:
+                inherited = self._foundry_inherited_usage(row["logical_id"], body)
+            except ModelWorkProvenanceError:
+                inheritance = body.get("usage_inheritance")
+                if not isinstance(inheritance, dict):
+                    raise
+                target_record, _, verified_body = self._read_verified_artifact_json(row["artifact_ref"])
+                if target_record.get("author") != "command.controller" or verified_body != body:
+                    raise ModelWorkProvenanceError("request reconciliation requires an immutable controller owner")
+                record, _, source = self._read_verified_artifact_json(inheritance["source_ref"])
+                body = reconcile_inherited_request_outcomes(body, record, source, target_ref=row["artifact_ref"])
+                self._publish(row["logical_id"], "note", body, "command.controller")
+                inherited = self._foundry_inherited_usage(row["logical_id"], body)
             for key, amount in body.get("usage", {}).items():
                 if key in self.usage and type(amount) in (int, float) and math.isfinite(amount) and amount >= 0:
                     totals[key] = totals.get(key, 0) + amount - inherited.get(key, 0)
@@ -2733,7 +2734,8 @@ class ComposerRunner:
     @staticmethod
     def _forward_failure_class(error, *, stage_kind=None):
         """Classify a failed attempt without turning every defect into a stop."""
-        if ComposerRunner._is_operational_stage_failure(error):
+        if (ComposerRunner._is_operational_stage_failure(error)
+                or getattr(error, "failure_class", None) == "harness_bug"):
             return "operational_recovery"
         if getattr(error, "failure_class", None) == "context_budget":
             return "resource_fence"
@@ -26954,6 +26956,8 @@ class ComposerRunner:
         closure. Provider/model quotas, deadlines, and process interruptions
         remain environmental fences and never enter this path.
         """
+        if getattr(error, "failure_class", None) == "harness_bug":
+            return False
         if getattr(error, "failure_class", None) == "context_budget":
             # The smallest role-specific packet already failed local
             # admission. Reopening the same scientific scope cannot add
