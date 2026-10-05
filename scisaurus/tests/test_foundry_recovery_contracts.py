@@ -17,6 +17,48 @@ from scisaurus.tests.test_capability_foundry import StubClient, MINI_VALIDATOR, 
 
 
 class FoundryRecoveryContractTests(unittest.TestCase):
+    def test_response_repair_lifecycle_retires_only_verified_older_owners(self):
+        cases = ('older', 'same', 'newer', 'wrong_input', 'foreign_stage',
+                 'missing', 'unbound', 'unadmitted', 'scientific', 'scientific_kind')
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as path:
+                runner = ComposerRunner(composer_fixtures.ComposerWorkflowTests()._workflow(Path(path)))
+                try:
+                    stage = runner.workflow['stages'][1]
+                    def publish(number, stage_id, digest):
+                        dossier = {'schema_version': 'composer-failure-recovery-1',
+                                   'stage_id': stage_id, 'attempt_number': number,
+                                   'failure_class': 'model_contract', 'input_sha256': digest}
+                        return runner._publish(f'command/composer/failure-recovery/{stage_id}/{number}', 'decision_note', dossier,
+                                               'command.composer')['artifact_ref']
+                    old_number = 12 if case == 'newer' else 8
+                    old_ref = publish(old_number, 'foreign' if case == 'foreign_stage' else stage['id'], 'a' * 64)
+                    current_ref = old_ref if case == 'same' else publish(11, stage['id'], 'b' * 64)
+                    order = {'id': 'response-owner', 'kind': 'additional_experiment' if case == 'scientific_kind' else 'recovery', 'owner': 'methods.validation',
+                             'target_stage_id': stage['id'], 'source_stage_id': stage['id'],
+                             'recovery_mode': 'repair_then_rerun' if case == 'scientific' else 'format_repair_then_rerun',
+                             'failure_dossier_ref': 'artifact:missing@1' if case == 'missing' else old_ref,
+                             'failure_input_sha256': 'x' * 64 if case == 'wrong_input' else 'a' * 64}
+                    unrelated = {'id': 'survey-owner', 'kind': 'literature_expansion', 'target_stage_id': 'survey'}
+                    runner.active_research_requests = [order, unrelated]
+                    if case != 'unadmitted':
+                        runner.feedback.append({'action': 'continue_research', 'research_requests': [order]})
+                    runner.context[stage['id']] = {'failure_dossier_ref': current_ref, 'research_requests': [order]}
+                    runner.stage_records[stage['id']] = {'attempts': [
+                        {'attempt_number': old_number, 'failure_dossier_ref': old_ref},
+                        {'attempt_number': old_number if case == 'same' else 11,
+                         'failure_dossier_ref': current_ref}]}
+                    if case == 'unbound':
+                        runner.stage_records[stage['id']]['attempts'] = []
+                    retired = runner._reconcile_superseded_response_recovery_orders()
+                    self.assertEqual(bool(retired), case == 'older')
+                    self.assertEqual(len(runner.active_research_requests), 1 if case == 'older' else 2)
+                    self.assertIn(unrelated, runner.active_research_requests)
+                    self.assertEqual(len(runner.context[stage['id']]['research_requests']), 0 if case == 'older' else 1)
+                    self.assertEqual(len(runner.stage_records[stage['id']]['attempts']), 0 if case == 'unbound' else 2)
+                finally:
+                    runner.close()
+
     def test_response_recovery_signature_preserves_exact_failure_owner(self):
         order = {'kind': 'recovery', 'recovery_mode': 'format_repair_then_rerun',
                  'target_stage_id': 'experiment', 'objective': 'Repair the response contract.',

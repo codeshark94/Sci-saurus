@@ -94,7 +94,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-response-identity-question-alignment-15")
+    "experiment-current-response-order-lifecycle-16")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -1174,6 +1174,7 @@ class ComposerRunner:
                 self._checkpoint("resume:refresh_current_topic_lineage", force=True)
             self._continuation_budget_baseline = max(
                 0, int(self.continuation_cycles or 0))
+            self._reconcile_superseded_response_recovery_orders()
             self.active_research_requests = self._scope_active_research_requests(
                 self.active_research_requests)
             self._reconcile_misclassified_model_budget_orders()
@@ -5811,6 +5812,7 @@ class ComposerRunner:
         # A continuation is new scientific work.  Check the immutable mission
         # wall before publishing its decision or activating any work order.
         self._remaining()
+        self._reconcile_superseded_response_recovery_orders()
         previous_cycle = self.continuation_cycles
         requests = self._continuation_requests()
         if not any(self._is_topic_pivot_request(item) for item in requests):
@@ -7387,6 +7389,65 @@ class ComposerRunner:
                     return record_cycle == identity["topic_cycle"]
                 return identity["topic_cycle"] == 0
         return True
+
+    def _reconcile_superseded_response_recovery_orders(self):
+        """Retire verified response repairs superseded by a newer owned failure."""
+        retired = {}
+        for request in self.active_research_requests:
+            if (not isinstance(request, dict)
+                    or request.get("kind") != "recovery"
+                    or request.get("recovery_mode") != "format_repair_then_rerun"
+                    or not self._research_request_was_admitted(request)):
+                continue
+            stage_id = request.get("target_stage_id")
+            context = self.context.get(stage_id, {})
+            if not isinstance(stage_id, str) or not isinstance(context, dict):
+                continue
+            recovery = context.get("failure_recovery")
+            recovery = recovery if isinstance(recovery, dict) else {}
+            current_ref = context.get("failure_dossier_ref") or recovery.get("dossier_ref")
+            old_ref = request.get("failure_dossier_ref")
+            if not isinstance(old_ref, str) or not isinstance(current_ref, str) or old_ref == current_ref:
+                continue
+            try:
+                owners = []
+                for ref in (old_ref, current_ref):
+                    manifest, _, dossier = self._read_verified_artifact_json(ref)
+                    evidence = self._failure_dossier_evidence(ref, expected_stage_id=stage_id)
+                    if (manifest.get("author") != "command.composer"
+                            or dossier.get("schema_version") != "composer-failure-recovery-1"
+                            or not isinstance(evidence, dict) or evidence.get("available") is not True):
+                        break
+                    owners.append(evidence)
+            except (NotFoundError, KeyError, OSError, TypeError, ValueError, ValidationError):
+                continue
+            if (len(owners) != 2 or owners[0].get("failure_class") != "model_contract"
+                    or owners[0].get("input_sha256") != request.get("failure_input_sha256")
+                    or type(owners[0].get("attempt_number")) is not int
+                    or type(owners[1].get("attempt_number")) is not int
+                    or owners[0]["attempt_number"] >= owners[1]["attempt_number"]):
+                continue
+            retired[self._research_request_signature(request)] = {
+                "request_id": request.get("id"), "stage_id": stage_id,
+                "prior_failure_dossier_ref": old_ref, "current_failure_dossier_ref": current_ref,
+                "prior_attempt_number": owners[0]["attempt_number"],
+                "current_attempt_number": owners[1]["attempt_number"],
+            }
+        if not retired:
+            return []
+        def retained(request):
+            return not isinstance(request, dict) or self._research_request_signature(request) not in retired
+        self.active_research_requests = [q for q in self.active_research_requests if retained(q)]
+        for context in self.context.values():
+            for key in ("research_requests", "research_expansion_requests", "deferred_research_requests"):
+                if isinstance(context, dict) and isinstance(context.get(key), list):
+                    context[key] = [q for q in context[key] if retained(q)]
+        self.departments.retire_superseded_work_orders(
+            {q.get("id") for q in self.active_research_requests if isinstance(q, dict)},
+            reason="response repair superseded by a newer verified failure owner")
+        self.department_activity.append({"cycle": self.continuation_cycles,
+            "action": "retire_superseded_response_recovery_orders", "work_orders": list(retired.values())})
+        return list(retired.values())
 
     def _scope_active_research_requests(self, requests):
         """Drop legacy work orders that predate the currently selected topic."""
