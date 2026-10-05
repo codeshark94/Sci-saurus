@@ -67,7 +67,7 @@ def _align_repair_fixture(response, prompt):
         })
     plan["evidence_checks"] = [{
         "claim": "The selected repair preserves the original question.",
-        "pointer": "/question_alignment/original/research_question", "quote": original["research_question"],
+        "pointer": "/repair_adjudication_packet/question_alignment/original/research_question", "quote": original["research_question"],
         "disposition": "supported", "explanation": "The original question is unchanged.",
     }]
     return response

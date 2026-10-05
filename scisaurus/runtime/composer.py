@@ -94,7 +94,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-owned-validator-question-alignment-14")
+    "experiment-response-identity-question-alignment-15")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -8051,6 +8051,10 @@ class ComposerRunner:
         for key in ("source_survey_ref", "source_assessment_ref", "foundry_work_ref"):
             if key in request:
                 stable[key] = deepcopy(request[key])
+        if request.get("recovery_mode") == "format_repair_then_rerun":
+            for key in ("failure_dossier_ref", "failure_input_sha256"):
+                if key in request:
+                    stable[key] = deepcopy(request[key])
         return hashlib.sha256(canonical_bytes(stable)).hexdigest()
 
     def _research_request_was_admitted(self, request, *, failure_dossier_ref=None):
@@ -27078,6 +27082,8 @@ class ComposerRunner:
                             if isinstance(item, dict)
                             and item.get("recovery_mode") == "format_repair_then_rerun"
                             and item.get("target_stage_id") == stage["id"]
+                            and item.get("failure_dossier_ref") == prior_context.get("failure_dossier_ref")
+                            and item.get("failure_input_sha256") == failure_recovery.get("input_sha256")
                             and item.get("repair_policy_revision") == policy_revision]
                 if not requests:
                     request = self._format_contract_recovery_request(stage, prior_context)

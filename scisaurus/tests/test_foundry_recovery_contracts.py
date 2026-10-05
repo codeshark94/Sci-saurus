@@ -17,6 +17,45 @@ from scisaurus.tests.test_capability_foundry import StubClient, MINI_VALIDATOR, 
 
 
 class FoundryRecoveryContractTests(unittest.TestCase):
+    def test_response_recovery_signature_preserves_exact_failure_owner(self):
+        order = {'kind': 'recovery', 'recovery_mode': 'format_repair_then_rerun',
+                 'target_stage_id': 'experiment', 'objective': 'Repair the response contract.',
+                 'failure_dossier_ref': 'artifact:command/composer/failure-recovery/experiment/attempt-8@1',
+                 'failure_input_sha256': 'a' * 64}
+        signature = ComposerRunner._research_request_signature(order)
+        for field, value in [('failure_dossier_ref', 'artifact:command/composer/failure-recovery/experiment/attempt-9@1'),
+                             ('failure_input_sha256', 'b' * 64)]:
+            changed = {**order, field: value}
+            self.assertNotEqual(signature, ComposerRunner._research_request_signature(changed))
+        self.assertEqual(signature, ComposerRunner._research_request_signature({**order, 'id': 'other-wrapper'}))
+        ordinary = {**order, 'recovery_mode': 'repair_then_rerun'}
+        self.assertEqual(ComposerRunner._research_request_signature(ordinary),
+            ComposerRunner._research_request_signature({**ordinary, 'failure_input_sha256': 'b' * 64}))
+
+    def test_continuation_replaces_admitted_old_response_owner(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(composer_fixtures.ComposerWorkflowTests()._workflow(Path(path)))
+            try:
+                stage = runner.workflow['stages'][1]
+                order = {'id': 'old-response-repair', 'kind': 'recovery', 'owner': 'methods.validation',
+                         'objective': 'Repair the response.', 'why': 'The role contract failed.',
+                         'success_condition': 'A valid response is captured.', 'evidence_needed': 'Original assignment.',
+                         'source_stage_id': stage['id'], 'target_stage_id': stage['id'],
+                         'recovery_mode': 'format_repair_then_rerun',
+                         'failure_dossier_ref': 'artifact:failure/attempt-8@1', 'failure_input_sha256': 'a' * 64}
+                current = {**order, 'id': 'current-response-repair',
+                           'failure_dossier_ref': 'artifact:failure/attempt-9@1', 'failure_input_sha256': 'b' * 64}
+                runner.active_research_requests = [order]
+                runner._attempted_request_signatures.add(runner._research_request_signature(order))
+                runner.feedback.append({'action': 'continue_research', 'research_requests': [order]})
+                runner.context[stage['id']] = {'status': 'research_expansion_required',
+                    'research_requests': [current], 'format_recovery': True, 'format_recovery_dispatched': False}
+                self.assertTrue(runner._begin_continuation(set(), {s['id']: s for s in runner.workflow['stages']}))
+                self.assertEqual([q['id'] for q in runner.active_research_requests], ['current-response-repair'])
+                self.assertEqual(runner.active_research_requests[0]['failure_dossier_ref'], current['failure_dossier_ref'])
+            finally:
+                runner.close()
+
     def test_additional_owner_allowance_does_not_count_retained_calls_twice(self):
         from scisaurus.runtime.models import _reserve_model_call_budgets, _settle_model_token_budgets
         with tempfile.TemporaryDirectory() as path:
@@ -176,7 +215,7 @@ class FoundryRecoveryContractTests(unittest.TestCase):
                     'interpretation_limit': 'Conditional sensitivity only', 'changes_estimand': False,
                     'scientific_justification': 'Preserve the frozen definition.'},
                 'evidence_checks': [{'claim': 'The current outcome is pointwise.',
-                    'pointer': '/question_alignment/candidate/primary_outcomes/0/definition',
+                    'pointer': '/repair_adjudication_packet/question_alignment/candidate/primary_outcomes/0/definition',
                     'quote': intent['primary_outcomes'][0]['definition'], 'disposition': 'supported',
                     'explanation': 'Must reconcile with the original decision rule.'}]}
         return packet, plan

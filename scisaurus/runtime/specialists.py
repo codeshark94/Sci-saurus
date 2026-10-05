@@ -111,15 +111,17 @@ def validate_decision_alignment(plan, evidence_document):
         if not isinstance(evidence_checks, list) or not evidence_checks:
             raise ValidationError("repair plan requires supplied-evidence checks of decisive assertions")
         from scisaurus.runtime.experiment import _json_pointer_value
-        for check in evidence_checks:
-            if not isinstance(check, dict) or any(
-                    not isinstance(check.get(key), str) or not check[key].strip()
-                    for key in ("claim", "pointer", "quote", "explanation")):
-                raise ValidationError("evidence check requires claim, pointer, quote and explanation")
+        for index, check in enumerate(evidence_checks):
+            required = ("claim", "pointer", "quote", "explanation")
+            missing = [key for key in required if not isinstance(check, dict)
+                       or not isinstance(check.get(key), str) or not check[key].strip()]
+            if missing:
+                raise ValidationError(f"evidence_checks[{index}] requires nonempty fields: {', '.join(missing)}")
             if check.get("disposition") not in {"supported", "rebutted"}:
                 raise ValidationError("evidence check disposition must be supported or rebutted")
             try:
-                cited = _json_pointer_value(evidence_document, check["pointer"])
+                cited = _json_pointer_value(
+                    {"repair_adjudication_packet": evidence_document}, check["pointer"])
             except ValidationError as exc:
                 raise ValidationError(f"evidence check pointer does not resolve: {exc}")
             if not isinstance(cited, str) or check["quote"] not in cited:
@@ -1634,12 +1636,17 @@ def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports
             },
             "evidence_checks": [{
                 "claim": "decisive reviewer/source assertion assessed",
-                "pointer": "JSON pointer in repair_adjudication_packet",
+                "pointer": "RFC 6901 JSON pointer from the original prompt root, starting /repair_adjudication_packet/",
                 "quote": "exact supplied text at that pointer",
                 "disposition": "supported | rebutted",
                 "explanation": "consequence for the selected repair",
             }],
         })
+        envelope["decision_contract"]["evidence_reference_contract"] = {
+            "document_root": "the original prompt object",
+            "example_pointer": "/repair_adjudication_packet/question_alignment/candidate/primary_outcomes/0/definition",
+            "quote_rule": "Copy contiguous text from the resolved string field exactly, including whitespace; never invent source statements or replace line breaks with semicolons.",
+        }
     return _json_with_budget(
         envelope, system=REPAIR_ADJUDICATION_SYSTEM,
         max_input_tokens=quota.get("max_input_tokens"))
