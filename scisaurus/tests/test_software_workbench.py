@@ -384,6 +384,10 @@ class SoftwareWorkbenchTests(unittest.TestCase):
         self._controller_assessment()
 
     def test_software_selection_review_has_phase_owned_contract_and_preserves_final_gates(self):
+        from scisaurus.runtime.specialists import SOFTWARE_SELECTION_SYSTEM
+        self.assertIn("For a reuse strategy", SOFTWARE_SELECTION_SYSTEM)
+        self.assertIn("custom_model requires the source-bound mathematical specification", SOFTWARE_SELECTION_SYSTEM)
+        self.assertIn("mandatory result-admission gates after selection", SOFTWARE_SELECTION_SYSTEM)
         stage = {"id": "experiment", "kind": "experiment"}
         final = {"current_stage_id": "experiment", "downstream_stage_ids": [],
                  "acceptance_target": "independent acceptance of the declared experiment output",
