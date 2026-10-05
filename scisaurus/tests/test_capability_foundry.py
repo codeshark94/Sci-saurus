@@ -4169,6 +4169,21 @@ if __name__ == "__main__":
 
 
 class IndependentValidatorAuthorshipTests(unittest.TestCase):
+    def test_captured_validator_response_requires_latest_successful_dispatch_owner(self):
+        from scisaurus.runtime.capability_foundry import _captured_validator_request
+        response = {'model': 'peer', 'finish_reason': 'stop', 'elapsed_seconds': 1.5,
+                    'usage': {'model_calls': 1}, 'text': '{"validator_source":"source"}'}
+        request = {key: value for key, value in response.items() if key != 'text'}
+        request.update(role='methods.validator-author', assignment_sha256='assignment', status='succeeded',
+                       response_sha256=hashlib.sha256(response['text'].encode()).hexdigest())
+        self.assertEqual(_captured_validator_request({'requests': [request]}, 'assignment', response), request)
+        for update in ({'status': 'result_unknown'}, {'status': 'started'}, {'model': 'other'},
+                       {'elapsed_seconds': 2.0}, {'usage': {'model_calls': 2}},
+                       {'response_sha256': 'wrong'}, {'finish_reason': 'length'}):
+            newer = {**request, **update}
+            self.assertIsNone(_captured_validator_request({'requests': [request, newer]},
+                                                         'assignment', response))
+
     def test_validator_model_transport_preserves_source_and_rejects_ambiguous_payloads(self):
         from scisaurus.runtime.capability_foundry import _independent_validator_source
         body = json.dumps({"validator_source": MINI_VALIDATOR})
@@ -4502,6 +4517,14 @@ class IndependentValidatorAuthorshipTests(unittest.TestCase):
                                      {'readiness_probe': True})
                     self.assertEqual(packet['readiness_handshake']['stdout'],
                                      {'status': 'ready'})
+                    self.assertEqual(set(packet['runtime_request_shape']),
+                                     {'configured_input', 'experiment', 'candidate',
+                                      'candidate_sha256', 'primary_outcomes'})
+                    self.assertNotIn('experiment_intent', packet['runtime_request_shape'])
+                    self.assertEqual(packet['runtime_request_shape']['candidate'],
+                                     "the exact JSON object the executor printed")
+                    self.assertIn('canonical candidate JSON',
+                                  packet['runtime_request_shape']['candidate_sha256'])
                     self.assertEqual(set(packet['validator_output_exact_shapes']['checks'][0]),
                                      {'id', 'outcome', 'evidence'})
                     if inner.calls > 1:

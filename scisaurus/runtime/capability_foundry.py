@@ -248,6 +248,22 @@ def _independent_validator_source(response):
     return value["validator_source"]
 
 
+def _captured_validator_request(state, identity, response):
+    if not isinstance(response, dict):
+        return None
+    request = next((item for item in reversed(state.get("requests", []))
+                    if item.get("role") == "methods.validator-author"
+                    and item.get("assignment_sha256") == identity), None)
+    if (not isinstance(request, dict) or request.get("status") != "succeeded"
+            or any(request.get(key) != response.get(key)
+                   for key in ("model", "finish_reason", "elapsed_seconds", "usage"))):
+        return None
+    digest = hashlib.sha256(str(response.get("text", "")).encode()).hexdigest()
+    if request.get("response_sha256", digest) != digest:
+        return None
+    return request
+
+
 def _canonical_capability_identifier(value):
     """Return the stable identifier spelling accepted by the program contract.
 
@@ -876,7 +892,7 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
                 "experiment": {"id": "the frozen experiment intent", "parameters": {},
                                "run_count": 100, "primary_outcomes": []},
                 "candidate": "the exact JSON object the executor printed",
-                "candidate_sha256": "sha256 of the executor's stdout bytes",
+                "candidate_sha256": "controller-supplied sha256 of the canonical candidate JSON; copy the exact candidate_sha256 from this runtime request",
                 "primary_outcomes": "the declared primary_outcomes list",
             },
         },
@@ -2763,7 +2779,8 @@ class CapabilityFoundry:
 
         def record_result(request, result):
             request.update(status="succeeded", model=result.model, usage=result.usage,
-                           finish_reason=result.finish_reason, elapsed_seconds=result.elapsed_seconds)
+                           finish_reason=result.finish_reason, elapsed_seconds=result.elapsed_seconds,
+                           response_sha256=hashlib.sha256(result.text.encode()).hexdigest())
             for dimension, amount in result.usage.items():
                 state["usage"][dimension] = state["usage"].get(dimension, 0) + amount - (
                     1 if dimension == "model_calls" else 0)
@@ -3670,6 +3687,7 @@ class CapabilityFoundry:
                 "contract": base_prompt["independent_validation_contract"],
                 "validator_output_exact_shapes": base_prompt["validator_output_exact_shapes"],
                 "readiness_handshake": validator_readiness_contract(),
+                "runtime_request_shape": deepcopy_config(base_prompt["stdin_examples"]["validator_receives"]),
                 "response_contract": {"validator_source": "complete Python source"},
                 "instructions": "The runtime request contains candidate.metrics as an array of records in candidate_output_exact_shapes; match each primary outcome to a record by its exact id and read that record's value only for reported_value. A numeric schema example is not a reported value. Use observation_schema for the actual row fields. Implement recalculation from raw observations and the frozen estimand. Never trust candidate metric values as recalculated values. Check every declared primary outcome, raw-data consistency, frozen limitations and finite values. No executor source or producer validator is available. Use only the declared runtime packages and permitted modules. Return only the complete JSON object.",
                 "runtime": runtime,
@@ -3691,8 +3709,10 @@ class CapabilityFoundry:
                 self.author_max_output_tokens, inherited_role="review.methods")
                 if self.validator_client is None else [])
             exhausted_routes = retained.setdefault("response_exhausted_routes", [])
+            captured_request = _captured_validator_request(state, identity, retained.get("response"))
 
-            if retained.get("status") == "repair_required" and not retained.get("source"):
+            if (retained.get("status") == "repair_required" and not retained.get("source")
+                    and captured_request is not None):
                 captured = retained.get("response")
                 if isinstance(captured, dict):
                     try:
