@@ -255,5 +255,41 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(report['status'],'failed')
         self.assertEqual(report['usage']['model_calls'],2)
 
+    def test_distinct_parsed_contract_errors_receive_their_own_correction(self):
+        final=selection_contract();final.update(decision='hold',summary='Prerequisites incomplete')
+        final['software_selection'].update(strategy='unavailable',rationale='No admitted execution')
+        wrong=json.loads(json.dumps(final))
+        wrong['software_selection']['environment_ref']='software:sha256:'+'a'*64
+        values=[{'response':final},wrong,final]
+        results=[ModelResult(json.dumps(value),'fixture',{'model_calls':1},.01,'stop',1) for value in values]
+        dispatcher=SpecialistDispatcher({'protocol':'openai_compatible','base_url':'http://127.0.0.1:1/v1',
+            'model':'fixture','timeout_seconds':10,'max_output_tokens':1000},
+            deadline=time.monotonic()+20,software_workspace=str(self.root))
+        with patch('scisaurus.runtime.specialists.ModelClient') as client, \
+                patch.object(SoftwareWorkbench,'_check_environment',return_value={'fixture':True}):
+            client.return_value.complete.side_effect=results
+            report=dispatcher._execute({'assigned_role':'methods.methodologist','role_id':'methodologist',
+                '_software_tools':True,'_response_contract':'software_selection','_prompt':'{}',
+                'quota':{'max_calls':None,'max_output_tokens':10000}}, {})
+        self.assertEqual(report['status'],'succeeded')
+        self.assertEqual(report['usage']['model_calls'],3)
+        self.assertEqual(len(report['retry_history']),2)
+        requests=client.return_value.complete.call_args_list
+        self.assertIn('non-reuse selection must not claim',str(requests[2]))
+
+    def test_different_malformed_json_positions_share_one_correction(self):
+        results=[ModelResult(value,'fixture',{'model_calls':1},.01,'stop',1) for value in ['{','{"broken":}']]
+        dispatcher=SpecialistDispatcher({'protocol':'openai_compatible','base_url':'http://127.0.0.1:1/v1',
+            'model':'fixture','timeout_seconds':10,'max_output_tokens':1000},
+            deadline=time.monotonic()+20,software_workspace=str(self.root))
+        with patch('scisaurus.runtime.specialists.ModelClient') as client, \
+                patch.object(SoftwareWorkbench,'_check_environment',return_value={'fixture':True}):
+            client.return_value.complete.side_effect=results
+            report=dispatcher._execute({'assigned_role':'methods.methodologist','role_id':'methodologist',
+                '_software_tools':True,'_response_contract':'software_selection','_prompt':'{}',
+                'quota':{'max_calls':None,'max_output_tokens':10000}}, {})
+        self.assertEqual(report['status'],'failed')
+        self.assertEqual(report['usage']['model_calls'],2)
+
 
 if __name__ == '__main__':unittest.main()

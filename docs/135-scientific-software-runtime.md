@@ -31,7 +31,10 @@ Reviewers receive evidence and cannot execute software tools.
 Each completed tool observation advances the producer's response state. A new
 response can receive a bounded format correction without consuming the
 correction for a different tool step. Repeated invalid output without a new
-observation still exhausts that correction. Identical actions with identical
+observation still exhausts that correction for the same diagnostic. Distinct
+parsed contract violations receive their own correction; malformed JSON shares
+one correction regardless of its parser position. Existing assignment budgets
+and deadlines bound all such requests. Identical actions with identical
 observations do not reset it. All requests consume the existing assignment
 usage and retain the original deadline. The JSON wire-format request remains
 explicit; it is not a guarantee that a provider enforces schema constraints.

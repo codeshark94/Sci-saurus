@@ -2578,6 +2578,7 @@ class SpecialistDispatcher:
         validation_retries = 0
         provider_retries = 0
         schema_repair_used = False
+        repaired_software_contract_errors = set()
         accumulated_usage = {}
         enforce_costs = enforce_model_cost_limits()
         output_budget_used = 0
@@ -2606,6 +2607,7 @@ class SpecialistDispatcher:
             result = None
             request_input = None
             response_received = False
+            parsed = None
             remaining_output_budget = output_budget - output_budget_used if enforce_costs else math.inf
             if remaining_output_budget <= 0:
                 report = {
@@ -2788,6 +2790,7 @@ class SpecialistDispatcher:
                     prompt = json.dumps(envelope, ensure_ascii=False, sort_keys=True)
                     validation_retries = 0
                     schema_repair_used = False
+                    repaired_software_contract_errors.clear()
                     continue_previous_output = False
                     previous_text = None
                     emit({"event": "software_tool_completed", "operation": action.get("operation"),
@@ -2965,7 +2968,9 @@ class SpecialistDispatcher:
                 if request_input is not None and not response_received:
                     request_input.update(request_attempts=0, outcome_known=True)
                 retry_available = not enforce_costs or max_call_attempts is None or call_attempts < max_call_attempts
-                can_repair_schema = not schema_repair_used
+                software_error_identity = str(exc) if parsed is not None else "invalid_json_object"
+                can_repair_schema = (software_error_identity not in repaired_software_contract_errors
+                                     if software_tools is not None else not schema_repair_used)
                 if (response_received and retry_available
                         and (continuing or can_repair_schema)):
                     validation_retries += 1
@@ -2975,6 +2980,8 @@ class SpecialistDispatcher:
                     else:
                         continue_previous_output = False
                         schema_repair_used = True
+                        if software_tools is not None:
+                            repaired_software_contract_errors.add(software_error_identity)
                     retry_history.append({
                         "kind": "length_continuation" if continuing else "validation",
                         "response_text": result.text,
