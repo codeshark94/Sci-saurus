@@ -52,6 +52,23 @@ variable name is stored in descriptors.
 
 ## Runtime policy
 
+Model reasoning controls are provider-specific. Query `/api/show` for each
+configured alias before selecting a native thinking value. The 2026-10-05
+cloud metadata and role settings are:
+
+| Model | Supported native thinking | Provider default | Role setting |
+|---|---|---|---|
+| GLM 5.3 Flash | `low`, `high`, `max` | `max` | `high` for scientific methods, code and validator authoring; `low` for general work |
+| DeepSeek v4.1 Flash | `false`, `low`, `high`, `max` | `high` | `high` for scientific reviews |
+| Gemma 4 31B | `false`, `true` | `false` | `false` for source capture, cataloging and routine bulk work |
+
+Primary and fallback routes declare their own controls; a stronger route's
+setting must not leak into a model with boolean-only controls. Native
+`reasoning_effort: "none"` represents `think: false`. Dispatch events and
+request receipts record the resolved protocol and reasoning setting, rather
+than relying on the provider default. These records exclude authentication
+fields. Figure review and scientific admission remain independently required.
+
 - Stage descriptors can reference a shared role table with
   `"model": {"config_path": "/absolute/path/model.json"}`. This file supplies
   provider selection, role assignments, routes, and fallbacks. Call-level

@@ -181,7 +181,8 @@ class SpecialistDispatcherTests(unittest.TestCase):
 
     def test_all_progress_events_preserve_admitted_assignment_identity(self):
         model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
-                 "model": "fixture", "timeout_seconds": 5.0, "max_output_tokens": 512}
+                 "model": "fixture", "timeout_seconds": 5.0, "max_output_tokens": 512,
+                 "reasoning_effort": "high"}
         assignment = {"assigned_role": "methods.analysis-reviewer", "role_id": "analysis-reviewer",
                       "model_role": "methods.analysis-reviewer", "execution_kind": "review",
                       "task_id": "scoped-review", "stage_id": "repair", "attempt_number": 7,
@@ -204,6 +205,14 @@ class SpecialistDispatcherTests(unittest.TestCase):
             self.assertEqual(event["stage_id"], assignment["stage_id"])
             self.assertEqual(event["role"], assignment["assigned_role"])
             self.assertEqual(event["assignment_attempt_number"], 7)
+        for event in events:
+            if event["event"] == "dispatched":
+                self.assertEqual(event["protocol"], "openai_compatible")
+                self.assertEqual(event["reasoning_effort"], "high")
+        for request in report["request_inputs"]:
+            self.assertEqual(request["generation_config"]["reasoning_effort"], "high")
+            self.assertEqual(request["generation_config"]["protocol"], "openai_compatible")
+            self.assertNotIn("auth_env", request["generation_config"])
 
     def test_json_continuation_classifies_incomplete_tokens_and_invalid_prefixes(self):
         from scisaurus.runtime.models import json_object_continuation_error

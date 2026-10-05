@@ -2606,6 +2606,8 @@ class SpecialistDispatcher:
                                   "model_role": model_role, "route_id": route["route_id"],
                                   "provider_pool": route["pool"], "model": config.get("model"),
                                   "base_url": config.get("base_url"),
+                                  "protocol": config.get("protocol"),
+                                  "reasoning_effort": config.get("reasoning_effort"),
                                   "context_window_tokens": config.get("context_window_tokens"),
                                   "max_input_tokens": config.get("max_input_tokens"),
                                   "max_output_tokens": config.get("max_output_tokens"),
@@ -2622,6 +2624,9 @@ class SpecialistDispatcher:
                 client = ModelClient(**config)
                 request_input = {"input": deepcopy(call_kwargs), "route_id": route["route_id"],
                                  "provider_pool": route["pool"], "request_attempts": None,
+                                 "generation_config": {key: config.get(key) for key in (
+                                     "protocol", "model", "base_url", "reasoning_effort",
+                                     "output_format", "max_output_tokens")},
                                  "input_sha256": hashlib.sha256(json.dumps(
                                      call_kwargs, ensure_ascii=False, sort_keys=True,
                                      separators=(",", ":")).encode("utf-8")).hexdigest()}
