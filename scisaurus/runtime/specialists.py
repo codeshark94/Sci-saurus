@@ -1246,9 +1246,21 @@ def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, det
     if stage_packet.get("repair_verification_scope") == "scientific_software_fitness":
         if not isinstance(body["chief_result"].get("software_assessment"), dict):
             raise ValidationError("scientific software reviewer has no current assessment evidence")
+        target = "source-bound scientific software selection before experiment implementation"
+        if declared_contract is not None:
+            body["verifier_contract"]["result_admission_contract"] = _preserve_response_value(declared_contract)
+            body["verifier_contract"]["result_admission_contract_sha256"] = hashlib.sha256(canonical_bytes(declared_contract)).hexdigest()
+            scoped = deepcopy(declared_contract)
+            scoped.update(acceptance_target=target, review_phase="scientific_software_fitness", current_requirements=[
+                "The selected strategy has an observed host environment check and source-bound scientific fitness for the declared question, units, mechanism and input scope.",
+                "For reuse, verify the exact acquired source and dependencies, reproduced upstream example and actual selected computation receipts. For custom_model, verify actual discovery, inspected alternatives and a source-bound mathematical specification justifying their rejection; custom implementation, replay and independent recalculation remain subsequent result-admission gates.",
+                "Parameter calibrations and mathematical design assumptions are distinguished with their applicable domain and unresolved scientific limits; a bounded assumption is not a verified species calibration or an observed result.",
+            ])
+            body["verifier_contract"]["stage_acceptance_contract"] = _preserve_response_value(scoped)
         body["verifier_contract"].update({
-            "acceptance_target": "source-bound scientific software fitness and upstream reproduction before experiment implementation",
+            "acceptance_target": target,
             "review_subject": {"path": "chief_result.software_assessment", "sha256": body["chief_result"]["software_assessment_sha256"]},
+            "phase_boundary": "This verdict approves or holds software selection only. The unchanged result_admission_contract remains mandatory after implementation; pending experiment observations, executor repair and independent recalculation cannot establish or invalidate this selection by their absence alone. Work orders remain execution obligations, not claims of completed work. Reuse requires actual upstream reproduction now; custom_model requires source-bound justification rather than a claimed nonexistent upstream reproduction. Hold unsupported scientific fitness or fabricated provenance; do not certify experimental success through a selection verdict.",
             "software_review_rule": "Check the admitted question and scope, observed host CPU/RAM/storage/accelerators, requested versus observed sandbox limits and per-process scope, actual runtime compatibility and measured example/computation durations, actual license, selected pinned source and dependencies, upstream documented example and precision, actual computation source/input/output/errors, units and calibration conventions. Generic benchmark throughput or an installed command alone does not establish solver capacity. Check that the adapter really invokes the acquired software, not a replacement formula or fabricated output. Custom modelling requires an actual search and source-bound mathematical specification explaining rejected established candidates. Installation, example agreement and computation are operational evidence, not experimental or publication admission. Hold missing mechanisms, ungrounded units, mismatched source/output provenance or unavailable prerequisites; preserve valid negative results and stated limitations."})
     if (stage_packet.get("repair_panel") is True
             and isinstance(stage_packet.get("capability_repair_packet"), dict)):

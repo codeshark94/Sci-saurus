@@ -32,6 +32,7 @@ from scisaurus.runtime.program_sandbox import (
 from scisaurus.runtime.programs import _parse_object
 
 REVISION = "scientific-software-tools-5"
+SELECTION_CONTRACT_REVISION = "scientific-software-selection-2"
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _PIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*==[A-Za-z0-9][A-Za-z0-9_.+!-]*\Z")
@@ -101,9 +102,21 @@ def project_receipt(receipt):
     return projected
 
 
-def _fields(value, required, optional=()):
-    if not isinstance(value, dict) or set(value) - set(required) - set(optional) or set(required) - set(value):
-        raise ValidationError(f"software action requires {sorted(required)}; optional {sorted(optional)}")
+def _field_errors(value, required, optional=(), *, path="/"):
+    if not isinstance(value, dict):
+        return [f"software object at {path} must be an object; observed {type(value).__name__}"]
+    missing = sorted(set(required) - set(value))
+    unexpected = sorted(set(value) - set(required) - set(optional))
+    if missing or unexpected:
+        return [f"software object at {path}: missing fields {missing}; unexpected fields {unexpected}; "
+                f"required fields {sorted(required)}; optional fields {sorted(optional)}"]
+    return []
+
+
+def _fields(value, required, optional=(), *, path="/"):
+    errors = _field_errors(value, required, optional, path=path)
+    if errors:
+        raise ValidationError("; ".join(errors))
 
 
 def _relative(value):
@@ -746,9 +759,12 @@ def selection_contract():
 
 
 def validate_selection(response, workbench, results):
-    _fields(response, {"decision", "summary", "findings", "evidence_gaps", "requested_actions", "software_selection"})
+    errors = _field_errors(response, {"decision", "summary", "findings", "evidence_gaps", "requested_actions", "software_selection"})
+    if isinstance(response, dict) and "software_selection" in response:
+        errors.extend(_field_errors(response["software_selection"], {"strategy", "rationale", "environment_ref", "example_ref", "computation_refs", "scientific_source_refs", "limitations"}, path="/software_selection"))
+    if errors:
+        raise ValidationError("; ".join(errors))
     selection = response["software_selection"]
-    _fields(selection, {"strategy", "rationale", "environment_ref", "example_ref", "computation_refs", "scientific_source_refs", "limitations"})
     if response["decision"] not in {"pass", "hold"} or selection["strategy"] not in {"reuse", "custom_model", "unavailable"}:
         raise ValidationError("scientific software selection has an unsupported decision")
     if not isinstance(selection["rationale"], str) or not selection["rationale"].strip():
@@ -775,7 +791,7 @@ def validate_selection(response, workbench, results):
     elif selection["environment_ref"] is not None or selection["example_ref"] is not None or selection["computation_refs"]:
         raise ValidationError("non-reuse selection must not claim an executed software capability")
     if selection["strategy"] == "custom_model":
-        if not selection["scientific_source_refs"] or not any(row.get("outcome") == "ok" and row["action"]["operation"] == "search" for row in results):
+        if not selection["scientific_source_refs"] or not any(row.get("outcome") == "ok" and row["action"]["operation"] in {"search", "search_evidence"} for row in results):
             raise ValidationError("custom modelling requires actual software discovery and source-bound justification")
     if selection["strategy"] == "unavailable" and response["decision"] != "hold":
         raise ValidationError("unavailable scientific software cannot admit implementation")

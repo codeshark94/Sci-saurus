@@ -38,6 +38,44 @@ def archive(files, *, unsafe=False):
 
 
 class SoftwareWorkbenchTests(unittest.TestCase):
+    def test_selection_shape_diagnostic_identifies_both_wrong_levels(self):
+        response = selection_contract()
+        response.update(decision="hold", summary="Prerequisites unresolved")
+        response["software_selection"].update(strategy="unavailable", rationale="Prerequisites unresolved")
+        valid = deepcopy(response)
+        for key in ("strategy", "scientific_source_refs"):
+            response[key] = response["software_selection"].pop(key)
+        before = deepcopy(response)
+        with self.assertRaises(ValidationError) as caught:
+            validate_selection(response, self.workbench, [])
+        diagnostic = str(caught.exception)
+        self.assertIn("at /: missing fields []; unexpected fields ['scientific_source_refs', 'strategy']", diagnostic)
+        self.assertIn("at /software_selection: missing fields ['scientific_source_refs', 'strategy']; unexpected fields []", diagnostic)
+        self.assertEqual(response, before)
+        validate_selection(valid, self.workbench, [])
+
+    def test_selection_shape_diagnostic_rejects_nonobjects_and_missing_selection(self):
+        for value, diagnostic in ((None, "at / must be an object"),
+                                  ([], "at / must be an object"),
+                                  ({}, "missing fields"),
+                                  ({**selection_contract(), "software_selection": []}, "at /software_selection must be an object")):
+            with self.subTest(value=value), self.assertRaisesRegex(ValidationError, diagnostic):
+                validate_selection(value, self.workbench, [])
+
+    def test_custom_selection_accepts_source_led_discovery_and_rejects_failed_search(self):
+        response = selection_contract()
+        response.update(decision="pass", summary="Declared mathematical model")
+        response["software_selection"].update(strategy="custom_model", rationale="Captured mechanism and inspected alternatives", scientific_source_refs=["captured-source"])
+        host = {"outcome": "ok", "action": {"operation": "check_environment"}}
+        for operation in ("search", "search_evidence"):
+            discovery = {"outcome": "ok", "action": {"operation": operation}}
+            with self.subTest(operation=operation):
+                validate_selection(response, self.workbench, [host, discovery])
+                with self.assertRaisesRegex(ValidationError, "actual software discovery"):
+                    validate_selection(response, self.workbench, [host, {**discovery, "outcome": "failed"}])
+        with self.assertRaisesRegex(ValidationError, "actual software discovery"):
+            validate_selection(response, self.workbench, [host])
+
     def test_experiment_projection_preserves_host_measurements_and_limits(self):
         from scisaurus.runtime.composer import ComposerRunner
         check = {"receipt_ref":"software:sha256:host", "outcome":"ok",
@@ -345,10 +383,43 @@ class SoftwareWorkbenchTests(unittest.TestCase):
     def test_controller_assessment_runs_multi_step_tools_review_and_reuses_owned_receipt(self):
         self._controller_assessment()
 
+    def test_software_selection_review_has_phase_owned_contract_and_preserves_final_gates(self):
+        stage = {"id": "experiment", "kind": "experiment"}
+        final = {"current_stage_id": "experiment", "downstream_stage_ids": [],
+                 "acceptance_target": "independent acceptance of the declared experiment output",
+                 "current_requirements": ["actual observations and independent recalculation"]}
+        packet = {"repair_verification_scope": "scientific_software_fitness", "stage_acceptance_contract": final,
+                  "work_orders": [{"objective": "repair executor and run independent validator"}]}
+        chief = {"software_assessment": {"selection": {"strategy": "custom_model"}, "selected_operations": []}}
+        before = deepcopy(packet)
+        prompt = json.loads(build_verifier_prompt(stage, packet, [], chief, max_input_tokens=32000))
+        contract = prompt["verifier_contract"]
+        self.assertEqual(contract["result_admission_contract"], final)
+        self.assertEqual(contract["result_admission_contract_sha256"], hashlib.sha256(canonical_bytes(final)).hexdigest())
+        self.assertEqual(contract["acceptance_target"], contract["stage_acceptance_contract"]["acceptance_target"])
+        self.assertEqual(contract["stage_acceptance_contract"]["review_phase"], "scientific_software_fitness")
+        self.assertEqual(contract["stage_acceptance_contract"]["downstream_stage_ids"], [])
+        self.assertIn("For reuse", contract["stage_acceptance_contract"]["current_requirements"][1])
+        self.assertIn("For custom_model", contract["stage_acceptance_contract"]["current_requirements"][1])
+        self.assertEqual(prompt["work_orders"], packet["work_orders"])
+        self.assertEqual(packet, before)
+        ordinary = json.loads(build_verifier_prompt(stage, {"stage_acceptance_contract": final}, [], {}, max_input_tokens=32000))
+        self.assertEqual(ordinary["verifier_contract"]["stage_acceptance_contract"], final)
+        self.assertNotIn("result_admission_contract", ordinary["verifier_contract"])
+
     def test_controller_assessment_without_stage_quota_uses_deadline(self):
         self._controller_assessment(with_quota=False)
 
-    def _controller_assessment(self, *, with_quota=True):
+    def test_controller_producer_contract_failure_keeps_response_ownership(self):
+        self._controller_assessment(failure_mode="producer_contract")
+
+    def test_controller_reviewer_contract_failure_keeps_response_ownership(self):
+        self._controller_assessment(failure_mode="reviewer_contract")
+
+    def test_controller_scientific_hold_is_not_a_response_contract_failure(self):
+        self._controller_assessment(failure_mode="scientific_hold")
+
+    def _controller_assessment(self, *, with_quota=True, failure_mode=None):
         from scisaurus.tests.test_composer import ComposerWorkflowTests
         from scisaurus.runtime.composer import ComposerRunner
         root = Path(self.directory.name)
@@ -368,12 +439,16 @@ class SoftwareWorkbenchTests(unittest.TestCase):
         model = {"protocol":"openai_compatible","base_url":"http://127.0.0.1:1/v1","model":"fixture","timeout_seconds":10,"max_output_tokens":4096}
         def complete(**kwargs):
             prompt = json.loads(kwargs["prompt"])
+            if "response_format_repair" in prompt:
+                prompt = prompt["evidence_packet"]
             if kwargs["system"] == VERIFIER_SYSTEM:
                 reviewer_inputs.append(prompt)
                 evidence = prompt["chief_result"]["software_assessment"]
                 self.assertEqual(evidence["request"]["topic"], topic["topic"])
                 self.assertEqual(evidence["selection"]["strategy"], "reuse")
                 response = {"decision":"accept","rationale":"fixture evidence is consistent","critical_findings":[],"repair_scope":[]}
+                if failure_mode == "reviewer_contract":
+                    response["decision"] = "unsupported_verdict"
             else:
                 tools = prompt.get("software_tool_results", [])
                 by_operation = {}
@@ -401,6 +476,12 @@ class SoftwareWorkbenchTests(unittest.TestCase):
                     response.update(decision="pass",summary="software fits the fixture question")
                     response["software_selection"].update(strategy="reuse",rationale="declared function matches fixture",environment_ref=by_operation["acquire"][0]["receipt_ref"],
                         example_ref=by_operation["run"][0]["receipt_ref"],computation_refs=[by_operation["run"][1]["receipt_ref"]],scientific_source_refs=[by_operation["read"][1]["receipt_ref"]],limitations=["fixture only"])
+                    if failure_mode == "producer_contract":
+                        for key in ("strategy", "scientific_source_refs"):
+                            response[key] = response["software_selection"].pop(key)
+                        response["independent recalculation"] = "wrong response field"
+                    elif failure_mode == "scientific_hold":
+                        response["decision"] = "hold"
             return ModelResult(json.dumps(response),"fixture",{"model_calls":1,"input_tokens":10,"output_tokens":10},0.001,"stop",1)
         with patch.object(runner,"_specialist_model_config",return_value=model), \
                 patch("scisaurus.runtime.composer.enforce_model_cost_limits",return_value=True), \
@@ -410,6 +491,45 @@ class SoftwareWorkbenchTests(unittest.TestCase):
                 patch("scisaurus.runtime.software_workbench.shutil.which",return_value=sys.executable), \
                 patch("scisaurus.runtime.software_workbench.sandbox_status",return_value={"mode":"sandbox-exec"}):
             client.return_value.complete.side_effect=complete
+            if failure_mode:
+                from scisaurus.runtime.model_work import ModelWorkBlocked
+                from scisaurus.runtime.failure_recovery import classify_failure
+                with self.assertRaises(ModelWorkBlocked) as caught:
+                    runner._assess_scientific_software(stage, {}, topic)
+                error = caught.exception
+                retained = error.stage_result["scientific_software_assessment"]
+                self.assertEqual(retained["status"], "blocked")
+                self.assertGreater(error.usage["model_calls"], 0)
+                self.assertEqual(error.usage, error.repair_panel_usage)
+                self.assertTrue(retained["evidence"]["discovery_and_diagnostics"])
+                if failure_mode.endswith("contract"):
+                    self.assertEqual(classify_failure("experiment", error, error.stage_result), "model_contract")
+                    self.assertEqual(error.stage_result["failure"], {"kind": "output_contract", "outcome_known": True, "failure_class": "model_contract"})
+                    self.assertFalse(runner._is_pre_execution_capability_failure(stage, error=error))
+                    self.assertFalse(runner._is_pre_execution_capability_failure(stage, error.stage_result))
+                    if failure_mode.startswith("producer"):
+                        prior = {"kind": "experiment", "status": "blocked", "failure_class": "model_contract",
+                                 "review_status": "model_contract_repair",
+                                 "failure_recovery": {"failure_class": "model_contract", "recovery_mode": "format_repair_then_rerun"}}
+                        runner.context[stage["id"]] = prior
+                        with patch.object(runner, "_format_contract_recovery_request", return_value={"id": "format-owned", "kind": "recovery", "target_stage_id": stage["id"]}), \
+                                patch.object(runner, "_begin_continuation", return_value=True):
+                            self.assertTrue(runner._admit_scientific_blocker_recovery(stage, error, set(), {stage["id"]: stage}))
+                        self.assertEqual(runner.context[stage["id"]]["review_status"], "model_contract_repair")
+                        self.assertEqual(runner.department_activity[-1]["action"], "admit_model_contract_recovery")
+                    self.assertEqual(error.repair_gate, "scientific_software_assessment_response")
+                    self.assertEqual(error.model_diagnostics["software_assessment_ref"], retained["artifact_ref"])
+                    owner_key = "producer_execution_ref" if failure_mode.startswith("producer") else "verifier_execution_ref"
+                    self.assertEqual(error.model_diagnostics["response_execution_ref"], retained[owner_key])
+                    self.assertEqual(error.model_diagnostics["response_error"], str(error))
+                    if failure_mode.startswith("producer"):
+                        self.assertIn("at /software_selection", str(error))
+                        self.assertEqual(reviewer_inputs, [])
+                else:
+                    self.assertEqual(classify_failure("experiment", error, error.stage_result), "experiment_failure")
+                    self.assertFalse(hasattr(error, "repair_gate"))
+                    self.assertEqual(reviewer_inputs, [])
+                return
             receipt=runner._assess_scientific_software(stage, {}, topic)
             self.assertEqual(receipt["status"], "accepted")
             self.assertEqual(len(reviewer_inputs),1)

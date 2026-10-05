@@ -3013,7 +3013,8 @@ class ComposerRunner:
         if not isinstance(failure_recovery, dict):
             failure_recovery = {}
         current_failure_class = classify_failure(
-            "experiment", error if error is not None else context.get("error"))
+            "experiment", error if error is not None else context.get("error"),
+            getattr(error, "stage_result", None) if error is not None else context)
         if (current_failure_class == "resource_fence"
                 or context.get("failure_class") == "resource_fence"
                 or failure_recovery.get("failure_class") == "resource_fence"):
@@ -13057,7 +13058,7 @@ class ComposerRunner:
 
     def _assess_scientific_software(self, stage, descriptor, topic_result, *, computation_scope=None):
         """Admit software fitness and executed upstream computations before authoring."""
-        from scisaurus.runtime.software_workbench import REVISION, SoftwareWorkbench, selection_contract
+        from scisaurus.runtime.software_workbench import REVISION, SELECTION_CONTRACT_REVISION, SoftwareWorkbench, selection_contract
         from scisaurus.runtime.software_discovery import accepted_survey_sources, retain_sources
         by_id = {item["id"]:item for item in self.workflow["stages"]}
         pending, dependencies = list(stage.get("depends_on",[])), set()
@@ -13073,7 +13074,7 @@ class ComposerRunner:
             [source for bundle in source_bundles for source in bundle["sources"]])
         topic = deepcopy(topic_result["topic"])
         topic.pop("experiment_capability_id", None)
-        identity = {"revision": REVISION, "topic": topic,
+        identity = {"revision": REVISION, "response_contract_revision": SELECTION_CONTRACT_REVISION, "topic": topic,
                     "prior_work": deepcopy(topic_result.get("candidate_prior_work", [])),
                     "source_challenge": deepcopy(topic_result.get("source_challenge")),
                     "evidence_catalog": evidence_catalog,
@@ -13187,12 +13188,24 @@ class ComposerRunner:
             failure = next((row for row in [produced, verifier] if isinstance(row, dict) and isinstance(row.get("failure"), dict)), None)
             if failure and failure.get("error_type") == "ModelCallError":
                 error = ModelCallError.from_failure(failure.get("error") or "software assessment unavailable", {**failure["failure"], "usage": {}})
+            elif failure and failure.get("failure", {}).get("kind") == "output_contract":
+                error = ModelWorkBlocked(failure.get("error") or "scientific software assessment response violates its contract",
+                                         failure_class="model_contract")
+                error.repair_gate = "scientific_software_assessment_response"
+                error.model_diagnostics = {
+                    "repair_gate": error.repair_gate,
+                    "software_assessment_ref": record["artifact_ref"],
+                    "response_execution_ref": failure.get("artifact_ref"),
+                    "response_error": str(error),
+                }
             else:
                 error = ModelWorkBlocked("scientific software assessment requires Methods recovery; generated implementation is not admitted")
             error.usage = usage
             error.repair_panel_usage = usage
             error.stage_result = {"kind": "experiment", "status": "blocked", "error": str(error),
                                   "scientific_software_assessment": {**receipt, "artifact_ref": record["artifact_ref"]}}
+            if getattr(error, "failure_class", None) == "model_contract":
+                error.stage_result["failure"] = {**deepcopy(failure["failure"]), "failure_class": "model_contract"}
             error.capability_failure_evidence = deepcopy(error.stage_result["scientific_software_assessment"])
             raise error
         return {**receipt, "artifact_ref": record["artifact_ref"], "dispatch_usage": usage}
@@ -27340,7 +27353,7 @@ class ComposerRunner:
                 })
             return admitted
         topic_budget_exhausted = self._is_local_topic_budget_exhaustion(error, stage)
-        current_failure_class = classify_failure(stage.get("kind"), error)
+        current_failure_class = classify_failure(stage.get("kind"), error, getattr(error, "stage_result", None))
         current_experiment_failure = (
             stage.get("kind") == "experiment"
             and current_failure_class == "experiment_failure"
@@ -27359,7 +27372,7 @@ class ComposerRunner:
             return False
         model_contract_failure = not current_experiment_failure and (
             getattr(error, "failure_class", None) == "model_contract"
-            or classify_failure(stage.get("kind"), error) == "model_contract"
+            or current_failure_class == "model_contract"
             or prior_context.get("failure_class") == "model_contract"
             or prior_context.get("review_status") in {
                 "model_contract_repair", "format_recovery_exhausted"}
