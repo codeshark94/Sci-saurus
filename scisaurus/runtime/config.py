@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from scisaurus.core.errors import ValidationError
-from scisaurus.runtime.models import resolve_model_config, ModelClient
+from scisaurus.runtime.models import load_model_config, resolve_model_config, ModelClient
 
 
 WORKER_RESULT_TOO_LARGE = {
@@ -102,6 +102,7 @@ def validate_common(value, extra_fields, *, retrieval=True):
         _text(value.get(key), key)
     if not isinstance(value.get("model"), dict):
         raise ValidationError("model configuration is required")
+    value["model"] = load_model_config(value["model"])
     try:
         # ``role_profiles`` is orchestration metadata, not a provider field.
         # Validate the base model after resolving it without a role so profile

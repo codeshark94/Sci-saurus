@@ -19,11 +19,62 @@ from scisaurus.runtime.models import (
     clear_model_provider_cooldown, complete_with_role_fallbacks, effective_model_timeout,
     estimate_input_tokens, model_context_budget, model_context_error,
     is_local_qwen_route, model_provider_cooldown_remaining, model_route_candidates, role_config_for,
-    role_routes_for, resolve_model_config, with_runtime_cooldown_fallback,
+    role_routes_for, resolve_model_config, with_runtime_cooldown_fallback, load_model_config,
 )
 
 
 class TestModelClient(unittest.TestCase):
+    def test_shared_routing_is_reloaded_without_stale_inline_roles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.json"
+            shared = {"model": "primary", "base_url": "https://example.test/v1",
+                      "role_models": {"methods.methodologist": {"model": "glm"}},
+                      "role_model_fallbacks": {"methods.methodologist": [{"model": "deepseek"}]},
+                      "role_routes": {"research.author": [{"id": "primary", "pool": "cloud",
+                          "model": "glm", "base_url": "https://example.test/v1"}]}}
+            path.write_text(json.dumps(shared))
+            reference = {"config_path": str(path), "max_output_tokens": 1234,
+                         "model_call_budget_scopes": [{"model_call_budget_path": str(Path(directory)/"budget.sqlite"),
+                             "model_call_budget_key": "owner", "model_call_budget_limit": 5}]}
+            resolved = resolve_model_config(reference, role="methods.methodologist")
+            self.assertEqual(resolved["model"], "glm")
+            self.assertEqual(resolved["max_output_tokens"], 1234)
+            self.assertEqual(resolved["model_call_budget_scopes"], reference["model_call_budget_scopes"])
+            self.assertNotIn("config_path", resolved)
+            self.assertEqual(role_routes_for(reference, "research.author")[0]["model"], "glm")
+            self.assertEqual([item["model"] for item in model_route_candidates(
+                reference, role="methods.methodologist")], ["glm", "deepseek"])
+            shared["role_models"]["methods.methodologist"]["model"] = "changed"
+            path.write_text(json.dumps(shared))
+            self.assertEqual(resolve_model_config(reference, role="methods.methodologist")["model"], "changed")
+            self.assertEqual(reference["config_path"], str(path))
+
+    def test_shared_model_preserves_both_budget_owners(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.json"
+            owner = {"model_call_budget_path": str(Path(directory)/"budget.sqlite"),
+                     "model_call_budget_key": "shared", "model_call_budget_limit": 5}
+            stage = {**owner, "model_call_budget_key": "stage"}
+            path.write_text(json.dumps({"model": "glm", "base_url": "https://example.test/v1",
+                                        "model_call_budget_scopes": [owner]}))
+            configured = load_model_config({"config_path": str(path), "model_call_budget_scopes": [stage]})
+            self.assertEqual(configured["model_call_budget_scopes"], [owner, stage])
+
+    def test_shared_routing_rejects_conflicts_missing_files_and_indirection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.json"
+            path.write_text(json.dumps({"model": "glm", "base_url": "https://example.test/v1"}))
+            for field in ("role_models", "role_routes", "role_model_fallbacks", "model", "base_url"):
+                with self.subTest(field=field), self.assertRaises(ValidationError):
+                    load_model_config({"config_path": str(path), field: "stale"})
+            for bad in ("relative.json", str(Path(directory)/"missing.json")):
+                with self.assertRaises(ValidationError):
+                    load_model_config({"config_path": bad})
+            for bad in ([], {"config_path": str(path)}):
+                path.write_text(json.dumps(bad))
+                with self.assertRaises(ValidationError):
+                    load_model_config({"config_path": str(path)})
+
     def test_development_dispatch_preserves_costs_without_admission_ceiling(self):
         from scisaurus.runtime.models import (_reserve_model_call_budgets, _settle_model_token_budgets,
             model_call_budget_remaining, register_model_token_budget, model_token_budget_usage,

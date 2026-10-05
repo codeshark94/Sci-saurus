@@ -52,6 +52,12 @@ variable name is stored in descriptors.
 
 ## Runtime policy
 
+- Stage descriptors can reference a shared role table with
+  `"model": {"config_path": "/absolute/path/model.json"}`. This file supplies
+  provider selection, role assignments, routes, and fallbacks. Call-level
+  settings such as output limits can be declared alongside the reference;
+  inline routing overrides are rejected. The referenced file participates in
+  stage input fingerprints, and model budget owners remain cumulative.
 - `model.role_models` provides explicit per-role provider/model overrides.
   Qwen and Gemma are assigned to the largest bulk workload: scholarly/web
   scouting, cataloging, citation mapping, source review, prose, and surface

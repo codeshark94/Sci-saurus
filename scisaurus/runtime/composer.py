@@ -66,7 +66,7 @@ from scisaurus.runtime.models import (
     DEFAULT_MODEL_RATE_LIMIT_COOLDOWN_SECONDS,
     MAX_MODEL_RATE_LIMIT_COOLDOWN_SECONDS,
     ModelCallError, ModelContextBudgetError, effective_model_timeout,
-    with_runtime_cooldown_fallback,
+    with_runtime_cooldown_fallback, load_model_config,
     register_model_token_budget, model_token_budget_usage, model_token_budget_limits,
     validate_model_budget_scope,
 )
@@ -2142,14 +2142,12 @@ class ComposerRunner:
                 if panel_required else 0
             )
         else:
-            panel_calls = repair_panel_usage.get("model_calls") \
-                if isinstance(repair_panel_usage, dict) else None
-            if type(panel_calls) is int and panel_calls >= 0:
-                repair_panel_reserve = panel_calls
-            elif panel_required:
-                repair_panel_reserve = self._capability_repair_panel_model_call_reserve(stage)
-            else:
-                repair_panel_reserve = 0
+            if not isinstance(repair_panel_usage, dict):
+                raise ValidationError("settled repair panel usage must be an object")
+            panel_calls = repair_panel_usage.get("model_calls", 0)
+            if type(panel_calls) is not int or panel_calls < 0:
+                raise ValidationError("settled repair panel model_calls must be a nonnegative integer")
+            repair_panel_reserve = panel_calls
         available = quota["max_model_calls"] - prior \
             - FOUNDRY_VERIFIER_MODEL_CALL_RESERVE - repair_panel_reserve
         return max(0, min(AUTONOMOUS_FOUNDRY_MODEL_CALL_LIMIT, available))
@@ -19801,7 +19799,7 @@ class ComposerRunner:
             return None
         model = descriptor.get("model")
         if isinstance(model, dict):
-            configured = with_runtime_cooldown_fallback(model)
+            configured = with_runtime_cooldown_fallback(load_model_config(model))
             return self._stage_model_config(stage, configured) if configured.get("base_url") and configured.get("model") else None
         model_path = descriptor.get("model_config_path")
         if not isinstance(model_path, str) or not model_path:
@@ -24023,6 +24021,8 @@ class ComposerRunner:
                 return context
         config = json.loads(Path(stage["config_path"]).read_text())
         config = self._adapt_continuation_config(stage, config)
+        if isinstance(config.get("model"), dict):
+            config["model"] = load_model_config(config["model"])
         config = self._apply_stage_quota(config, stage)
         if kind != "survey" and isinstance(config.get("model"), dict):
             config["model"] = self._stage_model_config(stage, config["model"])

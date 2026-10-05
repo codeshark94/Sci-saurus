@@ -118,10 +118,35 @@ def role_config_for(mapping, role, default=None):
     return mapping[max(parents, key=len)]
 
 
+def load_model_config(model):
+    """Materialize a shared routing file with explicit call-level overrides."""
+    if not isinstance(model, dict):
+        raise ValidationError("model configuration must be an object")
+    if "config_path" not in model:
+        return model
+    path = model["config_path"]
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        raise ValidationError("model.config_path must be an absolute file path")
+    overrides = {key: value for key, value in model.items() if key != "config_path"}
+    allowed = (MODEL_CONFIG_FIELDS | SAMPLING_FIELDS) - {
+        "model", "base_url", "protocol", "auth_env", "provider_quota_scope"}
+    if set(overrides) - allowed:
+        raise ValidationError("shared model routing cannot be overridden inline: "
+                              + ", ".join(sorted(set(overrides) - allowed)))
+    try:
+        shared = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as exc:
+        raise ValidationError("model.config_path must name a readable JSON object") from exc
+    if not isinstance(shared, dict) or "config_path" in shared:
+        raise ValidationError("shared model configuration must be a direct JSON object")
+    return merge_model_config(shared, overrides)
+
+
 def role_routes_for(model, role):
     """Return inherited role routes after excluding local Qwen inference."""
     if not isinstance(model, dict):
         return []
+    model = load_model_config(model)
     routes = role_config_for(model.get("role_routes"), role, [])
     if not isinstance(routes, list):
         return []
@@ -872,7 +897,7 @@ def resolve_model_config(model, *, role=None, overrides=None):
     """
     if not isinstance(model, dict):
         raise ValidationError("model configuration must be an object")
-    base = dict(model)
+    base = dict(load_model_config(model))
     role_models = base.pop("role_models", {})
     _validate_role_models(role_models)
     role_model_fallbacks = base.pop("role_model_fallbacks", {})
@@ -982,6 +1007,7 @@ def with_runtime_cooldown_fallback(model, *, env=None):
     """
     if not isinstance(model, dict):
         return model
+    model = load_model_config(model)
     explicit_fallback = model.get("provider_cooldown_fallback")
     if isinstance(explicit_fallback, dict):
         effective_fallback = dict(model)

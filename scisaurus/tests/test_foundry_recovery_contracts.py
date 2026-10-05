@@ -17,6 +17,29 @@ from scisaurus.tests.test_capability_foundry import StubClient, MINI_VALIDATOR, 
 
 
 class FoundryRecoveryContractTests(unittest.TestCase):
+    def test_settled_empty_panel_invoice_does_not_reserve_the_panel_again(self):
+        from scisaurus.core.errors import ValidationError
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(composer_fixtures.ComposerWorkflowTests()._workflow(Path(path)))
+            try:
+                runner.workflow['capability_foundry_config_path'] = str(Path(path)/'foundry.json')
+                stage = runner.workflow['stages'][1]
+                stage['quota'] = {'max_model_calls': 24}
+                with patch.object(runner, '_stage_usage', return_value={'model_calls': 3}), \
+                        patch.object(runner, '_capability_repair_panel_required', return_value=True), \
+                        patch.object(runner, '_capability_repair_panel_model_call_reserve', return_value=20):
+                    self.assertEqual(runner._foundry_model_call_budget(stage), 0)
+                    self.assertEqual(runner._foundry_model_call_budget(stage, repair_panel_usage={}), 12)
+                    self.assertEqual(runner._foundry_model_call_budget(stage,
+                                     repair_panel_usage={'model_calls': 0}), 12)
+                    self.assertEqual(runner._foundry_model_call_budget(stage,
+                                     repair_panel_usage={'model_calls': 11}), 8)
+                    for usage in ([], {'model_calls': -1}, {'model_calls': True}, {'model_calls': None}):
+                        with self.subTest(usage=usage), self.assertRaises(ValidationError):
+                            runner._foundry_model_call_budget(stage, repair_panel_usage=usage)
+            finally:
+                runner.close()
+
     def test_methods_response_diagnostic_identifies_exact_contract_defects(self):
         from scisaurus.core.errors import ValidationError
         from scisaurus.runtime.specialists import _validate_repair_adjudication_response
