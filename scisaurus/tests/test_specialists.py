@@ -1671,6 +1671,9 @@ class SpecialistDispatcherTests(unittest.TestCase):
                 self.assertEqual(transport["response_owner"]["kind"], kind)
                 self.assertEqual(transport["subject"], "previous_model_response")
                 self.assertIs(transport["stage_failure_evidence"], False)
+                self.assertEqual(transport["previous_response"], "irrelevant prior output")
+                self.assertEqual(transport["previous_response_sha256"], hashlib.sha256(
+                    b"irrelevant prior output").hexdigest())
                 if contract == "repair_adjudication":
                     self.assertIn("repair_plan", transport["instruction"])
                 if contract == "repair_evidence":
@@ -1684,9 +1687,46 @@ class SpecialistDispatcherTests(unittest.TestCase):
                          ["complete source", {"validation_error": "original evidence"}], "raw source packet"):
             prompt = json.dumps(original, ensure_ascii=False)
             for repair in (_verifier_repair_prompt, _specialist_repair_prompt):
-                self.assertEqual(repair(prompt, "Own output error", "", max_input_tokens=1), prompt)
+                with self.assertRaisesRegex(ValidationError, "identical request"):
+                    repair(prompt, "Own output error", "", max_input_tokens=1)
                 payload = json.loads(repair(prompt, "Own output error", "", max_input_tokens=20000))
                 self.assertEqual(payload["evidence_packet"], original)
+
+    def test_response_repair_omits_only_prior_response_when_context_cannot_fit_it(self):
+        original = {"source": "complete evidence", "validation_error": "real stage error"}
+        prompt = json.dumps(original)
+        previous = "prior answer " * 20000
+        for repair in (_verifier_repair_prompt, _specialist_repair_prompt):
+            payload = json.loads(repair(prompt, "Own output error", previous, max_input_tokens=3000))
+            self.assertEqual(payload["evidence_packet"], original)
+            subject = payload["response_format_repair"]
+            self.assertNotIn("previous_response", subject)
+            self.assertEqual(subject["previous_response_omitted"]["characters"], len(previous))
+            self.assertEqual(subject["previous_response_sha256"], hashlib.sha256(previous.encode()).hexdigest())
+            self.assertEqual(subject["diagnostic"]["message"], "Own output error")
+
+    def test_evidence_quote_error_names_its_exact_check_and_source_pointer(self):
+        from scisaurus.runtime.specialists import validate_decision_alignment
+        definition = "Exact current quantity."
+        evidence = {"question_alignment": {
+            "original": {"research_question": "Question?", "disconfirmation_test": "Rule."},
+            "candidate": {"primary_outcomes": [{"id": "quantity", "definition": definition}]},
+        }}
+        pointer = "/repair_adjudication_packet/question_alignment/candidate/primary_outcomes/0/definition"
+        check = {"claim": "Claim.", "pointer": pointer, "quote": "A paraphrase.",
+                 "explanation": "Consequence.", "disposition": "supported"}
+        plan = {"decision_alignment": {
+            "original_question": "Question?", "original_decision_rule": "Rule.",
+            "primary_outcome_id": "quantity", "quantity_definition": definition,
+            "baseline": "Baseline.", "aggregation": "Aggregation.",
+            "interpretation_limit": "Limit.", "scientific_justification": "Basis.",
+            "changes_estimand": False,
+        }, "required_changes": [], "evidence_checks": [check]}
+        with self.assertRaisesRegex(ValidationError, r"evidence_checks\[0\]\.quote") as error:
+            validate_decision_alignment(plan, evidence)
+        self.assertIn(pointer, str(error.exception))
+        check["quote"] = definition
+        self.assertEqual(validate_decision_alignment(plan, evidence)["evidence_checks"], [check])
 
     def test_verifier_retry_owns_its_diagnostic_without_excusing_stage_errors(self):
         model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",

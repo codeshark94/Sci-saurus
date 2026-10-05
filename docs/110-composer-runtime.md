@@ -80,6 +80,13 @@ The panel has a bounded worst-case envelope of four specialist assignments plus
 one verifier, each with one JSON repair slot; that envelope is reserved from
 the experiment-stage model quota before authoring begins.
 
+Cost reservations follow the execution policy. Development runs retain usage
+receipts but do not derive a Foundry call allowance from stage cost ceilings.
+Operational runs check that authoring capacity can remain before dispatching a
+repair panel; its worst-case reservation alone does not prove exhaustion.
+Foundry capacity failures retain their resource type across stage boundaries
+and cannot become scientific repair orders.
+
 The experiment repair contract is a real execution loop, not a rejection
 counter:
 
@@ -191,6 +198,12 @@ An output-limit failure retains its raw response as an artifact but does not
 echo an unfinished reasoning transcript into the repair prompt. The original
 source assignment and output contract remain intact, and the same durable
 repair allowance still applies.
+Specialist and verifier contract repairs include the previous final response
+as an unvalidated repair subject beside the unchanged evidence packet. Its hash,
+owning role and exact diagnostic remain separate from scientific evidence.
+Quote-reference errors identify the failing check and source pointer. If the
+prior response cannot fit, its omission and hash are explicit; if the correction
+metadata itself cannot fit, no identical request is dispatched without it.
 Review-only resume starts at the retained map checkpoint rather than replaying
 initial acquisition. Failed or uncertain full-text attempts retain their
 acquisition allowance; explicit retrieval reopening is a separate decision.

@@ -94,7 +94,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-reasoning-aware-output-transport-19")
+    "experiment-development-foundry-response-repair-20")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -2130,6 +2130,8 @@ class ComposerRunner:
         envelope.
         """
         if not self.workflow.get("capability_foundry_config_path"):
+            return None
+        if not enforce_model_cost_limits():
             return None
         quota = stage.get("quota") if isinstance(stage, dict) else None
         if not isinstance(quota, dict) or type(quota.get("max_model_calls")) is not int:
@@ -13829,7 +13831,8 @@ class ComposerRunner:
             model = json.loads(Path(configured["model_config_path"]).read_text())
             if evidence_frontier is not None:
                 available = self._foundry_model_call_budget(foundry_stage, repair_panel_usage={})
-                model_call_budget = available if model_call_budget is None else min(model_call_budget, available)
+                if available is not None:
+                    model_call_budget = available if model_call_budget is None else min(model_call_budget, available)
             model = self._stage_model_config(foundry_stage, model)
             # The foundry sandbox limit bounds generated code execution. Model
             # calls follow the configured route timeout and are additionally
@@ -14164,6 +14167,13 @@ class ComposerRunner:
         repair_context = None
         repair_panel_required = (fresh_pre_execution_repair or observed_experiment_repair
                                  or methods_response_repair)
+        if needs_fresh_capability and repair_panel_required:
+            available = self._foundry_model_call_budget(stage, repair_panel_usage={})
+            if available is not None and available < 1:
+                from scisaurus.runtime.capability_foundry import CapabilityModelBudgetExceeded
+                raise CapabilityModelBudgetExceeded(
+                    "capability foundry has no model-call budget left before Methods repair review",
+                    limit=0, observed=0, usage={})
         if repair_panel_required and isinstance(prior_experiment, dict):
             # A failed capability or an observed scientific hold is a design
             # failure, not merely a malformed transport response. Ask the
@@ -21796,10 +21806,11 @@ class ComposerRunner:
         except Exception as exc:
             # A provider reset is a time boundary, not a failed scientific
             # revision. Scoped research holds likewise return work orders.
-            from scisaurus.runtime.capability_foundry import CapabilityDeadlineError
+            from scisaurus.runtime.capability_foundry import CapabilityDeadlineError, CapabilityModelBudgetExceeded
             if self._is_operational_stage_failure(exc):
                 raise
-            if isinstance(exc, (ModelCallError, QuotaExceededError, *PROVIDER_OPERATOR_STOP_ERRORS, ProviderCooldownError, CapabilityDeadlineError,
+            if isinstance(exc, (ModelCallError, QuotaExceededError, *PROVIDER_OPERATOR_STOP_ERRORS, ProviderCooldownError,
+                                CapabilityDeadlineError, CapabilityModelBudgetExceeded,
                                 ComposerHardDeadlineExceeded, ComposerStageDeadlineExceeded)) or (
                     isinstance(exc, ModelCallError) and exc.status_code == 429):
                 raise

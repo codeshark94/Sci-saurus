@@ -113,6 +113,71 @@ class ComposerWorkflowTests(unittest.TestCase):
                     self.assertEqual(runner._stage_quota_error(stage).dimension, "max_openalex_requests")
             self.assertEqual(observed["model_calls"], 100)
 
+    def test_development_foundry_allowance_uses_execution_cost_policy(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            runner.workflow["capability_foundry_config_path"] = "configured-by-test"
+            stage = runner.workflow["stages"][1]
+            stage["quota"] = {"max_model_calls": 24}
+            observed = {"model_calls": 100, "input_tokens": 10000, "output_tokens": 1000}
+            with patch.object(runner, "_stage_usage", return_value=observed):
+                self.assertEqual(runner._foundry_model_call_budget(stage, repair_panel_usage={}), 0)
+                with patch.dict("os.environ", {"SCISAURUS_EXECUTION_POLICY": "development"}):
+                    self.assertIsNone(runner._foundry_model_call_budget(stage))
+                    self.assertIsNone(runner._foundry_model_call_budget(stage, repair_panel_usage={}))
+                    self.assertIsNone(runner._foundry_model_call_budget({"id": stage["id"]}))
+                self.assertEqual(runner._foundry_model_call_budget(stage, repair_panel_usage={}), 0)
+            self.assertEqual(observed["model_calls"], 100)
+
+    def test_foundry_call_capacity_failure_keeps_its_resource_identity(self):
+        from scisaurus.runtime.capability_foundry import CapabilityModelBudgetExceeded
+        from scisaurus.runtime.failure_recovery import classify_failure
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            stage = runner.workflow["stages"][1]
+            failure = CapabilityModelBudgetExceeded(
+                "No remaining authoring capacity", limit=24, observed=24,
+                usage={"model_calls": 24, "input_tokens": 1000})
+            with patch.object(runner, "_produce_stage", side_effect=failure):
+                with self.assertRaises(CapabilityModelBudgetExceeded) as caught:
+                    runner._run_stage(stage)
+            self.assertIs(caught.exception, failure)
+            self.assertEqual(caught.exception.limit, 24)
+            self.assertEqual(caught.exception.observed, 24)
+            self.assertEqual(caught.exception.foundry_usage["model_calls"], 0)
+            self.assertEqual(classify_failure("experiment", caught.exception), "resource_fence")
+
+    def test_repair_panel_preflight_checks_capacity_without_worst_case_reservation(self):
+        from scisaurus.runtime.capability_foundry import CapabilityModelBudgetExceeded
+        for prior, quota, expect_panel in ((24, 24, False), (0, 14, True)):
+            with self.subTest(prior=prior), tempfile.TemporaryDirectory() as path:
+                runner = ComposerRunner(self._workflow(Path(path)))
+                self.addCleanup(runner.close)
+                stage = runner.workflow["stages"][1]
+                stage["quota"] = {"max_model_calls": quota}
+                runner.workflow["capability_foundry_config_path"] = "configured-by-test"
+                runner.context["topic"] = {"kind": "topic_discovery", "topic": {
+                    "id": "frontier", "domain": "computational physics",
+                    "research_question": "Does mechanism A change response B?"}}
+                runner.context[stage["id"]] = {
+                    "status": "blocked", "review_status": "scientific_assignment_blocked",
+                    "error": "capability foundry did not admit the candidate"}
+                marker = RuntimeError("panel reached")
+                with patch.object(runner, "_stage_usage", return_value={"model_calls": prior}), \
+                        patch.object(runner, "_is_pre_execution_capability_failure", return_value=True), \
+                        patch.object(runner, "_run_capability_repair_panel", side_effect=marker) as panel:
+                    expected = RuntimeError if expect_panel else CapabilityModelBudgetExceeded
+                    with self.assertRaises(expected) as caught:
+                        runner._apply_topic_to_experiment_config(stage, {"experiment": {"revision": 1}},
+                                                                model_call_budget=0)
+                    if expect_panel:
+                        self.assertIs(caught.exception, marker)
+                        panel.assert_called_once()
+                    else:
+                        panel.assert_not_called()
+
     def _owned_held_topic(self, root, *, include_experiment=True):
         workflow = self._workflow(root)
         workflow["time_policy"]["hard_seconds"] = 120
@@ -16862,6 +16927,13 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(fresh.call_args.kwargs["repair_provenance"]["repair_evidence_frontier"], binding)
             brief = json.loads(fresh.call_args.args[0])
             self.assertEqual(brief["repair_evidence_frontier"], runner._capability_evidence_projection(frontier))
+            with patch.object(runner, "_require_capability_evidence_before_authoring", return_value=frontier), \
+                    patch.object(runner, "_foundry_model_call_budget", return_value=None), \
+                    patch("scisaurus.runtime.capability_registry.load_registry", return_value={"capabilities": [entry]}), \
+                    patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate", return_value=generated) as uncapped:
+                runner._materialize_topic_capability(result, stage_id="experiment")
+            self.assertIsNone(uncapped.call_args.kwargs["model_call_allowance"])
+            self.assertEqual(uncapped.call_args.kwargs["repair_provenance"]["repair_evidence_frontier"], binding)
             admission_path.write_text(json.dumps({"adversarial_review": valid_review,
                 "repair_provenance": {"repair_evidence_frontier": binding},
                 "validator_authorship": {"role": "methods.validator-author", "method": "blinded_separate_authoring", "source_sha256": "b" * 64}}))

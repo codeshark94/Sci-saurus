@@ -125,7 +125,11 @@ def validate_decision_alignment(plan, evidence_document):
             except ValidationError as exc:
                 raise ValidationError(f"evidence check pointer does not resolve: {exc}")
             if not isinstance(cited, str) or check["quote"] not in cited:
-                raise ValidationError("evidence check quote does not occur in its supplied source field")
+                raise ValidationError(
+                    "evidence check quote does not occur in its supplied source field: "
+                    f"evidence_checks[{index}].quote at {check['pointer']!r}; "
+                    "copy a contiguous exact substring from that string field, "
+                    "not a paraphrase or a quotation from another field")
     return ({"decision_alignment": deepcopy(decision_alignment),
              "evidence_checks": deepcopy(evidence_checks)} if decision_alignment is not None else {})
 
@@ -1932,7 +1936,7 @@ def _verifier_obligation_scope(prompt, assignment):
 
 
 def _response_format_repair_prompt(prompt, error, *, response_kind, output_role,
-                                  instruction, system, max_input_tokens):
+                                  instruction, system, max_input_tokens, previous_text=None):
     """Keep response-transport diagnostics separate from the original evidence."""
     try:
         evidence = json.loads(prompt)
@@ -1949,13 +1953,30 @@ def _response_format_repair_prompt(prompt, error, *, response_kind, output_role,
             "instruction": instruction,
         },
     }
+    if isinstance(previous_text, str) and previous_text:
+        repair = payload["response_format_repair"]
+        repair["previous_response_sha256"] = hashlib.sha256(previous_text.encode("utf-8")).hexdigest()
+        repair["previous_response"] = previous_text
+        repair["instruction"] += (
+            " When previous_response is supplied, correct it against this diagnostic and the exact "
+            "response contract. Retain valid decisions and evidence unless the correction "
+            "requires a change. The previous response is an unvalidated repair subject, "
+            "not source evidence or an admitted scientific conclusion."
+        )
+        candidate = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if estimate_input_tokens(system, candidate) <= max_input_tokens:
+            return candidate
+        repair.pop("previous_response")
+        repair["previous_response_omitted"] = {
+            "reason": "The complete prior response does not fit alongside the unchanged evidence packet.",
+            "characters": len(previous_text),
+        }
     candidate = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     if estimate_input_tokens(system, candidate) <= max_input_tokens:
         return candidate
-    # The initial assignment already fits the role quota. Preserve it exactly
-    # when transport metadata cannot fit; the system still enforces the same
-    # output contract, and the dispatch report retains the retry diagnostic.
-    return prompt
+    raise ValidationError(
+        "response-repair diagnostics do not fit alongside the unchanged evidence packet; "
+        "an identical request without its correction is not a valid repair")
 
 
 def _verifier_repair_prompt(prompt, error, previous_text, *, max_input_tokens,
@@ -1978,7 +1999,7 @@ def _verifier_repair_prompt(prompt, error, previous_text, *, max_input_tokens,
     )
     return _response_format_repair_prompt(prompt, error, response_kind="verifier",
         output_role=output_role, instruction=instruction, system=VERIFIER_SYSTEM,
-        max_input_tokens=max_input_tokens)
+        max_input_tokens=max_input_tokens, previous_text=previous_text)
 
 
 def _specialist_repair_prompt(prompt, error, previous_text, *, max_input_tokens,
@@ -2005,7 +2026,7 @@ def _specialist_repair_prompt(prompt, error, previous_text, *, max_input_tokens,
         system = REPAIR_ADJUDICATION_SYSTEM
     return _response_format_repair_prompt(prompt, error, response_kind="specialist",
         output_role=output_role, instruction=instruction, system=system,
-        max_input_tokens=max_input_tokens)
+        max_input_tokens=max_input_tokens, previous_text=previous_text)
 
 
 def specialist_system(assignment, *, verifier=False):
