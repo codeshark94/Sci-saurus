@@ -86,6 +86,10 @@ Operational runs check that authoring capacity can remain before dispatching a
 repair panel; its worst-case reservation alone does not prove exhaustion.
 Foundry capacity failures retain their resource type across stage boundaries
 and cannot become scientific repair orders.
+Local context admission failures are recorded as requests that were not
+dispatched. They preserve the candidate or partial response, consume neither
+an author attempt nor a model call, and permit retry after the route or input
+projection is corrected. Uncertain provider outcomes remain distinct.
 
 The experiment repair contract is a real execution loop, not a rejection
 counter:

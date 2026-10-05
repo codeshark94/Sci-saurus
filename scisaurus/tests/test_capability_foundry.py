@@ -40,7 +40,7 @@ from unittest.mock import patch
 from scisaurus.runtime.capability_registry import load_registry
 from scisaurus.runtime.experiment import ExperimentRunner, validate_program_output
 from scisaurus.runtime.experiment_config import ExperimentWorkOrderContractError
-from scisaurus.runtime.models import ModelCallError, ModelResult
+from scisaurus.runtime.models import ModelCallError, ModelContextBudgetError, ModelResult
 from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
 from scisaurus.runtime.research_quality import (
     ANALYSIS_FIELDS, default_research_quality_contract,
@@ -1584,6 +1584,90 @@ class CapabilityFoundryTests(unittest.TestCase):
         self.assertFalse(any(
             item.get("operation") == "continue_truncated_response"
             for item in final_state["requests"]))
+
+    def test_local_author_context_rejection_preserves_retry_without_charging(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry, cache = self._foundry(root), self._cache(root)
+            class ContextRejectedAuthor:
+                calls = 0
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    if inner_self.calls == 1:
+                        raise ModelContextBudgetError("input cannot fit", model="author",
+                            estimated_input_tokens=200, allowed_input_tokens=100,
+                            context_window_tokens=120, max_input_tokens=100, max_output_tokens=20)
+                    return ModelResult(json.dumps(self._payload()), "author", {"model_calls": 1}, .1, "stop")
+            author, progress = ContextRejectedAuthor(), []
+            with self.assertRaises(ModelContextBudgetError):
+                foundry.generate("bounded comparison", client=author, work_cache=cache,
+                    on_progress=lambda phase, state: progress.append(state))
+            stopped = progress[-1]
+            self.assertEqual(stopped["attempts"], 0)
+            self.assertEqual(stopped["usage"]["model_calls"], 0)
+            self.assertEqual(stopped["requests"][-1]["status"], "context_not_dispatched")
+            self.assertEqual(stopped["requests"][-1]["context_budget"]["estimated_input_tokens"], 200)
+            self.assertFalse(_author_request_was_attempted(stopped, stopped["requests"][-1]["request_signature"]))
+            self.assertEqual(foundry.generate("bounded comparison", client=author, work_cache=cache)["status"], "registered")
+            self.assertEqual(author.calls, 2)
+
+    def test_local_review_context_rejection_keeps_candidate_and_response_lease(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry, cache = self._foundry(root), self._cache(root)
+            class ContextRejectedReviewer:
+                calls = 0
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    if inner_self.calls == 1:
+                        raise ModelContextBudgetError("review cannot fit", model="reviewer",
+                            estimated_input_tokens=200, allowed_input_tokens=100,
+                            context_window_tokens=120, max_input_tokens=100, max_output_tokens=20)
+                    return ModelResult(json.dumps(self._review_payload()), "reviewer", {"model_calls": 1}, .1, "stop")
+            author, reviewer, progress = StubClient(self._payload()), ContextRejectedReviewer(), []
+            foundry.reviewer_client = reviewer
+            with self.assertRaises(ModelContextBudgetError):
+                foundry.generate("bounded comparison", client=author, work_cache=cache,
+                    on_progress=lambda phase, state: progress.append(state))
+            stopped = progress[-1]
+            self.assertEqual(stopped["requests"][-1]["status"], "context_not_dispatched")
+            self.assertEqual(stopped["requests"][-1]["usage"]["model_calls"], 0)
+            self.assertEqual(next(iter(stopped["scientific_reviews"].values()))["status"], "pending")
+            self.assertEqual(foundry.generate("bounded comparison", client=author, work_cache=cache)["status"], "registered")
+            self.assertEqual(author.calls, 1)
+            self.assertEqual(reviewer.calls, 2)
+
+    def test_local_review_continuation_context_rejection_can_resume_exact_suffix(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry, cache = self._foundry(root), self._cache(root)
+            complete_response = json.dumps(self._review_payload())
+            prefix = complete_response[:150]
+            class ContextRejectedContinuation:
+                calls = 0
+                model = "reviewer"
+                max_output_tokens = 4000
+                def complete(inner_self, *, system, prompt):
+                    inner_self.calls += 1
+                    if inner_self.calls == 1:
+                        return ModelResult(prefix, "reviewer", {"model_calls": 1}, .1, "length")
+                    if inner_self.calls == 2:
+                        raise ModelContextBudgetError("continuation cannot fit", model="reviewer",
+                            estimated_input_tokens=200, allowed_input_tokens=100,
+                            context_window_tokens=120, max_input_tokens=100, max_output_tokens=20)
+                    return ModelResult(complete_response[len(prefix):], "reviewer", {"model_calls": 1}, .1, "stop")
+            author, reviewer, progress = StubClient(self._payload()), ContextRejectedContinuation(), []
+            foundry.reviewer_client = reviewer
+            with self.assertRaises(ModelContextBudgetError):
+                foundry.generate("bounded comparison", client=author, work_cache=cache,
+                    on_progress=lambda phase, state: progress.append(state))
+            retained = next(iter(progress[-1]["scientific_reviews"].values()))
+            self.assertEqual(retained["response_continuation"]["partial_response"], prefix)
+            self.assertEqual(retained["response_continuation"]["request_signatures"], [])
+            self.assertEqual(progress[-1]["requests"][-1]["usage"]["model_calls"], 0)
+            self.assertEqual(foundry.generate("bounded comparison", client=author, work_cache=cache)["status"], "registered")
+            self.assertEqual(author.calls, 1)
+            self.assertEqual(reviewer.calls, 3)
 
     def test_known_author_rate_limit_is_resumable_without_charging_an_attempt(self):
         with tempfile.TemporaryDirectory() as path:

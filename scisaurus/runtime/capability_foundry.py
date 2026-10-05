@@ -42,7 +42,7 @@ from scisaurus.runtime.experiment import (
 )
 from scisaurus.runtime.experiment_config import EXPERIMENT_WORK_ORDER_KINDS, validate_work_orders
 from scisaurus.runtime.models import (
-    ModelCallError, ModelClient, ModelResult, effective_model_timeout,
+    ModelCallError, ModelClient, ModelContextBudgetError, ModelResult, effective_model_timeout,
     resolve_model_config,
 )
 from scisaurus.runtime.model_work import ModelWorkBlocked
@@ -588,7 +588,7 @@ def _author_request_signature_from_record(request):
         return None
     if request.get("role", "research.experiment-author") != "research.experiment-author":
         return None
-    if request.get("status") in {"provider_rate_limited", "cooldown_not_dispatched"}:
+    if request.get("status") in {"provider_rate_limited", "cooldown_not_dispatched", "context_not_dispatched"}:
         return None
     signature = request.get("request_signature")
     if isinstance(signature, str) and signature:
@@ -2778,6 +2778,35 @@ class CapabilityFoundry:
             error.usage = deepcopy_config(state.get("usage", {}))
             return True
 
+        def record_context_rejection(request, error, *, phase, retry_state=None,
+                                     retry_status="response_received",
+                                     request_signature=None, attempt_before=None):
+            if not isinstance(error, ModelContextBudgetError):
+                return False
+            request.update(status="context_not_dispatched", error=str(error),
+                usage={"model_calls": 0}, context_budget={
+                    key: getattr(error, key) for key in (
+                        "model", "estimated_input_tokens", "allowed_input_tokens",
+                        "context_window_tokens", "max_input_tokens", "max_output_tokens", "image_count")})
+            state["usage"]["model_calls"] = max(0, state["usage"].get("model_calls", 0) - 1)
+            request_signature = request_signature or request.get("request_signature")
+            if request_signature is not None:
+                state["author_request_signatures"] = [
+                    value for value in state.get("author_request_signatures", [])
+                    if value != request_signature]
+            if attempt_before is not None:
+                state["attempts"] = attempt_before
+            if isinstance(retry_state, dict):
+                retry_state["status"] = "pending"
+                if isinstance(retry_state.get("request_signatures"), list):
+                    retry_state["request_signatures"] = [
+                        value for value in retry_state["request_signatures"]
+                        if value != request_signature]
+            state["status"] = retry_status
+            save(phase)
+            error.usage = deepcopy_config(state.get("usage", {}))
+            return True
+
         def continue_truncated_author_response(result, attempt_number):
             """Continue a length-limited JSON response without replaying its prefix."""
             if result.finish_reason != "length":
@@ -2987,6 +3016,10 @@ class CapabilityFoundry:
                     save("author_response_continuation_unknown")
                     raise
                 except BaseException as exc:
+                    if record_context_rejection(
+                            request, exc, phase="author_continuation_context_rejected",
+                            retry_state=continuation, request_signature=request_signature):
+                        raise
                     request.update(
                         status="result_unknown",
                         error=f"{type(exc).__name__}: {exc}")
@@ -3309,6 +3342,12 @@ class CapabilityFoundry:
                     save("scientific_review_continuation_unknown")
                     raise
                 except BaseException as exc:
+                    if record_context_rejection(
+                            request, exc, phase="review_continuation_context_rejected",
+                            retry_state=continuation):
+                        retained["status"] = "response_received"
+                        save("review_continuation_context_rejected")
+                        raise
                     request.update(status="result_unknown",
                                    error=f"{type(exc).__name__}: {exc}")
                     continuation["status"] = "result_unknown"
@@ -3533,6 +3572,9 @@ class CapabilityFoundry:
                 save("scientific_review_unknown")
                 raise
             except BaseException as exc:
+                if record_context_rejection(
+                        request, exc, phase="scientific_review_context_rejected", retry_state=retained):
+                    raise
                 request.update(status="result_unknown", error=f"{type(exc).__name__}: {exc}")
                 retained["status"] = "result_unknown"
                 save("scientific_review_unknown")
@@ -3670,6 +3712,11 @@ class CapabilityFoundry:
                         save("validator_author_unknown")
                         raise
                     except BaseException as exc:
+                        if record_context_rejection(
+                                request, exc, phase="validator_author_context_rejected", retry_state=retained):
+                            retained["attempts"] = attempts_before
+                            save("validator_author_context_rejected")
+                            raise
                         retained["status"] = "result_unknown"
                         request.update(status="result_unknown", error=str(exc))
                         save("validator_author_unknown")
@@ -4006,6 +4053,10 @@ class CapabilityFoundry:
                     save("request_failed")
                     raise
                 except BaseException as exc:
+                    if record_context_rejection(
+                            request, exc, phase="author_context_rejected", retry_status="repairing",
+                            request_signature=request_signature, attempt_before=attempt):
+                        raise
                     request.update(status="result_unknown", error=f"{type(exc).__name__}: {exc}")
                     state["status"] = "repairing"
                     save("request_failed")
@@ -4261,6 +4312,8 @@ class CapabilityFoundry:
             except IndependentValidatorContractError:
                 raise
             except (ValidationError, KeyError, TypeError, ValueError) as exc:
+                if isinstance(exc, ModelContextBudgetError):
+                    raise
                 if deadline is not None and time.monotonic() >= deadline:
                     state["status"] = "response_received"
                     save("validation_pending")

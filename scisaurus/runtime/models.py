@@ -1527,6 +1527,8 @@ class ModelContextBudgetError(ValidationError):
         self.image_count = image_count
         self.failure_class = "context_budget"
         self.outcome_known = True
+        self.attempts = 0
+        self.usage = {}
 
 
 class _ProviderHTTPError(RuntimeError):
