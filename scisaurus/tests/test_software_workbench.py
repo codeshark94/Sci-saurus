@@ -14,7 +14,7 @@ from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.models import ModelResult
 from scisaurus.runtime.program_sandbox import SandboxResult, sandbox_status
 from scisaurus.runtime.software_workbench import SoftwareWorkbench, _matches_expected, project_receipt, selection_contract, validate_selection
-from scisaurus.runtime.specialists import SpecialistDispatcher, VERIFIER_SYSTEM, build_verifier_prompt
+from scisaurus.runtime.specialists import SpecialistDispatcher, VERIFIER_SYSTEM, REPAIR_EVIDENCE_SYSTEM, build_verifier_prompt
 
 
 COMMIT = "a" * 40
@@ -36,6 +36,23 @@ def archive(files, *, unsafe=False):
 
 
 class SoftwareWorkbenchTests(unittest.TestCase):
+    def test_experiment_projection_preserves_host_measurements_and_limits(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        check = {"receipt_ref":"software:sha256:host", "outcome":"ok",
+                 "action":{"operation":"check_environment"},
+                 "result":{"resources":{"cpu":{"logical_count":12}},
+                           "storage":{"free_bytes":12345},
+                           "sandbox_limits":{"address_space_bytes":4294967296}}}
+        discovery = {"outcome":"ok", "action":{"operation":"search"}, "result":{"items":[]}}
+        failed = {"outcome":"failed", "action":{"operation":"check_environment"}, "error":"probe failed"}
+        assessment = {"artifact_ref":"artifact:software@1", "review":{"decision":"accept"},
+            "evidence":{"selection":{"strategy":"custom_model"}, "selected_operations":[],
+                        "discovery_and_diagnostics":[check, discovery, failed]}}
+        projected = ComposerRunner._scientific_software_projection(assessment)
+        self.assertEqual(projected["host_environment_checks"], [check])
+        self.assertEqual(projected["operations"], [])
+        self.assertEqual(len(assessment["evidence"]["discovery_and_diagnostics"]),3)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -99,6 +116,8 @@ class SoftwareWorkbenchTests(unittest.TestCase):
     def test_discovery_install_example_and_computation_are_actual_receipts(self):
         searched = self.action("search", query="scientific tinyprobe")
         self.assertEqual(searched["result"]["repositories"][0]["full_name"], "upstream/tinyprobe")
+        self.assertEqual(searched["result"]["search_contract"]["documentation_qualifier"],"in:readme")
+        self.assertEqual(searched["result"]["query"],"scientific tinyprobe")
         inspected, license, docs, installed = self.provision()
         self.assertEqual(installed["result"]["commit"], COMMIT)
         with patch("scisaurus.runtime.software_workbench.sandbox_status", return_value={"mode":"sandbox-exec"}):
@@ -118,6 +137,54 @@ class SoftwareWorkbenchTests(unittest.TestCase):
         self.assertTrue(repeated["reused"])
         self.assertEqual(repeated["receipt_ref"], installed["receipt_ref"])
         self.assertEqual(len(self.runs), before)
+
+    def test_environment_resource_inventory_keeps_optional_runtime_failure(self):
+        old=self.workbench.runner
+        def runner(command,**kwargs):
+            if command[-1].endswith("check.R"):
+                return SandboxResult(1,b"",b"R runtime dependency missing",False,False,"sandbox-exec")
+            return old(command,**kwargs)
+        self.workbench.runner=runner
+        with patch("scisaurus.runtime.software_workbench.shutil.which",return_value=sys.executable), \
+                patch("scisaurus.runtime.software_workbench.sandbox_status",return_value={"mode":"sandbox-exec"}):
+            row=self.action("check_environment")
+        self.assertEqual(row["outcome"],"ok",row)
+        self.assertGreater(row["result"]["resources"]["cpu"]["logical_count"],0)
+        self.assertGreater(row["result"]["storage"]["total_bytes"],0)
+        self.assertEqual(row["result"]["r"]["status"],"unavailable")
+        self.assertIn("dependency missing",row["result"]["r"]["execution"]["stderr"])
+        self.assertEqual(row["result"]["sandbox_limits"]["requested_posix"]["address_space_bytes"],4*1024**3)
+        self.assertIsNone(row["result"]["sandbox_limits"]["observed_python_posix"])
+
+    def test_optional_runtime_startup_error_keeps_successful_python_probe(self):
+        old=self.workbench.runner
+        def runner(command,**kwargs):
+            if command[-1].endswith("check.R"):
+                raise OSError(8,"Exec format error")
+            return old(command,**kwargs)
+        self.workbench.runner=runner
+        with patch("scisaurus.runtime.software_workbench.shutil.which",return_value=sys.executable), \
+                patch("scisaurus.runtime.software_workbench.sandbox_status",return_value={"mode":"sandbox-exec"}):
+            row=self.action("check_environment")
+        self.assertEqual(row["outcome"],"ok",row)
+        self.assertEqual(row["result"]["python"]["returncode"],0)
+        error=row["result"]["r"]["execution"]["startup_error"]
+        self.assertEqual(error["errno"],8)
+        self.assertIn("Exec format error",error["message"])
+
+    @unittest.skipUnless(sandbox_status()["mode"] == "sandbox-exec", "requires the native sandbox")
+    def test_environment_records_actual_child_resource_limits(self):
+        from scisaurus.runtime.program_sandbox import run_sandboxed
+        self.workbench.runner=run_sandboxed
+        with patch("scisaurus.runtime.software_workbench.shutil.which",return_value=None):
+            row=self.action("check_environment")
+        self.assertEqual(row["outcome"],"ok",row)
+        result=row["result"]
+        measured=json.loads(result["python"]["stdout"])
+        self.assertEqual(result["sandbox_limits"]["observed_python_posix"],measured["posix_limits"])
+        self.assertEqual(measured["posix_limits"]["cpu_seconds"]["soft"],600)
+        self.assertEqual(measured["baseline"]["file_bytes"],8*1024**2)
+        self.assertGreater(result["python"]["elapsed_seconds"],0)
 
     def test_environment_tampering_is_rejected(self):
         _, _, _, installed = self.provision()
@@ -227,11 +294,10 @@ class SoftwareWorkbenchTests(unittest.TestCase):
                 by_operation = {}
                 for row in tools:
                     by_operation.setdefault(row["action"]["operation"], []).append(row)
+                self.assertIn("check_environment",by_operation)
                 def action(operation, **arguments):
                     return {"tool_action":{"operation":operation,"arguments":arguments}}
-                if "check_environment" not in by_operation:
-                    response = action("check_environment")
-                elif "search" not in by_operation:
+                if "search" not in by_operation:
                     response = action("search", query=topic["topic"]["research_question"])
                 elif "inspect" not in by_operation:
                     response = action("inspect", repository=by_operation["search"][0]["result"]["repositories"][0]["full_name"], revision="main")
@@ -269,6 +335,7 @@ class SoftwareWorkbenchTests(unittest.TestCase):
             self.assertEqual(retained["artifact_ref"],receipt["artifact_ref"])
             projection=runner._scientific_software_projection(receipt)
             self.assertEqual(projection["operations"][-1]["result"]["output"],{"answer":42})
+            self.assertEqual(projection["host_environment_checks"][0]["action"]["operation"],"check_environment")
             plan=runner._read_verified_artifact_json(receipt["ledger"]["assignment_plan_ref"])[2]
             if with_quota:
                 self.assertGreater(plan["role_quotas"]["methods.methodologist"]["max_calls"],4)
@@ -363,7 +430,6 @@ class SoftwareWorkbenchTests(unittest.TestCase):
         self.assertEqual(report["usage"]["input_tokens"], 30)
         self.assertEqual(len(report["software_tool_results"]), 2)
 
-    @unittest.skipUnless(sandbox_status()["mode"] == "sandbox-exec", "requires macOS sandbox")
     def test_null_call_quota_repairs_malformed_response_and_preserves_provider_failure(self):
         from scisaurus.runtime.models import ModelCallError
         valid=ModelResult(json.dumps({"decision":"hold","summary":"Prerequisites unresolved","findings":[],"evidence_gaps":[],"requested_actions":[]}),"fixture",{"model_calls":1,"input_tokens":10,"output_tokens":5},0.01,"stop",1)
@@ -380,6 +446,27 @@ class SoftwareWorkbenchTests(unittest.TestCase):
             if isinstance(initial,ModelResult):
                 self.assertEqual(report["status"],"succeeded")
                 self.assertEqual(report["usage"]["model_calls"],2)
+
+    def test_selection_format_repair_keeps_software_contract_and_evidence_tools_authorized(self):
+        response=selection_contract()
+        response.update(decision="hold",summary="Required solver runtime unavailable")
+        response["software_selection"].update(strategy="unavailable",rationale="Prerequisite missing")
+        responses=[ModelResult("invalid JSON","fixture",{"model_calls":1},0.01,"stop",1),
+                   ModelResult(json.dumps(response),"fixture",{"model_calls":1},0.01,"stop",1)]
+        prompts=[]
+        def complete(**kwargs):
+            prompts.append(kwargs["prompt"])
+            return responses.pop(0)
+        dispatcher=SpecialistDispatcher({"protocol":"openai_compatible","base_url":"http://127.0.0.1:1/v1","model":"fixture","timeout_seconds":10,"max_output_tokens":1000},
+                                       deadline=time.monotonic()+60,software_workspace=self.directory.name)
+        with patch("scisaurus.runtime.specialists.ModelClient") as client:
+            client.return_value.complete.side_effect=complete
+            report=dispatcher._execute({"assigned_role":"methods.methodologist","role_id":"methodologist","_software_tools":True,"_response_contract":"software_selection",
+                "_prompt":json.dumps({"software_assessment_request":{"source_ref_catalog":[]}}),"quota":{"max_calls":None,"max_output_tokens":1000}}, {})
+        self.assertEqual(report["status"],"succeeded",report)
+        self.assertIn("including software_selection",prompts[1])
+        self.assertEqual(report["response"]["software_selection"]["strategy"],"unavailable")
+        self.assertIn("intermediate response contains only tool_action",REPAIR_EVIDENCE_SYSTEM)
 
     @unittest.skipUnless(sandbox_status()["mode"] == "sandbox-exec", "requires macOS sandbox")
     def test_real_native_build_run_and_outside_write_denial(self):

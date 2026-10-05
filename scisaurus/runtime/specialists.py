@@ -173,6 +173,10 @@ REPAIR_EVIDENCE_SYSTEM = (
     "note from the supplied immutable sources and diagnostics. Preserve the admitted question "
     "and primary comparison. Do not invent data, sources, executed tests, or observations. "
     "Distinguish analytic derivation from actual execution; a note is not experiment admission. "
+    "When scientific_software_tools is supplied, use its controller tools to obtain missing "
+    "software or execution evidence. An intermediate response contains only tool_action under "
+    "that contract; read the actual returned receipt or error before choosing the next action. "
+    "Once the evidence action is resolved, return the final evidence-note object. "
     "Return exactly one JSON object with decision, summary, findings, evidence_gaps, requested_actions, "
     "evidence_note. decision is pass or hold. For pass, evidence_note contains title, content, "
     "source_refs, limitations, action_disposition; action_disposition is fulfilled or superseded. "
@@ -229,12 +233,22 @@ SOFTWARE_SELECTION_SYSTEM = (
     "You are the Methods scientific software assessor. Before a new implementation, actively "
     "discover established software from the admitted question and its literature, inspect primary "
     "documentation and licensing, provision a pinned isolated environment and reproduce an upstream "
-    "example with the provided tools. Choose software by mechanism, units, calibration and study "
-    "scope, not popularity alone. For reuse, run the bounded scientific computation needed for the "
+    "example with the provided tools. Choose software by mechanism, units, calibration, study "
+    "scope and actual host CPU, RAM, storage, architecture and accelerator/runtime support, "
+    "not popularity alone. "
+    "Distinguish requested sandbox ceilings from observed child limits, including unsupported "
+    "or unlimited limits and their per-process scope; use actual example/computation timings to "
+    "justify a feasible scale. A generic CPU benchmark is not solver throughput, and the presence "
+    "of GPU, Docker or MPI tooling does not prove a working scientific runtime. "
+    "For reuse, run the bounded scientific computation needed for the "
     "declared question and preserve its actual input and output. Never call stored upstream data a "
     "new simulation. A custom model needs source-bound mathematical justification and an explicit "
     "explanation of why established candidates are unsuitable; unavailable prerequisites require "
     "hold, not an invented fallback. Return a tool_action or the exact final output contract. "
+    "Resolve missing technical prerequisites with the available tools before declaring them "
+    "unavailable. Your target is software fitness and a reproduced computation, not completion "
+    "of the future experiment's validator or final scientific review. Retain relevant scientific "
+    "scope limits without demanding downstream admission before software can be assessed. "
     "Operational reproduction is not scientific admission; an independent Methods reviewer must "
     "assess the selection, computed outputs and scientific limitations. "
     + RESPONSE_REPAIR_PROVENANCE_RULE
@@ -1199,7 +1213,7 @@ def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, det
         body["verifier_contract"].update({
             "acceptance_target": "source-bound scientific software fitness and upstream reproduction before experiment implementation",
             "review_subject": {"path": "chief_result.software_assessment", "sha256": body["chief_result"]["software_assessment_sha256"]},
-            "software_review_rule": "Check the admitted question and scope, actual license, selected pinned source and dependencies, upstream documented example and precision, actual computation source/input/output/errors, units and calibration conventions. Check that the adapter really invokes the acquired software, not a replacement formula or fabricated output. Custom modelling requires an actual search and source-bound mathematical specification explaining rejected established candidates. Installation, example agreement and computation are operational evidence, not experimental or publication admission. Hold missing mechanisms, ungrounded units, mismatched source/output provenance or unavailable prerequisites; preserve valid negative results and stated limitations."})
+            "software_review_rule": "Check the admitted question and scope, observed host CPU/RAM/storage/accelerators, requested versus observed sandbox limits and per-process scope, actual runtime compatibility and measured example/computation durations, actual license, selected pinned source and dependencies, upstream documented example and precision, actual computation source/input/output/errors, units and calibration conventions. Generic benchmark throughput or an installed command alone does not establish solver capacity. Check that the adapter really invokes the acquired software, not a replacement formula or fabricated output. Custom modelling requires an actual search and source-bound mathematical specification explaining rejected established candidates. Installation, example agreement and computation are operational evidence, not experimental or publication admission. Hold missing mechanisms, ungrounded units, mismatched source/output provenance or unavailable prerequisites; preserve valid negative results and stated limitations."})
     if (stage_packet.get("repair_panel") is True
             and isinstance(stage_packet.get("capability_repair_packet"), dict)):
         body["capability_repair_packet"] = _verifier_repair_packet(
@@ -2042,6 +2056,9 @@ def _specialist_repair_prompt(prompt, error, previous_text, *, max_input_tokens,
     if response_contract == "repair_evidence":
         instruction = REPAIR_EVIDENCE_SYSTEM + " Regenerate the original evidence-note JSON contract."
         system = REPAIR_EVIDENCE_SYSTEM
+    elif response_contract == "software_selection":
+        instruction = SOFTWARE_SELECTION_SYSTEM + " Regenerate the original final response including software_selection and all its declared fields; preserve the actual tool receipts and scientific limitations."
+        system = SOFTWARE_SELECTION_SYSTEM
     elif response_contract == "repair_adjudication":
         instruction = (
             "The previous Methods lead response was invalid. Regenerate one complete JSON object "
@@ -2515,8 +2532,13 @@ class SpecialistDispatcher:
         if assignment.get("_software_tools") is True:
             if verifier or not self.software_workspace or self.deadline is None:
                 raise ValidationError("scientific software tools require a producer workspace and stage deadline")
-            from scisaurus.runtime.software_workbench import SoftwareWorkbench
+            from scisaurus.runtime.software_workbench import SoftwareWorkbench, project_receipt
             software_tools = SoftwareWorkbench(self.software_workspace, deadline=self.deadline)
+            if response_contract == "software_selection":
+                software_results.append(software_tools.execute({"operation":"check_environment","arguments":{}}))
+                envelope = json.loads(prompt)
+                envelope["software_tool_results"] = [project_receipt(row) for row in software_results]
+                prompt = json.dumps(envelope, ensure_ascii=False, sort_keys=True)
         max_input_tokens = self.input_limit_for_role(
             model_role, quota.get("max_input_tokens"))
         quota["max_input_tokens"] = max_input_tokens

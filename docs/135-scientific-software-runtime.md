@@ -35,6 +35,26 @@ programs execute without network access or inherited credentials. Global
 installation is unavailable. Missing compilers, MPI, GPU or other prerequisites
 are reported; presence of a command alone does not establish readiness.
 
+The controller collects the environment receipt before the assessor's first
+model call. It records logical and physical CPU capacity, load, physical
+memory and reclaimable-memory estimates, workspace filesystem capacity,
+and macOS GPU/Metal inventory. A sandboxed baseline measures a
+single-process math workload and small file write/fsync/cached-read times.
+These observations are not solver throughput predictions. Acquired examples
+and computations record their measured wall duration separately. The producer
+and reviewer assess compatibility and feasible experiment scale from both.
+Repository discovery exposes GitHub's actual field semantics: default name,
+description and topics, with `in:readme` for documentation. Search receipts
+retain the exact query and coverage limits; an empty result does not establish
+that no scientifically suitable software exists.
+GPU scientific runtime readiness requires a candidate-specific execution;
+GPU inventory alone is insufficient. Requested POSIX limits and observed child
+soft/hard limits are reported separately alongside host capacity and the
+parent's output/wall bounds. Null child limits mean unlimited; OS limits may
+be unsupported or clipped by inherited limits. POSIX limits apply per process
+and do not reserve or bound aggregate job resources. Successful host checks
+remain receipt-bound inputs for experiment implementation as well as review.
+
 Source archives must contain regular files and directories with safe relative
 paths. Archive links, submodule retrieval, containers, distributed execution and
 remote HPC provisioning are not supported by this adapter.

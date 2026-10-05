@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import math
+import os
 import platform
 from pathlib import Path, PurePosixPath
 import re
@@ -25,10 +26,12 @@ from urllib.request import Request, urlopen
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
-from scisaurus.runtime.program_sandbox import run_sandboxed, sandbox_status
+from scisaurus.runtime.program_sandbox import (
+    DEFAULT_ADDRESS_SPACE, DEFAULT_CPU_SECONDS, DEFAULT_FILE_SIZE, run_sandboxed, sandbox_status,
+)
 from scisaurus.runtime.programs import _parse_object
 
-REVISION = "scientific-software-tools-1"
+REVISION = "scientific-software-tools-3"
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _PIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*==[A-Za-z0-9][A-Za-z0-9_.+!-]*\Z")
@@ -54,6 +57,7 @@ def tool_contract():
         "rules": [
             "Return either one tool_action or the assignment's final response, never both.",
             "Prefer established software that addresses the declared mechanism; assess species, units, calibration and scope.",
+            "search uses GitHub repository search, not semantic paper search: default fields are name, description and topics. Use concise mechanism or cited package names and explicit in:readme where documentation is relevant. Empty or incomplete results establish only that query's coverage; reformulate the search or inspect cited software directly before concluding suitable software is unavailable.",
             "Inspect the actual license and dependencies, read the upstream example, acquire a pinned revision, then reproduce that example.",
             "build is supplied only for native software; executable is relative to the acquired environment. Native runs use a Python adapter and may invoke the pinned engine_path in the read-only environment; all child processes share the same sandbox.",
             "Run programs consume one JSON object on stdin and emit one JSON object on stdout. R programs may use base R for JSON literals or a pinned JSON dependency.",
@@ -61,6 +65,7 @@ def tool_contract():
             "A successful installation is not scientific admission. Distinguish upstream examples, new computations and stored upstream results.",
             "Use actual tool errors to correct dependencies or program calls, or reject the candidate and search another. Never substitute invented equations for unavailable software.",
             "Source citations use the returned receipt_ref. Failed and unknown operations remain failures; repeating an identical action provides no new evidence.",
+            "Assess CPU, RAM, available storage and accelerator/runtime compatibility. Distinguish requested sandbox ceilings from observed child limits and their per-process scope. Use measured example/computation times to choose a feasible scale; a generic host benchmark is not the throughput of the selected scientific solver.",
             "Unsupported runtimes or system dependencies must be reported explicitly. No global package installs, shell commands, source builds with network, or credential access are available.",
         ],
     }
@@ -241,20 +246,81 @@ class SoftwareWorkbench:
         with tempfile.TemporaryDirectory(dir=self.root, prefix="environment-check-") as directory:
             root = Path(directory)
             script = root / "check.py"
-            script.write_text('import json,sys,platform; from pathlib import Path; Path("write-check").write_text("ok"); print(json.dumps({"version":sys.version,"executable":sys.executable,"architecture":platform.machine(),"workspace_writable":True}))')
+            script.write_text('import json,sys,platform,math,time,os,resource; from pathlib import Path\n'
+                'start=time.perf_counter(); checksum=sum(math.sin(i*.001)**2 for i in range(500000)); cpu_seconds=time.perf_counter()-start\n'
+                'path=Path("write-check"); payload=b"0"*(8*1024*1024); start=time.perf_counter()\n'
+                'with path.open("wb") as stream: stream.write(payload); stream.flush(); os.fsync(stream.fileno())\n'
+                'write_seconds=time.perf_counter()-start; start=time.perf_counter(); read_bytes=len(path.read_bytes()); read_seconds=time.perf_counter()-start\n'
+                'limits={name:{"soft":None if soft==resource.RLIM_INFINITY else soft,"hard":None if hard==resource.RLIM_INFINITY else hard} for name,which in (("cpu_seconds",resource.RLIMIT_CPU),("address_space_bytes",resource.RLIMIT_AS),("file_size_bytes",resource.RLIMIT_FSIZE),("open_files",resource.RLIMIT_NOFILE)) for soft,hard in [resource.getrlimit(which)]}\n'
+                'print(json.dumps({"version":sys.version,"executable":sys.executable,"architecture":platform.machine(),"workspace_writable":True,"posix_limits":limits,"baseline":{"kind":"single_process_math_and_cached_file_io_not_solver_throughput","math_iterations":500000,"checksum":checksum,"math_seconds":cpu_seconds,"file_bytes":read_bytes,"write_and_fsync_seconds":write_seconds,"cached_read_seconds":read_seconds}}))')
             python = self._sandbox([sys.executable, "-I", str(script)], root)
+            observed_limits = _parse_object(python["stdout"].encode("utf-8")).get("posix_limits")
             rscript = shutil.which("Rscript")
             r = None
             if rscript:
                 source = root / "check.R"
                 source.write_text('cat(R.version.string, "\\n"); cat(R.version$arch, "\\n"); cat(.libPaths(), sep="\\n")')
-                r = self._sandbox([rscript, "--vanilla", str(source)], root)
+                try:
+                    r = self._sandbox([rscript, "--vanilla", str(source)], root)
+                except SoftwareExecutionError as exc:
+                    r = {"status":"unavailable", "execution":exc.execution}
             tools = {name: shutil.which(name) for name in ("R", "Rscript", "cc", "c++", "gfortran", "make", "cmake", "ninja", "pkg-config", "mpiexec", "nvidia-smi", "docker", "git")}
+            disk = shutil.disk_usage(self.root)
             return {"platform": platform.system(), "architecture": platform.machine(), "sandbox": sandbox_status(),
                     "python": python, "r": r, "system_tools": tools,
-                    "workspace": str(self.root), "free_bytes": shutil.disk_usage(self.root).free,
+                    "resources": self._host_resources(),
+                    "sandbox_limits": {
+                        "requested_posix": {"cpu_seconds_per_process":DEFAULT_CPU_SECONDS,"address_space_bytes":DEFAULT_ADDRESS_SPACE,
+                                            "file_size_bytes":DEFAULT_FILE_SIZE},
+                        "observed_python_posix": observed_limits,
+                        "semantics":"observed child soft/hard limits; null is unlimited. Requested defaults may be clipped or unsupported. Limits apply per process, not to aggregate job memory or CPU.",
+                        "captured_output_bytes":5000000,"wall_seconds":self._remaining()},
+                    "workspace": str(self.root), "free_bytes": disk.free,
+                    "storage": {"total_bytes":disk.total,"used_bytes":disk.used,"free_bytes":disk.free,"scope":"workspace filesystem; shared volumes may share capacity"},
                     "private_environments": True, "global_installation_allowed": False,
                     "readiness": "runtimes_probed_dependencies_not_yet_assessed"}
+
+    def _host_resources(self):
+        """Observe host capacity without interpreting installed tools as readiness."""
+        import subprocess
+        resources = {"cpu":{"logical_count":os.cpu_count(),"physical_count":None,"load_average":list(os.getloadavg())},
+                     "memory":{"total_bytes":None,"reclaimable_available_bytes":None},"accelerators":[],"diagnostics":[]}
+        def probe(command):
+            try:
+                result=subprocess.run(command,capture_output=True,text=True,timeout=min(15,self._remaining()),env={"PATH":"/usr/bin:/bin"})
+                if result.returncode:
+                    resources["diagnostics"].append({"command":command,"returncode":result.returncode,"stderr":result.stderr})
+                    return None
+                return result.stdout
+            except (OSError,subprocess.TimeoutExpired) as exc:
+                resources["diagnostics"].append({"command":command,"error":str(exc)})
+                return None
+        if platform.system()=="Darwin":
+            for name,section,key in (("hw.memsize","memory","total_bytes"),("hw.physicalcpu","cpu","physical_count")):
+                value=probe(["/usr/sbin/sysctl","-n",name])
+                if value and value.strip().isdecimal(): resources[section][key]=int(value)
+            value=probe(["/usr/bin/vm_stat"])
+            if value:
+                page=re.search(r"page size of (\d+) bytes",value)
+                rows={name:int(count) for name,count in re.findall(r"(Pages [a-z ]+):\s+(\d+)\.",value)}
+                if page and all(name in rows for name in ("Pages free","Pages inactive","Pages speculative")):
+                    resources["memory"].update(reclaimable_available_bytes=int(page[1])*sum(rows[name] for name in ("Pages free","Pages inactive","Pages speculative")),
+                        available_semantics="free plus inactive plus speculative pages; reclaimable estimate, not reserved memory")
+            value=probe(["/usr/sbin/system_profiler","SPDisplaysDataType","-json"])
+            if value:
+                try:
+                    for row in json.loads(value).get("SPDisplaysDataType",[]):
+                        resources["accelerators"].append({"model":row.get("sppci_model",row.get("_name")),"cores":row.get("sppci_cores"),
+                            "memory":row.get("spdisplays_vram"),"metal_support":row.get("spdisplays_mtlgpufamilysupport",row.get("spdisplays_metal")),
+                            "scientific_runtime_readiness":"not_probed"})
+                except (ValueError,TypeError) as exc: resources["diagnostics"].append({"probe":"GPU inventory","error":str(exc)})
+        elif platform.system()=="Linux":
+            try:
+                rows={name:int(count)*1024 for name,count in re.findall(r"^(\w+):\s+(\d+) kB",Path("/proc/meminfo").read_text(),re.M)}
+                resources["memory"].update(total_bytes=rows.get("MemTotal"),reclaimable_available_bytes=rows.get("MemAvailable"),available_semantics="kernel MemAvailable estimate, not reserved memory")
+                resources["cpu"]["affinity_count"]=len(os.sched_getaffinity(0))
+            except (OSError,AttributeError,ValueError) as exc: resources["diagnostics"].append({"probe":"host resources","error":str(exc)})
+        return resources
 
     def _search(self, args, _key):
         _fields(args, {"query"}, {"page"})
@@ -266,6 +332,11 @@ class SoftwareWorkbench:
         value = self._api("search/repositories?" + urlencode({"q": args["query"], "per_page": 100, "page": page}))
         return {"query": args["query"], "page": page, "total_count": value["total_count"],
                 "incomplete_results": value.get("incomplete_results", False),
+                "search_contract": {"provider":"GitHub repository search",
+                    "default_fields":["name","description","topics"],
+                    "documentation_qualifier":"in:readme",
+                    "interpretation":"An empty result is not evidence that no suitable scientific software exists. Use concise mechanism or cited package queries, broaden overly specific wording, and inspect source-cited repositories directly.",
+                    "reference":"https://docs.github.com/en/search-github/searching-on-github/searching-for-repositories"},
                 "repositories": [{key: row.get(key) for key in ("full_name", "html_url", "description", "license", "stargazers_count", "archived", "updated_at")}
                                  for row in value["items"]], "next_page": page + 1 if page * 100 < value["total_count"] else None}
 
@@ -309,10 +380,17 @@ class SoftwareWorkbench:
     def _sandbox(self, command, workspace, *, stdin=b"", env=None, read_only_paths=()):
         if sandbox_status()["mode"] != "sandbox-exec":
             raise ValidationError("scientific software installation and execution require the deny-by-default sandbox")
-        result = self.runner(command, workspace=str(workspace), input_bytes=stdin,
-                             timeout_seconds=self._remaining(), allow_network=False,
-                             env={"PATH": "/opt/homebrew/bin:/usr/bin:/bin", **(env or {})}, read_only_paths=read_only_paths)
-        record = {"command": command, "returncode": result.returncode, "stdout": result.stdout.decode("utf-8", errors="replace"),
+        started=time.monotonic()
+        try:
+            result = self.runner(command, workspace=str(workspace), input_bytes=stdin,
+                                 timeout_seconds=self._remaining(), allow_network=False,
+                                 env={"PATH": "/opt/homebrew/bin:/usr/bin:/bin", **(env or {})}, read_only_paths=read_only_paths)
+        except OSError as exc:
+            raise SoftwareExecutionError({"command":command,"elapsed_seconds":time.monotonic()-started,
+                "returncode":None,"stdout":"","stderr":"","timed_out":False,"truncated":False,
+                "sandbox_mode":sandbox_status()["mode"],"stdin_sha256":_sha(stdin),
+                "startup_error":{"type":type(exc).__name__,"errno":exc.errno,"message":str(exc)}}) from exc
+        record = {"command": command, "elapsed_seconds":time.monotonic()-started,"returncode": result.returncode, "stdout": result.stdout.decode("utf-8", errors="replace"),
                   "stderr": result.stderr.decode("utf-8", errors="replace"), "timed_out": result.timed_out,
                   "truncated": result.truncated, "sandbox_mode": result.mode, "stdin_sha256": _sha(stdin)}
         if result.returncode != 0 or result.timed_out or result.truncated or result.mode != "sandbox-exec":

@@ -13033,6 +13033,10 @@ class ComposerRunner:
                 result.pop("steps", None)
         return {"assessment_ref": assessment["artifact_ref"], "selection": evidence["selection"],
                 "operations": _preserve_response_value(selected),
+                "host_environment_checks": _preserve_response_value([
+                    row for row in evidence.get("discovery_and_diagnostics", [])
+                    if row.get("outcome") == "ok" and row.get("action", {}).get("operation") == "check_environment"
+                ]),
                 "review": deepcopy(assessment["review"]),
                 "execution_contract": "Reuse the exact acquired software computations as source-bound inputs. Do not replace the package mechanism with copied or invented equations. New scientific parameters require a new controller-recorded software computation, not relabelled old outputs. Ordinary experiment replay, independent recalculation and scientific review remain required."}
 
