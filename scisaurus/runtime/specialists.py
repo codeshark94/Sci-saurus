@@ -76,6 +76,22 @@ def research_question_alignment(topic, intent):
     }
 
 
+def _exact_quote_pointers(document, quote, pointer=""):
+    if isinstance(document, str):
+        return [pointer] if quote in document else []
+    if isinstance(document, dict):
+        children = document.items()
+    elif isinstance(document, list):
+        children = enumerate(document)
+    else:
+        return []
+    matches = []
+    for key, value in children:
+        segment = str(key).replace("~", "~0").replace("/", "~1")
+        matches.extend(_exact_quote_pointers(value, quote, f"{pointer}/{segment}"))
+    return matches
+
+
 def validate_decision_alignment(plan, evidence_document):
     """Validate evidence references without choosing the scientific estimand."""
     alignment = evidence_document.get("question_alignment", {})
@@ -111,6 +127,8 @@ def validate_decision_alignment(plan, evidence_document):
         if not isinstance(evidence_checks, list) or not evidence_checks:
             raise ValidationError("repair plan requires supplied-evidence checks of decisive assertions")
         from scisaurus.runtime.experiment import _json_pointer_value
+        evidence_root = {"repair_adjudication_packet": evidence_document}
+        citation_errors = []
         for index, check in enumerate(evidence_checks):
             required = ("claim", "pointer", "quote", "explanation")
             missing = [key for key in required if not isinstance(check, dict)
@@ -120,16 +138,20 @@ def validate_decision_alignment(plan, evidence_document):
             if check.get("disposition") not in {"supported", "rebutted"}:
                 raise ValidationError("evidence check disposition must be supported or rebutted")
             try:
-                cited = _json_pointer_value(
-                    {"repair_adjudication_packet": evidence_document}, check["pointer"])
+                cited = _json_pointer_value(evidence_root, check["pointer"])
             except ValidationError as exc:
-                raise ValidationError(f"evidence check pointer does not resolve: {exc}")
+                citation_errors.append(f"evidence_checks[{index}].pointer does not resolve: {exc}; "
+                    f"exact quote locations: {json.dumps(_exact_quote_pointers(evidence_root, check['quote']))}")
+                continue
             if not isinstance(cited, str) or check["quote"] not in cited:
-                raise ValidationError(
+                citation_errors.append(
                     "evidence check quote does not occur in its supplied source field: "
                     f"evidence_checks[{index}].quote at {check['pointer']!r}; "
                     "copy a contiguous exact substring from that string field, "
-                    "not a paraphrase or a quotation from another field")
+                    "not a paraphrase or a quotation from another field; "
+                    f"exact quote locations: {json.dumps(_exact_quote_pointers(evidence_root, check['quote']))}")
+        if citation_errors:
+            raise ValidationError("; ".join(citation_errors))
     return ({"decision_alignment": deepcopy(decision_alignment),
              "evidence_checks": deepcopy(evidence_checks)} if decision_alignment is not None else {})
 
@@ -1704,6 +1726,7 @@ def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports
             "document_root": "the original prompt object",
             "example_pointer": "/repair_adjudication_packet/question_alignment/candidate/primary_outcomes/0/definition",
             "quote_rule": "Copy contiguous text from the resolved string field exactly, including whitespace; never invent source statements or replace line breaks with semicolons.",
+            "source_chunk_rule": "source_chunks is an ordered transport of one source, not separate source revisions. Each quote must use the index of the chunk containing its exact text. A chunk boundary is not a code defect. Citation validation reports all unresolved or mismatched references together and exact matching locations; correct the response references without changing evidence or scientific claims.",
         }
     return _json_with_budget(
         envelope, system=REPAIR_ADJUDICATION_SYSTEM,

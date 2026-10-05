@@ -1727,6 +1727,26 @@ class SpecialistDispatcherTests(unittest.TestCase):
         self.assertIn(pointer, str(error.exception))
         check["quote"] = definition
         self.assertEqual(validate_decision_alignment(plan, evidence)["evidence_checks"], [check])
+        evidence["source/chunks"] = ["first source", "second source"]
+        plan["evidence_checks"] = [
+            {**check, "pointer": "/repair_adjudication_packet/source~1chunks/0", "quote": "second source"},
+            {**check, "pointer": "/repair_adjudication_packet/missing", "quote": "first source"},
+            {**check, "quote": "Invented source"},
+        ]
+        with self.assertRaises(ValidationError) as error:
+            validate_decision_alignment(plan, evidence)
+        message = str(error.exception)
+        self.assertIn("evidence_checks[0].quote", message)
+        self.assertIn("evidence_checks[1].pointer", message)
+        self.assertIn("evidence_checks[2].quote", message)
+        self.assertIn('"/repair_adjudication_packet/source~1chunks/1"', message)
+        self.assertIn('"/repair_adjudication_packet/source~1chunks/0"', message)
+        self.assertIn("exact quote locations: []", message)
+        plan["evidence_checks"] = [
+            {**check, "pointer": "/repair_adjudication_packet/source~1chunks/1", "quote": "second source"},
+            {**check, "pointer": "/repair_adjudication_packet/source~1chunks/0", "quote": "first source"},
+        ]
+        self.assertEqual(validate_decision_alignment(plan, evidence)["evidence_checks"], plan["evidence_checks"])
 
     def test_verifier_retry_owns_its_diagnostic_without_excusing_stage_errors(self):
         model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:1/v1",
