@@ -1,8 +1,8 @@
 # Ollama Cloud model wiring
 
-Sci-saurus dispatches structured model work through Ollama's local
-OpenAI-compatible bridge. The bridge is a provider adapter, not a second
-inference implementation: Ollama resolves the configured `:cloud` model and
+Sci-saurus dispatches structured model work through Ollama's native API or
+local OpenAI-compatible bridge. Both are provider adapters: Ollama resolves
+the configured `:cloud` model and
 owns the provider credentials. Sci-saurus never silently falls back to a
 different model.
 
@@ -58,6 +58,15 @@ variable name is stored in descriptors.
   settings such as output limits can be declared alongside the reference;
   inline routing overrides are rejected. The referenced file participates in
   stage input fingerprints, and model budget owners remain cumulative.
+- Native Ollama routes send `reasoning_effort` as the API's `think` control:
+  `none` becomes `false`, while `low`, `medium`, and `high` are sent as named
+  levels. Select a level supported by the model's `/api/show` metadata.
+  Structured replies use `format: "json"`; only `message.content` is treated
+  as the final response, and total generated tokens remain in usage accounting.
+- Image descriptors retain their pinned SHA-256, media type, byte limits,
+  and context admission checks on both transports. Native Ollama receives
+  base64 images in `messages[].images`; the compatible API receives image
+  content parts. The chosen model must support vision for figure reviews.
 - `model.role_models` provides explicit per-role provider/model overrides.
   Qwen and Gemma are assigned to the largest bulk workload: scholarly/web
   scouting, cataloging, citation mapping, source review, prose, and surface
@@ -78,13 +87,14 @@ variable name is stored in descriptors.
 - Ollama runs reserve one independent verifier slot: the active configuration
   is `concurrent_calls = 4` and `worker_concurrency = 3`. This is a bounded
   reservation, not a claim that a provider quota is currently available.
-- Structured stages use `reasoning_effort = none` and `output_format =
+- Compatible structured stages use `reasoning_effort = none` and `output_format =
   json_object`. The client rejects empty or non-JSON replies instead of
   fabricating a fallback.
 - The client keeps its own timeout, byte, retry, and attempt accounting. A
   stage budget remains authoritative even when the provider retries. Premium
   call reservations are atomic and count each retry attempt before network I/O.
-- Images are sent only as bounded Base64 `data:` parts. The configured image
+- Images are sent as bounded Base64 payloads in the selected transport's
+  image fields. The configured image
   and request byte limits apply before dispatch.
 
 ## Verification
@@ -120,20 +130,21 @@ PY
 
 - `deepseek-v4.1-flash:cloud` passed the adapter preflight and an actual long
   topic-discovery JSON call with a terminating response and valid JSON. It is
-  the default for structured Sci-saurus stages.
+  a compatible structured route; current assignments come from the shared
+  role table.
 - The owner-private Tailnet endpoint returned HTTP 200 for its `/v1/models`
   probe on 2026-09-15 from this host. It is available as an explicitly
   authorized weak research route for scouting and citation work; its old public
   `:8443` exposure remains retired.
 - `gemma4:31b-cloud` is present in Ollama's model listing and is configured for
-  low-risk roles, but a fresh adapter probe currently returns HTTP 429 because
-  Ollama's five-hour usage window is exhausted. It is not treated as accepted
-  live capacity until a later probe succeeds.
-- `glm-5.3-flash:cloud` is configured for independent reviews, methods
-  judgments, and adversarial checks. An older probe exposed a provider
-  reasoning wrapper and exhausted its completion budget; the adapter now
-  accepts only the exact JSON suffix after that wrapper, but a fresh live
-  GLM acceptance probe is still pending the Ollama quota reset.
+  low-risk roles. An earlier adapter probe returned HTTP 429 from an exhausted
+  usage window; that historical response does not establish current capacity.
+- On 2026-10-05, `glm-5.3-flash:cloud` declared thinking levels `low`, `high`,
+  and `max`. A matched structured smoke request through the compatible route
+  returned reasoning prose, while native `think: "low"` returned valid JSON.
+  Actual ModelClient probes also returned valid JSON and correctly identified
+  a pinned image through the native route. These probes establish transport
+  behavior, not completed mission work or scientific admission.
 
 These are observed executions, not latency or provider-availability
 guarantees. A provider failure remains visible in the run ledger.

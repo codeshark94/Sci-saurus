@@ -142,8 +142,6 @@ def validate_experiment_config(config, *, require_literature_gate=True):
     repair_mode = config.get("limits", {}).get("repair_mode")
     if repair_mode is not None and repair_mode not in {"bounded", "until_deadline"}:
         raise ValidationError("limits.repair_mode must be bounded or until_deadline")
-    if config["model"]["protocol"] != "openai_compatible":
-        raise ValidationError("experiment review requires an openai_compatible multimodal model")
     if config["limits"]["concurrent_calls"] < 3:
         raise ValidationError("experiment capacity must cover two reviewers and final verification")
     experiment = config.get("experiment")

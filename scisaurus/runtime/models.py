@@ -1748,8 +1748,8 @@ class ModelClient:
             }.items() if value is not None
         }
         _validate_sampling_options(sampling)
-        if protocol != "openai_compatible" and reasoning_effort is not None:
-            raise ValidationError("reasoning_effort requires the openai_compatible protocol")
+        if protocol == "ollama" and reasoning_effort == "xhigh":
+            raise ValidationError("native Ollama reasoning_effort requires none, low, medium, or high")
         if auth_env is not None and (not isinstance(auth_env, str) or not auth_env or not os.environ.get(auth_env)):
             raise ValidationError("configured model authentication environment variable is absent")
         self.base_url, self.model, self.protocol = base_url.rstrip("/"), model, protocol
@@ -1811,8 +1811,6 @@ class ModelClient:
         images = [] if images is None else images
         if not isinstance(images, list) or len(images) > 16:
             raise ValidationError("model images must be a list containing at most 16 items")
-        if images and self.protocol != "openai_compatible":
-            raise ValidationError("multimodal image input requires the openai_compatible protocol")
         context_config = {
             "model": request_model, "max_output_tokens": self.max_output_tokens,
             "context_window_tokens": self.context_window_tokens,
@@ -1837,17 +1835,23 @@ class ModelClient:
                 max_output_tokens=context_budget["max_output_tokens"],
                 image_count=context_budget["image_count"],
             )
-        parts, total = [{"type": "text", "text": prompt}], 0
+        parts, encoded_images, total = [{"type": "text", "text": prompt}], [], 0
         for descriptor in images:
             raw, media_type = self._read_image(descriptor)
             total += len(raw)
             if total > self.max_image_bytes:
                 raise ValidationError("combined model images exceed the configured byte limit")
             encoded = base64.b64encode(raw).decode("ascii")
+            encoded_images.append(encoded)
             parts.append({"type": "image_url", "image_url": {
                 "url": f"data:{media_type};base64,{encoded}"}})
-        user_content = parts if images else prompt
-        messages = [{"role": "system", "content": system}, {"role": "user", "content": user_content}]
+        user_message = {"role": "user", "content": prompt}
+        if images:
+            if self.protocol == "ollama":
+                user_message["images"] = encoded_images
+            else:
+                user_message["content"] = parts
+        messages = [{"role": "system", "content": system}, user_message]
         if continuation_text is not None:
             messages.extend([
                 {"role": "assistant", "content": continuation_text},
@@ -1863,6 +1867,9 @@ class ModelClient:
         }
         if self.protocol == "ollama":
             path = "/api/chat"
+            if self.reasoning_effort is not None:
+                body["think"] = (False if self.reasoning_effort == "none"
+                                 else self.reasoning_effort)
             # Ollama's native options expose temperature/top-p/seed but not
             # the OpenAI presence/frequency penalty names.
             body["options"] = {

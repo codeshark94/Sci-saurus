@@ -1011,21 +1011,39 @@ class TestModelClient(unittest.TestCase):
         self.assertEqual(base64.b64decode(url.split(',', 1)[1]), png)
         self.assertEqual(result.json_object(), {'ok': True})
 
-    def test_multimodal_input_rejects_drift_mismatch_and_unsupported_protocol(self):
+    def test_native_multimodal_images_are_hash_pinned_and_embedded(self):
+        self.response = {'message': {'content': '{"ok":true}', 'thinking': 'Internal trace.'},
+                         'done': True, 'done_reason': 'stop', 'eval_count': 40}
+        png = b'\x89PNG\r\n\x1a\n' + b'fixture-image'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'figure.png'
+            path.write_bytes(png)
+            result = self.client('ollama', reasoning_effort='low').complete(
+                system='Return JSON.', prompt='Inspect the figure.', images=[{
+                    'path': str(path.resolve()), 'media_type': 'image/png',
+                    'sha256': hashlib.sha256(png).hexdigest(),
+                }], continuation_text='{"partial":')
+        message = self.request['messages'][1]
+        self.assertEqual(message['content'], 'Inspect the figure.')
+        self.assertEqual(base64.b64decode(message['images'][0]), png)
+        self.assertNotIn('data:', message['images'][0])
+        self.assertEqual(self.request['messages'][2]['content'], '{"partial":')
+        self.assertEqual(result.json_object(), {'ok': True})
+
+    def test_multimodal_input_rejects_drift_and_mismatch_on_both_protocols(self):
         png = b'\x89PNG\r\n\x1a\n' + b'fixture-image'
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'figure.png'
             path.write_bytes(png)
             valid = {'path': str(path.resolve()), 'media_type': 'image/png',
                      'sha256': hashlib.sha256(png).hexdigest()}
-            with self.assertRaises(ValidationError):
-                self.client().complete(system='x', prompt='x', images=[valid])
-            with self.assertRaises(ValidationError):
-                self.client('openai_compatible').complete(
-                    system='x', prompt='x', images=[{**valid, 'sha256': '0' * 64}])
-            with self.assertRaises(ValidationError):
-                self.client('openai_compatible').complete(
-                    system='x', prompt='x', images=[{**valid, 'media_type': 'image/jpeg'}])
+            for protocol in ('ollama', 'openai_compatible'):
+                for invalid in ({**valid, 'sha256': '0' * 64},
+                                {**valid, 'media_type': 'image/jpeg'},
+                                {**valid, 'path': str(path.resolve()) + '.missing'}):
+                    with self.subTest(protocol=protocol, invalid=invalid), self.assertRaises(ValidationError):
+                        self.client(protocol).complete(system='x', prompt='x', images=[invalid])
+        self.assertFalse(hasattr(self, 'request'))
 
     def test_multimodal_request_limits_are_enforced_before_network(self):
         png = b'\x89PNG\r\n\x1a\n' + b'x' * 64
@@ -1034,9 +1052,13 @@ class TestModelClient(unittest.TestCase):
             path.write_bytes(png)
             image = {'path': str(path.resolve()), 'media_type': 'image/png',
                      'sha256': hashlib.sha256(png).hexdigest()}
-            with self.assertRaises(ValidationError):
-                self.client('openai_compatible', max_image_bytes=32,
-                            max_request_bytes=128).complete(system='x', prompt='x', images=[image])
+            for protocol in ('ollama', 'openai_compatible'):
+                for limits, images in (({'max_image_bytes': 32}, [image]),
+                                       ({'max_image_bytes': 100000, 'max_request_bytes': 128}, [image]),
+                                       ({}, [image] * 17)):
+                    with self.subTest(protocol=protocol, limits=limits), self.assertRaises(ValidationError):
+                        self.client(protocol, **limits).complete(system='x', prompt='x', images=images)
+        self.assertFalse(hasattr(self, 'request'))
 
     def test_invalid_or_unsupported_generation_options_fail_before_network(self):
         for value in ('', 'ultra', True, ['high']):
@@ -1045,13 +1067,26 @@ class TestModelClient(unittest.TestCase):
         for value in ('', 'json_schema', True, {'type': 'json_object'}):
             with self.subTest(output_format=value), self.assertRaises(ValidationError):
                 self.client('openai_compatible', output_format=value)
-        for options in ({'reasoning_effort': 'none'}, {'reasoning_effort': 'high'},
-                        {'reasoning_effort': 'xhigh'}):
+        for options in ({'reasoning_effort': 'xhigh'},):
             with self.subTest(ollama_options=options), self.assertRaises(ValidationError):
                 self.client('ollama', **options)
         with self.assertRaises(ValidationError):
             self.client('ollama', output_format='json_schema')
         self.assertFalse(hasattr(self, 'request'))
+
+    def test_native_reasoning_controls_use_think_and_keep_only_final_content(self):
+        self.response = {'model': 'served-model', 'message': {
+            'content': '{"ok":true}', 'thinking': 'Internal model trace.'},
+            'done': True, 'done_reason': 'stop', 'prompt_eval_count': 20, 'eval_count': 40}
+        for effort, wire_value in (('none', False), ('low', 'low'), ('medium', 'medium'), ('high', 'high')):
+            with self.subTest(effort=effort):
+                result = self.client('ollama', reasoning_effort=effort,
+                                     output_format='json_object').complete(system='Return JSON.', prompt='Inspect.')
+                self.assertEqual(self.request['think'], wire_value)
+                self.assertNotIn('reasoning_effort', self.request)
+                self.assertEqual(self.request['format'], 'json')
+                self.assertEqual(result.json_object(), {'ok': True})
+                self.assertEqual(result.usage['output_tokens'], 40)
 
     def test_json_output_mode_accepts_an_exact_json_markdown_fence(self):
         self.response = {'choices': [{'message': {'content': '```json\n{"ok":true}\n```'}, 'finish_reason': 'stop'}]}

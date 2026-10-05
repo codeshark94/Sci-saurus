@@ -420,6 +420,19 @@ class ExperimentTests(unittest.TestCase):
                     "setup", "supervision", "production", "unit_review", "integrated_review", "reassessment")},
                 "max_observations": 10, "max_asset_bytes": 100000}}
 
+    def test_native_multimodal_transport_keeps_experiment_contract(self):
+        config = self.config()
+        expected = validate_experiment_config(config)['experiment']
+        native = self.config()
+        native['model'].update(protocol='ollama', base_url='http://example.invalid',
+                               reasoning_effort='low', output_format='json_object')
+        actual = validate_experiment_config(native)
+        self.assertEqual(actual['experiment'], expected)
+        self.assertEqual(actual['model']['protocol'], 'ollama')
+        native['model']['protocol'] = 'unsupported'
+        with self.assertRaises(ValidationError):
+            validate_experiment_config(native)
+
     def test_program_and_deterministic_contracts_reject_missing_evidence(self):
         config = validate_experiment_config(self.config())["experiment"]
         candidate = {"schema_version": "experiment-program-output-1", "study_id": "fixture_study", "revision": 1,
