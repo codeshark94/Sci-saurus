@@ -95,7 +95,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-development-foundry-model-transport-22")
+    "experiment-development-foundry-program-artifact-23")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -513,6 +513,7 @@ def default_runtime_environment_files(repo_root=None):
     root = (Path(repo_root).resolve() if repo_root is not None
             else Path(__file__).resolve().parents[2])
     candidates = (
+        Path.home() / ".config" / "scisaurus" / "semantic-scholar.env",
         root / "local-private" / "openalex.env",
         root / "local-private" / "ollama-cloud.env",
         root / "local-private" / "ollama-recovery.env",
@@ -953,6 +954,8 @@ class ComposerRunner:
                 or not math.isfinite(additional_seconds) or additional_seconds <= 0):
             raise ValidationError("additional_seconds must be finite and positive")
         self.root = Path(self.workflow["project_id"]).resolve()
+        from scisaurus.runtime.run_control import check_project_stop
+        check_project_stop(self.root)
         # project_id is the stable identity; the workflow's project directory
         # is derived from it so a config cannot redirect the control ledger.
         self.root.mkdir(parents=True, exist_ok=True)
@@ -23092,7 +23095,7 @@ class ComposerRunner:
             findings = feedback.get("findings")
             if (not isinstance(gate, str)
                     or gate not in {"adversarial_review", "independent_recalculation",
-                                    "deterministic_replay", "validator_readiness", "static_scan"}
+                                    "deterministic_replay", "validator_readiness", "static_scan", "model_definition"}
                     or not isinstance(findings, list)):
                 continue
             complete_findings = [
@@ -23297,6 +23300,7 @@ class ComposerRunner:
         allowed_gates = {
             "adversarial_review", "independent_recalculation",
             "deterministic_replay", "validator_readiness", "static_scan",
+            "model_definition",
         }
         for stage_id, stage in by_id.items():
             if not isinstance(stage, dict) or stage.get("kind") != "experiment":
@@ -28149,6 +28153,11 @@ class ComposerRunner:
         return True
 
     def run(self):
+        from scisaurus.runtime.run_control import project_permission
+        with project_permission(self.root):
+            return self._run_authorized()
+
+    def _run_authorized(self):
         try:
             self._retire_restored_workflow_stops()
             for stage in self.workflow["stages"]:

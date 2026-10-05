@@ -4174,15 +4174,19 @@ class IndependentValidatorAuthorshipTests(unittest.TestCase):
         response = {'model': 'peer', 'finish_reason': 'stop', 'elapsed_seconds': 1.5,
                     'usage': {'model_calls': 1}, 'text': '{"validator_source":"source"}'}
         request = {key: value for key, value in response.items() if key != 'text'}
-        request.update(role='methods.validator-author', assignment_sha256='assignment', status='succeeded',
+        assignment = {'design': 'frozen'}
+        identity = hashlib.sha256(canonical_bytes(assignment)).hexdigest()
+        prompt = json.dumps(assignment)
+        request.update(role='methods.validator-author', assignment_sha256=identity, status='succeeded',
+                       prompt=prompt, prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
                        response_sha256=hashlib.sha256(response['text'].encode()).hexdigest())
-        self.assertEqual(_captured_validator_request({'requests': [request]}, 'assignment', response), request)
+        self.assertEqual(_captured_validator_request({'requests': [request]}, identity, response), request)
         for update in ({'status': 'result_unknown'}, {'status': 'started'}, {'model': 'other'},
                        {'elapsed_seconds': 2.0}, {'usage': {'model_calls': 2}},
                        {'response_sha256': 'wrong'}, {'finish_reason': 'length'}):
             newer = {**request, **update}
             self.assertIsNone(_captured_validator_request({'requests': [request, newer]},
-                                                         'assignment', response))
+                                                         identity, response))
 
     def test_validator_model_transport_preserves_source_and_rejects_ambiguous_payloads(self):
         from scisaurus.runtime.capability_foundry import _independent_validator_source
@@ -4558,7 +4562,7 @@ class IndependentValidatorAuthorshipTests(unittest.TestCase):
                 self.assertEqual(error.repair_gate, 'independent_validator_contract')
                 self.assertEqual(classify_failure('experiment', error), 'model_contract')
                 self.assertEqual(error.repair_ledger[-1]['gate'], 'independent_validator_contract')
-                self.assertEqual(error.repair_ledger[-1]['next_action'], 'format_repair_then_rerun')
+                self.assertEqual(error.repair_ledger[-1]['next_action'], 'patch_current_validator')
                 self.assertEqual((producer.calls, foundry.validator_client.calls), (1, 2))
             state = states[-1]
             self.assertEqual(state['last_attempt']['executor_source'], MINI_EXECUTOR)

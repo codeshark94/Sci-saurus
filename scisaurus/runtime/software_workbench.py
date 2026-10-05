@@ -72,6 +72,7 @@ def tool_contract():
             "Run programs consume one JSON object on stdin and emit one JSON object on stdout. R programs may use base R for JSON literals or a pinned JSON dependency.",
             "For upstream_example, expected must be {value: <documented upstream JSON object>, absolute_tolerance: <nonnegative number>, relative_tolerance: <nonnegative number>}; it cannot be null. For scientific_computation, expected may be null. Tolerances must follow documented precision; a match checks reproduction, not scientific fitness.",
             "A successful installation is not scientific admission. Distinguish upstream examples, new computations and stored upstream results.",
+            "Before admitting custom_model, record its mathematical model_definition and review source mappings, units and reference scales, coefficient status, applicability and question alignment. This is an implementation decision, not a requirement for final experimental results. Distinguish declared pilots from empirical calibrations.",
             "For custom_model or unavailable, environment_ref and example_ref must be null and computation_refs must be []; supporting helper acquisitions and failed operations remain diagnostic receipts rather than claims of scientific reuse.",
             "Use actual tool errors to correct dependencies or program calls, or reject the candidate and search another. Never substitute invented equations for unavailable software.",
             "Source citations use the returned receipt_ref. Failed and unknown operations remain failures; repeating an identical action provides no new evidence.",
@@ -177,7 +178,10 @@ class SoftwareWorkbench:
         # URLs are constructed exclusively from the GitHub API/codeload roots.
         limit = 128 * 1024 * 1024 if archive else 8 * 1024 * 1024
         request = Request(url, headers={"User-Agent": "Sci-saurus", "Accept": "application/vnd.github+json"})
-        with urlopen(request, timeout=min(60, self._remaining())) as response:
+        from scisaurus.runtime.run_control import dispatch_permission
+        with dispatch_permission():
+            response = urlopen(request, timeout=min(60, self._remaining()))
+        with response:
             if not response.url.startswith(("https://api.github.com/", "https://codeload.github.com/")):
                 raise ValidationError("software acquisition redirected outside its public repository provider")
             data = response.read(limit + 1)
@@ -203,6 +207,8 @@ class SoftwareWorkbench:
         return receipt
 
     def execute(self, action):
+        from scisaurus.runtime.run_control import ensure_run_allowed
+        ensure_run_allowed()
         _fields(action, {"operation", "arguments"})
         if not isinstance(action["operation"], str) or not isinstance(action["arguments"], dict):
             raise ValidationError("software action requires an operation name and argument object")
@@ -561,7 +567,8 @@ class SoftwareWorkbench:
                 # Only the trusted pip downloader has network access. Wheel code
                 # is never imported here; all install/build hooks run offline.
                 import subprocess
-                fetched = subprocess.run([executable, "-m", "pip", "--isolated", "download", "--index-url", "https://pypi.org/simple",
+                from scisaurus.runtime.run_control import run_process
+                fetched = run_process([executable, "-m", "pip", "--isolated", "download", "--index-url", "https://pypi.org/simple",
                     "--only-binary=:all:", "--dest", str(wheels), *args["requirements"]],
                     capture_output=True, timeout=self._remaining(), env={"PATH": "/usr/bin:/bin", "HOME": str(root), "PIP_CONFIG_FILE": "/dev/null"})
                 download = {"returncode": fetched.returncode, "stdout": fetched.stdout.decode(errors="replace"), "stderr": fetched.stderr.decode(errors="replace")}
@@ -755,13 +762,14 @@ def selection_contract():
             "requested_actions": [], "software_selection": {
                 "strategy": "reuse | custom_model | unavailable", "rationale": "source-bound scientific fit assessment",
                 "environment_ref": None, "example_ref": None, "computation_refs": [],
-                "scientific_source_refs": [], "limitations": []}}
+                "scientific_source_refs": [], "limitations": [],
+                "model_definition": "Required for custom_model: equations[{id,expression,status,source_ref}], variables[{id,unit,reference_scale}], parameters[{id,value,unit,status,source_ref,reason}], source_refs, applicability, claim_scope, question_alignment. Otherwise omit."}}
 
 
 def validate_selection(response, workbench, results):
     errors = _field_errors(response, {"decision", "summary", "findings", "evidence_gaps", "requested_actions", "software_selection"})
     if isinstance(response, dict) and "software_selection" in response:
-        errors.extend(_field_errors(response["software_selection"], {"strategy", "rationale", "environment_ref", "example_ref", "computation_refs", "scientific_source_refs", "limitations"}, path="/software_selection"))
+        errors.extend(_field_errors(response["software_selection"], {"strategy", "rationale", "environment_ref", "example_ref", "computation_refs", "scientific_source_refs", "limitations"}, {"model_definition"}, path="/software_selection"))
     if errors:
         raise ValidationError("; ".join(errors))
     selection = response["software_selection"]
@@ -793,5 +801,12 @@ def validate_selection(response, workbench, results):
     if selection["strategy"] == "custom_model":
         if not selection["scientific_source_refs"] or not any(row.get("outcome") == "ok" and row["action"]["operation"] in {"search", "search_evidence"} for row in results):
             raise ValidationError("custom modelling requires actual software discovery and source-bound justification")
+        from scisaurus.runtime.measurement_contract import validate_model_definition
+        source_refs = set(workbench.evidence_refs) | {row.get("receipt_ref") for row in results if row.get("outcome") == "ok"}
+        if not set(selection["scientific_source_refs"]).issubset(source_refs):
+            raise ValidationError("custom model cites scientific sources outside the acquired evidence")
+        validate_model_definition({"model_definition": selection.get("model_definition")},
+                                  source_refs=selection["scientific_source_refs"], required=response["decision"] == "pass")
+
     if selection["strategy"] == "unavailable" and response["decision"] != "hold":
         raise ValidationError("unavailable scientific software cannot admit implementation")

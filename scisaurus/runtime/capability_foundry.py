@@ -29,6 +29,7 @@ import unicodedata
 from dataclasses import asdict
 from pathlib import Path
 
+from scisaurus.runtime.measurement_contract import ModelDefinitionError
 from scisaurus.core.errors import ModelContractError, ValidationError
 from scisaurus.runtime.evidence import scientific_input_recovery_contract
 from scisaurus.core.schema import canonical_bytes, json_object as parse_complete_json_object
@@ -194,7 +195,7 @@ AUTHOR_CONTINUATION_SYSTEM = (
 VALIDATOR_AUTHOR_SYSTEM = (
     "You independently implement a scientific recalculation program from a frozen design and raw observation schema. "
     "You receive no executor source, producer validator or reported numerical results. "
-    "Return only a complete JSON object with validator_source. Use the permitted modules in the contract; "
+    "Return a complete JSON object with validator_source or exactly one complete Python code block. Never return prose or multiple artifacts. Use the permitted modules in the contract; "
     "never use the network, subprocesses, eval/exec or open()."
 )
 REVIEW_SYSTEM = (
@@ -208,6 +209,9 @@ REVIEW_SYSTEM = (
     "merely because observations are shared. Inspect the measurement code separately for mathematical defects. "
     "Require a justified mapping between the model and the research question: distinguish sourced equations "
     "and coefficients from declared design assumptions, and reject unsupported physical interpretation. "
+    "Compare model_definition against the exact current source, recorded source refs, units and reference scales, "
+    "parameter statuses and declared claim_scope. Compare decision_rules and their independently recalculated "
+    "values against each supported claim; a diagnostic sensitivity cannot prove decision robustness. "
     "Check applicable numerical convergence, settling, analytic limits and boundary/censoring conventions. "
     "Controls, sensitivity and uncertainty must be supported by computed evidence or a justified analytical "
     "calculation; a label, fixed detection threshold or description of an unperformed analysis is insufficient. "
@@ -238,31 +242,151 @@ CONFIG_FIELDS = {
 CONFIG_OPTIONAL_FIELDS = {"model_timeout_seconds"}
 
 
-def _independent_validator_source(response):
+
+def _artifact_generation_config(config, *, repair=False, empty_output=False):
+    """Separate implementation and local repair from scientific deliberation."""
+    config = deepcopy_config(config)
+    effort = config.get("reasoning_effort")
+    if empty_output:
+        config["reasoning_effort"] = "none"
+    elif effort is not None and effort != "none":
+        if repair:
+            config["reasoning_effort"] = "low"
+        elif effort in {"high", "xhigh"}:
+            config["reasoning_effort"] = "medium"
+    return config
+
+def _validator_program_artifact(response):
     if response.get("finish_reason") not in {"stop", "length"}:
         raise ValidationError("independent validator author response is incomplete")
-    value = parse_complete_json_object(response.get("text"), "independent validator author",
-                                       model_envelope=True, allow_analysis_prefix=False)
-    if set(value) != {"validator_source"} or not isinstance(value["validator_source"], str):
-        raise ValidationError("independent validator author must return exactly validator_source")
-    return value["validator_source"]
+    text = response.get("text")
+    if not isinstance(text, str):
+        raise ValidationError("independent validator author response must be text")
+    fenced = re.fullmatch(r"\s*```python[ \t]*\r?\n(?P<source>[\s\S]*?)^```[ \t]*(?:\r?\n)?\s*", text, re.MULTILINE)
+    if fenced:
+        source = fenced.group("source")
+        try:
+            ast.parse(source)
+        except (SyntaxError, ValueError) as exc:
+            raise ValidationError("independent validator Python artifact is incomplete or ambiguous") from exc
+        if not source.strip():
+            raise ValidationError("independent validator Python artifact is empty")
+        transport = "python_code_block"
+        span = list(fenced.span("source"))
+    else:
+        value = parse_complete_json_object(text, "independent validator author",
+                                           model_envelope=True, allow_analysis_prefix=False)
+        if set(value) != {"validator_source"} or not isinstance(value["validator_source"], str):
+            raise ValidationError("independent validator author must return exactly validator_source")
+        source, transport, span = value["validator_source"], "json_source_field", None
+    return {"source": source, "transport": transport, "source_span": span,
+            "response_sha256": hashlib.sha256(text.encode()).hexdigest(),
+            "source_sha256": hashlib.sha256(source.encode()).hexdigest()}
 
 
-def _captured_validator_request(state, identity, response):
+def _independent_validator_source(response):
+    return _validator_program_artifact(response)["source"]
+
+
+def _captured_validator_request(state, identity, response, *, store=None, visited=None):
     if not isinstance(response, dict):
         return None
     request = next((item for item in reversed(state.get("requests", []))
-                    if item.get("role") == "methods.validator-author"
+                    if isinstance(item, dict) and item.get("role") == "methods.validator-author"
                     and item.get("assignment_sha256") == identity), None)
+    if request is None:
+        inherited = state.get("validator_authorship", {}).get(identity, {}).get("inherited_dispatch")
+        if isinstance(inherited, dict):
+            if store is None:
+                return None
+            source_ref = inherited.get("source_ref")
+            visited = set() if visited is None else visited
+            if not isinstance(source_ref, str) or source_ref in visited:
+                raise ModelWorkProvenanceError("validator receipt inheritance has no unique immutable owner")
+            visited.add(source_ref)
+            record = store.get(source_ref)
+            raw = store.read_body(record["body_hash"])
+            if (record.get("author") != "command.controller" or inherited.get("source_body_sha256") != record["body_hash"]
+                    or hashlib.sha256(raw).hexdigest() != record["body_hash"]):
+                raise ModelWorkProvenanceError("validator receipt inheritance changed its immutable owner")
+            source = {**json.loads(raw), "cache_ref": source_ref}
+            owner = _captured_validator_request(source, identity, response, store=store, visited=visited)
+            if owner is None and inherited.get("migration") == "immutable-paired-prompt-hash-1":
+                migrated = _migrate_validator_receipt(source, identity, response, store)
+                owner = migrated.get("request") if migrated is not None else None
+            if owner != inherited.get("request"):
+                return None
+            request = owner
     if (not isinstance(request, dict) or request.get("status") != "succeeded"
+            or request.get("role") != "methods.validator-author"
+            or request.get("assignment_sha256") != identity
             or any(request.get(key) != response.get(key)
                    for key in ("model", "finish_reason", "elapsed_seconds", "usage"))):
         return None
     digest = hashlib.sha256(str(response.get("text", "")).encode()).hexdigest()
-    if request.get("response_sha256", digest) != digest:
+    if request.get("response_sha256") != digest:
+        return None
+    prompt = request.get("prompt")
+    if not isinstance(prompt, str) or request.get("prompt_sha256") != hashlib.sha256(prompt.encode()).hexdigest():
+        return None
+    try:
+        assignment = json.loads(prompt)
+    except ValueError:
+        return None
+    if not isinstance(assignment, dict):
+        return None
+    assignment.pop("validator_repair", None)
+    assignment.pop("validator_continuation", None)
+    if hashlib.sha256(canonical_bytes(assignment)).hexdigest() != identity:
         return None
     return request
 
+
+
+
+def _assembled_validator_response(retained, identity):
+    """Verify every suffix against its captured request before using assembled bytes."""
+    chain = retained.get("continuation")
+    if not isinstance(chain, dict):
+        return retained["response"]
+    root = chain["root_response"]
+    if _captured_validator_request({"requests": [chain["root_request"]]}, identity, root) is None:
+        raise ValidationError("validator continuation root has no captured dispatch owner")
+    partial = root["text"]
+    for item in chain.get("segments", []):
+        response, request = item["response"], item["request"]
+        if _captured_validator_request({"requests": [request]}, identity, response) is None:
+            raise ValidationError("validator continuation segment has no captured dispatch owner")
+        extension = json.loads(request["prompt"])["validator_continuation"]
+        marker, digest, prompt = _author_continuation_prompt(partial)
+        if extension != json.loads(prompt) or digest != item["prefix_sha256"]:
+            raise ValidationError("validator continuation does not bind its exact prefix")
+        partial += _author_continuation_suffix(partial, ModelResult(**response), marker)
+    if chain.get("partial_sha256") != hashlib.sha256(partial.encode()).hexdigest():
+        raise ValidationError("validator continuation assembled bytes changed")
+    return {**retained["response"], "text": partial}
+
+def _migrate_validator_receipt(state, identity, response, store):
+    """Derive a missing legacy prompt hash only from its exact immutable owner."""
+    if not isinstance(state.get("cache_ref"), str) or not isinstance(response, dict):
+        return None
+    record = store.get(state["cache_ref"])
+    raw = store.read_body(record["body_hash"])
+    captured = {key: value for key, value in state.items() if key != "cache_ref"}
+    if (record.get("author") != "command.controller" or hashlib.sha256(raw).hexdigest() != record["body_hash"]
+            or json.loads(raw) != captured):
+        return None
+    request = next((row for row in reversed(state.get("requests", [])) if isinstance(row, dict)
+                    and row.get("role") == "methods.validator-author"
+                    and row.get("assignment_sha256") == identity), None)
+    if not isinstance(request, dict) or "prompt_sha256" in request or not isinstance(request.get("prompt"), str):
+        return None
+    migrated = deepcopy_config(request)
+    migrated["prompt_sha256"] = hashlib.sha256(request["prompt"].encode()).hexdigest()
+    if _captured_validator_request({"requests": [migrated]}, identity, response) is None:
+        return None
+    return {"source_ref": record["artifact_ref"], "source_body_sha256": record["body_hash"],
+            "migration": "immutable-paired-prompt-hash-1", "request": migrated}
 
 def _canonical_capability_identifier(value):
     """Return the stable identifier spelling accepted by the program contract.
@@ -369,6 +493,12 @@ class CapabilityModelBudgetExceeded(ModelWorkBlocked):
         # is in flight.
         self.foundry_usage = deepcopy_config(usage) if isinstance(usage, dict) else {}
 
+
+
+
+
+class ScientificDefinitionError(ModelDefinitionError):
+    """An admitted model must be defined before implementing its experiment."""
 
 class IndependentValidatorContractError(ModelWorkBlocked):
     """Validator authoring must resume without changing the producer candidate."""
@@ -874,7 +1004,21 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
         "execution_environment": {"python": runtime_version, "packages": [
             {"name": name, "version": version} for name, version in runtime_packages]},
         "configured_input": test_input,
-        "optional_intent_fields": {"quality_contract": {
+        "optional_intent_fields": {
+            "decision_outcomes": [{"id": "derived_metric_id", "definition": "exact formula, aggregation and scope",
+                                   "unit": "declared unit", "parents": ["declared_metric_id"]}],
+            "decision_rules": [{"id": "rule_id", "metric_id": "declared_metric_id", "unit": "same unit",
+                                "operator": "< | <= | > | >= | ==", "threshold": "finite number",
+                                "claim": "claim conditional on this rule and stated model scope"}],
+            "model_definition": {
+                "equations": [{"id": "equation_id", "expression": "equation or algorithm",
+                               "status": "source_bound | design_assumption | estimated", "source_ref": "captured source ref or null"}],
+                "variables": [{"id": "variable_id", "unit": "physical or dimensionless unit", "reference_scale": "reference system and conversion"}],
+                "parameters": [{"id": "parameter_id", "value": "finite number", "unit": "unit", "status": "source_bound | design_assumption | estimated",
+                                "source_ref": "captured source ref or null", "reason": "basis and applicability"}],
+                "source_refs": ["captured scientific source ref"], "applicability": "regime and exclusions",
+                "claim_scope": "assumed pilot versus empirical inference", "question_alignment": "which question the mechanism can answer"},
+            "quality_contract": {
             "requirement": "Optional only when it is not supplied in required_intent_fields. "
                            "When supplied, preserve it exactly and make the executor emit the matching analysis summary.",
             "example": default_research_quality_contract(),
@@ -893,7 +1037,7 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
                                "run_count": 100, "primary_outcomes": []},
                 "candidate": "the exact JSON object the executor printed",
                 "candidate_sha256": "controller-supplied sha256 of the canonical candidate JSON; copy the exact candidate_sha256 from this runtime request",
-                "primary_outcomes": "the declared primary_outcomes list",
+                "primary_outcomes": "the complete primary_outcomes plus decision_outcomes list, in declaration order",
             },
         },
         "executor_output_exact_shapes": {
@@ -933,6 +1077,13 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             "max_observations": 5000, "max_asset_bytes": 10000000,
         },
         "constraints": [
+            "Declare every derived value used to decide a claim in decision_outcomes and its exact decision_rules. "
+            "All such values must be independently recalculated; narrative diagnostic values cannot substitute for them. "
+            "Null parents remain undefined. Declare aggregation, equality semantics and units before implementation.",
+            "For custom scientific modelling provide model_definition before the source fields: source-bound equations, "
+            "variable units and reference scales, coefficient status, applicability and question fit. A declared assumption "
+            "is not an empirical calibration. Review the definition before implementation; do not require final results "
+            "to select a model. Conclusions about robustness require sensitivity of the actual decision metric.",
             "Emit experiment_intent before either source field in the returned JSON object. "
             "It is the compact frozen design record; preserve it even when either source would "
             "need a later continuation.",
@@ -2225,6 +2376,17 @@ class CapabilityFoundry:
             configured_input.get("work_orders")
             if isinstance(configured_input, dict) else None)
         validator_repair_review = validator_methods_repair(brief, repair_provenance)
+        software_selection = configured_input.get("scientific_software", {}).get("selection", {}) if isinstance(configured_input.get("scientific_software"), dict) else {}
+        if software_selection.get("strategy") == "custom_model":
+            from scisaurus.runtime.measurement_contract import validate_model_definition
+            try:
+                validate_model_definition({"model_definition": software_selection.get("model_definition")},
+                                          source_refs=software_selection.get("scientific_source_refs", []), required=True)
+            except ValidationError as exc:
+                error = ScientificDefinitionError(str(exc))
+                error.stage_result = {"repair_verification_scope": "scientific_software_fitness",
+                                      "scientific_software": deepcopy_config(configured_input.get("scientific_software"))}
+                raise error from exc
         requires_source_data = _requires_source_data_manifest(brief)
         source_manifest = (configured_input.get("source_data_manifest")
                            if isinstance(configured_input, dict) else None)
@@ -2253,7 +2415,7 @@ class CapabilityFoundry:
             contract = hashlib.sha256()
             for name in ("capability_foundry.py", "capability_registry.py", "experiment.py",
                          "experiment_config.py", "research_quality.py", "results.py",
-                         "program_admission.py", "program_gates.py", "program_sandbox.py"):
+                         "program_admission.py", "program_gates.py", "program_sandbox.py", "measurement_contract.py"):
                 contract.update((Path(__file__).parent / name).read_bytes())
             key = work_cache.key(scope="experiment-capability", role="research.experiment-author",
                 system=SYSTEM, prompt={"assignment": base_prompt,
@@ -2450,7 +2612,17 @@ class CapabilityFoundry:
                                      or (authored.get("candidate_sha256") is None
                                          and assignment.get("experiment_intent") == candidate["experiment_intent"]
                                          and assignment.get("configured_input") == configured_input))):
-                            state.setdefault("validator_authorship", {})[identity] = deepcopy_config(authored)
+                            inherited = deepcopy_config(authored)
+                            receipt = _captured_validator_request(prior, identity, authored.get("response"), store=work_cache.store)
+                            if receipt is not None:
+                                record = work_cache.store.get(prior["cache_ref"])
+                                inherited["inherited_dispatch"] = {"source_ref": prior["cache_ref"],
+                                    "source_body_sha256": record["body_hash"], "request": deepcopy_config(receipt)}
+                            else:
+                                migrated = _migrate_validator_receipt(prior, identity, authored.get("response"), work_cache.store)
+                                if migrated is not None:
+                                    inherited["inherited_dispatch"] = migrated
+                            state.setdefault("validator_authorship", {})[identity] = inherited
                     if isinstance(prior_format_repair, dict):
                         state["format_repair"] = deepcopy_config(prior_format_repair)
                         reason = prior.get("feedback") or prior_format_repair.get("previous_error")
@@ -2543,6 +2715,20 @@ class CapabilityFoundry:
                     "truncated": result.truncated,
                     "mode": result.mode,
                 }
+                if operation in {"executor_preview", "executor_replay"} and result.returncode == 0:
+                    try:
+                        observed = json.loads(result.stdout)
+                    except (ValueError, UnicodeError):
+                        observed = None
+                    if isinstance(observed, dict) and isinstance(observed.get("observations"), list):
+                        record["observations_sha256"] = hashlib.sha256(canonical_bytes(observed["observations"])).hexdigest()
+                        record["observation_count"] = len(observed["observations"])
+                        record["metrics_sha256"] = hashlib.sha256(canonical_bytes(observed.get("metrics"))).hexdigest()
+                previous = next((row for row in reversed(state.get("sandbox_executions", []))
+                                 if row.get("operation") == operation), None)
+                record["evidence_delta"] = {name: previous is None or previous.get(name) != record.get(name)
+                    for name in ("program_sha256", "stdin_sha256", "stdout_sha256", "observations_sha256", "metrics_sha256")
+                    if name in record}
                 state.setdefault("sandbox_executions", []).append(record)
                 save("sandbox_execution_recorded")
             return result
@@ -2755,6 +2941,8 @@ class CapabilityFoundry:
             state["model_call_budget"] = model_call_budget
 
         def ensure_model_call_budget():
+            from scisaurus.runtime.run_control import ensure_run_allowed
+            ensure_run_allowed()
             if model_call_budget is None:
                 return
             observed = state.get("usage", {}).get("model_calls", 0)
@@ -2780,7 +2968,8 @@ class CapabilityFoundry:
         def record_result(request, result):
             request.update(status="succeeded", model=result.model, usage=result.usage,
                            finish_reason=result.finish_reason, elapsed_seconds=result.elapsed_seconds,
-                           response_sha256=hashlib.sha256(result.text.encode()).hexdigest())
+                           response_sha256=hashlib.sha256(result.text.encode()).hexdigest(),
+                           response_metadata=deepcopy_config(result.response_metadata))
             for dimension, amount in result.usage.items():
                 state["usage"][dimension] = state["usage"].get(dimension, 0) + amount - (
                     1 if dimension == "model_calls" else 0)
@@ -2829,6 +3018,17 @@ class CapabilityFoundry:
         def record_context_rejection(request, error, *, phase, retry_state=None,
                                      retry_status="response_received",
                                      request_signature=None, attempt_before=None):
+            from scisaurus.runtime.run_control import RunPausedError
+            if isinstance(error, RunPausedError):
+                request.update(status="operator_paused_not_dispatched", error=str(error), usage={"model_calls": 0})
+                state["usage"]["model_calls"] = max(0, state["usage"].get("model_calls", 0) - 1)
+                if isinstance(retry_state, dict):
+                    retry_state["status"] = "response_received" if retry_state.get("response") else "pending"
+                if attempt_before is not None:
+                    state["attempts"] = attempt_before
+                state["status"] = retry_status
+                save("operator_pause_before_dispatch")
+                return True
             if not isinstance(error, ModelContextBudgetError):
                 return False
             request.update(status="context_not_dispatched", error=str(error),
@@ -3709,14 +3909,14 @@ class CapabilityFoundry:
                 self.author_max_output_tokens, inherited_role="review.methods")
                 if self.validator_client is None else [])
             exhausted_routes = retained.setdefault("response_exhausted_routes", [])
-            captured_request = _captured_validator_request(state, identity, retained.get("response"))
+            captured_request = _captured_validator_request(state, identity, retained.get("response"), store=work_cache.store if work_cache is not None else None)
 
             if (retained.get("status") == "repair_required" and not retained.get("source")
                     and captured_request is not None):
                 captured = retained.get("response")
                 if isinstance(captured, dict):
                     try:
-                        _independent_validator_source(captured)
+                        _independent_validator_source(_assembled_validator_response(retained, identity))
                     except ValidationError:
                         pass
                     else:
@@ -3773,7 +3973,8 @@ class CapabilityFoundry:
                 state.setdefault("repair_ledger", []).append({
                     "attempt": state.get("attempts"), "gate": "independent_validator_contract",
                     "candidate_sha256": fingerprint, "error": retained.get("error") or str(reason),
-                    "next_action": "format_repair_then_rerun",
+                    "next_action": retained.get("failure", {}).get("next_action", "complete_program_artifact"),
+                    "failure": deepcopy_config(retained.get("failure", {})),
                 })
                 save("independent_validator_repair_deferred")
                 blocked = IndependentValidatorContractError(str(reason))
@@ -3783,7 +3984,11 @@ class CapabilityFoundry:
                     blocked.validator_failure = deepcopy_config(state["validator_failure"])
                 raise blocked
 
+            if retained.get("status") == "response_received" and captured_request is None:
+                defer_validator_repair("captured validator response has no verified current dispatch owner")
+
             if (validator_routes and retained.get("error") and not retained.get("source")
+                    and retained.get("failure_kind") not in {"output_exhaustion", "empty_output_exhaustion"}
                     and retained.get("status") != "response_received"):
                 exhaust_validator_route()
 
@@ -3827,21 +4032,47 @@ class CapabilityFoundry:
                         config = next((route for route in available_routes
                             if self._dispatch_route_identity(route) == current), available_routes[0])
                         retained["current_route"] = self._dispatch_route_identity(config)
+                        config = _artifact_generation_config(config, repair=bool(retained.get("source")),
+                            empty_output=retained.get("failure_kind") == "empty_output_exhaustion")
+                        retained["generation_profile"] = {key: config.get(key) for key in ("reasoning_effort", "max_output_tokens")}
                         validator_client = ModelClient(**config)
                     prior_response = retained.get("response") or {}
+                    repair_source = retained.get("source") or retained.get("repair_base", {}).get("source")
                     repair = {
-                        "prior_source": retained.get("source"),
+                        "prior_source": repair_source,
                         "prior_response": {
                             "finish_reason": prior_response.get("finish_reason"),
                             "response_sha256": hashlib.sha256(
                                 str(prior_response.get("text", "")).encode()).hexdigest(),
                         },
                         "diagnostic": retained.get("error"),
-                        "instructions": "Write one concise complete validator implementation. Do not continue an incomplete response or repeat helper variants. Preserve the frozen estimand and independently recalculate from raw observations.",
+                        "failure_kind": retained.get("failure_kind"),
+                        "source_sha256": hashlib.sha256(repair_source.encode()).hexdigest() if repair_source else None,
+                        "patch_contract": {"updates": {"validator_source": {"edits": [{"old": "exact unique prior source text", "new": "replacement text"}]}}} if repair_source else None,
+                        "instructions": ("Patch only your recorded validator source with exact unique edits. Preserve the frozen estimand, inputs and acceptance criteria." if repair_source else
+                                         "Write one concise complete validator implementation. Preserve the frozen estimand and independently recalculate from raw observations."),
                     }
+                    extension = {"validator_repair": repair} if retained.get("error") else {}
+                    continuation = retained.get("continuation")
+                    continuing = (retained.get("failure_kind") == "output_exhaustion" and isinstance(continuation, dict)
+                                  and len(continuation.get("segments", [])) < AUTHOR_MAX_CONTINUATIONS)
+                    if continuing:
+                        partial = _assembled_validator_response(retained, identity)["text"]
+                        marker, prefix_digest, continuation_prompt = _author_continuation_prompt(partial)
+                        extension = {"validator_continuation": json.loads(continuation_prompt)}
                     request = {"role": "methods.validator-author", "assignment_sha256": identity,
                         "route_identity": retained.get("current_route"),
-                        "status": "started", "prompt": json.dumps({**assignment, **({"validator_repair": repair} if retained.get("error") else {})}, sort_keys=True), "usage": {"model_calls": 1}}
+                        "generation_profile": retained.get("generation_profile"),
+                        "status": "started", "prompt": json.dumps({**assignment, **extension}, sort_keys=True), "usage": {"model_calls": 1}}
+                    if continuing:
+                        request.update(operation="continue_truncated_response", prefix_sha256=prefix_digest)
+                    if any(row.get("prompt") == request["prompt"] and row.get("assignment_sha256") == identity
+                           and row.get("route_identity") == request.get("route_identity")
+                           and row.get("generation_profile") == request.get("generation_profile")
+                           and row.get("status") not in {"cooldown_not_dispatched", "provider_rate_limited"}
+                           for row in state.get("requests", [])):
+                        defer_validator_repair("refusing an identical validator author request without new failure evidence")
+                    request["prompt_sha256"] = hashlib.sha256(request["prompt"].encode()).hexdigest()
                     state["requests"].append(request)
                     state["usage"]["model_calls"] = state["usage"].get("model_calls", 0) + 1
                     attempts_before = retained.get("attempts", 0)
@@ -3849,7 +4080,15 @@ class CapabilityFoundry:
                     retained["status"] = "calling"
                     save("independent_validator_authoring")
                     try:
-                        response = validator_client.complete(system=VALIDATOR_AUTHOR_SYSTEM, prompt=request["prompt"])
+                        if continuing and hasattr(validator_client, "output_format"):
+                            original_format = validator_client.output_format
+                            validator_client.output_format = None
+                            try:
+                                response = validator_client.complete(system=AUTHOR_CONTINUATION_SYSTEM, prompt=request["prompt"])
+                            finally:
+                                validator_client.output_format = original_format
+                        else:
+                            response = validator_client.complete(system=AUTHOR_CONTINUATION_SYSTEM if continuing else VALIDATOR_AUTHOR_SYSTEM, prompt=request["prompt"])
                     except ModelCallError as exc:
                         if record_provider_rate_limit(request, exc, phase="validator_author_rate_limited", retry_state=retained):
                             retained["attempts"] = attempts_before
@@ -3870,27 +4109,68 @@ class CapabilityFoundry:
                         save("validator_author_unknown")
                         raise
                     record_result(request, response)
+                    if continuing:
+                        continuation["segments"].append({"request": deepcopy_config(request), "response": asdict(response),
+                                                         "prefix_sha256": prefix_digest})
+                        try:
+                            suffix = _author_continuation_suffix(partial, response, marker)
+                        except ValidationError as exc:
+                            continuation["segments"].pop()
+                            retained.pop("continuation", None)
+                            retained.update(status="repair_required", error=str(exc), failure_kind="artifact_transport")
+                            exhaust_validator_route(request)
+                            save("independent_validator_continuation_failed")
+                            continue
+                        continuation["partial_sha256"] = hashlib.sha256((partial + suffix).encode()).hexdigest()
+                    else:
+                        retained.pop("continuation", None)
                     retained.update(status="response_received", response=asdict(response), assignment=assignment)
                     save("independent_validator_response")
                 source = None
                 provenance = None
+                phase = "artifact_transport"
                 try:
-                    response = retained["response"]
-                    retained.pop("source", None)
-                    retained.pop("provenance", None)
-                    source = _independent_validator_source(response)
+                    response = _assembled_validator_response(retained, identity)
+                    prior_source = retained.pop("source", None) or retained.get("repair_base", {}).get("source")
+                    prior_provenance = retained.pop("provenance", None)
+                    if prior_source:
+                        retained["repair_base"] = {"source": prior_source, "provenance": prior_provenance or retained.get("repair_base", {}).get("provenance")}
+                    if prior_source and response.get("finish_reason") == "stop":
+                        try:
+                            decoded = parse_complete_json_object(response["text"], "independent validator repair", model_envelope=True, allow_analysis_prefix=False)
+                        except ValidationError:
+                            decoded = None
+                        if isinstance(decoded, dict) and "updates" in decoded:
+                            patched = apply_authoring_patch({"validator_source": prior_source}, decoded)["validator_source"]
+                            if patched == prior_source:
+                                raise ValidationError("validator repair did not change its failed source")
+                            artifact = {"source": patched, "transport": "exact_source_patch", "source_span": None,
+                                        "response_sha256": hashlib.sha256(response["text"].encode()).hexdigest(),
+                                        "source_sha256": hashlib.sha256(patched.encode()).hexdigest()}
+                        else:
+                            artifact = _validator_program_artifact(response)
+                    else:
+                        artifact = _validator_program_artifact(response)
+                    source = artifact["source"]
+                    retained["transport_artifact"] = {key: value for key, value in artifact.items() if key != "source"}
                     retained["source"] = source
                     provenance = {"role": "methods.validator-author", "method": "blinded_separate_authoring",
                         "assignment_sha256": identity, "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
-                        "response_sha256": hashlib.sha256(response["text"].encode()).hexdigest(), "model": response["model"]}
+                        "response_sha256": hashlib.sha256(retained["response"]["text"].encode()).hexdigest(), "model": response["model"]}
+                    if retained.get("continuation"):
+                        provenance["assembled_response_sha256"] = hashlib.sha256(response["text"].encode()).hexdigest()
+                        provenance["continuation_chain_sha256"] = hashlib.sha256(canonical_bytes(retained["continuation"])).hexdigest()
                     retained["provenance"] = provenance
+                    phase = "source_static_scan"
                     scan_program_source(source, "independent program validator")
+                    phase = "validator_readiness"
                     probe = execute_recorded(source, canonical_bytes(
                         validator_readiness_contract()["stdin"]), "validator_readiness")
                     if probe.timed_out and deadline is not None and time.monotonic() >= deadline:
                         raise CapabilityDeadlineError("independent validator readiness reached the mission deadline")
                     validate_validator_readiness(probe)
                     digest = hashlib.sha256(canonical_bytes(document)).hexdigest()
+                    phase = "validator_execution"
                     preview = execute_recorded(source, canonical_bytes(experiment_validation_payload(
                         intent, payload["configured_input"], document, digest)), "validator_preview")
                     if preview.timed_out and deadline is not None and time.monotonic() >= deadline:
@@ -3898,6 +4178,7 @@ class CapabilityFoundry:
                     if preview.timed_out or preview.truncated or preview.returncode != 0:
                         raise ValidationError("independent validator protocol execution failed: "
                             + preview.stderr.decode("utf-8", "replace")[-1200:])
+                    phase = "validator_output_contract"
                     verdict = validate_deterministic_validation(json.loads(preview.stdout), intent, digest)
                     bind_deterministic_validation(verdict, document, intent)
                     return source, provenance, probe
@@ -3906,10 +4187,35 @@ class CapabilityFoundry:
                     save("independent_validator_validation_pending")
                     raise
                 except (ValidationError, ValueError, TypeError) as exc:
-                    retained.update(status="repair_required", error=str(exc))
-                    if source is None and validator_routes:
+                    failure_kind = ("empty_output_exhaustion" if response.get("finish_reason") == "length" and not response.get("text", "").strip()
+                                    else "output_exhaustion" if response.get("finish_reason") == "length"
+                                    else phase)
+                    signature = hashlib.sha256(canonical_bytes({"source_sha256": hashlib.sha256(source.encode()).hexdigest() if source else None,
+                        "input_sha256": hashlib.sha256(canonical_bytes(payload)).hexdigest(), "kind": failure_kind, "error": str(exc),
+                        "generation_profile": retained.get("generation_profile") if source is None else None,
+                        "response_sha256": hashlib.sha256(response.get("text", "").encode()).hexdigest() if source is None else None})).hexdigest()
+                    repeated = signature in retained.setdefault("failure_signatures", [])
+                    retained["failure_signatures"].append(signature)
+                    retained.update(status="repair_required", error=str(exc), failure_kind=failure_kind,
+                        failure={"phase": phase, "kind": failure_kind, "owner": "methods.validator-author", "signature": signature,
+                                 "source_sha256": hashlib.sha256(source.encode()).hexdigest() if source else None,
+                                 "input_sha256": hashlib.sha256(canonical_bytes(payload)).hexdigest(),
+                                 "diagnostic": str(exc), "next_action": "patch_current_validator" if source else "complete_program_artifact"})
+                    if source is None and failure_kind == "output_exhaustion" and _author_json_prefix_state(response.get("text", "")) == "incomplete":
+                        if "continuation" not in retained:
+                            receipt = _captured_validator_request(state, identity, retained["response"], store=work_cache.store if work_cache is not None else None)
+                            if receipt is not None:
+                                retained["continuation"] = {"root_response": deepcopy_config(retained["response"]),
+                                    "root_request": deepcopy_config(receipt), "segments": [],
+                                    "partial_sha256": hashlib.sha256(response["text"].encode()).hexdigest()}
+                        can_continue = "continuation" in retained and len(retained["continuation"].get("segments", [])) < AUTHOR_MAX_CONTINUATIONS
+                    else:
+                        can_continue = False
+                    if source is None and validator_routes and not can_continue:
                         exhaust_validator_route()
                     save("independent_validator_contract_failed")
+                    if repeated and source is not None:
+                        defer_validator_repair("independent validator repeated the same source/input failure without progress: " + str(exc))
                     if retained.get("attempts", 0) >= self.max_attempts:
                         defer_validator_repair("independent validator technical repair exhausted: " + str(exc))
 
@@ -4364,6 +4670,10 @@ class CapabilityFoundry:
                     })
                 executor = attempt_value["executor_source"]
                 validate_experiment_intent(attempt_value["experiment_intent"])
+                if software_selection.get("strategy") == "custom_model" and canonical_bytes(
+                        attempt_value["experiment_intent"].get("model_definition")) != canonical_bytes(software_selection["model_definition"]):
+                    raise ScientificDefinitionError("implementation changed the admitted model definition; Methods must review a new definition before source repair")
+
                 scan_program_source(executor, "program executor")
                 candidate_fingerprint = hashlib.sha256(canonical_bytes(attempt_value)).hexdigest()
                 failed_candidates = state.setdefault("failed_candidates", {})
@@ -4456,6 +4766,27 @@ class CapabilityFoundry:
             except (IndependentValidatorContractError, ModelWorkProvenanceError):
                 raise
             except ModelWorkBlocked as exc:
+                if isinstance(exc, ModelDefinitionError):
+                    state.update(status="blocked", last_failure_class=exc.failure_class,
+                                 last_failure_gate=exc.repair_gate, repair_owner=exc.repair_owner,
+                                 error=str(exc), feedback=str(exc), last_attempt=deepcopy_config(attempt_value))
+                    fingerprint = _authored_candidate_sha256(attempt_value)
+                    state["validation_feedback"] = {
+                        "decision": "rejected", "gate": exc.repair_gate,
+                        "findings": [{"severity": "blocking", "finding": str(exc),
+                                      "evidence": "Current candidate intent and admitted model definition.",
+                                      "required_change": "Methods must adjudicate the model specification before implementation."}],
+                    }
+                    state["validation_feedback_candidate_sha256"] = fingerprint
+                    state.setdefault("repair_ledger", []).append({
+                        "attempt": state.get("attempts"), "gate": exc.repair_gate,
+                        "candidate_sha256": fingerprint, "error": str(exc),
+                        "next_action": exc.next_action,
+                    })
+                    save("model_definition_adjudication_required")
+                    exc.__dict__.update(repair_exhausted_error().__dict__)
+                    exc.repair_feedback.update(repair_owner=exc.repair_owner, next_action=exc.next_action)
+                    raise
                 if getattr(exc, "failure_class", None) != "model_contract":
                     raise
                 gate = _repair_gate(exc)

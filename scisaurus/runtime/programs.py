@@ -121,6 +121,8 @@ class LocalProgramClient:
         self.sandbox_required = sandbox_required
 
     def run(self, input):
+        from scisaurus.runtime.run_control import ensure_run_allowed, start_process
+        ensure_run_allowed()
         document = json_object(input)
         stdin = canonical_bytes(document)
         identity = command_identity(self.command, self.cwd, self.env)
@@ -142,7 +144,7 @@ class LocalProgramClient:
         deadline = time.monotonic() + self.timeout
         selector = selectors.DefaultSelector()
         try:
-            process = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            process = start_process(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, cwd=self.cwd, env=self.env, shell=False,
                                        bufsize=0, start_new_session=self.own_process_group)
             for stream, name, event in ((process.stdin, "stdin", selectors.EVENT_WRITE),

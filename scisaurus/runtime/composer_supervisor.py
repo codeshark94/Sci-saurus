@@ -747,12 +747,25 @@ class ComposerSupervisor:
         self._write_state(child_status=result.get("status"), action="waiting_to_resume", result=result)
         deadline = time.monotonic() + delay
         while True:
+            if not self._execution_allowed():
+                return False
             left = deadline - time.monotonic()
             if left <= 0:
                 return True
             time.sleep(min(5.0, left))
 
+    def _execution_allowed(self):
+        from scisaurus.runtime.run_control import ensure_run_allowed, check_project_stop, RunPausedError
+        try:
+            ensure_run_allowed()
+            check_project_stop(self.workflow["project_id"])
+        except RunPausedError:
+            return False
+        return True
+
     def _should_resume(self, result):
+        if not self._execution_allowed():
+            return False
         if not isinstance(result, dict):
             return True
         active_blockers = result.get("active_blockers")
@@ -1050,6 +1063,9 @@ class ComposerSupervisor:
 
     def _run_one_process(self, resume, *, additional_seconds=None):
         """Run one Composer attempt while the parent remains killable."""
+        from scisaurus.runtime.run_control import ensure_run_allowed, check_project_stop
+        ensure_run_allowed()
+        check_project_stop(self.workflow["project_id"])
         context = multiprocessing.get_context("spawn")
         parent_pipe, child_pipe = context.Pipe(duplex=False)
         authorized_deadline = None
@@ -1064,7 +1080,9 @@ class ComposerSupervisor:
             name=f"scisaurus-composer-{self.workflow.get('id', 'run')}",
         )
         try:
-            child.start()
+            from scisaurus.runtime.run_control import dispatch_permission
+            with dispatch_permission():
+                child.start()
         except BaseException:
             parent_pipe.close()
             child_pipe.close()
@@ -1077,6 +1095,12 @@ class ComposerSupervisor:
         monitor_interval = max(0.25, min(5.0, self.poll_seconds or 0.25))
         try:
             while child.is_alive():
+                if not self._execution_allowed():
+                    self._stop_child(child)
+                    self._mark_interrupted_checkpoint()
+                    result = {"status": "paused", "stop_reason": "operator_paused"}
+                    self._write_state(child_status="paused", action="stop", result=result)
+                    return result
                 while parent_pipe.poll():
                     try:
                         received = parent_pipe.recv()

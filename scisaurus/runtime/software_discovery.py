@@ -229,7 +229,9 @@ class PublicSourceClient:
             if name.lower() == "x-subscription-token" and parsed.hostname == "api.search.brave.com":
                 headers[name] = value
         try:
-            connection.request("GET",path,headers=headers)
+            from scisaurus.runtime.run_control import dispatch_permission
+            with dispatch_permission():
+                connection.request("GET",path,headers=headers)
             return _HTTPResponse(connection,connection.getresponse())
         except BaseException:
             connection.close()

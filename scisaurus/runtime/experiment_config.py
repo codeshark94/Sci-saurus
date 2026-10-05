@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 
+from scisaurus.runtime.measurement_contract import INTENT_EXTENSIONS, recalculation_outcomes, validate_model_definition
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.config import _text, configured_worker_slots, validate_common
@@ -151,7 +152,7 @@ def validate_experiment_config(config, *, require_literature_gate=True):
         "literature_gate", "execution", "validation", "required_assets", "reviewers", "stage_seconds",
         "max_observations", "max_asset_bytes",
     }
-    if (not isinstance(experiment, dict) or set(experiment) - (experiment_fields | {"quality_contract"})
+    if (not isinstance(experiment, dict) or set(experiment) - (experiment_fields | {"quality_contract"} | INTENT_EXTENSIONS)
             or not experiment_fields.issubset(experiment)):
         raise ValidationError(
             f"experiment score requires {sorted(experiment_fields)} and permits quality_contract")
@@ -197,6 +198,8 @@ def validate_experiment_config(config, *, require_literature_gate=True):
                 type(outcome["threshold"]) not in (int, float) or not math.isfinite(outcome["threshold"])):
             raise ValidationError("primary outcome threshold must be finite or null")
 
+    recalculation_outcomes(experiment)
+    validate_model_definition(experiment)
     limitations = experiment["limitations"]
     if not isinstance(limitations, list) or not limitations:
         raise ValidationError("experiment requires explicit design limitations")

@@ -224,7 +224,8 @@ def run_sandboxed(command, *, workspace, input_bytes=b"", timeout_seconds=300.0,
             workspace, command, allow_network=allow_network, read_only_paths=read_only_paths), *command]
     else:
         mode = "rlimits-only"
-    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    from scisaurus.runtime.run_control import start_process
+    process = start_process(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                cwd=str(workspace), env=process_env, shell=False, bufsize=0,
                                preexec_fn=_limits(cpu_seconds, address_space_bytes, file_size_bytes))
     stdout, stderr = bytearray(), bytearray()

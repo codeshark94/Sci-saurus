@@ -169,6 +169,7 @@ def classify_failure(stage_kind, error, stage_result=None):
             and repair_gate in {
                 "adversarial_review", "independent_recalculation",
                 "deterministic_replay", "validator_readiness", "static_scan",
+                "model_definition",
             }):
         # A bounded foundry rejection is not a response-format defect when its
         # typed gate is judging the generated program or its scientific result.

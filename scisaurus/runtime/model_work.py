@@ -118,7 +118,15 @@ class ModelWorkCache:
         record = self.store.head(f"{self.namespace}/{key}")
         if record is None:
             return None
-        body = json.loads(self.store.read_body(record["body_hash"]))
+        return self._verified_body(record)
+
+    def _verified_body(self, record):
+        raw = self.store.read_body(record["body_hash"])
+        if hashlib.sha256(raw).hexdigest() != record["body_hash"]:
+            raise ModelWorkProvenanceError("model work body differs from its immutable digest")
+        body = json.loads(raw)
+        if not isinstance(body, dict):
+            raise ModelWorkProvenanceError("model work body must be an object")
         return {**body, "cache_ref": record["artifact_ref"]}
 
     def inherited_usage(self, body):
@@ -167,8 +175,7 @@ class ModelWorkCache:
             "(SELECT logical_id,MAX(version) version FROM artifacts WHERE logical_id LIKE ? GROUP BY logical_id) h "
             "ON a.logical_id=h.logical_id AND a.version=h.version ORDER BY a.created_at DESC",
             (self.namespace + "/%",))
-        return [{**json.loads(self.store.read_body(row["body_hash"])), "cache_ref": row["artifact_ref"]}
-                for row in rows]
+        return [self._verified_body(dict(row)) for row in rows]
 
     def put(self, key, body, *, subjects=()):
         record = self.publish(f"{self.namespace}/{key}", "note", deepcopy(body),

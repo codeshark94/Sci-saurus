@@ -1,7 +1,7 @@
 """Bounded calls to explicitly configured Ollama or compatible GPU servers."""
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from contextlib import closing
 from email.utils import parsedate_to_datetime
 import base64
@@ -549,22 +549,27 @@ def _reserve_model_call_budgets(configs, *, token_reservation=None):
             receipt = _reserve_model_call_budget(config, token_reservation=token_reservation)
             reserved.append(receipt)
     except (ModelCallError, ValidationError):
-        for budget in reversed(reserved):
-            try:
-                with closing(sqlite3.connect(budget["path"], timeout=30.0)) as connection:
-                    with connection:
-                        connection.execute("UPDATE model_call_budgets SET used_calls=used_calls-1 "
-                            "WHERE budget_key=? AND used_calls>0", (budget["key"],))
-                        if budget.get("development_admission_id"):
-                            connection.execute("DELETE FROM model_development_admissions WHERE admission_id=?",
-                                               (budget["development_admission_id"],))
-                        if budget.get("reservation_id"):
-                            connection.execute("DELETE FROM model_token_reservations WHERE reservation_id=?",
-                                               (budget["reservation_id"],))
-            except (OSError, sqlite3.Error) as exc:
-                raise ModelCallError("model call budget reservation could not be released", outcome_known=True) from exc
+        _release_model_call_budgets(reserved)
         raise
     return reserved
+
+
+def _release_model_call_budgets(reserved):
+    """Undo only reservations whose request was never submitted."""
+    for budget in reversed(reserved):
+        try:
+            with closing(sqlite3.connect(budget["path"], timeout=30.0)) as connection:
+                with connection:
+                    connection.execute("UPDATE model_call_budgets SET used_calls=used_calls-1 "
+                        "WHERE budget_key=? AND used_calls>0", (budget["key"],))
+                    if budget.get("development_admission_id"):
+                        connection.execute("DELETE FROM model_development_admissions WHERE admission_id=?",
+                                           (budget["development_admission_id"],))
+                    if budget.get("reservation_id"):
+                        connection.execute("DELETE FROM model_token_reservations WHERE reservation_id=?",
+                                           (budget["reservation_id"],))
+        except (OSError, sqlite3.Error) as exc:
+            raise ModelCallError("model call budget reservation could not be released", outcome_known=True) from exc
 
 
 def _reserve_model_call_budget(config, *, token_reservation=None):
@@ -1634,6 +1639,7 @@ class ModelResult:
     elapsed_seconds: float
     finish_reason: str
     request_attempts: int = 1
+    response_metadata: dict = field(default_factory=dict)
 
     def json_object(self, *, allow_missing_closers=False):
         return json_object(self.text, "model output", model_envelope=True,
@@ -1800,6 +1806,8 @@ class ModelClient:
     def complete(self, *, system: str, prompt: str, images=None,
                  continuation_text: str | None = None,
                  dispatch_budget: dict | None = None) -> ModelResult:
+        from scisaurus.runtime.run_control import ensure_run_allowed, dispatch_permission, RunPausedError
+        ensure_run_allowed()
         request_model = self.model
         request_base_url = self.base_url
         reject_local_qwen_route({"base_url": request_base_url, "model": request_model})
@@ -1957,18 +1965,23 @@ class ModelClient:
             if remaining <= 0:
                 raise failure("model request deadline exceeded") from None
             try:
-                reserved = _reserve_model_call_budgets([*self.model_call_budget_scopes, dispatch_budget or {}, {
-                    "model_call_budget_path": self.model_call_budget_path,
-                    "model_call_budget_key": self.model_call_budget_key,
-                    "model_call_budget_limit": self.model_call_budget_limit,
-                }], token_reservation={"input_tokens": estimate_input_tokens(system, budget_prompt, image_count=len(images)),
-                                       "output_tokens": self.max_output_tokens})
+                with dispatch_permission():
+                    reserved = _reserve_model_call_budgets([*self.model_call_budget_scopes, dispatch_budget or {}, {
+                        "model_call_budget_path": self.model_call_budget_path,
+                        "model_call_budget_key": self.model_call_budget_key,
+                        "model_call_budget_limit": self.model_call_budget_limit,
+                    }], token_reservation={"input_tokens": estimate_input_tokens(system, budget_prompt, image_count=len(images)),
+                                           "output_tokens": self.max_output_tokens})
+                    attempts_made += 1
+            except RunPausedError as exc:
+                exc.attempts = attempts_made
+                exc.usage = {"model_calls": attempts_made} if attempts_made else {}
+                raise
             except ModelCallError as exc:
                 raise failure(str(exc), outcome_known=exc.outcome_known,
                     status_code=exc.status_code, retry_after_seconds=exc.retry_after_seconds,
                     provider_error_kind=exc.provider_error_kind,
                     budget_admission=getattr(exc, "budget_admission", None)) from exc
-            attempts_made += 1
             connection = connection_type(parsed_base.hostname, parsed_base.port,
                                          timeout=max(0.1, remaining))
             response = None
@@ -2004,8 +2017,9 @@ class ModelClient:
                 if "qwen" in request_model.casefold():
                     peer = connection.sock.getpeername()[0]
                     _reject_local_qwen_peer(request_model, peer)
-                connection.request("POST", request_path, wire,
-                                   headers={**headers, "Connection": "close"})
+                with dispatch_permission():
+                    connection.request("POST", request_path, wire,
+                                       headers={**headers, "Connection": "close"})
                 response = connection.getresponse()
                 code = response.status
                 if 300 <= code < 400:
@@ -2057,6 +2071,13 @@ class ModelClient:
                 # authoritative outcome for this transaction.
                 if expired.is_set() or time.monotonic() >= deadline:
                     raise failure("model request deadline exceeded") from None
+            except RunPausedError as exc:
+                _release_model_call_budgets(reserved)
+                reserved = []
+                attempts_made -= 1
+                exc.attempts = attempts_made
+                exc.usage = {"model_calls": attempts_made, **reported_usage} if attempts_made else {}
+                raise
             except _ProviderHTTPError as exc:
                 code = exc.code
                 retry_after = exc.retry_after
@@ -2087,6 +2108,8 @@ class ModelClient:
                     str(exc), outcome_known=exc.outcome_known,
                     status_code=exc.status_code,
                     retry_after_seconds=exc.retry_after_seconds,
+                    provider_error_kind=exc.provider_error_kind,
+                    budget_admission=getattr(exc, "budget_admission", None),
                 ) from None
             except (http.client.HTTPException, TimeoutError, OSError, ValueError, AttributeError) as exc:
                 if expired.is_set() or time.monotonic() >= deadline:
@@ -2135,7 +2158,16 @@ class ModelClient:
                     raise ValueError("invalid usage")
                 if reason not in {"stop", "length", "load", "unload", "unknown"}:
                     raise ValueError("unsupported completion state")
-                parsed = (text, reason, usage, data.get("model", self.model))
+                message = data.get("message", {}) if self.protocol == "ollama" else choice.get("message", {})
+                thinking = message.get("thinking", message.get("reasoning_content"))
+                metadata = {"reasoning_effort": self.reasoning_effort,
+                            "wire_reasoning": body.get("think", body.get("reasoning_effort")),
+                            "max_output_tokens": self.max_output_tokens, "answer_bytes": len(text.encode()),
+                            "thinking_bytes": len(thinking.encode()) if isinstance(thinking, str) else None}
+                details = data.get("usage", {}).get("completion_tokens_details", {}) if isinstance(data.get("usage"), dict) else {}
+                if isinstance(details, dict) and type(details.get("reasoning_tokens")) is int and details["reasoning_tokens"] >= 0:
+                    metadata["reasoning_tokens"] = details["reasoning_tokens"]
+                parsed = (text, reason, usage, data.get("model", self.model), metadata)
             except (ValueError, TypeError, KeyError, IndexError):
                 # A received HTTP 200 may already have consumed a complete
                 # generation. Its unknown usage must not be hidden by a
@@ -2144,8 +2176,8 @@ class ModelClient:
                               outcome_known=all(key in reported_usage for key in ("input_tokens", "output_tokens"))) from None
             break
         elapsed = time.monotonic() - started
-        text, reason, usage, served_model = parsed
+        text, reason, usage, served_model, metadata = parsed
         settle(usage)
         return ModelResult(text, served_model,
                            {"model_calls": attempts_made, **usage}, elapsed, reason,
-                           request_attempts=attempts_made)
+                           request_attempts=attempts_made, response_metadata=metadata)

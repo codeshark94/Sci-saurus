@@ -109,6 +109,8 @@ class _ResultFile:
 
 def _invoke_worker(kind, params, channel):
     try:
+        from scisaurus.runtime.run_control import ensure_run_allowed
+        ensure_run_allowed()
         if kind == "model":
             client = ModelClient(**resolve_model_config(
                 params["client"], role=params.get("role"),
@@ -133,6 +135,9 @@ def _invoke_worker(kind, params, channel):
         elif kind == "program":
             from scisaurus.runtime.programs import LocalProgramClient
             result = LocalProgramClient(**params["client"]).run(params["input"])
+        elif kind == "semantic_scholar":
+            from scisaurus.runtime.semantic_scholar import SemanticScholarClient
+            result = SemanticScholarClient(**params["client"]).run(**{key: value for key, value in params.items() if key != "client"})
         elif kind == "openalex":
             from scisaurus.runtime.literature import OpenAlexClient
             result = OpenAlexClient(**params["client"]).run(**{key: value for key, value in params.items() if key != "client"})
@@ -1486,7 +1491,9 @@ class ExecutionRuntime:
         entry["deadline"] = min(self.deadline, time.monotonic() + operation_limit)
         self._before_dispatch(spec)
         try:
-            process.start()
+            from scisaurus.runtime.run_control import dispatch_permission
+            with dispatch_permission():
+                process.start()
         finally:
             entry["dispatched"] = process.pid is not None
 

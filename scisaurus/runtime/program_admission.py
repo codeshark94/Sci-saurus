@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import re
 import sys
 from pathlib import Path
 
+from scisaurus.runtime.measurement_contract import INTENT_EXTENSIONS, ModelDefinitionError, recalculation_outcomes, validate_model_definition
 from scisaurus.core.errors import ModelContractError, ValidationError
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.experiment_config import validate_experiment_config
@@ -184,7 +186,7 @@ def _validate_test_vector(value):
 
 def _validate_experiment_intent(intent):
     if (not isinstance(intent, dict) or not INTENT_FIELDS.issubset(intent)
-            or set(intent) - (INTENT_FIELDS | {"quality_contract"})):
+            or set(intent) - (INTENT_FIELDS | {"quality_contract"} | INTENT_EXTENSIONS)):
         observed = sorted(intent) if isinstance(intent, dict) else type(intent).__name__
         raise ValidationError(
             f"experiment_intent requires {sorted(INTENT_FIELDS)} and permits quality_contract; observed keys: {observed}")
@@ -223,8 +225,10 @@ def _validate_experiment_intent(intent):
         if outcome["direction"] not in DIRECTIONS:
             raise ValidationError(
                 f"experiment_intent primary outcome direction {outcome['direction']!r} must be one of {sorted(DIRECTIONS)}")
-        if outcome["threshold"] is not None and not isinstance(outcome["threshold"], (int, float)):
+        if outcome["threshold"] is not None and (type(outcome["threshold"]) not in (int, float) or (type(outcome["threshold"]) is float and not math.isfinite(outcome["threshold"]))):
             raise ValidationError("experiment_intent primary outcome threshold must be numeric or null")
+    recalculation_outcomes(intent)
+    validate_model_definition(intent)
     if not isinstance(intent["limitations"], list) or not intent["limitations"]:
         raise ValidationError("experiment_intent limitations must be nonempty")
     for limitation in intent["limitations"]:
@@ -302,7 +306,7 @@ def validate_experiment_intent(intent):
     """Validate model-authored intent and preserve its response-contract type."""
     try:
         return _validate_experiment_intent(intent)
-    except ModelContractError:
+    except (ModelContractError, ModelDefinitionError):
         raise
     except ValidationError as exc:
         raise ExperimentIntentContractError(str(exc)) from exc

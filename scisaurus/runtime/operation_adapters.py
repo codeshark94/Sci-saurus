@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes, sha256_hex
-from scisaurus.runtime import literature, pdf_text, programs, retrieval
+from scisaurus.runtime import literature, pdf_text, programs, retrieval, semantic_scholar
 
 
 def _text(value, name):
@@ -83,6 +83,26 @@ def _openalex_client(client, project_path, environment_files):
     except (TypeError, ValueError) as exc:
         raise ValidationError(str(exc)) from exc
     return client
+
+
+def _semantic_scholar_client(client, project_path, environment_files):
+    _limits(client)
+    try:
+        instance = semantic_scholar.SemanticScholarClient(**client)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(str(exc)) from exc
+    client.setdefault("endpoint", instance.endpoint)
+    client.setdefault("auth_env", instance.auth_env)
+    client.setdefault("rate_state_path", str(instance.rate_state_path))
+    client.setdefault("min_interval_seconds", instance.min_interval_seconds)
+    return client
+
+
+def _semantic_scholar_arguments(arguments):
+    try:
+        return semantic_scholar.validate_arguments(arguments)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(str(exc)) from exc
 
 
 def _process_client(client, project_path, environment_files, label):
@@ -913,6 +933,10 @@ class OperationAdapter:
 
 
 ADAPTERS = {
+    "semantic_scholar": OperationAdapter(
+        {"provider": "semantic_scholar", "transport": "http_api", "representation": "scholarly_metadata"},
+        "semantic_scholar", "retrieval", "retrieval_calls", str(Path(semantic_scholar.__file__).absolute()), semantic_scholar.ADAPTER_VERSION,
+        _semantic_scholar_client, _semantic_scholar_arguments, _http_files, semantic_scholar.inspect_result),
     "openalex": OperationAdapter(
         {"provider": "openalex", "transport": "http_api", "representation": "scholarly_metadata"},
         "openalex", "retrieval", "retrieval_calls", str(Path(literature.__file__).absolute()), literature.ADAPTER_VERSION,

@@ -65,7 +65,9 @@ class SoftwareWorkbenchTests(unittest.TestCase):
     def test_custom_selection_accepts_source_led_discovery_and_rejects_failed_search(self):
         response = selection_contract()
         response.update(decision="pass", summary="Declared mathematical model")
-        response["software_selection"].update(strategy="custom_model", rationale="Captured mechanism and inspected alternatives", scientific_source_refs=["captured-source"])
+        from scisaurus.tests.test_harness_recovery import model_definition
+        self.workbench.evidence_refs = frozenset({'captured-source'})
+        response["software_selection"].update(strategy="custom_model", rationale="Captured mechanism and inspected alternatives", scientific_source_refs=["captured-source"], model_definition=model_definition())
         host = {"outcome": "ok", "action": {"operation": "check_environment"}}
         for operation in ("search", "search_evidence"):
             discovery = {"outcome": "ok", "action": {"operation": operation}}

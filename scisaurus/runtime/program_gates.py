@@ -175,6 +175,8 @@ def admit_program_candidate(candidate, *, execute, validate, readiness=None, rev
         raise ValidationError("independent recalculation reported no metric comparison")
     bind_deterministic_validation(
         verdict, document, candidate["experiment_intent"])
+    from scisaurus.runtime.measurement_contract import verified_decisions
+    decision_assessments = verified_decisions(candidate["experiment_intent"], verdict)
     readiness_record = None
     if readiness is not None:
         readiness_record = validate_validator_readiness(readiness())
@@ -200,6 +202,7 @@ def admit_program_candidate(candidate, *, execute, validate, readiness=None, rev
         "independent_recalculation": {"decision": verdict.get("decision"),
                                        "checks": len(checks),
                                        "metrics": len(recalculations)},
+        "decision_assessments": decision_assessments,
         "validator_readiness": readiness_record,
         "adversarial_review": review_record,
         "gates": ["static_scan", "deterministic_replay", "test_vector_digest",

@@ -123,6 +123,7 @@ class ComposerSupervisorTests(unittest.TestCase):
                       "stages": {}, "release_status": "held"}
             for watch in (False, True):
                 with self.subTest(watch=watch), patch("builtins.print"), \
+                        patch("scisaurus.runtime.composer.validate_workflow"), \
                         patch("scisaurus.runtime.composer.ComposerRunner") as runner, \
                         patch("scisaurus.runtime.composer_supervisor.supervise_composer", return_value=result) as supervise:
                     runner.return_value.run.return_value = result

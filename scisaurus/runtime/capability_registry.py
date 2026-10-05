@@ -16,6 +16,7 @@ import shutil
 import threading
 import uuid
 
+from scisaurus.runtime.measurement_contract import INTENT_EXTENSIONS, recalculation_outcomes, validate_model_definition
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
 
@@ -149,8 +150,9 @@ def experiment_program_payload(intent, configured_input):
         experiment = {key: intent[key] for key in PROGRAM_EXPERIMENT_FIELDS}
     except (KeyError, TypeError) as exc:
         raise ValidationError("generated experiment intent cannot form a runtime payload") from exc
-    if intent.get("quality_contract") is not None:
-        experiment["quality_contract"] = intent["quality_contract"]
+    for name in INTENT_EXTENSIONS | {"quality_contract"}:
+        if name in intent:
+            experiment[name] = intent[name]
     return json.loads(canonical_bytes({
         "configured_input": configured_input,
         "experiment": experiment,
@@ -169,14 +171,15 @@ def experiment_validation_payload(intent, configured_input, candidate, candidate
         experiment = {key: intent[key] for key in PROGRAM_EXPERIMENT_FIELDS}
     except (KeyError, TypeError) as exc:
         raise ValidationError("generated experiment intent cannot form a validator payload") from exc
-    if intent.get("quality_contract") is not None:
-        experiment["quality_contract"] = intent["quality_contract"]
+    for name in INTENT_EXTENSIONS | {"quality_contract"}:
+        if name in intent:
+            experiment[name] = intent[name]
     return deepcopy_json({
         "configured_input": configured_input,
         "experiment": experiment,
         "candidate": candidate,
         "candidate_sha256": candidate_sha256,
-        "primary_outcomes": experiment["primary_outcomes"],
+        "primary_outcomes": recalculation_outcomes(experiment),
     })
 
 

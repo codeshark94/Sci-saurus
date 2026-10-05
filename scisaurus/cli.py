@@ -302,25 +302,28 @@ def main(argv=None) -> int:
         from scisaurus.runtime.execution_policy import development_execution
         with development_execution(args.development):
             from scisaurus.core.errors import ValidationError
-            from scisaurus.runtime.composer import ComposerRunner, load_runtime_environment_files
+            from scisaurus.runtime.composer import ComposerRunner, load_runtime_environment_files, validate_workflow
             try:
                 workflow = json.loads(Path(args.workflow).read_text())
+                validate_workflow(workflow)
                 load_runtime_environment_files(args.env_file)
                 on_progress = lambda state: print(_composer_progress_line(state), flush=True)
-                if args.watch:
-                    from scisaurus.runtime.composer_supervisor import supervise_composer
-                    result = supervise_composer(
-                        workflow, initial_resume=args.resume,
-                        initial_additional_seconds=args.extend_deadline_seconds,
-                        poll_seconds=args.watch_interval, on_progress=on_progress,
-                        stop_after_stage=args.stop_after_stage,
-                        extend_workflow=args.extend_workflow)
-                else:
-                    result = ComposerRunner(workflow, resume=args.resume,
-                                            additional_seconds=args.extend_deadline_seconds,
-                                            on_progress=on_progress,
-                                            stop_after_stage=args.stop_after_stage,
-                                            extend_workflow=args.extend_workflow).run()
+                from scisaurus.runtime.run_control import workflow_permission
+                with workflow_permission(args.workflow, initialize=not args.resume):
+                    if args.watch:
+                        from scisaurus.runtime.composer_supervisor import supervise_composer
+                        result = supervise_composer(
+                            workflow, initial_resume=args.resume,
+                            initial_additional_seconds=args.extend_deadline_seconds,
+                            poll_seconds=args.watch_interval, on_progress=on_progress,
+                            stop_after_stage=args.stop_after_stage,
+                            extend_workflow=args.extend_workflow)
+                    else:
+                        result = ComposerRunner(workflow, resume=args.resume,
+                                                additional_seconds=args.extend_deadline_seconds,
+                                                on_progress=on_progress,
+                                                stop_after_stage=args.stop_after_stage,
+                                                extend_workflow=args.extend_workflow).run()
             except (OSError, ValueError, ValidationError) as exc:
                 print(f"composer workflow rejected: {exc}", file=sys.stderr)
                 return 2

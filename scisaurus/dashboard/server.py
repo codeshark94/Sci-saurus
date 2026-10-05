@@ -3263,9 +3263,8 @@ class DashboardService:
 
     @staticmethod
     def _save_run_control(output, value):
-        temporary = output / "run-control.json.tmp"
-        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
-        temporary.replace(output / "run-control.json")
+        from scisaurus.runtime.run_control import save_control
+        save_control(output, value)
 
     def run_status(self, project_ref=None):
         project_dir = self._resolve_project(project_ref)
@@ -3363,11 +3362,18 @@ class DashboardService:
                 command.append("--resume")
             log_path = project_id / "output" / "composer-console.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            with log_path.open("ab") as log_file:
-                process = subprocess.Popen(
-                    command, cwd=str(repository), stdout=log_file,
-                    stderr=subprocess.STDOUT, start_new_session=True,
-                )
+            from scisaurus.runtime.run_control import authorized_control
+            grant = authorized_control(workflow_path, previous=_read_json(output / "run-control.json"), settings=settings)
+            self._save_run_control(output, grant)
+            try:
+                with log_path.open("ab") as log_file:
+                    process = subprocess.Popen(
+                        command, cwd=str(repository), stdout=log_file,
+                        stderr=subprocess.STDOUT, start_new_session=True,
+                    )
+            except BaseException:
+                self._save_run_control(output, {**grant, "stop_requested": True})
+                raise
             self._owned_processes[str(workflow_path)] = process
             Thread(target=process.wait, daemon=True).start()
             try:
@@ -3378,14 +3384,13 @@ class DashboardService:
                                  if item["pid"] == process.pid), None)
                 if identity is None:
                     raise ValueError(f"Composer startup identity could not be verified; inspect {log_path}")
-                self._save_run_control(output, {"workflow_path": str(workflow_path.resolve()),
-                                       "pid": process.pid, "started": identity["started"],
-                                       "stop_requested": False, "settings": settings})
+                self._save_run_control(output, {**grant, "pid": process.pid, "started": identity["started"]})
             except BaseException:
                 if process.poll() is None:
                     process.terminate()
                 process.wait(timeout=20)
                 self._owned_processes.pop(str(workflow_path), None)
+                self._save_run_control(output, {**grant, "stop_requested": True})
                 raise
             return {"status": "started", "project": project_dir.name,
                     "workflow_path": str(workflow_path), "pid": process.pid,
@@ -3400,6 +3405,9 @@ class DashboardService:
         with self._run_lock(project_id) as output:
             processes = self._composer_processes(workflow_path)
             if not processes:
+                control = _read_json(output / "run-control.json") or {}
+                self._save_run_control(output, {**control, "workflow_path": str(workflow_path.resolve()),
+                                               "stop_requested": True})
                 return {"status": "already_stopped", "project": project_ref or "."}
             if len(processes) != 1:
                 raise ValueError("multiple Composer supervisors own this workflow; reconcile their ownership before stopping")
@@ -3415,13 +3423,15 @@ class DashboardService:
             current = next((item for item in self._composer_processes(workflow_path)
                             if item["pid"] == owner["pid"]), None)
             if current is None:
+                self._save_run_control(output, {**control, "workflow_path": str(workflow_path.resolve()),
+                                               "stop_requested": True, "settings": settings})
                 return {"status": "already_stopped", "project": project_ref or "."}
             if current != owner:
                 raise ValueError("Composer process identity changed before stop")
-            os.kill(owner["pid"], signal.SIGTERM)
-            self._save_run_control(output, {"workflow_path": str(workflow_path.resolve()),
+            self._save_run_control(output, {**control,"workflow_path": str(workflow_path.resolve()),
                                    "pid": owner["pid"], "started": owner["started"],
                                    "stop_requested": True, "settings": settings})
+            os.kill(owner["pid"], signal.SIGTERM)
             return {"status": "stopping", "project": project_ref or ".", "pid": owner["pid"]}
 
     @staticmethod

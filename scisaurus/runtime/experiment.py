@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 
+from scisaurus.runtime.measurement_contract import INTENT_EXTENSIONS, recalculation_outcomes, validate_model_definition
 from scisaurus.core.errors import ModelContractError, ValidationError
 from scisaurus.core.events import ControlStore
 from scisaurus.core.schema import canonical_bytes, sha256_hex
@@ -311,17 +312,18 @@ def validate_program_output(value, experiment, work_orders=None):
             "limitations": value["limitations"], "assets": [
                 {key: asset[key] for key in ("path", "sha256", "role")} for asset in assets]}
     validate_results_package(core)
-    configured = {item["id"]: item for item in experiment["primary_outcomes"]}
+    configured = {item["id"]: item for item in recalculation_outcomes(experiment)}
     observed = {item["id"]: item for item in value["metrics"]}
     if set(configured) - set(observed):
         raise ValidationError("experiment output omits a configured primary outcome")
     if any(observed[key]["unit"] != contract["unit"] for key, contract in configured.items()):
         raise ValidationError("experiment output changes a configured primary outcome unit")
+    primary_ids = {row["id"] for row in experiment["primary_outcomes"]}
     null_primary = {
-        metric_id for metric_id in configured
+        metric_id for metric_id in primary_ids
         if observed[metric_id]["value"] is None
     }
-    if len(null_primary) == len(configured):
+    if len(null_primary) == len(primary_ids):
         raise ValidationError(
             "all declared primary outcomes are null; the experiment has no estimable "
             "primary result. Diagnose the undefinedness against the executable model, "
@@ -425,12 +427,12 @@ def validate_deterministic_validation(value, experiment, candidate_sha256):
             observed_match = abs(float(reported) - float(recalculated)) <= float(metric["tolerance"])
         if metric["matches"] is not observed_match:
             raise ValidationError("metric recalculation match flag contradicts its values")
-    configured_metric_ids = {item["id"] for item in experiment["primary_outcomes"]}
+    configured_metric_ids = {item["id"] for item in recalculation_outcomes(experiment)}
     if metric_ids != configured_metric_ids:
         missing = sorted(configured_metric_ids - metric_ids)
         unexpected = sorted(metric_ids - configured_metric_ids)
         raise ValidationError(
-            "deterministic validation must recalculate exactly the primary outcomes; "
+            "deterministic validation must recalculate exactly the primary and decision outcomes; "
             f"missing metric_ids={missing}; unexpected metric_ids={unexpected}; "
             f"expected metric_ids={sorted(configured_metric_ids)}; "
             f"observed metric_ids={sorted(metric_ids)}")
@@ -456,12 +458,12 @@ def validate_deterministic_validation(value, experiment, candidate_sha256):
 
 def bind_deterministic_validation(value, candidate, experiment):
     """Bind validator metric claims to the exact candidate metric values."""
-    declared = {item["id"] for item in experiment["primary_outcomes"]}
+    declared = {item["id"] for item in recalculation_outcomes(experiment)}
     reported = {item["id"]: item["value"] for item in candidate["metrics"]}
     recalculations = value["metric_recalculations"]
     if {item["metric_id"] for item in recalculations} != declared:
         raise ValidationError(
-            "deterministic validation must bind exactly the declared primary outcomes")
+            "deterministic validation must bind exactly the declared primary and decision outcomes")
     for item in recalculations:
         metric_id = item["metric_id"]
         echoed = item["reported_value"]
@@ -475,6 +477,10 @@ def bind_deterministic_validation(value, candidate, experiment):
             raise ValidationError(
                 "deterministic validation changed a reported primary metric: "
                 f"metric_id={metric_id}, expected={original!r}, observed={echoed!r}")
+    for outcome in experiment.get("decision_outcomes", []):
+        values = {row["metric_id"]: row["recalculated_value"] for row in recalculations}
+        if any(values[parent] is None for parent in outcome["parents"]) and values[outcome["id"]] is not None:
+            raise ValidationError("decision outcome is defined despite an undefined parent")
     return value
 
 
@@ -1080,6 +1086,11 @@ class ExperimentRunner(ExecutionRuntime):
             "evidence_refs": evidence_refs, "required_checks": sorted(required_checks),
             "required_finding_ids": sorted(item["id"] for item in candidate["findings"]),
             "instructions": instructions}
+        for name in INTENT_EXTENSIONS:
+            if name in self.experiment:
+                assignment["study"][name] = deepcopy(self.experiment[name])
+        from scisaurus.runtime.measurement_contract import verified_decisions
+        assignment["verified_decisions"] = verified_decisions(self.experiment, deterministic)
         if self.work_orders:
             assignment["work_orders"] = deepcopy(self.work_orders)
             assignment["required_work_order_ids"] = [item["id"] for item in self.work_orders]
@@ -1359,7 +1370,7 @@ class ExperimentRunner(ExecutionRuntime):
         return value, record
 
     def _package(self, candidate, candidate_sha256, validation_record, validator_execution_ref,
-                 assessment, assessment_record, reviews):
+                 assessment, assessment_record, reviews, deterministic=None):
         package_dir = self.dir / "output" / "results-package"
         package_dir.mkdir(parents=True, exist_ok=True)
         raw = canonical_bytes({"schema_version": "experiment-observations-1", "study_id": self.experiment["id"],
@@ -1431,6 +1442,15 @@ class ExperimentRunner(ExecutionRuntime):
                 "deterministic_validation_ref": validation_record["artifact_ref"],
                 "model_review_refs": [record["artifact_ref"] for record in self.review_records],
                 "assessment_ref": assessment_record["artifact_ref"]}}
+        if self.experiment.get("decision_rules"):
+            from scisaurus.runtime.measurement_contract import verified_decisions
+            package["decision_evidence"] = {
+                "contract": {key: deepcopy(self.experiment.get(key, [])) for key in (
+                    "id", "revision", "primary_outcomes", "decision_outcomes", "decision_rules")},
+                "deterministic_validation": deepcopy(deterministic),
+            }
+            package["decision_evidence"]["assessments"] = verified_decisions(
+                self.experiment, package["decision_evidence"]["deterministic_validation"])
         if scoped_assessment:
             package["withheld_findings"] = withheld_findings
         if work_order_assessments:
@@ -1501,7 +1521,7 @@ class ExperimentRunner(ExecutionRuntime):
                 assessment, assessment_record = self._assess(candidate, validation_record, reviews, images)
                 package, package_path = self._package(candidate, candidate_sha256, validation_record,
                                                       validator_execution_ref, assessment, assessment_record,
-                                                      reviews)
+                                                      reviews, deterministic=deterministic)
                 quality = package.get("quality_admission")
                 requests = [deepcopy(item) for item in self.research_expansion_requests
                             if isinstance(item, dict)]

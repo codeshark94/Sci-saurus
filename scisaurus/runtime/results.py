@@ -162,7 +162,7 @@ def validate_results_package(value, *, base_dir=None):
         if schema == "results-package-3":
             required |= {"withheld_findings"}
         allowed = required | {
-            "analysis", "quality_contract", "quality_admission", "work_order_assessments",
+            "analysis", "quality_contract", "quality_admission", "work_order_assessments", "decision_evidence",
         }
         if (set(value) - allowed) or not required.issubset(value):
             raise ValidationError(
@@ -294,5 +294,25 @@ def validate_results_package(value, *, base_dir=None):
                     raise ValidationError("results quality_admission does not match the declared package")
         elif "quality_admission" in value:
             raise ValidationError("results quality_admission requires quality_contract")
+    if "decision_evidence" in value:
+        from scisaurus.runtime.measurement_contract import verified_decisions
+        from scisaurus.runtime.experiment import validate_deterministic_validation, bind_deterministic_validation
+        evidence = value["decision_evidence"]
+        _exact(evidence, {"contract", "deterministic_validation", "assessments"}, "decision evidence")
+        if (not isinstance(evidence["contract"], dict)
+                or evidence["contract"].get("id") != value["id"]
+                or type(evidence["contract"].get("revision")) is not int
+                or evidence["contract"]["revision"] != value["revision"]):
+            raise ValidationError("result decision contract belongs to another study revision")
+        from scisaurus.runtime.measurement_contract import recalculation_outcomes
+        metrics = {row["id"]: row for row in value["metrics"]}
+        if any(row["id"] not in metrics or metrics[row["id"]]["unit"] != row["unit"]
+               for row in recalculation_outcomes(evidence["contract"])):
+            raise ValidationError("result decision metric units differ from their declared contract")
+        digest = value["provenance"]["replay_sha256"]
+        verdict = validate_deterministic_validation(evidence["deterministic_validation"], evidence["contract"], digest)
+        bind_deterministic_validation(verdict, value, evidence["contract"])
+        if canonical_bytes(evidence["assessments"]) != canonical_bytes(verified_decisions(evidence["contract"], verdict)):
+            raise ValidationError("result decision assessments contradict their independent evidence")
     canonical_bytes(value)
     return value
