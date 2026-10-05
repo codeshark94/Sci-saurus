@@ -4169,6 +4169,248 @@ if __name__ == "__main__":
 
 
 class IndependentValidatorAuthorshipTests(unittest.TestCase):
+    def routed_foundry(self, root, models=("primary", "peer")):
+        foundry = CapabilityFoundryTests._foundry(root)
+        foundry.validator_client = None
+        foundry.max_attempts = 4
+        foundry.model_config["role_models"] = {"methods.validator-author": {"model": models[0]}}
+        foundry.model_config["role_model_fallbacks"] = {
+            "methods.validator-author": [{"model": model} for model in models[1:]]}
+        return foundry
+
+    def test_validator_routes_use_shared_identity_and_parent_resolution(self):
+        with tempfile.TemporaryDirectory() as path:
+            foundry = self.routed_foundry(Path(path))
+            foundry.model_config["role_models"] = {"methods": {"model": "parent"},
+                "review.methods": {"model": "reviewer"}}
+            foundry.model_config["role_model_fallbacks"] = {
+                "methods": [{"model": "parent", "reasoning_effort": "high"},
+                            {"model": "peer"}, {"model": "peer", "timeout_seconds": 90}],
+                "review.methods": [{"model": "review-peer"}]}
+            routes = foundry._format_model_routes("methods.validator-author", 24000,
+                                                 inherited_role="review.methods")
+            self.assertEqual([route["model"] for route in routes], ["parent", "peer"])
+
+    def test_validator_owned_role_never_borrows_reviewer_fallback(self):
+        with tempfile.TemporaryDirectory() as path:
+            foundry = self.routed_foundry(Path(path))
+            foundry.model_config["role_model_fallbacks"] = {"review.methods": [{"model": "review-peer"}]}
+            routes = foundry._format_model_routes("methods.validator-author", 24000,
+                                                 inherited_role="review.methods")
+            self.assertEqual([route["model"] for route in routes], ["primary"])
+
+    def test_legacy_validator_role_inherits_review_primary_and_peer(self):
+        with tempfile.TemporaryDirectory() as path:
+            foundry = self.routed_foundry(Path(path))
+            foundry.model_config["role_models"] = {"review.methods": {"model": "reviewer"}}
+            foundry.model_config["role_model_fallbacks"] = {"review.methods": [{"model": "review-peer"}]}
+            routes = foundry._format_model_routes("methods.validator-author", 24000,
+                                                 inherited_role="review.methods")
+            self.assertEqual([route["model"] for route in routes], ["reviewer", "review-peer"])
+
+    def test_empty_validator_responses_advance_distinct_routes_once(self):
+        with tempfile.TemporaryDirectory() as path:
+            foundry = self.routed_foundry(Path(path), ("primary", "peer", "last"))
+            producer = StubClient(CapabilityFoundryTests._payload())
+            seen = []
+            class Validator:
+                def __init__(inner, **config):
+                    inner.model = config["model"]
+                def complete(inner, *, system, prompt):
+                    seen.append(inner.model)
+                    packet = json.loads(prompt)
+                    self.assertNotIn("executor_source", packet)
+                    self.assertNotIn("metrics", packet)
+                    text = json.dumps({"validator_source": MINI_VALIDATOR}) if inner.model == "last" else ""
+                    return ModelResult(text, inner.model, {"model_calls": 1}, 0, "length")
+            with patch("scisaurus.runtime.capability_foundry.ModelClient", Validator):
+                outcome = foundry.generate("bounded comparison", client=producer)
+            self.assertEqual(outcome["status"], "registered")
+            self.assertEqual(seen, ["primary", "peer", "last"])
+            self.assertEqual(producer.calls, 1)
+
+    def test_exhausted_validator_response_routes_do_not_dispatch_again(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self.routed_foundry(root)
+            cache = CapabilityFoundryTests._cache(self, root)
+            producer = StubClient(CapabilityFoundryTests._payload())
+            empty = StubClient({})
+            with patch("scisaurus.runtime.capability_foundry.ModelClient", return_value=empty):
+                for _ in range(2):
+                    with self.assertRaises(ModelWorkBlocked) as blocked:
+                        foundry.generate("bounded comparison", client=producer, work_cache=cache)
+                    self.assertEqual(blocked.exception.repair_gate, "independent_validator_contract")
+            self.assertEqual((producer.calls, empty.calls), (1, 2))
+
+    def test_unknown_validator_fallback_resumes_next_route_after_reordering(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self.routed_foundry(root, ("primary", "peer", "last"))
+            cache = CapabilityFoundryTests._cache(self, root)
+            producer = StubClient(CapabilityFoundryTests._payload())
+            producer.model = "stub"
+            seen = []
+            class Validator:
+                def __init__(inner, **config):
+                    inner.model = config["model"]
+                def complete(inner, *, system, prompt):
+                    seen.append(inner.model)
+                    if inner.model == "peer":
+                        raise ModelCallError("provider outcome unknown")
+                    text = json.dumps({"validator_source": MINI_VALIDATOR}) if inner.model == "last" else ""
+                    return ModelResult(text, inner.model, {"model_calls": 1}, 0, "length")
+            with patch("scisaurus.runtime.capability_foundry.ModelClient", Validator):
+                with self.assertRaises(ModelCallError):
+                    foundry.generate("bounded comparison", client=producer, work_cache=cache)
+                foundry.model_config["role_model_fallbacks"]["methods.validator-author"].reverse()
+                outcome = foundry.generate("bounded comparison", client=producer, work_cache=cache)
+            self.assertEqual(outcome["status"], "registered")
+            self.assertEqual(seen, ["primary", "peer", "last"])
+            self.assertEqual(producer.calls, 1)
+
+    def test_reviewer_route_recovery_preserves_validator_across_config_rekey(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            foundry.reviewer_client = None
+            foundry.model_config["role_models"] = {"review.methods": {"model": "first"}}
+            foundry.model_config["role_model_fallbacks"] = {"review.methods": [{"model": "second"}]}
+            producer = StubClient(CapabilityFoundryTests._payload())
+            producer.model = "stub"
+            cache = CapabilityFoundryTests._cache(self, root)
+            seen = []
+            class Reviewer:
+                def __init__(inner, **config):
+                    inner.model = config["model"]
+                def complete(inner, *, system, prompt):
+                    seen.append(inner.model)
+                    value = CapabilityFoundryTests._review_payload() if inner.model == "last" else {}
+                    return ModelResult(json.dumps(value), inner.model, {"model_calls": 1}, 0, "stop")
+            with patch("scisaurus.runtime.capability_foundry.ModelClient", Reviewer):
+                with self.assertRaises(ModelWorkBlocked) as blocked:
+                    foundry.generate("bounded comparison", client=producer, work_cache=cache)
+                self.assertEqual(blocked.exception.repair_gate, "review_response_format")
+                foundry.model_config["role_model_fallbacks"]["review.methods"].append({"model": "last"})
+                outcome = foundry.generate("bounded comparison", client=producer, work_cache=cache)
+            self.assertEqual(outcome["status"], "registered")
+            self.assertEqual(seen, ["first", "second", "last"])
+            self.assertEqual((producer.calls, foundry.validator_client.calls), (1, 1))
+
+    def test_unknown_reviewer_fallback_recovers_only_to_next_distinct_route(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            foundry.reviewer_client = None
+            foundry.model_config["role_models"] = {"review.methods": {"model": "first"}}
+            foundry.model_config["role_model_fallbacks"] = {
+                "review.methods": [{"model": "unknown"}, {"model": "last"}]}
+            producer = StubClient(CapabilityFoundryTests._payload())
+            producer.model = "stub"
+            cache = CapabilityFoundryTests._cache(self, root)
+            seen = []
+            class Reviewer:
+                def __init__(inner, **config):
+                    inner.model = config["model"]
+                def complete(inner, *, system, prompt):
+                    seen.append(inner.model)
+                    if inner.model == "unknown":
+                        raise ModelCallError("unknown dispatched review")
+                    value = CapabilityFoundryTests._review_payload() if inner.model == "last" else {}
+                    return ModelResult(json.dumps(value), inner.model, {"model_calls": 1}, 0, "stop")
+            with patch("scisaurus.runtime.capability_foundry.ModelClient", Reviewer):
+                with self.assertRaises(ModelCallError):
+                    foundry.generate("bounded comparison", client=producer, work_cache=cache)
+                outcome = foundry.generate("bounded comparison", client=producer, work_cache=cache)
+            self.assertEqual(outcome["status"], "registered")
+            self.assertEqual(seen, ["first", "unknown", "last"])
+            self.assertEqual((producer.calls, foundry.validator_client.calls), (1, 1))
+
+    def test_unknown_reviewer_suffix_is_preserved_without_replay(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            foundry.reviewer_client = None
+            foundry.model_config["role_models"] = {"review.methods": {"model": "first"}}
+            foundry.model_config["role_model_fallbacks"] = {"review.methods": [{"model": "peer"}]}
+            producer = StubClient(CapabilityFoundryTests._payload())
+            producer.model = "stub"
+            cache = CapabilityFoundryTests._cache(self, root)
+            seen = []
+            class Reviewer:
+                def __init__(inner, **config):
+                    inner.model = config["model"]
+                def complete(inner, *, system, prompt):
+                    seen.append(inner.model)
+                    if inner.model == "peer":
+                        return ModelResult(json.dumps(CapabilityFoundryTests._review_payload()),
+                                           inner.model, {"model_calls": 1}, 0, "stop")
+                    if len(seen) > 1:
+                        raise ModelCallError("unknown suffix outcome")
+                    return ModelResult('{"status":"admitted","checks":[', inner.model,
+                                       {"model_calls": 1}, 0, "length")
+            with patch("scisaurus.runtime.capability_foundry.ModelClient", Reviewer):
+                with self.assertRaises(ModelCallError):
+                    foundry.generate("bounded comparison", client=producer, work_cache=cache)
+                outcome = foundry.generate("bounded comparison", client=producer, work_cache=cache)
+            self.assertEqual(outcome["status"], "registered")
+            self.assertEqual(seen, ["first", "first", "peer"])
+            self.assertEqual((producer.calls, foundry.validator_client.calls), (1, 1))
+            reviews = cache.entries()[0]["scientific_reviews"].values()
+            self.assertTrue(any(value.get("retired_response_continuations") for value in reviews))
+
+    def test_retired_suffix_does_not_block_new_peer_json_continuation(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            foundry.reviewer_client = None
+            foundry.model_config["role_models"] = {"review.methods": {"model": "first"}}
+            foundry.model_config["role_model_fallbacks"] = {"review.methods": [{"model": "peer"}]}
+            producer = StubClient(CapabilityFoundryTests._payload())
+            producer.model = "stub"
+            cache = CapabilityFoundryTests._cache(self, root)
+            review_json = json.dumps(CapabilityFoundryTests._review_payload())
+            prefix = review_json[:-2]
+            seen = []
+            class Reviewer:
+                def __init__(inner, **config):
+                    inner.model = config["model"]
+                def complete(inner, *, system, prompt):
+                    seen.append(inner.model)
+                    count = seen.count(inner.model)
+                    if inner.model == "first" and count == 2:
+                        raise ModelCallError("unknown suffix outcome")
+                    text = prefix if count == 1 else review_json[len(prefix):]
+                    return ModelResult(text, inner.model, {"model_calls": 1}, 0,
+                                       "length" if count == 1 else "stop")
+            with patch("scisaurus.runtime.capability_foundry.ModelClient", Reviewer):
+                with self.assertRaises(ModelCallError):
+                    foundry.generate("bounded comparison", client=producer, work_cache=cache)
+                outcome = foundry.generate("bounded comparison", client=producer, work_cache=cache)
+            self.assertEqual(outcome["status"], "registered")
+            self.assertEqual(seen, ["first", "first", "peer", "peer"])
+            self.assertEqual((producer.calls, foundry.validator_client.calls), (1, 1))
+
+    def test_reviewer_response_failure_does_not_request_producer_source_patch(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            foundry.reviewer_client = StubClient({})
+            producer = StubClient(CapabilityFoundryTests._payload())
+            cache = CapabilityFoundryTests._cache(self, root)
+            states = []
+            for _ in range(2):
+                with self.assertRaises(ModelWorkBlocked) as blocked:
+                    foundry.generate("bounded comparison", client=producer, work_cache=cache,
+                        on_progress=lambda phase, state: states.append(state))
+                self.assertEqual(blocked.exception.failure_class, "model_contract")
+                self.assertEqual(blocked.exception.repair_gate, "review_response_format")
+            self.assertEqual((producer.calls, foundry.reviewer_client.calls), (1, 2))
+            self.assertEqual(states[-1]["repair_owner"], "review.methods")
+            self.assertEqual(states[-1]["last_attempt"]["executor_source"], MINI_EXECUTOR)
+            self.assertEqual(states[-1]["repair_ledger"][-1]["next_action"], "format_repair_then_rerun")
+            self.assertFalse(states[-1]["failed_candidates"])
+
     def test_validator_protocol_deadline_retains_captured_response(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)

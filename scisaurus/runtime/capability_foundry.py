@@ -43,7 +43,7 @@ from scisaurus.runtime.experiment import (
 from scisaurus.runtime.experiment_config import EXPERIMENT_WORK_ORDER_KINDS, validate_work_orders
 from scisaurus.runtime.models import (
     ModelCallError, ModelClient, ModelContextBudgetError, ModelResult, effective_model_timeout,
-    resolve_model_config,
+    resolve_model_config, load_model_config, model_route_candidates, role_config_for,
 )
 from scisaurus.runtime.model_work import ModelWorkBlocked
 from scisaurus.runtime.specialists import (
@@ -2085,6 +2085,28 @@ class CapabilityFoundry:
             config.get("timeout_seconds"), *timeout_bounds)
         return config
 
+    def _format_model_routes(self, role, output_limit, *, inherited_role=None):
+        model = deepcopy_config(load_model_config(self.model_config))
+        fallback_default = []
+        if (inherited_role is not None
+                and role_config_for(model.get("role_models"), role) is None):
+            model.setdefault("role_models", {})[role] = resolve_model_config(model, role=inherited_role)
+            fallback_default = role_config_for(model.get("role_model_fallbacks"), inherited_role, [])
+        alternatives = role_config_for(model.get("role_model_fallbacks"), role, fallback_default)
+        filtered = [
+            alternative for alternative in alternatives
+            if not alternative.get("model_call_budget_key")]
+        model["role_model_fallbacks"] = {key: value for key, value in model.get("role_model_fallbacks", {}).items()
+                                        if key != role and not role.startswith(key + ".")}
+        if filtered:
+            model["role_model_fallbacks"][role] = filtered
+        return [self._model_config_for_role(role, output_limit, model_config=config)
+                for config in model_route_candidates(model, role=role)]
+
+    @staticmethod
+    def _dispatch_route_identity(config):
+        return {key: config.get(key) for key in ("protocol", "base_url", "model", "auth_env")}
+
     @staticmethod
     def _reserve_output_capacity(config, output_limit, *, role):
         requested = max(int(config["max_output_tokens"]), int(output_limit))
@@ -2190,45 +2212,7 @@ class CapabilityFoundry:
         author_role = "research.experiment-author"
         author_route_configs = []
         if client is None:
-            model_config = self._model_config_for_role(
-                author_role, self.author_max_output_tokens)
-            author_route_configs.append(model_config)
-            # Keep a malformed response from consuming the whole authoring
-            # lease on one model.  Fallbacks are instantiated lazily and only
-            # after a transport/schema defect; scientific gate failures stay
-            # on the current route so the Composer's methods repair path keeps
-            # its meaning.
-            for alternative in self.model_config.get("role_model_fallbacks", {}).get(
-                    author_role, []):
-                # A budgeted premium model is reserved for consequential
-                # scientific decisions. A malformed envelope is a transport
-                # defect, not a reason to spend that scarce call budget.
-                if alternative.get("model_call_budget_key"):
-                    continue
-                fallback_model = deepcopy_config(self.model_config)
-                fallback_model.setdefault("role_models", {})[author_role] = deepcopy_config(alternative)
-                fallback_config = resolve_model_config(fallback_model, role=author_role)
-                try:
-                    self._reserve_output_capacity(
-                        fallback_config, self.author_max_output_tokens,
-                        role=author_role)
-                except ValidationError:
-                    continue
-                timeout_bounds = []
-                if self.model_timeout_seconds is not None:
-                    timeout_bounds.append(self.model_timeout_seconds)
-                if self.deadline is not None:
-                    remaining = self.deadline - time.monotonic()
-                    if remaining <= 0.2:
-                        raise CapabilityDeadlineError(
-                            "capability fallback model has no request window remaining")
-                    timeout_bounds.append(remaining)
-                fallback_config["timeout_seconds"] = effective_model_timeout(
-                    fallback_config.get("timeout_seconds"), *timeout_bounds)
-                if not all(
-                        fallback_config.get(key) == author_route_configs[0].get(key)
-                        for key in ("base_url", "model", "auth_env")):
-                    author_route_configs.append(fallback_config)
+            author_route_configs = self._format_model_routes(author_role, self.author_max_output_tokens)
             client = ModelClient(**author_route_configs[0])
         runtime = self._runtime()
         base_prompt = candidate_prompt(brief, self.runtime_packages, configured_input,
@@ -2328,7 +2312,11 @@ class CapabilityFoundry:
                                 and response["text"]
                                 and (response.get("finish_reason") == "length"
                                      or (response.get("finish_reason") == "stop"
-                                         and prior.get("status") == "response_received"))
+                                         and (prior.get("status") == "response_received"
+                                              or (prior.get("status") == "blocked"
+                                                  and prior.get("last_failure_class") == "model_contract"
+                                                  and prior.get("last_failure_gate") in {
+                                                      "independent_validator_contract", "review_response_format"}))))
                                 and isinstance(last_request, dict)
                                 and last_request.get("role", author_role) == author_role
                                 and last_request.get("status") == "succeeded"
@@ -2415,12 +2403,13 @@ class CapabilityFoundry:
                     if isinstance(prior_diagnostics, list):
                         state["model_diagnostics"] = deepcopy_config(prior_diagnostics[-12:])
                     prior_format_repair = prior.get("format_repair")
-                    # Only failed authoring receipts are reusable. Successful
-                    # validators and verdicts still run the current protocol.
+                    # Reuse candidate-bound authoring receipts, then run the
+                    # current readiness and recalculation protocol again.
                     for identity, authored in prior.get("validator_authorship", {}).items():
                         assignment = authored.get("assignment", {}) if isinstance(authored, dict) else {}
                         if (isinstance(authored, dict)
-                                and authored.get("status") == "repair_required"
+                                and authored.get("status") in {"repair_required", "response_received", "calling",
+                                                             "result_unknown", "provider_rate_limited"}
                                 and (authored.get("candidate_sha256") == _authored_candidate_sha256(
                                         {name: candidate[name] for name in PRODUCER_FIELDS})
                                      or (authored.get("candidate_sha256") is None
@@ -2565,9 +2554,9 @@ class CapabilityFoundry:
                 "model_contract" if format_failure else "experiment_capability_repair")
             error.recovery_mode = (
                 "format_repair_then_rerun" if format_failure else "repair_then_rerun")
-            format_response_incomplete = format_failure and latest.get("outcome") in {
-                "incomplete_response", "inadmissible_finish_reason",
-            }
+            format_response_incomplete = (
+                format_failure and failure_gate in {None, "author_response_format"}
+                and latest.get("outcome") in {"incomplete_response", "inadmissible_finish_reason"})
             error.repair_gate = (
                 ("author_response_format" if format_response_incomplete else
                  failure_gate or "author_response_format") if format_failure else
@@ -3121,39 +3110,24 @@ class CapabilityFoundry:
             save("author_response_continuation_exhausted")
             return combined
 
-        def reviewer_for_attempt(review_attempt):
+        def reviewer_for_attempt(review_attempt, retained=None):
             reviewer = self.reviewer_client
             if reviewer is None:
-                model_config = deepcopy_config(self.model_config)
-                alternatives = model_config.get("role_model_fallbacks", {}).get(
-                    "review.methods", [])
-                if (review_attempt or state.get("prefer_review_fallback")) and alternatives:
-                    model_config.setdefault("role_models", {})["review.methods"] = alternatives[0]
-                config = resolve_model_config(model_config, role="review.methods")
-                configured_limit = max(
-                    int(config.get("max_output_tokens", 0)),
-                    int(self.reviewer_max_output_tokens),
-                )
-                window = config.get("context_window_tokens")
-                input_limit = config.get("max_input_tokens")
-                if type(window) is int:
-                    available = window - (input_limit if type(input_limit) is int else 1024)
-                    if available <= 0:
-                        raise ValidationError(
-                            "foundry reviewer route leaves no output context after its input reservation")
-                    configured_limit = min(configured_limit, available)
-                config["max_output_tokens"] = configured_limit
-                timeout_bounds = []
-                if self.model_timeout_seconds is not None:
-                    timeout_bounds.append(self.model_timeout_seconds)
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0.2:
-                        raise CapabilityDeadlineError(
-                            "independent program review reached its mission deadline")
-                    timeout_bounds.append(remaining)
-                config["timeout_seconds"] = effective_model_timeout(
-                    config.get("timeout_seconds"), *timeout_bounds)
+                routes = self._format_model_routes("review.methods", self.reviewer_max_output_tokens)
+                recorded = (retained or {}).get("response_routes", [])
+                current = recorded[review_attempt] if review_attempt < len(recorded) else None
+                available = [route for route in routes if self._dispatch_route_identity(route)
+                             not in (retained or {}).get("response_exhausted_routes", [])]
+                if not available:
+                    blocked = ModelWorkBlocked("independent program reviewer response routes exhausted")
+                    blocked.failure_class = "model_contract"
+                    blocked.recovery_mode = "format_repair_then_rerun"
+                    blocked.repair_gate = "review_response_format"
+                    raise blocked
+                config = next((route for route in available
+                               if self._dispatch_route_identity(route) == current), available[0])
+                if retained is not None:
+                    retained["current_route"] = self._dispatch_route_identity(config)
                 reviewer = ModelClient(**config)
             if hasattr(reviewer, "timeout_seconds"):
                 timeout_bounds = []
@@ -3203,14 +3177,26 @@ class CapabilityFoundry:
                 return result
 
             continuation = retained.get("response_continuation")
-            if isinstance(continuation, dict) and continuation.get("status") in {
-                    "calling", "result_unknown", "provider_rate_limited"}:
-                raise ModelWorkBlocked(
-                    "reviewer JSON continuation has an unobserved or rate-limited outcome; "
-                    "refusing to repeat it")
             prefix_digest = hashlib.sha256(result.text.encode("utf-8")).hexdigest()
-            if (isinstance(continuation, dict)
-                    and continuation.get("prefix_sha256") == prefix_digest):
+            same_response = (isinstance(continuation, dict)
+                             and continuation.get("prefix_sha256") == prefix_digest
+                             and continuation.get("review_attempt") == review_attempt + 1
+                             and continuation.get("candidate_sha256") == identity)
+            if same_response and continuation.get("status") in {"calling", "result_unknown"}:
+                if self.reviewer_client is not None:
+                    raise ModelWorkBlocked("reviewer JSON continuation has an unobserved outcome")
+                continuation["status"] = "retired_unknown"
+                retained.setdefault("retired_response_continuations", []).append(deepcopy_config(continuation))
+                save("scientific_review_continuation_retired")
+                raise ValidationError("reviewer JSON suffix outcome is unknown; a complete fresh review is required")
+            if same_response and continuation.get("status") == "retired_unknown":
+                raise ValidationError("reviewer JSON suffix outcome is unknown; a complete fresh review is required")
+            if same_response and continuation.get("status") == "provider_rate_limited":
+                signature = continuation.get("request_signature")
+                continuation["request_signatures"] = [value for value in continuation.get("request_signatures", [])
+                                                       if value != signature]
+                continuation["status"] = "pending"
+            if same_response:
                 partial = continuation.get("partial_response", result.text)
                 usage = continuation.get("usage", result.usage)
                 elapsed = continuation.get("elapsed_seconds", result.elapsed_seconds)
@@ -3234,7 +3220,7 @@ class CapabilityFoundry:
                 retained["response_continuation"] = continuation
                 save("scientific_review_continuation_pending")
 
-            reviewer = reviewer_for_attempt(review_attempt)
+            reviewer = reviewer_for_attempt(review_attempt, retained)
             continuation_limit = min(AUTHOR_MAX_CONTINUATIONS, 3)
             for continuation_index in range(continuation.get("continuations", 0),
                                             continuation_limit):
@@ -3432,32 +3418,68 @@ class CapabilityFoundry:
             retained = reviews.setdefault(identity + ":" + review_scope,
                                           {"status": "pending", "responses": []})
             responses = retained.setdefault("responses", [retained["result"]] if retained.get("result") else [])
-            if retained["status"] in {
-                    "calling", "result_unknown", "provider_rate_limited"}:
-                raise ModelWorkBlocked("independent program review has an unobserved provider outcome")
-            for review_attempt in range(2):
+            if retained["status"] in {"calling", "result_unknown", "provider_rate_limited"}:
+                if self.reviewer_client is not None or not isinstance(retained.get("current_route"), dict):
+                    raise ModelWorkBlocked("independent program review has an unobserved provider outcome")
+                if retained["status"] != "provider_rate_limited":
+                    exhausted = retained.setdefault("response_exhausted_routes", [])
+                    if retained["current_route"] not in exhausted:
+                        exhausted.append(retained["current_route"])
+                    for request in reversed(state.get("requests", [])):
+                        if request.get("role") == "review.methods" and request.get("candidate_sha256") == identity:
+                            if request.get("status") == "started":
+                                request.update(status="result_unknown", error="process exited before review result was recorded")
+                            break
+                    retained["error"] = "review response outcome is unknown; recovery requires a distinct configured route"
+                retained["status"] = "repairing"
+                save("scientific_review_route_recovery")
+            review_attempt = 0
+            while True:
                 if review_attempt < len(responses):
                     result = ModelResult(**responses[review_attempt])
                 else:
                     result = call_reviewer(
                         candidate, document, identity, retained, review_attempt,
                         prior_blocking_issues, execution_evidence, question_alignment)
-                result = continue_truncated_review_response(
-                    result, identity, retained, review_attempt)
                 try:
+                    result = continue_truncated_review_response(
+                        result, identity, retained, review_attempt)
                     if result.finish_reason not in {"stop", "length"}:
                         raise ValidationError(f"independent program reviewer finish_reason={result.finish_reason}")
                     review = validate_program_review(
                         result.json_object(allow_missing_closers=True),
                         prior_blocking_issues=prior_blocking_issues)
+                except (CapabilityDeadlineError, CapabilityModelBudgetExceeded,
+                        ModelContextBudgetError, ModelWorkBlocked):
+                    raise
                 except ValidationError as exc:
                     retained.update(status="repairing", error=str(exc))
                     state["prefer_review_fallback"] = True
+                    if self.reviewer_client is None:
+                        recorded = retained.get("response_routes", [])
+                        route = recorded[review_attempt] if review_attempt < len(recorded) else None
+                        if route is None:
+                            matching = [self._dispatch_route_identity(config) for config in
+                                self._format_model_routes("review.methods", self.reviewer_max_output_tokens)
+                                if _model_route_identity(config.get("model")) == _model_route_identity(result.model)]
+                            route = matching[0] if len(matching) == 1 else None
+                        if route is None:
+                            blocked = ModelWorkBlocked("review response route cannot be reconciled with its dispatch record")
+                            blocked.failure_class = "model_contract"
+                            blocked.recovery_mode = "format_repair_then_rerun"
+                            blocked.repair_gate = "review_response_format"
+                            raise blocked from exc
+                        exhausted = retained.setdefault("response_exhausted_routes", [])
+                        if route not in exhausted:
+                            exhausted.append(route)
                     save("scientific_review_format_repair")
                     continuation_status = (
                         retained.get("response_continuation", {}).get("status")
                         if isinstance(retained.get("response_continuation"), dict)
                         else None)
+                    if self.reviewer_client is None:
+                        review_attempt += 1
+                        continue
                     if continuation_status in {"exhausted", "failed"}:
                         blocked = ModelWorkBlocked(
                             "independent program review remained incomplete after exact JSON continuation")
@@ -3466,6 +3488,7 @@ class CapabilityFoundry:
                         blocked.repair_gate = "review_response_format"
                         raise blocked from exc
                     if review_attempt == 0:
+                        review_attempt += 1
                         continue
                     blocked = ModelWorkBlocked(
                         f"independent program review response is invalid: {exc}")
@@ -3504,7 +3527,7 @@ class CapabilityFoundry:
                     if isinstance(item, dict)
                     and isinstance(item.get("review_check_id"), str)
                 })
-            reviewer = reviewer_for_attempt(review_attempt)
+            reviewer = reviewer_for_attempt(review_attempt, retained)
             ensure_model_call_budget()
             prompt = {"assignment": "independent_scientific_program_review",
                 "scientific_input_recovery": scientific_input_recovery_contract(),
@@ -3552,7 +3575,13 @@ class CapabilityFoundry:
                                     "Judge the same evidence independently; do not relax the criteria. "
                                     "Include exactly one check row for every required_check_ids entry, even "
                                     "when the outcome is failed; do not omit independent_validation."}
+            if self.reviewer_client is None:
+                routes = retained.setdefault("response_routes", [])
+                while len(routes) <= review_attempt:
+                    routes.append(None)
+                routes[review_attempt] = retained["current_route"]
             request = {"role": "review.methods", "candidate_sha256": identity,
+                       "route_identity": retained.get("current_route"),
                        "review_attempt": review_attempt + 1,
                        "status": "started", "prompt": json.dumps(prompt, ensure_ascii=False, sort_keys=True),
                        "usage": {"model_calls": 1}}
@@ -3615,6 +3644,28 @@ class CapabilityFoundry:
             identity = hashlib.sha256(canonical_bytes(assignment)).hexdigest()
             retained = state.setdefault("validator_authorship", {}).setdefault(identity, {"status": "pending"})
             retained["candidate_sha256"] = _authored_candidate_sha256(state.get("last_attempt"))
+            validator_routes = (self._format_model_routes("methods.validator-author",
+                self.author_max_output_tokens, inherited_role="review.methods")
+                if self.validator_client is None else [])
+            exhausted_routes = retained.setdefault("response_exhausted_routes", [])
+
+            def recorded_validator_route(request=None):
+                recorded = (request or {}).get("route_identity") or retained.get("current_route")
+                if isinstance(recorded, dict):
+                    return recorded
+                model_name = (request or {}).get("model") or retained.get("response", {}).get("model")
+                matching = [self._dispatch_route_identity(route) for route in validator_routes
+                            if _model_route_identity(route.get("model")) == _model_route_identity(model_name)]
+                return matching[0] if len(matching) == 1 else None
+
+            def exhaust_validator_route(request=None):
+                route = recorded_validator_route(request)
+                if route is None:
+                    defer_validator_repair("validator response route cannot be reconciled with its dispatch record")
+                if route not in exhausted_routes:
+                    exhausted_routes.append(route)
+                retained["current_route"] = route
+
 
             def defer_validator_repair(reason):
                 state.update(status="blocked", error=str(reason), feedback=str(reason),
@@ -3653,9 +3704,28 @@ class CapabilityFoundry:
                     blocked.validator_failure = deepcopy_config(state["validator_failure"])
                 raise blocked
 
+            if (validator_routes and retained.get("error") and not retained.get("source")
+                    and retained.get("status") != "response_received"):
+                exhaust_validator_route()
+
+
             while True:
                 if retained.get("status") in {"calling", "result_unknown"}:
-                    raise ModelWorkBlocked("independent validator authoring has an unresolved dispatched request")
+                    interrupted_request = None
+                    for request in reversed(state.get("requests", [])):
+                        if (request.get("role") == "methods.validator-author"
+                                and request.get("assignment_sha256") == identity):
+                            interrupted_request = request
+                            if request.get("status") == "started":
+                                request.update(status="result_unknown",
+                                    error="process exited before the validator result was recorded")
+                            break
+                    if self.validator_client is not None:
+                        raise ModelWorkBlocked("independent validator authoring has an unresolved dispatched request")
+                    exhaust_validator_route(interrupted_request)
+                    retained.update(status="repair_required",
+                        error="validator response outcome is unknown; recovery requires a distinct configured route")
+                    save("independent_validator_unknown_route_recovery")
                 if (retained.get("status") == "repair_required"
                         and retained.get("attempts", 0) >= self.max_attempts):
                     defer_validator_repair(
@@ -3670,16 +3740,15 @@ class CapabilityFoundry:
                         raise
                     validator_client = self.validator_client
                     if validator_client is None:
-                        model = deepcopy_config(self.model_config)
-                        role = "methods.validator-author"
-                        if role not in model.get("role_models", {}):
-                            review_config = resolve_model_config(model, role="review.methods")
-                            model.setdefault("role_models", {})[role] = review_config
-                        alternatives = model.get("role_model_fallbacks", {}).get(
-                            role, model.get("role_model_fallbacks", {}).get("review.methods", []))
-                        if retained.get("error") and alternatives:
-                            model.setdefault("role_models", {})[role] = alternatives[0]
-                        config = self._model_config_for_role(role, self.author_max_output_tokens, model_config=model)
+                        available_routes = [route for route in validator_routes
+                            if self._dispatch_route_identity(route) not in exhausted_routes]
+                        if not available_routes:
+                            defer_validator_repair("independent validator response routes exhausted: "
+                                + retained.get("error", "no complete response"))
+                        current = retained.get("current_route")
+                        config = next((route for route in available_routes
+                            if self._dispatch_route_identity(route) == current), available_routes[0])
+                        retained["current_route"] = self._dispatch_route_identity(config)
                         validator_client = ModelClient(**config)
                     prior_response = retained.get("response") or {}
                     repair = {
@@ -3693,6 +3762,7 @@ class CapabilityFoundry:
                         "instructions": "Write one concise complete validator implementation. Do not continue an incomplete response or repeat helper variants. Preserve the frozen estimand and independently recalculate from raw observations.",
                     }
                     request = {"role": "methods.validator-author", "assignment_sha256": identity,
+                        "route_identity": retained.get("current_route"),
                         "status": "started", "prompt": json.dumps({**assignment, **({"validator_repair": repair} if retained.get("error") else {})}, sort_keys=True), "usage": {"model_calls": 1}}
                     state["requests"].append(request)
                     state["usage"]["model_calls"] = state["usage"].get("model_calls", 0) + 1
@@ -3730,7 +3800,7 @@ class CapabilityFoundry:
                     response = retained["response"]
                     retained.pop("source", None)
                     retained.pop("provenance", None)
-                    if response["finish_reason"] != "stop":
+                    if response["finish_reason"] not in {"stop", "length"}:
                         raise ValidationError("independent validator author response is incomplete")
                     value = parse_complete_json_object(response["text"], "independent validator author", model_envelope=False)
                     if set(value) != {"validator_source"} or not isinstance(value["validator_source"], str):
@@ -3764,6 +3834,8 @@ class CapabilityFoundry:
                     raise
                 except (ValidationError, ValueError, TypeError) as exc:
                     retained.update(status="repair_required", error=str(exc))
+                    if source is None and validator_routes:
+                        exhaust_validator_route()
                     save("independent_validator_contract_failed")
                     if retained.get("attempts", 0) >= self.max_attempts:
                         defer_validator_repair("independent validator technical repair exhausted: " + str(exc))
@@ -4311,6 +4383,24 @@ class CapabilityFoundry:
                 raise
             except IndependentValidatorContractError:
                 raise
+            except ModelWorkBlocked as exc:
+                if getattr(exc, "failure_class", None) != "model_contract":
+                    raise
+                gate = _repair_gate(exc)
+                state.update(status="blocked", error=str(exc), feedback=str(exc),
+                    last_failure_class="model_contract", last_failure_gate=gate,
+                    repair_owner="review.methods" if gate == "review_response_format" else None)
+                state["candidate_failure"] = {"repair_kind": gate, "gate": gate, "error": str(exc)}
+                state["candidate_failure_sha256"] = _authored_candidate_sha256(state.get("last_attempt"))
+                state.setdefault("repair_ledger", []).append({
+                    "attempt": state.get("attempts"), "gate": gate,
+                    "candidate_sha256": state["candidate_failure_sha256"], "error": str(exc),
+                    "next_action": "format_repair_then_rerun"})
+                save("owned_response_repair_deferred")
+                receipt = repair_exhausted_error()
+                exc.__dict__.update(receipt.__dict__)
+                raise
+
             except (ValidationError, KeyError, TypeError, ValueError) as exc:
                 if isinstance(exc, ModelContextBudgetError):
                     raise

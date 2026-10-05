@@ -71,6 +71,14 @@ class TestPrivateRouting(unittest.TestCase):
         }
         self.assertEqual(premium_ids, set())
 
+    def test_validator_author_has_explicit_primary_peer_and_context(self):
+        config = self.config(self.env())
+        role = "methods.validator-author"
+        self.assertEqual(config["role_models"][role]["model"], "deepseek-v4.1-flash:cloud")
+        self.assertEqual(config["role_model_fallbacks"][role][0]["model"], "glm-5.3-flash:cloud")
+        self.assertEqual(config["role_models"][role]["context_window_tokens"],
+                         config["role_models"]["research.experiment-author"]["context_window_tokens"])
+
     def test_ollama_only_maps_qwen_bulk_and_ignores_remote_credentials(self):
         values = self.env(
             SCISAURUS_OLLAMA_ONLY="1",
