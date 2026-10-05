@@ -1169,6 +1169,20 @@ assert(wrapped.includes('Internal transport'));
         self.assertNotRegex(html + javascript, r'[가-힣]')
         self.assertNotRegex(stylesheet, r'\.project-nav\s*\{[^}]*display\s*:\s*none')
 
+    def test_brand_and_execution_controls_share_aligned_geometry(self):
+        static = Path(__file__).parents[1] / "dashboard/static"
+        html = (static / "index.html").read_text()
+        stylesheet = (static / "styles.css").read_text()
+        brand = re.search(r'<div class="sidebar-context">(.*?)</div>', html).group(1)
+        self.assertIn("<span>Sci-saurus</span>", brand)
+        self.assertNotIn("<br>", brand)
+        self.assertNotIn("<small>", brand)
+        for selector in (".run-control-settings select", ".run-control-buttons .button"):
+            rule = re.search(re.escape(selector) + r'\s*\{([^}]+)\}', stylesheet).group(1)
+            self.assertIn("height: var(--control-height)", rule)
+        buttons = re.search(r'\.run-control-buttons\s*\{([^}]+)\}', stylesheet).group(1)
+        self.assertIn("align-self: end", buttons)
+
 
 if __name__ == "__main__":
     unittest.main()
