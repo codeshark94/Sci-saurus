@@ -96,20 +96,55 @@ def quote_sha256(quote: str) -> str:
     return hashlib.sha256(quote.encode("utf-8")).hexdigest()
 
 
+def source_window_ranges(window, text_length):
+    """Validate and merge visible character ranges without bridging gaps."""
+    ranges = [{"start": 0, "end": text_length}] if window is None else (
+        window if isinstance(window, list) else [window])
+    merged = []
+    for item in ranges:
+        if (not isinstance(item, dict) or type(item.get("start")) is not int
+                or type(item.get("end")) is not int
+                or not 0 <= item["start"] <= item["end"] <= text_length):
+            raise ValidationError("source window must be a valid character range")
+    for item in sorted(ranges, key=lambda item: (item["start"], item["end"])):
+        if merged and item["start"] <= merged[-1]["end"]:
+            merged[-1]["end"] = max(merged[-1]["end"], item["end"])
+        else:
+            merged.append({"start": item["start"], "end": item["end"]})
+    return merged
+
+
+def index_source_windows(sources):
+    """Index every displayed slice, including disjoint slices of one capture."""
+    grouped = {}
+    for source in sources:
+        grouped.setdefault(source["source_ref"], []).append(source["window"])
+    result = {}
+    for ref, ranges in grouped.items():
+        length = max(item["end"] for item in ranges)
+        merged = source_window_ranges(ranges, length)
+        result[ref] = merged[0] if len(merged) == 1 else merged
+    return result
+
+
 def locate(source: dict, quote: str, *, window: dict | None = None) -> dict:
     """Return an unambiguous exact occurrence inside an explicitly supplied window."""
     text = source.get("text")
     if not isinstance(text, str) or not isinstance(quote, str) or not quote:
         raise ValidationError("source text and evidence quote must be nonempty strings")
-    start, end = (0, len(text)) if window is None else (window.get("start"), window.get("end"))
-    if (type(start) is not int or type(end) is not int
-            or not 0 <= start <= end <= len(text)):
-        raise ValidationError("source window must be a valid character range")
-    position = text.find(quote, start, end)
-    if position < 0 or position + len(quote) > end:
+    positions = []
+    for span in source_window_ranges(window, len(text)):
+        position = text.find(quote, span["start"], span["end"])
+        if position < 0:
+            continue
+        positions.append(position)
+        if text.find(quote, position + 1, span["end"]) >= 0:
+            raise ValidationError("evidence quote occurs more than once; provide a longer unique quotation")
+    if not positions:
         raise ValidationError("evidence quote is absent from the supplied source window")
-    if text.find(quote, position + 1, end) >= 0:
+    if len(positions) > 1:
         raise ValidationError("evidence quote occurs more than once; provide a longer unique quotation")
+    position = positions[0]
     return {"start": position, "end": position + len(quote), "quote_sha256": quote_sha256(quote)}
 
 
@@ -123,9 +158,7 @@ def _restore_unique_source_whitespace(source: dict, quote: str, *, window: dict 
     text = source.get("text")
     if not isinstance(text, str) or not isinstance(quote, str) or not quote or not quote.strip():
         raise ValidationError("source text and evidence quote must be nonempty strings")
-    start, end = (0, len(text)) if window is None else (window.get("start"), window.get("end"))
-    if (type(start) is not int or type(end) is not int or not 0 <= start <= end <= len(text)):
-        raise ValidationError("source window must be a valid character range")
+    ranges = source_window_ranges(window, len(text))
     parts = re.split(r"\s+", quote.strip())
 
     # Renderers commonly replace ASCII punctuation with typographic
@@ -148,7 +181,8 @@ def _restore_unique_source_whitespace(source: dict, quote: str, *, window: dict 
         return "".join(rendered)
 
     pattern = re.compile(r"\s+".join(pattern_part(part) for part in parts))
-    matches = list(pattern.finditer(text, start, end))
+    matches = [match for span in ranges
+               for match in pattern.finditer(text, span["start"], span["end"])]
     if len(matches) == 1:
         return matches[0].group(0)
     if matches:
@@ -185,7 +219,8 @@ def _restore_unique_source_whitespace(source: dict, quote: str, *, window: dict 
             window_tokens = observed[offset:offset + len(expected)]
             if [token[0] for token in window_tokens] != expected:
                 continue
-            if window_tokens[0][1] < start or window_tokens[-1][2] > end:
+            if not any(span["start"] <= window_tokens[0][1]
+                       and window_tokens[-1][2] <= span["end"] for span in ranges):
                 continue
             candidates.append(window_tokens)
         if len(candidates) == 1:
@@ -252,7 +287,8 @@ def _restore_unique_source_whitespace(source: dict, quote: str, *, window: dict 
         window_tokens = observed_transport[offset:offset + len(expected_values)]
         if [token for token, _, _ in window_tokens] != expected_values:
             continue
-        if window_tokens[0][1] < start or window_tokens[-1][2] > end:
+        if not any(span["start"] <= window_tokens[0][1]
+                   and window_tokens[-1][2] <= span["end"] for span in ranges):
             continue
         candidates.append(window_tokens)
     if len(candidates) == 1:
@@ -335,12 +371,8 @@ def validate(proof: dict, source: dict, *, require_span: bool, window: dict | No
     fields = set(proof)
     if fields == LEGACY_EVIDENCE_FIELDS and not require_span:
         text = source.get("text", "")
-        if window is not None:
-            start, end = window.get("start"), window.get("end")
-            visible = text[start:end] if type(start) is int and type(end) is int else ""
-        else:
-            visible = text
-        if proof.get("quote") not in visible:
+        ranges = source_window_ranges(window, len(text))
+        if not any(proof.get("quote") in text[span["start"]:span["end"]] for span in ranges):
             if window is not None:
                 raise ValidationError("focused review quotation must be visible in its recorded source window")
             raise ValidationError(
@@ -359,7 +391,6 @@ def validate(proof: dict, source: dict, *, require_span: bool, window: dict | No
     if proof.get("quote_sha256") != quote_sha256(proof["quote"]):
         raise ValidationError("evidence quote SHA-256 does not match the exact span text")
     if window is not None:
-        window_start, window_end = window.get("start"), window.get("end")
-        if (type(window_start) is not int or type(window_end) is not int
-                or start < window_start or end > window_end):
+        if not any(span["start"] <= start and end <= span["end"]
+                   for span in source_window_ranges(window, len(text))):
             raise ValidationError("evidence span lies outside the displayed source window")

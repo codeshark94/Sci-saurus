@@ -2,10 +2,49 @@
 import unittest
 
 from scisaurus.core.errors import ValidationError
-from scisaurus.core.source_spans import bind, expand_evidence, index_evidence, locate, validate
+from scisaurus.core.source_spans import (bind, expand_evidence, index_evidence,
+                                        index_source_windows, locate, validate)
 
 
 class SourceSpanTests(unittest.TestCase):
+    def test_disjoint_windows_preserve_absolute_spans_and_hide_gaps(self):
+        source = {"work_id": "W1", "text": "head quote. hidden result. tail quote."}
+        windows = {"source": [{"start": 0, "end": 11}, {"start": 27, "end": 38}]}
+        value = {"evidence": [{"work_id": "W1", "source_ref": "source", "quote": quote}
+                              for quote in ("head quote.", "tail quote.")]}
+        bound = bind(value, {"source": source}, windows=windows)
+        self.assertEqual([proof["start"] for proof in bound["evidence"]], [0, 27])
+        indexed, catalog = index_evidence(bound, {"source": source})
+        self.assertEqual(expand_evidence(indexed, catalog, {"source": source}, windows=windows), bound)
+        hidden = bind({"work_id": "W1", "source_ref": "source", "quote": "hidden result."}, {"source": source})
+        with self.assertRaisesRegex(ValidationError, "outside"):
+            bind(hidden, {"source": source}, windows=windows)
+        crossing = bind({"work_id": "W1", "source_ref": "source", "quote": source["text"]}, {"source": source})
+        with self.assertRaisesRegex(ValidationError, "outside"):
+            validate(crossing, source, require_span=True, window=windows["source"])
+
+    def test_union_location_and_transport_restoration_reject_ambiguity(self):
+        source = {"work_id": "W1", "text": "first\nquote. gap first\nquote."}
+        windows = [{"start": 0, "end": 12}, {"start": 17, "end": 29}]
+        for quote in ("first\nquote.", "first quote."):
+            with self.subTest(quote=quote), self.assertRaises(ValidationError):
+                bind({"work_id": "W1", "source_ref": "source", "quote": quote},
+                     {"source": source}, windows={"source": windows})
+        bound = bind({"work_id": "W1", "source_ref": "source", "quote": "first quote."},
+                     {"source": source}, windows={"source": windows[:1]})
+        self.assertEqual(bound["quote"], "first\nquote.")
+        self.assertEqual(bound["start"], 0)
+
+    def test_window_index_merges_overlap_without_bridging_gaps(self):
+        rows = [{"source_ref": "source", "window": window} for window in
+                [{"start": 20, "end": 30}, {"start": 0, "end": 8},
+                 {"start": 5, "end": 10}, {"start": 10, "end": 12}]]
+        self.assertEqual(index_source_windows(rows),
+                         {"source": [{"start": 0, "end": 12}, {"start": 20, "end": 30}]})
+        source = {"work_id": "W1", "text": "unique quotation"}
+        self.assertEqual(locate(source, "unique", window=[{"start": 0, "end": 12},
+                                                         {"start": 0, "end": 16}])["start"], 0)
+
     def test_binds_and_validates_an_unambiguous_character_span(self):
         source = {"work_id": "W1", "text": "alpha exact quotation omega"}
         value = {"evidence": [{"work_id": "W1", "source_ref": "source", "quote": "exact quotation"}]}
@@ -128,6 +167,23 @@ class SourceSpanTests(unittest.TestCase):
                  **locate(source, "exact quotation", window={"start": 0, "end": 15})}
         with self.assertRaisesRegex(ValidationError, "outside"):
             bind(proof, {"source": source}, windows={"source": {"start": visible_start, "end": len(text)}})
+
+    def test_assessment_rebinding_keeps_hidden_positioned_evidence_on_its_source(self):
+        from scisaurus.core.surveys import SurveyGate
+        sources = {"hidden": {"work_id": "W1", "text": "hidden quotation. tail."},
+                   "visible": {"work_id": "W1", "text": "hidden quotation."}}
+        windows = {"hidden": {"start": 18, "end": 23},
+                   "visible": {"start": 0, "end": 17}}
+        positioned = {"work_id": "W1", "source_ref": "hidden", "quote": "hidden quotation.",
+                      "start": 0, "end": 17}
+        hashed = bind(positioned, sources)
+        for proof in (positioned, hashed):
+            with self.subTest(has_digest="quote_sha256" in proof):
+                value = {"evidence": [proof]}
+                rebound = SurveyGate._rebind_assessment_sources(value, sources, windows)
+                self.assertEqual(rebound, value)
+                with self.assertRaisesRegex(ValidationError, "outside"):
+                    bind(rebound, sources, windows=windows)
 
     def test_evidence_catalog_rejects_forgery_unknown_ids_and_hidden_spans(self):
         sources = {"source": {"work_id": "W1", "text": "hidden visible"}}

@@ -13,7 +13,9 @@ from urllib.parse import urlsplit
 
 from scisaurus.core.errors import ConflictError, StateError, ValidationError
 from scisaurus.core.schema import canonical_bytes, json_object, parse_ref, sha256_hex
-from scisaurus.core.source_spans import (bind as bind_source_spans, expand_evidence,
+from scisaurus.core.source_spans import (LOCATED_EVIDENCE_FIELDS, bind as bind_source_spans, expand_evidence,
+                                        index_source_windows, locate as locate_source_span,
+                                        quote_sha256,
                                         validate as validate_source_span)
 from scisaurus.runtime.bibliographic_identity import normalize_doi, project_crossref_work, reconcile_result
 from scisaurus.runtime.operation_adapters import get_adapter
@@ -724,7 +726,7 @@ class SurveyGate:
                         or context.get("text") != source["text"][window["start"]:window["end"]]):
                     raise ValidationError("assessment dispatch source window is not an exact captured slice")
                 source_values[context["source_ref"]] = source
-                windows[context["source_ref"]] = window
+            windows = index_source_windows(supplied)
             reply = normalize_gap_assessment_envelope(
                 reply,
                 evidence_catalog=prompt.get("evidence_catalog", []),
@@ -829,12 +831,7 @@ class SurveyGate:
                 if not all(isinstance(part, str) for part in (quote, ref, work_id)):
                     continue
                 source = sources.get(ref)
-                window = windows.get(ref, {})
                 if source is not None and isinstance(source.get("text"), str):
-                    start, end = window.get("start"), window.get("end")
-                    visible = source["text"][start:end] if type(start) is int and type(end) is int else ""
-                    if visible.count(quote) == 1:
-                        continue
                     # Preserve the supplied representation when the only
                     # difference is renderer whitespace or typography.  The
                     # shared binder returns the exact source slice and keeps
@@ -846,14 +843,23 @@ class SurveyGate:
                         continue
                     except ValidationError:
                         pass
+                    try:
+                        positioned = ({**item, "quote_sha256": quote_sha256(quote)}
+                                      if set(item) == LOCATED_EVIDENCE_FIELDS else item)
+                        validate_source_span(positioned, source, require_span=True)
+                    except ValidationError:
+                        pass
+                    else:
+                        # Valid absolute locators remain pinned even when
+                        # hidden; final visibility validation must reject them.
+                        continue
                 candidates = []
                 for candidate_ref, candidate in by_work.get(work_id, []):
-                    candidate_window = windows.get(candidate_ref, {})
-                    start, end = candidate_window.get("start"), candidate_window.get("end")
-                    if type(start) is not int or type(end) is not int:
-                        continue
-                    visible = candidate.get("text", "")[start:end]
-                    if visible.count(quote) == 1:
+                    try:
+                        locate_source_span(candidate, quote, window=windows.get(candidate_ref))
+                    except ValidationError:
+                        pass
+                    else:
                         candidates.append(candidate_ref)
                 if len(candidates) == 1:
                     item["source_ref"] = candidates[0]

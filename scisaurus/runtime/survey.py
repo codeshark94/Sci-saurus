@@ -15,7 +15,8 @@ from scisaurus.core.errors import (ContractError, ModelContractError, ProviderCo
                                    ProviderRateLimitError, QuotaExceededError, StateError, ValidationError)
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.source_spans import (bind as bind_source_spans, contains_legacy,
-                                        expand_evidence, index_evidence)
+                                        expand_evidence, index_evidence, index_source_windows,
+                                        source_window_ranges)
 from scisaurus.core.surveys import (ABSTENTION_REASONS, RELATIONSHIP_SEMANTICS, SurveyGate,
                                    critique_check_id, is_explicit_abstention, work_review_checks)
 from scisaurus.runtime.execution import SYSTEM, ExecutionRuntime, _invoke_worker
@@ -328,6 +329,11 @@ def _normalize_scoped_entry_updates(wid, updates):
     if not isinstance(nested, dict):
         raise ModelContractError("scoped map repair work updates must be an explicit object")
     return nested
+
+
+def _map_withdrawn_fields(fields):
+    """A screening decision cannot survive withdrawal of its rationale."""
+    return list(dict.fromkeys([*fields, *(["inclusion"] if "reason" in fields else [])]))
 
 
 def apply_scoped_map_repair(wid, previous, old_relationships, feedback, patch, *,
@@ -3913,7 +3919,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
 
     @staticmethod
     def _project_assessment_sources(sources, *, full_text_chars,
-                                    abstract_chars, unverified_chars, evidence=()):
+                                    abstract_chars, unverified_chars, evidence=(),
+                                    disjoint_evidence=False):
         """Shrink background context without cutting any supplied quotation."""
         anchors = {}
         for proof in evidence:
@@ -3938,6 +3945,13 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             end = max(proof["end"] for proof in proofs)
             if not offset <= start < end <= source["window"]["end"]:
                 raise ValidationError("assessment source omits a required evidence span")
+            if disjoint_evidence:
+                ranges = source_window_ranges(
+                    [{"start": proof["start"], "end": proof["end"]} for proof in proofs],
+                    source["window"]["end"])
+                projected.extend({**source, "text": source["text"][span["start"]-offset:span["end"]-offset],
+                                  "window": span} for span in ranges)
+                continue
             # Mandatory evidence is never truncated to meet a nominal profile.
             # The enclosing admission check decides whether the packet fits.
             spare = max(0, limit - (end - start))
@@ -3970,6 +3984,22 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         if fits(assignment):
             return assignment
         coverage = self._compact_assessment_coverage(assignment.get("coverage", {}))
+        def project(full_text_chars, abstract_chars, unverified_chars, *, disjoint=False):
+            candidate = {**assignment, "coverage": deepcopy(coverage),
+                "sources": self._project_assessment_sources(
+                    sources, full_text_chars=full_text_chars,
+                    abstract_chars=abstract_chars, unverified_chars=unverified_chars,
+                    evidence=catalog, disjoint_evidence=disjoint)}
+            candidate["coverage"]["source_windows"] = [
+                {key: source[key] for key in ("source_ref", "available_chars", "window")}
+                for source in candidate["sources"]]
+            if disjoint:
+                candidate["source_projection"] = "disjoint_quoted_windows"
+                candidate["instructions"] = assignment.get("instructions", _GAP_ASSESSMENT_INSTRUCTIONS) + (
+                    " Source rows may show disjoint exact quotation windows of the same capture. "
+                    "Every mapped quotation is retained; intervening source text is not displayed. "
+                    "Omitted passages cannot establish absence of a result or exhaustive full-text review.")
+            return candidate
         profiles = (
             (100000, 2500, 40000),
             (60000, 1600, 24000),
@@ -3981,19 +4011,12 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             (0, 0, 0),
         )
         for full_text_chars, abstract_chars, unverified_chars in profiles:
-            candidate = {
-                **assignment,
-                "coverage": coverage,
-                "sources": self._project_assessment_sources(
-                    sources, full_text_chars=full_text_chars,
-                    abstract_chars=abstract_chars, unverified_chars=unverified_chars,
-                    evidence=catalog),
-            }
-            candidate["coverage"]["source_windows"] = [
-                {key: source[key] for key in ("source_ref", "available_chars", "window")}
-                for source in candidate["sources"]]
+            candidate = project(full_text_chars, abstract_chars, unverified_chars)
             if fits(candidate):
                 return candidate
+        candidate = project(0, 0, 0, disjoint=True)
+        if fits(candidate):
+            return candidate
         raise ValidationError(
             "literature gap-assessment assignment cannot fit any configured provider context budget: "
             f"required evidence exceeds {limit} tokens; split the assessment scope rather than truncate quotations")
@@ -4035,48 +4058,14 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         work; unsupported or ambiguous quotes still fail the normal evidence
         validator and are sent back for a scoped retry.
         """
-        source_by_ref = {source["source_ref"]: source for source in sources}
-        by_work = {}
-        for source in sources:
-            by_work.setdefault(source["work_id"], []).append(source)
-        repaired = deepcopy(value)
-
-        def repair(items):
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                quote, ref, work_id = item.get("quote"), item.get("source_ref"), item.get("work_id")
-                if not all(isinstance(part, str) for part in (quote, ref, work_id)):
-                    continue
-                source = source_by_ref.get(ref)
-                visible = source["text"] if source is not None else ""
-                if visible.count(quote) == 1:
-                    continue
-                # First try the displayed representation itself.  The source
-                # binder can restore line breaks and typographic punctuation
-                # while retaining the full-text source reference, which is
-                # required for a decisive assessment.
-                if source is not None:
-                    try:
-                        bound = self._bind_visible_spans({"evidence": [item]}, [source])
-                        item.clear()
-                        item.update(bound["evidence"][0])
-                        continue
-                    except ValidationError:
-                        pass
-                candidates = [candidate for candidate in by_work.get(work_id, [])
-                              if candidate["text"].count(quote) == 1]
-                if len(candidates) == 1:
-                    item["source_ref"] = candidates[0]["source_ref"]
-
-        repair(repaired.get("evidence", []))
-        for comparison in repaired.get("comparisons", []):
-            if isinstance(comparison, dict):
-                repair(comparison.get("evidence", []))
+        source_values = {source["source_ref"]: self.source_docs[source["source_ref"]]
+                         for source in sources}
+        repaired = SurveyGate._rebind_assessment_sources(
+            deepcopy(value), source_values, index_source_windows(sources))
         return self._bind_visible_spans(repaired, sources)
 
     def _bind_visible_spans(self, value, sources):
-        windows = {source["source_ref"]: source["window"] for source in sources}
+        windows = index_source_windows(sources)
         return bind_source_spans(value, self.source_docs, windows=windows)
 
     def _coverage(self):
@@ -4385,11 +4374,13 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             )
 
         effective = {}
-        def validate(value):
+        def validate(value, *, controller_withdrawal=False):
             if review_feedback is not None:
                 value = apply_scoped_map_repair(
                     wid, previous, old_relationships, review_feedback, value,
                     reject_ungranted_changes=True)
+                if controller_withdrawal and "reason" in review_feedback["entry_fields"]:
+                    value["entries"][0]["inclusion"] = "uncertain"
             validate_map(value, [wid], set(self.works), self.source_docs, require_spans=True)
             if not own_sources:
                 entry = value["entries"][0]
@@ -4460,10 +4451,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                     **{field: deepcopy(null) for field in MAP_FIELDS}})
                 value = {"entries": [entry], "relationships": []}
             value = normalize(value)
-            validate(value)
+            validate(value, controller_withdrawal=True)
             execution = self._record(f"command/survey-abstentions/{wid}", "note", {
                 "work_id": wid, "reason": state["error"], "scope": "contract_exhausted",
-                "withdrawn_fields": list(review_feedback["entry_fields"]) if review_feedback else list(MAP_FIELDS),
+                "withdrawn_fields": _map_withdrawn_fields(review_feedback["entry_fields"]) if review_feedback else list(MAP_FIELDS),
                 "entry_sha256": hashlib.sha256(canonical_bytes(effective["value"]["entries"][0])).hexdigest(),
                 "model_calls": 0,
             }, "command.controller", subjects=basis)
@@ -4484,7 +4475,9 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                        if self.config["model"].get("reasoning_effort") is not None else {}),
                 },
                 "normalizer": normalize,
-                "validator": validate, "on_valid": integrate, "on_exhausted": abstain}
+                "validator": validate,
+                "withdrawal_validator": lambda value: validate(value, controller_withdrawal=True),
+                "on_valid": integrate, "on_exhausted": abstain}
 
     def _map_body(self):
         return {"entries": [json.loads(self.store.read_body(r["body_hash"])) for r in self.analysis_records.values()],
@@ -5079,9 +5072,9 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                                           "The captured evidence does not resolve the screening rationale.")
                     value = {"entry_updates": updates, "relationships": []}
                     value = job["normalizer"](value)
-                    job["validator"](value)
+                    job["withdrawal_validator"](value)
                     record = self._publish(f"kb/claim-withdrawals/{wid}", "note", {
-                        "review_ref": feedback["review_ref"], "withdrawn_fields": feedback["entry_fields"],
+                        "review_ref": feedback["review_ref"], "withdrawn_fields": _map_withdrawn_fields(feedback["entry_fields"]),
                         "withdrawn_relationship_targets": feedback["relationship_targets"],
                     }, "command.controller", subjects=[feedback["review_ref"]])
                     job["on_valid"](value, record["artifact_ref"])
@@ -5453,7 +5446,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         assessment_sources = assessment_assignment["sources"]
         assessment_source_lookup = {source["source_ref"]: self.source_docs[source["source_ref"]]
                                     for source in assessment_sources}
-        windows = {source["source_ref"]: source["window"] for source in assessment_sources}
+        windows = index_source_windows(assessment_sources)
         assessment_evidence_catalog = deepcopy(assessment_assignment["evidence_catalog"])
         verified_full_text_refs = assessment_assignment["verified_full_text_refs"]
         if resume_gap_assessment:

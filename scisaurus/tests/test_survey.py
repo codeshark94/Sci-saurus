@@ -18,7 +18,7 @@ from scisaurus.core.errors import ModelContractError, ProviderRateLimitError, Qu
 from scisaurus.core.events import ControlStore
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.store import ArtifactStore
-from scisaurus.core.source_spans import bind, expand_evidence
+from scisaurus.core.source_spans import bind, expand_evidence, index_source_windows
 from scisaurus.core.surveys import ABSTENTION_REASONS, SurveyGate, work_review_checks
 from scisaurus.runtime.execution import SYSTEM, _invoke_worker
 from scisaurus.runtime.bibliographic_identity import reconcile_result
@@ -1604,7 +1604,7 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(projected["coverage"]["source_windows"], [
             {key: sources[0][key] for key in ("source_ref", "available_chars", "window")}])
 
-    def test_gap_context_does_not_cut_mandatory_evidence_to_fit(self):
+    def test_gap_context_preserves_disjoint_mandatory_evidence_without_intervening_text(self):
         runner = self.runtime()
         self.addCleanup(runner.control.close)
         text = "start anchor. " + "Background " * 6000 + "end anchor."
@@ -1613,8 +1613,48 @@ class TestSurveyRunner(unittest.TestCase):
                   for quote in ("start anchor.", "end anchor.")]
         assignment = {"map": {"evidence": proofs}, "sources": runner._assessment_source_context()}
         with patch.object(runner, "_map_input_limit", return_value=3500):
+            projected = runner._fit_assessment_assignment(assignment)
+        self.assertEqual(projected["source_projection"], "disjoint_quoted_windows")
+        self.assertLessEqual(estimate_input_tokens(SYSTEM, json.dumps(projected)), 3500)
+        self.assertEqual([source["text"] for source in projected["sources"]], ["start anchor.", "end anchor."])
+        self.assertEqual(expand_evidence(projected["map"], projected["evidence_catalog"], runner.source_docs,
+                                        windows=index_source_windows(projected["sources"])),
+                         bind(assignment["map"], runner.source_docs))
+
+    def test_gap_context_rejects_truly_oversized_mandatory_quotation(self):
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        text = "Large required quotation. " * 6000
+        runner.source_docs = {"source": {"work_id": "W1", "representation": "abstract", "text": text}}
+        assignment = {"map": {"evidence": [{"work_id": "W1", "source_ref": "source", "quote": text}]},
+                      "sources": runner._assessment_source_context()}
+        with patch.object(runner, "_map_input_limit", return_value=3500):
             with self.assertRaisesRegex(ValidationError, "required evidence exceeds"):
                 runner._fit_assessment_assignment(assignment)
+
+    def test_disjoint_assessment_windows_replay_through_independent_acceptance_gate(self):
+        runner = self.runtime(survey_config(self.endpoint, "catalog-evidence"))
+        self.addCleanup(runner.control.close)
+        fit = runner._fit_assessment_assignment
+        def disjoint(assignment):
+            projected = fit(assignment)
+            rows = runner._project_assessment_sources(projected["sources"], full_text_chars=0,
+                abstract_chars=0, unverified_chars=0, evidence=projected["evidence_catalog"], disjoint_evidence=True)
+            for source in projected["sources"]:
+                ends = [row["window"]["end"] for row in rows if row["source_ref"] == source["source_ref"]]
+                if max(ends) < source["window"]["end"] - 5:
+                    start, end = source["window"]["end"] - 5, source["window"]["end"]
+                    rows.append({**source, "text": source["text"][start:end], "window": {"start": start, "end": end}})
+            projected["sources"] = rows
+            return projected
+        with patch.object(runner, "_fit_assessment_assignment", side_effect=disjoint):
+            result = runner.run()
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        control, store = self.open_store()
+        prompts = [prompt for _, prompt in self.model_contexts(control, store)
+                   if prompt.get("phase") == "gap_assessment"]
+        self.assertTrue(any(isinstance(window, list) for window in index_source_windows(prompts[-1]["sources"]).values()))
+        self.assertTrue(control._conn.execute("SELECT 1 FROM events WHERE event_type='assessment.accepted'").fetchone())
 
     def test_gap_evidence_ids_are_replayed_by_runtime_and_acceptance_gate(self):
         runner = self.runtime(survey_config(self.endpoint, "catalog-evidence"))
@@ -2695,6 +2735,58 @@ class TestSurveyRunner(unittest.TestCase):
         entry = json.loads(store.read_body(store.head("kb/work-analyses/W101")["body_hash"]))
         self.assertNotIn("every task", entry["reason"])
         self.assertIn("does not resolve", entry["reason"])
+        self.assertEqual(entry["inclusion"], "uncertain")
+        withdrawal = json.loads(store.read_body(store.head("kb/claim-withdrawals/W101")["body_hash"]))
+        self.assertEqual(withdrawal["withdrawn_fields"], ["reason", "inclusion"])
+
+    def test_contract_withdrawal_invalidates_only_reason_dependent_screening(self):
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        original = deepcopy(runner._body(runner.analysis_records["W101"]))
+        for status in ("included", "excluded"):
+            with self.subTest(status=status):
+                previous = {**original, "inclusion": status}
+                runner.analysis_records["W101"] = runner._record(
+                    "kb/work-analyses/W101", "note", previous, "research.literature-mapper",
+                    subjects=runner.analyzed_basis["W101"])
+                feedback = {"entry_fields": ["reason"], "relationship_targets": [], "checks": []}
+                job = runner._map_job("W101", runner.analyzed_basis["W101"], review_feedback=feedback)
+                self.assertEqual(job["assignment"]["editable_entry_fields"], ["reason"])
+                value = job["normalizer"]({"entry_updates": {"reason": "A bounded source-supported rationale."},
+                                           "relationships": []})
+                job["validator"](value)
+                job["on_valid"](value, runner.analysis_records["W101"]["artifact_ref"])
+                self.assertEqual(runner._body(runner.analysis_records["W101"])["inclusion"], status)
+                value, execution = job["on_exhausted"]({"error": "Invalid repair response."})
+                job["on_valid"](value, execution)
+                entry = runner._body(runner.analysis_records["W101"])
+                self.assertEqual(entry["inclusion"], "uncertain")
+                self.assertEqual(entry["reason"], ABSTENTION_REASONS["screening_unresolved"])
+                self.assertEqual({field: entry[field] for field in MAP_FIELDS},
+                                 {field: original[field] for field in MAP_FIELDS})
+                receipt = runner._body(runner.store.get(execution))
+                self.assertEqual(receipt["withdrawn_fields"], ["reason", "inclusion"])
+                self.assertEqual(receipt["entry_sha256"], runner.analysis_records["W101"]["body_hash"])
+
+    def test_content_withdrawal_preserves_screening_and_other_claims(self):
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        runner._initialize(); runner._setup()
+        runner._bibliographic_call("work", role="research.seed-reader", work_id="W101")
+        runner._map()
+        original = deepcopy(runner._body(runner.analysis_records["W101"]))
+        feedback = {"entry_fields": ["problem"], "relationship_targets": [], "checks": []}
+        job = runner._map_job("W101", runner.analyzed_basis["W101"], review_feedback=feedback)
+        value, execution = job["on_exhausted"]({"error": "Invalid repair response."})
+        job["on_valid"](value, execution)
+        entry = runner._body(runner.analysis_records["W101"])
+        self.assertEqual(entry["problem"], {"text": None, "evidence": []})
+        self.assertEqual({key: value for key, value in entry.items() if key != "problem"},
+                         {key: value for key, value in original.items() if key != "problem"})
+        self.assertEqual(runner._body(runner.store.get(execution))["withdrawn_fields"], ["problem"])
 
     def test_exhausted_scientific_review_excludes_work_without_blocking_valid_siblings(self):
         config = survey_config(self.endpoint, "review-never-resolves")
