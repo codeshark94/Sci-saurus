@@ -95,7 +95,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-development-foundry-response-repair-20")
+    "experiment-development-foundry-model-transport-21")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -13026,6 +13026,24 @@ class ComposerRunner:
             return None
         evidence = deepcopy(assessment["evidence"])
         selected = evidence["selected_operations"]
+        strategy = evidence["selection"]["strategy"]
+        if strategy == "reuse":
+            execution_contract = (
+                "Reuse the exact acquired software computations as source-bound inputs. "
+                "Do not replace the package mechanism with copied or invented equations. "
+                "New scientific parameters require a new controller-recorded software computation, "
+                "not relabelled old outputs.")
+        elif strategy == "custom_model":
+            execution_contract = (
+                "Implement the admitted source-bound mathematical specification as a custom model. "
+                "Preserve the selected source references, equations, units, coefficient mappings "
+                "and applicability limits. Distinguish sourced parameters from declared design "
+                "assumptions; reconcile any departure with the current scientific review. "
+                "Selected upstream computations are not a prerequisite for this strategy. "
+                "Record the actual runtime dependencies and execute the authored implementation.")
+        else:
+            raise ValidationError("scientific software projection requires an admitted selection strategy")
+        execution_contract += " Ordinary experiment replay, independent recalculation and scientific review remain required."
         for row in selected:
             if row["action"]["operation"] == "acquire":
                 result = row["result"]
@@ -13039,7 +13057,7 @@ class ComposerRunner:
                     if row.get("outcome") == "ok" and row.get("action", {}).get("operation") == "check_environment"
                 ]),
                 "review": deepcopy(assessment["review"]),
-                "execution_contract": "Reuse the exact acquired software computations as source-bound inputs. Do not replace the package mechanism with copied or invented equations. New scientific parameters require a new controller-recorded software computation, not relabelled old outputs. Ordinary experiment replay, independent recalculation and scientific review remain required."}
+                "execution_contract": execution_contract}
 
     def _software_producer_quota(self, stage):
         quota = deepcopy(self.departments._resolve_assignment("methods", "methodologist")["quota"])

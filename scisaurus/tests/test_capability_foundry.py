@@ -4169,6 +4169,66 @@ if __name__ == "__main__":
 
 
 class IndependentValidatorAuthorshipTests(unittest.TestCase):
+    def test_validator_model_transport_preserves_source_and_rejects_ambiguous_payloads(self):
+        from scisaurus.runtime.capability_foundry import _independent_validator_source
+        body = json.dumps({"validator_source": MINI_VALIDATOR})
+        for text in (body, '```json\n' + body + '\n```', 'reasoning</think>' + body):
+            self.assertEqual(_independent_validator_source({"text": text, "finish_reason": "stop"}),
+                             MINI_VALIDATOR)
+        for text in (body + ' trailing', body + body, body[:-1],
+                     '{"validator_source":"a","validator_source":"b"}',
+                     '{"validator_source":"a","extra":NaN}',
+                     json.dumps({"validator_source": MINI_VALIDATOR, "extra": True})):
+            with self.subTest(text=text[:60]), self.assertRaises(ValidationError):
+                _independent_validator_source({"text": text, "finish_reason": "stop"})
+        with self.assertRaises(ValidationError):
+            _independent_validator_source({"text": body, "finish_reason": "tool_calls"})
+
+    def test_fenced_validator_runs_all_admission_gates_without_another_author_call(self):
+        with tempfile.TemporaryDirectory() as path:
+            foundry = CapabilityFoundryTests._foundry(Path(path))
+            producer = StubClient(CapabilityFoundryTests._payload())
+            class FencedValidator:
+                calls = 0
+                def complete(inner, *, system, prompt):
+                    inner.calls += 1
+                    return ModelResult('```json\n' + json.dumps({'validator_source': MINI_VALIDATOR}) + '\n```',
+                                       'independent', {'model_calls': 1}, 0, 'stop')
+            foundry.validator_client = FencedValidator()
+            outcome = foundry.generate('bounded comparison', client=producer)
+            self.assertEqual(outcome['status'], 'registered')
+            self.assertEqual((producer.calls, foundry.validator_client.calls), (1, 1))
+
+    def test_captured_validator_transport_is_revalidated_before_another_dispatch(self):
+        from scisaurus.core.schema import json_object
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = CapabilityFoundryTests._foundry(root)
+            cache = CapabilityFoundryTests._cache(self, root)
+            producer = StubClient(CapabilityFoundryTests._payload())
+            class FencedValidator:
+                calls = 0
+                def complete(inner, *, system, prompt):
+                    inner.calls += 1
+                    return ModelResult('```json\n' + json.dumps({'validator_source': MINI_VALIDATOR}) + '\n```',
+                                       'independent', {'model_calls': 1}, 0, 'stop')
+            foundry.validator_client = FencedValidator()
+            def prior_decoder(raw, name='JSON', **kwargs):
+                return json_object(raw, name, model_envelope=False)
+            def pause_at_failure(phase, state):
+                if phase == 'independent_validator_contract_failed':
+                    raise CapabilityDeadlineError('captured transport failure')
+            with patch('scisaurus.runtime.capability_foundry.parse_complete_json_object',
+                       side_effect=prior_decoder), self.assertRaises(CapabilityDeadlineError):
+                foundry.generate('bounded comparison', client=producer, work_cache=cache,
+                                 on_progress=pause_at_failure)
+            phases = []
+            outcome = foundry.generate('bounded comparison', client=producer, work_cache=cache,
+                                       on_progress=lambda phase, state: phases.append(phase))
+            self.assertEqual(outcome['status'], 'registered')
+            self.assertEqual((producer.calls, foundry.validator_client.calls), (1, 1))
+            self.assertIn('independent_validator_transport_revalidated', phases)
+
     def routed_foundry(self, root, models=("primary", "peer")):
         foundry = CapabilityFoundryTests._foundry(root)
         foundry.validator_client = None

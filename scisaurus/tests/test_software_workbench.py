@@ -92,6 +92,17 @@ class SoftwareWorkbenchTests(unittest.TestCase):
         self.assertEqual(projected["host_environment_checks"], [check])
         self.assertEqual(projected["operations"], [])
         self.assertEqual(len(assessment["evidence"]["discovery_and_diagnostics"]),3)
+        self.assertIn("custom model", projected["execution_contract"])
+        self.assertIn("not a prerequisite", projected["execution_contract"])
+        self.assertNotIn("Reuse the exact acquired", projected["execution_contract"])
+        self.assertIn("independent recalculation", projected["execution_contract"])
+        assessment["evidence"]["selection"]["strategy"] = "reuse"
+        reuse = ComposerRunner._scientific_software_projection(assessment)
+        self.assertIn("Reuse the exact acquired", reuse["execution_contract"])
+        self.assertIn("New scientific parameters require", reuse["execution_contract"])
+        assessment["evidence"]["selection"]["strategy"] = "unknown"
+        with self.assertRaisesRegex(ValidationError, "admitted selection strategy"):
+            ComposerRunner._scientific_software_projection(assessment)
 
     def test_inspection_uses_observed_default_branch_without_guessing(self):
         original=self.fetch

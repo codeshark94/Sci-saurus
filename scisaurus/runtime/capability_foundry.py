@@ -238,6 +238,16 @@ CONFIG_FIELDS = {
 CONFIG_OPTIONAL_FIELDS = {"model_timeout_seconds"}
 
 
+def _independent_validator_source(response):
+    if response.get("finish_reason") not in {"stop", "length"}:
+        raise ValidationError("independent validator author response is incomplete")
+    value = parse_complete_json_object(response.get("text"), "independent validator author",
+                                       model_envelope=True, allow_analysis_prefix=False)
+    if set(value) != {"validator_source"} or not isinstance(value["validator_source"], str):
+        raise ValidationError("independent validator author must return exactly validator_source")
+    return value["validator_source"]
+
+
 def _canonical_capability_identifier(value):
     """Return the stable identifier spelling accepted by the program contract.
 
@@ -2873,7 +2883,7 @@ class CapabilityFoundry:
 
             try:
                 parse_complete_json_object(
-                    result.text, "program author response", model_envelope=False)
+                    result.text, "program author response", model_envelope=True, allow_analysis_prefix=False)
             except ValidationError:
                 pass
             else:
@@ -2927,7 +2937,7 @@ class CapabilityFoundry:
             for continuation_index in range(continuation_count, continuation_limit):
                 try:
                     parse_complete_json_object(
-                        partial, "continued program author response", model_envelope=False)
+                        partial, "continued program author response", model_envelope=True, allow_analysis_prefix=False)
                 except ValidationError:
                     pass
                 else:
@@ -3121,7 +3131,7 @@ class CapabilityFoundry:
                 try:
                     parse_complete_json_object(
                         partial, "continued program author response",
-                        model_envelope=False)
+                        model_envelope=True, allow_analysis_prefix=False)
                 except ValidationError:
                     pass
                 else:
@@ -3194,7 +3204,7 @@ class CapabilityFoundry:
                     return result
             try:
                 parse_complete_json_object(
-                    result.text, "independent program review", model_envelope=False)
+                    result.text, "independent program review", model_envelope=True, allow_analysis_prefix=False)
             except ValidationError:
                 pass
             else:
@@ -3258,7 +3268,7 @@ class CapabilityFoundry:
                                             continuation_limit):
                 try:
                     parse_complete_json_object(
-                        partial, "continued independent program review", model_envelope=False)
+                        partial, "continued independent program review", model_envelope=True, allow_analysis_prefix=False)
                 except ValidationError:
                     pass
                 else:
@@ -3406,7 +3416,7 @@ class CapabilityFoundry:
 
             try:
                 parse_complete_json_object(
-                    partial, "continued independent program review", model_envelope=False)
+                    partial, "continued independent program review", model_envelope=True, allow_analysis_prefix=False)
             except ValidationError:
                 continuation.update(status="exhausted", partial_response=partial)
                 combined = ModelResult(
@@ -3682,6 +3692,22 @@ class CapabilityFoundry:
                 if self.validator_client is None else [])
             exhausted_routes = retained.setdefault("response_exhausted_routes", [])
 
+            if retained.get("status") == "repair_required" and not retained.get("source"):
+                captured = retained.get("response")
+                if isinstance(captured, dict):
+                    try:
+                        _independent_validator_source(captured)
+                    except ValidationError:
+                        pass
+                    else:
+                        retained["status"] = "response_received"
+                        retained["transport_revalidation"] = {
+                            "response_sha256": hashlib.sha256(captured["text"].encode()).hexdigest(),
+                            "assignment_sha256": identity,
+                            "candidate_sha256": retained["candidate_sha256"],
+                        }
+                        save("independent_validator_transport_revalidated")
+
             def recorded_validator_route(request=None):
                 recorded = (request or {}).get("route_identity") or retained.get("current_route")
                 if isinstance(recorded, dict):
@@ -3832,12 +3858,7 @@ class CapabilityFoundry:
                     response = retained["response"]
                     retained.pop("source", None)
                     retained.pop("provenance", None)
-                    if response["finish_reason"] not in {"stop", "length"}:
-                        raise ValidationError("independent validator author response is incomplete")
-                    value = parse_complete_json_object(response["text"], "independent validator author", model_envelope=False)
-                    if set(value) != {"validator_source"} or not isinstance(value["validator_source"], str):
-                        raise ValidationError("independent validator author must return exactly validator_source")
-                    source = value["validator_source"]
+                    source = _independent_validator_source(response)
                     retained["source"] = source
                     provenance = {"role": "methods.validator-author", "method": "blinded_separate_authoring",
                         "assignment_sha256": identity, "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
@@ -4179,7 +4200,7 @@ class CapabilityFoundry:
                         # envelope. It may proceed only through the ordinary
                         # schema, sandbox, and independent admission gates.
                         attempt_value = parse_complete_json_object(
-                            result.text, "program author response", model_envelope=False)
+                            result.text, "program author response", model_envelope=True, allow_analysis_prefix=False)
                     except ValidationError as parse_error:
                         continuation = state.get("author_response_continuation")
                         continuation_error = (

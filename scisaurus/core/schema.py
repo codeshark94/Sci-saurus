@@ -241,12 +241,14 @@ def _escape_model_string_controls(text: str) -> str:
 
 
 def json_object(raw, name="JSON", *, model_envelope=False,
-                allow_missing_closers=False) -> dict:
+                allow_missing_closers=False, allow_analysis_prefix=True) -> dict:
     """Parse one unambiguous object, with optional provider transport wrappers.
 
     Immutable control records remain plain JSON. Model replies may additionally
     use a single JSON fence or an explicit reasoning terminator; neither form
     permits duplicate keys, non-finite values, comments, or trailing prose.
+    Generated-program contracts disable unmarked analysis-prefix extraction
+    while retaining explicitly delimited transport wrappers.
     """
     def unique(pairs):
         value = {}
@@ -303,10 +305,11 @@ def json_object(raw, name="JSON", *, model_envelope=False,
         # the response contract says "JSON only". Recover only a final,
         # structurally complete object; role-specific validation still owns
         # the scientific contract.
-        for candidate in tuple(candidates):
-            extracted = _final_json_object_candidate(candidate)
-            if extracted is not None and extracted != candidate:
-                candidates.append(extracted)
+        if allow_analysis_prefix:
+            for candidate in tuple(candidates):
+                extracted = _final_json_object_candidate(candidate)
+                if extracted is not None and extracted != candidate:
+                    candidates.append(extracted)
     error = None
     for candidate in candidates:
         if model_envelope and isinstance(candidate, str):
