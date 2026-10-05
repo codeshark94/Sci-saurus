@@ -54,6 +54,7 @@ from scisaurus.runtime.specialists import (
     build_repair_adjudication_prompt, build_repair_evidence_prompt, build_specialist_prompt,
     build_verifier_prompt, redact_sensitive_text, _preserve_response_value, _repair_candidate_program,
     _normalise_verdict,
+    research_question_alignment, validate_decision_alignment, RESEARCH_QUESTION_ALIGNMENT_RULE,
 )
 from scisaurus.runtime.execution_policy import MODEL_COST_LIMITS, enforce_model_cost_limits, execution_policy
 from scisaurus.runtime.model_work import ModelWorkBlocked, ModelWorkCache
@@ -93,7 +94,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-preview-evidence-configured-author-output-13")
+    "experiment-owned-validator-question-alignment-14")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -2121,7 +2122,9 @@ class ComposerRunner:
         are already accounted for by that attempt's usage ledger (or are reused
         with zero new usage). Before a repair panel runs, reserve its configured
         worst case. Once it completes, replace that reservation with the calls
-        actually dispatched so unused panel capacity can fund the capability
+        actually dispatched outside the stage ledger. Owner-scoped completed
+        panels are already included in prior usage and need no second reserve.
+        Unused panel capacity can fund the capability
         author and its independent admission review without exceeding the stage
         envelope.
         """
@@ -3011,6 +3014,8 @@ class ComposerRunner:
             # A current, concrete executor/result failure supersedes stale
             # format-recovery state from an earlier author response.
             return True
+        if current_failure_class == "model_contract":
+            return False
         if failure_recovery.get("requires_capability_repair") is True:
             # A later transport failure must not erase the typed scientific
             # rejection retained in the same checkpoint.
@@ -11821,6 +11826,7 @@ class ComposerRunner:
             for source in unresolved_attempt_sources if isinstance(source, dict)]
         packet["foundry_execution_evidence"] = deepcopy((verified_dossier or {}).get("foundry_execution_evidence", {}))
         packet["experiment_intent"] = deepcopy(intent)
+        packet["question_alignment"] = research_question_alignment(packet.get("topic"), intent)
         packet["survey_evidence_refs"] = deepcopy(survey_refs)
         packet["prior_measurements"] = deepcopy(prior_measurements)
         packet["review_input_sha256"] = self._capability_repair_review_input_sha256(packet)
@@ -11828,6 +11834,7 @@ class ComposerRunner:
             "stage_id": stage.get("id"),
             "topic": packet.get("topic"),
             "experiment_intent": intent,
+            "question_alignment": packet.get("question_alignment"),
             "candidate_sources": {
                 name: {
                     "available": record.get("available") is True,
@@ -11927,6 +11934,7 @@ class ComposerRunner:
              if key in source}
             for source in program_snapshot if isinstance(source, dict)
         ]
+        semantic_packet["question_alignment"] = packet["question_alignment"]
         packet["input_sha256"] = hashlib.sha256(
             canonical_bytes(semantic_packet)).hexdigest()
         return packet
@@ -12038,6 +12046,11 @@ class ComposerRunner:
         if (not isinstance(uncertainties, list)
                 or any(not isinstance(item, str) for item in uncertainties)):
             return None, "the repair plan has invalid residual uncertainties"
+        try:
+            alignment_fields = validate_decision_alignment(
+                plan, {**packet, "candidate_program": _repair_candidate_program(packet)})
+        except ValidationError as exc:
+            return None, str(exc)
         return {
             "schema_version": "experiment-repair-adjudication-2",
             "topic_id": topic.get("id"),
@@ -12055,6 +12068,7 @@ class ComposerRunner:
             # must not veto an otherwise evidence-bound experimental design.
             "dissent_resolution": [],
             "residual_uncertainties": deepcopy(uncertainties),
+            **alignment_fields,
         }, None
 
     @staticmethod
@@ -12472,6 +12486,8 @@ class ComposerRunner:
             )},
             "experiment_intent": intent,
             "candidate_sources": source_identity,
+            "question_alignment": packet.get("question_alignment"),
+            "question_alignment_rule": RESEARCH_QUESTION_ALIGNMENT_RULE,
             "program_snapshot": program_identity,
             "survey_refs": survey_refs,
             "current_result": result_identity,
@@ -13920,7 +13936,7 @@ class ComposerRunner:
                     deadline=time.monotonic() + (
                         self._stage_remaining(stage_id)
                         if stage_id is not None else self._remaining()),
-                    model_call_budget=model_call_budget,
+                    model_call_allowance=model_call_budget,
                     repair_provenance=repair_provenance,
                     resume_work_ref=frozen_work_ref,
                 )
@@ -14035,6 +14051,7 @@ class ComposerRunner:
         # the research question after an arbitrary number of edits.
         fresh_pre_execution_repair = (
             pre_execution_capability_blocked
+            and self._is_pre_execution_capability_failure(stage, prior_experiment)
         )
         observed_experiment_repair = (
             has_observed_experiment
@@ -14144,8 +14161,10 @@ class ComposerRunner:
                 self.context[stage["id"]] = prior_experiment
             foundry_model_call_budget = model_call_budget
             if repair_panel_required:
+                if isinstance(stage.get("quota"), dict):
+                    self._stage_model_config(stage, {})
                 foundry_model_call_budget = self._foundry_model_call_budget(
-                    stage, repair_panel_usage=repair_context.get("dispatch_usage"))
+                    stage, repair_panel_usage={})
             try:
                 self._materialize_topic_capability(
                     topic_context, force_regenerate=True,
@@ -14180,7 +14199,7 @@ class ComposerRunner:
                 quality_contract=(current.get("quality_contract")
                                   if isinstance(current.get("quality_contract"), dict)
                                   else None),
-                model_call_budget=model_call_budget)
+                model_call_budget=self._foundry_model_call_budget(stage, repair_panel_usage={}))
             generated = topic_context.get("generated_capability")
         if isinstance(generated, dict):
             capability_id = generated.get("capability_id")

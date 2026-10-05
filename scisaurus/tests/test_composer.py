@@ -44,6 +44,35 @@ from scisaurus.core.tasks import TaskManager
 from scisaurus.tests.test_research_program import topic_package
 
 
+def _align_repair_fixture(response, prompt):
+    packet = json.loads(prompt).get("repair_adjudication_packet", {})
+    original = packet.get("question_alignment", {}).get("original", {})
+    if not original.get("research_question") or not isinstance(response.get("repair_plan"), dict):
+        return response
+    plan = response["repair_plan"]
+    outcomes = packet.get("question_alignment", {}).get("candidate", {}).get("primary_outcomes") or []
+    outcome = outcomes[0] if outcomes else {"id": "test_contrast", "definition": "The declared intervention contrast."}
+    plan["decision_alignment"] = {
+        "original_question": original["research_question"],
+        "original_decision_rule": original.get("disconfirmation_test"),
+        "primary_outcome_id": outcome["id"], "quantity_definition": outcome["definition"],
+        "baseline": "Declared reference condition", "aggregation": "Declared outcome operator",
+        "interpretation_limit": "Bounded synthetic comparison", "changes_estimand": not bool(outcomes),
+        "scientific_justification": "Preserve the declared comparison and explicitly define its outcome.",
+    }
+    if not outcomes:
+        plan["required_changes"].append({
+            "target": "estimand", "instruction": "Define the intervention contrast explicitly.",
+            "scientific_basis": "The comparison requires an unambiguous outcome.", "source_refs": [],
+        })
+    plan["evidence_checks"] = [{
+        "claim": "The selected repair preserves the original question.",
+        "pointer": "/question_alignment/original/research_question", "quote": original["research_question"],
+        "disposition": "supported", "explanation": "The original question is unchanged.",
+    }]
+    return response
+
+
 class _ComposerTestSpecialistClient:
     def __init__(self, **config):
         self.config = config
@@ -5219,6 +5248,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                                         {"phase": "execution", "check": "Recalculate the result independently from raw observations."},
                                     ],
                                 }
+                        response = _align_repair_fixture(response, prompt)
                         return ModelResult(
                             json.dumps(response), "fake", {"model_calls": 1}, 0.0, "stop")
 
@@ -16828,7 +16858,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                     patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate", return_value=generated) as fresh:
                 runner._materialize_topic_capability(result, stage_id="experiment")
             available.assert_called_once_with(workflow["stages"][1], repair_panel_usage={})
-            self.assertEqual(fresh.call_args.kwargs["model_call_budget"], 2)
+            self.assertEqual(fresh.call_args.kwargs["model_call_allowance"], 2)
             self.assertEqual(fresh.call_args.kwargs["repair_provenance"]["repair_evidence_frontier"], binding)
             brief = json.loads(fresh.call_args.args[0])
             self.assertEqual(brief["repair_evidence_frontier"], runner._capability_evidence_projection(frontier))
@@ -18582,6 +18612,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                                     "dissent_resolution": [],
                                     "residual_uncertainties": [],
                                 }
+                        payload = _align_repair_fixture(payload, prompt)
                         return ModelResult(json.dumps(payload), "fake", {"model_calls": 1}, 0.0, "stop")
 
                 with patch("scisaurus.runtime.specialists.ModelClient", FakeModel):
@@ -18843,6 +18874,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                             ],
                             "dissent_resolution": [], "residual_uncertainties": [],
                         }
+                    response = _align_repair_fixture(response, prompt)
                     return ModelResult(json.dumps(response), "fake", {"model_calls": 1}, 0.0, "stop")
 
             first = ComposerRunner(workflow)

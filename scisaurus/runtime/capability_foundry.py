@@ -46,7 +46,10 @@ from scisaurus.runtime.models import (
     resolve_model_config,
 )
 from scisaurus.runtime.model_work import ModelWorkBlocked
-from scisaurus.runtime.specialists import _preserve_response_value, REPAIR_CHECK_PHASE_RULE
+from scisaurus.runtime.specialists import (
+    _preserve_response_value, REPAIR_CHECK_PHASE_RULE,
+    research_question_alignment, RESEARCH_QUESTION_ALIGNMENT_RULE,
+)
 from scisaurus.runtime.program_admission import (
     ExperimentIntentContractError, is_main_entry_guard, scan_program_source,
     validate_experiment_intent,
@@ -339,6 +342,14 @@ class CapabilityModelBudgetExceeded(ModelWorkBlocked):
         # Composer already reconciles durable foundry work while the request
         # is in flight.
         self.foundry_usage = deepcopy_config(usage) if isinstance(usage, dict) else {}
+
+
+class IndependentValidatorContractError(ModelWorkBlocked):
+    """Validator authoring must resume without changing the producer candidate."""
+
+    failure_class = "model_contract"
+    recovery_mode = "format_repair_then_rerun"
+    repair_gate = "independent_validator_contract"
 
 
 def _repair_gate(error):
@@ -2149,12 +2160,18 @@ class CapabilityFoundry:
 
     def generate(self, brief, *, test_input=None, required_intent=None, client=None,
                  work_cache=None, on_progress=None, deadline=None,
-                 model_call_budget=None, repair_provenance=None, resume_work_ref=None):
+                 model_call_budget=None, model_call_allowance=None,
+                 repair_provenance=None, resume_work_ref=None):
         if resume_work_ref is not None and work_cache is None:
             raise ValidationError("foundry format resume requires its durable work cache")
         if model_call_budget is not None and (
                 type(model_call_budget) is not int or model_call_budget < 1):
             raise ValidationError("foundry model_call_budget must be a positive integer when supplied")
+        if model_call_allowance is not None:
+            if model_call_budget is not None:
+                raise ValidationError("foundry requires either a lifetime call budget or an additional call allowance")
+            if type(model_call_allowance) is not int or model_call_allowance < 0:
+                raise ValidationError("foundry model_call_allowance must be a nonnegative integer when supplied")
         configured_input = test_input if test_input is not None else {"probe": True}
         validate_work_orders(
             configured_input.get("work_orders")
@@ -2398,6 +2415,18 @@ class CapabilityFoundry:
                     if isinstance(prior_diagnostics, list):
                         state["model_diagnostics"] = deepcopy_config(prior_diagnostics[-12:])
                     prior_format_repair = prior.get("format_repair")
+                    # Only failed authoring receipts are reusable. Successful
+                    # validators and verdicts still run the current protocol.
+                    for identity, authored in prior.get("validator_authorship", {}).items():
+                        assignment = authored.get("assignment", {}) if isinstance(authored, dict) else {}
+                        if (isinstance(authored, dict)
+                                and authored.get("status") == "repair_required"
+                                and (authored.get("candidate_sha256") == _authored_candidate_sha256(
+                                        {name: candidate[name] for name in PRODUCER_FIELDS})
+                                     or (authored.get("candidate_sha256") is None
+                                         and assignment.get("experiment_intent") == candidate["experiment_intent"]
+                                         and assignment.get("configured_input") == configured_input))):
+                            state.setdefault("validator_authorship", {})[identity] = deepcopy_config(authored)
                     if isinstance(prior_format_repair, dict):
                         state["format_repair"] = deepcopy_config(prior_format_repair)
                         reason = prior.get("feedback") or prior_format_repair.get("previous_error")
@@ -2668,6 +2697,13 @@ class CapabilityFoundry:
             return switched
 
         state["repair_gate_counts"] = _seed_repair_gate_counts(state)
+        if model_call_allowance is not None:
+            retained_calls = state.get("usage", {}).get("model_calls", 0)
+            if type(retained_calls) is not int or retained_calls < 0:
+                raise ValidationError("retained foundry usage has invalid model call count")
+            state["model_call_allowance"] = {"additional_calls": model_call_allowance,
+                                           "retained_calls": retained_calls}
+            model_call_budget = retained_calls + model_call_allowance
         if model_call_budget is not None:
             state["model_call_budget"] = model_call_budget
 
@@ -2679,14 +2715,14 @@ class CapabilityFoundry:
                 observed = 0
             if observed < model_call_budget:
                 return
-            state["status"] = "blocked"
             state["error"] = (
                 "capability foundry model-call budget exhausted before admission: "
-                f"{observed} >= {model_call_budget}; change the scientific framing "
-                "or continue from a fresh scoped work order instead of replaying the same candidate")
+                f"{observed} >= {model_call_budget}; preserve the candidate and "
+                "pending admission phase until authorized call capacity is available")
             state["budget_exhausted"] = {
                 "dimension": "model_calls", "limit": model_call_budget,
                 "observed": observed,
+                "pending_status": state["status"],
                 "usage": deepcopy_config(state.get("usage", {})),
             }
             save("model_call_budget_exhausted")
@@ -3340,11 +3376,19 @@ class CapabilityFoundry:
             identity = hashlib.sha256(canonical_bytes(candidate)).hexdigest()
             reviews = state.setdefault("scientific_reviews", {})
             execution_evidence = program_review_evidence(candidate, document, verdict)
+            topic = {}
+            try:
+                topic = json.loads(brief).get("topic", {}) if isinstance(brief, str) else brief.get("topic", {})
+            except (ValueError, AttributeError, TypeError):
+                pass
+            question_alignment = research_question_alignment(topic, candidate["experiment_intent"])
             review_scope = hashlib.sha256(canonical_bytes({
                 "checks": sorted(PROGRAM_REVIEW_CHECKS),
                 "execution_evidence": execution_evidence,
                 "response_fields": sorted(PROGRAM_REVIEW_FIELDS),
                 "review_system": REVIEW_SYSTEM,
+                "question_alignment": question_alignment,
+                "question_alignment_rule": RESEARCH_QUESTION_ALIGNMENT_RULE,
             })).hexdigest()
             retained = reviews.setdefault(identity + ":" + review_scope,
                                           {"status": "pending", "responses": []})
@@ -3358,7 +3402,7 @@ class CapabilityFoundry:
                 else:
                     result = call_reviewer(
                         candidate, document, identity, retained, review_attempt,
-                        prior_blocking_issues, execution_evidence)
+                        prior_blocking_issues, execution_evidence, question_alignment)
                 result = continue_truncated_review_response(
                     result, identity, retained, review_attempt)
                 try:
@@ -3414,7 +3458,7 @@ class CapabilityFoundry:
                         "prior_blocking_issues": deepcopy_config(prior_blocking_issues)}
 
         def call_reviewer(candidate, document, identity, retained, review_attempt,
-                          prior_blocking_issues, execution_evidence):
+                          prior_blocking_issues, execution_evidence, question_alignment):
             required_check_ids = sorted(
                 PROGRAM_REVIEW_CHECKS | {
                     item["review_check_id"] for item in prior_blocking_issues
@@ -3430,6 +3474,8 @@ class CapabilityFoundry:
                 "executor_source": candidate["executor_source"],
                 "validator_source": candidate["validator_source"],
                 "execution_evidence": execution_evidence,
+                "question_alignment": question_alignment,
+                "question_alignment_rule": RESEARCH_QUESTION_ALIGNMENT_RULE,
                 "observed_data": program_failure_context(document),
                 "raw_observation_sample": document["observations"][:24],
                 "raw_observation_sample_complete": len(document["observations"]) <= 24,
@@ -3526,11 +3572,60 @@ class CapabilityFoundry:
                     "producer-authored validator patches are not admissible.")
             identity = hashlib.sha256(canonical_bytes(assignment)).hexdigest()
             retained = state.setdefault("validator_authorship", {}).setdefault(identity, {"status": "pending"})
+            retained["candidate_sha256"] = _authored_candidate_sha256(state.get("last_attempt"))
+
+            def defer_validator_repair(reason):
+                state.update(status="blocked", error=str(reason), feedback=str(reason),
+                    last_failure_class="model_contract",
+                    last_failure_gate="independent_validator_contract",
+                    repair_owner="methods.validator-author")
+                state["candidate_failure"] = {
+                    "repair_kind": "independent_validator_contract", "gate": "independent_validator_contract",
+                    "error": retained.get("error") or str(reason),
+                    "assignment_sha256": identity,
+                }
+                state.setdefault("failed_candidates", {})
+                if retained.get("source") and retained.get("provenance"):
+                    state["last_attempt"]["validator_source"] = retained["source"]
+                    state["validator_failure"] = {
+                        "source": retained["source"], "provenance": deepcopy_config(retained["provenance"]),
+                        "status": "rejected", "diagnostic": retained.get("error"),
+                    }
+                else:
+                    state["last_attempt"].pop("validator_source", None)
+                    state.pop("validator_failure", None)
+                fingerprint = _authored_candidate_sha256(state["last_attempt"])
+                state["candidate_failure_sha256"] = fingerprint
+                state["validation_context"] = program_failure_context(document)
+                state["validation_context_candidate_sha256"] = fingerprint
+                state.setdefault("repair_ledger", []).append({
+                    "attempt": state.get("attempts"), "gate": "independent_validator_contract",
+                    "candidate_sha256": fingerprint, "error": retained.get("error") or str(reason),
+                    "next_action": "format_repair_then_rerun",
+                })
+                save("independent_validator_repair_deferred")
+                blocked = IndependentValidatorContractError(str(reason))
+                receipt = repair_exhausted_error()
+                blocked.__dict__.update(receipt.__dict__)
+                if state.get("validator_failure"):
+                    blocked.validator_failure = deepcopy_config(state["validator_failure"])
+                raise blocked
+
             while True:
                 if retained.get("status") in {"calling", "result_unknown"}:
                     raise ModelWorkBlocked("independent validator authoring has an unresolved dispatched request")
+                if (retained.get("status") == "repair_required"
+                        and retained.get("attempts", 0) >= self.max_attempts):
+                    defer_validator_repair(
+                        "independent validator technical repair exhausted: " + retained.get("error", "contract failure"))
                 if retained.get("status") != "response_received":
-                    ensure_model_call_budget()
+                    try:
+                        ensure_model_call_budget()
+                    except CapabilityModelBudgetExceeded:
+                        if retained.get("status") == "repair_required" and retained.get("error"):
+                            defer_validator_repair(
+                                "independent validator technical repair deferred: " + retained["error"])
+                        raise
                     validator_client = self.validator_client
                     if validator_client is None:
                         model = deepcopy_config(self.model_config)
@@ -3544,8 +3639,19 @@ class CapabilityFoundry:
                             model.setdefault("role_models", {})[role] = alternatives[0]
                         config = self._model_config_for_role(role, self.author_max_output_tokens, model_config=model)
                         validator_client = ModelClient(**config)
+                    prior_response = retained.get("response") or {}
+                    repair = {
+                        "prior_source": retained.get("source"),
+                        "prior_response": {
+                            "finish_reason": prior_response.get("finish_reason"),
+                            "response_sha256": hashlib.sha256(
+                                str(prior_response.get("text", "")).encode()).hexdigest(),
+                        },
+                        "diagnostic": retained.get("error"),
+                        "instructions": "Write one concise complete validator implementation. Do not continue an incomplete response or repeat helper variants. Preserve the frozen estimand and independently recalculate from raw observations.",
+                    }
                     request = {"role": "methods.validator-author", "assignment_sha256": identity,
-                        "status": "started", "prompt": json.dumps({**assignment, **({"validator_repair": {"prior_source": retained.get("source"), "prior_response": retained.get("response"), "diagnostic": retained["error"]}} if retained.get("error") else {})}, sort_keys=True), "usage": {"model_calls": 1}}
+                        "status": "started", "prompt": json.dumps({**assignment, **({"validator_repair": repair} if retained.get("error") else {})}, sort_keys=True), "usage": {"model_calls": 1}}
                     state["requests"].append(request)
                     state["usage"]["model_calls"] = state["usage"].get("model_calls", 0) + 1
                     attempts_before = retained.get("attempts", 0)
@@ -3575,17 +3681,20 @@ class CapabilityFoundry:
                 provenance = None
                 try:
                     response = retained["response"]
+                    retained.pop("source", None)
+                    retained.pop("provenance", None)
                     if response["finish_reason"] != "stop":
                         raise ValidationError("independent validator author response is incomplete")
                     value = parse_complete_json_object(response["text"], "independent validator author", model_envelope=False)
                     if set(value) != {"validator_source"} or not isinstance(value["validator_source"], str):
                         raise ValidationError("independent validator author must return exactly validator_source")
                     source = value["validator_source"]
-                    scan_program_source(source, "independent program validator")
                     retained["source"] = source
                     provenance = {"role": "methods.validator-author", "method": "blinded_separate_authoring",
                         "assignment_sha256": identity, "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
                         "response_sha256": hashlib.sha256(response["text"].encode()).hexdigest(), "model": response["model"]}
+                    retained["provenance"] = provenance
+                    scan_program_source(source, "independent program validator")
                     probe = execute_recorded(source, canonical_bytes(
                         validator_readiness_contract()["stdin"]), "validator_readiness")
                     if probe.timed_out and deadline is not None and time.monotonic() >= deadline:
@@ -3610,14 +3719,7 @@ class CapabilityFoundry:
                     retained.update(status="repair_required", error=str(exc))
                     save("independent_validator_contract_failed")
                     if retained.get("attempts", 0) >= self.max_attempts:
-                        blocked = ModelWorkBlocked("independent validator technical repair exhausted: " + str(exc))
-                        blocked.failure_class = "model_contract"
-                        blocked.recovery_mode = "format_repair_then_rerun"
-                        blocked.repair_gate = "independent_validator_contract"
-                        if source is not None and provenance is not None:
-                            blocked.validator_failure = {"source": source,
-                                "provenance": provenance, "status": "rejected", "diagnostic": str(exc)}
-                        raise blocked from exc
+                        defer_validator_repair("independent validator technical repair exhausted: " + str(exc))
 
         if state["status"] == "blocked" and isinstance(
                 state.get("repair_budget_exhausted"), dict):
@@ -4155,6 +4257,8 @@ class CapabilityFoundry:
                 # The Composer owns this scientific budget boundary. Do not
                 # reinterpret it as a candidate defect and spend another
                 # repair call before the pivot/recovery path sees it.
+                raise
+            except IndependentValidatorContractError:
                 raise
             except (ValidationError, KeyError, TypeError, ValueError) as exc:
                 if deadline is not None and time.monotonic() >= deadline:

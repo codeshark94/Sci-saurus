@@ -32,6 +32,7 @@ _OPERATIONAL_MARKERS = (
     "project directory", "workspace is already",
 )
 _MODEL_CONTRACT_MARKERS = (
+    "independent validator technical repair", "independent validator author response is incomplete",
     "invalid json", "malformed json",
     "response contract", "output contract", "model output must contain",
     "model output omitted",
@@ -136,6 +137,9 @@ def classify_failure(stage_kind, error, stage_result=None):
         # that a scientific claim or experiment design needs model review.
         return "harness_bug"
     repair_feedback = getattr(error, "repair_feedback", None)
+    if (getattr(error, "failure_class", None) == "model_contract"
+            and getattr(error, "repair_gate", None) == "independent_validator_contract"):
+        return "model_contract"
     observed = repair_feedback.get("validation_context") if isinstance(repair_feedback, dict) else None
     if (stage_kind == "experiment"
             and getattr(error, "failure_class", None) == "experiment_capability_repair"
@@ -177,12 +181,12 @@ def classify_failure(stage_kind, error, stage_result=None):
             (stage_result or {}).get("error") if isinstance(stage_result, dict) else None,
         )
     ).casefold()
+    if getattr(error, "failure_class", None) == "model_contract":
+        return "model_contract"
     if any(marker in text for marker in _RESOURCE_MARKERS):
         return "resource_fence"
     if any(marker in text for marker in _OPERATIONAL_MARKERS):
         return "operational_recovery"
-    if getattr(error, "failure_class", None) == "model_contract":
-        return "model_contract"
     # A malformed/truncated provider response must be repaired at the model
     # interface before any scientific continuation is opened.  It is not a
     # rejected hypothesis and it should not replay survey/interpretation work.
