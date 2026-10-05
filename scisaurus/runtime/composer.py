@@ -93,7 +93,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-response-owner-recovery-12")
+    "experiment-preview-evidence-configured-author-output-13")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -9875,10 +9875,14 @@ class ComposerRunner:
                     and record.get("returncode") == 0
                     and record.get("timed_out") is False and record.get("truncated") is False)
         try:
-            if any(not isinstance(attempt.get(name + "_source"), str) for name in ("executor", "validator")):
-                raise ValidationError("Failed candidate source pair is unavailable")
+            if not isinstance(attempt.get("executor_source"), str):
+                raise ValidationError("Failed candidate executor source is unavailable")
+            validator_source = attempt.get("validator_source")
+            if validator_source is not None and not isinstance(validator_source, str):
+                raise ValidationError("Failed candidate validator source is invalid")
             source_hashes = {name: hashlib.sha256(attempt[name + "_source"].encode()).hexdigest()
-                             for name in ("executor", "validator")}
+                             for name in ("executor", "validator")
+                             if isinstance(attempt.get(name + "_source"), str)}
             executor = next(record for record in reversed(records)
                             if successful(record) and record.get("operation") in ("executor_preview", "executor_replay")
                             and record.get("program_sha256") == source_hashes["executor"])
@@ -9899,11 +9903,18 @@ class ComposerRunner:
             observations = document.get("observations")
             if not isinstance(observations, list) or any(not isinstance(row, dict) for row in observations):
                 raise ValidationError("Recorded executor observations are not a row collection")
-            candidate = normalize_program_output(deepcopy(document))
-            candidate_hash = hashlib.sha256(canonical_bytes(candidate)).hexdigest()
+            normalization_error = None
+            try:
+                candidate = normalize_program_output(deepcopy(document))
+                candidate_hash = hashlib.sha256(canonical_bytes(candidate)).hexdigest()
+            except ValidationError as exc:
+                if validator_source is not None:
+                    raise
+                candidate_hash = None
+                normalization_error = str(exc)
             validator = None
             verdict = None
-            for record in reversed(records):
+            for record in (reversed(records) if validator_source is not None else []):
                 if (not successful(record) or record.get("operation") not in ("validator_preview", "validator_recalculation")
                         or record.get("program_sha256") != source_hashes["validator"]):
                     continue
@@ -9924,7 +9935,7 @@ class ComposerRunner:
                     raise ValidationError("Recorded validator verdict does not bind the exact candidate")
                 validator = record
                 break
-            if validator is None:
+            if validator_source is not None and validator is None:
                 raise ValidationError("No current-source validator output is bound to the executor result")
             def encoded_document(value):
                 text = redact_sensitive_text(canonical_bytes(value).decode())
@@ -9943,18 +9954,24 @@ class ComposerRunner:
                 columns[name] = summary
             identity = {"candidate_sha256": candidate_hash,
                         "raw_document_sha256": hashlib.sha256(canonical_bytes(document)).hexdigest(),
-                        "candidate_normalization": "shared_program_output_normalization",
+                        "candidate_normalization": ("shared_program_output_normalization"
+                                                    if normalization_error is None else "output_contract_invalid"),
+                        "output_contract_error": normalization_error,
                         "sources": source_hashes,
                         "executor": {key: executor.get(key) for key in (
                             "operation", "mode", "stdin_sha256", "stdout_sha256", "stderr_sha256")},
                         "validator": {key: validator.get(key) for key in (
-                            "operation", "mode", "stdin_sha256", "stdout_sha256", "stderr_sha256")}}
+                            "operation", "mode", "stdin_sha256", "stdout_sha256", "stderr_sha256")}
+                        if validator is not None else None}
             return {"available": True, "admissible_as_verified_claims": False,
+                    "execution_phase": "independent_recalculation" if validator is not None else "executor_preview",
                     "identity": identity, "observation_count": len(observations),
                     "observation_columns": columns,
                     "executor_output": encoded_document({key: value for key, value in document.items() if key != "assets"}),
                     "executor_output_omitted_fields": ["assets"] if "assets" in document else [],
-                    "validator_output": encoded_document(verdict)}
+                    "validator_output": encoded_document(verdict) if validator is not None else {
+                        "available": False, "complete": False, "source_chunks": [],
+                        "reason": "Independent validator has not been authored for this candidate."}}
         except (StopIteration, NotFoundError, KeyError, OSError, TypeError, ValueError, ValidationError) as exc:
             return unavailable | {"reason": str(exc) or "No matching current-source execution is available."}
 
@@ -10072,6 +10089,8 @@ class ComposerRunner:
             if isinstance(last_attempt, dict):
                 projected_attempt = {
                     "experiment_intent": deepcopy(last_attempt.get("experiment_intent")),
+                    **{key + "_sha256": hashlib.sha256(canonical_bytes(last_attempt[key])).hexdigest()
+                       for key in ("test_input", "runtime") if key in last_attempt},
                 }
                 source_integrity = {}
                 for source_name in ("executor", "validator"):
@@ -22134,21 +22153,34 @@ class ComposerRunner:
             dossier_integrity = dossier_attempt.get("source_integrity")
             dossier_integrity = dossier_integrity if isinstance(dossier_integrity, dict) else {}
             try:
-                linked_sources_match = (
+                linked_attempt_matches = (
                     isinstance(dossier_intent, dict)
                     and isinstance(cached_intent, dict)
                     and canonical_bytes(dossier_intent) == canonical_bytes(cached_intent)
+                    and all(key not in dossier_attempt
+                            or canonical_bytes(dossier_attempt[key]) == canonical_bytes(cached_attempt.get(key))
+                            for key in ("test_input", "runtime"))
+                    and all(key + "_sha256" not in dossier_attempt
+                            or dossier_attempt[key + "_sha256"] == hashlib.sha256(
+                                canonical_bytes(cached_attempt.get(key))).hexdigest()
+                            for key in ("test_input", "runtime"))
+                    and (foundry.get("cache_body_sha256") is None
+                         or foundry["cache_body_sha256"] == foundry_cache_body_hash)
                 )
             except (TypeError, ValueError):
-                linked_sources_match = False
+                linked_attempt_matches = False
             for source_key, integrity_key in (
                     ("executor_source", "executor"), ("validator_source", "validator")):
                 cache_source = cached_attempt.get(source_key)
                 dossier_source = dossier_attempt.get(source_key)
                 expected = dossier_integrity.get(integrity_key)
                 expected = expected.get("sha256") if isinstance(expected, dict) else None
+                if source_key == "validator_source" and cache_source is None and dossier_source is None:
+                    if expected is not None:
+                        linked_attempt_matches = False
+                    continue
                 if not isinstance(cache_source, str):
-                    linked_sources_match = False
+                    linked_attempt_matches = False
                     break
                 if isinstance(expected, str):
                     source_matches = hashlib.sha256(
@@ -22158,9 +22190,9 @@ class ComposerRunner:
                         isinstance(dossier_source, str) and cache_source == dossier_source
                     )
                 if not source_matches:
-                    linked_sources_match = False
+                    linked_attempt_matches = False
                     break
-            if linked_sources_match:
+            if linked_attempt_matches:
                 foundry_cache_identity_verified = True
             else:
                 foundry_cache = {}
@@ -22169,7 +22201,7 @@ class ComposerRunner:
                 cached_attempt = None
                 foundry_cache_error = (
                     "The linked foundry-work artifact does not match the failed attempt's "
-                    "experiment intent and executor/validator digests."
+                    "experiment intent, configured input, runtime, and executor/validator digests."
                 )
         last_attempt = cached_attempt if isinstance(cached_attempt, dict) else dossier_attempt
         integrity = dossier_attempt.get("source_integrity")

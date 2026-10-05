@@ -17,7 +17,6 @@ from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.capability_foundry import (
     CapabilityFoundry, CapabilityDeadlineError, CapabilityModelBudgetExceeded,
     AUTHOR_CONTINUATION_MAX_OUTPUT_TOKENS,
-    AUTHOR_PATCH_MAX_OUTPUT_TOKENS,
     AUTHOR_PATCH_MAX_SOURCE_CHARS, AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS,
     SourceDataUnavailable, _is_repeated_repair_failure, _sandbox_failure_signature,
     _program_gate_failure_signature,
@@ -821,7 +820,6 @@ class CapabilityFoundryTests(unittest.TestCase):
             "program author response was incomplete (finish_reason=length)",
             has_candidate=True)
         self.assertIn("truncated", truncated)
-        self.assertEqual(AUTHOR_PATCH_MAX_OUTPUT_TOKENS, 4096)
         self.assertIn("bounded patch contract", truncated)
 
     def test_author_request_signature_prevents_an_unchanged_route_replay(self):
@@ -1919,7 +1917,7 @@ class CapabilityFoundryTests(unittest.TestCase):
                             "marker": "wrong-continuation-marker",
                             "continuation": "}",
                         }), "primary-author", {"model_calls": 1}, 0.0, "stop")
-                    self_test.assertEqual(self.max_output_tokens, 4096)
+                    self_test.assertEqual(self.max_output_tokens, 24000)
                     return ModelResult('{"updates":', "primary-author",
                                        {"model_calls": 1, "output_tokens": 16384},
                                        0.0, "length")
@@ -1930,7 +1928,7 @@ class CapabilityFoundryTests(unittest.TestCase):
                 prompt_value = None
 
                 def complete(self, *, system, prompt):
-                    self_test.assertEqual(self.max_output_tokens, 4096)
+                    self_test.assertEqual(self.max_output_tokens, 24000)
                     self.calls += 1
                     request = json.loads(prompt)
                     self.prompt_value = request
@@ -2282,7 +2280,7 @@ class CapabilityFoundryTests(unittest.TestCase):
 
         self.assertEqual(outcome["status"], "registered")
         self.assertEqual(outcome["candidate"]["executor_source"], MINI_EXECUTOR)
-        self.assertEqual(client.output_limits, [24000, 4096])
+        self.assertEqual(client.output_limits, [24000, 24000])
 
     def test_exact_source_edits_reject_missing_or_ambiguous_matches_atomically(self):
         previous = self._payload()
@@ -3780,7 +3778,7 @@ class CapabilityFoundryTests(unittest.TestCase):
 
         self.assertEqual(outcome["status"], "registered")
         self.assertEqual(author.calls, 3)
-        self.assertEqual(author.output_budgets, [24000, 4096, 4096])
+        self.assertEqual(author.output_budgets, [24000, 24000, 24000])
         repair_prompt = json.loads(author.prompts[1])
         self.assertEqual(repair_prompt["format_repair"]["repair_kind"], "executor_output_contract")
         self.assertEqual(repair_prompt["format_repair"]["missing_fields"], ["observations"])

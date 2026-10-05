@@ -2714,6 +2714,82 @@ class ComposerWorkflowTests(unittest.TestCase):
                         changed["sandbox_executions"][0]["stdout_sha256"] = "0" * 64
                     self.assertFalse(runner._foundry_execution_evidence(changed)["available"])
 
+    def test_prevalidator_preview_reaches_owned_failure_review_without_admission(self):
+        from scisaurus.runtime.capability_registry import experiment_program_payload
+        from scisaurus.tests.test_program_admission import INTENT
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            intent = {**deepcopy(INTENT), "id": "study", "revision": 2}
+            configured = {"grid": [1, 2, 3]}
+            document = {"study_id": "study", "revision": 2,
+                        "observations": [{"condition": "primary", "x": i} for i in range(4200)],
+                        "metrics": [], "analysis": {"row_accounting": {"total": 4200}}}
+            def publish(value):
+                body = value.encode() if isinstance(value, str) else canonical_bytes(value)
+                return runner.store.publish_object(body, "application/json")
+            source = "executor"
+            work = {"status": "blocked", "last_attempt": {
+                "executor_source": source, "experiment_intent": intent, "test_input": configured},
+                "sandbox_executions": [{"operation": "executor_preview", "mode": "sandbox-exec",
+                    "returncode": 0, "timed_out": False, "truncated": False,
+                    "program_sha256": publish(source),
+                    "stdin_sha256": publish(experiment_program_payload(intent, configured)),
+                    "stdout_sha256": publish(document)}]}
+            evidence = runner._foundry_execution_evidence(work)
+            self.assertTrue(evidence["available"], evidence)
+            self.assertFalse(evidence["admissible_as_verified_claims"])
+            self.assertEqual(evidence["execution_phase"], "executor_preview")
+            self.assertIsNone(evidence["identity"]["candidate_sha256"])
+            self.assertIn("row_accounting", evidence["identity"]["output_contract_error"])
+            self.assertIsNone(evidence["identity"]["validator"])
+            self.assertFalse(evidence["validator_output"]["available"])
+            self.assertEqual(json.loads("".join(evidence["executor_output"]["source_chunks"])), document)
+            foundry = runner.store.publish_artifact(logical_id="command/foundry-work/prevalidator",
+                artifact_type="note", media_type="application/json", body=canonical_bytes(work),
+                author="command.controller")
+            snapshot = {"cache_ref": foundry["artifact_ref"], "last_attempt": {
+                **work["last_attempt"], "source_integrity": {
+                    "executor": {"sha256": hashlib.sha256(source.encode()).hexdigest()}}}}
+            def hydrate(current_snapshot):
+                dossier = runner.store.publish_artifact(logical_id="command/failure/prevalidator",
+                    artifact_type="note", media_type="application/json", author="command.controller",
+                    body=canonical_bytes({"stage_id": "experiment", "attempt_number": 1,
+                        "foundry_work_snapshot": current_snapshot}))
+                runner.stage_records["experiment"] = {"attempts": [{"attempt_number": 1,
+                    "failure_dossier_ref": dossier["artifact_ref"]}]}
+                return runner._failure_dossier_evidence(dossier["artifact_ref"],
+                    expected_stage_id="experiment", expected_attempt_number=1)
+            hydrated = hydrate(snapshot)
+            self.assertEqual(hydrated["foundry_execution_evidence"], evidence)
+            for alteration in ("executor", "input", "stdout", "validator", "validator_digest",
+                               "dossier_input", "dossier_runtime", "input_digest", "runtime_digest", "body_digest"):
+                with self.subTest(alteration=alteration):
+                    changed = deepcopy(work)
+                    if alteration == "executor":
+                        changed["last_attempt"]["executor_source"] = "other source"
+                    elif alteration == "input":
+                        changed["last_attempt"]["test_input"] = {}
+                    elif alteration == "stdout":
+                        changed["sandbox_executions"][0]["stdout_sha256"] = "0" * 64
+                    elif alteration == "validator":
+                        changed["last_attempt"]["validator_source"] = "validator without execution"
+                    else:
+                        changed_snapshot = deepcopy(snapshot)
+                        if alteration == "validator_digest":
+                            changed_snapshot["last_attempt"]["source_integrity"]["validator"] = {"sha256": "a" * 64}
+                        elif alteration in {"input_digest", "runtime_digest"}:
+                            key = "test_input" if alteration == "input_digest" else "runtime"
+                            changed_snapshot["last_attempt"][key + "_sha256"] = "0" * 64
+                        elif alteration == "body_digest":
+                            changed_snapshot["cache_body_sha256"] = "0" * 64
+                        else:
+                            key = "test_input" if alteration == "dossier_input" else "runtime"
+                            changed_snapshot["last_attempt"][key] = {"foreign_input": True}
+                        self.assertFalse(hydrate(changed_snapshot)["foundry_execution_evidence"]["available"])
+                        continue
+                    self.assertFalse(runner._foundry_execution_evidence(changed)["available"])
+
     def test_foundry_failure_lookup_scans_past_unrelated_history(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -2734,6 +2810,8 @@ class ComposerWorkflowTests(unittest.TestCase):
                     }},
                     "last_attempt": {
                         "experiment_intent": {"id": "topic-a", "revision": 1},
+                        "test_input": {"grid": list(range(64))},
+                        "runtime": {"python": "3.14", "packages": []},
                         "executor_source": "# executor\n" + ("value = 1\n" * 3200),
                         "validator_source": "# validator\n" + ("value = 2\n" * 3200),
                     },
@@ -2767,6 +2845,9 @@ class ComposerWorkflowTests(unittest.TestCase):
                                  target["last_attempt"]["validator_source"])
                 self.assertFalse(result["last_attempt"]["source_integrity"]["executor"][
                     "truncated"])
+                for key in ("test_input", "runtime"):
+                    self.assertEqual(result["last_attempt"][key + "_sha256"], hashlib.sha256(
+                        canonical_bytes(target["last_attempt"][key])).hexdigest())
             finally:
                 runner.close()
 

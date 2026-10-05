@@ -221,7 +221,6 @@ ATTEMPT_FIELDS = {"executor_source", "validator_source", "experiment_intent"}
 PRODUCER_FIELDS = {"executor_source", "experiment_intent"}
 LEGACY_TRANSPORT_FIELDS = {"runtime", "test_input"}
 IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,63}")
-AUTHOR_PATCH_MAX_OUTPUT_TOKENS = 4096
 AUTHOR_PATCH_MAX_EDITS = 4
 AUTHOR_PATCH_MAX_SOURCE_CHARS = 12000
 AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS = 8
@@ -3851,12 +3850,8 @@ class CapabilityFoundry:
                 if (isinstance(last_attempt, dict)
                         and PRODUCER_FIELDS.issubset(last_attempt)
                         and type(getattr(client, "max_output_tokens", None)) is int):
-                    output_limit = self.author_max_output_tokens
-                    if feedback is not None or isinstance(format_repair, dict):
-                        output_limit = min(
-                            output_limit, AUTHOR_PATCH_MAX_OUTPUT_TOKENS)
                     client.max_output_tokens = min(
-                        client.max_output_tokens, output_limit)
+                        client.max_output_tokens, self.author_max_output_tokens)
                 timeout_bounds = []
                 if self.model_timeout_seconds is not None:
                     timeout_bounds.append(self.model_timeout_seconds)
