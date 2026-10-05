@@ -1,6 +1,7 @@
 import base64
 from copy import deepcopy
 import io
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -11,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from scisaurus.core.errors import ValidationError
+from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.models import ModelResult
 from scisaurus.runtime.program_sandbox import SandboxResult, sandbox_status
 from scisaurus.runtime.software_workbench import SoftwareWorkbench, _matches_expected, project_receipt, selection_contract, validate_selection
@@ -52,6 +54,31 @@ class SoftwareWorkbenchTests(unittest.TestCase):
         self.assertEqual(projected["host_environment_checks"], [check])
         self.assertEqual(projected["operations"], [])
         self.assertEqual(len(assessment["evidence"]["discovery_and_diagnostics"]),3)
+
+    def test_inspection_uses_observed_default_branch_without_guessing(self):
+        original=self.fetch
+        def fetch(url,*,archive=False):
+            if url.endswith('/repos/upstream/tinyprobe'):
+                return json.dumps({'default_branch':'master','license':{'spdx_id':'MIT'}}).encode()
+            return original(url,archive=archive)
+        self.workbench.fetch=fetch
+        result=self.workbench.execute({'operation':'inspect','arguments':{'repository':'upstream/tinyprobe'}})
+        self.assertEqual(result['outcome'],'ok')
+        self.assertEqual(result['result']['resolved_revision'],'master')
+        self.assertTrue(any('/commits/master' in url for url in self.fetches))
+
+    def test_wrong_explicit_revision_is_not_silently_changed(self):
+        from urllib.error import HTTPError
+        original=self.fetch
+        def fetch(url,*,archive=False):
+            if url.endswith('/repos/upstream/tinyprobe'):
+                return json.dumps({'default_branch':'master'}).encode()
+            if '/commits/main' in url:raise HTTPError(url,422,'missing revision',{},None)
+            return original(url,archive=archive)
+        self.workbench.fetch=fetch
+        result=self.workbench.execute({'operation':'inspect','arguments':{'repository':'upstream/tinyprobe','revision':'main'}})
+        self.assertEqual(result['outcome'],'failed')
+        self.assertIn('upstream default branch: master',result['diagnostic_notes'][0])
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -136,7 +163,65 @@ class SoftwareWorkbenchTests(unittest.TestCase):
         repeated = self.workbench.execute(installed["action"])
         self.assertTrue(repeated["reused"])
         self.assertEqual(repeated["receipt_ref"], installed["receipt_ref"])
-        self.assertEqual(len(self.runs), before)
+
+    def test_example_without_comparison_is_rejected_before_sandbox(self):
+        _,_,docs,installed=self.provision()
+        before=len(self.runs)
+        result=self.action('run',environment_ref=installed['receipt_ref'],source='cat("{}")',input={},
+            purpose='upstream_example',documentation_refs=[docs['receipt_ref']],expected=None)
+        self.assertEqual(result['outcome'],'failed')
+        self.assertIn('requires a documented expected output',result['error'])
+        self.assertEqual(len(self.runs),before)
+
+    def test_example_mismatch_is_failed_with_complete_observed_result(self):
+        _,_,docs,installed=self.provision()
+        result=self.action('run',environment_ref=installed['receipt_ref'],source='cat("{}")',input={'parameter':1},
+            purpose='upstream_example',documentation_refs=[docs['receipt_ref']],
+            expected={'value':{'answer':43},'absolute_tolerance':0,'relative_tolerance':0})
+        self.assertEqual(result['outcome'],'failed')
+        self.assertIn('does not match',result['error'])
+        observed=result['execution']
+        self.assertEqual(observed['output'],{'answer':42})
+        self.assertEqual(observed['expected']['value'],{'answer':43})
+        self.assertFalse(observed['expected_matches'])
+        self.assertEqual(observed['execution']['returncode'],0)
+        self.assertEqual(observed['input'],{'parameter':1})
+        self.assertEqual(observed['scientific_admission'],'not_assessed')
+        again=self.workbench.execute(result['action'])
+        self.assertTrue(again['reused'])
+        self.assertEqual(again['receipt_ref'],result['receipt_ref'])
+
+    def test_previous_reproduction_semantics_do_not_reuse_successful_mismatch(self):
+        _,_,docs,installed=self.provision()
+        action={'operation':'run','arguments':{
+            'environment_ref':installed['receipt_ref'],'source':'cat("{}")','input':{},
+            'purpose':'upstream_example','documentation_refs':[docs['receipt_ref']],
+            'expected':{'value':{'answer':43},'absolute_tolerance':0,'relative_tolerance':0}}}
+        old={'revision':'scientific-software-tools-4','action':action,'outcome':'ok',
+             'result':{'expected_matches':False}}
+        raw=canonical_bytes(old)
+        sha=hashlib.sha256(raw).hexdigest()
+        (self.workbench.root/'receipts'/(sha+'.json')).write_bytes(raw)
+        old_key=hashlib.sha256(canonical_bytes({'revision':old['revision'],'action':action})).hexdigest()
+        (self.workbench.root/'actions'/(old_key+'.json')).write_bytes(canonical_bytes(
+            {'status':'finished','receipt_ref':'software:sha256:'+sha}))
+        before=len(self.runs)
+        current=self.workbench.execute(action)
+        self.assertEqual(current['outcome'],'failed')
+        self.assertFalse(current['reused'])
+        self.assertFalse(current['execution']['expected_matches'])
+        self.assertEqual(len(self.runs),before+1)
+        self.assertEqual((self.workbench.root/'receipts'/(sha+'.json')).read_bytes(),raw)
+
+    def test_wrong_documentation_receipt_identifies_exact_reference_and_operation(self):
+        _,_,_,installed=self.provision()
+        before=len(self.runs)
+        result=self.action('run',environment_ref=installed['receipt_ref'],source='cat("{}")',input={},
+            purpose='scientific_computation',documentation_refs=[installed['receipt_ref']],expected=None)
+        self.assertEqual(result['outcome'],'failed')
+        self.assertIn(installed['receipt_ref'],result['error'])
+        self.assertIn('records operation acquire; operation read is required',result['error'])
+        self.assertEqual(len(self.runs),before)
 
     def test_environment_resource_inventory_keeps_optional_runtime_failure(self):
         old=self.workbench.runner

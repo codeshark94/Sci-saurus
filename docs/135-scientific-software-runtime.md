@@ -4,11 +4,15 @@ Experiment authoring begins with a Methods software assessment. The agent
 searches public repositories from the research question, reads the selected
 source and documentation, checks scientific applicability, and chooses reuse,
 a source-supported custom model, or an explicit unavailable result.
+Omitting an inspection revision resolves the repository's reported default
+branch to an exact commit. Explicit revisions are never silently substituted;
+a failed revision retains the observed default branch as a diagnostic.
 
 ## Execution flow
 
 1. Probe the host runtime and deny-by-default sandbox.
-2. Search, inspect an exact commit, and read its license and example.
+2. Read accepted literature, follow its code links, search by mechanism,
+   inspect an exact commit, and read its license and example.
 3. Acquire source into a project-private environment and install or build it.
 4. Reproduce a documented example with explicit numerical tolerances.
 5. Execute computations for the current question, source data and work orders.
@@ -19,7 +23,44 @@ a source-supported custom model, or an explicit unavailable result.
 Tool responses return to the same producer. Installation, execution and parsing
 errors retain stdout, stderr, exit status and input identity. Producers can
 correct their calls or choose another implementation from the observed error.
+An upstream example requires a declared reference before execution. A
+comparison mismatch is a failed reproduction even when the program exits
+successfully; its parsed observation, reference and tolerances remain recorded.
 Reviewers receive evidence and cannot execute software tools.
+
+Each completed tool observation advances the producer's response state. A new
+response can receive a bounded format correction without consuming the
+correction for a different tool step. Repeated invalid output without a new
+observation still exhausts that correction. Identical actions with identical
+observations do not reset it. All requests consume the existing assignment
+usage and retain the original deadline. The JSON wire-format request remains
+explicit; it is not a guarantee that a provider enforces schema constraints.
+
+## Source-following discovery
+
+The assessment receives a content-addressed catalog of exact source versions
+referenced by accepted survey bundles in its workflow dependency graph.
+`search_evidence` performs literal OR matching over titles and captured text;
+`read_evidence` pages through a scoped immutable source and returns its links.
+The catalog participates in assessment and response-cache identity. Changing
+an accepted source bundle requires a fresh assessment. A newer mutable source
+head cannot replace the bundle's original version. Abstract and full-text
+representations remain distinct.
+
+`fetch_source` reads public HTTPS text, HTML or PDF, records the raw capture,
+checks robots policy and redirects, and pins globally routable DNS addresses
+with TLS hostname verification. Private destinations, embedded credentials,
+nonstandard ports and oversized/incomplete responses are rejected. Follow-up
+pages use a prior `capture_ref` to retain the same bytes. Page contents are
+untrusted evidence and do not authorize tool actions or scientific claims.
+
+`search_web` uses `BRAVE_SEARCH_API_KEY` when explicitly configured and public
+DuckDuckGo HTML otherwise. Authentication requirements, rate limits, access
+challenges, robots denial, unknown result envelopes and interrupted bodies
+remain recorded failures. Partial transport segments remain explicitly
+incomplete. Neither such failures nor a verified empty result prove that
+reusable software is absent. Direct documentation and captured-source routes
+remain independently available.
 
 ## Supported environments
 
@@ -67,7 +108,7 @@ installed files and dependency receipts. Builds and execution recursively
 verify dependency environments; cached executions also verify the current
 environment before returning an old result.
 
-Assessment identity includes the question, prior-work challenge, current
+Assessment identity includes the accepted literature catalog, question, prior-work challenge, current
 source-data manifest, executable work orders, study type and quality contract.
 New factual rows or a new computation scope require another assessment.
 Matching acquisition and execution actions reuse verified receipts. Identical
@@ -96,3 +137,19 @@ experiment. New parameters require new recorded software computations. This
 does not grant generated programs unrestricted imports or subprocess access.
 Ordinary experiment replay, separately authored recalculation, methodological
 review and scientific admission remain mandatory.
+
+## Operational benchmark
+
+`scripts/benchmark-software-discovery.py` runs the production specialist/tool
+loop on an exact assessment request and accepted survey store. It records the
+scientific input hash, source activation hashes, model request trace, actual
+tool receipts and usage. `--resume` preserves successful content-addressed
+operations, failed-operation diagnostics and historical reports after verifying
+that every scientific request field and the accepted catalog are unchanged.
+A tool-contract revision may advance; each run records that revision and its
+activation hashes separately from the scientific request identity.
+Historical model judgments are not fed
+back. The benchmark is separate from mission admission and does not modify
+mission outputs. Evaluate source following, query correction, candidate fit,
+actual reproduction and failure-led correction separately; a final model
+decision alone is not a successful benchmark.

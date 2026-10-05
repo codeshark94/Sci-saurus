@@ -13058,11 +13058,26 @@ class ComposerRunner:
     def _assess_scientific_software(self, stage, descriptor, topic_result, *, computation_scope=None):
         """Admit software fitness and executed upstream computations before authoring."""
         from scisaurus.runtime.software_workbench import REVISION, SoftwareWorkbench, selection_contract
+        from scisaurus.runtime.software_discovery import accepted_survey_sources, retain_sources
+        by_id = {item["id"]:item for item in self.workflow["stages"]}
+        pending, dependencies = list(stage.get("depends_on",[])), set()
+        while pending:
+            dependency = pending.pop()
+            if dependency in dependencies:
+                continue
+            dependencies.add(dependency)
+            pending.extend(by_id[dependency].get("depends_on",[]))
+        source_bundles = [accepted_survey_sources(by_id[name]["project_dir"]) for name in sorted(dependencies)
+                          if by_id[name]["kind"] == "survey"]
+        evidence_catalog = retain_sources(self.root/"scientific-software",
+            [source for bundle in source_bundles for source in bundle["sources"]])
         topic = deepcopy(topic_result["topic"])
         topic.pop("experiment_capability_id", None)
         identity = {"revision": REVISION, "topic": topic,
                     "prior_work": deepcopy(topic_result.get("candidate_prior_work", [])),
                     "source_challenge": deepcopy(topic_result.get("source_challenge")),
+                    "evidence_catalog": evidence_catalog,
+                    "evidence_availability": [{key:value for key,value in bundle.items() if key != "sources"} for bundle in source_bundles],
                     "computation_scope": deepcopy(computation_scope or {})}
         digest = hashlib.sha256(canonical_bytes(identity)).hexdigest()
         logical = f"command/scientific-software-assessments/{digest}"
@@ -13095,6 +13110,8 @@ class ComposerRunner:
         collect(identity["computation_scope"])
         collect(self.context)
         request["source_ref_catalog"] = sorted(set(request["source_ref_catalog"]))
+        request["source_ref_catalog"] = sorted(set([*request["source_ref_catalog"],
+                                                    *[row["source_ref"] for row in evidence_catalog]]))
         request_record = self._publish(logical + "/request", "note", request, "command.composer")
         panel_id = self._capability_repair_panel_stage_id(stage["id"], digest, self.continuation_cycles, 1, purpose="software")
         attempt = self._next_capability_repair_assignment_attempt(panel_id)

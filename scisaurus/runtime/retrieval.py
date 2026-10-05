@@ -83,7 +83,7 @@ def _bounded_http_body(response, *, byte_limit, deadline, body=None):
     return bytes(body), True
 
 
-def _robots_policy(url, *, deadline, cache):
+def _robots_policy(url, *, deadline, cache, http_open=None):
     """Fetch and apply one origin's robots rules; uncertain policies fail closed."""
     parsed = urlsplit(url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
@@ -112,7 +112,7 @@ def _robots_policy(url, *, deadline, cache):
                       "status": None, "reason": "Robots policy request exceeded its deadline"}
             break
         try:
-            response = _open_http(Request(current_url, headers={"User-Agent": PDF_USER_AGENT}),
+            response = (http_open or _open_http)(Request(current_url, headers={"User-Agent": PDF_USER_AGENT}),
                                   timeout=remaining)
         except (OSError, URLError, HTTPException, IncompleteRead, TimeoutError) as exc:
             policy = {"outcome": "robots_unavailable", "robots_url": initial_url,
@@ -167,7 +167,7 @@ def _robots_policy(url, *, deadline, cache):
                           "status": status, "bytes": len(body),
                           "sha256": hashlib.sha256(body).hexdigest(), "redirects": redirects}
                 if not allowed:
-                    policy["reason"] = "Robots policy disallows this PDF URL"
+                    policy["reason"] = "Robots policy disallows this source URL"
                 break
             if status in {404, 410}:
                 policy = {"outcome": "allowed", "robots_url": initial_url,
