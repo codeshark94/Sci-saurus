@@ -497,7 +497,7 @@ class CapabilityModelBudgetExceeded(ModelWorkBlocked):
 
 
 class ScientificDefinitionError(ModelDefinitionError):
-    """An admitted model must be defined before implementing its experiment."""
+    """An approved scientific specification must be adjudicated before changing it."""
 
 class IndependentValidatorContractError(ModelWorkBlocked):
     """Validator authoring must resume without changing the producer candidate."""
@@ -2827,6 +2827,22 @@ class CapabilityFoundry:
                 "candidate_sha256": current_candidate_sha256,
                 "candidate_failure": _retained_candidate_failure(state, retained_candidate),
             })
+            repair_ledger = state.get("repair_ledger")
+            current_repair = repair_ledger[-1] if isinstance(repair_ledger, list) and repair_ledger else None
+            candidate_fingerprints = {current_candidate_sha256}
+            if isinstance(retained_candidate, dict):
+                candidate_fingerprints.add(hashlib.sha256(canonical_bytes(retained_candidate)).hexdigest())
+            if (isinstance(current_repair, dict)
+                    and isinstance(failure_gate, str) and failure_gate.strip()
+                    and current_repair.get("candidate_sha256") in candidate_fingerprints - {None}
+                    and current_repair.get("gate") == failure_gate == error.repair_gate
+                    and current_repair.get("attempt") == state.get("attempts")):
+                owner = current_repair.get("repair_owner")
+                action = current_repair.get("next_action")
+                if isinstance(owner, str) and owner.strip() and isinstance(action, str) and action.strip():
+                    error.repair_owner = owner
+                    error.next_action = action
+                    error.repair_feedback.update(repair_owner=owner, next_action=action)
             if work_cache is not None:
                 retained_work = work_cache.get(key)
                 if retained_work is not None:
@@ -4682,13 +4698,10 @@ class CapabilityFoundry:
                             "required": deepcopy_config(required_intent["stage_seconds"]),
                             "received": received_stage_seconds,
                         })
-                    if not isinstance(intent, dict) or any(
-                            intent.get(key) != value for key, value in required_intent.items()):
-                        differences = {key: {"required": value, "received": intent.get(key) if isinstance(intent, dict) else None}
-                                       for key, value in required_intent.items()
-                                       if not isinstance(intent, dict) or intent.get(key) != value}
-                        raise ValidationError(
-                            "program author changed a required scientific intent field: " + json.dumps(differences))
+                    missing = sorted(set(required_intent) - set(intent)) if isinstance(intent, dict) else sorted(required_intent)
+                    if missing:
+                        raise ExperimentIntentContractError(
+                            "program author omitted required scientific intent fields: " + json.dumps(missing))
                 attempt_value, identifier_repairs = normalize_capability_candidate(attempt_value)
                 if identifier_repairs:
                     state.setdefault("normalizations", []).append({
@@ -4698,6 +4711,14 @@ class CapabilityFoundry:
                     })
                 executor = attempt_value["executor_source"]
                 validate_experiment_intent(attempt_value["experiment_intent"])
+                if required_intent:
+                    intent = attempt_value["experiment_intent"]
+                    differences = {key: {"required": value, "received": intent[key]}
+                                   for key, value in required_intent.items()
+                                   if intent[key] != value}
+                    if differences:
+                        raise ScientificDefinitionError(
+                            "program author changed a required scientific intent field: " + json.dumps(differences))
                 scan_program_source(executor, "program executor")
                 candidate_fingerprint = hashlib.sha256(canonical_bytes(attempt_value)).hexdigest()
                 failed_candidates = state.setdefault("failed_candidates", {})
@@ -4805,6 +4826,7 @@ class CapabilityFoundry:
                     state.setdefault("repair_ledger", []).append({
                         "attempt": state.get("attempts"), "gate": exc.repair_gate,
                         "candidate_sha256": fingerprint, "error": str(exc),
+                        "repair_owner": exc.repair_owner,
                         "next_action": exc.next_action,
                     })
                     save("model_definition_adjudication_required")
@@ -4822,6 +4844,7 @@ class CapabilityFoundry:
                 state.setdefault("repair_ledger", []).append({
                     "attempt": state.get("attempts"), "gate": gate,
                     "candidate_sha256": state["candidate_failure_sha256"], "error": str(exc),
+                    "repair_owner": state["repair_owner"],
                     "next_action": "format_repair_then_rerun"})
                 save("owned_response_repair_deferred")
                 receipt = repair_exhausted_error()
@@ -4960,9 +4983,10 @@ class CapabilityFoundry:
                 state.setdefault("repair_ledger", []).append({
                     "attempt": attempt + 1,
                     "gate": gate,
-                    "candidate_sha256": candidate_fingerprint,
+                    "candidate_sha256": _authored_candidate_sha256(last_attempt),
                     "error": feedback[:4000],
                     "failure_signature": failure_signature,
+                    "repair_owner": "methods_adjudication" if needs_adjudication else None,
                     "validation_context": deepcopy_config(state.get("validation_context", {})),
                     "validation_feedback": deepcopy_config(state.get("validation_feedback", {})),
                     "next_action": ("methods_adjudication_before_source_repair" if needs_adjudication

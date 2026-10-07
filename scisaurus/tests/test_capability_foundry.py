@@ -3427,6 +3427,106 @@ class CapabilityFoundryTests(unittest.TestCase):
                         "research_question": INTENT["research_question"]},
                     client=StubClient(payload))
 
+    def test_required_scientific_intent_change_goes_to_methods_without_source_retries(self):
+        payload = self._payload()
+        required = {"limitations": deepcopy(payload["experiment_intent"]["limitations"])}
+        payload["experiment_intent"]["limitations"] = ["A different scientific claim scope."]
+        progress = []
+        author = StubClient(payload)
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            foundry = self._foundry(root)
+            cache = self._cache(root)
+            foundry.max_attempts = 6
+            for _ in range(2):
+                with self.assertRaises(ModelWorkBlocked) as caught:
+                    foundry.generate("bounded question", required_intent=required, client=author,
+                        work_cache=cache,
+                        on_progress=lambda phase, state: progress.append((phase, deepcopy(state))))
+                self.assertEqual(caught.exception.repair_owner, "methods_adjudication")
+                self.assertEqual(caught.exception.next_action, "methods_adjudication_before_source_repair")
+                self.assertEqual(caught.exception.repair_feedback["repair_owner"], caught.exception.repair_owner)
+                self.assertEqual(caught.exception.repair_feedback["next_action"], caught.exception.next_action)
+            self.assertEqual(author.calls, 1)
+            self.assertEqual(foundry.validator_client.calls, 0)
+            self.assertEqual(foundry.reviewer_client.calls, 0)
+            self.assertEqual(caught.exception.failure_class, "experiment_capability_repair")
+            self.assertEqual(caught.exception.repair_gate, "model_definition")
+            self.assertEqual(caught.exception.repair_owner, "methods_adjudication")
+            phase, state = progress[-1]
+            self.assertEqual(phase, "model_definition_adjudication_required")
+            self.assertEqual(state["last_attempt"]["experiment_intent"], payload["experiment_intent"])
+            self.assertEqual(state["assignment"]["required_intent_fields"], required)
+            self.assertIn("limitations", state["validation_feedback"]["findings"][0]["finding"])
+            self.assertEqual(state["repair_ledger"][-1]["next_action"], caught.exception.next_action)
+
+    def test_cached_intent_handoff_rejects_unbound_repair_ownership(self):
+        for field, invalid in (("candidate_sha256", "a" * 64), ("gate", "scientific_review"),
+                               ("attempt", 0), ("repair_owner", None)):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as path:
+                root = Path(path)
+                payload = self._payload()
+                required = {"limitations": deepcopy(payload["experiment_intent"]["limitations"])}
+                payload["experiment_intent"]["limitations"] = ["A different claim scope."]
+                author = StubClient(payload)
+                foundry = self._foundry(root)
+                cache = self._cache(root)
+                with self.assertRaises(ModelWorkBlocked):
+                    foundry.generate("bounded question", required_intent=required, client=author, work_cache=cache)
+                entry = cache.entries()[0]
+                if field == "repair_owner":
+                    entry["repair_ledger"][-1].pop(field)
+                    entry["repair_owner"] = "review.methods"
+                else:
+                    entry["repair_ledger"][-1][field] = invalid
+                key = entry["cache_ref"].rsplit("/", 1)[-1].split("@")[0]
+                cache.put(key, entry)
+                with self.assertRaises(ModelWorkBlocked) as caught:
+                    foundry.generate("bounded question", required_intent=required, client=author, work_cache=cache)
+                self.assertNotIn("repair_owner", caught.exception.repair_feedback)
+                self.assertNotIn("next_action", caught.exception.repair_feedback)
+                self.assertEqual(author.calls, 1)
+
+    def test_malformed_required_intent_field_is_not_a_scientific_change(self):
+        for invalid in (None, "not a limitations array", [None]):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as path:
+                payload = self._payload()
+                required = {"limitations": deepcopy(payload["experiment_intent"]["limitations"])}
+                payload["experiment_intent"]["limitations"] = invalid
+                progress = []
+                foundry = self._foundry(Path(path))
+                foundry.max_attempts = 1
+                with self.assertRaises(ModelWorkBlocked) as caught:
+                    foundry.generate("bounded question", required_intent=required, client=StubClient(payload),
+                        on_progress=lambda phase, state: progress.append((phase, deepcopy(state))))
+                self.assertEqual(caught.exception.failure_class, "model_contract")
+                self.assertNotEqual(caught.exception.repair_gate, "model_definition")
+                self.assertFalse(any(phase == "model_definition_adjudication_required" for phase, _ in progress))
+                self.assertEqual(foundry.validator_client.calls, 0)
+
+    def test_missing_required_intent_field_is_a_contract_repair(self):
+        payload = self._payload()
+        required = {"limitations": deepcopy(payload["experiment_intent"]["limitations"])}
+        payload["experiment_intent"].pop("limitations")
+        test = self
+        class Author:
+            calls = 0
+            def complete(self, *, system, prompt):
+                self.calls += 1
+                if self.calls == 1:
+                    value = payload
+                else:
+                    request = json.loads(prompt)
+                    test.assertIn("omitted required scientific intent fields", request["repair_request"]["previous_error"])
+                    value = {"updates": {"experiment_intent": required}}
+                return ModelResult(json.dumps(value), "author", {"model_calls": 1}, 0, "stop")
+        with tempfile.TemporaryDirectory() as path:
+            author = Author()
+            outcome = self._foundry(Path(path)).generate("bounded question", required_intent=required, client=author)
+            self.assertEqual(author.calls, 2)
+            self.assertEqual(outcome["status"], "registered")
+            self.assertEqual(outcome["candidate"]["experiment_intent"]["limitations"], required["limitations"])
+
     def test_required_revision_is_controller_owned_and_normalized(self):
         payload = self._payload()
         payload["experiment_intent"]["revision"] = INTENT["revision"] + 1
@@ -4925,6 +5025,9 @@ class RecalculationOwnershipTests(unittest.TestCase):
                                      on_progress=lambda phase, state: states.append(state))
                 self.assertEqual(raised.exception.failure_class, 'experiment_capability_repair')
                 self.assertEqual(raised.exception.repair_gate, 'independent_recalculation')
+                self.assertEqual(raised.exception.repair_owner, 'methods_adjudication')
+                self.assertEqual(raised.exception.next_action, 'methods_adjudication_before_source_repair')
+                self.assertEqual(raised.exception.repair_feedback['repair_owner'], 'methods_adjudication')
             self.assertEqual(producer.calls, 1)
             self.assertEqual(foundry.validator_client.calls, 1)
             self.assertEqual(foundry.reviewer_client.calls, 0)
