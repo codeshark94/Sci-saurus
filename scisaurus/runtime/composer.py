@@ -3205,7 +3205,8 @@ class ComposerRunner:
             and request.get("owner") == "methods.validation"
         )
 
-    def _unresolved_experiment_attempt_inventory(self, stage, context, *, include_paths=False):
+    def _unresolved_experiment_attempt_inventory(self, stage, context, *, include_paths=False,
+                                               selected_topic=None):
         """Merge the scoped checkpoint ledger with any carried recovery summary.
 
         Recovery directives are durable snapshots and can predate later
@@ -3214,10 +3215,13 @@ class ComposerRunner:
         equivalent execution.
         """
         context = context if isinstance(context, dict) else {}
-        current_topic = self._current_topic_identity()
-        current_topic_id = (
-            current_topic.get("topic_id") if isinstance(current_topic, dict) else None
-        )
+        if isinstance(selected_topic, dict):
+            current_topic_id = selected_topic.get("id")
+        else:
+            current_topic = self._current_topic_identity()
+            current_topic_id = (
+                current_topic.get("topic_id") if isinstance(current_topic, dict) else None
+            )
         inventory = {}
 
         def include(value, *, checkpoint=False):
@@ -10328,6 +10332,25 @@ class ComposerRunner:
             **failed,
         }
 
+    def _experiment_stage_root(self, stage):
+        """Resolve attempt containment from the declared workflow, before I/O."""
+        declarations = [item for item in self.workflow.get("stages", [])
+                        if isinstance(item, dict) and item.get("id") == stage.get("id")
+                        and item.get("kind") == "experiment"]
+        if len(declarations) != 1:
+            raise ValueError("experiment stage has no unique workflow declaration")
+        root = Path(declarations[0]["project_dir"]).resolve()
+        current = Path(stage["project_dir"]).resolve()
+        parts = current.relative_to(root).parts
+        if parts and parts[0] == "continuations":
+            if len(parts) < 2 or re.fullmatch(r"cycle-[1-9][0-9]*", parts[1]) is None:
+                raise ValueError("experiment continuation namespace is invalid")
+            parts = parts[2:]
+        if parts and (len(parts) != 2 or parts[0] != "attempts"
+                      or re.fullmatch(r"attempt-[1-9][0-9]*", parts[1]) is None):
+            raise ValueError("experiment attempt namespace is invalid")
+        return root
+
     def _prior_attempt_result_evidence(self, stage, prior_context, *, selected_topic=None):
         """Resolve a rejected experiment result only inside its own attempt namespace."""
         unavailable = {
@@ -10346,18 +10369,7 @@ class ComposerRunner:
                 or not isinstance(project_dir, str)):
             return {**unavailable, "reason": "prior_attempt_identity_incomplete"}
         try:
-            stage_root = Path(stage["project_dir"]).resolve()
-            if (stage_root.name.startswith("attempt-")
-                    and stage_root.parent.name == "attempts"):
-                # Stage runners receive an attempt-scoped descriptor. Prior
-                # evidence lives beside that attempt, under the stable stage
-                # project root, so using the current attempt directory as the
-                # containment root incorrectly hides every prior result.
-                stage_root = next((parent for parent in stage_root.parents
-                                   if (parent / "continuations").is_dir()), None)
-                if stage_root is None:
-                    return {**unavailable,
-                            "reason": "prior_attempt_stage_root_unresolvable"}
+            stage_root = self._experiment_stage_root(stage)
             attempt_root = Path(project_dir).resolve()
             attempt_root.relative_to(stage_root)
             if (attempt_root == stage_root
@@ -10790,12 +10802,7 @@ class ComposerRunner:
         )
         summary["attempt_count"] = len(unresolved)
         try:
-            stage_root = Path(stage["project_dir"]).resolve()
-            if stage_root.name.startswith("attempt-") and stage_root.parent.name == "attempts":
-                stage_root = next((parent for parent in stage_root.parents
-                                   if (parent / "continuations").is_dir()), None)
-            if stage_root is None:
-                raise ValueError("experiment stage root is unavailable")
+            stage_root = self._experiment_stage_root(stage)
         except (KeyError, OSError, RuntimeError, TypeError, ValueError):
             summary["evidence_status"] = "stage_root_unavailable"
             return summary
@@ -11271,12 +11278,7 @@ class ComposerRunner:
         current_topic_id = (selected_topic.get("id")
                             if isinstance(selected_topic, dict) else None)
         try:
-            stage_root = Path(stage["project_dir"]).resolve()
-            if stage_root.name.startswith("attempt-") and stage_root.parent.name == "attempts":
-                stage_root = next((parent for parent in stage_root.parents
-                                   if (parent / "continuations").is_dir()), None)
-            if stage_root is None:
-                raise ValueError("experiment stage root is unavailable")
+            stage_root = self._experiment_stage_root(stage)
         except (KeyError, OSError, RuntimeError, TypeError, ValueError):
             return {"available_attempts": 0, "same_measurement_repeated": False,
                     "measurements": [], "related_results": [],
@@ -11463,7 +11465,8 @@ class ComposerRunner:
         prior_attempt_history = self._prior_attempt_result_history(
             stage, selected_topic=selected)
         unresolved_attempt_evidence = self._unresolved_prior_attempt_evidence(
-            stage, prior_context.get("unresolved_prior_attempts"),
+            stage, self._unresolved_experiment_attempt_inventory(
+                stage, prior_context, include_paths=True, selected_topic=selected),
             selected_topic=selected)
         unresolved_attempt_sources = unresolved_attempt_evidence.pop(
             "generated_sources", [])

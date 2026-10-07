@@ -3611,6 +3611,87 @@ class ComposerWorkflowTests(unittest.TestCase):
         }
         return topic, prior_context, package_path
 
+    def test_experiment_stage_root_does_not_require_materialized_attempts(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            try:
+                stage = deepcopy(runner.workflow["stages"][1])
+                root = Path(stage["project_dir"])
+                unresolved = [{"attempt_id": "old-attempt", "attempt_number": 29,
+                               "cycle": 26, "state": "unknown",
+                               "project_dir": str(root / "continuations" / "cycle-26"
+                                                  / "attempts" / "attempt-29")}]
+                runner.stage_records["experiment"] = {"attempts": unresolved}
+                stage["project_dir"] = str(root / "continuations" / "cycle-58"
+                                           / "attempts" / "attempt-70")
+                self.assertFalse((root / "continuations").exists())
+                self.assertEqual(runner._experiment_stage_root(stage), root)
+                packet = runner._build_capability_repair_packet(
+                    stage, {"topic": {"id": "topic-a", "domain": "physics",
+                                     "research_question": "Does the contrast change?"}},
+                    {"unresolved_prior_attempts": []}, ValidationError("missing definition"))
+                evidence = packet["unresolved_attempt_evidence"]
+                self.assertEqual(evidence["attempt_count"], 1)
+                self.assertEqual(evidence["missing_directory_count"], 1)
+                self.assertEqual(evidence["records"]["cycle-26-attempt-29"]["classification"],
+                                 "attempt_directory_missing")
+                self.assertFalse(evidence["records"]["cycle-26-attempt-29"]["admissible_as_verified_claims"])
+                self.assertEqual(runner.stage_records["experiment"]["attempts"][0]["state"], "unknown")
+                self.assertFalse((root / "continuations").exists())
+            finally:
+                runner.close()
+
+    def test_experiment_stage_root_rejects_foreign_and_ambiguous_namespaces(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            try:
+                stage = deepcopy(runner.workflow["stages"][1])
+                root = Path(stage["project_dir"])
+                for suffix in ("attempts/attempt-2", "continuations/cycle-2",
+                               "continuations/cycle-2/attempts/attempt-3"):
+                    self.assertEqual(runner._experiment_stage_root(
+                        {**stage, "project_dir": str(root / suffix)}), root)
+                for suffix in ("other/attempts/attempt-3", "continuations/cycle-0",
+                               "continuations/cycle-2/other", "attempts/attempt-x"):
+                    with self.subTest(suffix=suffix), self.assertRaises(ValueError):
+                        runner._experiment_stage_root({**stage, "project_dir": str(root / suffix)})
+                with self.assertRaises(ValueError):
+                    runner._experiment_stage_root({**stage, "project_dir": str(root.parent / "foreign")})
+                link = root / "attempts"
+                link.symlink_to(root.parent / "survey", target_is_directory=True)
+                with self.assertRaises(ValueError):
+                    runner._experiment_stage_root({**stage, "project_dir": str(link / "attempt-3")})
+                with self.assertRaises(ValueError):
+                    runner._experiment_stage_root({**stage, "id": "unknown"})
+                runner.workflow["stages"].append(deepcopy(stage))
+                with self.assertRaises(ValueError):
+                    runner._experiment_stage_root(stage)
+            finally:
+                runner.close()
+
+    def test_repair_packet_attempt_inventory_uses_selected_topic(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            try:
+                stage = runner.workflow["stages"][1]
+                root = Path(stage["project_dir"])
+                runner.stage_records["experiment"] = {"attempts": [
+                    {"attempt_number": number, "cycle": number, "state": "unknown",
+                     "topic_id": topic_id, "project_dir": str(root / "continuations"
+                        / f"cycle-{number}" / "attempts" / f"attempt-{number}")}
+                    for number, topic_id in [(2, "topic-a"), (3, "topic-b")]]}
+                with patch.object(runner, "_current_topic_identity",
+                                  return_value={"topic_id": "topic-a"}):
+                    packet = runner._build_capability_repair_packet(
+                        stage, {"topic": {"id": "topic-b", "domain": "physics",
+                                         "research_question": "Does the contrast change?"}},
+                        {"unresolved_prior_attempts": []}, ValidationError("missing definition"))
+                evidence = packet["unresolved_attempt_evidence"]
+                self.assertEqual(evidence["attempt_count"], 1)
+                self.assertEqual(list(evidence["records"]), ["cycle-3-attempt-3"])
+            finally:
+                runner.close()
+
     def test_capability_repair_packet_binds_rejected_prior_result_and_raw_data(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
