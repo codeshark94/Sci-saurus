@@ -95,6 +95,9 @@ class StudyEvidenceTests(unittest.TestCase):
         frozen, errors = format_recovery_intent_constraints(missing, {}, configured_input={}, evidence_required=True)
         self.assertNotIn("evidence_plan", frozen)
         self.assertIn("requires", errors["evidence_plan"])
+        with self.assertRaisesRegex(ValidationError, "requires"):
+            format_recovery_intent_constraints(missing, {"evidence_plan": None},
+                                              configured_input={}, evidence_required=True)
         with self.assertRaisesRegex(ValidationError, "configured_input"):
             format_recovery_intent_constraints(valid, {}, configured_input=None)
 

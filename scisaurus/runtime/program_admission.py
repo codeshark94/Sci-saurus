@@ -352,7 +352,9 @@ def format_recovery_intent_constraints(intent, required, *, configured_input, ev
     # Invalid controller declarations cannot be repaired by releasing their constraints.
     constraints.update(deepcopy(required))
     validate_experiment_intent(constraints)
-    validate_evidence_plan(constraints, source_refs=source_refs)
+    validate_evidence_plan(constraints,
+                          required=evidence_required and "evidence_plan" in required,
+                          source_refs=source_refs)
     return constraints, diagnostics
 
 
