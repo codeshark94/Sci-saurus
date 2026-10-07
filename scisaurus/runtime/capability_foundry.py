@@ -721,12 +721,15 @@ def _sum_model_usage(*values):
     return totals
 
 
-def _author_request_signature(model, max_output_tokens, prompt):
-    return hashlib.sha256(canonical_bytes({
+def _author_request_signature(model, max_output_tokens, prompt, reasoning_effort=None):
+    request = {
         "model": model,
         "max_output_tokens": max_output_tokens,
         "prompt": prompt,
-    })).hexdigest()
+    }
+    if reasoning_effort is not None:
+        request["reasoning_effort"] = reasoning_effort
+    return hashlib.sha256(canonical_bytes(request)).hexdigest()
 
 
 def _model_route_identity(model):
@@ -755,7 +758,7 @@ def _author_request_signature_from_record(request):
     if (not isinstance(model, str) or not isinstance(prompt, str)
             or type(output_tokens) is not int):
         return None
-    return _author_request_signature(model, output_tokens, prompt)
+    return _author_request_signature(model, output_tokens, prompt, request.get("reasoning_effort"))
 
 
 def _author_request_signatures(state):
@@ -2400,7 +2403,8 @@ class CapabilityFoundry:
         author_route_configs = []
         if client is None:
             author_route_configs = self._format_model_routes(author_role, self.author_max_output_tokens)
-            client = ModelClient(**author_route_configs[0])
+            client = ModelClient(**_artifact_generation_config(author_route_configs[0]))
+        author_baseline_effort = getattr(client, "reasoning_effort", None)
         runtime = self._runtime()
         base_prompt = candidate_prompt(brief, self.runtime_packages, configured_input,
             required_intent=required_intent, runtime_version=runtime["python"])
@@ -2502,10 +2506,38 @@ class CapabilityFoundry:
                             prior_continuation.get("status")
                             if isinstance(prior_continuation, dict) else None
                         )
+                        response_metadata = response.get("response_metadata") if isinstance(response, dict) else None
+                        response_text = response.get("text") if isinstance(response, dict) else None
+                        response_digest = hashlib.sha256(response_text.encode()).hexdigest() if isinstance(response_text, str) else None
+                        owned_empty_response = (
+                            resume_work_ref is not None
+                            and isinstance(response_text, str) and not response_text.strip()
+                            and response.get("finish_reason") == "length"
+                            and prior.get("status") == "blocked"
+                            and prior.get("last_failure_class") == "model_contract"
+                            and prior.get("last_failure_gate") == "author_response_format"
+                            and not isinstance(prior.get("last_attempt"), dict)
+                            and isinstance(response_metadata, dict)
+                            and last_request.get("response_sha256") == response_digest
+                            and last_request.get("response_metadata") == response_metadata
+                            and last_request.get("reasoning_effort", response_metadata.get("reasoning_effort"))
+                                == response_metadata.get("reasoning_effort")
+                            and last_request.get("finish_reason") == response.get("finish_reason")
+                            and last_request.get("usage") == response.get("usage")
+                            and last_request.get("elapsed_seconds") == response.get("elapsed_seconds")
+                        )
+                        empty_profile_recovery = (owned_empty_response
+                            and response_metadata.get("reasoning_effort") in {"low", "medium", "high", "xhigh"}
+                            and prior.get("author_generation_recovery") is None)
+                        retained_empty_recovery = (owned_empty_response
+                            and response_metadata.get("reasoning_effort") == "none"
+                            and isinstance(prior.get("author_generation_recovery"), dict)
+                            and prior["author_generation_recovery"].get("assignment_sha256")
+                                == hashlib.sha256(canonical_bytes(base_prompt)).hexdigest())
                         if (
                                 isinstance(response, dict)
                                 and isinstance(response.get("text"), str)
-                                and response["text"]
+                                and (response["text"] or empty_profile_recovery or retained_empty_recovery)
                                 and (response.get("finish_reason") == "length"
                                      or (response.get("finish_reason") == "stop"
                                          and (prior.get("status") == "response_received"
@@ -2532,6 +2564,16 @@ class CapabilityFoundry:
                                 "source_request_count": len(prior.get("requests", [])),
                             }
                             resumable_response.pop("cache_ref", None)
+                            if empty_profile_recovery:
+                                offset = prior["attempts"]
+                                resumable_response["author_generation_recovery"] = {
+                                    "reasoning_effort": "none", "attempt_offset": offset,
+                                    "attempt_limit": offset + self.max_attempts + max(
+                                        0, len(author_route_configs) - 1 - prior_route_index),
+                                    "source_ref": prior["cache_ref"],
+                                    "response_sha256": response_digest,
+                                    "assignment_sha256": hashlib.sha256(canonical_bytes(base_prompt)).hexdigest(),
+                                }
                             break
 
                     seed = reusable_prior_candidate(prior)
@@ -2549,7 +2591,8 @@ class CapabilityFoundry:
                     # route; the current continuation, sandbox, and admission
                     # gates still decide whether any program is usable.
                     state = resumable_response
-                    state.update(status="response_received", assignment=base_prompt)
+                    state.update(status="blocked" if retained_empty_recovery else
+                                 "repairing" if empty_profile_recovery else "response_received", assignment=base_prompt)
                     if not isinstance(state.get("author_request_signatures"), list):
                         state["author_request_signatures"] = []
                 elif reusable_prior:
@@ -2668,7 +2711,12 @@ class CapabilityFoundry:
             author_route_index = min(author_route_index, len(author_route_configs) - 1)
             state["author_route_index"] = author_route_index
             if author_route_index:
-                client = ModelClient(**author_route_configs[author_route_index])
+                client = ModelClient(**_artifact_generation_config(author_route_configs[author_route_index]))
+
+        def author_generation_profile(*, repair=False, empty_output=False):
+            baseline = (author_route_configs[author_route_index] if author_route_configs else
+                        {"reasoning_effort": author_baseline_effort})
+            return _artifact_generation_config(baseline, repair=repair, empty_output=empty_output)
 
         def save(phase):
             try:
@@ -2857,7 +2905,7 @@ class CapabilityFoundry:
             if not author_route_configs or author_route_index + 1 >= len(author_route_configs):
                 return False
             author_route_index += 1
-            client = ModelClient(**author_route_configs[author_route_index])
+            client = ModelClient(**_artifact_generation_config(author_route_configs[author_route_index]))
             state["author_route_index"] = author_route_index
             state.setdefault("route_events", []).append({
                 "from": author_route_configs[author_route_index - 1].get("model"),
@@ -3187,8 +3235,10 @@ class CapabilityFoundry:
                     client, "max_output_tokens", self.author_max_output_tokens)
                 continuation_output_limit = min(
                     int(current_output_limit), AUTHOR_CONTINUATION_MAX_OUTPUT_TOKENS)
+                original_reasoning_effort = getattr(client, "reasoning_effort", None)
+                continuation_effort = author_generation_profile(repair=True).get("reasoning_effort")
                 request_signature = _author_request_signature(
-                    route_model, continuation_output_limit, prompt)
+                    route_model, continuation_output_limit, prompt, continuation_effort)
                 if _author_request_was_attempted(state, request_signature):
                     continuation.update(status="failed", error=(
                         "refusing to replay an identical author-response continuation"))
@@ -3229,6 +3279,8 @@ class CapabilityFoundry:
                     "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
                     "request_signature": request_signature,
                     "max_output_tokens": continuation_output_limit,
+                    "reasoning_effort": continuation_effort,
+                    "model": route_model,
                     "status": "started",
                     "usage": {"model_calls": 1},
                 }
@@ -3243,6 +3295,8 @@ class CapabilityFoundry:
                     client.max_output_tokens = continuation_output_limit
                 if hasattr(client, "output_format"):
                     client.output_format = None
+                if hasattr(client, "reasoning_effort"):
+                    client.reasoning_effort = continuation_effort
                 if continuation_timeout is not None:
                     client.timeout_seconds = continuation_timeout
                 try:
@@ -3280,6 +3334,8 @@ class CapabilityFoundry:
                         client.timeout_seconds = original_timeout
                     if hasattr(client, "output_format"):
                         client.output_format = original_output_format
+                    if hasattr(client, "reasoning_effort"):
+                        client.reasoning_effort = original_reasoning_effort
                 record_result(request, segment)
                 request_attempts += segment.request_attempts
                 elapsed += segment.elapsed_seconds
@@ -4337,6 +4393,14 @@ class CapabilityFoundry:
         author_attempt_limit = state.get("repair_subject_attempt_limit")
         if type(author_attempt_limit) is not int or author_attempt_limit < subject_offset:
             author_attempt_limit = subject_offset + self.max_attempts + max(0, len(author_route_configs) - 1)
+        generation_recovery = state.get("author_generation_recovery")
+        if isinstance(generation_recovery, dict) and not state.get("repair_subject_sha256"):
+            offset, limit = generation_recovery.get("attempt_offset"), generation_recovery.get("attempt_limit")
+            if (type(offset) is not int or type(limit) is not int or not 0 <= offset <= state["attempts"]
+                    or limit < offset or generation_recovery.get("assignment_sha256")
+                    != hashlib.sha256(canonical_bytes(base_prompt)).hexdigest()):
+                raise ValidationError("author generation recovery has inconsistent assignment or attempt bounds")
+            author_attempt_limit = limit
         if state.get("repair_subject_sha256"):
             state["repair_subject_attempt_limit"] = author_attempt_limit
             save("author_repair_subject_retained")
@@ -4445,6 +4509,13 @@ class CapabilityFoundry:
             if buffered is not None:
                 result, buffered = buffered, None
             else:
+                if hasattr(client, "reasoning_effort"):
+                    prior_response = state.get("last_response") or {}
+                    profile = author_generation_profile(
+                        repair=bool(format_repair) or isinstance(last_attempt, dict),
+                        empty_output=prior_response.get("finish_reason") == "length"
+                        and not (prior_response.get("text") or "").strip())
+                    client.reasoning_effort = profile["reasoning_effort"]
                 if (isinstance(last_attempt, dict)
                         and PRODUCER_FIELDS.issubset(last_attempt)
                         and type(getattr(client, "max_output_tokens", None)) is int):
@@ -4470,7 +4541,7 @@ class CapabilityFoundry:
                 )
                 output_tokens = getattr(client, "max_output_tokens", None)
                 request_signature = _author_request_signature(
-                    route_model, output_tokens, prompt)
+                    route_model, output_tokens, prompt, getattr(client, "reasoning_effort", None))
                 if _author_request_was_attempted(state, request_signature):
                     error = (
                         "refusing to resend an unchanged experiment-author prompt to the same "
@@ -4481,8 +4552,10 @@ class CapabilityFoundry:
                 state.setdefault("author_request_signatures", []).append(request_signature)
                 state["attempts"] = attempt + 1
                 request = {"attempt": attempt + 1, "role": "research.experiment-author", "status": "started", "prompt": prompt,
+                           "model": route_model,
                            "request_signature": request_signature,
                            "max_output_tokens": getattr(client, "max_output_tokens", None),
+                           "reasoning_effort": getattr(client, "reasoning_effort", None),
                            "usage": {"model_calls": 1}}
                 state["requests"].append(request)
                 state["usage"]["model_calls"] = state["usage"].get("model_calls", 0) + 1

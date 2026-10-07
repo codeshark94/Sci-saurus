@@ -199,6 +199,80 @@ class RunPermissionTests(unittest.TestCase):
 
 
 class ProgramArtifactTests(unittest.TestCase):
+    def test_primary_author_profiles_follow_failure_without_changing_input(self):
+        from scisaurus.tests.test_capability_foundry import CapabilityFoundryTests, StubClient
+        from scisaurus.runtime.models import ModelResult
+        for first_text, finish, expected in (("", "length", "none"), ("invalid JSON", "stop", "low")):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as path:
+                root = Path(path); foundry = CapabilityFoundryTests._foundry(root)
+                cache = CapabilityFoundryTests._cache(self, root)
+                class Author(StubClient):
+                    reasoning_effort = 'high'
+                    model = 'stub'
+                    max_output_tokens = 32768
+                    def complete(inner, **kwargs):
+                        efforts.append(inner.reasoning_effort)
+                        prompts.append(json.loads(kwargs['prompt']))
+                        if len(efforts) == 1:
+                            inner.calls += 1
+                            return ModelResult(first_text, 'stub', {'model_calls': 1}, 0, finish)
+                        return super().complete(**kwargs)
+                efforts, prompts = [], []
+                outcome = foundry.generate('bounded comparison', client=Author(CapabilityFoundryTests._payload()), work_cache=cache)
+                self.assertEqual(efforts, ['medium', expected])
+                self.assertEqual(outcome['status'], 'registered')
+                self.assertEqual(prompts[0]['configured_input'], prompts[1]['configured_input'])
+                self.assertEqual(prompts[0].get('required_intent_fields'), prompts[1].get('required_intent_fields'))
+                requests = cache.entries()[0]['requests']
+                primary = [r for r in requests if r.get('role') == 'research.experiment-author']
+                self.assertEqual([r['reasoning_effort'] for r in primary], efforts)
+
+    def test_empty_author_profile_recovery_preserves_cumulative_receipts_and_bounds(self, response_text=''):
+        from scisaurus.tests.test_capability_foundry import CapabilityFoundryTests, StubClient
+        from scisaurus.runtime.models import ModelResult
+        from scisaurus.runtime.model_work import ModelWorkBlocked
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path); foundry = CapabilityFoundryTests._foundry(root); foundry.max_attempts = 1
+            cache = CapabilityFoundryTests._cache(self, root)
+            class EmptyAuthor(StubClient):
+                reasoning_effort = 'high'; model = 'stub'; max_output_tokens = 32768
+                def complete(inner, **kwargs):
+                    inner.calls += 1
+                    return ModelResult(response_text, 'stub', {'model_calls': 1, 'output_tokens': 32768}, 0, 'length',
+                        response_metadata={'reasoning_effort': inner.reasoning_effort, 'wire_reasoning': inner.reasoning_effort,
+                                           'answer_bytes': 0, 'thinking_bytes': 123000, 'max_output_tokens': 32768})
+            with self.assertRaises(ModelWorkBlocked):
+                foundry.generate('bounded comparison', client=EmptyAuthor(CapabilityFoundryTests._payload()), work_cache=cache)
+            prior = cache.entries()[0]
+            class RecoveryAuthor(StubClient):
+                reasoning_effort = 'high'; model = 'stub'; max_output_tokens = 32768
+                def complete(inner, **kwargs):
+                    efforts.append(inner.reasoning_effort)
+                    return super().complete(**kwargs)
+            efforts = []
+            outcome = foundry.generate('bounded comparison', client=RecoveryAuthor(CapabilityFoundryTests._payload()),
+                                      work_cache=cache, resume_work_ref=prior['cache_ref'])
+            self.assertEqual(efforts, ['none'])
+            self.assertEqual(outcome['status'], 'registered')
+            current = next(w for w in cache.entries() if w.get('author_generation_recovery'))
+            self.assertEqual(current['requests'][0], prior['requests'][0])
+            self.assertEqual(current['author_generation_recovery']['attempt_offset'], 1)
+            self.assertEqual(current['author_generation_recovery']['attempt_limit'], 2)
+            self.assertEqual(current['attempts'], 2)
+            self.assertGreaterEqual(current['usage']['output_tokens'], 32768)
+
+    def test_blank_author_profile_recovery_preserves_exact_response_bytes(self):
+        self.test_empty_author_profile_recovery_preserves_cumulative_receipts_and_bounds(' \n\t')
+
+    def test_author_dispatch_signature_binds_reasoning_and_preserves_legacy(self):
+        from scisaurus.runtime.capability_foundry import _author_request_signature, _author_request_signature_from_record
+        legacy = _author_request_signature('stub', 32768, 'fixed prompt')
+        self.assertEqual(legacy, _author_request_signature_from_record({'model':'stub', 'max_output_tokens':32768,
+            'prompt':'fixed prompt','status':'succeeded'}))
+        self.assertNotEqual(legacy, _author_request_signature('stub', 32768, 'fixed prompt', 'none'))
+        self.assertNotEqual(_author_request_signature('stub', 32768, 'fixed prompt', 'low'),
+                            _author_request_signature('stub', 32768, 'fixed prompt', 'none'))
+
     def test_single_program_fence_preserves_newline_span_and_bytes(self):
         source = 'import json\nprint(json.dumps({"ok": True}))\n'
         text = '```python\n' + source + '```\n'
