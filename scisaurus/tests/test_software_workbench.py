@@ -78,6 +78,73 @@ class SoftwareWorkbenchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "actual software discovery"):
             validate_selection(response, self.workbench, [host])
 
+    def test_model_selection_reference_diagnostic_identifies_exact_binding(self):
+        from scisaurus.tests.test_harness_recovery import model_definition
+        from scisaurus.runtime.software_workbench import selection_reference_contract
+        self.workbench.evidence_refs = frozenset({"captured-source", "other-captured-source"})
+        results = [{"outcome": "ok", "action": {"operation": operation}}
+                   for operation in ("check_environment", "search")]
+        results += [{"outcome": "ok", "receipt_ref": "software:receipt",
+                     "action": {"operation": "read_evidence"}},
+                    {"outcome": "failed", "receipt_ref": "software:failed",
+                     "action": {"operation": "read_evidence"}}]
+        contract = selection_reference_contract(self.workbench, results)
+        self.assertEqual(contract["allowed_refs"], ["captured-source", "other-captured-source", "software:receipt"])
+        response = selection_contract()
+        response.update(decision="pass", summary="Bounded model")
+        response["software_selection"].update(strategy="custom_model", rationale="Captured basis",
+            scientific_source_refs=["captured-source"], model_definition=model_definition())
+        response["software_selection"]["model_definition"]["source_refs"].append("other-captured-source")
+        before = deepcopy(response)
+        with self.assertRaises(ValidationError) as caught:
+            validate_selection(response, self.workbench, results)
+        self.assertIn("/software_selection/model_definition/source_refs", str(caught.exception))
+        self.assertIn("/software_selection/scientific_source_refs", str(caught.exception))
+        self.assertIn("other-captured-source", str(caught.exception))
+        self.assertEqual(response, before)
+        response["software_selection"]["scientific_source_refs"].append("other-captured-source")
+        validate_selection(response, self.workbench, results)
+        response["software_selection"]["scientific_source_refs"].append("unknown-ref")
+        with self.assertRaisesRegex(ValidationError, "unavailable identifiers.*unknown-ref"):
+            validate_selection(response, self.workbench, results)
+
+    def test_model_definition_contract_is_shared_with_program_author(self):
+        from scisaurus.runtime.measurement_contract import model_definition_contract
+        from scisaurus.runtime.capability_foundry import candidate_prompt
+        expected = model_definition_contract()
+        self.assertEqual(selection_contract()["software_selection"]["model_definition"], expected)
+        prompt = candidate_prompt({"research_question": "A question", "domain": "physics"}, {}, {})
+        self.assertEqual(prompt["optional_intent_fields"]["model_definition"], expected)
+        self.assertIn("source_bound | design_assumption | estimated", expected["equations"][0]["status"])
+        self.assertIn("finite non-boolean", expected["parameters"][0]["value"])
+
+    def test_direct_inspection_and_web_search_are_discovery_routes(self):
+        from scisaurus.tests.test_harness_recovery import model_definition
+        self.workbench.evidence_refs = frozenset({"captured-source"})
+        response = selection_contract()
+        response.update(decision="pass", summary="Bounded model")
+        response["software_selection"].update(strategy="custom_model", rationale="Captured basis",
+            scientific_source_refs=["captured-source"], model_definition=model_definition())
+        host = {"outcome": "ok", "action": {"operation": "check_environment"}}
+        for operation in ("inspect", "search_web", "search", "search_evidence"):
+            with self.subTest(operation=operation):
+                validate_selection(response, self.workbench,
+                    [host, {"outcome": "ok", "action": {"operation": operation}}])
+                with self.assertRaisesRegex(ValidationError, "successful receipt.*inspect"):
+                    validate_selection(response, self.workbench,
+                        [host, {"outcome": "failed", "action": {"operation": operation}}])
+        with self.assertRaisesRegex(ValidationError, "actual software discovery"):
+            validate_selection(response, self.workbench,
+                [host, {"outcome": "ok", "action": {"operation": "read"}}])
+
+    def test_held_software_selection_cannot_cite_unavailable_sources(self):
+        response = selection_contract()
+        response.update(decision="hold", summary="Fit unresolved")
+        response["software_selection"].update(strategy="unavailable", rationale="Fit unresolved",
+                                              scientific_source_refs=["unavailable-ref"])
+        with self.assertRaisesRegex(ValidationError, "unavailable identifiers.*unavailable-ref"):
+            validate_selection(response, self.workbench, [])
+
     def test_experiment_projection_preserves_host_measurements_and_limits(self):
         from scisaurus.runtime.composer import ComposerRunner
         check = {"receipt_ref":"software:sha256:host", "outcome":"ok",
@@ -472,6 +539,10 @@ class SoftwareWorkbenchTests(unittest.TestCase):
                 for row in tools:
                     by_operation.setdefault(row["action"]["operation"], []).append(row)
                 self.assertIn("check_environment",by_operation)
+                references = prompt["scientific_source_reference_contract"]
+                self.assertTrue({row["receipt_ref"] for row in tools if row.get("outcome") == "ok"}
+                                .issubset(set(references["allowed_refs"])))
+                self.assertEqual(references["model_path"], "/software_selection/model_definition/source_refs")
                 def action(operation, **arguments):
                     return {"tool_action":{"operation":operation,"arguments":arguments}}
                 if "search" not in by_operation:

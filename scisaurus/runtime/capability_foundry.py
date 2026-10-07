@@ -29,7 +29,7 @@ import unicodedata
 from dataclasses import asdict
 from pathlib import Path
 
-from scisaurus.runtime.measurement_contract import ModelDefinitionError
+from scisaurus.runtime.measurement_contract import ModelDefinitionError, model_definition_contract
 from scisaurus.core.errors import ModelContractError, ValidationError
 from scisaurus.runtime.evidence import scientific_input_recovery_contract
 from scisaurus.core.schema import canonical_bytes, json_object as parse_complete_json_object
@@ -1010,14 +1010,7 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             "decision_rules": [{"id": "rule_id", "metric_id": "declared_metric_id", "unit": "same unit",
                                 "operator": "< | <= | > | >= | ==", "threshold": "finite number",
                                 "claim": "claim conditional on this rule and stated model scope"}],
-            "model_definition": {
-                "equations": [{"id": "equation_id", "expression": "equation or algorithm",
-                               "status": "source_bound | design_assumption | estimated", "source_ref": "captured source ref or null"}],
-                "variables": [{"id": "variable_id", "unit": "physical or dimensionless unit", "reference_scale": "reference system and conversion"}],
-                "parameters": [{"id": "parameter_id", "value": "finite number", "unit": "unit", "status": "source_bound | design_assumption | estimated",
-                                "source_ref": "captured source ref or null", "reason": "basis and applicability"}],
-                "source_refs": ["captured scientific source ref"], "applicability": "regime and exclusions",
-                "claim_scope": "assumed pilot versus empirical inference", "question_alignment": "which question the mechanism can answer"},
+            "model_definition": model_definition_contract(),
             "quality_contract": {
             "requirement": "Optional only when it is not supplied in required_intent_fields. "
                            "When supplied, preserve it exactly and make the executor emit the matching analysis summary.",

@@ -23,6 +23,22 @@ COMPARATORS = {"<": operator.lt, "<=": operator.le, ">": operator.gt,
                ">=": operator.ge, "==": operator.eq}
 
 
+def model_definition_contract():
+    return {
+        "equations": [{"id": "equation_id", "expression": "equation or algorithm",
+                       "status": "source_bound | design_assumption | estimated",
+                       "source_ref": "exact declared source ref or null"}],
+        "variables": [{"id": "variable_id", "unit": "physical or dimensionless unit",
+                       "reference_scale": "reference system and conversion"}],
+        "parameters": [{"id": "parameter_id", "value": "finite non-boolean number",
+                        "unit": "unit", "status": "source_bound | design_assumption | estimated",
+                        "source_ref": "exact declared source ref or null", "reason": "basis and applicability"}],
+        "source_refs": ["exact captured scientific source ref; no annotations; source_bound rows require a ref from this list"],
+        "applicability": "regime and exclusions", "claim_scope": "assumed pilot versus empirical inference",
+        "question_alignment": "which question the mechanism can answer",
+    }
+
+
 def _text(value, name):
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(f"{name} must be nonempty text")

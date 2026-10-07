@@ -32,7 +32,8 @@ from scisaurus.runtime.program_sandbox import (
 from scisaurus.runtime.programs import _parse_object
 
 REVISION = "scientific-software-tools-5"
-SELECTION_CONTRACT_REVISION = "scientific-software-selection-2"
+SELECTION_CONTRACT_REVISION = "scientific-software-selection-3"
+DISCOVERY_OPERATIONS = frozenset({"search", "search_evidence", "search_web", "inspect"})
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _PIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*==[A-Za-z0-9][A-Za-z0-9_.+!-]*\Z")
@@ -758,12 +759,30 @@ def _matches_expected(output, expected):
 
 
 def selection_contract():
+    from scisaurus.runtime.measurement_contract import model_definition_contract
     return {"decision": "pass | hold", "summary": "...", "findings": [], "evidence_gaps": [],
             "requested_actions": [], "software_selection": {
                 "strategy": "reuse | custom_model | unavailable", "rationale": "source-bound scientific fit assessment",
                 "environment_ref": None, "example_ref": None, "computation_refs": [],
                 "scientific_source_refs": [], "limitations": [],
-                "model_definition": "Required for custom_model: equations[{id,expression,status,source_ref}], variables[{id,unit,reference_scale}], parameters[{id,value,unit,status,source_ref,reason}], source_refs, applicability, claim_scope, question_alignment. Otherwise omit."}}
+                "model_definition": model_definition_contract()}}
+
+
+def selection_reference_contract(workbench, results):
+    return {"allowed_refs": sorted(set(workbench.evidence_refs) | {
+                row["receipt_ref"] for row in results
+                if row.get("outcome") == "ok" and row.get("receipt_ref")}),
+            "selection_path": "/software_selection/scientific_source_refs",
+            "model_path": "/software_selection/model_definition/source_refs",
+            "custom_model_prerequisites": {
+                "discovery_operations": sorted(DISCOVERY_OPERATIONS),
+                "requirement": "A successful discovery receipt and nonempty scientific_source_refs are required. "
+                               "A direct repository inspection is discovery; installation or reading alone is not. "
+                               "A pass additionally requires model_definition in the declared exact shape."},
+            "binding": "Every model source ref must also appear in scientific_source_refs. "
+                       "Every selected source ref must exactly match an allowed_refs identifier. "
+                       "Place explanations in rationale or reason, never inside a source ref. "
+                       "This identity binding does not establish scientific adequacy or verify source interpretation."}
 
 
 def validate_selection(response, workbench, results):
@@ -799,12 +818,25 @@ def validate_selection(response, workbench, results):
     elif selection["environment_ref"] is not None or selection["example_ref"] is not None or selection["computation_refs"]:
         raise ValidationError("non-reuse selection must not claim an executed software capability")
     if selection["strategy"] == "custom_model":
-        if not selection["scientific_source_refs"] or not any(row.get("outcome") == "ok" and row["action"]["operation"] in {"search", "search_evidence"} for row in results):
-            raise ValidationError("custom modelling requires actual software discovery and source-bound justification")
+        if not selection["scientific_source_refs"] or not any(row.get("outcome") == "ok" and row["action"]["operation"] in DISCOVERY_OPERATIONS for row in results):
+            raise ValidationError("custom modelling requires actual software discovery and nonempty "
+                                  "/software_selection/scientific_source_refs; a successful receipt must use one of "
+                                  + json.dumps(sorted(DISCOVERY_OPERATIONS)))
+    source_refs = set(selection_reference_contract(workbench, results)["allowed_refs"])
+    unknown = sorted(set(selection["scientific_source_refs"]) - source_refs)
+    if unknown:
+        raise ValidationError("/software_selection/scientific_source_refs contains unavailable identifiers: "
+                              + json.dumps(unknown) + "; select exact identifiers from scientific_source_reference_contract.allowed_refs")
+    if selection["strategy"] == "custom_model":
         from scisaurus.runtime.measurement_contract import validate_model_definition
-        source_refs = set(workbench.evidence_refs) | {row.get("receipt_ref") for row in results if row.get("outcome") == "ok"}
-        if not set(selection["scientific_source_refs"]).issubset(source_refs):
-            raise ValidationError("custom model cites scientific sources outside the acquired evidence")
+        definition = selection.get("model_definition")
+        if isinstance(definition, dict) and isinstance(definition.get("source_refs"), list):
+            if all(isinstance(ref, str) for ref in definition["source_refs"]):
+                unselected = sorted(set(definition["source_refs"]) - set(selection["scientific_source_refs"]))
+                if unselected:
+                    raise ValidationError("/software_selection/model_definition/source_refs contains identifiers absent from "
+                                          "/software_selection/scientific_source_refs: " + json.dumps(unselected)
+                                          + "; every model ref must be an exact selected acquired identifier")
         validate_model_definition({"model_definition": selection.get("model_definition")},
                                   source_refs=selection["scientific_source_refs"], required=response["decision"] == "pass")
 

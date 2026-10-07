@@ -2603,6 +2603,8 @@ class SpecialistDispatcher:
                 software_results.append(software_tools.execute({"operation":"check_environment","arguments":{}}))
                 envelope = json.loads(prompt)
                 envelope["software_tool_results"] = [project_receipt(row) for row in software_results]
+                from scisaurus.runtime.software_workbench import selection_reference_contract
+                envelope["scientific_source_reference_contract"] = selection_reference_contract(software_tools, software_results)
                 prompt = json.dumps(envelope, ensure_ascii=False, sort_keys=True)
         max_input_tokens = self.input_limit_for_role(
             model_role, quota.get("max_input_tokens"))
@@ -2821,6 +2823,9 @@ class SpecialistDispatcher:
                     envelope = json.loads(prompt)
                     from scisaurus.runtime.software_workbench import project_receipt
                     envelope["software_tool_results"] = [project_receipt(row) for row in software_results]
+                    if response_contract == "software_selection":
+                        from scisaurus.runtime.software_workbench import selection_reference_contract
+                        envelope["scientific_source_reference_contract"] = selection_reference_contract(software_tools, software_results)
                     request = envelope.get("repair_evidence_request")
                     if isinstance(request, dict):
                         request["source_ref_catalog"] = list(dict.fromkeys([
@@ -2848,10 +2853,6 @@ class SpecialistDispatcher:
                 if response_contract == "software_selection" and not verifier:
                     from scisaurus.runtime.software_workbench import validate_selection
                     validate_selection(parsed, software_tools, software_results)
-                    supplied_refs = json.loads(prompt).get("software_assessment_request", {}).get("source_ref_catalog", [])
-                    supplied_refs = [*supplied_refs, *[row.get("receipt_ref") for row in software_results]]
-                    if any(ref not in supplied_refs for ref in parsed["software_selection"]["scientific_source_refs"]):
-                        raise ValidationError("scientific software selection cites an unavailable scientific source")
                     normalized["software_selection"] = _preserve_response_value(parsed["software_selection"])
                 if response_contract == "repair_evidence" and not verifier:
                     if (set(parsed) != {"decision", "summary", "findings", "evidence_gaps", "requested_actions", "evidence_note"}
