@@ -289,6 +289,46 @@ class StudyEvidenceTests(unittest.TestCase):
                 finally:
                     fixtures.doCleanups()
 
+    def test_methods_diagnostics_collect_schema_and_citation_errors_without_mutation(self):
+        from scisaurus.runtime.specialists import _validate_repair_adjudication_response
+        evidence = {"question_alignment": {"original": {"research_question": "Question", "disconfirmation_test": "Rule"},
+            "candidate": {"primary_outcomes": [{"id": "eta", "definition": "Row mean"}]}},
+            "candidate_program": {"experiment_intent": {"limitations": ["Exact current limitation."]}}}
+        result = {"decision": "repair", "summary": "Repair plan.", "findings": [], "evidence_gaps": [],
+            "requested_actions": [], "repair_plan_note": None, "repair_plan": {
+                "disposition": "repair", "root_cause": {"statement": "Cause", "evidence": []},
+                "required_changes": [], "acceptance_checks": [], "residual_uncertainties": [],
+                "decision_alignment": {"original_question": "Question", "original_decision_rule": "Rule",
+                    "primary_outcome_id": "eta", "quantity_definition": "Row mean", "baseline": "Reference",
+                    "aggregation": "Mean", "interpretation_limit": "Pilot", "scientific_justification": "Current evidence",
+                    "changes_estimand": False},
+                "evidence_checks": [{"claim": "Scope", "disposition": "supported", "explanation": "Current source",
+                    "pointer": "/repair_adjudication_packet/experiment_intent/limitations/0",
+                    "quote": "Exact current limitation."}]}}
+        before = deepcopy(result)
+        with self.assertRaises(ValidationError) as error:
+            _validate_repair_adjudication_response(result, evidence)
+        self.assertIn("unexpected fields: repair_plan_note", str(error.exception))
+        self.assertIn("pointer does not resolve", str(error.exception))
+        self.assertIn("/repair_adjudication_packet/candidate_program/experiment_intent/limitations/0", str(error.exception))
+        self.assertEqual(result, before)
+        result["repair_plan"]["evidence_checks"][0]["pointer"] = "/repair_adjudication_packet/candidate_program/experiment_intent/limitations/0"
+        with self.assertRaisesRegex(ValidationError, "unexpected fields"):
+            _validate_repair_adjudication_response(result, evidence)
+        result.pop("repair_plan_note")
+        _validate_repair_adjudication_response(result, evidence)
+        for malformed in (None, [None], [{"target": "estimand"}]):
+            broken = deepcopy(result);broken["repair_plan"]["required_changes"] = malformed
+            with self.subTest(malformed=malformed), self.assertRaises(ValidationError):
+                _validate_repair_adjudication_response(broken, evidence)
+        for disposition in ([], {}, True, None):
+            broken = deepcopy(result);broken["repair_plan_note"] = None
+            broken["repair_plan"]["evidence_checks"][0]["disposition"] = disposition
+            with self.subTest(disposition=disposition), self.assertRaises(ValidationError) as error:
+                _validate_repair_adjudication_response(broken, evidence)
+            self.assertIn("unexpected fields", str(error.exception))
+            self.assertIn("disposition must be supported or rebutted", str(error.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -138,7 +138,8 @@ def validate_decision_alignment(plan, evidence_document):
                        or not isinstance(check.get(key), str) or not check[key].strip()]
             if missing:
                 raise ValidationError(f"evidence_checks[{index}] requires nonempty fields: {', '.join(missing)}")
-            if check.get("disposition") not in {"supported", "rebutted"}:
+            if (not isinstance(check.get("disposition"), str)
+                    or check["disposition"] not in {"supported", "rebutted"}):
                 raise ValidationError("evidence check disposition must be supported or rebutted")
             try:
                 cited = _json_pointer_value(evidence_root, check["pointer"])
@@ -1846,7 +1847,7 @@ def _response_items(value):
     return [_response_text(item) for item in value]
 
 
-def _validate_repair_adjudication_response(result):
+def _validate_repair_adjudication_response(result, evidence_document=None):
     """Validate response transport before scientific admission consumes the plan."""
     keys = {"decision", "summary", "findings", "evidence_gaps", "requested_actions", "repair_plan"}
     if not isinstance(result, dict):
@@ -1862,45 +1863,55 @@ def _validate_repair_adjudication_response(result):
         if key in result and (not isinstance(result[key], list)
                               or any(not isinstance(item, str) for item in result[key])):
             diagnostics.append(key + " must be a string list")
-    if diagnostics:
-        raise ValidationError("repair-adjudication response contract: " + "; ".join(diagnostics))
     decision = result.get("decision")
     plan = result.get("repair_plan")
     if decision == "hold":
         if plan is not None:
-            raise ValidationError("a held repair adjudication must have repair_plan null")
+            diagnostics.append("a held repair adjudication must have repair_plan null")
+        if diagnostics:
+            raise ValidationError("repair-adjudication response contract: " + "; ".join(diagnostics))
         return
     if decision != "repair" or not isinstance(plan, dict) or plan.get("disposition") != "repair":
-        raise ValidationError("repair adjudication requires decision repair and an object with disposition repair")
+        diagnostics.append("repair adjudication requires decision repair and an object with disposition repair")
+        raise ValidationError("repair-adjudication response contract: " + "; ".join(diagnostics))
     cause = plan.get("root_cause")
     if (not isinstance(cause, dict) or not isinstance(cause.get("statement"), str)
             or not isinstance(cause.get("evidence"), list)
             or any(not isinstance(item, str) for item in cause["evidence"])):
-        raise ValidationError("repair_plan.root_cause requires statement text and an evidence string list")
+        diagnostics.append("repair_plan.root_cause requires statement text and an evidence string list")
     changes = plan.get("required_changes")
-    if not isinstance(changes, list):
-        raise ValidationError("repair_plan.required_changes must be a list")
-    for index, change in enumerate(changes):
+    changes_valid = isinstance(changes, list)
+    if not changes_valid:
+        diagnostics.append("repair_plan.required_changes must be a list")
+    for index, change in enumerate(changes if changes_valid else []):
         if (not isinstance(change, dict)
                 or any(not isinstance(change.get(key), str) for key in ("target", "instruction", "scientific_basis"))
                 or not isinstance(change.get("source_refs", []), list)
                 or any(not isinstance(item, str) for item in change.get("source_refs", []))):
-            raise ValidationError(f"repair_plan.required_changes[{index}] requires target, instruction, scientific_basis text and source_refs strings")
+            diagnostics.append(f"repair_plan.required_changes[{index}] requires target, instruction, scientific_basis text and source_refs strings")
+            changes_valid = False
     uncertainties = plan.get("residual_uncertainties", [])
     if not isinstance(uncertainties, list) or any(not isinstance(item, str) for item in uncertainties):
-        raise ValidationError("repair_plan.residual_uncertainties must be a string list")
+        diagnostics.append("repair_plan.residual_uncertainties must be a string list")
     checks = plan.get("acceptance_checks", [])
     if not isinstance(checks, list):
-        raise ValidationError("repair_plan.acceptance_checks must be a list")
+        diagnostics.append("repair_plan.acceptance_checks must be a list")
     if any(key in plan for key in ("plan_acceptance_checks", "execution_acceptance_checks", "deferred_gates")):
-        raise ValidationError("repair checks belong only in repair_plan.acceptance_checks")
-    for index, check in enumerate(checks):
+        diagnostics.append("repair checks belong only in repair_plan.acceptance_checks")
+    for index, check in enumerate(checks if isinstance(checks, list) else []):
         if (not isinstance(check, dict) or set(check) != {"phase", "check"}
                 or check.get("phase") not in ("plan", "execution")
                 or not isinstance(check.get("check"), str) or not check["check"].strip()):
-            raise ValidationError(
+            diagnostics.append(
                 f"repair_plan.acceptance_checks[{index}] must contain exactly phase and check; "
                 "phase must be plan or execution and check must be a nonempty string")
+    if evidence_document is not None and changes_valid:
+        try:
+            validate_decision_alignment(plan, evidence_document)
+        except ValidationError as exc:
+            diagnostics.append(str(exc))
+    if diagnostics:
+        raise ValidationError("repair-adjudication response contract: " + "; ".join(diagnostics))
 
 
 def _normalise_report(result):
@@ -2859,11 +2870,9 @@ class SpecialistDispatcher:
                           "role": assigned_role, "role_id": assignment.get("role_id")})
                     continue
                 if response_contract == "repair_adjudication" and not verifier:
-                    _validate_repair_adjudication_response(parsed)
-                    if parsed.get("decision") == "repair":
-                        original_assignment = json.loads(prompt)
-                        validate_decision_alignment(parsed["repair_plan"],
-                            original_assignment.get("repair_adjudication_packet", {}))
+                    original_assignment = json.loads(prompt)
+                    _validate_repair_adjudication_response(parsed,
+                        original_assignment.get("repair_adjudication_packet", {}))
                 normalized = _normalise_verdict(parsed, **_verifier_obligation_scope(prompt, assignment)) \
                     if verifier else _normalise_report(parsed)
                 if response_contract == "software_selection" and not verifier:
