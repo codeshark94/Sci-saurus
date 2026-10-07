@@ -18,7 +18,7 @@ class ModelDefinitionError(ModelWorkBlocked):
     next_action = "methods_adjudication_before_source_repair"
 
 
-INTENT_EXTENSIONS = frozenset({"decision_outcomes", "decision_rules", "model_definition"})
+INTENT_EXTENSIONS = frozenset({"decision_outcomes", "decision_rules", "model_definition", "evidence_plan"})
 COMPARATORS = {"<": operator.lt, "<=": operator.le, ">": operator.gt,
                ">=": operator.ge, "==": operator.eq}
 
@@ -94,6 +94,8 @@ def recalculation_outcomes(intent):
         if rule["unit"] != by_id[rule["metric_id"]].get("unit"):
             raise ValidationError("decision rule and metric units differ")
         _text(rule["claim"], "conditional decision claim")
+    from scisaurus.runtime.study_evidence import validate_evidence_plan
+    validate_evidence_plan(intent)
     return deepcopy(outcomes)
 
 

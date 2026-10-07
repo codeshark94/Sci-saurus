@@ -78,6 +78,18 @@ def _composer_progress_line(state):
     return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
 
 
+def _composer_result_summary(result, report_path):
+    """Serialize only fields supplied by the actual terminal result variant."""
+    fields = ("status", "stop_reason", "elapsed_seconds", "deadline_seconds", "stages",
+              "release_status", "continuation_policy", "continuation_cycles",
+              "active_research_requests", "organization")
+    summary = {field: result[field] for field in fields if field in result}
+    summary["report"] = str(report_path)
+    if "interim_report_path" in result:
+        summary["interim_report"] = result["interim_report_path"]
+    return summary
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="scisaurus")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -327,15 +339,8 @@ def main(argv=None) -> int:
             except (OSError, ValueError, ValidationError) as exc:
                 print(f"composer workflow rejected: {exc}", file=sys.stderr)
                 return 2
-            print(json.dumps({"status": result["status"], "elapsed_seconds": result["elapsed_seconds"],
-                              "deadline_seconds": result.get("deadline_seconds"),
-                              "stages": result["stages"], "release_status": result["release_status"],
-                              "continuation_policy": result.get("continuation_policy"),
-                              "continuation_cycles": result.get("continuation_cycles", 0),
-                              "active_research_requests": result.get("active_research_requests", []),
-                              "organization": result.get("organization"),
-                              "report": str(Path(workflow["project_id"]).resolve() / "output" / "run.json"),
-                              "interim_report": result.get("interim_report_path")}, indent=2))
+            print(json.dumps(_composer_result_summary(
+                result, Path(workflow["project_id"]).resolve() / "output" / "run.json"), indent=2))
             return 0 if result["status"] == "completed" else 3
     if args.cmd == "composer-interim-report":
         from scisaurus.core.errors import ValidationError

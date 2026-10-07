@@ -436,6 +436,8 @@ def validate_deterministic_validation(value, experiment, candidate_sha256):
             f"missing metric_ids={missing}; unexpected metric_ids={unexpected}; "
             f"expected metric_ids={sorted(configured_metric_ids)}; "
             f"observed metric_ids={sorted(metric_ids)}")
+    from scisaurus.runtime.study_evidence import validate_evidence_checks
+    validate_evidence_checks(experiment, value)
     if not isinstance(value["limitations"], list):
         raise ValidationError("deterministic validation limitations must be a list")
     for limitation in value["limitations"]:
@@ -481,6 +483,8 @@ def bind_deterministic_validation(value, candidate, experiment):
         values = {row["metric_id"]: row["recalculated_value"] for row in recalculations}
         if any(values[parent] is None for parent in outcome["parents"]) and values[outcome["id"]] is not None:
             raise ValidationError("decision outcome is defined despite an undefined parent")
+    from scisaurus.runtime.study_evidence import bind_evidence_observations
+    bind_evidence_observations(experiment, candidate, value)
     return value
 
 

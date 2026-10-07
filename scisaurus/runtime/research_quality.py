@@ -266,6 +266,9 @@ def build_research_design(experiment):
         "limitations": list(experiment["limitations"]),
         "quality_contract": deepcopy(experiment.get("quality_contract")),
     }
+    from scisaurus.runtime.measurement_contract import INTENT_EXTENSIONS
+    for field in sorted(INTENT_EXTENSIONS & experiment.keys()):
+        design[field] = deepcopy(experiment[field])
     canonical_bytes(design)
     return design
 

@@ -42,6 +42,9 @@ from scisaurus.runtime.models import (
 )
 
 
+from scisaurus.runtime.study_evidence import study_evidence_contract
+
+
 RESPONSE_REPAIR_PROVENANCE_RULE = (
     "In a response-format repair envelope, evidence_packet is the unchanged original assignment. "
     "response_format_repair describes only your own previous model response, with its output role "
@@ -403,7 +406,7 @@ def _safe_value(value, *, depth=0):
             if str(key) in {"candidate_program", "prior_plan_review", "repair_evidence_request",
                             "repair_evidence_note", "repair_adjudication", "repair_contract",
                             "prior_evidence_review", "evidence_experiment_intent", "foundry_execution_evidence",
-                            "question_alignment", "admitted_model_definition"}:
+                            "question_alignment", "admitted_model_definition", "evidence_plan", "study_evidence_contract"}:
                 output[key] = _preserve_response_value(item)
                 continue
             output[key] = _safe_value(item, depth=depth + 1)
@@ -450,7 +453,7 @@ def _bounded_value(value, *, depth=0, max_depth=5, max_keys=64, max_items=24,
             if str(key) in {"candidate_program", "prior_plan_review", "repair_evidence_request",
                             "repair_evidence_note", "repair_adjudication", "repair_contract",
                             "prior_evidence_review", "evidence_experiment_intent", "foundry_execution_evidence",
-                            "question_alignment", "admitted_model_definition"}:
+                            "question_alignment", "admitted_model_definition", "evidence_plan", "study_evidence_contract"}:
                 output[key] = _preserve_response_value(item)
                 continue
             if index >= max_keys:
@@ -1184,6 +1187,8 @@ def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, det
             "evidence_needed": ["required evidence to perform the check"]}],
         "repair_scope": ["actionable non-blocking follow-up, or an empty list"],
     }
+    if stage.get("kind") == "experiment":
+        contract["study_evidence_contract"] = study_evidence_contract()
     if stage.get("kind") == "topic_discovery":
         contract.update({
             "acceptance_target": (
@@ -1497,6 +1502,8 @@ def build_specialist_prompt(assignment, stage_packet):
             "prohibited_action": "threshold relabeling or cosmetic edits that preserve the failed mechanism",
             "question_alignment_rule": RESEARCH_QUESTION_ALIGNMENT_RULE,
         }
+    if assignment.get("stage_kind") == "experiment":
+        envelope["study_evidence_contract"] = study_evidence_contract()
     quota = assignment.get("quota") if isinstance(assignment.get("quota"), dict) else {}
     return _json_with_budget(
         envelope, system=SPECIALIST_SYSTEM,
@@ -1670,6 +1677,7 @@ def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports
             "system_contract": assignment.get("system_contract"),
         },
         "scientific_input_recovery": scientific_input_recovery_contract(),
+        "study_evidence_contract": study_evidence_contract(),
         "repair_adjudication_packet": repair_adjudication_evidence_document(
             repair_packet, reviewer_reports, prior_plan_review=prior_plan_review),
         "decision_contract": {

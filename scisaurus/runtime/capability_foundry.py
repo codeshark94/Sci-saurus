@@ -52,7 +52,7 @@ from scisaurus.runtime.specialists import (
     research_question_alignment, RESEARCH_QUESTION_ALIGNMENT_RULE,
 )
 from scisaurus.runtime.program_admission import (
-    ExperimentIntentContractError, is_main_entry_guard, scan_program_source,
+    ExperimentIntentContractError, INTENT_FIELDS, is_main_entry_guard, scan_program_source,
     validate_experiment_intent,
     validate_program_candidate,
 )
@@ -65,6 +65,7 @@ from scisaurus.runtime.research_quality import (
     ANALYSIS_FIELDS, AnalysisContractError, analysis_output_contract,
     default_research_quality_contract,
 )
+from scisaurus.runtime.study_evidence import evidence_source_refs, study_evidence_contract, validate_evidence_plan
 
 
 def _sandbox_status_text(returncode):
@@ -157,7 +158,7 @@ def _validate_source_observation_binding(document, configured_input):
     observed_ids = set()
     for observation in observations:
         if (not isinstance(observation, dict)
-                or set(observation) - {"source_record_id", "source_values", "replicate"}
+                or set(observation) - {"source_record_id", "source_values", "replicate", "condition"}
                 or not isinstance(observation.get("source_record_id"), str)
                 or observation["source_record_id"] not in source_rows
                 or observation["source_record_id"] in observed_ids
@@ -165,6 +166,9 @@ def _validate_source_observation_binding(document, configured_input):
             raise ValidationError(
                 "empirical observation must retain its exact controller-supplied source row and identity")
         replicate = observation.get("replicate")
+        if "condition" in observation and (not isinstance(observation["condition"], str)
+                                            or not observation["condition"].strip()):
+            raise ValidationError("empirical observation condition must be nonempty design metadata")
         if replicate is not None and (type(replicate) is not int or replicate < 1):
             raise ValidationError("empirical observation replicate must be a positive integer")
         observed_ids.add(observation["source_record_id"])
@@ -950,6 +954,15 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
         if isinstance(required_intent, dict) else None
     )
     requires_analysis = isinstance(quality_contract, dict)
+    parsed_brief = brief
+    if isinstance(parsed_brief, str):
+        try:
+            parsed_brief = json.loads(parsed_brief)
+        except ValueError:
+            parsed_brief = None
+    evidence_required = (isinstance(parsed_brief, dict)
+                         and parsed_brief.get("study_evidence_contract") == study_evidence_contract()
+                         and not INTENT_FIELDS.issubset(required_intent or {}))
     requires_source_data = _requires_source_data_manifest(brief)
     analysis_descriptions = analysis_output_contract()
     analysis_shape = {key: analysis_descriptions[key] for key in sorted(ANALYSIS_FIELDS)}
@@ -1007,6 +1020,7 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             {"name": name, "version": version} for name, version in runtime_packages]},
         "configured_input": test_input,
         "optional_intent_fields": {
+            "evidence_plan": [study_evidence_contract()["entry_shape"]],
             "decision_outcomes": [{"id": "derived_metric_id", "definition": "exact formula, aggregation and scope",
                                    "unit": "declared unit", "parents": ["declared_metric_id"]}],
             "decision_rules": [{"id": "rule_id", "metric_id": "declared_metric_id", "unit": "same unit",
@@ -1169,6 +1183,16 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             "but unidentifiable program.",
         ],
     }
+    prompt["study_evidence_contract"] = study_evidence_contract()
+    prompt["evidence_plan_source_refs"] = evidence_source_refs(test_input)
+    prompt["evidence_plan_required"] = evidence_required
+    prompt["constraints"].append(
+        "Declare the prospective evidence_plan using study_evidence_contract. When evidence_plan_required "
+        "is true, it is mandatory for this new design. Keep a supplied complete frozen intent unchanged; "
+        "a format repair must not add scientific obligations to a legacy candidate. Every planned obligation "
+        "source_ref must exactly match evidence_plan_source_refs from the current controller-owned input. "
+        "Each planned obligation must be independently checked under its exact validator_check_id, even when its check fails. "
+        "Preserve every claim_limit and each not_applicable method verbatim in output limitations.")
     if requires_source_data:
         prompt["constraints"].extend([
             "This experiment depends on empirical source data. Use only configured_input.source_data_manifest; "
@@ -1938,6 +1962,8 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
     return {
         "assignment": "repair_existing_experiment_candidate",
         "topic": topic,
+        "study_evidence_contract": study_evidence_contract(),
+        "evidence_plan_source_refs": evidence_source_refs(configured_input),
         "required_intent_fields": required_intent or {},
         "candidate_sha256": _authored_candidate_sha256(candidate),
         "current_candidate": {
@@ -2357,7 +2383,7 @@ class CapabilityFoundry:
             contract = hashlib.sha256()
             for name in ("capability_foundry.py", "capability_registry.py", "experiment.py",
                          "experiment_config.py", "research_quality.py", "results.py",
-                         "program_admission.py", "program_gates.py", "program_sandbox.py", "measurement_contract.py"):
+                         "program_admission.py", "program_gates.py", "program_sandbox.py", "measurement_contract.py", "study_evidence.py"):
                 contract.update((Path(__file__).parent / name).read_bytes())
             key = work_cache.key(scope="experiment-capability", role="research.experiment-author",
                 system=SYSTEM, prompt={"assignment": base_prompt,
@@ -2536,6 +2562,9 @@ class CapabilityFoundry:
                         state["author_request_signatures"] = []
                 elif reusable_prior:
                     prior, requests, candidate = reusable_prior[0]
+                    if (prior.get("study_evidence_plan_required") is True
+                            and prior.get("assignment", {}).get("evidence_plan_required") is True):
+                        state["study_evidence_plan_required"] = True
                     state["blocking_issue_ledger"] = _merge_prior_blocking_issues(
                         prior.get("blocking_issue_ledger"),
                         prior.get("validation_feedback"),
@@ -3801,6 +3830,7 @@ class CapabilityFoundry:
             ensure_model_call_budget()
             prompt = {"assignment": "independent_scientific_program_review",
                 "scientific_input_recovery": scientific_input_recovery_contract(),
+                "study_evidence_contract": study_evidence_contract(),
                 "research_assignment": brief,
                 "experiment_intent": candidate["experiment_intent"],
                 "executor_source": candidate["executor_source"],
@@ -3898,8 +3928,9 @@ class CapabilityFoundry:
                 "validator_output_exact_shapes": base_prompt["validator_output_exact_shapes"],
                 "readiness_handshake": validator_readiness_contract(),
                 "runtime_request_shape": deepcopy_config(base_prompt["stdin_examples"]["validator_receives"]),
+                "study_evidence_contract": study_evidence_contract(),
                 "response_contract": {"validator_source": "complete Python source"},
-                "instructions": "The runtime request contains candidate.metrics as an array of records in candidate_output_exact_shapes; match each primary outcome to a record by its exact id and read that record's value only for reported_value. A numeric schema example is not a reported value. Use observation_schema for the actual row fields. Implement recalculation from raw observations and the frozen estimand. Never trust candidate metric values as recalculated values. Check every declared primary outcome, raw-data consistency, frozen limitations and finite values. No executor source or producer validator is available. Use only the declared runtime packages and permitted modules. Return only the complete JSON object.",
+                "instructions": "The runtime request contains candidate.metrics as an array of records in candidate_output_exact_shapes; match each primary outcome to a record by its exact id and read that record's value only for reported_value. A numeric schema example is not a reported value. Use observation_schema for the actual row fields. Implement recalculation from raw observations and the frozen estimand. Never trust candidate metric values as recalculated values. Check every declared primary outcome, raw-data consistency, frozen limitations and finite values. For each planned evidence_plan entry, emit its exact validator_check_id and assess acceptance_rule from current observations; retain failed checks rather than dropping obligations. No executor source or producer validator is available. Use only the declared runtime packages and permitted modules. Return only the complete JSON object.",
                 "runtime": runtime,
                 "permitted_modules": ["json", "math", "statistics", "hashlib", "pathlib", "sys", "itertools", "functools", "random", "collections", "dataclasses", "typing", "decimal", "fractions", "re", "time", "os", "numpy", "matplotlib"],
             }
@@ -4370,6 +4401,8 @@ class CapabilityFoundry:
                 has_repair_candidate
                 and (feedback is not None or isinstance(format_repair, dict))
             )
+            if base_prompt.get("evidence_plan_required") and not bounded_patch_retry:
+                state["study_evidence_plan_required"] = True
             if bounded_patch_retry:
                 patch_repair = (
                     format_repair if isinstance(format_repair, dict) else {
@@ -4711,6 +4744,11 @@ class CapabilityFoundry:
                     })
                 executor = attempt_value["executor_source"]
                 validate_experiment_intent(attempt_value["experiment_intent"])
+                if state.get("study_evidence_plan_required") is True:
+                    try:
+                        validate_evidence_plan(attempt_value["experiment_intent"], required=True)
+                    except ValidationError as exc:
+                        raise ExperimentIntentContractError(str(exc)) from exc
                 if required_intent:
                     intent = attempt_value["experiment_intent"]
                     differences = {key: {"required": value, "received": intent[key]}

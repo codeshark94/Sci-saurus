@@ -76,6 +76,7 @@ from scisaurus.runtime.failure_recovery import (
     build_failure_dossier, build_repair_commands, build_repair_request,
     classify_failure, failure_evidence_lineage_conflicts,
 )
+from scisaurus.runtime.study_evidence import study_evidence_contract
 from scisaurus.runtime.topic_discovery import (
     TOPIC_RESPONSE_CONTRACT_REVISION,
     DEFAULT_TOPIC_BUDGETS,
@@ -96,7 +97,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-development-foundry-scientific-intent-ownership-27")
+    "experiment-development-foundry-study-evidence-28")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -13128,6 +13129,7 @@ class ComposerRunner:
                     "evidence_catalog": evidence_catalog,
                     "evidence_availability": [{key:value for key,value in bundle.items() if key != "sources"} for bundle in source_bundles],
                     "computation_scope": deepcopy(computation_scope or {})}
+        identity["study_evidence_contract"] = study_evidence_contract()
         digest = hashlib.sha256(canonical_bytes(identity)).hexdigest()
         logical = f"command/scientific-software-assessments/{digest}"
         previous = self.store.head(logical + "/receipt")
@@ -14146,6 +14148,7 @@ class ComposerRunner:
                     "feasibility_plan")},
                 "repair_evidence_frontier": evidence_projection,
                 "scientific_software": self._scientific_software_projection(software_assessment) if software_assessment else None,
+                "study_evidence_contract": study_evidence_contract(),
                 "repair_evidence_frontier_sha256": hashlib.sha256(canonical_bytes(evidence_projection)).hexdigest()
                     if evidence_projection is not None else None,
                 "evidence_policy": {

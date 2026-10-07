@@ -332,5 +332,12 @@ def validate_program_candidate(value):
         raise ValidationError("program executor and validator sources must be independently authored")
     _validate_runtime(value["runtime"])
     _validate_test_vector(value["test_vector"])
+    if "evidence_plan" in value["experiment_intent"]:
+        from scisaurus.runtime.study_evidence import evidence_source_refs, validate_evidence_plan
+        runtime_input = value["test_vector"]["input"]
+        if not isinstance(runtime_input, dict):
+            raise ValidationError("study evidence requires an object runtime input")
+        configured = runtime_input.get("configured_input", {})
+        validate_evidence_plan(value["experiment_intent"], source_refs=evidence_source_refs(configured))
     canonical_bytes(value)
     return value
