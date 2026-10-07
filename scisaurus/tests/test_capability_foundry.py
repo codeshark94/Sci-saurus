@@ -321,7 +321,47 @@ class CapabilityFoundryTests(unittest.TestCase):
         self.assertEqual(prompt["repair_request"]["repair_plan"], plan)
         self.assertEqual(prompt["repair_request"]["repair_plan_sha256"], digest)
 
-    def test_authoring_repair_prompt_targets_one_blocker_and_defers_the_rest(self):
+    def test_authoring_repair_preserves_long_structured_evidence_and_all_mismatches(self):
+        feedback = {"gate": "adversarial_review", "decision": "rejected",
+                    "findings": [{"severity": "blocking", "finding": f"issue-{i}",
+                                  "evidence": "exact evidence " * 400,
+                                  "required_change": "Resolve the measured inconsistency.",
+                                  "source_refs": [{"sha256": "a" * 64, "line": i}]}
+                                 for i in range(18)],
+                    "metric_mismatches": [{"metric_id": f"metric-{i}",
+                                           "reported_value": None, "recalculated_value": i,
+                                           "matches": False} for i in range(20)]}
+        snapshot = deepcopy(feedback)
+        prompt = authoring_patch_prompt(
+            brief={}, required_intent={}, configured_input={},
+            candidate={"executor_source": "x", "experiment_intent": {}},
+            feedback="rejected", validation_context={}, validation_feedback=feedback,
+            format_repair={})
+        actual = prompt["repair_request"]["validation_feedback"]
+        self.assertEqual(actual["findings"], feedback["findings"])
+        self.assertEqual(actual["metric_mismatches"], feedback["metric_mismatches"])
+        self.assertEqual(feedback, snapshot)
+        actual["findings"][0]["source_refs"][0]["line"] = -1
+        self.assertEqual(feedback, snapshot)
+
+    def test_candidate_output_contract_repair_does_not_expand_scientific_scope(self):
+        failure = {"gate": "analysis_output_contract", "error": "upper must be finite"}
+        prompt = authoring_patch_prompt(
+            brief={}, required_intent={"id": "frozen"}, configured_input={},
+            candidate={"executor_source": "x", "experiment_intent": {"id": "frozen"}},
+            feedback="rejected", validation_context={},
+            validation_feedback={"findings": [{"severity": "blocking", "finding": "older review"}]},
+            format_repair={"repair_kind": "analysis_output_contract", "candidate_failure": failure,
+                           "previous_error": failure["error"]})
+        self.assertEqual(prompt["repair_request"]["repair_scope"], {
+            "policy": "candidate_output_contract", "active_issue": "candidate_failure",
+            "gate": "analysis_output_contract"})
+        self.assertIsNone(prompt["repair_request"]["author_response_error"])
+        self.assertEqual(prompt["repair_request"]["candidate_failure"], failure)
+        self.assertIn("repair only that contract and preserve scientific", prompt["instructions"])
+        self.assertEqual(prompt["required_intent_fields"], {"id": "frozen"})
+
+    def test_authoring_repair_prompt_preserves_the_complete_blocking_set(self):
         primary = {
             "severity": "blocking", "finding": "The contrast is algebraic by construction.",
             "evidence": "The down branch is the up branch times one parameter factor.",
@@ -361,20 +401,14 @@ class CapabilityFoundryTests(unittest.TestCase):
         )
 
         repair = prompt["repair_request"]["validation_feedback"]
-        self.assertEqual(repair["findings"], [primary])
-        self.assertEqual(repair["deferred_failed_check_ids"],
-                         ["claim_support", "independent_validation"])
+        self.assertEqual(repair["findings"], [primary, secondary, warning])
+        self.assertEqual(repair["failed_checks"], feedback["failed_checks"])
+        self.assertEqual(repair["metric_mismatches"], feedback["metric_mismatches"])
         self.assertEqual(repair["repair_scope"], {
-            "policy": "one_issue_per_candidate_revision",
-            "active_issue": "blocking_finding",
-            "deferred_blocking_findings": 1,
-            "deferred_warning_findings": 1,
-            "deferred_failed_checks": 2,
-            "deferred_metric_mismatches": 1,
+            "policy": "current_candidate_blocking_set", "active_issue": "blocking_set",
+            "blocking_findings": 2, "warning_findings": 1,
+            "failed_checks": 2, "metric_mismatches": 1,
         })
-        self.assertEqual(repair["deferred_failed_check_ids"],
-                         ["claim_support", "independent_validation"])
-        self.assertEqual(repair["deferred_metric_ids"], ["slope_diff"])
         mismatch_prompt = authoring_patch_prompt(
             brief={}, required_intent={}, configured_input={},
             candidate={"executor_source": "x", "validator_source": "y", "experiment_intent": {}},
@@ -386,13 +420,13 @@ class CapabilityFoundryTests(unittest.TestCase):
         self.assertEqual(mismatch_prompt["metric_mismatches"],
                          [feedback["metric_mismatches"][0]])
         serialized = json.dumps(prompt, ensure_ascii=False)
-        self.assertNotIn(secondary["finding"], serialized)
-        self.assertNotIn(warning["finding"], serialized)
+        self.assertIn(secondary["finding"], serialized)
+        self.assertIn(warning["finding"], serialized)
         self.assertNotIn("DEFERRED-FEEDBACK-LEAK-MARKER", serialized)
         self.assertNotIn("Malformed response: " + json.dumps(feedback), serialized)
-        self.assertIn("deferred scientific findings remain recorded",
+        self.assertIn("address the complete current blocking set",
                       prompt["format_repair"]["previous_error"])
-        self.assertIn("resolve only the single active issue", prompt["instructions"])
+        self.assertIn("diagnose all current blocking", prompt["instructions"])
         prior_issues = _compact_prior_blocking_issues(feedback)
         self.assertEqual(len(prior_issues), 5)
         self.assertIn("The interval is not independently checked.",
@@ -413,9 +447,8 @@ class CapabilityFoundryTests(unittest.TestCase):
                                  "failed_checks": [detailed_check, feedback["failed_checks"][1]]},
             format_repair={},
         )["repair_request"]["validation_feedback"]
-        self.assertEqual(check_only["failed_checks"], [detailed_check])
-        self.assertEqual(check_only["deferred_failed_check_ids"], ["independent_validation"])
-        self.assertEqual(check_only["repair_scope"]["active_issue"], "failed_check")
+        self.assertEqual(check_only["failed_checks"], [detailed_check, feedback["failed_checks"][1]])
+        self.assertEqual(check_only["repair_scope"]["active_issue"], "blocking_set")
 
 
 
@@ -2422,14 +2455,14 @@ class CapabilityFoundryTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValidationError):
                 apply_authoring_patch(self._payload(), {"updates": {"executor_source": value}})
 
-    def test_source_patch_limits_reject_excessive_edit_count_and_size_atomically(self):
+    def test_source_patch_volume_is_bounded_without_limiting_issue_count(self):
         candidate = self._payload()
         candidate["executor_source"] = "a b c d e"
-        too_many_edits = {"updates": {"executor_source": {"edits": [
+        multiple_edits = {"updates": {"executor_source": {"edits": [
             {"old": old, "new": old.upper()} for old in "abcde"
         ]}}}
-        with self.assertRaisesRegex(ValidationError, "bounded source-edit limit of 4 edits"):
-            apply_authoring_patch(candidate, too_many_edits)
+        revised = apply_authoring_patch(candidate, multiple_edits)
+        self.assertEqual(revised["executor_source"], "A B C D E")
         self.assertEqual(candidate["executor_source"], "a b c d e")
 
         oversized = {"updates": {"executor_source": {"edits": [
@@ -2459,6 +2492,67 @@ class CapabilityFoundryTests(unittest.TestCase):
             self.assertEqual(outcome["candidate"]["validator_source"], MINI_VALIDATOR)
             self.assertEqual(outcome["candidate"]["executor_source"], MINI_EXECUTOR)
             self.assertEqual(client.calls, 2)
+
+    def test_multiple_review_blockers_share_one_patch_and_fresh_validation(self):
+        payload = self._payload()
+        payload["executor_source"] = MINI_EXECUTOR.replace('95th-percentile absolute error is', '90th-percentile absolute error is').replace(
+            '95th-percentile absolute error %.6g', '90th-percentile absolute error %.6g')
+        blockers = [{"severity": "blocking", "finding": "Metric percentile is mislabeled.",
+                     "evidence": "Presentation states the 90th percentile.", "required_change": "Correct the percentile label."},
+                    {"severity": "blocking", "finding": "Finding names the wrong percentile.",
+                     "evidence": "Finding states the 90th percentile.",
+                     "required_change": "Name the declared percentile."}]
+        prompts, progress = [], []
+        test = self
+
+        class Author:
+            calls = 0
+            def complete(self, *, system, prompt):
+                self.calls += 1
+                if self.calls == 1:
+                    value = payload
+                else:
+                    request = json.loads(prompt)
+                    prompts.append(request)
+                    test.assertEqual(request["repair_request"]["validation_feedback"]["findings"], blockers)
+                    value = {"updates": {"executor_source": {"edits": [
+                        {"old": '90th-percentile absolute error is', "new": '95th-percentile absolute error is'},
+                        {"old": '90th-percentile absolute error %.6g',
+                         "new": '95th-percentile absolute error %.6g'},
+                    ]}}}
+                return ModelResult(json.dumps(value), "author", {"model_calls": 1}, 0, "stop")
+
+        class Reviewer:
+            calls = 0
+            def complete(self, *, system, prompt):
+                self.calls += 1
+                value = test._review_payload()
+                if self.calls == 1:
+                    value["status"] = "rejected"
+                    value["checks"][0].update(outcome="failed", evidence="Two output labels are wrong.")
+                    value["findings"] = blockers
+                else:
+                    request = json.loads(prompt)
+                    test.assertTrue({b["finding"] for b in blockers} <= {
+                        i["finding"] for i in request["prior_blocking_issues"]})
+                    test.assertEqual(request["executor_source"], MINI_EXECUTOR)
+                return ModelResult(json.dumps(_add_prior_review_checks(value, prompt)),
+                                   "reviewer", {"model_calls": 1}, 0, "stop")
+
+        with tempfile.TemporaryDirectory() as path:
+            foundry = self._foundry(Path(path))
+            author, reviewer = Author(), Reviewer()
+            foundry.reviewer_client = reviewer
+            outcome = foundry.generate("bounded comparison", client=author,
+                work_cache=self._cache(Path(path)),
+                on_progress=lambda phase, state: progress.append((phase, deepcopy(state))))
+            self.assertEqual(outcome["status"], "registered")
+            self.assertEqual((author.calls, reviewer.calls, foundry.validator_client.calls), (2, 2, 1))
+            executions = progress[-1][1]["sandbox_executions"]
+            replays = [r for r in executions if r["operation"] == "executor_replay"]
+            self.assertEqual(len(replays), 6)
+            self.assertEqual(len({r["program_sha256"] for r in replays}), 2)
+            self.assertEqual(len([r for r in executions if r["operation"] == "validator_recalculation"]), 2)
 
     def test_rejected_source_edit_feedback_reaches_next_repair_and_recovers(self):
         payload = self._payload()

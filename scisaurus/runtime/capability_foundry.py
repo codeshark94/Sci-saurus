@@ -228,7 +228,6 @@ ATTEMPT_FIELDS = {"executor_source", "validator_source", "experiment_intent"}
 PRODUCER_FIELDS = {"executor_source", "experiment_intent"}
 LEGACY_TRANSPORT_FIELDS = {"runtime", "test_input"}
 IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,63}")
-AUTHOR_PATCH_MAX_EDITS = 4
 AUTHOR_PATCH_MAX_SOURCE_CHARS = 12000
 AUTHOR_PATCH_MAX_STRUCTURAL_REMOVALS = 8
 AUTHOR_CONTINUATION_MAX_OUTPUT_TOKENS = 24000
@@ -801,14 +800,14 @@ def _author_format_repair_instructions(reason, *, has_candidate=False):
             or "exceeds the bounded source-edit limit" in message):
         return (
             "The previous source-patch response was truncated or exceeded the bounded patch contract. "
-            f"Return at most {AUTHOR_PATCH_MAX_EDITS} exact edits and no more than "
+            "Return exact edits with no more than "
             f"{AUTHOR_PATCH_MAX_SOURCE_CHARS} characters total across old and new source text. "
             "Do not return complete programs, commentary, or derivations. Keep the repair scoped to the "
-            "single active issue; the candidate will be replayed through every gate."
+            "current repair scope; the candidate will be replayed through every gate."
         )
     return (
         "The previous response did not satisfy the authoring patch contract. Return only a compact "
-        f"updates object with at most {AUTHOR_PATCH_MAX_EDITS} exact edits and no more than "
+        "updates object with exact edits and no more than "
         f"{AUTHOR_PATCH_MAX_SOURCE_CHARS} characters total across old and new source text. "
         "Use unique excerpts and do not rewrite complete programs."
     )
@@ -1244,7 +1243,6 @@ def apply_authoring_patch(previous, response):
     if not isinstance(updates, dict) or not updates or set(updates) - ATTEMPT_FIELDS:
         raise ValidationError("authoring updates may change only executor_source, validator_source or experiment_intent")
     result = deepcopy_config(previous)
-    edit_count = 0
     source_edit_chars = 0
 
     def merge(target, patch):
@@ -1283,10 +1281,6 @@ def apply_authoring_patch(previous, response):
                 or not isinstance(value["edits"], list) or not value["edits"]
                 or not isinstance(result.get(name), str)):
             raise ValidationError(f"{name} repair requires complete source or a nonempty exact edits list")
-        if edit_count + len(value["edits"]) > AUTHOR_PATCH_MAX_EDITS:
-            raise ValidationError(
-                f"authoring patch exceeds the bounded source-edit limit of "
-                f"{AUTHOR_PATCH_MAX_EDITS} edits")
         source = result[name]
         for edit in value["edits"]:
             if (not isinstance(edit, dict) or set(edit) != {"old", "new"}
@@ -1294,7 +1288,6 @@ def apply_authoring_patch(previous, response):
                     or not isinstance(edit["new"], str)):
                 raise ValidationError(f"{name} edit requires nonempty old text and string new text")
             source_edit_chars += len(edit["old"]) + len(edit["new"])
-            edit_count += 1
             if source_edit_chars > AUTHOR_PATCH_MAX_SOURCE_CHARS:
                 raise ValidationError(
                     f"authoring patch exceeds the bounded source-edit limit of "
@@ -1756,6 +1749,7 @@ def _reconcile_prior_blocking_issues(prior_issues, review):
 
 
 def _compact_repair_findings(value):
+    """Preserve the current rejection's complete repair obligations."""
     if not isinstance(value, dict):
         return {}
     result = {
@@ -1763,81 +1757,21 @@ def _compact_repair_findings(value):
         for key in ("decision", "gate")
         if isinstance(value.get(key), str)
     }
-    raw_checks = value.get("failed_checks")
-    raw_findings = value.get("findings")
-    raw_mismatches = value.get("metric_mismatches")
-    checks = [item for item in (raw_checks if isinstance(raw_checks, list) else [])
-              if isinstance(item, dict)]
-    findings = [item for item in (raw_findings if isinstance(raw_findings, list) else [])
-                if isinstance(item, dict)]
-    mismatches = [item for item in (raw_mismatches if isinstance(raw_mismatches, list) else [])
-                  if isinstance(item, dict)]
-    blocking = [item for item in findings if item.get("severity") == "blocking"]
-    active_finding = blocking[0] if blocking else None
-    active_check = checks[0] if checks and active_finding is None else None
-    active_mismatch = mismatches[0] if mismatches and not (active_finding or active_check) else None
-
-    def compact(item, keys):
-        compacted = {}
-        for key in keys:
-            if key not in item:
-                continue
-            item_value = item[key]
-            compacted[key] = (
-                item_value if item_value is None or type(item_value) in (bool, int, float)
-                else _bounded_repair_text(item_value, 1200)
-            )
-        return compacted
-
-    if active_finding is not None:
-        result["findings"] = [{
-            key: _bounded_repair_text(active_finding[key], 1200)
-            for key in ("severity", "finding", "evidence", "required_change")
-            if key in active_finding
-        }]
-    else:
-        result["findings"] = []
-    if active_check is not None:
-        result["failed_checks"] = [compact(
-            active_check, ("id", "outcome", "evidence", "severity", "finding", "required_change"))]
-    if active_mismatch is not None:
-        if "metric_id" in active_mismatch:
-            result["metric_mismatches"] = [compact(
-                active_mismatch, ("metric_id", "reported_value", "recalculated_value",
-                                  "tolerance", "matches"))]
-        else:
-            result["metric_mismatches"] = [compact(
-                active_mismatch, ("metric", "expected", "observed"))]
-
-    active_check_index = 0 if active_check is not None else None
-    deferred_check_ids = [
-        _bounded_repair_text(item.get("id", "unknown"), 120)
-        for index, item in enumerate(checks)
-        if index != active_check_index
-    ]
-    if deferred_check_ids:
-        result["deferred_failed_check_ids"] = deferred_check_ids
-    active_mismatch_index = 0 if active_mismatch is not None else None
-    deferred_metric_ids = [
-        _bounded_repair_text(item.get("metric_id", item.get("metric", "unknown")), 120)
-        for index, item in enumerate(mismatches)
-        if index != active_mismatch_index
-    ]
-    if deferred_metric_ids:
-        result["deferred_metric_ids"] = deferred_metric_ids
-
+    for key in ("failed_checks", "findings", "metric_mismatches"):
+        items = value.get(key)
+        result[key] = [deepcopy_config(item) for item in items
+                       if isinstance(item, dict)] if isinstance(items, list) else []
+    blocking = [item for item in result["findings"]
+                if item.get("severity") == "blocking"]
     result["repair_scope"] = {
-        "policy": "one_issue_per_candidate_revision",
-        "active_issue": (
-            "blocking_finding" if active_finding is not None else
-            "failed_check" if active_check is not None else
-            "metric_mismatch" if active_mismatch is not None else "none"
-        ),
-        "deferred_blocking_findings": max(0, len(blocking) - (active_finding is not None)),
-        "deferred_warning_findings": sum(
-            item.get("severity") == "warning" for item in findings),
-        "deferred_failed_checks": len(deferred_check_ids),
-        "deferred_metric_mismatches": len(deferred_metric_ids),
+        "policy": "current_candidate_blocking_set",
+        "active_issue": ("blocking_set" if blocking or result["failed_checks"]
+                         or result["metric_mismatches"] else "none"),
+        "blocking_findings": len(blocking),
+        "warning_findings": sum(item.get("severity") == "warning"
+                                for item in result["findings"]),
+        "failed_checks": len(result["failed_checks"]),
+        "metric_mismatches": len(result["metric_mismatches"]),
     }
     return result
 
@@ -1984,20 +1918,20 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
     repair_scope = deepcopy_config(compact_feedback.get("repair_scope", {}))
     active_issue = repair_scope.get("active_issue", "none")
     if candidate_failure:
-        repair_scope = {"policy": "one_issue_per_candidate_revision",
+        repair_scope = {"policy": "candidate_output_contract",
                         "active_issue": "candidate_failure",
                         "gate": candidate_failure.get("gate")}
     elif active_issue != "none" and "previous_error" in format_details:
         format_details["previous_error"] = (
             "The prior response did not satisfy the requested JSON format. Return one complete JSON "
-            "object matching output_contract and address only the single active issue below; "
-            "deferred scientific findings remain recorded for later review."
+            "object matching output_contract and address the complete current blocking set below. "
+            "Independent review will reassess every issue against the revised candidate."
         )
     format_error = format_details.get("previous_error")
     previous_error_source = candidate_failure.get("error") or feedback or format_error
     previous_error = (
         f"The prior candidate failed {compact_feedback.get('gate', 'validation')}; "
-        "see the single active issue below."
+        "see the complete current blocking set below."
         if active_issue != "none" and not candidate_failure
         else _bounded_repair_text(previous_error_source, 2200)
     )
@@ -2034,9 +1968,14 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
         "output_contract": output_contract,
         "instructions": (
             "Return exactly one JSON object with only the updates key. Make the smallest exact source edits "
-            "that resolve only the single active issue identified in repair_request.repair_scope. Do not attempt deferred "
-            "findings or checks in this revision; they remain recorded and will be independently reviewed "
-            "after the candidate is replayed. Preserve the frozen estimand and controller-owned inputs; "
+            "within repair_request.repair_scope. For a scientific rejection, diagnose all current blocking "
+            "findings, failed checks and metric mismatches together, including shared root causes. "
+            "Address them coherently in this revision; warnings are advisory rather than admission blockers. "
+            "If an obligation requires changing a frozen scientific definition, preserve that definition "
+            "and leave the issue for Methods adjudication instead of silently changing the question. "
+            "For a candidate output-contract failure, repair only that contract and preserve scientific "
+            "calculations and design. Independent review will reassess every retained issue against "
+            "the fresh execution. Preserve the frozen estimand and controller-owned inputs; "
             "do not change results or invent observations. "
             + REPAIR_CHECK_PHASE_RULE + " "
             "Do not emit internal reasoning, deliberation, alternative hypotheses, or narration. "
@@ -2048,8 +1987,8 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
             "choose the physical line_start to retain. The structural patch can remove only "
             "other duplicate declarations, never arbitrary line ranges. The source_sha256 must match the "
             "current source context. Otherwise use exact edits whose old source excerpt occurs exactly once. "
-            "Use at most "
-            f"{AUTHOR_PATCH_MAX_EDITS} edits and no more than {AUTHOR_PATCH_MAX_SOURCE_CHARS} "
+            "Use exact edits with no more than "
+            f"{AUTHOR_PATCH_MAX_SOURCE_CHARS} "
             "characters total across old and new source text. If the reported failure is only an "
             "output-shape mismatch, repair that shape and leave the scientific design unchanged."
         ),
@@ -4451,7 +4390,7 @@ class CapabilityFoundry:
                         "validation_feedback_candidate_sha256"),
                     "repair_protocol": {
                         "sequence": [
-                            "diagnose the first invalid scientific assumption from the exact trace",
+                            "diagnose all current blocking issues and shared root causes from the exact trace",
                             "edit the executor and validator source when the mechanism or estimand is wrong",
                             "rerun in a fresh sandbox and preserve raw observations",
                             "independently recalculate every primary outcome before review",
@@ -4466,7 +4405,7 @@ class CapabilityFoundry:
                             "return an unchanged candidate with a renamed threshold",
                         ],
                     },
-                    "instructions": "Fix only the reported failure. Never call open(), eval(), exec(), "
+                    "instructions": "Resolve the current blocking set coherently. Never call open(), eval(), exec(), "
                                     "compile(), input() or __import__(); use Path.write_bytes for files.",
                 }
                 if isinstance(last_attempt, dict) and PRODUCER_FIELDS.issubset(last_attempt):
