@@ -18,6 +18,7 @@ def study_evidence_contract():
     return {
         "revision": "computational-study-evidence-1",
         "plan_field": "experiment_intent.evidence_plan",
+        "plan_type": "nonempty array of entry_shape objects; no revision/entries wrapper",
         "entry_shape": {
             "id": "unique bounded lowercase identifier",
             "kind": "baseline_reproduction | uncertainty | control | sensitivity | external_validation",

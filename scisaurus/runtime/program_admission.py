@@ -312,6 +312,50 @@ def validate_experiment_intent(intent):
         raise ExperimentIntentContractError(str(exc)) from exc
 
 
+def format_recovery_intent_constraints(intent, required, *, configured_input, evidence_required=False):
+    """Freeze validated declarations without promoting malformed response fields."""
+    from copy import deepcopy
+    from scisaurus.runtime.study_evidence import evidence_source_refs, validate_evidence_plan
+
+    if not isinstance(intent, dict) or not isinstance(required, dict):
+        raise ExperimentIntentContractError("format recovery intent and controller constraints must be objects")
+    source_refs = evidence_source_refs(configured_input)
+    base = {key: deepcopy(value) for key, value in intent.items()
+            if key in INTENT_FIELDS or key == "quality_contract"}
+    # Base declarations must validate before any authored science becomes a constraint.
+    # A malformed base stays a response failure rather than an executable frozen plan.
+    validate_experiment_intent(base)
+    constraints = deepcopy(base)
+    diagnostics = {key: "experiment_intent field is not declared by the response contract"
+                   for key in set(intent) - (INTENT_FIELDS | {"quality_contract"} | INTENT_EXTENSIONS)}
+    groups = (("model_definition",), ("decision_outcomes", "decision_rules"), ("evidence_plan",))
+    for group in groups:
+        fields = {key: deepcopy(intent[key]) for key in group if key in intent}
+        if not fields:
+            continue
+        trial = {**constraints, **fields}
+        try:
+            validate_experiment_intent(trial)
+            if "evidence_plan" in fields:
+                validate_evidence_plan(trial, required=evidence_required, source_refs=source_refs)
+        except ModelDefinitionError:
+            raise
+        except ExperimentIntentContractError as exc:
+            diagnostics.update({key: str(exc) for key in fields})
+        except ValidationError as exc:
+            diagnostics.update({key: str(exc) for key in fields})
+        else:
+            constraints.update(fields)
+    if evidence_required and "evidence_plan" not in intent:
+        diagnostics["evidence_plan"] = "new computational study requires experiment_intent.evidence_plan"
+    # Controller constraints remain authoritative, including when the response disagrees.
+    # Invalid controller declarations cannot be repaired by releasing their constraints.
+    constraints.update(deepcopy(required))
+    validate_experiment_intent(constraints)
+    validate_evidence_plan(constraints, source_refs=source_refs)
+    return constraints, diagnostics
+
+
 def validate_program_candidate(value):
     """Validate one model-proposed program candidate before any execution."""
     if not isinstance(value, dict) or set(value) != CANDIDATE_FIELDS:

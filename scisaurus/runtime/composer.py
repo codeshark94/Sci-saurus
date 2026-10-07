@@ -97,7 +97,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-development-foundry-study-evidence-diagnostics-29")
+    "experiment-development-foundry-validated-format-constraints-30")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -14274,9 +14274,19 @@ class ComposerRunner:
                     assignment = frozen_work["assignment"]
                     author_brief = assignment["capability_brief"]
                     foundry_input = deepcopy(assignment["configured_input"])
-                    required_intent = deepcopy(
-                        (frozen_work.get("last_attempt") or {}).get("experiment_intent")
-                        or assignment.get("required_intent_fields") or {})
+                    authored_intent = (frozen_work.get("last_attempt") or {}).get("experiment_intent")
+                    required_intent = deepcopy(assignment.get("required_intent_fields") or {})
+                    if authored_intent:
+                        from scisaurus.runtime.program_admission import format_recovery_intent_constraints
+                        required_intent, contract_errors = format_recovery_intent_constraints(
+                            authored_intent, required_intent, configured_input=foundry_input,
+                            evidence_required=(frozen_work.get("study_evidence_plan_required") is True
+                                               or assignment.get("evidence_plan_required") is True))
+                        self.department_activity.append({
+                            "action": "validate_format_recovery_constraints",
+                            "foundry_work_ref": frozen_work_ref,
+                            "invalid_authored_fields": contract_errors,
+                        })
                     repair_provenance = deepcopy(frozen_work.get("repair_provenance"))
                 outcome = foundry.generate(
                     author_brief,

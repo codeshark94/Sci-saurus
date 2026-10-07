@@ -12,7 +12,9 @@ from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.capability_foundry import candidate_prompt
 from scisaurus.runtime.experiment import bind_deterministic_validation, validate_deterministic_validation
 from scisaurus.runtime.measurement_contract import recalculation_outcomes
-from scisaurus.runtime.program_admission import validate_program_candidate
+from scisaurus.runtime.program_admission import (
+    format_recovery_intent_constraints, validate_program_candidate,
+)
 from scisaurus.runtime.research_quality import build_research_design
 from scisaurus.runtime.study_evidence import (
     EVIDENCE_KINDS, evidence_source_refs, study_evidence_contract, validate_evidence_plan,
@@ -54,6 +56,48 @@ def document():
 
 
 class StudyEvidenceTests(unittest.TestCase):
+    def test_format_recovery_freezes_valid_fields_without_freezing_invalid_extension(self):
+        valid = planned_intent()
+        malformed = deepcopy(valid)
+        malformed["evidence_plan"] = {"revision": "computational-study-evidence-1",
+                                      "entries": deepcopy(valid["evidence_plan"])}
+        before = deepcopy(malformed)
+        required = {key: deepcopy(valid[key]) for key in ("domain", "research_question", "revision")}
+        configured = {"scientific_software": {"selection": {
+            "scientific_source_refs": ["artifact:kb/reference@1"]}}}
+        frozen, errors = format_recovery_intent_constraints(malformed, required, configured_input=configured)
+        self.assertEqual(frozen, {key: value for key, value in valid.items() if key != "evidence_plan"})
+        self.assertEqual(errors, {"evidence_plan": "evidence_plan must be a nonempty list"})
+        self.assertEqual(malformed, before)
+        repaired = deepcopy(malformed); repaired["evidence_plan"] = deepcopy(valid["evidence_plan"])
+        from scisaurus.runtime.program_admission import validate_experiment_intent
+        validate_experiment_intent(repaired)
+        self.assertTrue(all(repaired[key] == value for key, value in frozen.items()))
+        frozen_valid, errors = format_recovery_intent_constraints(valid, required, configured_input=configured)
+        self.assertEqual(frozen_valid, valid)
+        self.assertEqual(errors, {})
+        with self.assertRaisesRegex(ValidationError, "nonempty list"):
+            format_recovery_intent_constraints(malformed, malformed, configured_input=configured)
+
+    def test_format_recovery_rejects_invalid_base_and_retains_source_validation(self):
+        valid = planned_intent()
+        malformed = deepcopy(valid); malformed["seed"] = True
+        with self.assertRaises(ValidationError):
+            format_recovery_intent_constraints(malformed, {}, configured_input={})
+        frozen, errors = format_recovery_intent_constraints(valid, {}, configured_input={})
+        self.assertNotIn("evidence_plan", frozen)
+        self.assertIn("acquired source catalog", errors["evidence_plan"])
+        self.assertEqual(frozen["hypothesis"], valid["hypothesis"])
+        self.assertEqual(frozen["parameters"], valid["parameters"])
+        self.assertEqual(frozen["primary_outcomes"], valid["primary_outcomes"])
+        self.assertEqual(frozen["limitations"], valid["limitations"])
+        missing = deepcopy(valid); missing["evidence_plan"] = None
+        frozen, errors = format_recovery_intent_constraints(missing, {}, configured_input={}, evidence_required=True)
+        self.assertNotIn("evidence_plan", frozen)
+        self.assertIn("requires", errors["evidence_plan"])
+        with self.assertRaisesRegex(ValidationError, "configured_input"):
+            format_recovery_intent_constraints(valid, {}, configured_input=None)
+
     def test_legacy_intent_remains_byte_equivalent(self):
         intent = candidate()["experiment_intent"]
         before = json.dumps(intent, sort_keys=True)
