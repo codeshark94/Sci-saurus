@@ -403,7 +403,7 @@ def _safe_value(value, *, depth=0):
             if str(key) in {"candidate_program", "prior_plan_review", "repair_evidence_request",
                             "repair_evidence_note", "repair_adjudication", "repair_contract",
                             "prior_evidence_review", "evidence_experiment_intent", "foundry_execution_evidence",
-                            "question_alignment"}:
+                            "question_alignment", "admitted_model_definition"}:
                 output[key] = _preserve_response_value(item)
                 continue
             output[key] = _safe_value(item, depth=depth + 1)
@@ -450,7 +450,7 @@ def _bounded_value(value, *, depth=0, max_depth=5, max_keys=64, max_items=24,
             if str(key) in {"candidate_program", "prior_plan_review", "repair_evidence_request",
                             "repair_evidence_note", "repair_adjudication", "repair_contract",
                             "prior_evidence_review", "evidence_experiment_intent", "foundry_execution_evidence",
-                            "question_alignment"}:
+                            "question_alignment", "admitted_model_definition"}:
                 output[key] = _preserve_response_value(item)
                 continue
             if index >= max_keys:
@@ -713,6 +713,8 @@ def _repair_candidate_program(repair_packet):
         "experiment_intent": _bounded_value(
             attempt.get("experiment_intent", {}), max_depth=5,
             max_keys=24, max_items=12, max_text=1800),
+        "admitted_model_definition": _preserve_response_value(
+            repair_packet.get("admitted_model_definition", {"available": False})),
         "exact_execution_sources": source_files,
         "source_authority": (
             "Use exact_execution_sources when complete is true. Concatenate each file's "

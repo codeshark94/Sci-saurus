@@ -95,7 +95,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-development-foundry-program-artifact-23")
+    "experiment-development-foundry-admitted-definition-24")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -9450,7 +9450,7 @@ class ComposerRunner:
         if isinstance(value, dict):
             output = {}
             for index, (key, item) in enumerate(value.items()):
-                if str(key) in {"foundry_execution_evidence", "current_foundry_failure"}:
+                if str(key) in {"foundry_execution_evidence", "current_foundry_failure", "admitted_model_definition"}:
                     output[str(key)] = _preserve_response_value(item)
                     continue
                 if index >= max_keys:
@@ -11748,6 +11748,8 @@ class ComposerRunner:
             "prior_foundry_work": foundry_failure,
             "foundry_source_applicable_to_execution": source_applicability,
             "exact_candidate_sources": exact_candidate_sources,
+            "admitted_model_definition": deepcopy(verified_dossier.get("admitted_model_definition"))
+            if verified_dossier else {"available": False, "reason": "Failure identity is unverified."},
             "experiment_repair_plan": self._capability_repair_projection(
                 repair_plan, max_text=4200),
             "experiment_repair_history": self._capability_repair_projection(
@@ -11935,6 +11937,7 @@ class ComposerRunner:
             "stage_id": stage.get("id"),
             "topic": packet.get("topic"),
             "experiment_intent": intent,
+            "admitted_model_definition": (packet.get("admitted_model_definition") or {}).get("definition"),
             "question_alignment": packet.get("question_alignment"),
             "candidate_sources": {
                 name: {
@@ -11973,10 +11976,11 @@ class ComposerRunner:
             "unresolved_execution_evidence": unresolved_identity,
             "unresolved_execution_sources": unresolved_source_identity,
         })).hexdigest()
-        execution_evidence = packet.pop("foundry_execution_evidence", {})
+        complete_evidence = {name: packet.pop(name, {}) for name in (
+            "foundry_execution_evidence", "admitted_model_definition")}
         packet = self._capability_repair_projection(
             packet, max_depth=9, max_text=CAPABILITY_REPAIR_SOURCE_CHARS)
-        packet["foundry_execution_evidence"] = execution_evidence
+        packet.update(complete_evidence)
         semantic_packet = deepcopy(packet)
         semantic_packet["repair_prompt_revision"] = CAPABILITY_REPAIR_PANEL_PROMPT_REVISION
         semantic_packet.pop("continuation_cycle", None)
@@ -12578,9 +12582,13 @@ class ComposerRunner:
         if not isinstance(survey_refs, dict):
             survey_refs = packet.get("survey_refs")
         survey_refs = survey_refs if isinstance(survey_refs, dict) else {}
+        admitted_model = packet.get("admitted_model_definition")
+        admitted_model = admitted_model if isinstance(admitted_model, dict) else {}
         evidence = {
             "contract_revision": CAPABILITY_REPAIR_REVIEW_EVIDENCE_REVISION,
             "foundry_execution_evidence": packet.get("foundry_execution_evidence"),
+            "admitted_model_definition": {key: admitted_model.get(key) for key in (
+                "available", "definition", "scientific_source_refs")},
             "topic": {key: topic.get(key) for key in (
                 "id", "title", "domain", "research_question", "scope",
                 "comparison", "measurement", "disconfirmation_test", "resource_plan",
@@ -22652,6 +22660,22 @@ class ComposerRunner:
             len(all_acceptance_checks) - len(acceptance_checks)
         )
 
+        admitted_model = {"available": False, "reason": "No verified custom-model assignment is available."}
+        if foundry_cache_identity_verified:
+            assignment = foundry_cache.get("assignment")
+            assignment_input = assignment.get("configured_input", {}) if isinstance(assignment, dict) else {}
+            software = assignment_input.get("scientific_software", {}) if isinstance(assignment_input, dict) else {}
+            selection = software.get("selection", {}) if isinstance(software, dict) else {}
+            if isinstance(selection, dict) and selection.get("strategy") == "custom_model" and isinstance(selection.get("model_definition"), dict):
+                admitted_model = {
+                    "available": True,
+                    "definition": deepcopy(selection["model_definition"]),
+                    "scientific_source_refs": deepcopy(selection.get("scientific_source_refs", [])),
+                    "assessment_ref": software.get("assessment_ref"),
+                    "foundry_work_ref": foundry_cache_ref,
+                    "foundry_work_body_sha256": foundry_cache_body_hash,
+                    "authority": "Frozen software selection in this failed Foundry assignment; comparison contract, not an observed result.",
+                }
         evidence = {
             "artifact_ref": artifact_ref,
             "artifact_body_sha256": dossier_body_hash,
@@ -22675,6 +22699,7 @@ class ComposerRunner:
                 "acceptance_check_lineage_conflicts": omitted_acceptance_check_lineage_count,
             },
             "experiment_intent": last_attempt.get("experiment_intent"),
+            "admitted_model_definition": admitted_model,
             "candidate_input_sha256": hashlib.sha256(canonical_bytes({
                 key: last_attempt.get(key) for key in (
                     "experiment_intent", "runtime", "test_input", "source_integrity")})).hexdigest(),
@@ -22741,6 +22766,7 @@ class ComposerRunner:
                     raise ValidationError("Methods repair subject conflicts with newly produced candidate evidence")
             for key in ("experiment_intent", "candidate_input_sha256", "validation_context_sha256",
                         "topic_identity", "source_integrity", "source_files", "foundry_execution_evidence",
+                        "admitted_model_definition",
                         "runtime", "test_input", "program_snapshot", "prior_foundry_feedback",
                         "foundry_work_artifact_ref", "foundry_work_body_sha256",
                         "foundry_work_body_verified", "foundry_work_identity_verified",
@@ -22752,10 +22778,11 @@ class ComposerRunner:
             evidence["scientific_failure_error"] = origin.get("scientific_failure_error", origin.get("error"))
             evidence["scientific_observed_result"] = deepcopy(
                 origin.get("scientific_observed_result", origin.get("observed_result")))
-        execution_evidence = evidence.pop("foundry_execution_evidence", {})
+        complete_evidence = {name: evidence.pop(name, {}) for name in (
+            "foundry_execution_evidence", "admitted_model_definition")}
         projected = self._capability_repair_projection(
             evidence, max_depth=7, max_keys=40, max_items=12, max_text=20_000)
-        projected["foundry_execution_evidence"] = execution_evidence
+        projected.update(complete_evidence)
         return projected
 
     def _experiment_ancestor_stage_id(self, stage):

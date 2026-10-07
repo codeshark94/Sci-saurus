@@ -377,6 +377,69 @@ class MeasurementContractTests(unittest.TestCase):
             self.assertEqual(state['last_attempt']['experiment_intent']['parameters']['a'], 3)
             self.assertEqual(producer.calls, 1)
 
+    def test_admitted_definition_is_required_and_omission_is_a_contract_error(self):
+        from scisaurus.tests.test_capability_foundry import CapabilityFoundryTests, StubClient
+        from scisaurus.runtime.model_work import ModelWorkBlocked
+        from scisaurus.runtime.failure_recovery import classify_failure
+        selection = {'strategy': 'custom_model', 'model_definition': model_definition(),
+                     'scientific_source_refs': ['captured-source']}
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path); foundry = CapabilityFoundryTests._foundry(root)
+            foundry.max_attempts = 1
+            cache = CapabilityFoundryTests._cache(self, root)
+            payload = CapabilityFoundryTests._payload()
+            payload['test_input'] = {'scientific_software': {'selection': selection}}
+            author = StubClient(payload)
+            required = {'domain': payload['experiment_intent']['domain']}; original = deepcopy(required)
+            with self.assertRaises(ModelWorkBlocked) as caught, patch.object(foundry, '_execute') as execution:
+                foundry.generate('declared question', test_input={'scientific_software': {'selection': selection}},
+                                 required_intent=required, client=author, work_cache=cache)
+            self.assertNotIsInstance(caught.exception, ScientificDefinitionError)
+            self.assertEqual(classify_failure('experiment', caught.exception), 'model_contract')
+            execution.assert_not_called()
+            state = cache.entries()[0]; assignment = state['assignment']
+            self.assertEqual(assignment['required_intent_fields']['model_definition'], selection['model_definition'])
+            self.assertEqual(assignment['output_contract']['experiment_intent']['model_definition'], selection['model_definition'])
+            self.assertNotIn('model_definition', assignment['optional_intent_fields'])
+            self.assertEqual(required, original)
+
+    def test_partial_admitted_definition_is_an_author_contract_error(self):
+        from scisaurus.tests.test_capability_foundry import CapabilityFoundryTests, StubClient
+        from scisaurus.runtime.model_work import ModelWorkBlocked
+        from scisaurus.runtime.failure_recovery import classify_failure
+        selection = {'strategy': 'custom_model', 'model_definition': model_definition(),
+                     'scientific_source_refs': ['captured-source']}
+        for definition in ({}, {'equations': []}, {**model_definition(), 'parameters': 'invalid'}):
+            with self.subTest(definition=definition), tempfile.TemporaryDirectory() as path:
+                root = Path(path); foundry = CapabilityFoundryTests._foundry(root)
+                foundry.max_attempts = 1
+                cache = CapabilityFoundryTests._cache(self, root)
+                payload = CapabilityFoundryTests._payload()
+                payload['test_input'] = {'scientific_software': {'selection': selection}}
+                payload['experiment_intent']['model_definition'] = definition
+                with self.assertRaises(ModelWorkBlocked) as caught, patch.object(foundry, '_execute') as execution:
+                    foundry.generate('declared question', test_input=payload['test_input'],
+                                     client=StubClient(payload), work_cache=cache)
+                self.assertEqual(classify_failure('experiment', caught.exception), 'model_contract')
+                self.assertNotIsInstance(caught.exception, ScientificDefinitionError)
+                execution.assert_not_called()
+                self.assertEqual(cache.entries()[0]['last_attempt']['experiment_intent']['model_definition'], definition)
+
+    def test_changed_admitted_definition_still_requires_methods(self):
+        from scisaurus.tests.test_capability_foundry import CapabilityFoundryTests, StubClient
+        selection = {'strategy': 'custom_model', 'model_definition': model_definition(),
+                     'scientific_source_refs': ['captured-source']}
+        payload = CapabilityFoundryTests._payload()
+        payload['test_input'] = {'scientific_software': {'selection': selection}}
+        payload['experiment_intent']['model_definition'] = model_definition()
+        payload['experiment_intent']['model_definition']['equations'][0]['expression'] = 'y = a*x*x'
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path); foundry = CapabilityFoundryTests._foundry(root)
+            with self.assertRaises(ScientificDefinitionError), patch.object(foundry, '_execute') as execution:
+                foundry.generate('declared question', test_input={'scientific_software': {'selection': selection}},
+                                 client=StubClient(payload))
+            execution.assert_not_called()
+
 class IndependentProgramRecoveryTests(unittest.TestCase):
     def fixture(self, root):
         from scisaurus.tests.test_capability_foundry import CapabilityFoundryTests, StubClient

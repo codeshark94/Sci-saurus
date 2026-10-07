@@ -1185,8 +1185,8 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
         for key, value in required_intent.items():
             if key == "quality_contract":
                 continue
-            if key in prompt["output_contract"]["experiment_intent"]:
-                prompt["output_contract"]["experiment_intent"][key] = deepcopy_config(value)
+            prompt["output_contract"]["experiment_intent"][key] = deepcopy_config(value)
+            prompt["optional_intent_fields"].pop(key, None)
         prompt["constraints"].append(
             "copy every supplied required_intent_fields value exactly into experiment_intent; do not broaden, "
             "rename, paraphrase, or substitute the admitted scientific question")
@@ -2380,6 +2380,12 @@ class CapabilityFoundry:
                 error.stage_result = {"repair_verification_scope": "scientific_software_fitness",
                                       "scientific_software": deepcopy_config(configured_input.get("scientific_software"))}
                 raise error from exc
+            required_intent = deepcopy_config(required_intent or {})
+            definition = software_selection["model_definition"]
+            if ("model_definition" in required_intent
+                    and canonical_bytes(required_intent["model_definition"]) != canonical_bytes(definition)):
+                raise ScientificDefinitionError("required implementation intent conflicts with the admitted model definition")
+            required_intent["model_definition"] = deepcopy_config(definition)
         requires_source_data = _requires_source_data_manifest(brief)
         source_manifest = (configured_input.get("source_data_manifest")
                            if isinstance(configured_input, dict) else None)
@@ -4622,6 +4628,23 @@ class CapabilityFoundry:
                 if "test_input" in attempt_value and attempt_value["test_input"] != configured_input:
                     raise ValidationError("program author changed the controller-owned configured_input")
                 attempt_value = {**attempt_value, "runtime": runtime, "test_input": configured_input}
+                intent = attempt_value.get("experiment_intent")
+                if (software_selection.get("strategy") == "custom_model"
+                        and (not isinstance(intent, dict) or not isinstance(intent.get("model_definition"), dict))):
+                    raise ExperimentIntentContractError(
+                        "experiment_intent.model_definition is required; copy the supplied "
+                        "required_intent_fields.model_definition exactly")
+                if software_selection.get("strategy") == "custom_model":
+                    try:
+                        validate_model_definition(intent, required=True)
+                    except ModelDefinitionError:
+                        raise
+                    except ValidationError as exc:
+                        raise ExperimentIntentContractError(str(exc)) from exc
+                if (software_selection.get("strategy") == "custom_model"
+                        and isinstance(intent, dict) and isinstance(intent.get("model_definition"), dict)
+                        and canonical_bytes(intent["model_definition"]) != canonical_bytes(software_selection["model_definition"])):
+                    raise ScientificDefinitionError("implementation changed the admitted model definition; Methods must review a new definition before source repair")
                 if required_intent:
                     intent = attempt_value.get("experiment_intent")
                     if (isinstance(intent, dict)
@@ -4663,10 +4686,6 @@ class CapabilityFoundry:
                     })
                 executor = attempt_value["executor_source"]
                 validate_experiment_intent(attempt_value["experiment_intent"])
-                if software_selection.get("strategy") == "custom_model" and canonical_bytes(
-                        attempt_value["experiment_intent"].get("model_definition")) != canonical_bytes(software_selection["model_definition"]):
-                    raise ScientificDefinitionError("implementation changed the admitted model definition; Methods must review a new definition before source repair")
-
                 scan_program_source(executor, "program executor")
                 candidate_fingerprint = hashlib.sha256(canonical_bytes(attempt_value)).hexdigest()
                 failed_candidates = state.setdefault("failed_candidates", {})

@@ -9945,6 +9945,11 @@ class ComposerWorkflowTests(unittest.TestCase):
                 runner.close()
 
     def test_experiment_recovery_brief_carries_prior_failure_and_review_evidence(self):
+        from scisaurus.tests.test_harness_recovery import model_definition
+        definition = model_definition()
+        definition["parameters"] = [{**definition["parameters"][0], "id": f"parameter_{index}"}
+                                    for index in range(14)]
+        definition["claim_scope"] = "Bounded model scope " + "s" * 21_000
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
             runner = ComposerRunner(self._workflow(root))
@@ -9968,6 +9973,10 @@ class ComposerWorkflowTests(unittest.TestCase):
                     media_type="application/json",
                     body=json.dumps({
                         "status": "failed",
+                        "assignment": {"configured_input": {"scientific_software": {
+                            "assessment_ref": "artifact:command/scientific-software-assessments/fixture/receipt@1",
+                            "selection": {"strategy": "custom_model", "model_definition": definition,
+                                          "scientific_source_refs": ["captured-source"]}}}},
                         "last_attempt": {
                             "experiment_intent": {"hypothesis": "negative slope"},
                             "source_integrity": source_integrity,
@@ -10080,6 +10089,35 @@ class ComposerWorkflowTests(unittest.TestCase):
                                  failure_dossier["body_hash"])
                 self.assertEqual(dossier_evidence["input_sha256"], "a" * 64)
                 self.assertTrue(dossier_evidence["foundry_work_body_verified"])
+                admitted = dossier_evidence["admitted_model_definition"]
+                self.assertTrue(admitted["available"])
+                self.assertEqual(admitted["definition"], definition)
+                self.assertEqual(admitted["foundry_work_body_sha256"], foundry_cache["body_hash"])
+                child_dossier = runner.store.publish_artifact(
+                    logical_id="command/failure-recovery/experiment-attempt-4",
+                    artifact_type="report", author="command.composer", media_type="application/json",
+                    body=json.dumps({"stage_id": "experiment", "attempt_number": 4,
+                        "failure_class": "experiment_failure", "input_sha256": "b" * 64,
+                        "repair_phase": "pre_execution_plan_review", "repair_subject": {
+                            "stage_id": "experiment", "attempt_number": 3,
+                            "failure_dossier_ref": failure_dossier_ref,
+                            "failure_input_sha256": "a" * 64,
+                            "failure_dossier_body_sha256": failure_dossier["body_hash"]}}).encode())
+                runner.stage_records["experiment"]["attempts"].append({
+                    "attempt_number": 4, "failure_dossier_ref": child_dossier["artifact_ref"]})
+                inherited = runner._failure_dossier_evidence(child_dossier["artifact_ref"],
+                    expected_stage_id="experiment", expected_attempt_number=4)
+                self.assertEqual(inherited["admitted_model_definition"], admitted)
+                review_packet = {"admitted_model_definition": admitted}
+                digest = runner._capability_repair_review_input_sha256(review_packet)
+                changed_receipt = {**admitted, "foundry_work_ref": "artifact:command/foundry-work/later@2",
+                                   "foundry_work_body_sha256": "c" * 64}
+                self.assertEqual(digest, runner._capability_repair_review_input_sha256(
+                    {"admitted_model_definition": changed_receipt}))
+                changed_definition = deepcopy(definition)
+                changed_definition["equations"][0]["expression"] = "y = a*x*x"
+                self.assertNotEqual(digest, runner._capability_repair_review_input_sha256(
+                    {"admitted_model_definition": {**admitted, "definition": changed_definition}}))
                 executor_record = dossier_evidence["source_files"]["executor"]
                 validator_record = dossier_evidence["source_files"]["validator"]
                 self.assertEqual("".join(executor_record["source_chunks"]), executor_source)
@@ -10109,6 +10147,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                 projected = prompt["projected_input"]["failure_evidence"]
                 self.assertEqual(projected["failure_dossier_ref"], failure_dossier_ref)
                 self.assertNotIn("truncated_context", prompt)
+                self.assertEqual(projected["failure_dossier"]["admitted_model_definition"], admitted)
                 self.assertEqual("".join(projected["failure_dossier"]["source_files"]
                                          ["executor"]["source_chunks"]), executor_source)
                 self.assertEqual("".join(projected["failure_dossier"]["source_files"]
