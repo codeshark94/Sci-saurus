@@ -54,7 +54,8 @@ from scisaurus.runtime.specialists import (
     build_repair_adjudication_prompt, build_repair_evidence_prompt, build_specialist_prompt,
     build_verifier_prompt, redact_sensitive_text, _preserve_response_value, _repair_candidate_program,
     _normalise_verdict,
-    research_question_alignment, validate_decision_alignment, RESEARCH_QUESTION_ALIGNMENT_RULE,
+    research_question_alignment, validate_decision_alignment, repair_adjudication_evidence_document,
+    RESEARCH_QUESTION_ALIGNMENT_RULE,
 )
 from scisaurus.runtime.execution_policy import MODEL_COST_LIMITS, enforce_model_cost_limits, execution_policy
 from scisaurus.runtime.model_work import (ModelWorkBlocked, ModelWorkCache, ModelWorkProvenanceError,
@@ -12045,7 +12046,7 @@ class ComposerRunner:
         return packet
 
     @staticmethod
-    def _validated_capability_repair_plan(report, packet):
+    def _validated_capability_repair_plan(report, packet, *, reviewer_reports=(), prior_plan_review=None):
         """Accept one lineage-bound methods plan, never a bundle of suggestions."""
         if not isinstance(report, dict):
             return None, "the methods lead report is unavailable"
@@ -12153,7 +12154,8 @@ class ComposerRunner:
             return None, "the repair plan has invalid residual uncertainties"
         try:
             alignment_fields = validate_decision_alignment(
-                plan, {**packet, "candidate_program": _repair_candidate_program(packet)})
+                plan, repair_adjudication_evidence_document(
+                    packet, reviewer_reports, prior_plan_review=prior_plan_review))
         except ValidationError as exc:
             return None, str(exc)
         return {
@@ -12413,13 +12415,27 @@ class ComposerRunner:
         if (not isinstance(packet, dict)
                 or packet.get("input_sha256") != panel.get("input_sha256")):
             return False
+        reviewer_ids = panel.get("adjudication_reviewer_role_ids", [])
+        if (not isinstance(reviewer_ids, list)
+                or any(not isinstance(role_id, str) or not role_id for role_id in reviewer_ids)
+                or len(set(reviewer_ids)) != len(reviewer_ids)):
+            return False
+        reports = panel.get("reports", [])
+        if not isinstance(reports, list):
+            return False
+        reviewer_reports = []
+        for role_id in reviewer_ids:
+            matching = [report for report in reports if isinstance(report, dict) and report.get("role_id") == role_id]
+            if len(matching) != 1:
+                return False
+            reviewer_reports.append(matching[0])
         validated, error = cls._validated_capability_repair_plan({
             "status": "succeeded",
             "response": {
                 "decision": "repair",
                 "raw": {"repair_plan": panel["repair_plan"]},
             },
-        }, packet)
+        }, packet, reviewer_reports=reviewer_reports, prior_plan_review=panel.get("prior_plan_review"))
         if error is not None or validated is None:
             return False
         verifier = panel.get("verifier")
@@ -13673,7 +13689,8 @@ class ComposerRunner:
                 panel_stage, lead_assignment, lead_bundle)
             lead_report = lead_bundle.get("by_role", {}).get(lead.get("role_id"))
             repair_plan, plan_validation_error = self._validated_capability_repair_plan(
-                lead_report, packet)
+                lead_report, packet, reviewer_reports=reviewer_bundle.get("reports", []),
+                prior_plan_review=prior_plan_review)
             if repair_plan is not None:
                 repair_plan_source = "methods_lead_response"
             if repair_plan is None:
@@ -13807,6 +13824,8 @@ class ComposerRunner:
                 if isinstance(prior_context.get("repair_commands"), list) else []
             ),
             "reports": reports,
+            "adjudication_reviewer_role_ids": [report.get("role_id")
+                for report in reviewer_bundle.get("reports", []) if isinstance(report, dict)],
             "verifier": {
                 "status": verifier.get("status") if isinstance(verifier, dict) else None,
                 "error": (str(verifier.get("error", ""))[:1200]

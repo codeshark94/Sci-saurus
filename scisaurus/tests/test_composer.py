@@ -5428,6 +5428,81 @@ class ComposerWorkflowTests(unittest.TestCase):
             finally:
                 runner.close()
 
+    def test_repair_plan_citations_use_the_document_delivered_to_the_author(self):
+        from scisaurus.runtime.specialists import validate_decision_alignment
+        packet = {"topic": {"id": "topic"}, "failure_lineage": {
+            "identity_verified": True, "stage_id": "experiment", "attempt_number": 3,
+            "failure_dossier_ref": "artifact:failure/attempt-3@1", "failure_input_sha256": "a" * 64},
+            "question_alignment": {"original": {"research_question": "Which declared contrast is reproducible?",
+                "disconfirmation_test": "Use the declared contrast."}, "candidate": {
+                "primary_outcomes": [{"id": "contrast", "definition": "The declared contrast."}]}},
+            "prior_foundry_work": {"validation_feedback": {"failed_checks": [
+                {"evidence": "The current formula lacks a reference term. " + "x" * 1400}]}},
+            "repair_contract": {"must_prove": ["Independent recalculation."]}}
+        plan = {"disposition": "repair", "root_cause": {"statement": "The reference term is absent.",
+            "evidence": ["The exact current feedback identifies the missing term."]},
+            "required_changes": [{"target": "executor", "instruction": "Implement the declared reference term.",
+                "scientific_basis": "The fixed contrast requires its reference.", "source_refs": []}],
+            "acceptance_checks": [{"phase": "execution", "check": "Recalculate the fixed contrast."}],
+            "residual_uncertainties": []}
+        response = {"decision": "repair", "repair_plan": plan}
+        prompt = build_repair_adjudication_prompt({}, packet, [])
+        _align_repair_fixture(response, prompt)
+        plan["evidence_checks"] = [{"claim": "The current failure is source-bound.",
+            "pointer": "/repair_adjudication_packet/validation_feedback/failed_checks/0/evidence",
+            "quote": "The current formula lacks a reference term.", "disposition": "supported",
+            "explanation": "Restore the declared reference without changing the estimand."}]
+        before = deepcopy(packet), deepcopy(plan)
+        document = json.loads(prompt)["repair_adjudication_packet"]
+        validate_decision_alignment(plan, document)
+        report = {"status": "succeeded", "response": {"decision": "repair", "raw": {"repair_plan": plan}}}
+        normalized, error = ComposerRunner._validated_capability_repair_plan(report, packet)
+        self.assertIsNone(error)
+        self.assertEqual(normalized["evidence_checks"], plan["evidence_checks"])
+        self.assertEqual((packet, plan), before)
+        for pointer, quote in (("/repair_adjudication_packet/prior_foundry_work/validation_feedback/failed_checks/0/evidence",
+                                plan["evidence_checks"][0]["quote"]),
+                               (plan["evidence_checks"][0]["pointer"], "a fabricated reference"),
+                               (plan["evidence_checks"][0]["pointer"], "x" * 1250)):
+            changed = deepcopy(report)
+            changed["response"]["raw"]["repair_plan"]["evidence_checks"][0].update(pointer=pointer, quote=quote)
+            self.assertIsNone(ComposerRunner._validated_capability_repair_plan(changed, packet)[0])
+        reviewers = [{"role_id": "analysis", "status": "succeeded", "response": {
+            "findings": ["The independent reviewer confirms the missing reference."]}}]
+        prior_review = {"blocking_findings": ["The prior design lacked a reference."]}
+        for pointer, quote in (("/repair_adjudication_packet/reviewer_reports/0/findings/0",
+                                reviewers[0]["response"]["findings"][0]),
+                               ("/repair_adjudication_packet/prior_plan_review/blocking_findings/0",
+                                prior_review["blocking_findings"][0])):
+            with self.subTest(pointer=pointer):
+                scoped = deepcopy(report)
+                scoped["response"]["raw"]["repair_plan"]["evidence_checks"][0].update(pointer=pointer, quote=quote)
+                normalized, error = ComposerRunner._validated_capability_repair_plan(scoped, packet,
+                    reviewer_reports=reviewers, prior_plan_review=prior_review)
+                self.assertIsNone(error)
+                packet["input_sha256"] = "b" * 64
+                retained_reports = [{"role_id": row["role_id"], "status": row["status"],
+                                     **deepcopy(row["response"])} for row in reviewers]
+                panel = {"status": "completed", "decision": "repair", "packet": packet,
+                    "input_sha256": packet["input_sha256"], "repair_plan": normalized,
+                    "reports": retained_reports, "adjudication_reviewer_role_ids": ["analysis"],
+                    "prior_plan_review": prior_review,
+                    "verifier": {"status": "succeeded", "decision": "accept"}}
+                self.assertTrue(ComposerRunner._capability_repair_plan_admitted(panel))
+                changed = deepcopy(panel)
+                if "reviewer_reports" in pointer:
+                    changed["reports"][0]["findings"][0] = "Different evidence."
+                else:
+                    changed["prior_plan_review"]["blocking_findings"][0] = "Different evidence."
+                self.assertFalse(ComposerRunner._capability_repair_plan_admitted(changed))
+                for ids in (["missing"], ["analysis", "analysis"], [{}], None):
+                    changed = deepcopy(panel)
+                    changed["adjudication_reviewer_role_ids"] = ids
+                    self.assertFalse(ComposerRunner._capability_repair_plan_admitted(changed))
+                changed = deepcopy(panel)
+                changed["reports"].append(deepcopy(retained_reports[0]))
+                self.assertFalse(ComposerRunner._capability_repair_plan_admitted(changed))
+
     def test_capability_repair_plan_binds_current_lineage_not_model_echo(self):
         packet = {
             "topic": {"id": "direction_3"},

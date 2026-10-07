@@ -1503,14 +1503,13 @@ def build_specialist_prompt(assignment, stage_packet):
         max_input_tokens=quota.get("max_input_tokens"))
 
 
-def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports, *,
-                                     prior_plan_review=None):
-    """Ask the methods lead to reconcile reviews into one executable plan."""
+def repair_adjudication_evidence_document(repair_packet, reviewer_reports=(), *, prior_plan_review=None):
+    """Project the authoritative document used for repair-plan evidence citations."""
     compact_reports = []
     for report in reviewer_reports if isinstance(reviewer_reports, list) else []:
         if not isinstance(report, dict):
             continue
-        response = report.get("response") if isinstance(report.get("response"), dict) else {}
+        response = report.get("response") if isinstance(report.get("response"), dict) else report
         compact_reports.append({
             "role_id": report.get("role_id"),
             "assigned_role": report.get("assigned_role"),
@@ -1525,7 +1524,6 @@ def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports
             response.get("requested_actions", []), max_depth=2,
             max_keys=8, max_items=3, max_text=500),
         })
-    quota = assignment.get("quota") if isinstance(assignment.get("quota"), dict) else {}
     lineage = repair_packet.get("failure_lineage")
     lineage = lineage if isinstance(lineage, dict) else {}
     unresolved = repair_packet.get("unresolved_attempt_evidence")
@@ -1601,6 +1599,69 @@ def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports
                     "process_returncode", "observation_count", "metric_count")
                 if name in worker
             } for worker in related_workers[:4] if isinstance(worker, dict)]
+    return {
+        "failure_lineage": {
+            "stage_id": lineage.get("stage_id"),
+            "identity_verified": lineage.get("identity_verified") is True,
+            "failure_dossier_ref": lineage.get("failure_dossier_ref"),
+            "failed_stage_attempt_number": lineage.get("attempt_number"),
+            "failed_stage_input_sha256": lineage.get("failure_input_sha256"),
+            "failure_dossier_body_sha256": lineage.get(
+                "failure_dossier_body_sha256"),
+            "adjudication_packet_input_sha256": repair_packet.get("input_sha256"),
+            "digest_semantics": (
+                "failed_stage_input_sha256 identifies the failed experiment input; "
+                "adjudication_packet_input_sha256 identifies the evidence packet reviewed "
+                "here. They are not interchangeable."
+            ),
+        },
+        "topic": _bounded_value(repair_packet.get("topic", {}), max_depth=3,
+                                max_keys=16, max_items=6, max_text=1000),
+        "repair_contract": _preserve_response_value(repair_packet.get("repair_contract", {})),
+        "foundry_execution_evidence": _preserve_response_value(repair_packet.get("foundry_execution_evidence", {})),
+        "plan_review_failure": _bounded_value(
+            repair_packet.get("plan_review_failure", {}), max_depth=3,
+            max_keys=12, max_items=8, max_text=1400),
+        "failure": _bounded_value(repair_packet.get("failure", {}), max_depth=4,
+                                  max_keys=16, max_items=8, max_text=1400),
+        "observed_result": _bounded_value(
+            repair_packet.get("failure_observed_result", {}), max_depth=4,
+            max_keys=20, max_items=8, max_text=1200),
+        "prior_attempt_result": _bounded_value(
+            repair_packet.get("prior_attempt_result_evidence", {}), max_depth=5,
+            max_keys=24, max_items=10, max_text=1400),
+        "prior_attempt_result_history": _bounded_value(
+            repair_packet.get("prior_attempt_result_history", {}), max_depth=5,
+            max_keys=20, max_items=8, max_text=800),
+        "unresolved_attempt_evidence": _bounded_value(
+            projected_unresolved, max_depth=8, max_keys=24,
+            max_items=10, max_text=800),
+        "historical_execution_sources": _bounded_value(
+            repair_packet.get("unresolved_attempt_sources", []),
+            max_depth=4, max_keys=24, max_items=16, max_text=7000),
+        "candidate_program": _repair_candidate_program(repair_packet),
+        "question_alignment": _preserve_response_value(repair_packet.get("question_alignment", {})),
+        "program_snapshot": _bounded_value(
+            repair_packet.get("program_snapshot", []), max_depth=4,
+            max_keys=20, max_items=6, max_text=1800),
+        "validation_feedback": _bounded_value(
+            (repair_packet.get("prior_foundry_work") or {}).get(
+                "validation_feedback", {}), max_depth=4,
+            max_keys=16, max_items=8, max_text=1200),
+        "validation_context": _bounded_value(
+            (repair_packet.get("prior_foundry_work") or {}).get(
+                "validation_context", {}), max_depth=4,
+            max_keys=24, max_items=12, max_text=900),
+        "prior_plan_review": _preserve_response_value(
+            prior_plan_review if isinstance(prior_plan_review, dict) else {}),
+        "reviewer_reports": compact_reports,
+    }
+
+
+def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports, *,
+                                     prior_plan_review=None):
+    """Ask the methods lead to reconcile reviews into one executable plan."""
+    quota = assignment.get("quota") if isinstance(assignment.get("quota"), dict) else {}
     envelope = {
         "assignment": {
             "assigned_role": assignment.get("assigned_role"),
@@ -1609,63 +1670,8 @@ def build_repair_adjudication_prompt(assignment, repair_packet, reviewer_reports
             "system_contract": assignment.get("system_contract"),
         },
         "scientific_input_recovery": scientific_input_recovery_contract(),
-        "repair_adjudication_packet": {
-            "failure_lineage": {
-                "stage_id": lineage.get("stage_id"),
-                "identity_verified": lineage.get("identity_verified") is True,
-                "failure_dossier_ref": lineage.get("failure_dossier_ref"),
-                "failed_stage_attempt_number": lineage.get("attempt_number"),
-                "failed_stage_input_sha256": lineage.get("failure_input_sha256"),
-                "failure_dossier_body_sha256": lineage.get(
-                    "failure_dossier_body_sha256"),
-                "adjudication_packet_input_sha256": repair_packet.get("input_sha256"),
-                "digest_semantics": (
-                    "failed_stage_input_sha256 identifies the failed experiment input; "
-                    "adjudication_packet_input_sha256 identifies the evidence packet reviewed "
-                    "here. They are not interchangeable."
-                ),
-            },
-            "topic": _bounded_value(repair_packet.get("topic", {}), max_depth=3,
-                                    max_keys=16, max_items=6, max_text=1000),
-            "repair_contract": _preserve_response_value(repair_packet.get("repair_contract", {})),
-            "foundry_execution_evidence": _preserve_response_value(repair_packet.get("foundry_execution_evidence", {})),
-            "plan_review_failure": _bounded_value(
-                repair_packet.get("plan_review_failure", {}), max_depth=3,
-                max_keys=12, max_items=8, max_text=1400),
-            "failure": _bounded_value(repair_packet.get("failure", {}), max_depth=4,
-                                      max_keys=16, max_items=8, max_text=1400),
-            "observed_result": _bounded_value(
-                repair_packet.get("failure_observed_result", {}), max_depth=4,
-                max_keys=20, max_items=8, max_text=1200),
-            "prior_attempt_result": _bounded_value(
-                repair_packet.get("prior_attempt_result_evidence", {}), max_depth=5,
-                max_keys=24, max_items=10, max_text=1400),
-            "prior_attempt_result_history": _bounded_value(
-                repair_packet.get("prior_attempt_result_history", {}), max_depth=5,
-                max_keys=20, max_items=8, max_text=800),
-            "unresolved_attempt_evidence": _bounded_value(
-                projected_unresolved, max_depth=8, max_keys=24,
-                max_items=10, max_text=800),
-            "historical_execution_sources": _bounded_value(
-                repair_packet.get("unresolved_attempt_sources", []),
-                max_depth=4, max_keys=24, max_items=16, max_text=7000),
-            "candidate_program": _repair_candidate_program(repair_packet),
-            "question_alignment": _preserve_response_value(repair_packet.get("question_alignment", {})),
-            "program_snapshot": _bounded_value(
-                repair_packet.get("program_snapshot", []), max_depth=4,
-                max_keys=20, max_items=6, max_text=1800),
-            "validation_feedback": _bounded_value(
-                (repair_packet.get("prior_foundry_work") or {}).get(
-                    "validation_feedback", {}), max_depth=4,
-                max_keys=16, max_items=8, max_text=1200),
-            "validation_context": _bounded_value(
-                (repair_packet.get("prior_foundry_work") or {}).get(
-                    "validation_context", {}), max_depth=4,
-                max_keys=24, max_items=12, max_text=900),
-            "prior_plan_review": _preserve_response_value(
-                prior_plan_review if isinstance(prior_plan_review, dict) else {}),
-            "reviewer_reports": compact_reports,
-        },
+        "repair_adjudication_packet": repair_adjudication_evidence_document(
+            repair_packet, reviewer_reports, prior_plan_review=prior_plan_review),
         "decision_contract": {
             "purpose": "Select one scientifically defensible source/design repair before execution.",
             "rules": [
