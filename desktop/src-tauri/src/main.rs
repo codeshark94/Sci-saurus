@@ -160,23 +160,23 @@ fn launch(app: &tauri::AppHandle, host: &Host, workspace: Workspace) -> Result<C
     if !workspace.repository.join("scisaurus/cli.py").is_file()
         || !workspace.repository.join(".venv/bin/python").is_file()
     {
-        return Err("Choose a Sci-saurus repository with its .venv runtime installed.".into());
+        return Err("Choose a Sci-whale repository with its .venv runtime installed.".into());
     }
     if !workspace.workspace.is_dir() || !workspace.workspace.starts_with(&workspace.repository) {
-        return Err("The workspace must be inside the Sci-saurus repository.".into());
+        return Err("The workspace must be inside the Sci-whale repository.".into());
     }
     let config = config_path(app)?;
     fs::create_dir_all(config.parent().unwrap()).map_err(|e| e.to_string())?;
     let binary = if cfg!(debug_assertions) {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("binaries")
-            .join(format!("scisaurus-backend-{}", env!("SCISAURUS_TARGET")))
+            .join(format!("sciwhale-backend-{}", env!("SCIWHALE_TARGET")))
     } else {
         std::env::current_exe()
             .map_err(|e| e.to_string())?
             .parent()
             .unwrap()
-            .join("scisaurus-backend")
+            .join("sciwhale-backend")
     };
     let log = fs::OpenOptions::new()
         .create(true)
@@ -264,6 +264,21 @@ async fn connect_saved(
             })
         } else {
             let config = config_path(&app)?;
+            if !config.exists() {
+                let legacy = app.path().config_dir().map_err(|e| e.to_string())?
+                    .join("science.scisaurus.desktop").join("workspace.json");
+                if legacy.is_file() {
+                    let workspace: Workspace = serde_json::from_slice(
+                        &fs::read(&legacy).map_err(|e| e.to_string())?
+                    ).map_err(|e| e.to_string())?;
+                    fs::create_dir_all(config.parent().ok_or("Invalid application configuration path")?)
+                        .map_err(|e| e.to_string())?;
+                    let temporary = config.with_extension("json.tmp");
+                    fs::write(&temporary, serde_json::to_vec_pretty(&workspace).map_err(|e| e.to_string())?)
+                        .map_err(|e| e.to_string())?;
+                    fs::rename(temporary, &config).map_err(|e| e.to_string())?;
+                }
+            }
             if config.is_file() {
                 Some(
                     serde_json::from_slice::<Workspace>(
@@ -293,7 +308,7 @@ async fn choose_repository(
         let folder = app
             .dialog()
             .file()
-            .set_title("Choose the Sci-saurus repository")
+            .set_title("Choose the Sci-whale repository")
             .blocking_pick_folder();
         let Some(folder) = folder else {
             return Ok(None);
@@ -334,7 +349,7 @@ fn main() {
     let host = Host::default();
     let quit_host = host.clone();
     tauri::Builder::default()
-        .register_asynchronous_uri_scheme_protocol("scisaurus", |context, request, responder| {
+        .register_asynchronous_uri_scheme_protocol("sciwhale", |context, request, responder| {
             let host = context.app_handle().state::<Host>().inner().clone();
             std::thread::spawn(move || {
                 let response = backend_request(&host, request).unwrap_or_else(|error| {
@@ -388,7 +403,7 @@ fn main() {
             let navigation_host = host.clone();
             let handle = app.handle().clone();
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                .title("Sci-saurus")
+                .title("Sci-whale")
                 .inner_size(1440.0, 940.0)
                 .min_inner_size(1100.0, 720.0)
                 .on_navigation(move |url| {
@@ -400,7 +415,7 @@ fn main() {
                         .lock()
                         .ok()
                         .and_then(|backend| backend.connection.as_ref().map(|c| c.url.clone()));
-                    if url.scheme() == "scisaurus"
+                    if url.scheme() == "sciwhale"
                         && url.host_str() == Some("localhost")
                         && allowed.is_some()
                     {
@@ -438,7 +453,7 @@ fn main() {
                     Err(error) => {
                         app.dialog()
                             .message(error)
-                            .title("Sci-saurus backend")
+                            .title("Sci-whale backend")
                             .show(|_| {});
                     }
                     _ => {}

@@ -1,4 +1,4 @@
-# Sci-saurus — Execution Contract
+# Sci-whale — Execution Contract
 
 > **Version:** v0.8 · **Date:** 2026-09-10 · **Status:** normative proposed interface specification, not a software implementation.
 > Concepts and decision authority come from `00-SSOT.md`. This file defines the shared field vocabulary and lifecycle rules used by the architecture and examples. Changing an interface requires a `schema_version` change and a documented migration.

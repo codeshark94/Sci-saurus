@@ -1,4 +1,4 @@
-# Sci-saurus — P0 Contract Freeze Record
+# Sci-whale — P0 Contract Freeze Record
 
 > **Version:** v0.8 · **Date:** 2026-09-10 · **Status:** freeze record for [Roadmap §3](30-roadmap.md) (P0). Part of the v0.8 package; introduces no new decisions.
 > This record freezes user-facing principles, selects the first acceptance fixture, and fixes the deployment-configuration template. Principal sign-off (§6) is distinct from evidence of effective model behavior.

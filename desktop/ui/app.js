@@ -6,7 +6,7 @@ async function connect(command) {
     const connection = await window.__TAURI__.core.invoke(command);
     if (connection) { window.location.replace(connection.url); return; }
     status.textContent = "Choose your research workspace";
-    detail.textContent = "Select the Sci-saurus repository containing your runtime and missions.";
+    detail.textContent = "Select the Sci-whale repository containing your runtime and missions.";
   } catch (error) { status.textContent = "Backend unavailable"; detail.textContent = String(error); }
   for (const button of document.querySelectorAll("button")) button.disabled = false;
 }

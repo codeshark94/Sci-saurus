@@ -1,4 +1,4 @@
-# Sci-saurus — v1 Architecture
+# Sci-whale — v1 Architecture
 
 > **Document version:** v0.8 · **Date:** 2026-09-10 · **Status:** proposed implementation architecture.
 > The original filename is retained for continuity; “v0” in the filename is not this document's revision number.
@@ -37,7 +37,7 @@ A department is a persistent responsibility, backlog, memory scope, and authorit
 
 The primary feedback loop is observe mission state → compare possible activities → allocate concurrent work → independently verify useful changes → update the frontier and incumbent. Departmental stages constrain accepted commitment, while authorized provisional branches permit earlier exploration.
 
-Instantiate this organization per research project. Command, knowledge, task graph, mutable environments, credentials, and artifact authority are project-scoped. Shared GPU/provider capacity has aggregate admission accounting plus project attribution. The Sci-saurus code repository is the framework, not the shared mutable workspace of all research projects.
+Instantiate this organization per research project. Command, knowledge, task graph, mutable environments, credentials, and artifact authority are project-scoped. Shared GPU/provider capacity has aggregate admission accounting plus project attribution. The Sci-whale code repository is the framework, not the shared mutable workspace of all research projects.
 
 ## 2. Principal-facing command
 
@@ -440,7 +440,7 @@ A runner does not receive raw write access to the project, database, event log, 
 
 Artifact mutation additionally requires a valid EditGrant; a runner returns a ChangeSet rather than a replacement assembled document. Retrieval/API/MCP adapters return normalized observations and captures through the same service boundary. Retrieval rights and artifact-edit/adoption rights are separate.
 
-The first backend is an authorized inference endpoint, normally the external GPU pool; the same adapter contract supports local inference. Capability probes establish model identity, context limits, cancellation behavior, observed throughput, and supported concurrency before dispatch. LangGraphRunner/AutoGenRunner are later optional adapters. Their internal checkpoints do not replace Sci-saurus's intent/artifact/approval contracts. Remote workers use the orchestrator service, not shared mutable queue files.
+The first backend is an authorized inference endpoint, normally the external GPU pool; the same adapter contract supports local inference. Capability probes establish model identity, context limits, cancellation behavior, observed throughput, and supported concurrency before dispatch. LangGraphRunner/AutoGenRunner are later optional adapters. Their internal checkpoints do not replace Sci-whale's intent/artifact/approval contracts. Remote workers use the orchestrator service, not shared mutable queue files.
 
 ### 8.1 ContextBuilder
 

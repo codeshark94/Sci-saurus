@@ -112,7 +112,7 @@ def main():
     axes[0].set_ylabel("Empirical cumulative probability")
     axes[1].legend(frameon=False, loc="lower right")
     fig.suptitle(f"Mean estimation across {experiment['run_count']:,} seeded replicates (n={n})", fontsize=12)
-    fig.savefig(figure_path, dpi=180, metadata={"Software": "Sci-saurus robust mean pilot"})
+    fig.savefig(figure_path, dpi=180, metadata={"Software": "Sci-whale robust mean pilot"})
     plt.close(fig)
 
     # The ECDF shows the full error distribution, but it does not make the
@@ -135,7 +135,7 @@ def main():
     axis.set_title("Median and upper-tail error by sampling condition")
     axis.grid(True, axis="y", alpha=.22, linewidth=.7)
     axis.legend(frameon=False)
-    fig.savefig(summary_path, dpi=180, metadata={"Software": "Sci-saurus robust mean pilot"})
+    fig.savefig(summary_path, dpi=180, metadata={"Software": "Sci-whale robust mean pilot"})
     plt.close(fig)
 
     # Contamination is not a single homogeneous condition: the recorded
@@ -169,7 +169,7 @@ def main():
     for axis in axes:
         axis.grid(True, alpha=.22, linewidth=.7)
     fig.suptitle("Descriptive sensitivity within contaminated replicates", fontsize=12)
-    fig.savefig(stratified_path, dpi=180, metadata={"Software": "Sci-saurus robust mean pilot"})
+    fig.savefig(stratified_path, dpi=180, metadata={"Software": "Sci-whale robust mean pilot"})
     plt.close(fig)
 
     figure = figure_path.read_bytes()

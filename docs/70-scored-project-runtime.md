@@ -102,7 +102,7 @@ The helper inspects installed package metadata, fixes the checker command to the
 Configure the authorized endpoint, model name, optional credential environment-variable name, and `live_dispatch_allowed`. Use a new project directory:
 
 ```bash
-python3 -m scisaurus.cli run-project /tmp/operating-policy \
+./sci-whale run-project /tmp/operating-policy \
   --config /tmp/operations-run.json \
   --first-result-seconds 300 \
   --target-seconds 450 \

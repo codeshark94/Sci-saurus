@@ -536,7 +536,7 @@ def build_repair_commands(stage_kind, failure_class, *, stage_result=None,
         return [{
             "id": "repair-runtime-defect",
             "operation": "patch_runtime",
-            "target": "the failing Sci-saurus source frame recorded in runtime_frames",
+            "target": "the failing Sci-whale source frame recorded in runtime_frames",
             "instruction": (
                 "Patch the source defect and add a deterministic regression test. Preserve the admitted "
                 "topic and checkpoint; do not dispatch a model review or rerun research work until the "

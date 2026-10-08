@@ -695,16 +695,16 @@ the unresolved boundary rather than merely rewrite unchanged prose. Internal
 request IDs and routing metadata remain in the Composer ledger.
 
 ```bash
-python3 -m scisaurus.cli run-composer --workflow composer-workflow.json
-python3 -m scisaurus.cli run-composer --workflow composer-workflow.json --resume
+./sci-whale run-composer --workflow composer-workflow.json
+./sci-whale run-composer --workflow composer-workflow.json --resume
 # Append downstream stages to a settled workflow checkpoint
-python3 -m scisaurus.cli run-composer --workflow extended-workflow.json \
+./sci-whale run-composer --workflow extended-workflow.json \
   --resume --extend-workflow
 # Continue the same mission after a hard stop, adding only the time you intend
-python3 -m scisaurus.cli run-composer --workflow composer-workflow.json \
+./sci-whale run-composer --workflow composer-workflow.json \
   --resume --extend-deadline-seconds 36000
 # Inspect a stopped run without opening the full ledger
-python3 -m scisaurus.cli composer-interim-report /path/to/composer-project
+./sci-whale composer-interim-report /path/to/composer-project
 ```
 
 `--extend-workflow` admits an append-only workflow revision at a settled

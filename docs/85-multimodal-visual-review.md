@@ -25,7 +25,7 @@ The same configured first-result, target, and hard elapsed limits used by other 
 Copy [`config/visual-review.example.json`](../config/visual-review.example.json), set absolute asset paths and an authorized OpenAI-compatible multimodal model, then run:
 
 ```bash
-python -m scisaurus.cli run-visual-review PROJECT_DIR --config CONFIG.json
+./sci-whale run-visual-review PROJECT_DIR --config CONFIG.json
 ```
 
 The CLI also accepts `--first-result-seconds`, `--target-seconds`, and `--deadline-seconds`. A project directory is single-use, preserving the exact Score, image captures, model contexts, responses, validation failures, accepted assessment, and event chain.

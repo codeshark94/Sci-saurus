@@ -1,4 +1,4 @@
-# Sci-saurus — Fixtures
+# Sci-whale — Fixtures
 
 Test fixtures for the P1 vertical slice and later acceptance suites. Fixtures are **immutable test inputs**: any change creates a new fixture version; the P0 freeze record pins the selected set.
 

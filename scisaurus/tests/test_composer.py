@@ -19964,7 +19964,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                 "manuscript_project_dir": str(root / "manuscript"),
                 "survey_project_dir": str(root / "survey"), "survey_ref": "x", "assessment_ref": "y",
                 "results_package": "z", "evidence": [], "claims": [], "references": [],
-                "authors": ["Sci-saurus"], "keywords": ["test"],
+                "authors": ["Sci-whale"], "keywords": ["test"],
                 "storyline": {"id": "old", "revision": 1, "thesis": "old",
                               "beats": [{"id": "old", "role": "question", "proposition": "old"}]},
                 "depth_profile": {"min_words": 1, "min_references": 1, "min_full_text_references": 0,

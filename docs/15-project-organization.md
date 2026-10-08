@@ -1,4 +1,4 @@
-# Sci-saurus — Project Organization and Operations
+# Sci-whale — Project Organization and Operations
 
 > **Version:** v2.0 · **Date:** 2026-09-15 · **Status:** project-scoped bounded specialist pool, role-isolated stage assignments, independent verdict artifacts, v1 migration, and Composer-controlled work-order lifecycle implemented; configured operational adapters remain the execution boundary.
 > Governed by [SSOT](00-SSOT.md) D35–D36. Integrates the [activity model](05-system-concept.md), [web/tool adapters](50-web-intelligence-integration.md), and [scoped artifact changes](45-artifact-change-control.md).

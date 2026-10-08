@@ -96,7 +96,7 @@ class PaperReleaseTests(unittest.TestCase):
                 "references": [{"key": "known", "title": "Known Treatment", "authors": "Fixture Author",
                                 "year": "2026", "doi": None, "url": "https://example.org/known",
                                 "source_ref": self.survey_fixture.source}],
-                "authors": ["Sci-saurus Validation Team"], "keywords": ["provenance", "controlled revision"]}
+                "authors": ["Sci-whale Validation Team"], "keywords": ["provenance", "controlled revision"]}
 
     def test_finding_binding_accepts_equivalent_scientific_notation(self):
         finding = {"statement": "The maximum absolute error was 1.110e-16."}

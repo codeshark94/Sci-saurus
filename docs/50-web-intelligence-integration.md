@@ -1,4 +1,4 @@
-# Sci-saurus — Active Web Intelligence and Integrations
+# Sci-whale — Active Web Intelligence and Integrations
 
 > **Version:** v0.8 · **Date:** 2026-09-10 · **Status:** implementation design; adapters and live credentials are not provided by this document.
 > Implements SSOT D22–D24 and D34. Shared records follow [Execution Contract](40-execution-contract.md); artifact modifications follow [Change Control](45-artifact-change-control.md).
@@ -17,7 +17,7 @@ Expected information value and coverage gaps govern continuation. Provider acces
 
 Prefer an existing working capability, then implement a direct API adapter where it gives reliable structured access, and use a connected plugin/MCP service when its distinctive corpus or operations materially help. Different transports use the same task, policy, provenance, failure, and usage contracts. No plugin output is automatically more authoritative than a direct response.
 
-A tool available in the current authoring environment is not automatically installed or callable in the deployed Sci-saurus runtime. An integration plan distinguishes the service API, client implementation, actual deployment binding, credentials, authorized data, and successful capability check. Discovery of a plugin or registry listing does not establish any of those later states.
+A tool available in the current authoring environment is not automatically installed or callable in the deployed Sci-whale runtime. An integration plan distinguishes the service API, client implementation, actual deployment binding, credentials, authorized data, and successful capability check. Discovery of a plugin or registry listing does not establish any of those later states.
 
 An already authorized public retrieval capability can be used without repeated human confirmation. A new integration can be developed and tested under existing development/tool delegation. Installation, account connection, paid expenditure, and protected-data transfer follow actual authority; broad integration ambition does not invent credentials or bypass those boundaries.
 

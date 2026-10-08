@@ -1,4 +1,4 @@
-"""Command-line entry points for Sci-saurus projects and the local console."""
+"""Command-line entry points for Sci-whale projects and the local console."""
 
 from __future__ import annotations
 
@@ -91,8 +91,13 @@ def _composer_result_summary(result, report_path):
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="scisaurus")
+    parser = argparse.ArgumentParser(prog="sci-whale")
     sub = parser.add_subparsers(dest="cmd", required=True)
+    p_batch = sub.add_parser("run-engineering-batch", help="run a fixed-model DSH file-based engineering job")
+    p_batch.add_argument("--config", required=True)
+    p_batch.add_argument("--job", required=True, help="JSON work order with task, inputs, seed_files and outputs")
+    p_batch.add_argument("--output", required=True)
+    p_batch.add_argument("--check", action="store_true", help="check runtime pins without starting an agent")
 
     p_init = sub.add_parser("init", help="initialize a project control store")
     p_init.add_argument("project_dir")
@@ -274,6 +279,19 @@ def main(argv=None) -> int:
     p_interim.add_argument("project_dir")
 
     args = parser.parse_args(argv)
+    if args.cmd == "run-engineering-batch":
+        from scisaurus.runtime.dsh_batch import DshBatchRunner, validate_batch_config
+        config = validate_batch_config(json.loads(Path(args.config).read_text()))
+        if args.check:
+            print(json.dumps({"status": "configuration_valid", "model": config["model"],
+                              "provider": config["provider"], "model_calls": 0}))
+            return 0
+        job = json.loads(Path(args.job).read_text())
+        if not isinstance(job, dict) or set(job) != {"task", "inputs", "seed_files", "outputs"}:
+            raise ValueError("engineering work order requires task, inputs, seed_files and outputs")
+        result = DshBatchRunner(config, root=args.output).run(**job)
+        print(json.dumps({k: v for k, v in result.items() if k != "files"}, ensure_ascii=False))
+        return 0
     if args.cmd == "grant-token-capacity":
         from scisaurus.core.errors import ValidationError
         from scisaurus.runtime.models import grant_model_token_capacity

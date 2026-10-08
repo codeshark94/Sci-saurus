@@ -1,6 +1,6 @@
 """Bounded, evidence-gated research branches.
 
-This is the small control-plane piece Sci-saurus takes from progressive tree
+This is the small control-plane piece Sci-whale takes from progressive tree
 search systems: hypotheses can be explored in parallel, every branch points to
 an immutable parent, and promotion is a separate operation that requires
 independent evidence.  The module deliberately does not execute model-written

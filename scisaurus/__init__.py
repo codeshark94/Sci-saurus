@@ -1,4 +1,4 @@
-"""Sci-saurus — control-plane core.
+"""Sci-whale — control-plane core.
 
 Implements the durable core of the v0.8 contract (docs/40-execution-contract.md):
 transactional control store, immutable artifacts, event hash chain, message

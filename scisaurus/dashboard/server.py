@@ -1,4 +1,4 @@
-"""A small localhost console for live Sci-saurus project state.
+"""A small localhost console for live Sci-whale project state.
 
 The dashboard reads the same durable JSON checkpoints, artifact objects, and
 SQLite ledgers used by the runtime. Snapshot and file inspection are
@@ -3814,7 +3814,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if host not in allowed_hosts:
             return self._error(403, "dashboard action Host does not match this server")
         origin = self.headers.get("Origin")
-        expected_origin = "scisaurus://localhost" if private_transport else f"http://{host}"
+        expected_origin = "sciwhale://localhost" if private_transport else f"http://{host}"
         if origin and origin != expected_origin:
             return self._error(403, "dashboard actions require the same origin")
         if self.headers.get_content_type() != "application/json":
@@ -3881,7 +3881,7 @@ def run_dashboard(project_dir, *, host="127.0.0.1", port=0, open_browser=False):
     server = DashboardServer((host, port), service)
     url_host = "localhost" if host in {"127.0.0.1", "::1"} else host
     url = f"http://{url_host}:{server.server_port}/"
-    print(f"Sci-saurus dashboard: {url}", flush=True)
+    print(f"Sci-whale dashboard: {url}", flush=True)
     if open_browser:
         import webbrowser
         Thread(target=webbrowser.open, args=(url,), daemon=True).start()

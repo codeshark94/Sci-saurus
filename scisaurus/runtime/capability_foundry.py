@@ -242,7 +242,7 @@ CONFIG_FIELDS = {
     "registry_root", "repo_root", "requirements_file", "runtime_packages",
     "max_attempts", "timeout_seconds",
 }
-CONFIG_OPTIONAL_FIELDS = {"model_timeout_seconds"}
+CONFIG_OPTIONAL_FIELDS = {"model_timeout_seconds", "author_backend"}
 
 
 
@@ -1096,6 +1096,9 @@ def validate_foundry_config(value):
             (type(model_timeout) not in (int, float)
              or not math.isfinite(model_timeout) or model_timeout <= 0)):
         raise ValidationError("capability foundry model_timeout_seconds must be finite and positive")
+    if value.get("author_backend") is not None:
+        from scisaurus.runtime.dsh_batch import validate_batch_config
+        validate_batch_config(value["author_backend"])
     try:
         model = json.loads(Path(value["model_config_path"]).read_text())
         ModelClient(**resolve_model_config(model, role="research.experiment-author"))
@@ -2352,7 +2355,8 @@ class CapabilityFoundry:
     def __init__(self, model_config, *, runtime_python, workspace_root, registry_root, repo_root,
                  requirements_file, runtime_packages, max_attempts=4, timeout_seconds=900.0,
                  model_timeout_seconds=None, reviewer_client=None, validator_client=None,
-                 author_max_output_tokens=24000, reviewer_max_output_tokens=12000):
+                 author_max_output_tokens=24000, reviewer_max_output_tokens=12000,
+                 author_backend=None):
         self.model_config = deepcopy_config(model_config)
         self.runtime_python = Path(runtime_python)
         self.workspace_root = Path(workspace_root)
@@ -2368,6 +2372,13 @@ class CapabilityFoundry:
         self.deadline = None
         self.reviewer_client = reviewer_client
         self.validator_client = validator_client
+        self.author_backend = None
+        if author_backend is not None:
+            from scisaurus.runtime.dsh_batch import validate_batch_config, DshValidatorClient
+            self.author_backend = validate_batch_config(author_backend)
+            if self.validator_client is None:
+                self.validator_client = DshValidatorClient(self.author_backend,
+                    root=self.workspace_root / "dsh-validator-jobs", runtime_python=self.runtime_python)
         if type(max_attempts) is not int or not 1 <= max_attempts <= 12:
             raise ValidationError("foundry max_attempts must be an integer between 1 and 12")
         if (type(timeout_seconds) not in (int, float)
@@ -2548,13 +2559,28 @@ class CapabilityFoundry:
         self.deadline = deadline
         author_role = "research.experiment-author"
         author_route_configs = []
-        if client is None:
+        if self.author_backend is not None:
+            if client is not None:
+                raise ValidationError("DSH author_backend cannot be combined with an injected author client")
+            if model_call_budget is not None or model_call_allowance is not None:
+                raise ValidationError("DSH batch cannot bypass an explicit per-call allowance; an admission-aware provider relay is required")
+            from scisaurus.runtime.dsh_batch import DshAuthorClient
+            client = DshAuthorClient(self.author_backend, root=self.workspace_root / "dsh-jobs",
+                                     runtime_python=self.runtime_python)
+        elif client is None:
             author_route_configs = self._format_model_routes(author_role, self.author_max_output_tokens)
             client = ModelClient(**_artifact_generation_config(author_route_configs[0]))
         author_baseline_effort = getattr(client, "reasoning_effort", None)
         runtime = self._runtime()
         base_prompt = candidate_prompt(brief, self.runtime_packages, configured_input,
             required_intent=required_intent, runtime_version=runtime["python"])
+        if self.author_backend is not None:
+            base_prompt["author_backend"] = {
+                "schema_version": self.author_backend["schema_version"],
+                "model": self.author_backend["model"],
+                "config_sha256": hashlib.sha256(canonical_bytes(self.author_backend)).hexdigest(),
+            }
+            client.base_assignment = deepcopy_config(base_prompt)
         if resume_work_ref is not None and work_cache is not None:
             if not resume_work_ref.startswith(f"artifact:{work_cache.namespace}/"):
                 raise ValidationError("foundry format resume references a foreign work namespace")
@@ -2565,7 +2591,8 @@ class CapabilityFoundry:
             original_assignment = json.loads(body).get("assignment")
             # Interface descriptions can evolve while an already dispatched
             # response retains its exact scientific assignment and receipt.
-            identity_fields = ("capability_brief", "configured_input", "required_intent_fields", "execution_environment")
+            identity_fields = ("capability_brief", "configured_input", "required_intent_fields",
+                               "execution_environment", "author_backend")
             if (isinstance(original_assignment, dict)
                     and all(canonical_bytes(original_assignment.get(field)) == canonical_bytes(base_prompt.get(field))
                             for field in identity_fields)):
@@ -2580,7 +2607,7 @@ class CapabilityFoundry:
             contract = hashlib.sha256()
             for name in ("capability_foundry.py", "capability_registry.py", "experiment.py",
                          "experiment_config.py", "research_quality.py", "results.py",
-                         "program_admission.py", "program_gates.py", "program_sandbox.py", "measurement_contract.py", "study_evidence.py"):
+                         "program_admission.py", "program_gates.py", "program_sandbox.py", "measurement_contract.py", "study_evidence.py", "dsh_batch.py"):
                 contract.update((Path(__file__).parent / name).read_bytes())
             key = work_cache.key(scope="experiment-capability", role="research.experiment-author",
                 system=SYSTEM, prompt={"assignment": base_prompt,
@@ -3285,6 +3312,19 @@ class CapabilityFoundry:
             for dimension, amount in result.usage.items():
                 state["usage"][dimension] = state["usage"].get(dimension, 0) + amount - (
                     1 if dimension == "model_calls" else 0)
+
+        def record_batch_failure(request, error, *, retained=None):
+            request.update(status="result_unknown", error=str(error), usage=deepcopy_config(error.usage),
+                           batch_receipt=error.receipt)
+            for dimension, amount in error.usage.items():
+                state["usage"][dimension] = state["usage"].get(dimension, 0) + amount - (
+                    1 if dimension == "model_calls" else 0)
+            if retained is not None:
+                retained.update(status="result_unknown", error=str(error))
+            state.update(status="blocked", error=str(error), feedback=str(error),
+                         last_failure_class=error.failure_class, last_failure_gate="delegated_batch")
+            save("delegated_batch_failed")
+            error.usage = deepcopy_config(state["usage"])
 
         def record_provider_rate_limit(request, error, *, phase, retry_state=None,
                                        retry_status="response_received",
@@ -4270,6 +4310,8 @@ class CapabilityFoundry:
                     "and recorded row sample. Never alter a tolerance or acceptance check just to "
                     "agree with the producer. No executor implementation is supplied and "
                     "producer-authored validator patches are not admissible.")
+            if self.author_backend is not None:
+                assignment["author_backend"] = deepcopy_config(base_prompt["author_backend"])
             identity = hashlib.sha256(canonical_bytes(assignment)).hexdigest()
             retained = state.setdefault("validator_authorship", {}).setdefault(identity, {"status": "pending"})
             retained["candidate_sha256"] = _authored_candidate_sha256(state.get("last_attempt"))
@@ -4390,6 +4432,8 @@ class CapabilityFoundry:
                                 "independent validator technical repair deferred: " + retained["error"])
                         raise
                     validator_client = self.validator_client
+                    if self.author_backend is not None and hasattr(validator_client, "deadline"):
+                        validator_client.deadline = deadline
                     if validator_client is None:
                         available_routes = [route for route in validator_routes
                             if self._dispatch_route_identity(route) not in exhausted_routes]
@@ -4467,6 +4511,10 @@ class CapabilityFoundry:
                         save("validator_author_unknown")
                         raise
                     except BaseException as exc:
+                        from scisaurus.runtime.dsh_batch import DshBatchError
+                        if isinstance(exc, DshBatchError):
+                            record_batch_failure(request, exc, retained=retained)
+                            raise
                         if record_context_rejection(
                                 request, exc, phase="validator_author_context_rejected", retry_state=retained):
                             retained["attempts"] = attempts_before
@@ -4587,6 +4635,19 @@ class CapabilityFoundry:
                     if retained.get("attempts", 0) >= self.max_attempts:
                         defer_validator_repair("independent validator technical repair exhausted: " + str(exc))
 
+        last_request = state.get("requests", [])[-1] if state.get("requests") else {}
+        if (self.author_backend is not None
+                and last_request.get("role", author_role) in {author_role, "methods.validator-author"}
+                and last_request.get("status") in {"started", "result_unknown"}):
+            from scisaurus.runtime.dsh_batch import DshBatchError
+            error = state.get("error") or "DSH batch outcome is unknown; retained jobs require reconciliation before a new dispatch"
+            last_request.update(status="result_unknown", error=error)
+            state.update(status="blocked", error=error, last_failure_class="operational_recovery",
+                         last_failure_gate="delegated_batch")
+            save("delegated_batch_unknown_retained")
+            owner = client if last_request.get("role", author_role) == author_role else self.validator_client
+            raise DshBatchError(error, receipt=last_request.get("batch_receipt") or owner.runner.root,
+                                usage=state.get("usage", {}))
         if state["status"] == "blocked" and isinstance(
                 state.get("repair_budget_exhausted"), dict):
             ledger = state.get("repair_ledger", [])
@@ -4831,7 +4892,7 @@ class CapabilityFoundry:
                         empty_output=prior_response.get("finish_reason") == "length"
                         and not (prior_response.get("text") or "").strip())
                     client.reasoning_effort = profile["reasoning_effort"]
-                if (isinstance(last_attempt, dict)
+                if (self.author_backend is None and isinstance(last_attempt, dict)
                         and PRODUCER_FIELDS.issubset(last_attempt)
                         and type(getattr(client, "max_output_tokens", None)) is int):
                     client.max_output_tokens = min(
@@ -4890,6 +4951,10 @@ class CapabilityFoundry:
                     save("request_failed")
                     raise
                 except BaseException as exc:
+                    from scisaurus.runtime.dsh_batch import DshBatchError
+                    if isinstance(exc, DshBatchError):
+                        record_batch_failure(request, exc)
+                        raise
                     if record_context_rejection(
                             request, exc, phase="author_context_rejected", retry_status="repairing",
                             request_signature=request_signature, attempt_before=attempt):

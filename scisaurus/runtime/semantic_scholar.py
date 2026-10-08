@@ -248,7 +248,7 @@ class SemanticScholarClient:
             incomplete = False
             chunks = []
             try:
-                request_headers = {"Accept": "application/json", "x-api-key": secret, "User-Agent": "Sci-saurus/1"}
+                request_headers = {"Accept": "application/json", "x-api-key": secret, "User-Agent": "Sci-whale/1"}
                 if body is not None:
                     request_headers["Content-Type"] = "application/json"
                 with dispatch_permission():

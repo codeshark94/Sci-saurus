@@ -38,9 +38,9 @@ Copy `config/paragraph-run.example.json` to a local configuration file. The exam
 For [Ollama's native API](https://docs.ollama.com/api/chat), the base URL excludes `/api/chat`. For a [vLLM-compatible server](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html), provide its API base including `/v1`; the adapter appends `/chat/completions`. The protocol name does not select or authorize a different provider. No alternate endpoint is used on failure. Explicit reasoning/output-format settings are rejected for the native Ollama adapter; unset settings are omitted. `cache_prompt` is deliberately opt-in because it is provider-specific; when enabled, the request hint is sent unchanged and reported cache-read/write counters are retained in the execution artifact. vLLM's automatic prefix cache must also be enabled on the server (for example, `--enable-prefix-caching`), and `--enable-prompt-tokens-details` is required for hit/write counters; a successful request with zero counters is not treated as a cache hit. Reported completion tokens already include provider reasoning tokens and are counted once.
 
 ```bash
-python3 -m scisaurus.cli run-paragraph /tmp/research-paragraph --config /path/to/run.json
-python3 -m scisaurus.cli status /tmp/research-paragraph
-python3 -m scisaurus.cli verify /tmp/research-paragraph
+./sci-whale run-paragraph /tmp/research-paragraph --config /path/to/run.json
+./sci-whale status /tmp/research-paragraph
+./sci-whale verify /tmp/research-paragraph
 ```
 
 The project directory must be new. Existing runs remain inspectable and cannot be overwritten by this command. Exit code `0` means the exact candidate was adopted, `2` rejects configuration, and `3` reports a blocked, paused, or unresolved run.

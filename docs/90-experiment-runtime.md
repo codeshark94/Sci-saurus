@@ -34,7 +34,7 @@ python3 scripts/prepare-experiment-config.py --output /tmp/experiment.json
 Set the authorized model connection, change `live_dispatch_allowed` to `true`, and optionally bind a completed literature survey. Use a new project directory:
 
 ```bash
-python3 -m scisaurus.cli run-experiment /tmp/experiment-run \
+./sci-whale run-experiment /tmp/experiment-run \
   --config /tmp/experiment.json \
   --first-result-seconds 720 --target-seconds 960 --deadline-seconds 1200
 ```

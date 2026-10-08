@@ -9,7 +9,7 @@
 `SurveyRunner` reconstructs works, source captures, query records, maps, focused reviews, accepted surveys, nominations, challenge plans, challenge-query completion, and accepted assessments from exact artifact versions. A nomination alone cannot skip counter-search. A successful challenge query is reused only under its exact nomination-bound plan, and final assessment requires a current accepted survey that includes those query records. Stored search queries are not repeated within that recovery state. Bibliography and identity workload slots are durably reserved before provider dispatch; resume restores their cumulative sequence counters, including failed or interrupted calls and legacy runs whose earlier successful requests predate that ledger. A source change may invalidate mapping or later review while leaving external captures intact. `deadline_replan` computes the required dependency closure and defers optional tasks rather than starting work that cannot leave time for required completion.
 
 ```bash
-python3 -m scisaurus.cli resume-survey /path/to/existing-run \
+./sci-whale resume-survey /path/to/existing-run \
   --config /path/to/original-config.json \
   --additional-seconds 600 \
   --reconcile-unknown \
@@ -38,8 +38,8 @@ Local tools are reused from explicit profiles. Python packages may be provisione
 `prepare-evaluation` exports a packet containing case IDs, task types, and evidence without labels or adjudication rationales. `score-evaluation` accepts exactly one prediction for every case and requires the frozen corpus hash. It reports accuracy, coverage, per-task results, and the rate at which a system makes a decisive gap claim on expert-labeled insufficient-evidence cases.
 
 ```bash
-python3 -m scisaurus.cli prepare-evaluation --corpus held-out.json --output blind.json
-python3 -m scisaurus.cli score-evaluation --corpus held-out.json \
+./sci-whale prepare-evaluation --corpus held-out.json --output blind.json
+./sci-whale score-evaluation --corpus held-out.json \
   --predictions predictions.json --output evaluation.json
 ```
 
@@ -65,7 +65,7 @@ adjudication references. Direct legacy builds retain their prior candidate
 version so historical artifacts remain stable.
 
 ```bash
-python3 -m scisaurus.cli build-paper /path/to/new-release \
+./sci-whale build-paper /path/to/new-release \
   --config /path/to/paper-score.json
 ```
 

@@ -22,7 +22,7 @@ The helper reuses the project runtime inventory to verify the installed MCP Fetc
 Set the authorized model endpoint, model name, optional authentication environment-variable name, and `live_dispatch_allowed` in the prepared file. The configuration requires public inputs and an explicitly authorized capacity pool. Use a new project directory:
 
 ```bash
-python3 -m scisaurus.cli run-survey /tmp/attention-survey \
+./sci-whale run-survey /tmp/attention-survey \
   --config /tmp/survey-run.json \
   --first-result-seconds 480 --target-seconds 720 --deadline-seconds 900
 ```
@@ -130,7 +130,7 @@ The same run directory was then continued through explicit, separately bounded r
 
 The completed continuation produced current survey `artifact:kb/surveys/current@4` and current assessment `artifact:kb/gap-assessments/current@1`. The first newly accepted survey in the successful continuation arrived after 275.97 seconds, within its 480-second first-result target. A separate final assessment continuation completed after 90.29 seconds and returned `refuted_by_prior_work`: verified full text from W2626778328 states that the Transformer relies entirely on self-attention without sequence-aligned RNNs or convolution. The system preserved two counter-search results that exceeded the work limit as residual coverage gaps; it did not need them to establish the identified counterexample.
 
-Across the original run and continuations, the durable ledger records 93 model calls, 25 retrieval calls, 841,565 input tokens, and 514,503 output tokens, including conservatively charged unknown outcomes and repeated operational probes. The final store contains 1,029 artifacts and 2,512 hash-chained events; `python3 -m scisaurus.cli verify` reports `ok`. The current `output/run.json` SHA-256 is `d7e63233e256c9b73b2cdb8ed96cfb49fe4fcc0d8d7d4ce6c3bed71b368efd73`; the accepted assessment export SHA-256 is `c2e3d21504755135f2b3863cdb234a61493200944aa3f5c7122742a32a928dd3`. A no-work replay reports the survey as `retained_from_prior_run`, so inherited evidence is not misreported as new progress in that window.
+Across the original run and continuations, the durable ledger records 93 model calls, 25 retrieval calls, 841,565 input tokens, and 514,503 output tokens, including conservatively charged unknown outcomes and repeated operational probes. The final store contains 1,029 artifacts and 2,512 hash-chained events; `./sci-whale verify` reports `ok`. The current `output/run.json` SHA-256 is `d7e63233e256c9b73b2cdb8ed96cfb49fe4fcc0d8d7d4ce6c3bed71b368efd73`; the accepted assessment export SHA-256 is `c2e3d21504755135f2b3863cdb234a61493200944aa3f5c7122742a32a928dd3`. A no-work replay reports the survey as `retained_from_prior_run`, so inherited evidence is not misreported as new progress in that window.
 
 This completes one live recovery and assessment path. It does not establish exhaustive coverage, bibliographic identity accuracy, or expert-level judgment. The proposed gap in this case was deliberately false and correctly rejected; a held-out corpus remains necessary to measure false novelty claims and missed prior work.
 

@@ -23,14 +23,14 @@ def main(argv=None):
     workspace = Path(args.workspace).expanduser().resolve()
     python = repository / ".venv/bin/python"
     if not (repository / "scisaurus/cli.py").is_file() or not python.is_file():
-        raise ValueError("Select a Sci-saurus repository with its .venv runtime installed.")
+        raise ValueError("Select a Sci-whale repository with its .venv runtime installed.")
     if not workspace.is_dir() or not workspace.is_relative_to(repository):
         raise ValueError("The research workspace must be a directory inside the repository.")
     service = DashboardService(workspace, repository=repository, runtime_python=python)
     transport = tempfile.TemporaryDirectory(prefix="scisaurus-")
     socket_path = str(Path(transport.name) / "backend.sock")
     server = DashboardUnixServer(socket_path, service)
-    print(json.dumps({"url": "scisaurus://localhost/", "socket_path": socket_path,
+    print(json.dumps({"url": "sciwhale://localhost/", "socket_path": socket_path,
                       "repository": str(repository), "workspace": str(workspace)}), flush=True)
 
     def terminate(*_):

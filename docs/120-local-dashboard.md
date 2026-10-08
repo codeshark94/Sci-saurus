@@ -1,6 +1,6 @@
 # Local dashboard
 
-Sci-saurus includes a small localhost web console for understanding and
+Sci-whale includes a small localhost web console for understanding and
 managing the whole local research workspace and its bounded Composer projects. It reads the durable workflow checkpoints,
 content-addressed artifact store, SQLite control ledger, and project files.
 Snapshot and file inspection stay read-only; the Projects dialog exposes only
@@ -29,7 +29,7 @@ Set `SCISAURUS_COMPOSER_WORKFLOW` when a specific workflow must be selected.
 The equivalent module command also auto-selects that project:
 
 ```bash
-python3 -m scisaurus.cli dashboard
+./sci-whale dashboard
 ```
 
 To inspect another project, pass its directory explicitly:
@@ -39,13 +39,13 @@ To inspect another project, pass its directory explicitly:
 ```
 
 The command prints a localhost URL and opens it in the default browser. The
-root page is the Sci-saurus workspace overview; selecting a project opens its
+root page is the Sci-whale workspace overview; selecting a project opens its
 project detail surface. It chooses a free local port by default. Use `--no-open` when the URL should only
 be printed, `--port` to select a fixed port explicitly, or `--host` to select
 another bind address.
 
 ```bash
-python3 -m scisaurus.cli dashboard PROJECT_DIR --no-open --port 8765
+./sci-whale dashboard PROJECT_DIR --no-open --port 8765
 ```
 
 The dashboard workspace is rooted at the directory passed to the command. It

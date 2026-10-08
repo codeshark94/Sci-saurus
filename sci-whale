@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+repository=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+runtime="$repository/.venv/bin/python"
+if [ ! -x "$runtime" ]; then
+  printf '%s\n' 'Install the project runtime with scripts/setup-runtime.sh first.' >&2
+  exit 1
+fi
+cd "$repository"
+exec "$runtime" -m scisaurus.cli "$@"

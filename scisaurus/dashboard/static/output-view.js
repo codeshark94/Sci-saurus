@@ -36,5 +36,5 @@
     }
     return render(value);
   }
-  root.ScisaurusOutputView = { render, document, label };
+  root.SciwhaleOutputView = { render, document, label };
 })(typeof window === "undefined" ? globalThis : window);

@@ -1,4 +1,4 @@
-# Sci-saurus — Structured Artifacts and Surgical Change Control
+# Sci-whale — Structured Artifacts and Surgical Change Control
 
 > **Version:** v0.8 · **Date:** 2026-09-10 · **Status:** proposed execution contract; not an implemented editor.
 > Extends [Execution Contract](40-execution-contract.md) under [SSOT](00-SSOT.md) D31–D33. Applies to all generated deliverables, with paper-specific block kinds in the paper Score.

@@ -191,7 +191,7 @@
     $("#workspace-link").classList.toggle("is-active", workspace);
     if (workspace) {
       $("#breadcrumb-context").textContent = "WORKSPACE";
-      $("#breadcrumb-name").textContent = "Sci-saurus";
+      $("#breadcrumb-name").textContent = "Sci-whale";
     } else {
       $("#breadcrumb-context").textContent = "PROJECT";
       $("#breadcrumb-name").textContent = projectName(state.projectRef);
@@ -296,7 +296,7 @@
     const project = snapshot.project || {};
     const live = snapshot.live || {};
     const status = live.status || "unknown";
-    $("#project-name").textContent = text(project.name, "Sci-saurus");
+    $("#project-name").textContent = text(project.name, "Sci-whale");
     $("#breadcrumb-context").textContent = "PROJECT";
     $("#breadcrumb-name").textContent = text(project.name, "project");
     renderCurrentProject();
@@ -330,7 +330,7 @@
   }
   function inspectionButton(label, output) {
     const ref = typeof output === "string" ? output : output?.file_ref;
-    return ref?.includes("::") ? `<button class="button button--quiet" type="button" data-output-title="${escapeHtml(typeof output === "object" && output?.label ? window.ScisaurusOutputView.label(output.label.replace(/\.json$/, "")) : label)}" data-output-ref="${escapeHtml(ref)}">${escapeHtml(label)}</button>` : "";
+    return ref?.includes("::") ? `<button class="button button--quiet" type="button" data-output-title="${escapeHtml(typeof output === "object" && output?.label ? window.SciwhaleOutputView.label(output.label.replace(/\.json$/, "")) : label)}" data-output-ref="${escapeHtml(ref)}">${escapeHtml(label)}</button>` : "";
   }
   function bindOutputInspection(container) {
     container.querySelectorAll("[data-output-ref]").forEach((button) => button.addEventListener("click", () => openInspector(button.dataset.outputRef, button.dataset.outputTitle)));
@@ -360,7 +360,7 @@
     $("#stage-result-summary").innerHTML = `<article class="stage-summary-card"><div class="research-label">Execution result</div><strong>${escapeHtml(STAGE_STATUS[stage.status] || text(stage.status))}</strong><p>${escapeHtml(text(stage.deliverable, "Inspect the actual outputs and independent verdict for this stage."))}</p></article><article class="stage-summary-card"><div class="research-label">Independent review</div><strong>${escapeHtml((stage.kind === "topic_discovery" && decision === "accept" ? "Admitted to literature survey" : decisions[decision]) || (decision ? text(decision) : "Not reviewed"))}</strong><p>${escapeHtml(text(review.summary || review.rationale, "The review will record its evidence and outstanding requirements."))}</p>${inspectionButton("Read review", review)}</article>`;
     bindOutputInspection($("#stage-result-summary"));
     const outputs = stage.outputs || [];
-    $("#stage-result-outputs").innerHTML = `<div class="section-heading"><h3>Stage outputs</h3><span class="section-caption">${outputs.length} outputs</span></div>` + (outputs.length ? `<div class="stage-output-grid">${outputs.map((output) => `<article class="stage-output-card"><div><strong>${escapeHtml(window.ScisaurusOutputView.label((output.label || "Output").replace(/\.json$/, "")))}</strong><span>${output.current === false ? "Historical output · not current evidence" : escapeHtml(text(output.status, "Produced"))}</span></div>${inspectionButton("Open",output)}</article>`).join("")}</div>` : '<div class="stage-empty">No output has been produced for this stage yet.</div>');
+    $("#stage-result-outputs").innerHTML = `<div class="section-heading"><h3>Stage outputs</h3><span class="section-caption">${outputs.length} outputs</span></div>` + (outputs.length ? `<div class="stage-output-grid">${outputs.map((output) => `<article class="stage-output-card"><div><strong>${escapeHtml(window.SciwhaleOutputView.label((output.label || "Output").replace(/\.json$/, "")))}</strong><span>${output.current === false ? "Historical output · not current evidence" : escapeHtml(text(output.status, "Produced"))}</span></div>${inspectionButton("Open",output)}</article>`).join("")}</div>` : '<div class="stage-empty">No output has been produced for this stage yet.</div>');
     bindOutputInspection($("#stage-result-outputs"));
     const obligations = stage.open_obligations || [];
     $("#stage-obligations").hidden = !obligations.length;
@@ -1198,7 +1198,7 @@
     let value = original;
     try { value = JSON.parse(original); } catch (_) { /* Preserve plain text previews. */ }
     $("#inspector-content").textContent = original;
-    $("#inspector-readable").innerHTML = window.ScisaurusOutputView.document(value);
+    $("#inspector-readable").innerHTML = window.SciwhaleOutputView.document(value);
     setInspectorView(false);
   }
 
@@ -1216,7 +1216,7 @@
       if (!response.ok) throw new Error(`file request failed (${response.status})`);
       const file = await response.json();
       if (request !== state.inspectorRequest) return;
-      $("#inspector-title").textContent = title || window.ScisaurusOutputView.label(text(file.name, "File").replace(/\.json$/, ""));
+      $("#inspector-title").textContent = title || window.SciwhaleOutputView.label(text(file.name, "File").replace(/\.json$/, ""));
       $("#inspector-meta").textContent = `${text(file.root_key)} · ${text(file.path)} · ${bytes(file.size)} · ${relativeDate(file.updated_at)}`;
       setInspectorContent(text(file.text, "No preview available."));
       $("#inspector-note").textContent = file.truncated ? "Preview truncated at 800 KB." : "Preview is bounded and read-only.";

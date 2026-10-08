@@ -1,7 +1,7 @@
 # Desktop app
 
-Sci-saurus uses Tauri to host the research console and a bundled Python backend.
-The app is built for macOS desktop. Its `scisaurus://` resources are served through
+Sci-whale uses Tauri to host the research console and a bundled Python backend.
+The app is built for macOS desktop. Its `sciwhale://` resources are served through
 an app protocol and a private Unix socket; the app does not open a TCP web port.
 
 ## Build and open
@@ -17,13 +17,15 @@ cd ..
 ./desktop-app
 ```
 
-The build creates `desktop/src-tauri/target/release/bundle/macos/Sci-saurus.app`.
+The build creates `desktop/src-tauri/target/release/bundle/macos/Sci-whale.app`.
 It can be copied to Applications. The build always regenerates its PyInstaller
 backend before packaging; Python build dependencies are isolated in
 `desktop/.venv-build`. `npm run dev` runs the desktop development window.
 
 The app saves the selected repository and research workspace in its application
-support directory. `Workspace → Choose repository…` changes the selection;
+support directory under `science.sciwhale.desktop`. On first launch it imports
+the prior `science.scisaurus.desktop/workspace.json` selection when no new
+selection exists. The original settings and research artifacts are retained. `Workspace → Choose repository…` changes the selection;
 `Reconnect backend` reconnects to the current workspace. Opening the app does
 not launch a mission.
 

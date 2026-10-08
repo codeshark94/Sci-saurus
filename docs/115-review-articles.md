@@ -45,7 +45,7 @@ does not authorize contacting an editor, submitting, or claiming an invitation.
 Import provider settings from an existing workflow without making model calls:
 
 ```sh
-.venv/bin/python -m scisaurus.cli prepare-review-article \
+./sci-whale prepare-review-article \
   --from-workflow /absolute/path/to/existing/workflow.json \
   --output-dir /absolute/path/to/new-review-project \
   --brief "Identify a timely critical-review question in the declared research area"
@@ -55,7 +55,7 @@ Inspect `review.json`, confirm authorship, and supply the local credential file
 at launch if it was not already part of the source workflow:
 
 ```sh
-.venv/bin/python -m scisaurus.cli run-composer \
+./sci-whale run-composer \
   --workflow /absolute/path/to/new-review-project/workflow.json \
   --env-file /absolute/path/to/provider.env
 ```

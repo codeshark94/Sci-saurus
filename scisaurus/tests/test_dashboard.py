@@ -1101,7 +1101,7 @@ class DashboardFrontendContractTests(unittest.TestCase):
         script = """
 const assert = require('node:assert/strict');
 require(process.argv[1]);
-const view = globalThis.ScisaurusOutputView;
+const view = globalThis.SciwhaleOutputView;
 const output = view.render({schema_version:'v1',question:'Does hydration matter?',
   deferred_obligations:[{requirement:'Find numeric bounds',target_stage_id:'survey'}],
   abstract:'<img src=x onerror=alert(1)>',analysis:{checks:[]}});
@@ -1174,7 +1174,7 @@ assert(wrapped.includes('Internal transport'));
         html = (static / "index.html").read_text()
         stylesheet = (static / "styles.css").read_text()
         brand = re.search(r'<div class="sidebar-context">(.*?)</div>', html).group(1)
-        self.assertIn("<span>Sci-saurus</span>", brand)
+        self.assertIn("<span>Sci-whale</span>", brand)
         self.assertNotIn("<br>", brand)
         self.assertNotIn("<small>", brand)
         for selector in (".run-control-settings select", ".run-control-buttons .button"):

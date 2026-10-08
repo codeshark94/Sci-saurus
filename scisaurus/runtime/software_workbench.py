@@ -179,7 +179,7 @@ class SoftwareWorkbench:
     def _fetch(self, url, *, archive=False):
         # URLs are constructed exclusively from the GitHub API/codeload roots.
         limit = 128 * 1024 * 1024 if archive else 8 * 1024 * 1024
-        request = Request(url, headers={"User-Agent": "Sci-saurus", "Accept": "application/vnd.github+json"})
+        request = Request(url, headers={"User-Agent": "Sci-whale", "Accept": "application/vnd.github+json"})
         from scisaurus.runtime.run_control import dispatch_permission
         with dispatch_permission():
             response = urlopen(request, timeout=min(60, self._remaining()))

@@ -233,11 +233,11 @@ class DashboardControlTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Mission controls", body)
         self.assertEqual(request("POST", "/api/actions", origin="http://localhost")[0], 403)
-        status, body = request("POST", "/api/actions", origin="scisaurus://localhost")
+        status, body = request("POST", "/api/actions", origin="sciwhale://localhost")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["status"], "already_stopped")
         self.assertEqual(request("POST", "/api/actions")[0], 200)
-        self.assertEqual(request("POST", "/api/actions", origin="scisaurus://localhost", content_type="text/plain")[0], 415)
+        self.assertEqual(request("POST", "/api/actions", origin="sciwhale://localhost", content_type="text/plain")[0], 415)
 
     def test_settings_are_allowlisted_and_project_is_confined(self):
         for settings in ({"shell": "anything"}, {"development": "yes"}, {"stop_after_stage": "missing"}):

@@ -161,7 +161,7 @@ def main():
         axis.grid(True, which="both", alpha=.22, linewidth=.7)
     axes[0].legend(frameon=False, fontsize=8)
     fig.suptitle("Quadrature accuracy for a sharp Gaussian peak", fontsize=12)
-    fig.savefig("quadrature-convergence.png", dpi=190, metadata={"Software": "Sci-saurus free-topic run"})
+    fig.savefig("quadrature-convergence.png", dpi=190, metadata={"Software": "Sci-whale free-topic run"})
     plt.close(fig)
 
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), sharey=False, constrained_layout=True)
@@ -178,7 +178,7 @@ def main():
         axis.grid(True, alpha=.22, linewidth=.7)
     axes[0].legend(frameon=False, fontsize=8)
     fig.suptitle("Sign structure and practical cancellation", fontsize=12)
-    fig.savefig("quadrature-signed-error.png", dpi=190, metadata={"Software": "Sci-saurus free-topic run"})
+    fig.savefig("quadrature-signed-error.png", dpi=190, metadata={"Software": "Sci-whale free-topic run"})
     plt.close(fig)
 
     # A third display exposes computational cost rather than repeating the
@@ -197,7 +197,7 @@ def main():
     axis.set_title("Accuracy versus work on the centred peak")
     axis.grid(True, which="both", alpha=.22, linewidth=.7)
     axis.legend(frameon=False, fontsize=8)
-    fig.savefig("quadrature-cost.png", dpi=190, metadata={"Software": "Sci-saurus free-topic run"})
+    fig.savefig("quadrature-cost.png", dpi=190, metadata={"Software": "Sci-whale free-topic run"})
     plt.close(fig)
 
     assets = []

@@ -120,7 +120,7 @@ class MCPRegistryClient:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValidationError("registry search limit must be between 1 and 100")
         url = self.endpoint + "?" + urlencode({"search": query, "version": "latest", "limit": limit})
-        request = Request(url, headers={"Accept": "application/json", "User-Agent": "Sci-saurus/0.1"})
+        request = Request(url, headers={"Accept": "application/json", "User-Agent": "Sci-whale/0.1"})
         with urlopen(request, timeout=self.timeout) as response:
             body = response.read(self.max_bytes + 1)
             media_type = response.headers.get_content_type()

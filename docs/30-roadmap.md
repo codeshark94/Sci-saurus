@@ -1,4 +1,4 @@
-# Sci-saurus — Implementation Roadmap
+# Sci-whale — Implementation Roadmap
 
 > **Version:** v1.1 · **Date:** 2026-09-11 · **Status:** implementation plan with evidence scoped to completed runtime slices.
 > Governed by `00-SSOT.md`, implemented through `20-architecture-v0.md` and `40-execution-contract.md`.
@@ -266,7 +266,7 @@ Evaluate the same tasks, evidence availability, approved model pool, and resourc
 |---|---|
 | A: Simple supplied-evidence writer | Establish output quality and human repair effort without organizational overhead |
 | B: Same-budget writer with generic feedback/refinement or independent candidate selection | Test whether improvement comes from extra compute alone |
-| C: Sci-saurus review/adjudication/verification/selection | Test the incremental value of the proposed mechanism |
+| C: Sci-whale review/adjudication/verification/selection | Test the incremental value of the proposed mechanism |
 
 Use the same frozen retrieval corpus where testing review mechanics; separately test retrieval policies when evaluating web intelligence. For retrieval evaluation, compare fixed-corpus search, broad multi-surface search, and broad search plus independent adversarial retrieval under explicit resource envelopes. Record input/output tokens, model calls, elapsed time, monetary cost when applicable, and human effort. Equal call counts are not equal compute if context length/model size differs; report the resource vector rather than hiding that mismatch.
 

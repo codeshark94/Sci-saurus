@@ -102,7 +102,7 @@ The standalone command is useful for any project that needs a scientific
 argument before composition:
 
 ~~~bash
-python3 -m scisaurus.cli run-argument \
+./sci-whale run-argument \
   --input evidence-packet.json \
   --config model-config.json \
   --output research-argument-package.json

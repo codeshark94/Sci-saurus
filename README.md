@@ -1,18 +1,18 @@
 <div align="center">
 
-# 🦖 Sci-saurus
+# 🐋 Sci-whale
 
 **A human-directed, evidence-first research workflow.**
 
 Bounded missions · Independent checks · Resumable work · Explicit release authority
 
-[![CI](https://github.com/codeshark94/Sci-saurus/actions/workflows/tests.yml/badge.svg)](https://github.com/codeshark94/Sci-saurus/actions/workflows/tests.yml)
+[![CI](https://github.com/codeshark94/Sci-whale/actions/workflows/tests.yml/badge.svg)](https://github.com/codeshark94/Sci-whale/actions/workflows/tests.yml)
 ![Python 3.14](https://img.shields.io/badge/python-3.14-3776AB?logo=python&logoColor=white)
 [![Concept SSOT](https://img.shields.io/badge/docs-concept%20SSOT-5B5F97)](docs/00-SSOT.md)
 
 </div>
 
-Sci-saurus coordinates project-scoped specialists to turn a Principal's goal
+Sci-whale coordinates project-scoped specialists to turn a Principal's goal
 into bounded work, inspectable evidence, reviewed artifacts, and explicit next
 decisions. The Principal sets the objective, authority, trade-offs, and release
 boundary. The Composer plans and supervises the work; departments form around
@@ -24,14 +24,14 @@ Authority, coordination, specialist work, operations, and independent checks
 have separate responsibilities. Specialists are activated for scoped tasks;
 the default roster does not mean a fixed set of model processes is running.
 
-![Sci-saurus accountability map: Principal, Composer, on-demand departments, Operations, and independent checks](docs/diagrams/organization-map.svg)
+![Sci-whale accountability map: Principal, Composer, on-demand departments, Operations, and independent checks](docs/diagrams/organization-map.svg)
 
 Solid arrows show direction and work assignment. Dashed paths show operational
 support and independent review feedback.
 
 ## How a mission progresses
 
-![Sci-saurus research workflow: adaptive agenda, dependency-gated stages, scoped repairs, and replanning](docs/diagrams/research-workflow.svg)
+![Sci-whale research workflow: adaptive agenda, dependency-gated stages, scoped repairs, and replanning](docs/diagrams/research-workflow.svg)
 
 The default paper mission is shown above. Topic discovery is used for
 free-topic missions; a project with supplied research can start at Survey or
@@ -52,6 +52,7 @@ provisional explanations, limitations, and future tests.
 | **Mission control** | Durable project state, event history, leases, checkpoints, adaptive ranking of dependency-ready work, and resumable decisions |
 | **Evidence and artifacts** | Immutable, content-addressed versions; provenance; scoped edits; literature identities; exact source references and spans |
 | **Literature workflow** | OpenAlex discovery, bounded HTML/XML and open-access PDF capture, identity reconciliation, citation maps, counter-search, and gap assessment |
+| **Engineering worker** | Headless DSH jobs with a fixed model, file editing, shell execution, local repair, durable receipts and independent admission; see [DSH batches](docs/dsh-batch.md) |
 | **Scientific execution** | Frozen methods and seeds, raw observations, deterministic replay, independent recalculation, and reviewed result packages |
 | **Recovery** | Failure dossiers, typed work orders, bounded capability repair, and reopening of affected downstream dependencies |
 | **Paper delivery** | Claim/evidence index, bibliography, figures, LaTeX source, rendered PDF, and a release proposal with provenance |
@@ -92,19 +93,19 @@ python3 -m unittest discover -s scisaurus/tests -t . -v
 Initialize a project, publish an artifact, and verify its record:
 
 ```bash
-python3 -m scisaurus.cli init /tmp/my-project
-python3 -m scisaurus.cli publish /tmp/my-project strategy/notes/demo brief.md --type note
-python3 -m scisaurus.cli verify /tmp/my-project
+./sci-whale init /tmp/my-project
+./sci-whale publish /tmp/my-project strategy/notes/demo brief.md --type note
+./sci-whale verify /tmp/my-project
 ```
 
 ## Prepare and run a workflow
 
 | Goal | Prepare | Run |
 |---|---|---|
-| Paragraph revision | `scripts/setup-runtime.sh` | `python3 -m scisaurus.cli run-paragraph PROJECT --config CONFIG.json` |
-| Multi-paragraph project | `scripts/prepare-project-config.py` | `python3 -m scisaurus.cli run-project PROJECT --config CONFIG.json` |
-| Literature survey | `scripts/prepare-survey-config.py` | `python3 -m scisaurus.cli run-survey PROJECT --config CONFIG.json` |
-| Scientific experiment | `scripts/setup-experiment-runtime.sh` + `scripts/prepare-experiment-config.py` | `python3 -m scisaurus.cli run-experiment PROJECT --config CONFIG.json` |
+| Paragraph revision | `scripts/setup-runtime.sh` | `./sci-whale run-paragraph PROJECT --config CONFIG.json` |
+| Multi-paragraph project | `scripts/prepare-project-config.py` | `./sci-whale run-project PROJECT --config CONFIG.json` |
+| Literature survey | `scripts/prepare-survey-config.py` | `./sci-whale run-survey PROJECT --config CONFIG.json` |
+| Scientific experiment | `scripts/setup-experiment-runtime.sh` + `scripts/prepare-experiment-config.py` | `./sci-whale run-experiment PROJECT --config CONFIG.json` |
 | Composer mission | `./run` | `./run` |
 | Local workspace console | `./dashboard [WORKSPACE]` | `./dashboard` |
 

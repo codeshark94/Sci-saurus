@@ -36,7 +36,7 @@ SAFE_PROCESS_ENV = {
     "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT",
     "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "LANG", "LC_ALL",
 }
-PDF_USER_AGENT = "Sci-saurus/0.8 (scholarly source retrieval)"
+PDF_USER_AGENT = "Sci-whale/0.8 (scholarly source retrieval)"
 ROBOTS_MAX_BYTES = 512 * 1024
 MAX_HTTP_REDIRECTS = 5
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
@@ -393,7 +393,7 @@ class CrossrefClient:
         try:
             try:
                 response = urlopen(Request(url, headers={
-                    "User-Agent": "Sci-saurus/0.8 (research metadata client)",
+                    "User-Agent": "Sci-whale/0.8 (research metadata client)",
                     "Accept": "application/json",
                 }), timeout=request_timeout)
             except HTTPError as exc:

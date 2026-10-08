@@ -1033,7 +1033,7 @@ class OpenAlexClient:
                                "capture_truncated": False, "capture_incomplete": False}}
         if auth_required is None:
             auth_required = self.auth_env is not None
-        headers = {"User-Agent": "Sci-saurus/0.8 (scholarly metadata client)",
+        headers = {"User-Agent": "Sci-whale/0.8 (scholarly metadata client)",
                    "Accept": "application/json", "Accept-Encoding": "identity"}
         if auth_required:
             if not credential or any(ord(c) < 33 or ord(c) > 126 for c in credential):

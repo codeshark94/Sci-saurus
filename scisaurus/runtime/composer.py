@@ -504,7 +504,7 @@ def load_runtime_environment_files(configured):
 
 
 def default_runtime_environment_files(repo_root=None):
-    """Return the owner-local env files used by a checked-out Sci-saurus run.
+    """Return the owner-local env files used by a checked-out Sci-whale run.
 
     Older workflow descriptors predate ``runtime_env_files`` and therefore
     cannot name the credential file without being regenerated.  The launcher
@@ -14367,6 +14367,7 @@ class ComposerRunner:
                 max_attempts=configured["max_attempts"],
                 timeout_seconds=configured["timeout_seconds"],
                 model_timeout_seconds=configured_model_timeout,
+                author_backend=configured.get("author_backend"),
             )
             foundry_input = {}
             if software_assessment is not None:

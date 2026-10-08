@@ -14,9 +14,9 @@ python3 scripts/prepare-project-config.py --output /tmp/project-run.json
 The helper uses the [synthetic project template](../config/project-run.example.json) and records the installed public software identity files. It preserves the virtual environment interpreter path, sets no credentials, performs no installation, and refuses to overwrite an existing output file. Set the authorized endpoint, deployed model name, optional `model.auth_env`, and `live_dispatch_allowed: true` in the generated configuration. The compatible API supports explicit reasoning effort and structured JSON output when the deployed server implements them.
 
 ```bash
-python3 -m scisaurus.cli run-project /tmp/research-project --config /tmp/project-run.json
-python3 -m scisaurus.cli status /tmp/research-project
-python3 -m scisaurus.cli verify /tmp/research-project
+./sci-whale run-project /tmp/research-project --config /tmp/project-run.json
+./sci-whale status /tmp/research-project
+./sci-whale verify /tmp/research-project
 ```
 
 Use a new project directory. Exit codes are `0` for adoption, `2` for invalid configuration, and `3` for blocked, paused, or unresolved work. Keys belong only in the named process environment variable, never in JSON or committed files.

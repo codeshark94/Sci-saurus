@@ -178,7 +178,7 @@ def main():
         "assets": []}
     results_path = evidence / "results.json"; results_path.write_bytes(canonical_bytes(results))
     config = {"schema_version": "paper-release-score-1", "paper_id": "pipeline_validation",
-        "title": "Sci-saurus Evidence-Bound Release Pipeline Validation", "revision": 1,
+        "title": "Sci-whale Evidence-Bound Release Pipeline Validation", "revision": 1,
         "document_type": "validation_report", "manuscript_project_dir": str(evidence / "manuscript"),
         "survey_project_dir": str(evidence / "survey"), "survey_ref": survey["survey_ref"],
         "assessment_ref": survey["assessment_ref"], "results_package": str(results_path),
@@ -193,7 +193,7 @@ def main():
         "references": [{"key": "known", "title": "Known Validation Record", "authors": "Validation Fixture",
                         "year": "2026", "doi": None, "url": "https://example.org/validation",
                         "source_ref": survey["source_ref"]}],
-        "authors": ["Sci-saurus Validation Team"], "keywords": ["provenance", "controlled revision", "PDF validation"]}
+        "authors": ["Sci-whale Validation Team"], "keywords": ["provenance", "controlled revision", "PDF validation"]}
     config_path = evidence / "paper-score.json"; config_path.write_bytes(canonical_bytes(config))
     result = PaperReleaseBuilder(root, config).build(compile_script=Path(args.compile_script))
     print(json.dumps({"release_dir": str(root), "evidence_dir": str(evidence),

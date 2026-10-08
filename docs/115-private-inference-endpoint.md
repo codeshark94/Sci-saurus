@@ -1,9 +1,9 @@
 # Ollama Cloud model wiring
 
-Sci-saurus dispatches structured model work through Ollama's native API or
+Sci-whale dispatches structured model work through Ollama's native API or
 local OpenAI-compatible bridge. Both are provider adapters: Ollama resolves
 the configured `:cloud` model and
-owns the provider credentials. Sci-saurus never silently falls back to a
+owns the provider credentials. Sci-whale never silently falls back to a
 different model.
 
 The owner-operated Qwen endpoint remains an authorized private alternative
@@ -131,7 +131,7 @@ Check the local bridge and the exact model through Ollama's model listing:
 curl -sS http://127.0.0.1:11434/v1/models
 ```
 
-Then exercise Sci-saurus's own adapter:
+Then exercise Sci-whale's own adapter:
 
 ```bash
 ./.venv/bin/python - <<'PY'

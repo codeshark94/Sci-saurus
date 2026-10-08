@@ -1,11 +1,11 @@
-# Sci-saurus — System Concept
+# Sci-whale — System Concept
 
 > **Version:** v0.8 · **Date:** 2026-09-10 · **Status:** proposed system design, not measured runtime behavior.
 > Governing decisions: [Concept SSOT](00-SSOT.md), especially D25–D36. Field definitions: [Execution Contract](40-execution-contract.md).
 
 ## 1. Purpose
 
-Sci-saurus is a research organization for turning abundant inference capacity into useful results over time. It can pursue multiple explanations, inspect difficult evidence, try competing constructions, and challenge its own choices. The human Principal sets the destination. The organization decides how to investigate and produce within that mandate.
+Sci-whale is a research organization for turning abundant inference capacity into useful results over time. It can pursue multiple explanations, inspect difficult evidence, try competing constructions, and challenge its own choices. The human Principal sets the destination. The organization decides how to investigate and produce within that mandate.
 
 The default resource premise is plentiful external GPU capacity. The design therefore favors capable models, substantial deliberation, broad parallel exploration, and strong independent verification when these can improve the result. Token minimization is not the objective. Attention to the right questions, external evidence, verifier reliability, coordination delay, and elapsed time remain constraints even with abundant GPUs.
 
@@ -187,7 +187,7 @@ Evaluate both equal-resource quality and equal-wall-clock usefulness. Compare a 
 
 ## 10. Research rationale and limits
 
-These studies motivate design hypotheses; they do not validate Sci-saurus or guarantee open-ended research progress.
+These studies motivate design hypotheses; they do not validate Sci-whale or guarantee open-ended research progress.
 
 - Snell et al., [Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters](https://arxiv.org/abs/2408.03314), found that effective compute allocation varied by difficulty and model in their mathematical reasoning experiments. The study used specialized revision/verifier training and also reported verifier over-optimization. **Design inference:** compare adaptive depth, breadth, and verification while measuring controller overhead and independent quality.
 - Wang et al., [Self-Consistency Improves Chain of Thought Reasoning in Language Models](https://arxiv.org/abs/2203.11171), improved evaluated arithmetic and commonsense benchmarks through diverse sampled reasoning paths and answer aggregation. **Design inference:** preserve different approaches; agreement in open-ended research remains a signal to investigate, not proof.

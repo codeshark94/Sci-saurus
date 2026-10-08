@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 repository=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-app="$repository/desktop/src-tauri/target/release/bundle/macos/Sci-saurus.app"
+app="$repository/desktop/src-tauri/target/release/bundle/macos/Sci-whale.app"
 if [ ! -d "$app" ]; then
   printf '%s\n' 'Build the desktop app first: cd desktop && npm ci && npm run build' >&2
   exit 1

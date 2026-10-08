@@ -1,1 +1,1 @@
-"""Domain entities of the Sci-saurus control plane."""
+"""Domain entities of the Sci-whale control plane."""
